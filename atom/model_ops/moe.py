@@ -3076,6 +3076,114 @@ class FusedMoE(torch.nn.Module):
                 narrow_weight = loaded_weight
             target_param[: narrow_weight.shape[0]].copy_(narrow_weight)
 
+    def stage_expert_weight(
+        self,
+        param: torch.nn.Parameter,
+        staging: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        local_expert_id: int,
+        shard_id: str,
+        weight_name: str,
+    ) -> bool:
+        """Write one expert's slice into the CPU staging buffer (batched load).
+
+        Mirrors the per-expert work `weight_loader` does, but targets a CPU
+        staging slice instead of the GPU param so the loader can flush all
+        experts of a fused param with a single H2D copy. Returns False for any
+        case not safe to batch here; the caller then falls back to the
+        per-expert `weight_loader` path.
+        """
+        # Cases not handled by the batched path — caller falls back.
+        if (
+            "input_scale" in weight_name
+            or "g_idx" in weight_name
+            or "weight_shape" in weight_name
+            or weight_name == ""
+        ):
+            return False
+        if shard_id not in ("w1", "w2", "w3"):
+            return False
+
+        # compressed-tensors packed-weight flip (matches weight_loader)
+        if self.quant_method.__class__.__name__ in (
+            "CompressedTensorsWNA16MarlinMoEMethod",
+            "CompressedTensorsWNA16MoEMethod",
+        ):
+            loaded_weight = loaded_weight.t().contiguous()
+
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        is_transposed = getattr(param, "is_transposed", False)
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+        if is_transposed:
+            shard_dim = int(not shard_dim)
+
+        if len(loaded_weight.shape) == 3:
+            return False
+
+        expert_data = staging[local_expert_id]
+
+        if (
+            staging.dtype == torch.uint8
+            and param.data.dtype == dtypes.fp4x2
+            and loaded_weight.dtype == dtypes.fp4x2
+        ):
+            loaded_weight = loaded_weight.view(torch.uint8)
+
+        # --- scale / zero / offset paths ---
+        if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
+            quant_method = self.layer_quant_config.quant_type
+            if quant_method == QuantType.per_Token:
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
+                return True
+            if quant_method in (QuantType.per_1x128, QuantType.per_1x32):
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    load_full=getattr(param, "load_full_w2", False),
+                )
+                return True
+            # per_Tensor or unknown quant_method — not safe to batch here.
+            return False
+
+        # --- main weight path ---
+        if "weight" in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=self.tp_rank,
+            )
+            return True
+
+        return False
+
+    def expected_batched_arrivals(self, param: torch.nn.Parameter) -> Optional[int]:
+        """How many checkpoint tensors will land in this fused param's staging
+        buffer before it is complete. w13 packs gate+up, so it receives two
+        shards (w1, w3) per local expert; w2 receives one per local expert."""
+        w13_params = [
+            getattr(self, n, None)
+            for n in ("w13_weight", "w13_weight_scale", "w13_bias")
+        ]
+        w2_params = [
+            getattr(self, n, None) for n in ("w2_weight", "w2_weight_scale", "w2_bias")
+        ]
+        if any(param is p for p in w13_params if p is not None):
+            return self.local_num_experts * 2
+        if any(param is p for p in w2_params if p is not None):
+            return self.local_num_experts
+        return None
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,

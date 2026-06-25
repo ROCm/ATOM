@@ -6,6 +6,7 @@ import json
 import os
 import logging
 import re
+import threading
 import time
 from glob import glob
 from typing import Generator, Tuple
@@ -401,11 +402,162 @@ def load_model(
     # rewritten name doesn't correspond to any model param. (orig, mapped) pairs.
     dropped_ckpt_keys: list[tuple[str, str]] = []
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
+    # --- Batched MoE expert loading ---------------------------------------
+    # Large MoE checkpoints (Kimi-K2.5 etc.) deliver each expert's weight as a
+    # separate tensor. The per-expert path then issues one tiny H2D copy per
+    # (expert, shard), i.e. hundreds of thousands of copies, each paying kernel
+    # launch + pageable-bounce-buffer + GIL overhead — this dominates load time
+    # (it stalls *after* the shard progress bar, in the futures drain). When
+    # ATOM_BATCH_EXPERT_LOAD is on, we instead accumulate every expert of a
+    # fused param into one pinned CPU staging buffer and flush it to the GPU
+    # with a single large H2D copy once all expected arrivals have landed.
+    batch_expert_load = envs.ATOM_BATCH_EXPERT_LOAD
+
+    staging_map: dict = {}
+    staging_lock = threading.Lock()
+
+    moe_module_cache: dict = {}
+    param_batchable: dict = {}
+
+    def _lookup_moe_module(full_param_name: str):
+        module_path = full_param_name.rsplit(".", 1)[0]
+        if module_path in moe_module_cache:
+            return moe_module_cache[module_path]
+        try:
+            mod = model.get_submodule(module_path)
+        except AttributeError:
+            mod = None
+        moe_module_cache[module_path] = mod
+        return mod
+
+    def _param_is_batchable(param, full_param_name: str) -> bool:
+        pid = id(param)
+        cached = param_batchable.get(pid)
+        if cached is not None:
+            return cached
+        moe = _lookup_moe_module(full_param_name)
+        ok = False
+        if moe is not None and hasattr(moe, "stage_expert_weight"):
+            expected = moe.expected_batched_arrivals(param)
+            ok = expected is not None and expected > 0
+        param_batchable[pid] = ok
+        return ok
+
+    def _do_flush(param, staging):
+        if staging.dtype != param.data.dtype:
+            param.data.view(torch.uint8).copy_(staging)
+        else:
+            param.data.copy_(staging)
+
+    def _stage_task(param, full_param_name, shard_id, global_expert_id, loaded_weight):
+        pid = id(param)
+
+        with staging_lock:
+            entry = staging_map.get(pid)
+            if entry is None:
+                moe = _lookup_moe_module(full_param_name)
+                expected = moe.expected_batched_arrivals(param)
+
+                pin = torch.cuda.is_available()
+
+                def _alloc_like():
+                    t = torch.empty(
+                        param.data.shape,
+                        dtype=param.data.dtype,
+                        device="cpu",
+                        pin_memory=pin,
+                    )
+                    t.zero_()
+                    return t
+
+                def _alloc_uint8():
+                    t = torch.empty(
+                        param.data.shape,
+                        dtype=torch.uint8,
+                        device="cpu",
+                        pin_memory=pin,
+                    )
+                    t.zero_()
+                    return t
+
+                try:
+                    try:
+                        staging = _alloc_like()
+                    except NotImplementedError:
+                        staging = _alloc_uint8()
+                except RuntimeError as e:
+                    logger.warning(
+                        "Pinned-memory allocation failed for %s (%s); "
+                        "falling back to unpinned staging.",
+                        full_param_name,
+                        e,
+                    )
+                    pin = False
+                    try:
+                        staging = _alloc_like()
+                    except NotImplementedError:
+                        staging = _alloc_uint8()
+                entry = [
+                    "active",
+                    staging,
+                    0,
+                    expected,
+                    moe,
+                    param,
+                    threading.Lock(),
+                ]
+                staging_map[pid] = entry
+
+        if entry[0] == "fallback":
+            wl = getattr(param, "weight_loader", default_weight_loader)
+            wl(param, loaded_weight, full_param_name, shard_id, global_expert_id)
+            return
+
+        _, staging, _, expected, moe, _, entry_lock = entry
+
+        local_eid = moe._map_global_expert_id_to_local_expert_id(global_expert_id)
+        if local_eid == -1:
+            return
+
+        ok = moe.stage_expert_weight(
+            param=param,
+            staging=staging,
+            loaded_weight=loaded_weight,
+            local_expert_id=local_eid,
+            shard_id=shard_id,
+            weight_name=full_param_name,
+        )
+
+        if not ok:
+            with staging_lock:
+                cur = staging_map.get(pid)
+                if cur is entry:
+                    staging_map[pid] = ("fallback",)
+            logger.warning(
+                "stage_expert_weight returned False mid-batch for %s "
+                "(shard_id=%s). Falling back to per-expert path.",
+                full_param_name,
+                shard_id,
+            )
+            wl = getattr(param, "weight_loader", default_weight_loader)
+            wl(param, loaded_weight, full_param_name, shard_id, global_expert_id)
+            return
+
+        flush_now = False
+        with entry_lock:
+            entry[2] += 1
+            if entry[2] >= expected:
+                flush_now = True
+
+        if flush_now:
+            _do_flush(param, staging)
+            with staging_lock:
+                if staging_map.get(pid) is entry:
+                    del staging_map[pid]
+
     use_threadpool = envs.ATOM_LOADER_USE_THREADPOOL
     if use_threadpool:
-        executor = concurrent.futures.ThreadPoolExecutor()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
     else:
         executor = None
     futures = []
@@ -593,11 +745,22 @@ def load_model(
                         if "mtp" in name and not spec_decode:
                             matched = True
                             break
-                        try:
-                            param = model.get_parameter(name)
-                        except AttributeError:
+                        param = params_dict.get(name)
+                        if param is None:
                             # Parameter absent from model (e.g. weight scales for
                             # an unquantized drafter MTP block); skip silently.
+                            matched = True
+                            break
+                        if batch_expert_load and _param_is_batchable(param, name):
+                            _submit(
+                                _stage_task,
+                                param,
+                                name,
+                                shard_id,
+                                expert_id,
+                                weight_tensor,
+                            )
+                            loaded_weights_record.add(prefix + name)
                             matched = True
                             break
                         weight_loader = getattr(param, "weight_loader")
@@ -657,9 +820,46 @@ def load_model(
                     )
                     _submit(weight_loader, param, weight_tensor)
                     loaded_weights_record.add(prefix + name)
+
+        if executor is not None:
+            enable_tqdm = (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            )
+            wait_iter = concurrent.futures.as_completed(futures)
+            if enable_tqdm:
+                wait_iter = tqdm(
+                    wait_iter,
+                    total=len(futures),
+                    desc="Loading weights",
+                    mininterval=1.0,
+                )
+            for future in wait_iter:
+                future.result()
+
+        # Any staging group that never reached its expected arrival count
+        # (e.g. a checkpoint missing some experts) is flushed here with whatever
+        # data landed, so the param isn't silently left at its init value.
+        with staging_lock:
+            pending = [e for e in staging_map.values() if e[0] == "active"]
+            staging_map.clear()
+        if pending:
+            logger.warning(
+                "Batched-load safety flush: %d group(s) did not reach "
+                "expected arrival count; flushing with partial data.",
+                len(pending),
+            )
+            for entry in pending:
+                _, staging, arrived, expected, _moe, param, _ = entry
+                logger.warning(
+                    "  param shape=%s arrived=%d expected=%d",
+                    tuple(param.shape),
+                    arrived,
+                    expected,
+                )
+                _do_flush(param, staging)
     finally:
         if executor is not None:
-            concurrent.futures.wait(futures)
             executor.shutdown(wait=True)
 
     # Verify every model parameter actually got loaded from the checkpoint.

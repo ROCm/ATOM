@@ -106,6 +106,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_USE_THREADPOOL": lambda: (
         os.getenv("ATOM_LOADER_USE_THREADPOOL", "1") == "1"
     ),
+    # When enabled (default), MoE expert tensors that arrive from the
+    # checkpoint are accumulated into a per-fused-param CPU staging buffer,
+    # and a single large H2D copy is submitted once the group fills. This
+    # collapses the hundreds-of-thousands of tiny per-expert H2D copies (which
+    # dominate load time on large MoE models like Kimi-K2.5) into one big copy
+    # per fused param. Set to 0 to revert to the per-expert path.
+    "ATOM_BATCH_EXPERT_LOAD": lambda: os.getenv("ATOM_BATCH_EXPERT_LOAD", "1") == "1",
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
