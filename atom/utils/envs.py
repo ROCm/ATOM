@@ -73,6 +73,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
+    # Replicate the EAGLE3 draft vocab embedding on every TP rank (full table per
+    # rank, local lookup) instead of sharding it — eliminates the post-embedding
+    # all-reduce. The draft embed is independent of the (sharded) lm_head.
+    "ATOM_EAGLE_REPLICATE_EMBED": lambda: (
+        os.getenv("ATOM_EAGLE_REPLICATE_EMBED", "1") == "1"
+    ),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
@@ -85,6 +91,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
