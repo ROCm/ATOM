@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
 from functools import cache
 from typing import Optional
 
@@ -1085,9 +1084,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 triton_fused_norm_rope_cache,
             )
 
-            state = self._topk_cache_state(sparse_metadata)
-            if state is not None:
-                self._debug_topk_cache_event(state, "skip_indexer_rope", ("rope",))
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
             q_raw, k_raw, v_raw, _, _ = torch.split(
@@ -1201,32 +1197,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             return None
         metadata_id = id(sparse_metadata)
         if state.get("metadata_id") != metadata_id:
-            debug_totals = state.get("_debug_totals")
             state.clear()
-            if debug_totals is not None:
-                state["_debug_totals"] = debug_totals
             state["metadata_id"] = metadata_id
         return state
-
-    def _debug_topk_cache_event(self, state: dict, event: str, key: tuple):
-        if os.environ.get("ATOM_DEBUG_MINIMAX_M3_INDEX_CACHE") != "1":
-            return
-        totals = state.setdefault("_debug_totals", {})
-        mode = key[0] if key else "unknown"
-        counter_key = f"{mode}_{event}"
-        totals[counter_key] = totals.get(counter_key, 0) + 1
-        total_events = sum(totals.values())
-        interval = int(
-            os.environ.get("ATOM_DEBUG_MINIMAX_M3_INDEX_CACHE_INTERVAL", "256")
-        )
-        if total_events <= 32 or (interval > 0 and total_events % interval == 0):
-            print(
-                "[MiniMax-M3 IndexCache] "
-                f"pid={os.getpid()} event={event} mode={mode} "
-                f"layer={self.layer_num} sparse_ord={self.sparse_layer_ordinal} "
-                f"skip={self.skip_index_topk} totals={totals}",
-                flush=True,
-            )
 
     def _topk_cache_key(
         self,
@@ -1271,9 +1244,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             return None
         entry = state.get("topk")
         if entry is None or entry.get("key") != key:
-            self._debug_topk_cache_event(state, "miss", key)
             return None
-        self._debug_topk_cache_event(state, "hit", key)
         return entry["value"]
 
     def _store_cached_topk(self, sparse_metadata, key: tuple, value: tuple):
@@ -1285,7 +1256,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 "layer_num": self.layer_num,
                 "sparse_layer_ordinal": self.sparse_layer_ordinal,
             }
-            self._debug_topk_cache_event(state, "store", key)
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
