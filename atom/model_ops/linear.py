@@ -1566,6 +1566,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         )
         param.weight_loader_process(param_data, loaded_weight)
 
+
 class RowParallelLinear(LinearBase):
     def __init__(
         self,

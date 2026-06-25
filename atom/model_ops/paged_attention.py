@@ -119,13 +119,6 @@ class Attention(BaseAttention):
         **kwargs,
     ):
         output = torch.ops.aiter.unified_attention_with_output_base(
-            query,
-            q_scale,
-            key,
-            value,
-            positions,
-            self.layer_name,
-            self.use_mla,
-            qkv,
+            query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )
         return output
