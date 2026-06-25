@@ -126,13 +126,13 @@ jobs:
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
-      #- name: Clean up old containers
-      #  run: |
-      #    containers=$($CONTAINER_ENGINE ps -q)
-      #    if [ -n "$containers" ]; then
-      #      $CONTAINER_ENGINE kill $containers || true
-      #    fi
-      #    $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
+      - name: Clean up old containers
+        run: |
+          containers=$($CONTAINER_ENGINE ps -q)
+          if [ -n "$containers" ]; then
+            $CONTAINER_ENGINE kill $containers || true
+          fi
+          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
       - name: Start validation container
         run: |
