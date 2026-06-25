@@ -1021,6 +1021,8 @@ class SparseMHAPagedAttentionImplForVllm(
         topk: int = 0,
         init_blocks: int = 0,
         local_blocks: int = 0,
+        skip_index_topk: bool = False,
+        sparse_layer_ordinal: int = -1,
         impl_cls=None,
         **kwargs,
     ) -> None:
@@ -1045,6 +1047,11 @@ class SparseMHAPagedAttentionImplForVllm(
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
+        self.skip_index_topk = skip_index_topk
+        self.sparse_layer_ordinal = sparse_layer_ordinal
+        self.index_cache: Optional[torch.Tensor] = None
+        self.index_topk_cache_state: Optional[dict] = None
+        self._index_q_cache_key_info: Optional[tuple] = None
         self._index_q: Optional[torch.Tensor] = None
 
         index_prefix = f"{self.layer_name}.index_cache"
