@@ -1216,7 +1216,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         counter_key = f"{mode}_{event}"
         totals[counter_key] = totals.get(counter_key, 0) + 1
         total_events = sum(totals.values())
-        interval = int(os.environ.get("ATOM_DEBUG_MINIMAX_M3_INDEX_CACHE_INTERVAL", "256"))
+        interval = int(
+            os.environ.get("ATOM_DEBUG_MINIMAX_M3_INDEX_CACHE_INTERVAL", "256")
+        )
         if total_events <= 32 or (interval > 0 and total_events % interval == 0):
             print(
                 "[MiniMax-M3 IndexCache] "
@@ -1237,7 +1239,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     ) -> tuple:
         if index_q is None:
             if self._index_q_cache_key_info is None:
-                raise RuntimeError("MiniMax-M3 index cache key missing index_q metadata")
+                raise RuntimeError(
+                    "MiniMax-M3 index cache key missing index_q metadata"
+                )
             index_q_shape, index_q_dtype, index_q_device = self._index_q_cache_key_info
         else:
             index_q_shape = tuple(index_q.shape)
