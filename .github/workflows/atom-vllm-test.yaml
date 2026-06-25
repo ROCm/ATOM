@@ -250,7 +250,7 @@ jobs:
               ATOM_MOE_GU_ITLV=1
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.94
-            runner: atom-mi35x-8gpu-oot-acc
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
@@ -259,7 +259,7 @@ jobs:
             env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_USE_V2_MODEL_RUNNER=1"
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.88
-            runner: atom-mi35x-8gpu-oot-acc
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Kimi-K2.5-MXFP4 TP4"
             model_name: "Kimi-K2.5-MXFP4"
             model_path: "amd/Kimi-K2.5-MXFP4-AttnFP8"
@@ -267,7 +267,7 @@ jobs:
             env_vars: ""
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.92
-            runner: atom-mi35x-8gpu-oot-acc
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
@@ -277,7 +277,7 @@ jobs:
               ATOM_USE_CUSTOM_ALL_GATHER=0
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.76
-            runner: atom-mi35x-8gpu-oot-acc
+            runner: atom-mi308-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
