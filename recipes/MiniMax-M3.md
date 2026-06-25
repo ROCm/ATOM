@@ -168,6 +168,7 @@ server command above plus the three speculative-decoding flags):
 model_path=amd/MiniMax-M3-MXFP4
 draft_path=Inferact/MiniMax-M3-EAGLE3
 
+export ATOM_FORCE_ATTN_TRITON=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0
 
