@@ -487,14 +487,23 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+        # gfx1250 (MI455) has no pa_decode_gluon kernel (gluon supports gfx942 /
+        # gfx950 only), so route the decode through the triton unified_attention
+        # path, which is gfx1250-capable and reads the same SHUFFLE KV cache.
+        use_unified = (
+            envs.ATOM_USE_UNIFIED_ATTN
+            or self.use_flash_layout
+            or get_gfx() == "gfx1250"
+        )
+
+        if use_unified and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             o = torch.empty_like(q)
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
+        if use_unified:
             # print(q.shape, k_cache.shape, v_cache.shape)
             sliding_window = (
                 (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
