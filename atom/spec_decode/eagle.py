@@ -260,7 +260,6 @@ class EagleProposer:
         else:
             self.model = model_class(self.config)
 
-        # Greedy-draft distributed-argmax fast path (resolved once, not per step).
         self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
@@ -291,8 +290,6 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         if self.speculative_config.method == "eagle3":
-            # Eagle3: load from a separate draft model checkpoint with
-            # independent embed_tokens and lm_head (no sharing).
             load_model(
                 self.model,
                 self.speculative_config.model,
@@ -514,10 +511,7 @@ class EagleProposer:
                             )
                         context.is_prefill = False
 
-                    # update metadata. Update context_lens for each draft step
-                    # (needed by both MHA attention and MLA+sparse indexer). M3
-                    # block-paged MHA folds this per-step context_lens/positions
-                    # bump into prepare_mtp_decode's kernel; others bump on host.
+                    # update metadata
                     attn_metadata.max_seqlen_k += 1
                     fuse_mtp = positions.ndim == 1 and getattr(
                         self.runner.attn_metadata_builder,
@@ -549,8 +543,7 @@ class EagleProposer:
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
                     if has_flat_kv and "slot_mapping" not in workinfos:
-                        # M3 block-paged returns its own slot_mapping; flat-kv
-                        # (MLA, block_size=1) derives it from kv_indices.
+                        # MLA/MHA path: slot derived from flat kv_indices.
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
