@@ -686,6 +686,31 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.has_own_lm_head = False
         self.has_own_embed_tokens = False
         self.combine_hidden_states = model.combine_hidden_states
+        self._maybe_index_draft_attn_layer()
+
+    def _maybe_index_draft_attn_layer(self) -> None:
+        # vLLM's bind_kv_cache calls extract_layer_index which asserts that
+        # each kv cache layer name contains only one integer. ATOM's
+        # Eagle3LlamaModel names its decoder layer as "midlayer", so prefix
+        # it with "layers.0." so that vLLM's assertion can pass
+        static_forward_context = self.vllm_compilation_config.static_forward_context
+
+        for _name, module in self.model.named_modules():
+            old_name = getattr(module, "layer_name", None)
+            if old_name is None or any(p.isdigit() for p in old_name.split(".")):
+                continue
+            new_name = f"layers.0.{old_name}"
+            if new_name in static_forward_context:
+                raise ValueError(
+                    f"Cannot re-key draft attention layer {old_name} to "
+                    f"{new_name}; name already registered."
+                )
+            static_forward_context[new_name] = static_forward_context.pop(old_name)
+            module.layer_name = new_name
+            logger.info(
+                f"Re-keyed EAGLE3 draft attention layer {old_name} to "
+                f"{new_name} for vLLM to extract a layer index"
+            )
 
     def forward(
         self,
