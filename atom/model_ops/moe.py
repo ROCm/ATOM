@@ -1391,15 +1391,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
         from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
 
-        # The dense shared-expert GEMM only implements the SiLU activation
-        # path; SwiGLU models have no fused shared experts, so this assert
-        # documents the supported scope.
-        assert (
-            activation != ActivationType.Swiglu
-        ), "dense shared-expert GEMM only supports the SiLU activation path"
+        from atom.model_ops.swiglu_oai import swiglu_oai_split
+
+        # Two activation flavours are supported, matching the routed experts:
+        #   * SiLU (DeepSeek): silu(gate) * clamp(up), split [gate | up] layout.
+        #   * SwiGLU-OAI (MiniMax-M3 / gpt-oss): gate * sigmoid(alpha*gate) *
+        #     (up + beta) with optional clamp. MiniMax-M3 does not interleave
+        #     gate/up, so the dense GEMM output is split [gate | up] - exactly
+        #     what swiglu_oai_split consumes (mirrors MiniMaxM3MLP.forward and
+        #     the routed swiglu_add_residual=True / alpha path).
+        is_swiglu = activation == ActivationType.Swiglu
 
         M = x.shape[0]
         swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
+        swiglu_alpha = getattr(layer, "swiglu_alpha", 1.702)
+        swiglu_beta = getattr(layer, "swiglu_beta", 1.0)
 
         use_a4w4 = self.act_quant == MoEActivationQuant.FP4
         if use_a4w4:
@@ -1425,14 +1431,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if shared_w13_bias is not None:
                 gate_up = gate_up + shared_w13_bias[e]
             half_n = gate_up.shape[-1] // 2
-            intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
-            fused_clamp_act_mul(
-                gate_up,
-                out=intermediate,
-                swiglu_limit=swiglu_limit,
-                activation="silu",
-                dtype_quant=None,
-            )
+            if is_swiglu:
+                intermediate = swiglu_oai_split(
+                    gate_up,
+                    alpha=swiglu_alpha,
+                    beta=swiglu_beta,
+                    limit=swiglu_limit if swiglu_limit > 0 else None,
+                    out_dtype=x.dtype,
+                )
+            else:
+                intermediate = torch.empty(
+                    (M, half_n), device=x.device, dtype=x.dtype
+                )
+                fused_clamp_act_mul(
+                    gate_up,
+                    out=intermediate,
+                    swiglu_limit=swiglu_limit,
+                    activation="silu",
+                    dtype_quant=None,
+                )
             out_e = _shared_expert_gemm(
                 intermediate,
                 layer.shared_w2_weight[e],
