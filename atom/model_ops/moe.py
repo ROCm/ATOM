@@ -234,7 +234,10 @@ def pad_for_all_gather(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
     padding_shape[0] = max_batch_size
     padded_x = torch.empty(padding_shape, device=x.device, dtype=x.dtype)
     padded_x[:original_batch_size, :].copy_(x)
-    # padded_x[original_batch_size:, :].zero_()
+    # Padded rows still enter fused-MoE routing/sort/dispatch before being
+    # sliced away after reduce-scatter; uninitialized NaN/Inf rows can perturb
+    # expert buckets or shared scratch and corrupt real tokens.
+    padded_x[original_batch_size:, :].zero_()
     return padded_x, original_batch_size
 
 
