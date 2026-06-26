@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import List, Optional, Type
 
 import numpy as np
 import torch
+from atom.utils import envs
 from aiter import (
     decode_update_mla_metadata_v1,
     dtypes,
@@ -24,6 +26,24 @@ from atom.utils.forward_context import AttentionMetaData, Context
 from .backends import AttentionBackend, CommonAttentionBuilder
 
 logger = logging.getLogger("atom")
+
+# `max_split_per_batch` is only needed (and only exists in newer aiter builds)
+# for the segmented page_size>1 MLA path. Detect support once so the default
+# page_size=1 path never passes an unsupported kwarg.
+try:
+    _MLA_META_SUPPORTS_MAX_SPLIT = (
+        "max_split_per_batch" in inspect.signature(get_mla_metadata_info_v1).parameters
+    )
+except (TypeError, ValueError):
+    _MLA_META_SUPPORTS_MAX_SPLIT = False
+
+
+def _mla_seg_meta_kwargs() -> dict:
+    """Extra kwargs for ``get_mla_metadata_info_v1`` on the seg (page_size>1)
+    path. Empty on the original page_size=1 path so behavior is unchanged."""
+    if envs.ATOM_MLA_PAGE_SIZE > 1 and _MLA_META_SUPPORTS_MAX_SPLIT:
+        return {"max_split_per_batch": 16}
+    return {}
 
 
 @dataclass
@@ -54,6 +74,10 @@ class MLAChunkContextMetadata:
     num_chunks: int
     k_workspace: torch.Tensor
     v_workspace: torch.Tensor
+    # Block-granular CSR per chunk for the shuffled-KV gather (block_size=64
+    # blocks instead of token slots). None for the plain token-slot layout.
+    shuffle_kv_block_indptr: Optional[List[torch.Tensor]] = None
+    shuffle_kv_block_indices: Optional[List[torch.Tensor]] = None
 
 
 def cdiv(a, b):
@@ -76,7 +100,16 @@ class AiterMLABackend(AttentionBackend):
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
-        self.block_size = 1
+        if envs.ATOM_MLA_PAGE_SIZE > 1:
+            self.block_size = envs.ATOM_MLA_PAGE_SIZE
+        else:
+            self.block_size = 1
+        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            assert model_runner.block_size == 64, (
+                f"ATOM_USE_TRITON_MLA=1 and ATOM_USE_TRITON_MLA_SHUFFLE_KV=1 expects --block-size 64 "
+                f"for {model_runner.kv_cache_dtype} KV cache, "
+                f"got --block-size {model_runner.block_size}"
+            )
         CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
@@ -103,6 +136,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.dtype_kv,
             is_sparse=self.is_sparse,
             fast_mode=True,
+            **_mla_seg_meta_kwargs(),
         )
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
@@ -184,6 +218,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dtype_kv,
                 is_sparse=True,
                 fast_mode=True,
+                **_mla_seg_meta_kwargs(),
             )
             mla_metadata["sparse_mtp_work_meta_data"] = torch.empty(
                 smt_wmd_size, dtype=smt_wmd_type, device=self.device
@@ -1237,6 +1272,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
+        # Self-consistent minimal KV metadata for capture: give every sequence
+        # exactly 1 page (kv_indptr = [0,1,...,bs]) pointing at block 0, with a
+        # 1-token last page. The split-KV stage1 asm kernel computes per batch
+        # full_pages = page_count - (tail_len != 0). With model_runner's default
+        # zeroed kv_indptr (page_count == 0) but kv_last_page_lens == 1, that
+        # subtraction underflows (0 - 1 -> 0xFFFFFFFF), inflating the kv loop
+        # count to ~2^32 so the kernel never exits and cudagraph capture hangs
+        # (only hit when num_kv_splits > 1; passes==1 takes the bf16 fast path).
+        # Replay overwrites these buffers with real values, so this only affects
+        # capture-time loop termination, not inference correctness.
+        if self.block_size > 1:
+            kv_indptr_buf = var["kv_indptr"]
+            kv_indptr_buf.np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+            kv_indptr_buf.copy_to_gpu(bs + 1)
+            var["kv_indices"].gpu[:bs].zero_()
+            var["kv_last_page_lens"].gpu[:bs].fill_(1)
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         sum_tokens = bs * max_q_len

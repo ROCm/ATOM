@@ -1,25 +1,93 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from typing import Type
 
 import aiter
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import kv_indices_generate_triton
-from atom.model_ops.attention_mha import PagedAttentionImpl
-from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils import CpuGpuBuffer, envs
+from atom.utils.block_convert import (
+    block_table_convert_triton,
+    kv_indices_generate_triton,
+)
+from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
+from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
 from atom.utils.tbo import TokenSplitPrefillState
-from atom.utils import envs
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+
+logger = logging.getLogger("atom")
 
 
 def cdiv(a, b):
     return (a + b - 1) // b
+
+
+def _is_indexed_sparse_attention(module) -> bool:
+    """True only for the MiniMax-M3 sparse ``Attention`` layer (the one that owns
+    the sparse impl), so binding reads ``module.impl``.
+
+    ``model.modules()`` walks both the outer ``MiniMaxM3SparseAttention`` wrapper
+    AND its child ``Attention`` layer. Only the child carries ``.impl`` (a
+    ``SparseMHAPagedAttentionImpl``) and the KV-cache slot; the wrapper must be
+    skipped (return None from build_kv_cache_tensor). So key off the impl flag,
+    NOT the wrapper's own ``is_indexed_sparse_attention`` class attribute."""
+    impl = getattr(module, "impl", None)
+    return bool(getattr(impl, "is_indexed_sparse_attention", False))
+
+
+@triton.jit
+def _mtp_prepare_decode_metadata_kernel(
+    context_lens_ptr,
+    block_tables_ptr,
+    slot_mapping_ptr,
+    positions_in_ptr,
+    positions_out_ptr,
+    last_token_indices_ptr,
+    bs,
+    skip_update: tl.constexpr,
+    update_context_lens: tl.constexpr,
+    update_positions: tl.constexpr,
+    select_positions: tl.constexpr,
+    block_size: tl.constexpr,
+    block_table_stride: tl.constexpr,
+    position_stride: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    if not skip_update:
+        seq = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = seq < bs
+
+        ctx = tl.load(context_lens_ptr + seq, mask=mask, other=1).to(tl.int64)
+        if update_context_lens:
+            ctx += 1
+            tl.store(context_lens_ptr + seq, ctx, mask=mask)
+
+        if update_positions:
+            pos_idx = seq
+            if select_positions:
+                pos_idx = tl.load(last_token_indices_ptr + seq, mask=mask, other=0)
+            pos = tl.load(positions_in_ptr + pos_idx, mask=mask, other=0)
+            tl.store(positions_out_ptr + seq * position_stride, pos + 1, mask=mask)
+
+        last_pos = tl.maximum(ctx - 1, 0)
+        block_col = last_pos // block_size
+        within_block = last_pos - block_col * block_size
+
+        phys_block = tl.load(
+            block_tables_ptr + seq * block_table_stride + block_col,
+            mask=mask,
+            other=0,
+        ).to(tl.int64)
+        tl.store(
+            slot_mapping_ptr + seq, phys_block * block_size + within_block, mask=mask
+        )
 
 
 class AiterBackend(AttentionBackend):
@@ -38,6 +106,9 @@ class AiterBackend(AttentionBackend):
 
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
+    # EagleProposer fuses the per-draft-step position bump into
+    # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
+    fuse_mtp_decode_position_update = True
 
     def __init__(
         self,
@@ -47,7 +118,27 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         device=None,
         model_runner=None,
     ):
-        self.block_size = 1024 if model_runner.block_size == 1024 else 16
+        hf_config = model_runner.config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        from atom.config import _is_minimax_m3_config
+
+        self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
+            hf_config
+        )
+        if self._has_sparse_attention and (
+            sparse_block_size := sparse_cfg.get("sparse_block_size")
+        ):
+            # MiniMax-M3 sparse kernels operate on sparse_attention_config's
+            # block size. The scheduler/KV manager block size may be larger as
+            # long as it is divisible by this logical attention block size.
+            self.block_size = sparse_block_size
+        else:
+            self.block_size = (
+                model_runner.block_size
+                if model_runner.block_size in (256, 1024)
+                else 16
+            )
         if envs.ATOM_USE_UNIFIED_ATTN:
             # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
             # as the physical block size so block_ratio == 1 and
@@ -56,12 +147,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
             # 128-byte physical page, i.e. block_size // x == 8).
             expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
-            assert model_runner.block_size == expected, (
-                f"ATOM_USE_UNIFIED_ATTN=1 expects --block-size {expected} "
-                f"for {model_runner.kv_cache_dtype} KV cache (so block_ratio == 1), "
-                f"got --block-size {model_runner.block_size}"
-            )
+            if model_runner.block_size != expected:
+                logger.warning(
+                    "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
+                    "cache (so block_ratio == 1), got --block-size %s. Continuing "
+                    "with the requested block size.",
+                    expected,
+                    model_runner.kv_cache_dtype,
+                    model_runner.block_size,
+                )
             self.block_size = model_runner.block_size
+
         assert (
             model_runner.block_size % self.block_size == 0
         ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
@@ -100,6 +196,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        if self._has_sparse_attention and self.block_ratio > 1:
+            self.model_runner.forward_vars["sparse_attention_block_tables"] = (
+                CpuGpuBuffer(
+                    self.max_bs,
+                    self.max_num_blocks_per_seq,
+                    **i32_kwargs,
+                )
+            )
+        self._pa_decode_bf16_asm_enabled = (
+            use_pa_decode_bf16_asm() and model_runner.block_size == 256
+        )
 
         pa_persistent_metadata = {
             "max_qlen": max_qlen,
@@ -298,6 +405,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
         num_kv_heads = runner._get_num_kv_heads()
         total_num_layers = runner._get_total_num_layers()
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
@@ -366,6 +474,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             * runner.physical_block_size
             * 4  # float32 kv_scale
         )
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        if sparse_cfg:
+            sparse_layers = sum(
+                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
+            )
+            index_dim = sparse_cfg["sparse_index_dim"]
+            block_bytes += (
+                sparse_layers
+                * runner.physical_block_size
+                * index_dim
+                * torch.empty((), dtype=config.torch_dtype).element_size()
+            )
         return block_bytes
 
     def allocate_kv_cache_tensors(
@@ -383,6 +503,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
 
         if runner.is_mimo_v2():
             # Per-layer allocation deferred (each module gets its own
@@ -393,7 +514,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "_kv_layer_cache_store": [],
             }
 
-        return {
+        tensors = {
             "kv_cache": torch.zeros(
                 2,
                 hf_config.num_hidden_layers,
@@ -414,6 +535,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
             ),
         }
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        if sparse_cfg:
+            sparse_layers = sum(
+                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
+            )
+            tensors["sparse_attention_index_cache"] = torch.zeros(
+                sparse_layers,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                sparse_cfg["sparse_index_dim"],
+                dtype=config.torch_dtype,
+                device="cuda",
+            )
+            tensors["_sparse_attention_cache_next"] = 0
+            if getattr(text_config, "use_index_cache", False) or getattr(
+                hf_config, "use_index_cache", False
+            ):
+                tensors["_sparse_attention_topk_cache_state"] = {}
+        return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one MHA (non-MLA) attention module to its KV slice.
@@ -428,6 +568,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         from atom.config import KVCacheTensor
         from aiter import dtypes
+
+        if _is_indexed_sparse_attention(module):
+            # MiniMax-M3 sparse attention. The KV cache uses the SAME allocation
+            # and binding as standard MHA — we only additionally bind the separate
+            # indexer-key cache here, then fall through to the standard branch for
+            # all K/V + scale binding (it sets module.k_cache/v_cache/k_scale/
+            # v_scale and returns the KVCacheTensor). The standard binding is
+            # page-128 SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it
+            # to page-16 SHUFFLE (zero-copy) at attention time. index_cache is a
+            # genuinely separate cache (not derivable from the KV cache), so the
+            # runner assigns each sparse layer its own slice here.
+            runner = self.model_runner
+            sparse_idx = runner._sparse_attention_cache_next
+            runner._sparse_attention_cache_next += 1
+            module.impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
+            module.impl.max_model_len = runner.config.max_model_len
+            module.impl.index_topk_cache_state = getattr(
+                runner, "_sparse_attention_topk_cache_state", None
+            )
+            # NOTE: no return — fall through to the standard MHA binding below.
 
         if not (
             hasattr(module, "base_attention")
@@ -526,6 +686,31 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             v_scale=module.v_scale,
         )
 
+    def _get_sparse_attention_block_tables(
+        self,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bs: int,
+    ) -> torch.Tensor:
+        """Return MiniMax-M3 sparse-kernel block tables.
+
+        `block_tables` is produced by the scheduler at `model_runner.block_size`
+        granularity. MiniMax-M3 sparse attention indexes blocks at
+        `sparse_block_size` granularity, so when the scheduler block is larger
+        we expand each scheduler page id into its logical sparse pages.
+        """
+        if self.block_ratio == 1:
+            return block_tables
+        sparse_block_tables = self.model_runner.forward_vars[
+            "sparse_attention_block_tables"
+        ].gpu[:bs]
+        return block_table_convert_triton(
+            block_tables,
+            sparse_block_tables,
+            seq_lens,
+            self.block_ratio,
+        )
+
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.types import (
             KVTransferRegion,
@@ -577,8 +762,102 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             num_blocks=runner.num_physical_kvcache_blocks,
         )
 
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor = None,
+        *,
+        update_context_lens: bool = False,
+        positions_out: torch.Tensor | None = None,
+        last_token_indices: torch.Tensor | None = None,
+    ):
+        """Per-draft-step metadata for a block-paged MHA Eagle3 draft.
+
+        Called by EagleProposer.propose at mid-step iters. The draft's decode
+        kernels (``paged_attention_{asm,triton}``) read ``block_tables`` +
+        ``context_lens``. Eagle can pre-bump ``context_lens`` before this call,
+        or ask this fused kernel to update it in place. The block_size==1024
+        persistent path is the only one consuming ``kv_indptr``/``kv_indices``;
+        MiniMax-M3 runs at ``--block-size 128`` so the kernel never reads them -
+        no rebuild.
+
+        The one value we must (re)compute is the write slot for the new draft
+        token in the draft's own block-paged KV cache:
+
+            slot = block_tables[seq, (ctx-1)//B] * B + (ctx-1) % B,   B = block_size
+
+        Returned under ``slot_mapping`` so EagleProposer skips its token-granular
+        (MLA physical block_size==1) flat-kv slot derivation, which would yield
+        a bare block id for ``B > 1``.
+
+        ``only_update`` / ``num_reject_tokens`` are MLA/V4-specific knobs and are
+        unused here: there are no persistent worker buffers to roll over for
+        ``block_size != 1024``.
+        """
+        var = self.model_runner.forward_vars
+        slot_mapping = var["slot_mapping"].gpu[:bs]
+        block_tables = var["block_tables"].gpu
+        context_lens = var["context_lens"].gpu
+        update_positions = positions_out is not None
+        select_positions = update_positions and last_token_indices is not None
+        if positions_out is None:
+            positions_out = positions
+        if last_token_indices is None:
+            last_token_indices = slot_mapping
+        # Dummy runs skip the draft attention, so keep this launch as a no-op:
+        # their synthetic context_lens can point past block_tables.
+        _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(bs, 128)),)](
+            context_lens,
+            block_tables,
+            slot_mapping,
+            positions,
+            positions_out,
+            last_token_indices,
+            bs,
+            bs == 0 or get_forward_context().context.is_dummy_run,
+            update_context_lens,
+            update_positions,
+            select_positions,
+            self.model_runner.block_size,
+            block_tables.stride(0),
+            positions_out.stride(0) if update_positions else 1,
+            BLOCK=128,
+        )
+        return {"slot_mapping": slot_mapping}
+
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
+        if self._has_sparse_attention and not attn_metadata.has_cached:
+            bs = batch.total_seqs_num_prefill
+            self.prepare_block_tables(batch)
+            attn_metadata.block_tables = self.model_runner.forward_vars[
+                "block_tables"
+            ].copy_to_gpu(bs)
+        if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_prefill_metadata,
+            )
+
+            bs = batch.total_seqs_num_prefill
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                attn_metadata.block_tables[:bs],
+                attn_metadata.context_lens[:bs],
+                bs,
+            )
+            attn_metadata.sparse_attention_metadata = make_sparse_prefill_metadata(
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                seq_lens=attn_metadata.context_lens,
+                block_table=sparse_block_tables,
+                slot_mapping=attn_metadata.slot_mapping,
+                max_query_len=attn_metadata.max_seqlen_q,
+                max_seq_len=attn_metadata.max_seqlen_k,
+                num_prefills=bs,
+                num_prefill_tokens=batch.total_tokens_num_prefill,
+            )
         if self._tbo_token_split:
             self._stash_tbo_token_split_prefill_state(batch)
         return attn_metadata, positions
@@ -753,7 +1032,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        if self.block_size == 1024:
+        if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
             ctx.update(ctx_pa_ps)
 
@@ -773,6 +1052,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
+        if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_decode_metadata,
+            )
+
+            # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
+            # the DECODE sparse path; the decode kernels handle q>1 per-token
+            # causal internally via max_query_len.
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                attn_metadata.block_tables[:scheduled_bs],
+                attn_metadata.context_lens[:scheduled_bs],
+                scheduled_bs,
+            )
+            attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
+                seq_lens=attn_metadata.context_lens[:scheduled_bs],
+                block_table=sparse_block_tables,
+                slot_mapping=attn_metadata.slot_mapping,
+                max_seq_len=int(max_seqlen_k),
+                max_query_len=int(max_seqlen_q),
+            )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
         )
@@ -876,7 +1175,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
             # Set PA persistent worker buffers for this ubatch
-            if self.block_size == 1024:
+            if self.block_size in (256, 1024):
                 self._set_ubatch_pa_buffers(padded_bs, max_seqlen_q, ub_idx)
 
     def _set_ubatch_pa_buffers(self, padded_bs, max_q_len, ubatch_idx):
@@ -922,7 +1221,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         max_q_len = var["max_qlen"]
 
         # Compute PA work buffers for this ubatch
-        if self.block_size == 1024:
+        if self.block_size in (256, 1024):
             self._set_ubatch_pa_buffers(padded_bs, max_q_len, ubatch_idx)
 
         attn = AttentionMetaData(
@@ -944,23 +1243,48 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
-        if self.block_size == 1024:
+        max_seqlen_k = self.model_runner.config.max_model_len
+        max_q_len = int(var["max_qlen"])
+
+        if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
+        total_tokens = bs * max_q_len
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[:total_tokens],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
-            max_seqlen_q=var["max_qlen"],
+            max_seqlen_q=max_q_len,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
-            max_seqlen_k=self.model_runner.config.max_model_len,
+            max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
         )
+        if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_decode_metadata,
+            )
 
-        positions = var["positions"].copy_to_gpu(bs)
+            seq_lens = attn_metadata.context_lens
+            # Both plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) use
+            # the DECODE sparse path; the decode kernels handle q>1 per-token causal
+            # internally (max_query_len), so no separate prefill graph is needed.
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                attn_metadata.block_tables,
+                seq_lens,
+                bs,
+            )
+            attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
+                seq_lens=seq_lens,
+                block_table=sparse_block_tables,
+                slot_mapping=attn_metadata.slot_mapping,
+                max_seq_len=attn_metadata.max_seqlen_k,
+                max_query_len=max_q_len,
+            )
+
+        positions = var["positions"].copy_to_gpu(total_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )

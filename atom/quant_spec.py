@@ -320,6 +320,14 @@ class GenericParser(QuantConfigParser):
             QuantType.per_1x128,
         ):
             quant_type = QuantType.per_1x32
+        # Mxfp8 ``[1, K]`` block to per_1x32.
+        weight_block_size = hf_quant_config.get("weight_block_size")
+        if (
+            isinstance(weight_block_size, (list, tuple))
+            and len(weight_block_size) == 2
+            and weight_block_size[0] == 1
+        ):
+            quant_type = QuantType.per_1x32
         is_dynamic = hf_quant_config.get("is_dynamic", True)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",
@@ -372,6 +380,27 @@ class GenericParser(QuantConfigParser):
         return torch.bfloat16
 
     def _infer_qtype(self, cfg: dict, config_str: str) -> QuantType:
+        # Prefer explicit HF/compressed-tensors block size over text heuristics
+        # so MXFP8 1x32 and blockscale 1x128/128x128 are not conflated.
+        if "weight_block_size" in cfg:
+            wbs = cfg.get("weight_block_size")
+            if wbs is None:
+                return QuantType.per_Tensor
+            if isinstance(wbs, (list, tuple)) and len(wbs) >= 2:
+                try:
+                    m, n = int(wbs[0]), int(wbs[1])
+                except (TypeError, ValueError):
+                    m = n = None
+                if (m, n) == (1, 128):
+                    return QuantType.per_1x128
+                if (m, n) == (128, 128):
+                    # per_128x128 enum has no consumers in linear.py / GEMM dispatch yet;
+                    # the per_1x128 path already allocates a (out//128, in//128)
+                    # scale grid which is exactly the (128, 128) block layout.
+                    return QuantType.per_1x128
+                if (m, n) == (1, 32):
+                    return QuantType.per_1x32
+                return QuantType.per_1x128
         # Check explicit fields
         for key in ("quant_type", "quantization_type", "scheme"):
             val = cfg.get(key)

@@ -72,6 +72,10 @@ if [ "$TYPE" == "launch" ]; then
   ATOM_SERVER_LOG="/tmp/atom_server.log"
   SERVER_PORT_ARGS=("--server-port" "$ATOM_SERVER_PORT")
   print_device_mapping_debug
+  echo ""
+  echo "========== ATOM server command =========="
+  echo "PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model $MODEL_PATH ${SERVER_PORT_ARGS[@]} $PROFILER_ARGS ${EXTRA_ARGS[@]}"
+  echo "=========================================="
   PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${SERVER_PORT_ARGS[@]}" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
   tail -f "$ATOM_SERVER_LOG" &

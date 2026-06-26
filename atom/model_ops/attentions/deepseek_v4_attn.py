@@ -121,14 +121,15 @@ class AttentionMetaData_DSV4(AttentionMetaData):
 
     # ----- Per-fwd hoisted (built in `_attach_v4_per_fwd_meta`) -----
     batch_id_per_token: Optional[torch.Tensor] = None
-    """[padded_T] int64 GPU — the SINGLE per-token mapping
-    (token_idx → seq_idx). int64 dtype is required by PyTorch fancy-index
-    (used in the indexer); triton kernels (swa_write, csa_translate_pack)
-    read int64 fine. Padded tail [T:padded_T] = -1 sentinel; consumer
-    kernels skip on `bid < 0`. All other per-token quantities resolved as
-    `per_seq_data[batch_id_per_token[t]]` — no [T] aliases of seq data."""
+    """[padded_T] int32 GPU — the SINGLE per-token mapping
+    (token_idx → seq_idx). int32 indices are accepted by PyTorch
+    advanced-indexing (used in the indexer); triton kernels (swa_write,
+    csa_translate_pack) and the fused flydsl SWA scatter read int32. Padded
+    tail [T:padded_T] = -1 sentinel; consumer kernels skip on `bid < 0`. All
+    other per-token quantities resolved as `per_seq_data[batch_id_per_token[t]]`
+    — no [T] aliases of seq data."""
     batch_id_per_token_cpu: Optional[Any] = None
-    """[T] int64 — CPU mirror of the unpadded batch_id slice. Built once in
+    """[T] int32 — CPU mirror of the unpadded batch_id slice. Built once in
     `_attach_v4_per_fwd_meta` (host-side `np.repeat`); reused by
     `_attach_v4_paged_decode_meta` for indptr fancy-index math. Avoids a
     duplicate `np.repeat` per fwd. None for prefill paths that don't go
@@ -212,9 +213,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_prefix_swa: Optional[torch.Tensor] = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `prefix_swa_count`."""
     kv_indices_prefix_csa: Optional[torch.Tensor] = None
-    """[sum(prefix_swa_count + min(n_csa, index_topk))] int32 GPU — SWA
-    history (head) + CSA topk (tail) per token. SWA section is filled by
-    builder; CSA section is filled per-layer by `csa_translate_pack`."""
+    """[sum(prefix_swa_count + min(n_csa, index_topk))] int32 GPU — CSA topk
+    (head) + SWA history (tail) per token. CSA section is filled per-layer by
+    `csa_translate_pack`; SWA prefix section is filled by builder at the slice
+    tail (head-CSA / tail-SWA convention, matching decode, #1116)."""
     kv_indptr_prefix_csa: Optional[torch.Tensor] = None
     """[total_tokens + 1] int32 GPU — packed cumsum of
     `prefix_swa_count + min(n_committed_csa, index_topk)`."""
@@ -262,6 +264,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     """
 
     block_size = 128
+
+    # Number of micro-batches for Two-Batch Overlap (TBO).
+    _NUM_TBO_UBATCHES = 2
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
@@ -383,6 +388,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `np[:n] = arr; copy_to_gpu(n)` pattern instead of per-call
         # `torch.as_tensor(arr)` allocations.
         self._alloc_v4_metadata_buffers()
+
+        self._ubatch_decode_meta: Optional[list] = None
 
     @property
     def prep_stream(self):
@@ -849,7 +856,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         per-seq committed count and cumsums it on CPU.
 
         Reuses two shared GPU tensors also set by `_attach_v4_per_fwd_meta`:
-          - `attn_metadata.batch_id_per_token`        [padded_T] int64
+          - `attn_metadata.batch_id_per_token`        [padded_T] int32
           - `attn_metadata.n_committed_csa_per_seq`   [bs] int32
 
         DECODE fast path: returns a minimal dict with only
@@ -944,7 +951,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "total_committed": total_committed,
             "cu_committed_gpu": cu_committed_gpu,
             "n_committed_per_seq_gpu": n_committed_per_seq_gpu,  # int32, [bs]
-            "batch_id_per_token_gpu": batch_id_per_token_gpu,  # int64, [total_tokens]
+            "batch_id_per_token_gpu": batch_id_per_token_gpu,  # int32, [total_tokens]
             # Prefill-only fields below — decode never consults them. NOT
             # in pre-allocated buffers (per-fwd derived); CG capture path
             # would see stale pointers, but the decode path doesn't touch
@@ -1176,7 +1183,186 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             sum_scheduled_tokens,
             positions_gpu=positions,
         )
+
+        self._ubatch_decode_meta = None
+        if (
+            self.model_runner.config.enable_tbo_decode
+            and scheduled_bs > 2
+            and not batch.is_dummy_run
+        ):
+            self._prepare_ubatch_decode(
+                scheduled_bs=scheduled_bs,
+                bs=bs,
+                max_seqlen_q=max_seqlen_q,
+                context_lens_np=context_lens_np,
+                state_slot_np=state_slot_np,
+                positions_np=positions_np,
+            )
+
         return attn_metadata, positions
+
+    def _prepare_ubatch_decode(
+        self,
+        *,
+        scheduled_bs: int,
+        bs: int,
+        max_seqlen_q: int,
+        context_lens_np: np.ndarray,
+        state_slot_np: np.ndarray,
+        positions_np: np.ndarray,
+    ) -> None:
+        """Split a decode batch into two micro-batches (by request) and build
+        each one's V4 decode metadata into ``ub{0,1}_`` prefixed buffers.
+
+        Mirrors :meth:`prepare_decode` but operates on a per-ubatch request
+        slice. The two resulting :class:`AttentionMetaData_DSV4` objects are
+        cached on ``self._ubatch_decode_meta`` and returned by
+        :meth:`build_ubatch_metadata`.
+
+        Token layout in a decode fwd is request-major with ``max_seqlen_q``
+        tokens per request, so ubatch token ranges fall on request boundaries.
+        """
+        var = self.model_runner.forward_vars
+        N = self._NUM_TBO_UBATCHES
+        enforce_eager = self.model_runner.enforce_eager
+        if enforce_eager:
+            split_total = scheduled_bs
+            half = scheduled_bs // N
+            padded_list = [half, scheduled_bs - half]
+            ub_ranges = [(0, half), (half, split_total)]
+        else:
+            from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
+
+            ctx = get_forward_context()
+            padded_list = [
+                UBatchWrapper._decode_ub_padded_bs(ctx, i, N, bs) for i in range(N)
+            ]
+            # Real-request ranges partition scheduled_bs; each ubatch owns up to
+            # its padded capacity, the tail ubatch takes the remainder. Pad rows
+            # beyond the real reqs carry sentinels (filled below).
+            ub_ranges = []
+            req_start = 0
+            for i in range(N):
+                if i == N - 1:
+                    req_end = scheduled_bs
+                else:
+                    req_end = min(scheduled_bs, req_start + padded_list[i])
+                ub_ranges.append((req_start, req_end))
+                req_start = req_end
+            split_total = scheduled_bs
+
+        metas: list = []
+        for ub_idx, (req_start, req_end) in enumerate(ub_ranges):
+            p = f"ub{ub_idx}_"
+            padded_bs = padded_list[ub_idx]
+            # Real requests that fall into this ubatch's [req_start, req_end),
+            # clamped to scheduled_bs (cudagraph pad rows beyond scheduled_bs
+            # carry sentinels, exercised only during capture's synthetic batch).
+            ub_real_reqs = max(0, min(scheduled_bs, req_end) - req_start)
+            tok_start = req_start * max_seqlen_q
+            ub_real_tokens = ub_real_reqs * max_seqlen_q
+
+            # ---- per-seq slices into ub buffers ----
+            ub_ctx_np = context_lens_np[req_start : req_start + ub_real_reqs]
+            var[f"{p}context_lens"].np[:ub_real_reqs] = ub_ctx_np
+            var[f"{p}context_lens"].np[ub_real_reqs:padded_bs] = 0
+
+            ub_state_np = state_slot_np[req_start : req_start + ub_real_reqs]
+            if len(ub_state_np) < ub_real_reqs:
+                ub_state_np = np.zeros(ub_real_reqs, dtype=np.int32)
+            var[f"{p}v4_meta_state_slot_groups"].np[:ub_real_reqs] = ub_state_np
+            var[f"{p}v4_meta_state_slot_groups"].np[ub_real_reqs:padded_bs] = 0
+            state_slot_np_ub = (
+                var[f"{p}v4_meta_state_slot_groups"].np[:padded_bs].copy()
+            )
+
+            var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
+                req_start : req_start + ub_real_reqs
+            ]
+            var[f"{p}block_tables"].np[ub_real_reqs:padded_bs] = 0
+
+            # positions: copy the ubatch's token slice (values match the global
+            # positions slice the UBatchWrapper Context will expose).
+            ub_positions_np = positions_np[tok_start : tok_start + ub_real_tokens]
+            var[f"{p}positions"].np[:ub_real_tokens] = ub_positions_np
+            var[f"{p}positions"].np[ub_real_tokens : padded_bs * max_seqlen_q] = 0
+
+            # cu_seqlens_q: uniform max_seqlen_q per real req, padded tail flat.
+            cu = np.arange(
+                0, (ub_real_reqs + 1) * max_seqlen_q, max_seqlen_q, dtype=np.int32
+            )
+            var[f"{p}cu_seqlens_q"].np[: ub_real_reqs + 1] = cu
+            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : padded_bs + 1] = (
+                ub_real_reqs * max_seqlen_q
+            )
+
+            # ---- H2D ----
+            ub_sum_tokens = max(ub_real_tokens, 1)
+            positions_gpu = var[f"{p}positions"].copy_to_gpu(padded_bs * max_seqlen_q)
+            cu_seqlens_q_gpu = var[f"{p}cu_seqlens_q"].copy_to_gpu(padded_bs + 1)
+            context_lens_gpu = var[f"{p}context_lens"].copy_to_gpu(padded_bs)
+            block_tables_gpu = var[f"{p}block_tables"].copy_to_gpu(padded_bs)
+            state_slot_gpu = var[f"{p}v4_meta_state_slot_groups"].copy_to_gpu(padded_bs)
+
+            # ---- compress plans (per ubatch buffer set) ----
+            extend_lens_np = np.full(ub_real_reqs, max_seqlen_q, dtype=np.int32)
+            ctx_for_plan = context_lens_np[req_start : req_start + ub_real_reqs]
+            compress_plans = self._build_compress_plans(
+                extend_lens_np,
+                ctx_for_plan,
+                for_decode_cg=True,
+                buf_prefix_ubatch=p,
+            )
+
+            attn_metadata = AttentionMetaData_DSV4(
+                cu_seqlens_q=cu_seqlens_q_gpu,
+                cu_seqlens_k=None,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=int(ub_ctx_np.max()) if ub_real_reqs > 0 else 1,
+                min_seqlen_q=0,
+                dropout_p=0.0,
+                has_cached=False,
+                total_kv=int(ub_ctx_np.sum()) if ub_real_reqs > 0 else 0,
+                num_cached_tokens=None,
+                block_tables=block_tables_gpu,
+                context_lens=context_lens_gpu,
+                state=AttnState.DECODE,
+            )
+            attn_metadata.state_slot_mapping = state_slot_gpu
+            attn_metadata.state_slot_mapping_cpu = state_slot_np_ub
+            attn_metadata.compress_plans = compress_plans
+
+            # token_num_per_seq over PADDED bs (pad reqs contribute max_seqlen_q
+            # each so batch_id_per_token covers padded_total_tokens).
+            token_num_per_seq = np.full(ub_real_reqs, max_seqlen_q, dtype=np.int32)
+            self._attach_v4_per_fwd_meta(
+                attn_metadata,
+                token_num_per_seq,
+                state_slot_np_ub,
+                ub_real_reqs,
+                ub_real_tokens,
+                padded_bs=padded_bs,
+                max_q_len=max_seqlen_q,
+                buf_prefix_ubatch=p,
+            )
+            self._attach_v4_indexer_meta(
+                attn_metadata,
+                max(ub_real_reqs, 1),
+                ub_sum_tokens,
+                positions_gpu=positions_gpu,
+            )
+            metas.append(attn_metadata)
+
+        self._ubatch_decode_meta = metas
+
+    def build_ubatch_metadata(
+        self, ubatch_idx: int, padded_bs: int
+    ) -> AttentionMetaData_DSV4:
+        assert self._ubatch_decode_meta is not None, (
+            "build_ubatch_metadata called but no ubatch decode metadata was "
+            "prepared — ensure enable_tbo_decode is set and prepare_decode ran."
+        )
+        return self._ubatch_decode_meta[ubatch_idx]
 
     def prepare_prefill(self, batch: ScheduledBatch):
         """V4 prefill prep: extends parent to always populate block_tables
@@ -1454,6 +1640,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         *,
         padded_bs: Optional[int] = None,
         max_q_len: Optional[int] = None,
+        buf_prefix_ubatch: str = "",
     ) -> None:
         """Hoist per-fwd, layer-invariant metadata used by every V4 layer.
 
@@ -1509,15 +1696,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # re-running `np.repeat(arange, token_num_per_seq)` (saves ~10μs/fwd
         # at bs=1024 + one allocation).
         batch_id_unpadded_np = np.repeat(
-            np.arange(scheduled_bs, dtype=np.int64), token_num_per_seq
+            np.arange(scheduled_bs, dtype=np.int32), token_num_per_seq
         )
-        batch_id_per_token_np = np.full(padded_total_tokens, -1, dtype=np.int64)
+        batch_id_per_token_np = np.full(padded_total_tokens, -1, dtype=np.int32)
         batch_id_per_token_np[:total_tokens] = batch_id_unpadded_np
         attn_metadata.batch_id_per_token_cpu = batch_id_unpadded_np
 
         # context_lens is int32 on the buffer; keep dtype through divide so
         # n_committed_{csa,hca} stay int32 (max value ~max_model_len // 4 ≪ 2^31).
-        ctx_per_seq_np = var["context_lens"].np[:scheduled_bs]
+        ctx_per_seq_np = var[f"{buf_prefix_ubatch}context_lens"].np[:scheduled_bs]
         # Single source of truth for n_committed_{csa,hca}_per_seq on CPU.
         # Stashed on attn_metadata so paged_decode_meta / paged_prefill_meta /
         # v4_indexer_meta can read instead of each re-running `ctx // k`.
@@ -1533,7 +1720,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # from `var["positions"].gpu` — saves O(T·win) numpy work + 4 MB
         # staging buffer. The `positions` H2D is already done by the caller.
         attn_metadata.batch_id_per_token = self._stage(
-            "v4_batch_id_per_token", batch_id_per_token_np
+            f"{buf_prefix_ubatch}v4_batch_id_per_token", batch_id_per_token_np
         )
         # Stage n_committed to GPU. For CG-replay safety: aiter
         # `top_k_per_row_decode` iterates the CAPTURED grid (= padded_bs *
@@ -1548,7 +1735,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `batch_id_per_token = -1` sentinel masks pad rows out of
         # `csa_translate_pack`, so the value just needs to be "big enough"
         # to keep row_len non-negative. Use `index_topk` (≥ 1024 ≫ next_n).
-        n_csa_buf = var["v4_n_committed_csa_per_seq"]
+        n_csa_buf = var[f"{buf_prefix_ubatch}v4_n_committed_csa_per_seq"]
         n_csa_buf.np[:scheduled_bs] = n_committed_csa_per_seq_np
         if is_pure_decode and padded_bs is not None and padded_bs > scheduled_bs:
             n_csa_buf.np[scheduled_bs:padded_bs] = self.index_topk
@@ -1563,6 +1750,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             scheduled_bs=scheduled_bs,
             total_tokens=total_tokens,
             padded_total_tokens=padded_total_tokens,
+            buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
     def _attach_v4_paged_decode_meta(
@@ -1573,6 +1761,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
         padded_total_tokens: Optional[int] = None,
+        buf_prefix_ubatch: str = "",
     ) -> None:
         """Phase B: build per-fwd paged-decode index buffers (layer-invariant).
 
@@ -1634,9 +1823,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ----- Per-seq scalars (CPU numpy) -----
         # The single per-token mapping. Built once in `_attach_v4_per_fwd_meta`
         # — both the GPU staging tensor and the unpadded CPU mirror — so we
-        # just borrow both here. int64 (numpy fancy-index source dtype is
+        # just borrow both here. int32 (numpy fancy-index source dtype is
         # irrelevant; consumers below produce int32 outputs).
-        batch_id_per_token_np = attn_metadata.batch_id_per_token_cpu  # [T] int64
+        batch_id_per_token_np = attn_metadata.batch_id_per_token_cpu  # [T] int32
         batch_id_per_token_gpu = attn_metadata.batch_id_per_token
 
         # Read pre-computed `ctx // {4,128}` from attn_metadata — populated by
@@ -1653,7 +1842,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # n_csa (which happens for early tokens in chunked-prefill verify
         # batches and MTP draft mid-iters).
         index_topk = self.index_topk
-        positions_np_view = var["positions"].np[:T]
+        positions_np_view = var[f"{buf_prefix_ubatch}positions"].np[:T]
         n_committed_hca_per_token = n_committed_hca_per_seq[batch_id_per_token_np]
 
         # actual_swa_count[t] = min(positions[t]+1, win). Matches the kernel's
@@ -1703,14 +1892,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if T_pad > T:
             hca_indptr_np[T + 1 :].fill(int(hca_indptr_np[T]))
 
-        swa_indptr_gpu = self._stage("v4_kv_indptr_swa", swa_indptr_np)
-        csa_indptr_gpu = self._stage("v4_kv_indptr_csa", csa_indptr_np)
-        hca_indptr_gpu = self._stage("v4_kv_indptr_hca", hca_indptr_np)
+        swa_indptr_gpu = self._stage(
+            f"{buf_prefix_ubatch}v4_kv_indptr_swa", swa_indptr_np
+        )
+        csa_indptr_gpu = self._stage(
+            f"{buf_prefix_ubatch}v4_kv_indptr_csa", csa_indptr_np
+        )
+        hca_indptr_gpu = self._stage(
+            f"{buf_prefix_ubatch}v4_kv_indptr_hca", hca_indptr_np
+        )
         # batch_id_per_token + n_committed_csa_per_seq already staged in
         # `_attach_v4_per_fwd_meta`.
 
         # ----- HCA compress paged offsets (CPU numpy, vectorized) -----
-        block_tables_np_full = var["block_tables"].np[:scheduled_bs]
+        block_tables_np_full = var[f"{buf_prefix_ubatch}block_tables"].np[:scheduled_bs]
         hca_total_indices = int(hca_indptr_np[T])
         hca_indices_np = np.full(hca_total_indices, -1, dtype=np.int32)
         # n_committed_hca_per_seq is int32; gather stays int32.
@@ -1732,7 +1927,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 swa_pages + block_tables_np_full[bid_expanded, entry_offsets]
             ).astype(np.int32)
         # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
-        hca_indices_gpu = self._stage("v4_kv_indices_hca", hca_indices_np)
+        hca_indices_gpu = self._stage(
+            f"{buf_prefix_ubatch}v4_kv_indices_hca", hca_indices_np
+        )
 
         # ----- Write SWA / CSA / HCA window-prefix paged offsets (1 kernel) -----
         # Kernel computes `n = min(positions[t]+1, win)` and ring-index
@@ -1742,12 +1939,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # persistent forward_vars buffers — no allocator churn (the prior
         # `index_copy_` chain raced under MTP-3 long-prefill; this kernel
         # also fixes that, see skill `debug-agent-locate-kernel`).
-        swa_indices_gpu = var["v4_kv_indices_swa"].gpu
-        csa_indices_gpu = var["v4_kv_indices_csa"].gpu
+        swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"].gpu
+        csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"].gpu
         write_v4_paged_decode_indices(
             state_slot_per_seq=attn_metadata.state_slot_mapping,
             batch_id_per_token=batch_id_per_token_gpu,
-            positions=var["positions"].gpu,
+            positions=var[f"{buf_prefix_ubatch}positions"].gpu,
             swa_indptr=swa_indptr_gpu,
             csa_indptr=csa_indptr_gpu,
             hca_indptr=hca_indptr_gpu,
@@ -1933,9 +2130,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if block_tables_gpu is None:
             block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
         state_slot_per_seq_gpu = attn_metadata.state_slot_mapping[:scheduled_bs]
-        # batch_id_per_token is int64 in storage (PyTorch fancy-index
-        # compatibility upstream); kernel uses tl.load which is dtype-agnostic
-        # but cast for safety + consistency.
+        # batch_id_per_token is int32 in storage (accepted by PyTorch
+        # advanced-indexing and the fused flydsl SWA scatter); the kernel uses
+        # tl.load which is dtype-agnostic.
         bid_per_token_gpu = attn_metadata.batch_id_per_token[:T]
 
         # ----- Allocate output buffers (exact sizes known from CPU totals) -----
@@ -1970,11 +2167,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             swa_pages=swa_pages,
         )
 
-        # ----- skip_prefix_len_csa: per-token CSA section write offset -----
-        # csa_translate_pack consumes this as offset within
-        # `kv_indices_prefix_csa[indptr[t]:indptr[t+1]]` where the CSA topk
-        # section starts (after the SWA prefix segment). Matches the per-token
-        # prefix_swa_count vector we just computed on CPU.
+        # ----- skip_prefix_len_csa: per-token SWA prefix length -----
+        # csa_translate_pack consumes this to derive the CSA topk length
+        # `valid_k = (indptr[t+1]-indptr[t]) - skip` it writes at the HEAD of
+        # `kv_indices_prefix_csa[indptr[t]:indptr[t+1]]`; the SWA prefix
+        # (length `skip`) occupies the slice TAIL, written by the builder.
+        # Matches the per-token prefix_swa_count vector we just computed on CPU.
         skip_csa_gpu = torch.from_numpy(prefix_swa_count_np).to(
             device, non_blocking=True
         )
@@ -1992,7 +2190,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.swa_pages = swa_pages
 
     def _build_compress_plans(
-        self, extend_lens_np, context_lens_np, *, for_decode_cg: bool
+        self,
+        extend_lens_np,
+        context_lens_np,
+        *,
+        for_decode_cg: bool,
+        buf_prefix_ubatch: str = "",
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
@@ -2028,8 +2231,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         plan_buffers = {
             ratio: {
-                "compress": var[f"v4_compress_plan_{ratio}"],
-                "write": var[f"v4_write_plan_{ratio}"],
+                "compress": var[f"{buf_prefix_ubatch}v4_compress_plan_{ratio}"],
+                "write": var[f"{buf_prefix_ubatch}v4_write_plan_{ratio}"],
             }
             for ratio, _ in self._unique_compress_ratios_overlap
         }
@@ -2195,6 +2398,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             positions_gpu=positions,
         )
 
+        if self.model_runner.config.enable_tbo_decode and bs > 2:
+            self._prepare_ubatch_decode(
+                scheduled_bs=bs,
+                bs=bs,
+                max_seqlen_q=max_q_len,
+                context_lens_np=context_lens_np,
+                state_slot_np=state_slot_np,
+                positions_np=positions_np.astype(np.int32),
+            )
+
         context = Context(
             positions=positions,
             is_prefill=False,
@@ -2270,13 +2483,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `_attach_v4_per_fwd_meta`.
         bufs["v4_n_committed_csa_per_seq"] = CpuGpuBuffer(bs, **i32)
         # Single per-token mapping shared across ALL V4 consumers:
-        #   - swa_write / csa_translate_pack (triton kernels, read int64 fine)
-        #   - _build_v4_indexer_meta (PyTorch fancy index, REQUIRES int64)
-        # int64 dtype satisfies the PyTorch constraint with one buffer rather
-        # than maintaining an int32 + int64 mirror. Sized to `mnbt`
-        # (worst-case prefill total tokens) since swa_write fires on prefill
-        # paths too. Phase B decode only uses [:T_dec] of this buffer.
-        bufs["v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i64)
+        #   - swa_write / csa_translate_pack (triton kernels)
+        #   - _build_v4_indexer_meta (PyTorch fancy index — int32 indices are
+        #     accepted by torch advanced-indexing)
+        #   - the fused SWA scatter in qk_norm_rope_maybe_quant (flydsl kernel
+        #     loads it as int32; the MTP-draft path also supplies int32 via the
+        #     cu_seqlens_q slice, so int32 keeps both decode paths uniform).
+        # Sized to `mnbt` (worst-case prefill total tokens) since swa_write
+        # fires on prefill paths too. Phase B decode only uses [:T_dec].
+        bufs["v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i32)
 
         # _build_v4_indexer_meta (CSA only — but allocate unconditionally;
         # never accessed when CSA layers are absent).
@@ -2347,7 +2562,62 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             per_seq_max = (self.max_spec_steps + ratio) // ratio
             self._decode_compress_cap[ratio] = bs * per_seq_max
 
+        if getattr(self.model_runner.config, "enable_tbo_decode", False):
+            self._alloc_v4_ubatch_decode_buffers(bufs, i32, i64)
+
         self.model_runner.forward_vars.update(bufs)
+
+    def _alloc_v4_ubatch_decode_buffers(self, bufs: dict, i32: dict, i64: dict) -> None:
+        """Clone decode-path metadata buffers into ``ub{0,1}_`` prefixed sets.
+
+        Mirrors the sizes chosen in :meth:`_alloc_v4_metadata_buffers` for the
+        decode-relevant buffers plus the global per-fwd inputs the decode
+        helpers read (``positions`` / ``context_lens`` / ``block_tables`` /
+        ``cu_seqlens_q``). Only invoked when ``enable_tbo_decode`` is set.
+        """
+        mnbt = self.max_num_batched_tokens
+        bs = self.max_bs
+        win = self.window_size
+        T_dec = self.max_decode_tokens
+        max_blocks = self.max_num_blocks_per_seq // self.block_ratio
+
+        for ub_idx in range(self._NUM_TBO_UBATCHES):
+            p = f"ub{ub_idx}_"
+            # Global per-fwd decode inputs (live in model_runner.forward_vars
+            # for the non-TBO path; cloned here so each ubatch slices its own).
+            bufs[f"{p}positions"] = CpuGpuBuffer(T_dec, **i64)
+            bufs[f"{p}context_lens"] = CpuGpuBuffer(bs, **i32)
+            bufs[f"{p}block_tables"] = CpuGpuBuffer(bs, max_blocks, **i32)
+            bufs[f"{p}cu_seqlens_q"] = CpuGpuBuffer(bs + 1, **i32)
+
+            # V4 decode metadata buffers.
+            bufs[f"{p}v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
+            bufs[f"{p}v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
+            bufs[f"{p}v4_kv_indices_csa"] = CpuGpuBuffer(
+                T_dec * (win + self.index_topk), **i32
+            )
+            bufs[f"{p}v4_kv_indices_hca"] = CpuGpuBuffer(
+                T_dec * (win + self.max_committed_hca), **i32
+            )
+            bufs[f"{p}v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
+            bufs[f"{p}v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
+            bufs[f"{p}v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
+            bufs[f"{p}v4_n_committed_csa_per_seq"] = CpuGpuBuffer(bs, **i32)
+            bufs[f"{p}v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i64)
+            bufs[f"{p}v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
+
+            for ratio, is_overlap in self._unique_compress_ratios_overlap:
+                K_pool = (2 if is_overlap else 1) * ratio
+                max_compress = mnbt // ratio + bs
+                max_write = min(mnbt, bs * K_pool)
+                cbuf = CpuGpuBuffer(max_compress, 4, **i32)
+                wbuf = CpuGpuBuffer(max_write, 4, **i32)
+                cbuf.cpu.fill_(-1)
+                cbuf.copy_to_gpu()
+                wbuf.cpu.fill_(-1)
+                wbuf.copy_to_gpu()
+                bufs[f"{p}v4_compress_plan_{ratio}"] = cbuf
+                bufs[f"{p}v4_write_plan_{ratio}"] = wbuf
 
     def _stage(self, name: str, arr) -> torch.Tensor:
         """Write numpy `arr` into `forward_vars[name]` (CpuGpuBuffer) and

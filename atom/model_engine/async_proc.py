@@ -34,6 +34,7 @@ from atom.utils import (
     resolve_obj_by_qualname,
     shutdown_all_processes,
 )
+from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
 
@@ -70,6 +71,20 @@ class AsyncIOProc:
         *args,
         **kwargs,
     ):
+        # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
+        # Auto-detects the GPU's local node by default; gated by
+        # ATOM_NUMA_BIND. Must run before any large allocation / native
+        # (mooncake) thread spawn so the mask is inherited by child threads and
+        # first-touch lands memory locally. The global GPU index is
+        # dp_rank*tp_size+tp_rank (engine_core_mgr GPU assignment).
+        try:
+            cfg = args[0]
+            gpu = (
+                cfg.parallel_config.data_parallel_rank * cfg.tensor_parallel_size + rank
+            )
+            numa_bind_to_node(gpu, label)
+        except Exception as e:
+            logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()

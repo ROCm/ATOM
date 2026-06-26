@@ -35,6 +35,7 @@ class Attention(BaseAttention):
         prefix: Optional[str] = None,
         q_norm: Optional[torch.nn.Module] = None,
         k_norm: Optional[torch.nn.Module] = None,
+        impl_cls: Optional[type] = None,
         **kwargs,
     ):
         assert (
@@ -79,7 +80,10 @@ class Attention(BaseAttention):
             block_size,
             use_mla=self.use_mla,
         )
-        impl_cls = self.attn_backend.get_impl_cls()
+        # Allow a model to plug in a specialized impl (e.g. the MiniMax-M3 sparse
+        # attention impl) while still reusing the backend's metadata builder.
+        # Falls back to the backend default when not overridden.
+        impl_cls = impl_cls or self.attn_backend.get_impl_cls()
         self.impl = impl_cls(
             num_heads=num_heads,
             head_dim=head_dim,
