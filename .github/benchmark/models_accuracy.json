@@ -338,6 +338,32 @@
     "_baseline_note": "ATOM CI measured BF16=0.9022 (gsm8k 3-shot flexible-extract). HF amd/MiniMax-M2.7-MXFP4: MXFP4=91.89, baseline=91.81 (percentage)."
   },
   {
+    "model_name": "MiniMax-M3-MXFP4",
+    "model_path": "amd/MiniMax-M3-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,max_gen_toks=16384,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 5 --output_path ${OUTPUT_PATH}",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.9363,
+    "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4",
+    "_baseline_note": "FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384) per /data/users/zejun/zejun_atom/m3.md: validated MXFP4 flexible-extract=0.9363 ± 0.0067 (measured at tp4). Threshold 0.93 leaves ~0.6pp headroom; refresh after first CI measurement at tp8."
+  },
+  {
+    "model_name": "MiniMax-M3-MXFP4 Eagle3",
+    "model_path": "amd/MiniMax-M3-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-seqs 256 --max-num-batched-tokens 32768 --no-enable_prefix_caching --method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3 --num-speculative-tokens 3",
+    "client_command": "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,max_gen_toks=16384,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 5 --output_path ${OUTPUT_PATH}",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.9469,
+    "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4 + Inferact/MiniMax-M3-EAGLE3",
+    "_baseline_note": "FP4 M3 + EAGLE3 draft (tp8), lossless vs greedy target. GSM8K 5-shot chat per /data/users/zejun/zejun_atom/m3.md: validated fp4_eagle_tp4 flexible-extract=0.9469 ± 0.0062 (accept ratio 73.36%, avg 3.20 toks/fwd, commit 9fc48338); baseline carried over from the tp4 validation since EAGLE3 is lossless wrt the target. Threshold 0.93 leaves ~1.7pp headroom; refresh after first CI measurement at tp8."
+  },
+  {
     "model_name": "MiMo-V2-Flash",
     "model_path": "XiaomiMiMo/MiMo-V2-Flash",
     "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code --gpu-memory-utilization 0.8",

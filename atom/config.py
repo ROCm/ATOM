@@ -299,7 +299,8 @@ class QuantizationConfig:
         else:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
-        # Online quantization: re-quantize float / FP8 / MXFP4 models at load time
+        # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
+        # models at load time.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
@@ -310,6 +311,7 @@ class QuantizationConfig:
             "fp8",
             "mxfp4",
             "mxfp8",
+            "quark",
         ]:
             self.online_quant = True
             online_parser = get_quant_parser("online_quant")
@@ -726,6 +728,16 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
         if getattr(text_config, "swiglu_beta", None) is None:
             text_config.swiglu_beta = 1.0
 
+    for attr_name in (
+        "use_index_cache",
+        "index_topk_freq",
+        "index_topk_pattern",
+        "index_skip_topk_offset",
+    ):
+        attr_value = getattr(hf_config, attr_name, None)
+        if attr_value is not None:
+            setattr(text_config, attr_name, attr_value)
+
     for attr_name, attr_value in vars(text_config).items():
         if attr_name.startswith("_") or getattr(hf_config, attr_name, None) is not None:
             continue
@@ -1017,6 +1029,7 @@ class Config:
     model: str
     trust_remote_code: bool = False
     max_num_batched_tokens: int = 16384
+    long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -1141,6 +1154,19 @@ class Config:
                 self.max_model_len, hf_config_max_position_embeddings
             )
         # assert self.max_num_batched_tokens >= self.max_model_len
+        if self.long_prefill_token_threshold > 0:
+            if self.long_prefill_token_threshold > self.max_model_len:
+                raise ValueError(
+                    f"long_prefill_token_threshold "
+                    f"({self.long_prefill_token_threshold}) cannot be greater "
+                    f"than max_model_len ({self.max_model_len})."
+                )
+            if self.long_prefill_token_threshold < self.kv_cache_block_size:
+                raise ValueError(
+                    f"long_prefill_token_threshold "
+                    f"({self.long_prefill_token_threshold}) must be >= "
+                    f"kv_cache_block_size ({self.kv_cache_block_size})."
+                )
         if not is_plugin_mode():
             if self.torch_profiler_dir is not None:
                 os.makedirs(self.torch_profiler_dir, exist_ok=True)
@@ -1200,16 +1226,6 @@ class Config:
             v4_block_size = 128
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
-            # TODO: V4's per-request SWA buffer cannot be restored from the classical
-            # KV pool on prefix cache hit, so disable prefix caching silently.
-            if self.enable_prefix_caching:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "DeepSeek-V4 does not support prefix caching "
-                    "(SWA buffer is not cacheable); disabling automatically."
-                )
-                self.enable_prefix_caching = False
 
     def compute_hash(self) -> str:
         """
@@ -1239,11 +1255,29 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
-                getattr(self.hf_config, "use_index_cache", False),
-                getattr(self.hf_config, "index_topk_freq", None),
-                getattr(self.hf_config, "index_topk_pattern", None),
+                getattr(
+                    text_config,
+                    "use_index_cache",
+                    getattr(self.hf_config, "use_index_cache", False),
+                ),
+                getattr(
+                    text_config,
+                    "index_topk_freq",
+                    getattr(self.hf_config, "index_topk_freq", None),
+                ),
+                getattr(
+                    text_config,
+                    "index_topk_pattern",
+                    getattr(self.hf_config, "index_topk_pattern", None),
+                ),
+                getattr(
+                    text_config,
+                    "index_skip_topk_offset",
+                    getattr(self.hf_config, "index_skip_topk_offset", None),
+                ),
             )
         )
 

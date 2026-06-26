@@ -856,7 +856,10 @@ class MLAAttention(nn.Module):
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
-            page_size = attn_metadata.block_size
+            if envs.ATOM_MLA_PAGE_SIZE is not None:
+                page_size = envs.ATOM_MLA_PAGE_SIZE
+            else:
+                page_size = 1
             if self.kv_cache_dtype.startswith("fp8"):
                 mla_decode_fwd(
                     q,
