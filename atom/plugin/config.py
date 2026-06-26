@@ -205,6 +205,11 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         enable_expert_parallel=vllm_parallel_config.enable_expert_parallel,
         master_addr=None,
         enable_dp_attention=False,
+        # vLLM EP shards MoE across the flattened DP x TP device space (and
+        # therefore disables fused shared experts); native uses per-DP MoE.
+        moe_ep_flatten_tp_across_dp=vllm_parallel_config.enable_expert_parallel,
+        # vLLM sizes the MORI dispatch buffer to the scheduler's batched-token cap.
+        mori_max_tokens_per_dp_rank=max_num_batched_tokens,
         enable_tbo=vllm_enable_dbo,
         enable_tbo_decode=vllm_enable_dbo,
         plugin_config=plugin_config,

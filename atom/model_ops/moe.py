@@ -42,7 +42,6 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
-from atom.plugin.prepare import is_vllm
 from atom.model_ops.utils import (
     _has_module,
     atom_parameter,
@@ -126,10 +125,10 @@ class FusedMoEParallelConfig:
         # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
 
-        # for vllm mode, when ep is enabled, the ep rank needs to
-        # be calculated in DP * TP flatten group space
-        flatten_tp_across_dp_for_moe = enable_dp_attention or (
-            is_vllm() and parallel_config.enable_expert_parallel
+        # When EP shards across the flattened DP * TP space (vLLM plugin under
+        # EP), the ep rank must be computed in that flattened group space.
+        flatten_tp_across_dp_for_moe = (
+            enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
         )
 
         use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
@@ -427,10 +426,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # )
             # mori_dtype = torch.bfloat16
 
-            if is_vllm():
-                max_num_tokens_per_dp_rank = moe.max_num_tokens
-            else:
-                max_num_tokens_per_dp_rank = 16384
+            max_num_tokens_per_dp_rank = (
+                get_current_atom_config().mori_max_tokens_per_dp_rank
+            )
 
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
@@ -449,7 +447,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
             )
-            from atom.config import get_current_atom_config
             from atom.utils.tbo.ubatching import tbo_enabled
 
             handle = all2all_manager.get_handle(all_to_all_args)
