@@ -14,6 +14,11 @@ from atom.utils.forward_context import AttentionMetaData
 logger = logging.getLogger("atom")
 
 
+def prefill_token_split_enabled(config=None) -> bool:
+    del config
+    return envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+
+
 @dataclass
 class UBatchSlice:
     """Describes which portion of a batch belongs to a micro-batch."""
@@ -46,7 +51,7 @@ def maybe_create_ubatch_slices(
     # even with a single request (bs=1) — only require that there are at
     # least `num_ubatches` tokens to go around. The request-boundary path
     # below still needs num_reqs >= num_ubatches.
-    token_split = num_scheduled_tokens is not None and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+    token_split = num_scheduled_tokens is not None and prefill_token_split_enabled()
     if not token_split and num_reqs < num_ubatches:
         return None
 
