@@ -125,7 +125,9 @@ def _resolve_num_tokens_across_dp(
     return num_tokens_across_dp
 
 
-def _slice_v4_graph_metadata_for_capture(attn_metadata: Any, *, num_tokens: int, bs: int):
+def _slice_v4_graph_metadata_for_capture(
+    attn_metadata: Any, *, num_tokens: int, bs: int
+):
     """Narrow reusable V4 graph metadata to this capture bucket.
 
     The DSV4 fallback metadata is initialized at max graph size.  SGLang then
@@ -251,9 +253,7 @@ def _set_atom_forward_context(
                     ATOMDeepseekV4BackendForSgl,
                 )
 
-                attn_metadata = (
-                    ATOMDeepseekV4BackendForSgl._last_atom_v4_graph_metadata
-                )
+                attn_metadata = ATOMDeepseekV4BackendForSgl._last_atom_v4_graph_metadata
                 if attn_metadata is not None:
                     attn_metadata = _slice_v4_graph_metadata_for_capture(
                         attn_metadata,

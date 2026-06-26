@@ -63,12 +63,14 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
 
         atom_model = getattr(getattr(self.model_runner, "model", None), "model", None)
         if forward_batch.forward_mode.is_decode_or_idle():
-            self.atom_v4_graph_metadata = build_atom_v4_decode_graph_metadata_from_sglang(
-                forward_batch,
-                positions,
-                proxy_pool=self.token_to_kv_pool,
-                req_to_token_pool=self.req_to_token_pool,
-                model=atom_model,
+            self.atom_v4_graph_metadata = (
+                build_atom_v4_decode_graph_metadata_from_sglang(
+                    forward_batch,
+                    positions,
+                    proxy_pool=self.token_to_kv_pool,
+                    req_to_token_pool=self.req_to_token_pool,
+                    model=atom_model,
+                )
             )
         else:
             self.atom_v4_graph_metadata = build_atom_v4_attention_metadata_from_sglang(

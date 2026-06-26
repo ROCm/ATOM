@@ -163,16 +163,17 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     def can_run(self, forward_batch):
         try:
             model_runner = getattr(self, "model_runner", None)
-            hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
+            hf_config = getattr(
+                getattr(model_runner, "model_config", None), "hf_config", None
+            )
             arches = getattr(hf_config, "architectures", None) or []
             is_dsv4 = any("DeepseekV4" in str(arch) for arch in arches)
             mode = getattr(forward_batch, "forward_mode", None)
-            is_spec_extend = (
-                bool(getattr(mode, "is_target_verify", lambda: False)())
-                or bool(
-                    getattr(mode, "is_draft_extend", lambda **kwargs: False)(
-                        include_v2=True
-                    )
+            is_spec_extend = bool(
+                getattr(mode, "is_target_verify", lambda: False)()
+            ) or bool(
+                getattr(mode, "is_draft_extend", lambda **kwargs: False)(
+                    include_v2=True
                 )
             )
             if is_dsv4 and is_spec_extend:
@@ -189,9 +190,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
         def init_cuda_graphs(self):
             try:
-                arch = (
-                    self.draft_runner.model_config.hf_config.architectures[0]
-                )
+                arch = self.draft_runner.model_config.hf_config.architectures[0]
                 if arch == "DeepseekV4ForCausalLMNextN":
                     self.cuda_graph_runner = None
                     self.cuda_graph_runner_for_draft_extend = None
