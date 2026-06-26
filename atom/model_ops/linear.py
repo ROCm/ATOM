@@ -19,6 +19,7 @@ from aiter import (
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
+from aiter.ops.shuffle import shuffle_weight
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
@@ -44,6 +45,25 @@ logger = logging.getLogger("atom")
 
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
+
+
+def maybe_shuffle_weight_for_preshuffle_gemm(weight: torch.Tensor) -> torch.Tensor:
+    """Return a 16x16-shuffled copy of *weight* for the non-preshuffle triton path.
+
+    Preshuffle blockscale GEMMs (``gemm_a8w8_blockscale_(b)preshuffle``,
+    ``gemm_a16w8_blockscale_preshuffle``) require a 16x16-shuffled weight. With
+    ``ATOM_USE_TRITON_GEMM=1`` and ``ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0`` the
+    loader keeps blockscale weights in their raw ``(N, K)`` layout (so the generic
+    dense linears can use the non-preshuffle triton kernel). Model code that still
+    calls a preshuffle kernel on such a weight (e.g. DeepSeek ``qkv_a_proj``) must
+    shuffle it at the call site; this helper centralizes that under the triton flag.
+
+    When PRESHUFFLE is enabled the loader has already shuffled the weight, so this
+    is a no-op (re-shuffling would corrupt it). ``weight_scale`` needs no shuffle.
+    """
+    if use_triton_gemm() and not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+        return shuffle_weight(weight, layout=(16, 16))
+    return weight
 
 
 def use_fp4_non_shuffle_triton_gemm() -> bool:
