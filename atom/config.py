@@ -300,7 +300,7 @@ class QuantizationConfig:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time. 
+        # models at load time.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
