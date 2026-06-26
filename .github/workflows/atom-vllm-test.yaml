@@ -263,10 +263,10 @@ jobs:
           - display_name: "Kimi-K2.5-MXFP4 TP4"
             model_name: "Kimi-K2.5-MXFP4"
             model_path: "amd/Kimi-K2.5-MXFP4-AttnFP8"
-            extra_args: "--tensor-parallel-size 4"
-            env_vars: ""
+            extra_args: "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384"
+            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
             lm_eval_num_fewshot: 3
-            accuracy_test_threshold: 0.92
+            accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_name: "Qwen3.5-35B-A3B-FP8"
