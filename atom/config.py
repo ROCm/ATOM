@@ -300,9 +300,7 @@ class QuantizationConfig:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time. Quark-exported checkpoints report
-        # quant_method="quark" regardless of their element dtype (e.g. the
-        # MiniMax-M3 MXFP4 export), so it must be allowed here too.
+        # models at load time. 
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
