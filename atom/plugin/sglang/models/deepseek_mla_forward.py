@@ -12,7 +12,6 @@ kv_b_proj post-load processing.
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -270,15 +269,7 @@ def init_sgl_attrs(
     attn.use_deep_gemm_bmm = False
     attn.alt_stream = None
     attn.kv_cache_dtype = kv_cache_dtype
-    attn.use_fused_qk_rope_concat_and_cache_mla = (
-        _use_aiter_gfx95
-        and os.getenv("ATOM_DEBUG_DISABLE_FUSED_QK_ROPE_CACHE_MLA", "0") != "1"
-    )
-    if os.getenv("ATOM_DEBUG_LOG_FUSED_QK_FLAG", "0") == "1":
-        print(
-            f"[ATOM_DEBUG_FUSED_QK_FLAG] use_fused_qk_rope_concat_and_cache_mla={attn.use_fused_qk_rope_concat_and_cache_mla} kv_cache_dtype={kv_cache_dtype}",
-            flush=True,
-        )
+    attn.use_fused_qk_rope_concat_and_cache_mla = _use_aiter_gfx95
     attn.current_sgl_plugin_attn_path = None
     attn.w_kc, attn.w_vc = None, None
     attn.w_scale = None

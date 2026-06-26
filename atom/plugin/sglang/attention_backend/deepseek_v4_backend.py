@@ -44,12 +44,6 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
         self.forward_metadata = forward_batch
-        logger.info(
-            "ATOM DSV4 init_forward_metadata_out_graph: in_capture=%s mode=%s bs=%s",
-            in_capture,
-            getattr(getattr(forward_batch, "forward_mode", None), "name", None),
-            getattr(forward_batch, "batch_size", None),
-        )
         if not (in_capture or hasattr(forward_batch, "actual_forward_mode")):
             self.atom_v4_graph_metadata = None
             return
@@ -65,9 +59,6 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
             positions = getattr(buffers, "positions", None)
         if positions is None:
             self.atom_v4_graph_metadata = None
-            logger.info(
-                "Skip ATOM DeepSeek-V4 graph metadata init: positions unavailable"
-            )
             return
 
         atom_model = getattr(getattr(self.model_runner, "model", None), "model", None)
@@ -89,12 +80,6 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
         forward_batch.atom_v4_graph_metadata = self.atom_v4_graph_metadata
         ATOMDeepseekV4BackendForSgl._last_atom_v4_graph_metadata = (
             self.atom_v4_graph_metadata
-        )
-        logger.info(
-            "ATOM DSV4 graph metadata initialized: mode=%s bs=%s metadata=%s",
-            getattr(getattr(forward_batch, "forward_mode", None), "name", None),
-            getattr(forward_batch, "batch_size", None),
-            type(self.atom_v4_graph_metadata).__name__,
         )
 
     def _init_decode_cuda_graph_metadata(

@@ -266,15 +266,6 @@ def _set_atom_forward_context(
             proxy_pool, "is_atom_v4_proxy_pool", False
         ):
             if is_capture_batch:
-                logger.info(
-                    "ATOM DSV4 capture metadata missing: backend=%s "
-                    "fb_has=%s class_has=%s",
-                    type(backend).__name__ if backend is not None else None,
-                    hasattr(forward_batch, "atom_v4_graph_metadata"),
-                    "ATOMDeepseekV4BackendForSgl" in locals()
-                    and ATOMDeepseekV4BackendForSgl._last_atom_v4_graph_metadata
-                    is not None,
-                )
                 raise RuntimeError(
                     "ATOM DeepSeek-V4 CUDA graph metadata was not initialized before capture"
                 )

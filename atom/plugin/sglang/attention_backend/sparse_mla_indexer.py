@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import re
-import os
 from typing import Optional
 
 import torch
@@ -240,77 +239,6 @@ def forward_sparse_mla_for_sglang(
         forward_batch.token_to_kv_pool.set_kv_buffer(
             layer, forward_batch.out_cache_loc, k, v
         )
-        if os.getenv("ATOM_DEBUG_DUMP_KV_WRITE", "0") == "1":
-            try:
-                from sglang.srt.distributed import get_tp_group
-
-                rank = int(get_tp_group().rank_in_group)
-            except Exception:
-                rank = int(os.getenv("RANK", "-1"))
-            dump_ranks = {
-                int(x)
-                for x in os.getenv("ATOM_DEBUG_DUMP_KV_WRITE_RANKS", "0").split(",")
-                if x.strip()
-            }
-            dump_layers = {
-                int(x)
-                for x in os.getenv("ATOM_DEBUG_DUMP_KV_WRITE_LAYERS", "0").split(",")
-                if x.strip()
-            }
-            dump_bs = {
-                int(x)
-                for x in os.getenv(
-                    "ATOM_DEBUG_DUMP_KV_WRITE_BS",
-                    str(int(forward_batch.batch_size)),
-                ).split(",")
-                if x.strip()
-            }
-            if (
-                rank in dump_ranks
-                and int(getattr(layer, "layer_id", -1)) in dump_layers
-                and int(forward_batch.batch_size) in dump_bs
-            ):
-                if not hasattr(forward_sparse_mla_for_sglang, "_debug_kv_write_counts"):
-                    forward_sparse_mla_for_sglang._debug_kv_write_counts = {}
-                key = (rank, int(getattr(layer, "layer_id", -1)), int(forward_batch.batch_size))
-                hits = forward_sparse_mla_for_sglang._debug_kv_write_counts.get(key, 0)
-                max_hits = int(os.getenv("ATOM_DEBUG_DUMP_KV_WRITE_MAX_HITS", "2"))
-                if hits < max_hits:
-                    forward_sparse_mla_for_sglang._debug_kv_write_counts[key] = hits + 1
-                    dump_dir = os.getenv(
-                        "ATOM_DEBUG_DUMP_KV_WRITE_DIR",
-                        "/home/qichu_qle/zhiwei/dsv4/atom/work_logs/bs64_issue/rootcause_20260620_kv_write",
-                    )
-                    os.makedirs(dump_dir, exist_ok=True)
-                    k_buffer_after = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                    loc = forward_batch.out_cache_loc.detach().long()
-                    dump_path = os.path.join(
-                        dump_dir,
-                        f"sparse_rank{rank}_layer{int(getattr(layer, 'layer_id', -1))}_bs{int(forward_batch.batch_size)}_hit{hits + 1}.pt",
-                    )
-                    torch.save(
-                        {
-                            "rank": rank,
-                            "layer": int(getattr(layer, "layer_id", -1)),
-                            "batch_size": int(forward_batch.batch_size),
-                            "forward_mode": str(forward_batch.forward_mode),
-                            "cache_loc": forward_batch.out_cache_loc.detach().cpu(),
-                            "positions": None
-                            if getattr(forward_batch, "positions", None) is None
-                            else forward_batch.positions.detach().cpu(),
-                            "seq_lens": None
-                            if getattr(forward_batch, "seq_lens", None) is None
-                            else forward_batch.seq_lens.detach().cpu(),
-                            "req_pool_indices": None
-                            if getattr(forward_batch, "req_pool_indices", None) is None
-                            else forward_batch.req_pool_indices.detach().cpu(),
-                            "k_input": k.detach().cpu(),
-                            "v_input": v.detach().cpu(),
-                            "k_after_write": k_buffer_after[loc].detach().cpu(),
-                        },
-                        dump_path,
-                    )
-                    print(f"[ATOM_KV_WRITE_DUMP] path={dump_path}", flush=True)
 
     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
     num_tokens = q.shape[0]
