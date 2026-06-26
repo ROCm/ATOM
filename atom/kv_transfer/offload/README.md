@@ -232,7 +232,7 @@ of an LMCache key.
 | Situation (`hbm` = HBM-cached, `lmc` = lookup hit, `chunk` = 256) | Outcome |
 |---|---|
 | `lmc <= hbm` | `hbm_satisfies_after_alloc` — HBM already covers the hit; **no load**. |
-| `hbm` not a multiple of `chunk` | `unaligned_hbm_prefill` — **no load** by default (recompute); see handoff below. |
+| `hbm` not a multiple of `chunk` | `unaligned_hbm_prefill` — takes the **handoff** path (always on, see below): recompute up to the chunk boundary, then load the rest. |
 | `lmc - hbm < OFFLOAD_MIN_LOAD_TOKENS` (default 8192) | `too_small` — reload cheaper to skip; **recompute**. |
 | `hbm` aligned **and** gap large enough | `aligned_large_hit` — **load** `[hbm, lmc)` from CPU/NVMe. |
 
@@ -250,10 +250,10 @@ Two hard rules behind the table:
 ### Unaligned HBM: prefill to the chunk boundary first, then load
 
 When the HBM prefix is *not* chunk-aligned, the gap `[hbm, lmc)` cannot be loaded
-directly (a chunk would straddle the boundary). The default is to recompute. With
-`OFFLOAD_UNALIGNED_HANDOFF=1`, the connector instead does exactly what you'd
-expect — **compute the short stretch up to the next chunk boundary, then reload
-the rest:**
+directly (a chunk would straddle the boundary). The connector **always** does the
+handoff (the `OFFLOAD_UNALIGNED_HANDOFF` switch was removed; it is now
+unconditional) — **compute the short stretch up to the next chunk boundary, then
+reload the rest:**
 
 ```mermaid
 flowchart TB
@@ -542,8 +542,9 @@ Connector-specific tuning (env):
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 2 | Chunks per bounded GPU staging buffer. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(1 + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
-| `OFFLOAD_UNALIGNED_HANDOFF` | 0 | Allow loading past an unaligned HBM boundary by parking a partial prefill. |
 | `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-LOAD-PROF]` / `[OFFLOAD-SAVE-PROF]` per-transfer timing. |
+
+> **Removed:** `OFFLOAD_UNALIGNED_HANDOFF` — the unaligned handoff is now **always on**; no switch needed. Old scripts/docs that still set it are ignored (harmless).
 
 `kv_transfer_config` may also override any LMCache field via a
 `"lmcache.<field>": value` extra.
@@ -641,7 +642,6 @@ Exact run configuration (so the numbers reproduce):
 | `--gpu-memory-utilization` | 0.95 | tight HBM → forces eviction → exercises reload |
 | `LMCACHE_MAX_LOCAL_CPU_SIZE` | 312.5 | GiB per rank |
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | |
-| `OFFLOAD_UNALIGNED_HANDOFF` | 1 | |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | **2** | sanity config; raise for throughput |
 | prefix cache | on | |
 
@@ -672,7 +672,7 @@ workspace under `scripts/`; the essential commands are:
 ```bash
 # server: same as "How to Run", plus profiling + agentic tuning
 export LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=312.5 LMCACHE_CHUNK_SIZE=256
-OFFLOAD_PROFILE=1 OFFLOAD_MIN_LOAD_TOKENS=8192 OFFLOAD_UNALIGNED_HANDOFF=1 \
+OFFLOAD_PROFILE=1 OFFLOAD_MIN_LOAD_TOKENS=8192 \
 OFFLOAD_GPU_STAGING_CHUNKS=2 \
 python -m atom.entrypoints.openai_server \
   --model /path/to/MiniMax-M2.5-MXFP4 -tp 1 --kv_cache_dtype fp8 --trust-remote-code \

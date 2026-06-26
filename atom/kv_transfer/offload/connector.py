@@ -433,9 +433,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._save_inflight: set[str] = set()
         self._lookup_in_step: list[str] = []
         self._handoff_loads: set[str] = set()
-        self._allow_unaligned_handoff = os.environ.get(
-            "OFFLOAD_UNALIGNED_HANDOFF", "0"
-        ).lower() in ("1", "true", "yes", "on")
+        # Unaligned handoff is always on: when the HBM prefix-cache hit is not
+        # chunk-aligned, recompute the misaligned head up to the next chunk
+        # boundary, then load the aligned remainder from CPU. (Previously gated
+        # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
         try:
             self._min_load_tokens = max(
                 0, int(os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192"))
@@ -606,8 +607,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         lmc: int,
         chunk: int,
     ) -> bool:
-        if not getattr(self, "_allow_unaligned_handoff", False):
-            return False
         boundary = ((hbm + chunk - 1) // chunk) * chunk
         remaining_after_boundary = lmc - boundary
         min_load = int(getattr(self, "_min_load_tokens", 8192))
