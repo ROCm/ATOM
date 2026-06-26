@@ -1054,7 +1054,7 @@ class LayerNorm(nn.Module):
         self,
         dim: int,
         eps: float = 1e-6,
-        dtype: torch.dtype | None = None
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
