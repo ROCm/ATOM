@@ -47,8 +47,10 @@ Three public entry points keep every consumer in sync:
 - `load_variants(path)`  -> flat per-variant dicts (server args, suffix, ...).
   Used by the dashboard display-name map and regression rerun.
 - `build_cells(path, ...)` -> fully-expanded benchmark cells (variant x scenario
-  x concurrency). Each cell self-describes one server+benchmark run and is the
-  single matrix dimension the GPU `benchmark` job iterates.
+  x concurrency). Each cell self-describes one server+benchmark run.
+- `build_cell_configs(path, ...)` -> cells regrouped by (variant x scenario) into
+  the first-level matrix configs the GPU `benchmark` job iterates; each config
+  carries a concurrency list the reusable template fans out over.
 - `validate_dispatch_inputs(path, keys)` -> assert the workflow_dispatch model
   checkboxes stay in sync with the catalog prefixes.
 """
