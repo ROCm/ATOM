@@ -99,11 +99,121 @@ def _register_custom_attention_to_sglang() -> None:
         return ATOMDeepseekV4BackendForSgl(runner)
 
 
+def _patch_sglang_dsv4_draft_backends() -> None:
+    """Route SGLang's hard-coded DSV4 speculative factories to ATOM.
+
+    DraftBackendFactory constructs DeepSeek-V4 draft backends directly instead
+    of going through the attention registry.  SGLang's native backend asserts a
+    native DeepSeekV4TokenToKVPool, while ATOM plugin mode uses a proxy KV pool,
+    so patch the factory methods to return the ATOM shim.
+    """
+
+    try:
+        from sglang.srt.speculative.draft_utils import DraftBackendFactory
+        from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
+            ATOMDeepseekV4BackendForSgl,
+        )
+    except Exception as exc:
+        logger.debug("Skip patching SGLang DSV4 draft backends: %s", exc)
+        return
+
+    if getattr(DraftBackendFactory, "_atom_dsv4_draft_backend_patched", False):
+        return
+
+    def _create_atom_dsv4_decode_backend(self):
+        return ATOMDeepseekV4BackendForSgl(
+            self.draft_model_runner,
+            topk=self.topk,
+            speculative_num_steps=self.speculative_num_steps,
+        )
+
+    def _create_atom_dsv4_prefill_backend(self):
+        return ATOMDeepseekV4BackendForSgl(
+            self.draft_model_runner,
+            skip_prefill=False,
+        )
+
+    DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
+    DraftBackendFactory._create_dsv4_prefill_backend = _create_atom_dsv4_prefill_backend
+    DraftBackendFactory._atom_dsv4_draft_backend_patched = True
+    logger.info("Patched SGLang DSV4 speculative draft backends to ATOM")
+
+
+def _patch_sglang_dsv4_spec_cuda_graph() -> None:
+    """Avoid replaying generic SGLang graphs for DSV4 speculative extend modes.
+
+    The target decode graph is still useful and remains enabled.  Target verify
+    and draft-extend need DSV4-specific per-token metadata; until that metadata
+    is fully graph-safe, let those forwards run eager to avoid replaying a graph
+    captured with decode-shaped metadata.
+    """
+
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+    except Exception as exc:
+        logger.debug("Skip patching SGLang DSV4 spec cuda graph: %s", exc)
+        return
+
+    if getattr(CudaGraphRunner, "_atom_dsv4_spec_can_run_patched", False):
+        return
+
+    original_can_run = CudaGraphRunner.can_run
+
+    def can_run(self, forward_batch):
+        try:
+            model_runner = getattr(self, "model_runner", None)
+            hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
+            arches = getattr(hf_config, "architectures", None) or []
+            is_dsv4 = any("DeepseekV4" in str(arch) for arch in arches)
+            mode = getattr(forward_batch, "forward_mode", None)
+            is_spec_extend = (
+                bool(getattr(mode, "is_target_verify", lambda: False)())
+                or bool(
+                    getattr(mode, "is_draft_extend", lambda **kwargs: False)(
+                        include_v2=True
+                    )
+                )
+            )
+            if is_dsv4 and is_spec_extend:
+                return False
+        except Exception:
+            pass
+        return original_can_run(self, forward_batch)
+
+    CudaGraphRunner.can_run = can_run
+    CudaGraphRunner._atom_dsv4_spec_can_run_patched = True
+
+    if not getattr(EagleDraftWorker, "_atom_dsv4_init_cuda_graphs_patched", False):
+        original_init_cuda_graphs = EagleDraftWorker.init_cuda_graphs
+
+        def init_cuda_graphs(self):
+            try:
+                arch = (
+                    self.draft_runner.model_config.hf_config.architectures[0]
+                )
+                if arch == "DeepseekV4ForCausalLMNextN":
+                    self.cuda_graph_runner = None
+                    self.cuda_graph_runner_for_draft_extend = None
+                    logger.info("Skip DSV4 draft cuda graph capture in ATOM plugin")
+                    return
+            except Exception:
+                pass
+            return original_init_cuda_graphs(self)
+
+        EagleDraftWorker.init_cuda_graphs = init_cuda_graphs
+        EagleDraftWorker._atom_dsv4_init_cuda_graphs_patched = True
+
+    logger.info("Patched SGLang DSV4 speculative cuda graph handling")
+
+
 def register_ops_to_sglang(atom_config: Config) -> None:
     """
     Register custom ops to sglang, including attention
     """
     _register_custom_attention_to_sglang()
+    _patch_sglang_dsv4_draft_backends()
+    _patch_sglang_dsv4_spec_cuda_graph()
 
 
 def set_attn_cls() -> None:

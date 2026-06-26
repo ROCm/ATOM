@@ -423,6 +423,19 @@ def _bind_compressor_state(
         compressor.cache_scale = None
 
 
+def _iter_deepseek_v4_cache_blocks(model):
+    inner = getattr(model, "model", None)
+    if inner is None:
+        return []
+    layers = getattr(inner, "layers", None)
+    if layers is not None:
+        return list(layers)
+    mtp = getattr(inner, "mtp", None)
+    if mtp is not None:
+        return list(mtp)
+    return []
+
+
 def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
     """Bind the SGLang-visible proxy arena to ATOM V4 attention modules.
 
@@ -439,7 +452,7 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
 
     csa_i = 0
     hca_i = 0
-    for local_layer_id, block in enumerate(model.model.layers):
+    for local_layer_id, block in enumerate(_iter_deepseek_v4_cache_blocks(model)):
         attn = block.attn
         ratio = int(attn.compress_ratio)
         attn.unified_kv = proxy_pool.views["unified"][local_layer_id]
@@ -772,7 +785,9 @@ def _get_seq_lens_cpu(forward_batch) -> np.ndarray:
     seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
     if seq_lens_cpu is None:
         seq_lens_cpu = forward_batch.seq_lens.detach().cpu()
-    return seq_lens_cpu.numpy().astype(np.int32)
+    if torch.is_tensor(seq_lens_cpu):
+        seq_lens_cpu = seq_lens_cpu.detach().cpu().numpy()
+    return np.asarray(seq_lens_cpu, dtype=np.int32)
 
 
 def _build_block_tables(
@@ -816,6 +831,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     )
     is_idle = bool(getattr(actual_mode, "is_idle", lambda: False)())
     out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+    positions_numel = int(positions.numel())
     scheduled_bs = (
         0
         if is_idle
@@ -825,15 +841,20 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
             else bs
         )
     )
-    total = scheduled_bs
+    total = max(scheduled_bs, positions_numel)
     t_pad = bs
 
     max_blocks = max(1, proxy_pool.num_blocks)
     bufs = getattr(proxy_pool, "_atom_v4_decode_graph_buffers", None)
-    if bufs is None or bufs.num_slots < bs or bufs.max_blocks < max_blocks:
+    if (
+        bufs is None
+        or bufs.num_slots < bs
+        or bufs.max_blocks < max_blocks
+        or bufs.max_decode_tokens < total
+    ):
         bufs = proxy_pool._atom_v4_decode_graph_buffers = _V4SGLangDecodeGraphBuffers(
             num_slots=proxy_pool.num_slots,
-            max_decode_tokens=max(proxy_pool.num_slots, bs),
+            max_decode_tokens=max(proxy_pool.num_slots, bs, total),
             window=proxy_pool.window_size,
             index_topk=1024,
             max_committed_hca=max_blocks,
@@ -874,12 +895,18 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.swa_pages = proxy_pool.num_slots * proxy_pool.window_size
 
     if total:
-        pos_np = (seq_np[:total] - 1).astype(np.int32)
-        batch_np = np.arange(total, dtype=np.int32)
+        if positions_numel > scheduled_bs:
+            pos_np = positions[:total].detach().cpu().numpy().astype(np.int32)
+            repeats = max(1, total // max(1, bs))
+            batch_np = np.repeat(np.arange(bs, dtype=np.int64), repeats)[:total]
+        else:
+            pos_np = (seq_np[:total] - 1).astype(np.int32)
+            batch_np = np.arange(total, dtype=np.int64)
     else:
         pos_np = np.zeros(0, dtype=np.int32)
-        batch_np = np.zeros(0, dtype=np.int32)
-    batch_pad = np.full(t_pad, -1, dtype=np.int32)
+        batch_np = np.zeros(0, dtype=np.int64)
+    t_pad = max(t_pad, total)
+    batch_pad = np.full(t_pad, -1, dtype=np.int64)
     if total:
         batch_pad[:total] = batch_np
 
@@ -891,11 +918,13 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
 
     slot_arr = np.zeros(bs, dtype=np.int32)
     reset_slots: set[int] = set()
-    if total:
-        first_blocks = block_tables[:total, 0].detach().cpu().numpy().astype(np.int32)
-        fresh_mask = pos_np == 0
+    if scheduled_bs:
+        first_blocks = (
+            block_tables[:scheduled_bs, 0].detach().cpu().numpy().astype(np.int32)
+        )
+        fresh_mask = seq_np[:scheduled_bs] <= 1
         slot_real, reset_slots = allocator.assign(first_blocks, fresh_mask)
-        slot_arr[:total] = slot_real
+        slot_arr[:scheduled_bs] = slot_real
 
     if reset_slots and model is not None:
         reset_deepseek_v4_state_slots(model, reset_slots)
@@ -924,9 +953,9 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     if total:
         actual_swa = np.minimum(pos_np + 1, win).astype(np.int32)
         csa_valid = np.minimum(
-            np.minimum((pos_np + 1) // 4, n_csa[:total]), index_topk
+            np.minimum((pos_np + 1) // 4, n_csa[batch_np]), index_topk
         ).astype(np.int32)
-        hca_valid = n_hca[:total].astype(np.int32)
+        hca_valid = n_hca[batch_np].astype(np.int32)
     else:
         actual_swa = csa_valid = hca_valid = np.zeros(0, dtype=np.int32)
 
@@ -977,8 +1006,30 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.kv_indptr_swa = swa_indptr
     md.kv_indptr_csa = csa_indptr
     md.kv_indptr_hca = hca_indptr
+    cu_committed_cpu = np.concatenate(
+        [
+            np.zeros(1, dtype=np.int32),
+            np.cumsum(md.n_committed_csa_per_seq_cpu, dtype=np.int32),
+        ]
+    )
+    cu_committed_cpu[-1] = max(int(cu_committed_cpu[-1]), 1)
+    cu_committed_gpu = torch.from_numpy(cu_committed_cpu).to(
+        device=device, dtype=torch.int32
+    )
+    safe_batch_id = md.batch_id_per_token.clamp_min(0)
+    seq_base = cu_committed_gpu[safe_batch_id].to(torch.int32)
+    visible_end = seq_base + torch.minimum(
+        (positions_gpu.to(torch.int32) + 1) // 4,
+        md.n_committed_csa_per_seq[safe_batch_id],
+    ).to(torch.int32)
     md.indexer_meta = {
+        "total_committed": int(cu_committed_cpu[-1]),
+        "cu_committed_gpu": cu_committed_gpu,
         "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
+        "batch_id_per_token_gpu": md.batch_id_per_token,
+        "seq_base_per_token_gpu": seq_base,
+        "cu_starts_gpu": seq_base,
+        "cu_ends_gpu": visible_end,
     }
     return md
 
@@ -1014,7 +1065,36 @@ def build_atom_v4_attention_metadata_from_sglang(
     else:
         extend_lens = _get_extend_lens_cpu(forward_batch, positions)
         if extend_lens is None:
-            raise RuntimeError("SGLang DeepSeek-V4 prefill metadata lacks extend lens")
+            extend_lens_t = getattr(forward_batch, "extend_seq_lens", None)
+            if extend_lens_t is not None:
+                extend_lens = extend_lens_t.detach().cpu().numpy().astype(np.int32)
+            else:
+                extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
+                if extend_start_loc is not None:
+                    extend_lens = np.diff(
+                        torch.nn.functional.pad(
+                            extend_start_loc, (0, 1), value=positions.numel()
+                        )
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.int32)
+                    )
+                else:
+                    tokens_per_req = getattr(
+                        getattr(forward_batch, "spec_info", None),
+                        "num_tokens_per_req",
+                        None,
+                    )
+                    if tokens_per_req is None:
+                        tokens_per_req = max(1, int(positions.numel()) // num_reqs)
+                    extend_lens = np.full(
+                        num_reqs,
+                        int(tokens_per_req),
+                        dtype=np.int32,
+                    )
+        else:
+            extend_lens = np.asarray(extend_lens, dtype=np.int32)
         lens = extend_lens[:num_reqs].astype(np.int32)
         q_np = np.zeros(num_reqs + 1, dtype=np.int32)
         q_np[1:] = np.cumsum(lens, dtype=np.int32)
@@ -1339,7 +1419,7 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
     if not slots:
         return
     idx = None
-    for block in getattr(model.model, "layers", []):
+    for block in _iter_deepseek_v4_cache_blocks(model):
         attn = getattr(block, "attn", None)
         swa = getattr(attn, "swa_kv", None)
         if isinstance(swa, torch.Tensor):

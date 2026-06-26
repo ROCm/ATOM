@@ -16,9 +16,10 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
     """
 
     needs_cpu_seq_lens = True
+    _last_atom_v4_graph_metadata = None
 
     def __init__(self, model_runner, *args, **kwargs):
-        del args, kwargs
+        del args
         logger.info("Initializing ATOMDeepseekV4BackendForSgl")
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
@@ -26,6 +27,12 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.forward_metadata = None
         self.atom_v4_graph_metadata = None
+        speculative_num_steps = int(kwargs.pop("speculative_num_steps", 0) or 0)
+        # SGLang EAGLE multi-step draft code expects decode backends to expose
+        # one attention backend per draft step.  ATOM DSV4 owns the real
+        # per-layer state in the model/bridge, so all draft steps can share this
+        # shim instance.
+        self.attn_backends = [self] * max(1, speculative_num_steps)
 
     @staticmethod
     def get_name() -> str:
@@ -37,14 +44,17 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
         self.forward_metadata = forward_batch
+        logger.info(
+            "ATOM DSV4 init_forward_metadata_out_graph: in_capture=%s mode=%s bs=%s",
+            in_capture,
+            getattr(getattr(forward_batch, "forward_mode", None), "name", None),
+            getattr(forward_batch, "batch_size", None),
+        )
         if not (in_capture or hasattr(forward_batch, "actual_forward_mode")):
             self.atom_v4_graph_metadata = None
             return
-        if not forward_batch.forward_mode.is_decode_or_idle():
-            self.atom_v4_graph_metadata = None
-            return
-
         from atom.plugin.sglang.deepseek_v4_bridge import (
+            build_atom_v4_attention_metadata_from_sglang,
             build_atom_v4_decode_graph_metadata_from_sglang,
         )
 
@@ -55,15 +65,36 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
             positions = getattr(buffers, "positions", None)
         if positions is None:
             self.atom_v4_graph_metadata = None
+            logger.info(
+                "Skip ATOM DeepSeek-V4 graph metadata init: positions unavailable"
+            )
             return
 
         atom_model = getattr(getattr(self.model_runner, "model", None), "model", None)
-        self.atom_v4_graph_metadata = build_atom_v4_decode_graph_metadata_from_sglang(
-            forward_batch,
-            positions,
-            proxy_pool=self.token_to_kv_pool,
-            req_to_token_pool=self.req_to_token_pool,
-            model=atom_model,
+        if forward_batch.forward_mode.is_decode_or_idle():
+            self.atom_v4_graph_metadata = build_atom_v4_decode_graph_metadata_from_sglang(
+                forward_batch,
+                positions,
+                proxy_pool=self.token_to_kv_pool,
+                req_to_token_pool=self.req_to_token_pool,
+                model=atom_model,
+            )
+        else:
+            self.atom_v4_graph_metadata = build_atom_v4_attention_metadata_from_sglang(
+                forward_batch,
+                positions,
+                proxy_pool=self.token_to_kv_pool,
+                req_to_token_pool=self.req_to_token_pool,
+            )
+        forward_batch.atom_v4_graph_metadata = self.atom_v4_graph_metadata
+        ATOMDeepseekV4BackendForSgl._last_atom_v4_graph_metadata = (
+            self.atom_v4_graph_metadata
+        )
+        logger.info(
+            "ATOM DSV4 graph metadata initialized: mode=%s bs=%s metadata=%s",
+            getattr(getattr(forward_batch, "forward_mode", None), "name", None),
+            getattr(forward_batch, "batch_size", None),
+            type(self.atom_v4_graph_metadata).__name__,
         )
 
     def _init_decode_cuda_graph_metadata(
@@ -114,18 +145,24 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
             req_to_token_pool=self.req_to_token_pool,
             model=atom_model,
         )
+        forward_batch.atom_v4_graph_metadata = self.atom_v4_graph_metadata
+        ATOMDeepseekV4BackendForSgl._last_atom_v4_graph_metadata = (
+            self.atom_v4_graph_metadata
+        )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-    ):
-        del num_tokens, encoder_lens, spec_info
+    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
+        # New SGLang graph API passes a ForwardBatch.  Older call sites pass
+        # unpacked fields.  Support both because speculative draft graph code
+        # still calls this legacy-named hook directly.
+        if len(args) == 1 and not kwargs and hasattr(args[0], "forward_mode"):
+            return self.init_forward_metadata_out_graph(args[0], in_capture=True)
+
+        bs = kwargs.get("bs", args[0] if len(args) > 0 else None)
+        req_pool_indices = kwargs.get(
+            "req_pool_indices", args[2] if len(args) > 2 else None
+        )
+        seq_lens = kwargs.get("seq_lens", args[3] if len(args) > 3 else None)
+        forward_mode = kwargs.get("forward_mode", args[5] if len(args) > 5 else None)
         self._init_decode_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -158,7 +195,40 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
         )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        del max_bs, max_num_tokens
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        from atom.plugin.sglang.deepseek_v4_bridge import (
+            build_atom_v4_decode_graph_metadata_from_sglang,
+        )
+
+        bs = int(max_bs)
+        tokens_per_req = max(1, int(max_num_tokens) // max(1, bs))
+        seq_lens = torch.full(
+            (bs,), tokens_per_req, dtype=torch.int32, device=self.device
+        )
+        req_pool_indices = torch.arange(bs, dtype=torch.int64, device=self.device)
+        positions = torch.arange(tokens_per_req, dtype=torch.int64, device=self.device)
+        positions = positions.repeat(bs)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            actual_forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.detach().cpu(),
+            out_cache_loc=None,
+        )
+        atom_model = getattr(getattr(self.model_runner, "model", None), "model", None)
+        self.atom_v4_graph_metadata = build_atom_v4_decode_graph_metadata_from_sglang(
+            forward_batch,
+            positions,
+            proxy_pool=self.token_to_kv_pool,
+            req_to_token_pool=self.req_to_token_pool,
+            model=atom_model,
+        )
+        ATOMDeepseekV4BackendForSgl._last_atom_v4_graph_metadata = (
+            self.atom_v4_graph_metadata
+        )
         return None
 
     def get_cuda_graph_seq_len_fill_value(self):

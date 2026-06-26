@@ -173,6 +173,93 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             self.prefill_ps_num_kv_splits = cu_num // math.gcd(self.num_kv_head, cu_num)
         else:
             self.prefill_ps_num_kv_splits = None
+        self._mtp_debug_counts: dict[tuple[int, int, str], int] = {}
+
+    def _debug_mtp_tensor(self, name: str, tensor: Optional[torch.Tensor]) -> str:
+        if tensor is None:
+            return f"{name}=None"
+        flat = tensor.detach().flatten()
+        if flat.numel() == 0:
+            return f"{name}=empty shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+        sample = flat[: min(6, flat.numel())].to(torch.float32).cpu().tolist()
+        stats_tensor = flat.to(torch.float32)
+        return (
+            f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"min={float(stats_tensor.min().item()):.6g} "
+            f"max={float(stats_tensor.max().item()):.6g} "
+            f"mean={float(stats_tensor.mean().item()):.6g} "
+            f"sample={sample}"
+        )
+
+    def _debug_mtp_target_verify(
+        self,
+        tag: str,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        q: Optional[torch.Tensor] = None,
+        o: Optional[torch.Tensor] = None,
+    ) -> None:
+        if os.getenv("ATOM_DEBUG_MTP_VERIFY", "0") != "1":
+            return
+        rank = -1
+        try:
+            from sglang.srt.distributed import get_tp_group
+
+            rank = int(get_tp_group().rank_in_group)
+        except Exception:
+            rank = int(os.getenv("RANK", "-1"))
+        debug_ranks = {
+            int(x)
+            for x in os.getenv("ATOM_DEBUG_MTP_VERIFY_RANKS", "0").split(",")
+            if x.strip()
+        }
+        if rank not in debug_ranks:
+            return
+        bs = int(forward_batch.batch_size)
+        debug_bs = {
+            int(x)
+            for x in os.getenv("ATOM_DEBUG_MTP_VERIFY_BS", "63,64").split(",")
+            if x.strip()
+        }
+        if bs not in debug_bs:
+            return
+        layer_id = int(getattr(layer, "layer_id", -1))
+        debug_layers = {
+            int(x)
+            for x in os.getenv("ATOM_DEBUG_MTP_VERIFY_LAYERS", "0,1,60").split(",")
+            if x.strip()
+        }
+        if layer_id not in debug_layers:
+            return
+        key = (bs, layer_id, tag)
+        max_hits = int(os.getenv("ATOM_DEBUG_MTP_VERIFY_MAX_HITS", "4"))
+        hits = self._mtp_debug_counts.get(key, 0)
+        if hits >= max_hits:
+            return
+        self._mtp_debug_counts[key] = hits + 1
+
+        md = self.forward_metadata
+        spec_info = getattr(forward_batch, "spec_info", None)
+        draft_num = getattr(spec_info, "draft_token_num", None)
+        pieces = [
+            f"[ATOM_MTP_DEBUG] tag={tag} hit={hits + 1} rank={rank} layer={layer_id} bs={bs}",
+            f"mode={forward_batch.forward_mode}",
+            f"draft_num={draft_num}",
+            f"max_q_len={getattr(md, 'max_q_len', None)}",
+            f"num_kv_splits={getattr(md, 'num_kv_splits', None)}",
+            f"kv_indices_len={None if md.kv_indices is None else md.kv_indices.numel()}",
+            f"work_metadata_shape={None if md.work_metadata is None else tuple(md.work_metadata.shape)}",
+            self._debug_mtp_tensor("kv_indices", md.kv_indices[: min(64, md.kv_indices.numel())] if md.kv_indices is not None else None),
+            self._debug_mtp_tensor("seq_lens", forward_batch.seq_lens[:bs]),
+            self._debug_mtp_tensor("req_pool", forward_batch.req_pool_indices[:bs]),
+            self._debug_mtp_tensor("out_cache_loc", getattr(forward_batch, "out_cache_loc", None)),
+            self._debug_mtp_tensor("qo_indptr", md.qo_indptr[: bs + 1] if md.qo_indptr is not None else None),
+            self._debug_mtp_tensor("kv_indptr", md.kv_indptr[: bs + 1] if md.kv_indptr is not None else None),
+            self._debug_mtp_tensor("kv_last_page_len", md.kv_last_page_len[:bs] if md.kv_last_page_len is not None else None),
+            self._debug_mtp_tensor("q", q),
+            self._debug_mtp_tensor("o", o),
+        ]
+        print(" | ".join(pieces), flush=True)
 
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
@@ -1728,6 +1815,83 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     )
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    if os.getenv("ATOM_DEBUG_DUMP_KV_WRITE", "0") == "1":
+                        try:
+                            from sglang.srt.distributed import get_tp_group
+
+                            rank = int(get_tp_group().rank_in_group)
+                        except Exception:
+                            rank = int(os.getenv("RANK", "-1"))
+                        dump_ranks = {
+                            int(x)
+                            for x in os.getenv("ATOM_DEBUG_DUMP_KV_WRITE_RANKS", "0").split(",")
+                            if x.strip()
+                        }
+                        dump_layers = {
+                            int(x)
+                            for x in os.getenv("ATOM_DEBUG_DUMP_KV_WRITE_LAYERS", "0").split(",")
+                            if x.strip()
+                        }
+                        dump_bs = {
+                            int(x)
+                            for x in os.getenv(
+                                "ATOM_DEBUG_DUMP_KV_WRITE_BS",
+                                str(int(forward_batch.batch_size)),
+                            ).split(",")
+                            if x.strip()
+                        }
+                        if (
+                            rank in dump_ranks
+                            and int(getattr(layer, "layer_id", -1)) in dump_layers
+                            and int(forward_batch.batch_size) in dump_bs
+                        ):
+                            if not hasattr(self, "_debug_kv_write_counts"):
+                                self._debug_kv_write_counts = {}
+                            key = (
+                                rank,
+                                int(getattr(layer, "layer_id", -1)),
+                                int(forward_batch.batch_size),
+                            )
+                            hits = self._debug_kv_write_counts.get(key, 0)
+                            max_hits = int(os.getenv("ATOM_DEBUG_DUMP_KV_WRITE_MAX_HITS", "2"))
+                            if hits < max_hits:
+                                self._debug_kv_write_counts[key] = hits + 1
+                                dump_dir = os.getenv(
+                                    "ATOM_DEBUG_DUMP_KV_WRITE_DIR",
+                                    "/home/qichu_qle/zhiwei/dsv4/atom/work_logs/bs64_issue/rootcause_20260620_kv_write",
+                                )
+                                os.makedirs(dump_dir, exist_ok=True)
+                                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(
+                                    layer.layer_id
+                                )
+                                loc = cache_loc.detach().long()
+                                dump_path = os.path.join(
+                                    dump_dir,
+                                    f"rank{rank}_layer{int(getattr(layer, 'layer_id', -1))}_bs{int(forward_batch.batch_size)}_hit{hits + 1}.pt",
+                                )
+                                torch.save(
+                                    {
+                                        "rank": rank,
+                                        "layer": int(getattr(layer, "layer_id", -1)),
+                                        "batch_size": int(forward_batch.batch_size),
+                                        "forward_mode": str(forward_batch.forward_mode),
+                                        "cache_loc": cache_loc.detach().cpu(),
+                                        "positions": None
+                                        if getattr(forward_batch, "positions", None) is None
+                                        else forward_batch.positions.detach().cpu(),
+                                        "seq_lens": None
+                                        if getattr(forward_batch, "seq_lens", None) is None
+                                        else forward_batch.seq_lens.detach().cpu(),
+                                        "req_pool_indices": None
+                                        if getattr(forward_batch, "req_pool_indices", None) is None
+                                        else forward_batch.req_pool_indices.detach().cpu(),
+                                        "k_input": k.detach().cpu(),
+                                        "v_input": v.detach().cpu(),
+                                        "k_after_write": k_buffer[loc].detach().cpu(),
+                                    },
+                                    dump_path,
+                                )
+                                print(f"[ATOM_KV_WRITE_DUMP] path={dump_path}", flush=True)
                 else:
                     k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -1946,6 +2110,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         qk_nope_head_dim,
     ):
         """Return FP8 k/v from MXFP4 kv_b_proj when the fused split-cat path fits."""
+        if os.getenv("ATOM_DEBUG_DISABLE_MXFP4_KVB_FUSED", "0") == "1":
+            return None
         if fused_gemm_afp4wfp4_preshuffle_split_cat is None:
             return None
         weight = getattr(layer.kv_b_proj, "weight", None)
@@ -2288,7 +2454,212 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
-            self._call_mla_decode_fwd(q, K_Buffer, o, layer)
+            dump_enabled = os.getenv("ATOM_DUMP_MLA_VERIFY_REPRO", "0") == "1"
+            dump_hit = False
+            dump_path = None
+            if dump_enabled:
+                try:
+                    from sglang.srt.distributed import get_tp_group
+
+                    rank = int(get_tp_group().rank_in_group)
+                except Exception:
+                    rank = int(os.getenv("RANK", "-1"))
+                dump_ranks = {
+                    int(x)
+                    for x in os.getenv("ATOM_DUMP_MLA_VERIFY_RANKS", "0").split(",")
+                    if x.strip()
+                }
+                dump_layers = {
+                    int(x)
+                    for x in os.getenv("ATOM_DUMP_MLA_VERIFY_LAYERS", "0").split(",")
+                    if x.strip()
+                }
+                key = (
+                    int(forward_batch.batch_size),
+                    int(getattr(layer, "layer_id", -1)),
+                    "dump_mla_verify",
+                )
+                if not hasattr(self, "_dump_mla_verify_counts"):
+                    self._dump_mla_verify_counts = {}
+                hits = self._dump_mla_verify_counts.get(key, 0)
+                max_hits = int(os.getenv("ATOM_DUMP_MLA_VERIFY_MAX_HITS", "1"))
+                dump_bs = {
+                    int(x)
+                    for x in os.getenv("ATOM_DUMP_MLA_VERIFY_BS", str(int(forward_batch.batch_size))).split(",")
+                    if x.strip()
+                }
+                dump_hit = (
+                    rank in dump_ranks
+                    and int(forward_batch.batch_size) in dump_bs
+                    and int(getattr(layer, "layer_id", -1)) in dump_layers
+                    and hits < max_hits
+                )
+                if dump_hit:
+                    self._dump_mla_verify_counts[key] = hits + 1
+                    dump_dir = os.getenv(
+                        "ATOM_DUMP_MLA_VERIFY_DIR",
+                        "/home/qichu_qle/zhiwei/dsv4/atom/work_logs/bs64_issue/fixed_prompt_rootcause_20260618/mla_kernel_repro",
+                    )
+                    os.makedirs(dump_dir, exist_ok=True)
+                    draft_num = getattr(forward_batch.spec_info, "draft_token_num", -1)
+                    dump_path = os.path.join(
+                        dump_dir,
+                        f"rank{rank}_layer{int(getattr(layer, 'layer_id', -1))}_bs{int(forward_batch.batch_size)}_draft{int(draft_num)}_hit{hits + 1}.pt",
+                    )
+                    md = self.forward_metadata
+                    compact_k = K_Buffer[md.kv_indices.long()].contiguous()
+                    unique_kv_indices = torch.unique(md.kv_indices.long())
+                    raw_k_slots = K_Buffer[unique_kv_indices].contiguous()
+                    torch.save(
+                        {
+                            "q": q.detach().cpu(),
+                            "k_compact": compact_k.detach().cpu(),
+                            "unique_kv_indices": unique_kv_indices.detach().cpu(),
+                            "raw_k_slots": raw_k_slots.detach().cpu(),
+                            "qo_indptr": md.qo_indptr.detach().cpu(),
+                            "kv_indptr": md.kv_indptr.detach().cpu(),
+                            "compact_kv_indices": torch.arange(
+                                compact_k.shape[0], dtype=torch.int32
+                            ),
+                            "kv_indices_original": None
+                            if md.kv_indices is None
+                            else md.kv_indices.detach().cpu(),
+                            "kv_last_page_len": md.kv_last_page_len.detach().cpu(),
+                            "seq_lens": None
+                            if getattr(forward_batch, "seq_lens", None) is None
+                            else forward_batch.seq_lens.detach().cpu(),
+                            "req_pool_indices": None
+                            if getattr(forward_batch, "req_pool_indices", None) is None
+                            else forward_batch.req_pool_indices.detach().cpu(),
+                            "out_cache_loc": None
+                            if getattr(forward_batch, "out_cache_loc", None) is None
+                            else forward_batch.out_cache_loc.detach().cpu(),
+                            "positions": None
+                            if getattr(forward_batch, "positions", None) is None
+                            else forward_batch.positions.detach().cpu(),
+                            "max_q_len": int(md.max_q_len),
+                            "num_kv_splits": int(md.num_kv_splits or 0),
+                            "q_scale": None
+                            if getattr(layer, "k_scale", None) is None
+                            else layer.k_scale.detach().cpu(),
+                            "kv_scale": None
+                            if getattr(layer, "k_scale", None) is None
+                            else layer.k_scale.detach().cpu(),
+                            "tp_q_head_num": int(layer.tp_q_head_num),
+                            "qk_head_dim": int(layer.qk_head_dim),
+                            "v_head_dim": int(layer.v_head_dim),
+                            "scaling": float(layer.scaling),
+                            "logit_cap": float(layer.logit_cap),
+                            "batch_size": int(forward_batch.batch_size),
+                            "draft_num": int(draft_num),
+                        },
+                        dump_path,
+                    )
+                    print(f"[ATOM_MLA_REPRO_DUMP] before path={dump_path}", flush=True)
+            self._debug_mtp_target_verify("before_mla_decode", layer, forward_batch, q=q)
+            if (
+                os.getenv("ATOM_DEBUG_SPLIT_TARGET_VERIFY_Q2", "0") == "1"
+                and int(getattr(md, "max_q_len", 0)) == 4
+                and int(forward_batch.batch_size) > 0
+            ):
+                bs = int(forward_batch.batch_size)
+                idx_first = torch.tensor(
+                    [r * 4 + j for r in range(bs) for j in (0, 1)],
+                    device=q.device,
+                    dtype=torch.long,
+                )
+                idx_second = torch.tensor(
+                    [r * 4 + j for r in range(bs) for j in (2, 3)],
+                    device=q.device,
+                    dtype=torch.long,
+                )
+                qo2 = torch.arange(0, (bs + 1) * 2, 2, dtype=torch.int32, device=q.device)
+                (
+                    work_metadata2,
+                    work_indptr2,
+                    work_info_set2,
+                    reduce_indptr2,
+                    reduce_final_map2,
+                    reduce_partial_map2,
+                ) = self.make_mla_decode_meta_data_buffer(2, bs)
+                num_kv_splits2 = self.max_split_per_batch
+                self.make_mla_meta_data(
+                    qo2,
+                    md.kv_indptr,
+                    md.kv_last_page_len,
+                    work_metadata2,
+                    work_info_set2,
+                    work_indptr2,
+                    reduce_indptr2,
+                    reduce_final_map2,
+                    reduce_partial_map2,
+                    2,
+                    fast_mode=_sglang_aiter.fast_mode,
+                    max_split_per_batch=num_kv_splits2,
+                    intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                )
+                old_md = self.forward_metadata
+                try:
+                    self.forward_metadata = ForwardMetadata(
+                        md.kv_indptr,
+                        md.kv_indices,
+                        qo2,
+                        md.kv_last_page_len,
+                        2,
+                        None,
+                        None,
+                        None,
+                        work_metadata=work_metadata2,
+                        work_info_set=work_info_set2,
+                        work_indptr=work_indptr2,
+                        reduce_indptr=reduce_indptr2,
+                        reduce_final_map=reduce_final_map2,
+                        reduce_partial_map=reduce_partial_map2,
+                        num_kv_splits=num_kv_splits2,
+                        run_graph=False,
+                    )
+                    o_first = o.new_empty((bs * 2, layer.tp_q_head_num, layer.v_head_dim))
+                    o_second = torch.empty_like(o_first)
+                    self._call_mla_decode_fwd(q[idx_first].contiguous(), K_Buffer, o_first, layer)
+                    self._call_mla_decode_fwd(q[idx_second].contiguous(), K_Buffer, o_second, layer)
+                    o[idx_first] = o_first
+                    o[idx_second] = o_second
+                finally:
+                    self.forward_metadata = old_md
+                print(
+                    f"[ATOM_MTP_DEBUG] tag=split_target_verify_q2 bs={bs} layer={int(getattr(layer, 'layer_id', -1))}",
+                    flush=True,
+                )
+            elif (
+                os.getenv("ATOM_DEBUG_TARGET_VERIFY_PREFILL_FWD", "0") == "1"
+                and int(getattr(md, "max_q_len", 0)) == 4
+            ):
+                o_prefill = self._extend_mla_absorbed_prefix(
+                    q,
+                    layer,
+                    K_Buffer,
+                    md.kv_indptr,
+                    md.kv_indices,
+                    md.qo_indptr,
+                )
+                if o_prefill.ndim == 2:
+                    o_prefill = o_prefill.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                o.copy_(o_prefill)
+                print(
+                    f"[ATOM_MTP_DEBUG] tag=target_verify_prefill_fwd bs={int(forward_batch.batch_size)} "
+                    f"layer={int(getattr(layer, 'layer_id', -1))}",
+                    flush=True,
+                )
+            else:
+                self._call_mla_decode_fwd(q, K_Buffer, o, layer)
+            if dump_hit and dump_path is not None:
+                saved = torch.load(dump_path, map_location="cpu")
+                saved["o"] = o.detach().cpu()
+                torch.save(saved, dump_path)
+                print(f"[ATOM_MLA_REPRO_DUMP] after path={dump_path}", flush=True)
+            self._debug_mtp_target_verify(
+                "after_mla_decode", layer, forward_batch, q=q, o=o
+            )
             return o
 
         if forward_batch.forward_mode.is_draft_extend(include_v2=True):

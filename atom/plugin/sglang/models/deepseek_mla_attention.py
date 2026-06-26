@@ -10,6 +10,7 @@ closer to the vLLM plugin path than the older model-side monkey-patched entry.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -228,6 +229,71 @@ class SGLangDeepseekMLAAttention(nn.Module):
                 is_neox=attn.rotary_emb.is_neox_style,
                 is_nope_first=True,
             )
+            if os.getenv("ATOM_DEBUG_DUMP_FUSED_QK_CACHE", "0") == "1":
+                try:
+                    from sglang.srt.distributed import get_tp_group
+
+                    rank = int(get_tp_group().rank_in_group)
+                except Exception:
+                    rank = int(os.getenv("RANK", "-1"))
+                ranks = {
+                    int(x)
+                    for x in os.getenv("ATOM_DEBUG_DUMP_FUSED_QK_CACHE_RANKS", "0").split(",")
+                    if x.strip()
+                }
+                layers = {
+                    int(x)
+                    for x in os.getenv("ATOM_DEBUG_DUMP_FUSED_QK_CACHE_LAYERS", "0").split(",")
+                    if x.strip()
+                }
+                bss = {
+                    int(x)
+                    for x in os.getenv(
+                        "ATOM_DEBUG_DUMP_FUSED_QK_CACHE_BS",
+                        str(int(forward_batch.batch_size)),
+                    ).split(",")
+                    if x.strip()
+                }
+                if (
+                    rank in ranks
+                    and int(getattr(mla_attn, "layer_id", -1)) in layers
+                    and int(forward_batch.batch_size) in bss
+                ):
+                    if not hasattr(self, "_debug_fused_qk_cache_counts"):
+                        self._debug_fused_qk_cache_counts = {}
+                    key = (rank, int(getattr(mla_attn, "layer_id", -1)), int(forward_batch.batch_size))
+                    hits = self._debug_fused_qk_cache_counts.get(key, 0)
+                    max_hits = int(os.getenv("ATOM_DEBUG_DUMP_FUSED_QK_CACHE_MAX_HITS", "2"))
+                    if hits < max_hits:
+                        self._debug_fused_qk_cache_counts[key] = hits + 1
+                        dump_dir = os.getenv(
+                            "ATOM_DEBUG_DUMP_FUSED_QK_CACHE_DIR",
+                            "/home/qichu_qle/zhiwei/dsv4/atom/work_logs/bs64_issue/rootcause_20260620_fused_qk_cache",
+                        )
+                        os.makedirs(dump_dir, exist_ok=True)
+                        loc = forward_batch.out_cache_loc.detach().long()
+                        dump_path = os.path.join(
+                            dump_dir,
+                            f"rank{rank}_layer{int(getattr(mla_attn, 'layer_id', -1))}_bs{int(forward_batch.batch_size)}_hit{hits + 1}.pt",
+                        )
+                        torch.save(
+                            {
+                                "rank": rank,
+                                "layer": int(getattr(mla_attn, "layer_id", -1)),
+                                "batch_size": int(forward_batch.batch_size),
+                                "mode": str(forward_batch.forward_mode),
+                                "out_cache_loc": forward_batch.out_cache_loc.detach().cpu(),
+                                "positions": positions.detach().cpu(),
+                                "q_nope_out": q_nope_out.detach().cpu(),
+                                "q_pe": q_pe.detach().cpu(),
+                                "k_nope": k_nope.detach().cpu(),
+                                "k_pe": k_pe.detach().cpu(),
+                                "q": q.detach().cpu(),
+                                "kv_cache_after": kv_cache[loc].detach().cpu(),
+                            },
+                            dump_path,
+                        )
+                        print(f"[ATOM_FUSED_QK_CACHE_DUMP] path={dump_path}", flush=True)
             k = None
             v = None
             save_kv_cache = False
