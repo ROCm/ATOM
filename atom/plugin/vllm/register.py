@@ -138,3 +138,9 @@ def register_model() -> None:
     from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
 
     apply_graph_capture_patch()
+
+    # The native MORI MoE path is frontend-agnostic; inject atom-vllm-specific
+    # launch-config selection and dispatch-buffer trimming via plugin patches.
+    from atom.plugin.vllm.mori_patch import apply_vllm_mori_patch
+
+    apply_vllm_mori_patch()

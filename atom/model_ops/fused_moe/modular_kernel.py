@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
 from atom.utils.tbo.ubatching import tbo_overlap_enabled
-from atom.plugin.prepare import is_vllm
 from atom.utils.forward_context import get_forward_context
 import torch
 from typing import Callable, Optional, final
@@ -283,6 +282,40 @@ class FusedMoEModularKernel(torch.nn.Module):
                 output = result()
         return output
 
+    def _maybe_trim_dispatch_output(
+        self,
+        dispatch_a1: torch.Tensor,
+        dispatch_scale: torch.Tensor | None,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_tokens_meta,
+    ):
+        """Trim the mori dispatch buffer's dead tail before fused_moe.
+
+        Default (native/sglang/rtp) policy: under a uniform all-ranks-decode
+        batch, trim to the static graph_bs*topk*dp bound so the shape is
+        consistent across cudagraph capture/replay. atom-vllm needs a different,
+        exact received-token trim for DP+EP mixed batches and overrides this
+        method via a plugin patch -- keep this body frontend-agnostic.
+        """
+        context = get_forward_context().context
+        if context is None:
+            return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
+        dp_size = get_dp_group().world_size
+        topk = topk_ids.shape[1]
+        # graph_bs keeps the trimmed shape consistent during capture/replay.
+        total_valid_tokens = context.graph_bs * topk * dp_size
+        all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
+        if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
+            dispatch_a1 = dispatch_a1[:total_valid_tokens]
+            dispatch_ids = dispatch_ids[:total_valid_tokens]
+            dispatch_weights = dispatch_weights[:total_valid_tokens]
+            if dispatch_scale is not None:
+                dispatch_scale = dispatch_scale[:total_valid_tokens]
+        return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -332,45 +365,26 @@ class FusedMoEModularKernel(torch.nn.Module):
             quant_type,
         )
 
-        # optimize fused_moe hidden_states
-        # mori dispatch expands buffer to (max_tokens * world_size, hidden_dim)
-        # but actual valid tokens = graph_bs * topk * dp_size
-        context = get_forward_context().context
-        if context is None:
-            if is_vllm():
-                from atom.plugin.vllm.mori_dispatch import (
-                    trim_vllm_mori_dispatch_tensors,
-                )
-
-                (
-                    dispatch_a1,
-                    dispatch_scale,
-                    dispatch_ids,
-                    dispatch_weights,
-                ) = trim_vllm_mori_dispatch_tensors(
-                    dispatch_a1,
-                    dispatch_scale,
-                    dispatch_ids,
-                    dispatch_weights,
-                    topk_ids,
-                    self.prepare_finalize.num_dispatchers(),
-                    expert_tokens_meta.expert_num_tokens,
-                )
-
-        else:
-            dp_size = get_dp_group().world_size
-            topk = topk_ids.shape[1]
-            # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
-            total_valid_tokens = context.graph_bs * topk * dp_size
-            all_ranks_decode = getattr(
-                context, "dp_uniform_decode", not context.is_prefill
-            )
-            if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
-                dispatch_a1 = dispatch_a1[:total_valid_tokens]
-                dispatch_ids = dispatch_ids[:total_valid_tokens]
-                dispatch_weights = dispatch_weights[:total_valid_tokens]
-                if dispatch_scale is not None:
-                    dispatch_scale = dispatch_scale[:total_valid_tokens]
+        # mori dispatch expands the receive buffer to
+        # (max_tokens * world_size, hidden_dim); only the first
+        # `expert_num_tokens` rows are valid and fused_moe is driven by that
+        # count via num_local_tokens, so the buffer must never be trimmed below
+        # it. Trimming the dead tail keeps fused_moe off uninitialized rows; the
+        # exact policy is frontend-specific (atom-vllm overrides this method),
+        # so it is isolated in a hookable helper.
+        (
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+        ) = self._maybe_trim_dispatch_output(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            topk_ids,
+            expert_tokens_meta,
+        )
 
         # aiter fused_moe expects a *binary* (0/1) expert_mask in this slot, not
         # the index-style expert_map (which carries -1 sentinels for non-local

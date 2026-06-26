@@ -426,10 +426,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # )
             # mori_dtype = torch.bfloat16
 
-            max_num_tokens_per_dp_rank = (
-                get_current_atom_config().mori_max_tokens_per_dp_rank
-            )
-
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
@@ -440,7 +436,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=max_num_tokens_per_dp_rank,
+                max_num_tokens_per_dp_rank=moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,

@@ -1054,10 +1054,6 @@ class Config:
     # per-DP MoE layout and leave it False. Set by the frontend in
     # atom/plugin/config.py, not queried via is_vllm() at the call site.
     moe_ep_flatten_tp_across_dp: bool = False
-    # Per-DP-rank token-buffer size for the MORI all-to-all dispatch. Native
-    # ATOM uses a fixed buffer; the vLLM plugin sizes it to
-    # max_num_batched_tokens. Set by the frontend in atom/plugin/config.py.
-    mori_max_tokens_per_dp_rank: int = 16384
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
