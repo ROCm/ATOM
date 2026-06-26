@@ -97,3 +97,30 @@ def weight_dequant_fp8(
 
     _weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
+
+# Optional E8M0 dtype: only available on newer torch builds.
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
+
+
+def weight_dequant_mxfp8(
+    x: torch.Tensor, s: torch.Tensor, block_size: int = 32
+) -> torch.Tensor:
+    """Dequantize an MXFP8 weight to the default float dtype."""
+    assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
+    M, K = x.shape
+    assert K % block_size == 0, f"K={K} not divisible by block_size={block_size}"
+    n_blocks = K // block_size
+    assert s.shape == (M, n_blocks), f"scale shape {tuple(s.shape)} != {(M, n_blocks)}"
+
+    if _E8M0_DTYPE is not None and s.dtype == _E8M0_DTYPE:
+        # E8M0 dtype decodes straight to the 2**(e-127) multiplier.
+        scale = s.to(torch.float32)
+    else:
+        # Raw E8M0 integer codes stored as uint8 / float.
+        scale = torch.exp2(s.to(torch.float32) - 127.0)
+
+    out_dtype = torch.get_default_dtype()
+    y = x.to(torch.float32).reshape(M, n_blocks, block_size)
+    y = y * scale.unsqueeze(-1)
+    return y.reshape(M, K).to(out_dtype)

@@ -47,6 +47,7 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 from atom.config import (
     Config,
     LayerQuantConfig,
@@ -1926,8 +1927,15 @@ class DeepseekV4Attention(nn.Module):
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        x = self.wo_b(o.flatten(1))
+        y = torch.empty(
+            num_tokens,
+            self.n_local_groups,
+            self.o_lora_rank,
+            dtype=o.dtype,
+            device=o.device,
+        ).transpose(0, 1)
+        y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
+        x = self.wo_b(y.transpose(0, 1).flatten(1))
         return x
 
     def _fill_csa_paged_compress(

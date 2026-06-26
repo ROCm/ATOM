@@ -202,6 +202,26 @@ def _build_sparse_req_id_per_token_for_sglang(
     return torch.repeat_interleave(req_ids, query_lens[:bs].to(torch.int32))
 
 
+def _supports_sparse_mla_fast_metadata(
+    nhead: int,
+    *,
+    max_seqlen_qo: int,
+    uni_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> bool:
+    """Whether AITER get_mla_metadata_v1 supports this sparse MLA shape."""
+    if nhead in (16, 64, 128):
+        return True
+    if uni_seqlen_qo == 1 and nhead % 16 == 0 and 2 <= nhead // 16 < 8:
+        return True
+    if nhead == 8 and max_seqlen_qo == 4:
+        return (q_dtype == dtypes.fp8 and kv_dtype == dtypes.fp8) or (
+            q_dtype == dtypes.bf16 and kv_dtype == dtypes.bf16
+        )
+    return False
+
+
 def forward_sparse_mla_for_sglang(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -272,7 +292,17 @@ def forward_sparse_mla_for_sglang(
     reduce_final_map = None
     reduce_partial_map = None
 
-    if fp8_sparse_mla:
+    max_seqlen_qo = 1
+    uni_seqlen_qo = 1
+    use_fast_metadata = fp8_sparse_mla and _supports_sparse_mla_fast_metadata(
+        layer.tp_q_head_num,
+        max_seqlen_qo=max_seqlen_qo,
+        uni_seqlen_qo=uni_seqlen_qo,
+        q_dtype=q.dtype,
+        kv_dtype=k_buffer.dtype,
+    )
+
+    if use_fast_metadata:
         (
             (work_metadata_size, work_metadata_dtype),
             (work_indptr_size, work_indptr_dtype),
@@ -322,8 +352,8 @@ def forward_sparse_mla_for_sglang(
             reduce_partial_map,
             kv_granularity=16,
             page_size=1,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
+            max_seqlen_qo=max_seqlen_qo,
+            uni_seqlen_qo=uni_seqlen_qo,
             fast_mode=True,
             dtype_q=q.dtype,
             dtype_kv=k_buffer.dtype,
