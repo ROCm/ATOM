@@ -30,4 +30,4 @@ class AttentionForVllm:
                     *args, mla_modules=mla_modules, **kwargs
                 )
             return AttentionForVllmMLA(*args, mla_modules=mla_modules, **kwargs)
-        return AttentionForVllmMHA(*args, **kwargs)
+        return AttentionForVllmMHA.create(*args, **kwargs)

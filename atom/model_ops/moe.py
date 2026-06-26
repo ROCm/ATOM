@@ -2825,6 +2825,19 @@ class FusedMoE(torch.nn.Module):
         if dst.dtype == dtypes.fp4x2:
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
             return
+        fp8_storage_dtypes = (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e8m0fnu,
+            dtypes.fp8,
+            dtypes.fp8_e8m0,
+        )
+        if dst.dtype in fp8_storage_dtypes and src.dtype in fp8_storage_dtypes:
+            # Offline FP8 checkpoints encode e4m3 bits. If the destination was
+            # allocated as platform fp8 (often fnuz), Tensor.copy_ converts the
+            # values before the later fn->fnuz scale fixup. Preserve the bytes.
+            dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            return
         if dst.dtype == dtypes.fp8_e8m0 and src.dtype == torch.uint8:
             # e8m0 microscale tensors are byte-encoded; copy_ would convert the
             # uint8 values numerically instead of preserving the scale bits.
