@@ -25,7 +25,13 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # layout (set by the vLLM plugin under DP+EP); disable it there.
     if dp_size > 1 and config.moe_ep_flatten_tp_across_dp:
         return False
-    if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
+    use_mori_all2all = (
+        dp_size > 1
+        and _has_module("mori")
+        and config.enable_dp_attention
+        and config.enable_expert_parallel
+    )
+    if use_mori_all2all:
         return False
 
     if quant_config is not None and shared_expert_prefix is not None:
@@ -66,15 +72,6 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 return False
             break
 
-    dp_size = config.parallel_config.data_parallel_size
-    use_mori_all2all = (
-        dp_size > 1
-        and _has_module("mori")
-        and config.enable_dp_attention
-        and config.enable_expert_parallel
-    )
-    if use_mori_all2all:
-        return False
     return True
 
 
