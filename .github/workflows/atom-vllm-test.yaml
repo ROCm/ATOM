@@ -473,8 +473,11 @@ jobs:
           elif [ -d "/mnt/dcgpuval/models" ]; then
             MODEL_CACHE_MOUNT="-v /mnt/dcgpuval/models:/models"
             MODEL_CACHE_DESC="/mnt/dcgpuval/models (host path)"
+          elif [ -d "/shareddata/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
+            MODEL_CACHE_DESC="/shareddata/models (host path)"
           else
-            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models directory not found on runner; using container-local /models."
+            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models directory not found on runner; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
