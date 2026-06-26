@@ -468,12 +468,13 @@ class Scheduler:
         # config registry maps "deepseek_v4" -> "deepseek_v3" so model_type
         # reads as v3 (same reason config.py:1118 uses architectures).
         self._v4_swa_warmup_blocks = 0
-        _arches = getattr(config.hf_config, "architectures", None) or []
+        _hf = getattr(config, "hf_config", None)
+        _arches = getattr(_hf, "architectures", None) or []
         _is_v4 = any("DeepseekV4" in str(a) for a in _arches)
         if config.enable_prefix_caching and _is_v4:
             import math as _math
 
-            window = int(getattr(config.hf_config, "sliding_window", 128) or 128)
+            window = int(getattr(_hf, "sliding_window", 128) or 128)
             # The SWA ring's physical stride is `win_with_spec = window + mtp_k`
             # (MTP draft tokens get their own ring slots). A tail token's window
             # can reach back `win_with_spec - 1` ring slots, so the re-forwarded
@@ -1089,7 +1090,13 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
-                now_partial = seq.num_cached_tokens < seq.num_tokens
+                # Prefill is partial until the whole PROMPT's KV is computed.
+                # Compare against num_prompt_tokens, not num_tokens: once a
+                # completion token is appended (this step's sampled token, or an
+                # externally-appended EOS), num_tokens > num_prompt_tokens and
+                # comparing against it would wrongly keep a finished prefill
+                # flagged partial — which makes the EOS/finish loop below skip it.
+                now_partial = seq.num_cached_tokens < seq.num_prompt_tokens
                 if now_partial != seq.is_partial_prefill:
                     self._partial_prefill_count += 1 if now_partial else -1
                     seq.is_partial_prefill = now_partial
