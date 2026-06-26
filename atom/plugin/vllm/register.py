@@ -133,6 +133,15 @@ def register_model() -> None:
     # isolation, so extend that allow-list before MTP/Eagle proposal runs.
     apply_vllm_spec_decode_patch()
 
+    # vLLM mamba-hybrid state builds seq_lens_cpu_upper_bound on CPU, but
+    # some versions do not pass it into CommonAttentionMetadata. ATOM MHA
+    # metadata consumes that CPU tensor to avoid a GPU->CPU sync.
+    from atom.plugin.vllm.mamba_hybrid_patch import (
+        apply_mamba_hybrid_seq_lens_patch,
+    )
+
+    apply_mamba_hybrid_seq_lens_patch()
+
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives
     from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
