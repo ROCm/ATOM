@@ -100,25 +100,25 @@ jobs:
       - name: Prepare model cache mount
         run: |
           MODEL_CACHE_MOUNT=""
-          MODEL_CACHE_ROOT="/models"
+          MODEL_CACHE_ROOT=""
           MODEL_CACHE_DESC=""
 
           if [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_ROOT="/shared/data/WRH/models"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/mnt/raid0/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/data/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/data/pretrained_model"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
             MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
-            echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model exists on runner; using container-local ${MODEL_CACHE_ROOT}."
+            echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model nor /shared/data/WRH/models exists on runner; using container-local ${MODEL_CACHE_ROOT}."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -166,9 +166,6 @@ jobs:
             --ulimit stack=67108864 \
             --env-file /tmp/sglang_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
-            -e HF_HOME="${MODEL_CACHE_ROOT}/.cache/huggingface" \
-            -e HUGGINGFACE_HUB_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/hub" \
-            -e TRANSFORMERS_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/transformers" \
             --name "$CONTAINER_NAME" \
             "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
         env:

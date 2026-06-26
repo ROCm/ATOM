@@ -1595,6 +1595,10 @@ class ModelRunner:
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
+            draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
+            if draft_regions:
+                transfer_tensors.block_regions.extend(draft_regions)
         set_kv_cache_data(kv_cache_data, config, transfer_tensors)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.

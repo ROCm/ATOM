@@ -215,14 +215,15 @@ def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
 
     layer_id = _extract_layer_index_from_prefix(prefix)
 
-    # GLM-5.2 MTP layer (index >= num_hidden_layers) reuses the cached topk.
+    # GLM-5.2 MTP layer (index >= num_hidden_layers): the MTP block ships its
+    # OWN indexer weights and computes its own top-k for the drafted position,
+    # so do not skip it. `index_share_for_mtp_iteration` only concerns sharing
+    # across MULTIPLE MTP draft steps (num_speculative_tokens>1); it does NOT
+    # mean the MTP reuses the target model's index. Matches vLLM upstream and
+    # the ATOM sglang plugin, which both run the MTP indexer independently.
     num_hidden_layers = getattr(config, "num_hidden_layers", None)
-    if (
-        num_hidden_layers is not None
-        and layer_id >= num_hidden_layers
-        and getattr(config, "index_share_for_mtp_iteration", False)
-    ):
-        return True
+    if num_hidden_layers is not None and layer_id >= num_hidden_layers:
+        return False
 
     # GLM-5.2 IndexShare: per-layer schedule, "shared" reuses the prior "full"
     # layer's topk. Authoritative when present; else fall back to pattern/freq.
