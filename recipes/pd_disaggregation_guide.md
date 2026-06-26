@@ -215,6 +215,163 @@ V4-specific env vars:
 
 ---
 
+## Single-Node PD: NUMA Binding
+
+When prefill and decode run on the **same** node — each a separate process pinned
+to a GPU subset via `HIP_VISIBLE_DEVICES` — bind every worker's CPU threads
+(especially mooncake's native RDMA threads) and its memory to the GPU's **local
+NUMA node**. On a 2-socket box this removes the cross-socket GPU launch bubbles
+that otherwise dominate prefill.
+
+### Mechanism
+
+`ATOM_NUMA_BIND` runs at the top of `AsyncIOProc.__init__` — before any large
+allocation or native (mooncake) thread spawn — calling `sched_setaffinity` +
+libnuma `numa_set_preferred`. Child threads inherit the mask and Linux
+first-touch lands memory on the local node. See `atom/utils/numa_utils.py` and
+`atom/model_engine/async_proc.py`. This replaces hand-rolled `taskset` / the old
+NUMA-blind `ATOM_CPU_AFFINITY` linear slice.
+
+### Env vars
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ATOM_NUMA_BIND` | `0` (off) | Master switch; `=1` enables binding |
+| `ATOM_NUMA_NODE` | empty (auto) | Explicit node id(s); empty = auto-detect (amdsmi → sysfs) |
+| `ATOM_AUTO_NUMA_BIND` | `1` | Auto-detect toggle (rarely changed) |
+| `ATOM_CRASH_ON_NUMA_BIND_FAILURE` | `0` | Raise instead of warn on bind failure |
+
+### Check the topology first
+
+```bash
+# GPU -> NUMA node (amdsmi if present, else sysfs)
+for d in /sys/class/drm/card*/device; do
+  [ -e "$d/numa_node" ] && echo "$(basename $(realpath $d)) node=$(cat $d/numa_node)"
+done | sort
+# cpus per node
+for n in /sys/devices/system/node/node*/cpulist; do echo "$n: $(cat $n)"; done
+```
+
+Example (2-socket, 8-GPU box): physical GPU 0–3 → node 0, 4–7 → node 1.
+
+### Per-process configuration
+
+Set a single node id per process (it broadcasts to all `tp` ranks in that
+process):
+
+| Process | `HIP_VISIBLE_DEVICES` | node | Config |
+|---|---|---|---|
+| prefill #1 | `0,1` | 0 | `ATOM_NUMA_BIND=1 ATOM_NUMA_NODE="0"` |
+| prefill #2 | `2,3` | 0 | `ATOM_NUMA_BIND=1 ATOM_NUMA_NODE="0"` |
+| decode #1 | `4,5` | 1 | `ATOM_NUMA_BIND=1 ATOM_NUMA_NODE="1"` |
+| decode #2 | `6,7` | 1 | `ATOM_NUMA_BIND=1 ATOM_NUMA_NODE="1"` |
+
+```bash
+export ATOM_NUMA_BIND=1
+export ATOM_NUMA_NODE="0"          # node of this process's GPUs
+export HIP_VISIBLE_DEVICES=0,1
+python -m atom.entrypoints.openai_server ... -tp 2 ...
+```
+
+### Full launch scripts (1P1D example)
+
+Set `NODE_IP` to this node's address. Prefill is the `kv_producer`, decode the
+`kv_consumer`; they coordinate through mooncake on the shared `handshake_port`.
+
+**Prefill (GPU 0,1 → node 0):**
+
+```bash
+export NODE_IP=<this-node-ip>
+
+export ATOM_NUMA_BIND=1
+export ATOM_NUMA_NODE="0"
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export HIP_VISIBLE_DEVICES=0,1
+export PYTHONUNBUFFERED=1
+export ATOM_HOST_IP=${NODE_IP}
+export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export ATOM_DISABLE_MMAP=true
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+python3 -m atom.entrypoints.openai_server \
+    --model /data/models/MiniMax-M2.7/ \
+    --host 0.0.0.0 --server-port 8030 \
+    --trust-remote-code \
+    -tp 2 \
+    --port 8006 \
+    --kv_cache_dtype fp8 \
+    --gpu-memory-utilization 0.75 \
+    --torch-profiler-dir /it-share/lirzhang/trace/prefill \
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"'"${NODE_IP}"'","handshake_port":6301}'
+```
+
+**Decode (GPU 4,5 → node 1):**
+
+```bash
+export NODE_IP=<this-node-ip>
+
+export ATOM_NUMA_BIND=1
+export ATOM_NUMA_NODE="1"
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export HIP_VISIBLE_DEVICES=4,5
+export PYTHONUNBUFFERED=1
+export ATOM_HOST_IP=${NODE_IP}
+export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export ATOM_DISABLE_MMAP=true
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+python3 -m atom.entrypoints.openai_server \
+    --model /data/models/MiniMax-M2.7/ \
+    --host 0.0.0.0 --server-port 8031 \
+    --trust-remote-code \
+    -tp 2 \
+    --port 8007 \
+    --kv_cache_dtype fp8 \
+    --gpu-memory-utilization 0.75 \
+    --torch-profiler-dir /it-share/lirzhang/trace/decode \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"'"${NODE_IP}"'","handshake_port":6302,"http_port":8041}'
+```
+
+> Each process pins to the NUMA node local to its GPUs (`0,1`/`2,3` → node 0;
+> `4,5`/`6,7` → node 1). For a 2P1D / 1P2D mesh, bump every deterministic id
+> (`server-port`, `--port`, `handshake_port`, `http_port`) per extra process so
+> they don't collide.
+
+### Indexing rule (important under HIP_VISIBLE_DEVICES masking)
+
+- **auto** (no `ATOM_NUMA_NODE`): resolves through `_physical_index()`, mapping
+  the process-local rank back to the real physical GPU via `HIP_VISIBLE_DEVICES`
+  before querying its node. Masking is handled correctly — **prefer auto when
+  amdsmi is available; it is portable and zero-config.**
+- **explicit** `ATOM_NUMA_NODE`: does **not** go through `_physical_index`; it is
+  indexed by **process-local rank** (`0..tp-1`). Write the node(s) of the GPUs
+  visible to *this* process, in local-rank order. A single value applies to all
+  ranks — convenient when a process's GPUs are all on one node.
+
+> If amdsmi is not installed, auto falls back to a sysfs scan (works when ROCm
+> enumerates GPUs in PCI-BDF order). When the node layout is fixed and known,
+> explicit `ATOM_NUMA_NODE` is the most deterministic choice.
+
+### Verify
+
+Each process logs one line per worker:
+
+```
+NUMA bind (ModelRunner0/2): gpu=0 -> node 0 (64 cores)
+```
+
+`tp2` → 2 lines with the expected node ids. A failure logs
+`NUMA bind ... failed ...` — in Docker add `--cap-add SYS_NICE`, or set
+`ATOM_NUMA_NODE` explicitly.
+
+### CI / portability
+
+When the target topology is unknown (e.g. a CI runner), set **only**
+`ATOM_NUMA_BIND=1` and let auto-detect pick the node per machine — do not
+hardcode `ATOM_NUMA_NODE`.
+
+---
+
 ## Accuracy Validation
 
 ### DeepSeek-R1
