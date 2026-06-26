@@ -1059,7 +1059,6 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.dtype = dtype
         self.weight = atom_parameter(torch.ones(dim, dtype=dtype))
         self.bias = atom_parameter(torch.zeros(dim, dtype=dtype))
 
@@ -1068,12 +1067,9 @@ class LayerNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        weight, bias = self.weight, self.bias
-        if self.dtype is not None and self.dtype != weight.dtype:
-            weight, bias = weight.to(self.dtype), bias.to(self.dtype)
         if residual is None:
-            return layernorm2d_fwd_(x, weight, bias, self.eps, self.dim)
+            return layernorm2d_fwd_(x, self.weight, self.bias, self.eps, self.dim)
         else:
             return layernorm2d_fwd_with_add_(
-                x, weight, residual, bias, self.eps, self.dim
+                x, self.weight, residual, self.bias, self.eps, self.dim
             )
