@@ -79,7 +79,9 @@ permissions:
 
 jobs:
   benchmark:
-    name: ${{ inputs.display }} ${{ inputs.isl }}/${{ inputs.osl }} c=${{ matrix.conc }}
+    # Nested under the caller job (which already shows model + scenario), so the
+    # template only needs the distinguishing second-level dimension: concurrency.
+    name: c=${{ matrix.conc }}
     strategy:
       fail-fast: false
       matrix:
