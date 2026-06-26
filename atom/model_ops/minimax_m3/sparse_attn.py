@@ -24,11 +24,8 @@ except ModuleNotFoundError:
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
-# Page-16 SHUFFLE layout for the AITER ASM / gluon paged-attention path. The KV
-# cache is allocated with physical page size 16 (the ASM kernel page), and each
-# logical sparse block (128 tokens) spans PAGES_PER_SPARSE_BLOCK contiguous
-# physical 16-pages. Used by the fused SHUFFLE KV-insert and the sparse
-# block-table builders.
+# Page-16 SHUFFLE layout for the AITER ASM / Gluon paged-attention path. Each
+# logical 128-token sparse block is exposed to Gluon as 8 physical 16-token pages.
 ASM_PAGE_SIZE = 16
 PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE  # 8
 

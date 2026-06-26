@@ -25,9 +25,7 @@ except ModuleNotFoundError:
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
-# Physical 16-pages per logical 128-block for the page-16 SHUFFLE ASM/gluon cache
-# (must match sparse_attn.PAGES_PER_SPARSE_BLOCK). Used by the fused block-table
-# emission in the topk kernels.
+# Physical 16-pages per logical 128-block for the page-16 SHUFFLE Gluon cache.
 PAGES_PER_SPARSE_BLOCK = 8
 
 
@@ -759,6 +757,7 @@ def minimax_m3_index_topk(
     num_kv_heads: int,
     sm_scale: float,
     emit_sparse_block_table: bool = False,
+    emit_block_table: torch.Tensor | None = None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
@@ -766,11 +765,11 @@ def minimax_m3_index_topk(
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
     per-index-head top-k maps 1:1 to kv heads (no index-head reduction needed).
 
-    When ``emit_sparse_block_table`` is True (requires num_idx_heads == 1), the
-    topk kernel ALSO fuses the per-query-token page-16 SHUFFLE block-table
-    compaction and returns ``(topk_idx, sparse_bt [total_q, topk*8], sparse_ctx
-    [total_q])`` ready for the ASM prefill kernel -- saving a separate build
-    launch + topk_idx HBM round-trip.
+    When ``emit_sparse_block_table`` is True, the topk kernel also emits the
+    page-16 SHUFFLE block table consumed by the main KV-cache attention kernel.
+    ``block_table`` still addresses the index cache used for scoring; callers
+    may pass ``emit_block_table`` when the main KV cache has different physical
+    slots from the index cache.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -816,6 +815,7 @@ def minimax_m3_index_topk(
         dtype=torch.int32,
         device=idx_q.device,
     )
+    emit_block_table = block_table if emit_block_table is None else emit_block_table
     # One emitted row per (query token, kv-head): the ASM/gluon path collapses
     # kv-head into the row dim, so sparse_bt/ctx are total_q*num_idx_heads rows
     # and the page ids are kv-head-encoded in the kernel. num_idx_heads == 1
@@ -831,7 +831,7 @@ def minimax_m3_index_topk(
             (total_q * num_idx_heads,), dtype=torch.int32, device=idx_q.device
         )
         sbt_arg, sctx_arg = sparse_bt, sparse_ctx
-        bt_stride0, sbt_stride0 = block_table.stride(0), sparse_bt.stride(0)
+        bt_stride0, sbt_stride0 = emit_block_table.stride(0), sparse_bt.stride(0)
     else:
         sbt_arg = torch.empty(1, dtype=torch.int32, device=idx_q.device)
         sctx_arg = torch.empty(1, dtype=torch.int32, device=idx_q.device)
@@ -855,7 +855,7 @@ def minimax_m3_index_topk(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
-        block_table,
+        emit_block_table,
         sbt_arg,
         sctx_arg,
         bt_stride0,
@@ -885,6 +885,7 @@ def minimax_m3_index_topk_decode(
     sm_scale: float,
     emit_sparse_block_table: bool = False,
     max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
+    emit_block_table: torch.Tensor | None = None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -894,11 +895,11 @@ def minimax_m3_index_topk_decode(
     ``causal_len = seq_len - max_query_len + tok + 1``; ``max_query_len == 1`` is
     plain decode (one token per request) and reduces to the original behavior.
 
-    When ``emit_sparse_block_table`` is True (requires num_idx_heads == 1), the
-    merge kernel ALSO fuses the page-16 SHUFFLE block-table compaction and returns
-    ``(topk_idx, sparse_bt [total_q, topk*8], sparse_ctx [total_q])`` ready for the
-    ASM/gluon decode kernel -- saving a separate build launch + topk_idx HBM
-    round-trip.
+    When ``emit_sparse_block_table`` is True, the merge kernel also emits the
+    page-16 SHUFFLE block table consumed by the main KV-cache attention kernel.
+    ``block_table`` still addresses the index cache used for scoring; callers
+    may pass ``emit_block_table`` when the main KV cache has different physical
+    slots from the index cache.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -1001,6 +1002,7 @@ def minimax_m3_index_topk_decode(
         topk_idx_partial.stride(2),
         topk_idx_partial.stride(3),
     )
+    emit_block_table = block_table if emit_block_table is None else emit_block_table
     # The fused emit now produces one row per (token, kv-head): the ASM/gluon path
     # collapses kv-head into the row dim. sparse_bt/ctx are sized total_q*num_idx_heads
     # and the page ids are kv-head-encoded inside the kernel. num_idx_heads == 1
@@ -1016,7 +1018,7 @@ def minimax_m3_index_topk_decode(
             (total_q * num_idx_heads,), dtype=torch.int32, device=idx_q.device
         )
         sbt_arg, sctx_arg = sparse_bt, sparse_ctx
-        bt_stride0, sbt_stride0 = block_table.stride(0), sparse_bt.stride(0)
+        bt_stride0, sbt_stride0 = emit_block_table.stride(0), sparse_bt.stride(0)
     else:
         # dummy 1-elem tensors so the kernel always has valid pointers.
         sbt_arg = torch.empty(1, dtype=torch.int32, device=idx_q.device)
@@ -1040,7 +1042,7 @@ def minimax_m3_index_topk_decode(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
-        block_table,
+        emit_block_table,
         sbt_arg,
         sctx_arg,
         bt_stride0,

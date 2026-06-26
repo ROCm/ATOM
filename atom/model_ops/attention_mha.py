@@ -1205,6 +1205,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         sm = getattr(attn_metadata, "sparse_attention_metadata", None)
         return sm if sm is not None else attn_metadata
 
+    def _index_sparse_metadata(self, fwd_ctx: ForwardContext, sparse_metadata):
+        index_attn_metadata = getattr(fwd_ctx, "index_attn_metadata", None)
+        if index_attn_metadata is None:
+            return sparse_metadata
+        sm = getattr(index_attn_metadata, "sparse_attention_metadata", None)
+        return sm if sm is not None else index_attn_metadata
+
     def _topk_cache_state(self, sparse_metadata):
         if self.index_topk_cache_state is None:
             return None
@@ -1290,17 +1297,26 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         index_q = self._index_q
         sparse_metadata = self._sparse_metadata(fwd_ctx)
+        index_sparse_metadata = self._index_sparse_metadata(fwd_ctx, sparse_metadata)
         prefill_md = sparse_metadata.prefill
+        index_prefill_md = index_sparse_metadata.prefill
         assert prefill_md is not None, "sparse prefill metadata missing"
+        assert index_prefill_md is not None, "sparse index prefill metadata missing"
         cu_seqlens_q = prefill_md.cu_seqlens_q
         seq_lens = prefill_md.seq_lens
         prefix_lens = prefill_md.context_lens
         block_tables = prefill_md.block_table
+        index_block_tables = index_prefill_md.block_table
 
+        # Top-k scoring reads the separate index cache, so it must use the
+        # index-cache metadata. The emitted sparse block table is consumed by
+        # the main KV-cache attention kernel, so it must be built from the main
+        # KV block table. Mixing these was the source of cross-request fp8
+        # accuracy drift under concurrent decode.
         topk_key = self._topk_cache_key(
             "prefill",
             index_q,
-            block_tables,
+            index_block_tables,
             seq_lens,
             prefill_md.max_query_len,
             prefill_md.max_seq_len,
@@ -1312,7 +1328,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk(
                 index_q,
                 self.index_cache,
-                block_tables,
+                index_block_tables,
                 cu_seqlens_q,
                 seq_lens,
                 prefix_lens,
@@ -1324,6 +1340,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 emit_sparse_block_table=True,
+                emit_block_table=block_tables,
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
@@ -1384,14 +1401,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         index_q = self._index_q
         sparse_metadata = self._sparse_metadata(fwd_ctx)
+        index_sparse_metadata = self._index_sparse_metadata(fwd_ctx, sparse_metadata)
         decode_md = sparse_metadata.decode
+        index_decode_md = index_sparse_metadata.decode
         assert decode_md is not None, "sparse decode metadata missing"
+        assert index_decode_md is not None, "sparse index decode metadata missing"
         max_query_len = getattr(decode_md, "max_query_len", 1)
 
+        # Same split-cache invariant as prefill: score top-k against the index
+        # cache, but emit/read pages from the main KV cache.
         topk_key = self._topk_cache_key(
             "decode",
             index_q,
-            decode_md.block_table,
+            index_decode_md.block_table,
             decode_md.seq_lens,
             max_query_len,
             sparse_metadata.max_seq_len,
@@ -1403,9 +1425,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
                 index_q,
                 self.index_cache,
-                decode_md.block_table,
-                decode_md.seq_lens,
-                sparse_metadata.max_seq_len,
+                index_decode_md.block_table,
+                index_decode_md.seq_lens,
+                index_sparse_metadata.max_seq_len,
                 self.topk,
                 self.init_blocks,
                 self.local_blocks,
@@ -1413,6 +1435,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.scale,
                 emit_sparse_block_table=True,
                 max_query_len=max_query_len,
+                emit_block_table=decode_md.block_table,
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
