@@ -20,6 +20,7 @@ def atom_vllm_mha_attention_fake(
     query: torch.Tensor,
     key: Optional[torch.Tensor],
     value: Optional[torch.Tensor],
+    kv_cache: torch.Tensor,
     layer_name: str,
     positions: Optional[torch.Tensor] = None,
     q_scale: Optional[torch.Tensor] = None,
@@ -31,18 +32,19 @@ def atom_vllm_mha_attention_fake(
 @mark_spliting_op(
     is_custom=True,
     gen_fake=atom_vllm_mha_attention_fake,
-    mutates_args=[],
+    mutates_args=["kv_cache"],
 )
 def atom_vllm_mha_attention(
     query: torch.Tensor,
     key: Optional[torch.Tensor],
     value: Optional[torch.Tensor],
+    kv_cache: torch.Tensor,
     layer_name: str,
     positions: Optional[torch.Tensor] = None,
     q_scale: Optional[torch.Tensor] = None,
     qkv: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    layer, attn_metadata, kv_cache = _get_layer_context(layer_name)
+    layer, attn_metadata, _ = _get_layer_context(layer_name)
     return layer.forward_impl(
         query,
         key,
