@@ -17,7 +17,15 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME = "model.layers.0.atom_deepseek_v4_proxy"
+ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX = "atom_deepseek_v4_draft_proxy"
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+
+
+def deepseek_v4_draft_proxy_layer_name(hf_config) -> str:
+    return (
+        f"model.layers.{int(getattr(hf_config, 'num_hidden_layers'))}."
+        f"{ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX}"
+    )
 
 
 def _aligned_index_dim(index_head_dim: int) -> int:
@@ -45,11 +53,23 @@ def _classical_block_bytes(hf_config) -> int:
     return csa_layers * (csa_main + csa_index) + hca_layers * hca_main
 
 
+def _v4_spec_steps(vllm_config) -> int:
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return 0
+    n = getattr(spec, "num_speculative_tokens", None)
+    return int(n) if n else 0
+
+
+def _v4_win_with_spec(vllm_config, window_size: int) -> int:
+    return int(window_size) + _v4_spec_steps(vllm_config)
+
+
 def _proxy_page_bytes(vllm_config) -> int:
     hf = vllm_config.model_config.hf_config
     ratios, _dense, _csa, _hca = _layer_counts(hf)
     head_dim = int(getattr(hf, "head_dim", 512))
-    win = int(getattr(hf, "sliding_window", 128))
+    win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
     max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
     max_model_len = int(vllm_config.model_config.max_model_len)
     min_blocks = max(
@@ -229,7 +249,8 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
         if common_attn_metadata is None:
             return common_attn_metadata
         sfc = self.vllm_config.compilation_config.static_forward_context
-        proxy = sfc.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+        proxy_layer_name = self.layer_names[0]
+        proxy = sfc.get(proxy_layer_name)
         model = getattr(proxy, "_atom_v4_model", None) if proxy is not None else None
         meta_params = getattr(model, "_atom_v4_meta_params", None)
         if model is None or meta_params is None:
@@ -345,15 +366,18 @@ class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
         )
 
 
-def register_deepseek_v4_proxy_layer(vllm_config) -> AtomDeepseekV4ProxyAttention:
+def register_deepseek_v4_proxy_layer(
+    vllm_config,
+    layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+) -> AtomDeepseekV4ProxyAttention:
     sfc = vllm_config.compilation_config.static_forward_context
-    existing = sfc.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+    existing = sfc.get(layer_name)
     if isinstance(existing, AtomDeepseekV4ProxyAttention):
         return existing
     if existing is not None:
-        raise ValueError(f"Duplicate layer name: {ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME}")
-    proxy = AtomDeepseekV4ProxyAttention()
-    sfc[ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME] = proxy
+        raise ValueError(f"Duplicate layer name: {layer_name}")
+    proxy = AtomDeepseekV4ProxyAttention(prefix=layer_name)
+    sfc[layer_name] = proxy
     return proxy
 
 
@@ -400,11 +424,29 @@ def _v4_max_spec_steps(vllm_config) -> int:
     Sets the decode CG bucket: the per-fwd token count for a uniform decode
     batch of ``bs`` requests is ``bs * (1 + max_spec_steps)``.
     """
-    spec = getattr(vllm_config, "speculative_config", None)
-    if spec is None:
-        return 0
-    n = getattr(spec, "num_speculative_tokens", None)
-    return int(n) if n else 0
+    return _v4_spec_steps(vllm_config)
+
+
+def _deepseek_v4_blocks(model):
+    inner = getattr(model, "model", None)
+    layers = getattr(inner, "layers", None)
+    if layers is not None:
+        return layers
+    mtp = getattr(inner, "mtp", None)
+    if mtp is not None:
+        return mtp
+    return []
+
+
+def _compressed_layer_cache_index(ratios, layer_id: int, ratio: int) -> int:
+    return sum(1 for r in ratios[:layer_id] if int(r) == int(ratio))
+
+
+def _v4_padded_token_count(common_attn_metadata, total: int) -> int:
+    num_actual = int(getattr(common_attn_metadata, "num_actual_tokens", total) or total)
+    slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
+    slot_tokens = int(slot_mapping.numel()) if isinstance(slot_mapping, torch.Tensor) else 0
+    return max(total, num_actual, slot_tokens)
 
 
 class _V4DecodeMetaBuffers:
@@ -503,9 +545,13 @@ class _V4DecodeMetaBuffers:
         return buf.copy_to_gpu(n)
 
 
-def bind_deepseek_v4_proxy_cache_views(model, vllm_config) -> bool:
+def bind_deepseek_v4_proxy_cache_views(
+    model,
+    vllm_config,
+    layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+) -> bool:
     sfc = vllm_config.compilation_config.static_forward_context
-    proxy = sfc.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+    proxy = sfc.get(layer_name)
     if proxy is None or not isinstance(proxy, AtomDeepseekV4ProxyAttention):
         return False
     if not isinstance(proxy.kv_cache, torch.Tensor) or proxy.kv_cache.numel() == 0:
@@ -522,30 +568,32 @@ def bind_deepseek_v4_proxy_cache_views(model, vllm_config) -> bool:
     # must use it for `swa_pages`, not the per-forward request count.
     if not hasattr(model, "_atom_v4_slot_allocator"):
         model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
+    window_size = int(model.args.window_size)
+    win_with_spec = _v4_win_with_spec(vllm_config, window_size)
     model._atom_v4_meta_params = SimpleNamespace(
         num_slots=num_slots,
-        window_size=int(model.args.window_size),
-        # Plugin SWA ring is sized by window_size (no MTP spec steps folded in,
-        # matching the slicing above), so the ring stride cs == window_size.
-        cs=int(model.args.window_size),
+        window_size=window_size,
+        # Match native V4 MTP: the SWA ring stride includes in-flight draft
+        # steps so MTP>1 writes do not alias the target decode window.
+        cs=win_with_spec,
         index_topk=int(getattr(model.args, "index_topk", 1024)),
     )
     views = slice_deepseek_v4_proxy_cache_views(
         proxy.kv_cache,
         compress_ratios=ratios,
         num_slots=num_slots,
-        window_size=int(model.args.window_size),
+        window_size=win_with_spec,
         head_dim=int(model.args.head_dim),
         index_head_dim=int(model.args.index_head_dim),
     )
-    csa_i = 0
-    hca_i = 0
-    for layer_id, block in enumerate(model.model.layers):
+    for fallback_layer_id, block in enumerate(_deepseek_v4_blocks(model)):
         attn = block.attn
+        layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
         ratio = int(attn.compress_ratio)
         attn.unified_kv = views["unified"][layer_id]
         attn.swa_kv = views["swa"][layer_id]
         if ratio == 4:
+            csa_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
                 attn.compressor,
                 views["csa_main"][csa_i],
@@ -563,15 +611,14 @@ def bind_deepseek_v4_proxy_cache_views(model, vllm_config) -> bool:
                 int(model.args.index_head_dim),
                 is_indexer=True,
             )
-            csa_i += 1
         elif ratio == 128:
+            hca_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
                 attn.compressor,
                 views["hca_main"][hca_i],
                 num_slots,
                 int(model.args.head_dim),
             )
-            hca_i += 1
     # Persistent decode-metadata buffers for the FULL decode CUDA/HIP graph.
     # Allocated once (sized to the worst-case decode shape) so build() can
     # refresh them in place each step; the captured kernels read stable
@@ -886,11 +933,11 @@ def build_atom_v4_attention_metadata(
     # Real reqs are contiguous at the front of a (reordered) decode batch; CG
     # padding appends zero-query-len reqs at the tail.
     scheduled_bs = int((lens > 0).sum()) if is_decode else num_reqs
-    # T_pad: the captured per-fwd token count (== num_actual_tokens, which vLLM
-    # sets to the cudagraph bucket size on capture/replay; == total in eager).
-    T_pad = int(getattr(common_attn_metadata, "num_actual_tokens", total) or total)
-    if T_pad < total:
-        T_pad = total
+    # T_pad: the per-fwd token count seen by the model. For draft decode, vLLM
+    # keeps `num_actual_tokens` at the real batch size but passes padded
+    # input/slot tensors; use slot_mapping length so ATOM metadata also carries
+    # a sentinel tail for padded draft slots.
+    T_pad = _v4_padded_token_count(common_attn_metadata, total)
 
     # ---- per-request state slot ----
     # Real per-request state slots are assigned only for genuine (non-capture)
@@ -1325,16 +1372,18 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     md.swa_pages = swa_pages
 
 
-def get_deepseek_v4_proxy_metadata_from_vllm_context():
+def get_deepseek_v4_proxy_metadata_from_vllm_context(
+    layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+):
     from vllm.forward_context import get_forward_context, is_forward_context_available
 
     if not is_forward_context_available():
         return None
     meta = get_forward_context().attn_metadata
     if isinstance(meta, dict):
-        return meta.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+        return meta.get(layer_name)
     if isinstance(meta, list) and meta and isinstance(meta[0], dict):
-        return meta[0].get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+        return meta[0].get(layer_name)
     return None
 
 
@@ -1392,6 +1441,7 @@ def atom_deepseek_v4_forward_context(
     state_model=None,
     meta_params=None,
     slot_allocator=None,
+    proxy_layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
 ):
     from atom.utils.forward_context import (
         Context,
@@ -1400,7 +1450,9 @@ def atom_deepseek_v4_forward_context(
     )
 
     if common_attn_metadata is None:
-        common_attn_metadata = get_deepseek_v4_proxy_metadata_from_vllm_context()
+        common_attn_metadata = get_deepseek_v4_proxy_metadata_from_vllm_context(
+            proxy_layer_name
+        )
     # Fast path: the proxy metadata builder already built the ATOM metadata into
     # persistent buffers (outside any captured region) and attached it. This is
     # the only path that is CUDA/HIP-graph safe -- the captured forward merely
@@ -1415,6 +1467,11 @@ def atom_deepseek_v4_forward_context(
             common_attn_metadata,
             meta_params=meta_params,
             slot_allocator=slot_allocator,
+            decode_bufs=(
+                getattr(state_model, "_atom_v4_decode_bufs", None)
+                if state_model is not None
+                else None
+            ),
         )
         # Selective per-slot reset: clear only the slots the allocator just
         # bound to a fresh request (replaces the old global position-0 reset,
