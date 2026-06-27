@@ -1556,8 +1556,24 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    logger.info(f"Starting server on {args.host}:{args.server_port}...")
-    uvicorn.run(app, host=args.host, port=args.server_port)
+    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
+    # which is markedly faster at the SSE socket I/O (sock.send / selector
+    # register-unregister) that saturates the event loop under high streaming
+    # concurrency. Fall back to the default loop if uvloop is unavailable.
+    try:
+        import uvloop  # noqa: F401
+
+        loop_impl = "uvloop"
+    except ImportError:
+        loop_impl = "auto"
+        logger.warning(
+            "uvloop not installed; falling back to the default asyncio loop."
+        )
+
+    logger.info(
+        f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
+    )
+    uvicorn.run(app, host=args.host, port=args.server_port, loop=loop_impl)
 
 
 if __name__ == "__main__":
