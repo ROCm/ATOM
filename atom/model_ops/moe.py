@@ -2801,7 +2801,7 @@ class FusedMoE(torch.nn.Module):
                 load_size = loaded_weight.shape[shard_dim]
                 if load_size != expert_data.shape[shard_dim]:
                     expert_data = expert_data.narrow(shard_dim, 0, load_size)
-                expert_data.copy_(loaded_weight)
+                self._copy_quant_storage(expert_data, loaded_weight)
             elif shard_id in ("w1", "w3"):
                 self._load_w13(
                     shard_id=shard_id,
@@ -2813,7 +2813,7 @@ class FusedMoE(torch.nn.Module):
                 )
             return
         if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            self._copy_quant_storage(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -2827,6 +2827,19 @@ class FusedMoE(torch.nn.Module):
     def _copy_quant_storage(dst: torch.Tensor, src: torch.Tensor) -> None:
         """Copy quantized tensors without numeric conversion of byte formats."""
         if dst.dtype == dtypes.fp4x2:
+            dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            return
+        fp8_storage_dtypes = (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e8m0fnu,
+            dtypes.fp8,
+            dtypes.fp8_e8m0,
+        )
+        if dst.dtype in fp8_storage_dtypes and src.dtype in fp8_storage_dtypes:
+            # Offline FP8 checkpoints encode raw FP8 bytes. Avoid dtype-to-dtype
+            # numeric conversion when destination storage uses a different FP8
+            # variant; later scale fixups expect the original bytes.
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
             return
         if dst.dtype == dtypes.fp8_e8m0 and src.dtype == torch.uint8:

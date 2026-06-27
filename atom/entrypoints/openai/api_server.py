@@ -287,13 +287,22 @@ def _prepare_multimodal_inputs(
     return inputs["input_ids"][0].tolist(), multimodal_data
 
 
+# ── Batched stream dispatch ──────────────────────────────────────────────
+# Per-seq `call_soon_threadsafe` floods the API event loop at high batch size
+# (one call per token). Instead the callback only decodes + buffers; the mgr
+# flushes a whole step with one scheduled call (see `flush_stream_batch`).
+import threading as _threading  # noqa: E402
+
+_stream_batch_tls = _threading.local()
+
+
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
 ) -> None:
-    """Send stream chunk directly to the queue."""
+    """Decode the chunk and buffer it; dispatch happens in flush_stream_batch."""
     global tokenizer
 
     new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
@@ -309,7 +318,34 @@ def _send_stream_chunk_direct(
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
+
+    buf = getattr(_stream_batch_tls, "buf", None)
+    if buf is None:
+        buf = _stream_batch_tls.buf = []
+    buf.append((loop, stream_queue, chunk_data))
+
+
+def _drain_batch_into_queues(items: list) -> None:
+    """Runs ON the event loop: push each chunk into its per-request queue.
+    One scheduled call handles a whole step's worth of chunks."""
+    for _loop, q, chunk in items:
+        q.put_nowait(chunk)
+
+
+def flush_stream_batch() -> None:
+    """Flush a step's buffered chunks: one call_soon_threadsafe per loop
+    (normally one — all requests on a rank share the API loop)."""
+    buf = getattr(_stream_batch_tls, "buf", None)
+    if not buf:
+        return
+    _stream_batch_tls.buf = []
+    # Group by loop (normally a single loop). dict preserves insertion order
+    # so per-request chunk ordering within the step is maintained.
+    by_loop: Dict[AbstractEventLoop, list] = {}
+    for loop, q, chunk in buf:
+        by_loop.setdefault(loop, []).append((loop, q, chunk))
+    for loop, items in by_loop.items():
+        loop.call_soon_threadsafe(_drain_batch_into_queues, items)
 
 
 def _send_stream_chunk_tagged(
