@@ -1323,12 +1323,18 @@ def _convert_req_index_to_global_index_kernel(
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr)  # int32
 
-        # Guard block_table access
+        # Guard block_table access. Bound `tok` itself, not just the column:
+        # under CUDA-graph replay a stale/-1 entry can occupy a lane the row
+        # mask still treats as valid; an unbounded flat load of
+        # kv_indices+kv_start+tok then underflows into an unmapped page and
+        # faults. Mirror the prefill kernel's (pos >= 0) & (pos < kv_len) guard
+        # and emit -1 for such entries (the documented "invalid" sentinel).
         valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        load_mask = valid_mask & (tok >= 0) & (tok < kv_len)
         out_val = tl.load(
             kv_indices + kv_start + tok,
-            mask=valid_mask,
-            other=0,
+            mask=load_mask,
+            other=-1,
         )
 
         # Store results
