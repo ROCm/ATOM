@@ -874,6 +874,24 @@ class MLAAttention(nn.Module):
                     sm_scale=self.scale,
                     q_scale=self._q_scale,
                     kv_scale=self._k_scale,
+                    work_meta_data=getattr(
+                        attn_metadata, "sparse_prefill_work_meta_data", None
+                    ),
+                    work_indptr=getattr(
+                        attn_metadata, "sparse_prefill_work_indptr", None
+                    ),
+                    work_info_set=getattr(
+                        attn_metadata, "sparse_prefill_work_info_set", None
+                    ),
+                    reduce_indptr=getattr(
+                        attn_metadata, "sparse_prefill_reduce_indptr", None
+                    ),
+                    reduce_final_map=getattr(
+                        attn_metadata, "sparse_prefill_reduce_final_map", None
+                    ),
+                    reduce_partial_map=getattr(
+                        attn_metadata, "sparse_prefill_reduce_partial_map", None
+                    ),
                 )
             else:
                 mla_prefill_fwd(
