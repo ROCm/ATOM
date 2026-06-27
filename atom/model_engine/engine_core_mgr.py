@@ -45,8 +45,6 @@ class CoreManager:
         self.stream_outputs_queue = queue.Queue()
         self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
-        # Batched stream-flush hook, resolved lazily (avoids import cycle).
-        self._flush_stream_batch_fn = None
         self.engine_core_processes = []
         self.input_sockets = []
         self.output_sockets = []
@@ -232,16 +230,18 @@ class CoreManager:
                             f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
                         )
                         self.stream_outputs_queue.put_nowait(stream_outputs)
-                        # Run per-seq callbacks (decode + buffer), then flush
-                        # the whole step in one scheduled call — avoids a
-                        # per-token call_soon_threadsafe storm on the API loop.
-                        any_callback = False
+                        # Also call callbacks if registered
                         for seq_id, request_output in stream_outputs:
                             callback = self._seq_id_to_callback.get(seq_id)
+                            logger.debug(
+                                f"{self.label}: seq_id={seq_id}, callback={'found' if callback is not None else 'NOT FOUND'}, tokens={request_output.output_tokens}"
+                            )
                             if callback is not None:
-                                any_callback = True
                                 try:
                                     callback(request_output)
+                                    logger.debug(
+                                        f"{self.label}: Successfully called callback for seq_id={seq_id}"
+                                    )
                                 except Exception as e:
                                     logger.warning(
                                         f"Error calling stream_callback for sequence {seq_id}: {e}",
@@ -249,12 +249,8 @@ class CoreManager:
                                     )
                             if request_output.finished:
                                 self._seq_id_to_callback.pop(seq_id, None)
-                        if any_callback:
-                            try:
-                                self._flush_stream_batch()
-                            except Exception:
-                                logger.exception(
-                                    f"{self.label}: flush_stream_batch failed"
+                                logger.debug(
+                                    f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                 )
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self.utility_response_queue.put_nowait(data)
@@ -416,20 +412,6 @@ class CoreManager:
                         ],
                         copy=False,
                     )
-
-    def _flush_stream_batch(self):
-        """Flush this step's buffered stream chunks (see flush_stream_batch).
-        Resolved lazily to avoid an import cycle; no-op without the entrypoint."""
-        fn = self._flush_stream_batch_fn
-        if fn is None:
-            try:
-                from atom.entrypoints.openai.api_server import flush_stream_batch
-
-                fn = self._flush_stream_batch_fn = flush_stream_batch
-            except Exception:
-                self._flush_stream_batch_fn = lambda: None  # resolve to no-op
-                return
-        fn()
 
     def get_stream_outputs(self):
         try:
