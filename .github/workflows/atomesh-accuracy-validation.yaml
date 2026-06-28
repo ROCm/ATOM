@@ -77,7 +77,7 @@ jobs:
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
@@ -253,7 +253,7 @@ jobs:
           EOF
 
       - name: Download aiter wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiter-whl
           path: /tmp/aiter-whl

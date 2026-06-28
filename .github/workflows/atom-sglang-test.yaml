@@ -226,7 +226,7 @@ jobs:
           echo "aiter_wheel_name=$(basename "$AITER_WHL")" >> "$GITHUB_OUTPUT"
 
       - name: Upload aiter wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
@@ -350,7 +350,7 @@ jobs:
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Download aiter wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiter-whl
           path: aiter-whl
@@ -630,7 +630,7 @@ jobs:
 
       - name: Upload SGLANG artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sglang-${{ matrix.model_name }}-artifacts
           path: |
