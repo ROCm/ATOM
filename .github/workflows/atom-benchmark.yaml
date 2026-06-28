@@ -158,6 +158,9 @@ jobs:
       atom_commit: ${{ inputs.atom_commit || '' }}
 
   summarize-benchmark-result:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     if: always()
     name: Summarize benchmark result
     needs: [benchmark]
