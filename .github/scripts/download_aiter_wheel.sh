@@ -22,11 +22,17 @@ ARTIFACT_RUN_SHA=""
 ARTIFACT_RUN_CREATED_AT=""
 
 resolve_download_url() {
-  python3 -c 'import sys
-  from urllib.parse import quote, unquote, urlsplit, urlunsplit
-  parts = urlsplit(sys.argv[1])
-  encoded_path = "/".join(quote(unquote(segment), safe="") for segment in parts.path.split("/"))
-  print(urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)))' "$1"
+  # The python body must be column-0: indenting continuation lines to match the
+  # bash block puts leading whitespace inside the single-quoted source and makes
+  # python raise "IndentationError: unexpected indent". The leading newline
+  # keeps the first line blank (valid) so every statement starts at column 0.
+  python3 -c '
+import sys
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+parts = urlsplit(sys.argv[1])
+encoded_path = "/".join(quote(unquote(segment), safe="") for segment in parts.path.split("/"))
+print(urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)))
+' "$1"
 }
 
 find_latest_artifact() {
