@@ -80,6 +80,9 @@ class MoEActivationQuant(Enum):
         return MoEActivationQuant.BF16
 
 
+_TBO_KEEPALIVE: dict[tuple[str, int], tuple[torch.Tensor, ...]] = {}
+
+
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
 
@@ -231,7 +234,10 @@ def pad_for_all_gather(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
     padding_shape[0] = max_batch_size
     padded_x = torch.empty(padding_shape, device=x.device, dtype=x.dtype)
     padded_x[:original_batch_size, :].copy_(x)
-    # padded_x[original_batch_size:, :].zero_()
+    # Padded rows still enter fused-MoE routing/sort/dispatch before being
+    # sliced away after reduce-scatter; uninitialized NaN/Inf rows can perturb
+    # expert buckets or shared scratch and corrupt real tokens.
+    padded_x[original_batch_size:, :].zero_()
     return padded_x, original_batch_size
 
 
@@ -2375,6 +2381,17 @@ class FusedMoE(torch.nn.Module):
                 ),
                 dim=0,
             )
+        # In the DP-attn fallback path (dp>1, no MORI all2all), MoE runs
+        # after all_gather_with_padding, so the token dim can be dp_size times
+        # the per-rank max.
+        moe_max_num_tokens = atom_config.max_num_batched_tokens
+        if (
+            self.moe_parallel_config.dp_size > 1
+            and not self.moe_parallel_config.use_all2all_kernels
+            and atom_config.enable_dp_attention
+        ):
+            moe_max_num_tokens *= self.moe_parallel_config.dp_size
+
         if fuse_shared_experts and self.num_fused_shared_experts > 0:
             init_aiter_topK_meta_data(
                 n_routed_experts=self.global_num_experts,
@@ -2387,7 +2404,7 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=atom_config.max_num_batched_tokens,
+                max_num_tokens=moe_max_num_tokens,
                 is_EP=self.use_ep,
             )
         if fuse_shared_experts:
@@ -2427,7 +2444,7 @@ class FusedMoE(torch.nn.Module):
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,
-            max_num_tokens=atom_config.max_num_batched_tokens,
+            max_num_tokens=moe_max_num_tokens,
             has_bias=self.has_bias,
             # is_act_and_mul=True,
             is_lora_enabled=False,
@@ -3338,6 +3355,26 @@ class FusedMoE(torch.nn.Module):
             hidden_states, router_logits, self.layer_name
         )
 
+    def _tbo_keepalive_slot(self) -> int:
+        try:
+            from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+
+            return tbo_current_ubatch_id()
+        except Exception:
+            return 0
+
+    def _hold_tbo_keepalive(self, role: str, *tensors: torch.Tensor) -> None:
+        tensors = tuple(tensor for tensor in tensors if tensor is not None)
+        if tensors:
+            # Keep one previous tensor set per ubatch/role alive globally.
+            # The next same-role hold, often in the next MoE layer, happens
+            # after this ubatch has waited on the prior comm work, so
+            # overwriting here is the delayed safe release point.
+            key = (role, self._tbo_keepalive_slot())
+            if key in _TBO_KEEPALIVE:
+                del _TBO_KEEPALIVE[key]
+            _TBO_KEEPALIVE[key] = tensors
+
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
@@ -3368,6 +3405,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
                 tbo_yield_and_switch_from_compute_to_comm()
+                self._hold_tbo_keepalive("ag_source", hidden_states, router_logits)
 
             (
                 hidden_states,
@@ -3380,6 +3418,7 @@ class FusedMoE(torch.nn.Module):
 
             if _tbo:
                 tbo_switch_to_compute_sync()
+                self._hold_tbo_keepalive("ag_output", hidden_states, router_logits)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -3405,6 +3444,7 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
+                self._hold_tbo_keepalive("rs_source", final_hidden_states)
             if dp_eager_mode:
                 final_hidden_states = reduce_scatterv(
                     final_hidden_states, sizes, dp_group
@@ -3415,6 +3455,7 @@ class FusedMoE(torch.nn.Module):
                 )
             if _tbo:
                 tbo_switch_to_compute_sync()
+                self._hold_tbo_keepalive("rs_output", final_hidden_states)
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

@@ -1016,7 +1016,7 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = not (dp_size > 1)
+            use_persistent_mode = dp_size <= 8
             if envs.ATOM_MLA_PAGE_SIZE > 1:
                 use_persistent_mode = False
 
