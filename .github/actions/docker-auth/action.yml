@@ -4,7 +4,7 @@ description: >-
   per-workflow inline `echo $PASSWORD | docker login` blocks so the credential
   handling lives in one place. Credentials are passed via env (never interpolated
   into the shell command line), which avoids both argv leakage and the
-  template-injection class that the inline `${{ secrets.* }}` form triggered.
+  template-injection class that inline secret interpolation triggered.
 
 inputs:
   username:
