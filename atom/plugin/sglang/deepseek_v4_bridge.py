@@ -916,7 +916,12 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         np.minimum((pos_np + 1) // 4, int(md.index_topk)),
         md.n_committed_csa_per_seq_cpu[batch_np],
     ).astype(np.int32)
-    hca_counts = md.n_committed_hca_per_seq_cpu[batch_np].astype(np.int32)
+    # Per-token causal cap, mirroring CSA above and the prefill kernel
+    # (n_hca = min((pos+1)//128, committed)); without it the indptr over-reserves
+    # vs the kernel's actual writes -> uninitialized HCA tail garbage.
+    hca_counts = np.minimum(
+        (pos_np + 1) // 128, md.n_committed_hca_per_seq_cpu[batch_np]
+    ).astype(np.int32)
     swa_indptr_np = _counts_to_indptr(swa_counts)
     csa_indptr_np = _counts_to_indptr(swa_counts + csa_counts)
     hca_indptr_np = _counts_to_indptr(swa_counts + hca_counts)
@@ -994,7 +999,12 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         np.minimum((pos_np + 1) // 4, md.n_committed_csa_per_seq_cpu[batch_np]),
         int(md.index_topk),
     ).astype(np.int32)
-    hca_count = md.n_committed_hca_per_seq_cpu[batch_np].astype(np.int32)
+    # Per-token causal cap, mirroring CSA above and the prefill kernel
+    # (n_hca = min((pos+1)//128, committed)); without it the indptr over-reserves
+    # vs the kernel's actual writes -> uninitialized HCA tail garbage.
+    hca_count = np.minimum(
+        (pos_np + 1) // 128, md.n_committed_hca_per_seq_cpu[batch_np]
+    ).astype(np.int32)
     ext_indptr_np = _counts_to_indptr(extend_count)
     swa_indptr_np = _counts_to_indptr(prefix_swa_count)
     csa_indptr_np = _counts_to_indptr(prefix_swa_count + csa_valid_k)

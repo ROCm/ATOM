@@ -104,6 +104,15 @@ from atom.model_engine.scheduler import Scheduler  # noqa: E402
 # ── 7. MockConfig ──────────────────────────────────────────────────────────
 
 
+class _MockHFConfig:
+    """Minimal hf_config stub. Default is non-V4 so Scheduler's V4 SWA-warmup
+    detection stays inert; pass architectures=[...] to exercise the V4 path."""
+
+    def __init__(self, architectures=None, sliding_window=128):
+        self.architectures = architectures or ["LlamaForCausalLM"]
+        self.sliding_window = sliding_window
+
+
 class MockConfig:
     """Lightweight stand-in for atom.config.Config.
 
@@ -118,6 +127,7 @@ class MockConfig:
             enable_prefix_caching=False,
             max_num_seqs=4,
             max_num_batched_tokens=64,
+            long_prefill_token_threshold=0,
             max_model_len=64,
             bos_token_id=1,
             eos_token_id=2,
@@ -125,6 +135,9 @@ class MockConfig:
             scheduler_delay_factor=0.0,
             speculative_config=None,
             enable_chunked_prefill=False,
+            # Scheduler.__init__ reads config.hf_config.architectures for V4
+            # SWA-warmup detection; a non-V4 stub keeps that path inert.
+            hf_config=_MockHFConfig(),
         )
         defaults.update(overrides)
         for k, v in defaults.items():
