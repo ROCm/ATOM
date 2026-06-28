@@ -19,6 +19,14 @@ Fix:
 import sys
 import unittest
 
+import pytest
+
+# These tests load the real atom.config / atom.model_ops.moe, which import the
+# AITER GPU kernel library (e.g. `from aiter import QuantType`). AITER has no
+# CPU/PyPI build, so skip this module visibly on the non-GPU unit gate; it runs
+# in the GPU CI where AITER is present.
+pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+
 # This test needs to inspect real atom source (not conftest.py stubs), so it
 # wipes any cached `atom.*` modules at module-import time. Previously this
 # also wiped the conftest stubs and never restored them, polluting later
