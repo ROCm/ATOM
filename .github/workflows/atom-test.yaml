@@ -241,62 +241,16 @@ jobs:
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
-        run: |
-          echo "Clean up containers..."
-          (docker ps -aq -f name="^${CONTAINER_NAME}$" | xargs -r docker stop) || true
-          (docker ps -aq -f name="^${CONTAINER_NAME}$" | xargs -r docker rm) || true
-
-          if [ -f "/etc/podinfo/gha-render-devices" ]; then
-            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-          else
-            DEVICE_FLAG="--device /dev/dri"
-          fi
-
-          if [ -d "/models" ]; then
-            MODEL_MOUNT="-v /models:/models"
-          else
-            echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
-            MODEL_MOUNT=""
-          fi
-
-          # Write env_vars via env block (avoids expression injection)
-          printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
-
-          IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
-          echo "Starting container with image: $IMAGE_TAG"
-          echo "Model-specific environment variables:"
-          cat /tmp/env_file.txt
-
-          PULL_FLAG=""
-          if [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
-            PULL_FLAG=""
-          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ] || [ "${{ matrix.runner }}" = "linux-atom-do-mi350x-8" ]; then
-            PULL_FLAG="--pull always"
-          fi
-
-          docker run -dt $PULL_FLAG --network=host --device=/dev/kfd $DEVICE_FLAG \
-          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-          $MODEL_MOUNT \
-          -w /workspace \
-          --ipc=host --group-add video \
-          --shm-size=16G \
-          --privileged \
-          --cap-add=SYS_PTRACE \
-          -e HF_TOKEN="${HF_TOKEN:-}" \
-          -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
-          --env-file /tmp/env_file.txt \
-          --security-opt seccomp=unconfined \
-          --ulimit memlock=-1 \
-          --ulimit stack=67108864 \
-          -e ATOM_DISABLE_MMAP=true \
-          -v "${{ github.workspace }}:/workspace" \
-          -w /workspace \
-          --name "$CONTAINER_NAME" \
-          $IMAGE_TAG
-
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          MODEL_ENV_VARS: ${{ matrix.env_vars }}
+        uses: ./.github/actions/setup-gpu-container
+        with:
+          container-name: ${{ env.CONTAINER_NAME }}
+          base-image: ${{ env.ATOM_BASE_IMAGE }}
+          resolved-image: ${{ env.RESOLVED_ATOM_BASE_IMAGE }}
+          runner: ${{ matrix.runner }}
+          env-vars: ${{ matrix.env_vars }}
+          hf-token: ${{ env.HF_TOKEN }}
+          dashboard-image: ${{ env.ATOM_DASHBOARD_DOCKER_IMAGE }}
+          network-host: "true"
 
       - name: Check shm size
         run: |
