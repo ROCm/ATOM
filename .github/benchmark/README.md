@@ -114,10 +114,37 @@ allocated for them**.
 | `regression_rerun.py` | regression report → rerun matrix |
 | `atom_test.sh` | in-container driver: `launch` / `benchmark` / `accuracy` / `stop` |
 | `summarize.py`, `plugin_benchmark_to_dashboard.py` | post-processing / dashboard input |
+| `validate_catalog.py` | schema + semantic gate for the accuracy catalogs (see below) |
 
 The GPU container lifecycle (start container + download model) is the composite
 action [`.github/actions/atom-bench-container`](../actions/atom-bench-container/action.yml),
 shared by the `benchmark-tmpl.yml` reusable workflow and the `regression-rerun` job.
+
+## Accuracy catalog schema
+
+The flat accuracy catalogs — `models_accuracy.json`, `oot_models_accuracy.json`,
+`sglang_models_accuracy.json` — are validated against
+[`schema/accuracy_catalog.schema.json`](schema/accuracy_catalog.schema.json) by
+[`../scripts/validate_catalog.py`](../scripts/validate_catalog.py). The
+`validate-catalog` job in `pre-checks.yaml` runs it on every PR (no GPU).
+
+- **Required fields**: `model_name`, `model_path`, `env_vars`, `runner`,
+  `test_level` (`pr` | `nightly` | `main`).
+- **`additionalProperties: false`** — an unknown/misspelled key fails CI. Add the
+  field to the schema first if it is intentional.
+- **Pass bar (semantic rule)**: each entry must have exactly one of
+  `accuracy_threshold` / `accuracy_test_threshold`.
+- **Known drift (tolerated for now)**: `extraArgs` vs `extra_args` and
+  `accuracy_threshold` vs `accuracy_test_threshold` are both accepted; the schema
+  documents the current reality. Normalizing these (and their consumers) is a
+  separate change.
+
+Run locally before pushing a catalog edit:
+
+```bash
+pip install jsonschema
+python .github/scripts/validate_catalog.py
+```
 
 ## Data contracts (keep stable)
 

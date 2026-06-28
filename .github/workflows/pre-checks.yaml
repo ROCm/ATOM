@@ -62,3 +62,18 @@ jobs:
             -reporter=github-pr-review \
             -filter-mode=diff_context \
             -fail-on-error=true
+
+  validate-catalog:
+    name: Validate accuracy catalogs against schema
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Python environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip3 install jsonschema
+      - name: Validate catalogs
+        run: python3 .github/scripts/validate_catalog.py
