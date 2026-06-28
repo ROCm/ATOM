@@ -503,6 +503,11 @@ jobs:
     name: Update accuracy dashboard
     needs: [atom-test]
     if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')
+    # Serialize with every other gh-pages push so the auto-push below does not
+    # race concurrent deploys (docs / benchmark dashboards) on the gh-pages branch.
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
