@@ -219,38 +219,6 @@ class TestSwiGLUInterleavingWithoutBias(unittest.TestCase):
       and guard only the bias interleaving on ``layer.w13_bias is not None``.
     """
 
-    @unittest.skip(
-        "Obsolete: Mxfp4MoEMethod.process_weights_after_loading no longer "
-        "branches on `layer.activation == ActivationType.Swiglu`. The function "
-        "now routes via `use_triton` (Triton swizzle) vs. the AITER shuffle "
-        "path, with bias cast handled unconditionally up top. The original "
-        "regression this guard was added for — the SwiGLU branch being "
-        "incorrectly gated on `w13_bias is not None` — cannot recur in the "
-        "current structure. Re-evaluate or delete when revisiting Mxfp4 MoE."
-    )
-    def test_swiglu_branch_condition_no_bias_check(self):
-        """The SwiGLU branch must NOT require bias to be present."""
-        import inspect
-        from atom.model_ops.moe import Mxfp4MoEMethod
-
-        source = inspect.getsource(Mxfp4MoEMethod.process_weights_after_loading)
-
-        # The condition should be just ActivationType.Swiglu, without "and ... bias"
-        self.assertIn(
-            "layer.activation == ActivationType.Swiglu:",
-            source.replace("\n", ""),
-            "SwiGLU branch must trigger on activation type alone, "
-            "not conditionally on bias presence",
-        )
-
-        # Bias interleaving should be guarded separately
-        self.assertIn(
-            "if layer.w13_bias is not None:",
-            source,
-            "Bias interleaving should be a separate conditional inside "
-            "the SwiGLU branch",
-        )
-
     def test_swiglu_branch_does_not_couple_bias_and_shuffle(self):
         """Ensure the old coupled condition is gone."""
         import inspect
