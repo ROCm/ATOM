@@ -1316,34 +1316,28 @@ def _convert_req_index_to_global_index_kernel(
     out_kv_start = tl.load(page_kv_indptr + batch_id)
     kv_len = kv_end - kv_start
 
-    # Decode-only kernel (max_seqlen_q == 1): each request has exactly one
-    # query token, so token_id == batch_id. Do NOT read qo_indptr
-    # (cu_seqlens_q): under CUDA-graph replay it can hold stale/cumulative
-    # (prefill) values, driving token_id far out of range -> a stale row of
-    # token_indices yields a -1 sentinel in a lane valid_mask treats as valid,
-    # and kv_indices+kv_start+(-1) underflows into an unmapped page and faults.
-    # batch_id == tl.program_id(0) is always correct, so derive the row
-    # directly and run a single pass.
-    token_id = batch_id
+    # Decode-only: token_id == batch_id. Don't read qo_indptr (cu_seqlens_q),
+    # which can be stale/cumulative under CUDA-graph replay.
+    for token_id in range(batch_id, batch_id + 1):
+        # Load token indices for this tile
+        ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+        tok = tl.load(ti_ptr)  # int32
 
-    # Load token indices for this tile
-    ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-    tok = tl.load(ti_ptr)  # int32
+        # Guard block_table access
+        valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        out_val = tl.load(
+            kv_indices + kv_start + tok,
+            mask=valid_mask,
+            other=0,
+        )
 
-    valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
-    out_val = tl.load(
-        kv_indices + kv_start + tok,
-        mask=valid_mask,
-        other=0,
-    )
-
-    # Store results
-    out_ptr_ij = out_kv_indices + out_kv_start + indice_id
-    tl.store(
-        out_ptr_ij,
-        out_val,
-        mask=valid_mask,
-    )
+        # Store results
+        out_ptr_ij = out_kv_indices + out_kv_start + indice_id
+        tl.store(
+            out_ptr_ij,
+            out_val,
+            mask=valid_mask,
+        )
 
 
 def triton_convert_req_index_to_global_index(
