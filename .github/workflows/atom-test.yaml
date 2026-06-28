@@ -316,29 +316,7 @@ jobs:
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
-        run: |
-          AITER_WHL=$(ls -t /tmp/aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
-          if [ -z "$AITER_WHL" ]; then
-            echo "ERROR: No amd_aiter wheel found"
-            ls -la /tmp/aiter-whl/
-            exit 1
-          fi
-
-          echo "=== Copying wheel into container ==="
-          WHL_NAME=$(basename "$AITER_WHL")
-          docker cp "$AITER_WHL" "$CONTAINER_NAME:/tmp/$WHL_NAME"
-
-          docker exec "$CONTAINER_NAME" bash -lc "
-            set -euo pipefail
-            echo '=== Uninstalling existing amd-aiter ==='
-            pip uninstall -y amd-aiter || true
-
-            echo '=== Installing amd-aiter from wheel ==='
-            pip install /tmp/$WHL_NAME
-
-            echo '=== Installed amd-aiter version ==='
-            pip show amd-aiter
-          "
+        run: bash .github/scripts/install_aiter_wheel.sh
 
       - name: Install ATOM and dependencies
         run: |
