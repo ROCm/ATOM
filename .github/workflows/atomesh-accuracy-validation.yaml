@@ -71,6 +71,8 @@ jobs:
     name: Download aiter wheel
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
       - name: Prefer latest main aiter wheel manifest and fallback to artifact
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
