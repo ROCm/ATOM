@@ -8,10 +8,17 @@ Nightly + on-demand performance benchmarking for the models in
 
 ```
 build-matrix            (ubuntu) validate catalog ⟷ dispatch inputs;
-  │                              expand catalog → cells.json (one cell = one run)
+  │                              expand catalog → configs_json (one config =
+  │                              variant × scenario, carrying a concurrency list)
   ▼
-benchmark               (GPU, matrix: cell) composite container setup →
+benchmark               (caller, matrix: config) one entry per variant×scenario;
+  │                              each calls benchmark-tmpl.yml (secrets: inherit)
+  ▼
+  └ benchmark-tmpl.yml   (GPU, matrix: conc) composite container setup →
   │                              atom_test.sh launch + benchmark → benchmark-<rf>.json
+  │                              Two-level fan-out (config × conc) keeps each
+  │                              matrix < GitHub's 256-jobs-per-matrix limit while
+  │                              every cell still runs as its own parallel job.
   ▼
 summarize-benchmark-result (ubuntu) gather results + previous-nightly baseline →
   │                              summarize.py → regression_report.json;
@@ -101,8 +108,8 @@ allocated for them**.
 
 | script | role |
 |--------|------|
-| `catalog.py` | catalog loader: `load_variants`, `build_cells`, `validate_dispatch_inputs`, `build_args` |
-| `build_benchmark_matrix.py` | turns the GitHub event + dispatch inputs into the `cells_json` matrix output |
+| `catalog.py` | catalog loader: `load_variants`, `build_cells`, `build_cell_configs`, `scenario_tag`, `validate_dispatch_inputs`, `build_args` |
+| `build_benchmark_matrix.py` | turns the GitHub event + dispatch inputs into the `configs_json` matrix output (variant×scenario configs, each with a concurrency list) |
 | `dashboard_models_map.py` | prefix→display map JS for the dashboard |
 | `regression_rerun.py` | regression report → rerun matrix |
 | `atom_test.sh` | in-container driver: `launch` / `benchmark` / `accuracy` / `stop` |
@@ -110,7 +117,7 @@ allocated for them**.
 
 The GPU container lifecycle (start container + download model) is the composite
 action [`.github/actions/atom-bench-container`](../actions/atom-bench-container/action.yml),
-shared by the `benchmark` and `regression-rerun` jobs.
+shared by the `benchmark-tmpl.yml` reusable workflow and the `regression-rerun` job.
 
 ## Data contracts (keep stable)
 
@@ -120,8 +127,14 @@ shared by the `benchmark` and `regression-rerun` jobs.
   this — do not change the format without updating the dashboard.
 - **Cell**: `build_cells` emits
   `{display, prefix, suffix, model_path, server_args, bench_args, env_vars,
-  runner, isl, osl, conc, ratio, result_filename}` — the single `benchmark`
-  matrix dimension.
+  runner, isl, osl, conc, ratio, result_filename}` — one fully-resolved run.
+- **Config** (matrix entry): `build_cell_configs` regroups cells by
+  (variant × scenario) into `{display, prefix, suffix, model_path, server_args,
+  bench_args, env_vars, runner, isl, osl, ratio, ratio_str, scenario,
+  concurrency}` where `concurrency` is a JSON list. The `benchmark` caller
+  matrixes over configs; `benchmark-tmpl.yml` matrixes over each config's
+  `concurrency`. Both stay < GitHub's 256-jobs-per-matrix limit. Adding a model
+  or scenario needs no workflow edit — the caller matrix is fully dynamic.
 
 ## How to …
 

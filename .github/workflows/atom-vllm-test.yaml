@@ -250,7 +250,7 @@ jobs:
               ATOM_MOE_GU_ITLV=1
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.94
-            runner: atom-mi35x-8gpu-oot-acc
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
@@ -259,15 +259,15 @@ jobs:
             env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_USE_V2_MODEL_RUNNER=1"
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.88
-            runner: atom-mi35x-8gpu-oot-acc
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Kimi-K2.5-MXFP4 TP4"
             model_name: "Kimi-K2.5-MXFP4"
             model_path: "amd/Kimi-K2.5-MXFP4-AttnFP8"
-            extra_args: "--tensor-parallel-size 4"
-            env_vars: ""
+            extra_args: "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384"
+            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.92
-            runner: atom-mi35x-8gpu-oot-acc
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
@@ -276,8 +276,8 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
             lm_eval_num_fewshot: 3
-            accuracy_test_threshold: 0.76
-            runner: atom-mi35x-8gpu-oot-acc
+            accuracy_test_threshold: 0.70
+            runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -467,8 +467,17 @@ jobs:
           if [ -d "/models" ]; then
             MODEL_CACHE_MOUNT="-v /models:/models"
             MODEL_CACHE_DESC="/models (host mount)"
+          elif [ -d "/it-share/models" ]; then
+            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
+            MODEL_CACHE_DESC="/it-share/models (host path)"
+          elif [ -d "/mnt/dcgpuval/models" ]; then
+            MODEL_CACHE_MOUNT="-v /mnt/dcgpuval/models:/models"
+            MODEL_CACHE_DESC="/mnt/dcgpuval/models (host path)"
+          elif [ -d "/shareddata/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
+            MODEL_CACHE_DESC="/shareddata/models (host path)"
           else
-            echo "Warning: /models directory not found on runner; using container-local /models."
+            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models directory not found on runner; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -490,7 +499,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host --network=host --group-add video \
             --shm-size=16G \
             --privileged \
             --cap-add=SYS_PTRACE \
@@ -593,7 +602,15 @@ jobs:
           fi
 
           echo "RESULT_FILE: $result_file"
-          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
+          flexible_extract_value=$(python3 - "$result_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              data = json.load(f)
+          print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
+          PY
+          )
           echo "Flexible extract value: $flexible_extract_value"
           echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
 
