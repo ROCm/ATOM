@@ -106,7 +106,7 @@ jobs:
     name: Build benchmark matrix
     runs-on: ubuntu-latest
     outputs:
-      cells_json: ${{ steps.build.outputs.cells_json }}
+      configs_json: ${{ steps.build.outputs.configs_json }}
       has_cells: ${{ steps.build.outputs.has_cells }}
     steps:
       - uses: actions/checkout@v6
@@ -118,8 +118,14 @@ jobs:
           INPUTS_JSON: ${{ toJson(inputs) }}
         run: python3 .github/scripts/build_benchmark_matrix.py
 
+  # Top-level fan-out: one matrix entry per (model variant × scenario) config.
+  # Each invokes benchmark-tmpl.yml, which fans out over the config's
+  # `concurrency` list. Two bounded matrices replace the former flat per-cell
+  # matrix that overflowed GitHub's 256-job-per-matrix limit (278 cells). Every
+  # (config × conc) cell still runs as its own parallel job; the caller job name
+  # stays `benchmark` so downstream `needs:` are unchanged.
   benchmark:
-    name: ${{ matrix.cell.display }} (isl=${{ matrix.cell.isl }} osl=${{ matrix.cell.osl }} c=${{ matrix.cell.conc }})
+    name: ${{ matrix.config.display }} ${{ matrix.config.scenario }}
     needs: [build-matrix]
     if: >-
       !cancelled()
@@ -128,181 +134,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Single dimension: each cell is one fully-resolved run (model variant ×
-        # scenario × concurrency). Concurrency bands are already applied by
-        # build_benchmark_matrix.py, so out-of-range combos never get scheduled —
-        # no GPU runner is allocated for them (the old exclude/IN_RANGE gate is gone).
-        cell: ${{ fromJson(needs.build-matrix.outputs.cells_json) }}
-
-    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}
-
-    env:
-      MODEL_PATH: ${{ matrix.cell.model_path }}
-      ARGS: ${{ matrix.cell.server_args }}
-      ISL: ${{ matrix.cell.isl }}
-      OSL: ${{ matrix.cell.osl }}
-      CONC: ${{ matrix.cell.conc }}
-      RANDOM_RANGE_RATIO: ${{ matrix.cell.ratio }}
-      RESULT_FILENAME: ${{ matrix.cell.result_filename }}
-
-    steps:
-      - name: Kill all Docker containers
-        run: |
-          echo "=== Cleaning up containers on $(hostname) ==="
-          containers=$(docker ps -q)
-          if [ -n "$containers" ]; then
-            docker kill $containers || true
-          fi
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
-
-      - name: Show ROCm status (host)
-        run: docker ps -a && rocm-smi --showmemuse 2>/dev/null || true
-
-      - name: Checkout ATOM repo
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.atom_commit || github.ref }}
-
-      - name: Start container + download model
-        uses: ./.github/actions/atom-bench-container
-        with:
-          image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
-          container-name: atom-benchmark
-          model-path: ${{ matrix.cell.model_path }}
-          env-vars: ${{ matrix.cell.env_vars }}
-          hf-token: ${{ secrets.AMD_HF_TOKEN }}
-          download-required: "true"
-          container-env: >-
-            -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }}
-            -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
-            -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }}
-            -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }}
-
-      - name: Collect GPU info (inside container)
-        id: gpu-info
-        env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-        run: |
-          RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}"
-          bash .github/scripts/collect_gpu_info.sh atom-benchmark docker "$RUNNER_HINT"
-          # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
-          DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
-          if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
-            RESOLVED_IMAGE=""
-            if RESOLUTION_JSON="$(python3 .github/scripts/resolve_atom_image.py --repository rocm/atom-dev --reference-tag latest --image-family native 2>/dev/null)"; then
-              RESOLVED_IMAGE="$(echo "$RESOLUTION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("resolved_image",""))')" || true
-            fi
-            DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
-          fi
-          echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
-          echo "Docker: ${DOCKER_IMAGE}"
-
-      - name: Run benchmark
-        timeout-minutes: 80
-        env:
-          EXTRA_LAUNCH_ARGS: ${{ inputs.extra_args || '' }}
-        run: |
-          set -euo pipefail
-          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
-          else model_path="${{ env.MODEL_PATH }}"; fi
-
-          # Launch via stdin so the container's bash parses the shell quoting in
-          # ARGS exactly once -- single-quoted JSON values survive intact (e.g.
-          # --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}').
-          # Substituting ${{ env.ARGS }} into a `bash -lc "..."` string instead
-          # collides the JSON's double quotes with the outer quotes and strips
-          # them (argparse: invalid loads value). Mirrors atom-test.yaml.
-          echo "ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
-            ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
-            .github/scripts/atom_test.sh launch $model_path $ARGS $EXTRA_LAUNCH_ARGS" \
-            | docker exec -i atom-benchmark bash -l
-
-          echo "========== Running benchmark =========="
-          docker exec \
-            -e ENABLE_TORCH_PROFILER="${{ inputs.enable_profiler && '1' || '0' }}" \
-            -e RESULT_FILENAME="${{ env.RESULT_FILENAME }}" \
-            -e SERVER_ARGS="$ARGS" \
-            -e BENCH_EXTRA_ARGS="${{ matrix.cell.bench_args }}" \
-            -e MP="$model_path" \
-            atom-benchmark bash -lc '.github/scripts/atom_test.sh benchmark "$MP"'
-
-      - name: Dump server log
-        if: always()
-        run: |
-          docker exec atom-benchmark cat /tmp/atom_server.log 2>/dev/null || true
-
-      - name: Dump client log
-        if: always()
-        run: |
-          docker exec atom-benchmark cat /tmp/atom_client.log 2>/dev/null || true
-
-      - name: Inject GPU metadata into benchmark result
-        run: |
-          docker exec \
-            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
-            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
-            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
-            -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
-            -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
-            -e DISPLAY_NAME="${{ matrix.cell.display }}" \
-            atom-benchmark python3 -c "
-          import json, os
-          p = os.environ['RESULT_PATH']
-          if not os.path.exists(p):
-              print(f'{p} not found, skipping GPU metadata injection')
-          else:
-              with open(p) as f:
-                  d = json.load(f)
-              d['gpu_name'] = os.environ.get('GPU_NAME', '')
-              d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
-              d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
-              d['docker_image'] = os.environ.get('DOCKER_IMAGE', '')
-              display_name = os.environ.get('DISPLAY_NAME', '')
-              if display_name:
-                  d['benchmark_model_name'] = display_name
-              with open(p, 'w') as f:
-                  json.dump(d, f, indent=2)
-          "
-
-      - name: Copy profiler traces
-        if: inputs.enable_profiler
-        run: docker cp atom-benchmark:/app/trace ./profiler-traces 2>/dev/null || true
-
-      - name: Upload profiler traces
-        if: inputs.enable_profiler
-        uses: actions/upload-artifact@v7
-        with:
-          name: profiler-traces-${{ env.RESULT_FILENAME }}
-          path: profiler-traces/
-
-      - name: Stop server and collect RTL traces
-        if: inputs.enable_rtl
-        run: |
-          docker exec atom-benchmark bash -lc \
-            "ENABLE_RTL_PROFILER=1 .github/scripts/atom_test.sh stop" || true
-          docker cp atom-benchmark:/app/rtl_traces ./rtl-traces 2>/dev/null || true
-
-      - name: Upload RTL traces
-        if: inputs.enable_rtl
-        uses: actions/upload-artifact@v7
-        with:
-          name: rtl-traces-${{ env.RESULT_FILENAME }}
-          path: rtl-traces/
-
-      - name: Upload benchmark result
-        uses: actions/upload-artifact@v7
-        with:
-          name: benchmark-${{ env.RESULT_FILENAME }}
-          path: ${{ env.RESULT_FILENAME }}.json
-
-      - name: Clean Up
-        if: always()
-        run: |
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
-            ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
-          docker stop atom-benchmark || true
-          docker rm atom-benchmark || true
+        config: ${{ fromJson(needs.build-matrix.outputs.configs_json) }}
+    uses: ./.github/workflows/benchmark-tmpl.yml
+    secrets: inherit
+    with:
+      display: ${{ matrix.config.display }}
+      prefix: ${{ matrix.config.prefix }}
+      suffix: ${{ matrix.config.suffix }}
+      model_path: ${{ matrix.config.model_path }}
+      server_args: ${{ matrix.config.server_args }}
+      bench_args: ${{ matrix.config.bench_args }}
+      env_vars: ${{ matrix.config.env_vars }}
+      runner: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.config.runner }}
+      isl: ${{ matrix.config.isl }}
+      osl: ${{ matrix.config.osl }}
+      ratio: ${{ matrix.config.ratio }}
+      ratio_str: ${{ matrix.config.ratio_str }}
+      concurrency: ${{ matrix.config.concurrency }}
+      image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+      enable_profiler: ${{ inputs.enable_profiler || false }}
+      enable_rtl: ${{ inputs.enable_rtl || false }}
+      extra_args: ${{ inputs.extra_args || '' }}
+      atom_commit: ${{ inputs.atom_commit || '' }}
 
   summarize-benchmark-result:
     if: always()

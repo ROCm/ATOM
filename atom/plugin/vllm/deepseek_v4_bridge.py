@@ -1130,7 +1130,13 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     csa_valid_k = np.minimum(
         np.minimum((pos_np + 1) // 4, n_csa_pt), index_topk
     ).astype(np.int32)
-    n_hca_pt = md.n_committed_hca_per_seq_cpu[batch_np].astype(np.int32)
+    # Per-token causal cap, mirroring CSA above and the kernel
+    # (write_v4_paged_prefill_indices: n_hca = min((pos+1)//128, committed)).
+    # Without it the indptr reserves `committed` HCA slots but the kernel only
+    # writes min((pos+1)//128, committed), leaving uninitialized tail garbage.
+    n_hca_pt = np.minimum(
+        (pos_np + 1) // 128, md.n_committed_hca_per_seq_cpu[batch_np]
+    ).astype(np.int32)
 
     ext_indptr_np = _counts_to_indptr(extend_count)
     swa_indptr_np = _counts_to_indptr(prefix_swa_count)

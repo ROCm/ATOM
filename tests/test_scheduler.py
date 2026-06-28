@@ -136,6 +136,133 @@ class TestSchedule:
         assert SequenceStatus.WAITING in statuses
 
 
+# ── long_prefill_token_threshold ──────────────────────────────────────────
+
+
+class TestLongPrefillTokenThreshold:
+    """Per-request cap on prefill tokens per step (vLLM parity)."""
+
+    def test_disabled_by_default(self, seq_factory):
+        """threshold=0 → no per-request cap, only max_num_batched_tokens applies."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [20]
+
+    def test_caps_single_long_request(self, seq_factory):
+        """A 20-token prompt with threshold=8 → first step does 8 tokens."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [8]
+
+    def test_short_request_unaffected(self, seq_factory):
+        """Prompt shorter than threshold → full prefill in one step."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                long_prefill_token_threshold=16,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory([1, 2, 3, 4, 5]))
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [5]
+
+    def test_applied_per_request_not_batch(self, seq_factory):
+        """Two long prompts each capped at 8 → batch carries 16 tokens."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))
+        sched.add(seq_factory(list(range(20, 40))))
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [8, 8]
+        assert batch.total_tokens_num_prefill == 16
+
+    def test_min_with_budget_remaining(self, seq_factory):
+        """budget < threshold → chunk is bounded by budget, not threshold."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=10,
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))  # capped at 8
+        sched.add(seq_factory(list(range(20, 40))))  # budget left = 2
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [8, 2]
+
+    def test_ignored_when_chunked_prefill_disabled(self, seq_factory):
+        """No chunked prefill → threshold is a no-op (full prompt or reject)."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=False,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))
+        batch, _ = sched.schedule()
+        # Full 20-token prompt scheduled in one shot, threshold ignored.
+        assert list(batch.num_scheduled_tokens) == [20]
+
+    def test_partial_prefill_resume_capped(self, seq_factory):
+        """Phase-1 resume of a partial-prefill seq is also capped by threshold."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=8,  # forces chunking on the 20-tok prompt
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(20)))
+        sched.add(seq)
+
+        # Step 1: new request, capped at 8.
+        batch1, _ = sched.schedule()
+        assert list(batch1.num_scheduled_tokens) == [8]
+        # Simulate postprocess marking it partial (would normally happen after
+        # forward returns and num_cached_tokens < num_prompt_tokens).
+        seq.num_cached_tokens = 8
+        seq.is_partial_prefill = True
+        sched._partial_prefill_count += 1
+
+        # Step 2: partial-prefill resume, also capped at 8 (not 12 remaining).
+        batch2, _ = sched.schedule()
+        assert list(batch2.num_scheduled_tokens) == [8]
+
+
 # ── prefix caching ────────────────────────────────────────────────────────
 
 
