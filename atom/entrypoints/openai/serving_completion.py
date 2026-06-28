@@ -55,14 +55,18 @@ def create_completion_chunk(
 async def stream_completion_response(
     request_id: str,
     model: str,
-    prompt: str,
     stream_queue: asyncio.Queue,
     seq_id: int,
-    tokenizer,
+    num_prompt_tokens: int,
     cleanup_fn,
 ) -> AsyncGenerator[str, None]:
-    """Generate streaming text completion response."""
-    num_tokens_input = len(tokenizer.encode(prompt))
+    """Generate streaming text completion response.
+
+    ``num_prompt_tokens`` is the engine-computed prompt length (``Sequence.
+    num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
+    event loop at stream start.
+    """
+    num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
 
     while True:
@@ -74,7 +78,7 @@ async def stream_completion_response(
         if "kv_transfer_params" in chunk_data:
             extra_fields["kv_transfer_params"] = chunk_data["kv_transfer_params"]
 
-        yield create_completion_chunk(
+        content_chunk = create_completion_chunk(
             request_id,
             model,
             new_text,
@@ -83,26 +87,31 @@ async def stream_completion_response(
         )
 
         if chunk_data.get("finished", False):
-            break
+            # Coalesce the finalization SSE messages (content + stop + usage +
+            # [DONE]) into a single send. At a wave boundary many requests
+            # finish simultaneously; collapsing 4 sends/req to 1 cuts the
+            # per-request socket-write syscalls that saturate the API loop.
+            cleanup_fn(request_id, seq_id)
+            usage_chunk = {
+                "id": request_id,
+                "object": TEXT_COMPLETION_OBJECT,
+                "created": int(time.time()),
+                "model": model,
+                "usage": {
+                    "prompt_tokens": num_tokens_input,
+                    "completion_tokens": num_tokens_output,
+                    "total_tokens": num_tokens_input + num_tokens_output,
+                },
+            }
+            yield (
+                content_chunk
+                + create_completion_chunk(request_id, model, "", "stop")
+                + f"data: {json.dumps(usage_chunk)}\n\n"
+                + STREAM_DONE_MESSAGE
+            )
+            return
 
-    cleanup_fn(request_id, seq_id)
-
-    usage = {
-        "prompt_tokens": num_tokens_input,
-        "completion_tokens": num_tokens_output,
-        "total_tokens": num_tokens_input + num_tokens_output,
-    }
-    yield create_completion_chunk(request_id, model, "", "stop")
-    # Usage-only chunk
-    usage_chunk = {
-        "id": request_id,
-        "object": TEXT_COMPLETION_OBJECT,
-        "created": int(time.time()),
-        "model": model,
-        "usage": usage,
-    }
-    yield f"data: {json.dumps(usage_chunk)}\n\n"
-    yield STREAM_DONE_MESSAGE
+        yield content_chunk
 
 
 def build_completion_response(
@@ -184,10 +193,9 @@ def build_completion_response_multi(
 async def stream_completion_response_fanout(
     request_id: str,
     model: str,
-    prompt: str,
     shared_queue: asyncio.Queue,
     seq_ids: List[int],
-    tokenizer,
+    num_prompt_tokens: int,
     cleanup_fn,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant multiplexing ``len(seq_ids)`` siblings into one SSE.
@@ -195,9 +203,13 @@ async def stream_completion_response_fanout(
     Each chunk pulled from ``shared_queue`` is a ``(sibling_index, chunk_data)``
     tuple; we re-emit with ``choices[0].index = sibling_index``. Finishes
     only when every sibling has reported ``finished=True``.
+
+    ``num_prompt_tokens`` is the engine-computed prompt length shared by all
+    siblings; reusing it avoids re-tokenizing on the event loop at stream
+    start.
     """
     n = len(seq_ids)
-    num_tokens_input = len(tokenizer.encode(prompt))
+    num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     finished = [False] * n
 
@@ -227,9 +239,6 @@ async def stream_completion_response_fanout(
     for sid in seq_ids:
         cleanup_fn(request_id, sid)
 
-    for i in range(n):
-        yield create_completion_chunk(request_id, model, "", "stop", index=i)
-
     usage = {
         "prompt_tokens": num_tokens_input,
         "completion_tokens": sum(num_tokens_output),
@@ -243,5 +252,12 @@ async def stream_completion_response_fanout(
         "model": model,
         "usage": usage,
     }
-    yield f"data: {json.dumps(usage_chunk)}\n\n"
-    yield STREAM_DONE_MESSAGE
+    # Coalesce the per-sibling stop chunks + usage + [DONE] into one send.
+    yield (
+        "".join(
+            create_completion_chunk(request_id, model, "", "stop", index=i)
+            for i in range(n)
+        )
+        + f"data: {json.dumps(usage_chunk)}\n\n"
+        + STREAM_DONE_MESSAGE
+    )
