@@ -1318,26 +1318,27 @@ def _convert_req_index_to_global_index_kernel(
 
     # Decode-only: token_id == batch_id. Don't read qo_indptr (cu_seqlens_q),
     # which can be stale/cumulative under CUDA-graph replay.
-    for token_id in range(batch_id, batch_id + 1):
-        # Load token indices for this tile
-        ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-        tok = tl.load(ti_ptr)  # int32
+    token_id = batch_id
 
-        # Guard block_table access
-        valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
-        out_val = tl.load(
-            kv_indices + kv_start + tok,
-            mask=valid_mask,
-            other=0,
-        )
+    # Load token indices for this tile
+    ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+    tok = tl.load(ti_ptr)  # int32
 
-        # Store results
-        out_ptr_ij = out_kv_indices + out_kv_start + indice_id
-        tl.store(
-            out_ptr_ij,
-            out_val,
-            mask=valid_mask,
-        )
+    # Guard block_table access
+    valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+    out_val = tl.load(
+        kv_indices + kv_start + tok,
+        mask=valid_mask,
+        other=0,
+    )
+
+    # Store results
+    out_ptr_ij = out_kv_indices + out_kv_start + indice_id
+    tl.store(
+        out_ptr_ij,
+        out_val,
+        mask=valid_mask,
+    )
 
 
 def triton_convert_req_index_to_global_index(
