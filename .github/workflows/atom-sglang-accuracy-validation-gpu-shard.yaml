@@ -126,13 +126,54 @@ jobs:
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
-      - name: Clean up old containers
+      - name: Clean up GPU and Python processes
         run: |
-          containers=$($CONTAINER_ENGINE ps -q)
-          if [ -n "$containers" ]; then
-            $CONTAINER_ENGINE kill $containers || true
+          set -euo pipefail
+
+          echo "=== Cleaning up GPU processes ==="
+          gpu_pids=""
+          for dev in /dev/kfd /dev/dri/renderD*; do
+            if [ -e "$dev" ]; then
+              dev_pids=$(fuser "$dev" 2>/dev/null || true)
+              if [ -n "$dev_pids" ]; then
+                gpu_pids="${gpu_pids} ${dev_pids}"
+              fi
+            fi
+          done
+          gpu_pids=$(printf '%s\n' $gpu_pids 2>/dev/null | awk '!seen[$1]++' | tr '\n' ' ' || true)
+          if [ -n "$gpu_pids" ]; then
+            echo "Killing GPU processes: $gpu_pids"
+            echo "$gpu_pids" | xargs -r sudo kill -9 || true
+          else
+            echo "No GPU processes found."
           fi
-          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+          echo "=== Cleaning up Python processes on this machine ==="
+          keep_pids=" $$ $PPID "
+          pid="$PPID"
+          while [ -n "$pid" ] && [ "$pid" != "0" ]; do
+            keep_pids="${keep_pids} ${pid} "
+            pid="$(ps -o ppid= -p "$pid" 2>/dev/null | awk '{print $1}' || true)"
+          done
+
+          python_pids=$(ps -eo pid=,comm= \
+            | awk -v keep="$keep_pids" '
+                keep ~ (" " $1 " ") { next }
+                $2 ~ /^python([0-9.]+)?$/ { print $1 }
+                $2 ~ /^python[0-9.]+-?dbg$/ { print $1 }
+                $2 ~ /^ipython$/ { print $1 }
+                $2 ~ /^pytest$/ { print $1 }
+                $2 ~ /^uvicorn$/ { print $1 }
+                $2 ~ /^gunicorn$/ { print $1 }
+                $2 ~ /^sglang$/ { print $1 }
+                $2 ~ /^vllm$/ { print $1 }
+              ' || true)
+          if [ -n "$python_pids" ]; then
+            echo "Killing Python processes on this machine: $python_pids"
+            echo "$python_pids" | xargs -r sudo kill -9 || true
+          else
+            echo "No Python processes found on this machine."
+          fi
 
       - name: Start validation container
         run: |
