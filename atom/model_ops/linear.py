@@ -473,6 +473,7 @@ class LinearBase(nn.Module):
 
         assert online_quant_dtype in [
             torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
             torch.float4_e2m1fn_x2,
         ], (
             f"Unsupported online quant: "
@@ -540,6 +541,7 @@ class LinearBase(nn.Module):
         self.quant_func = get_hip_quant(online_quant_type)
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
+            and q_weight.dtype != torch.float8_e4m3fnuz
         )
         self._online_quant_info = {
             "layer": self.prefix,
