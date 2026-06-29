@@ -115,10 +115,14 @@ jobs:
             MODEL_CACHE_ROOT="/data/pretrained_model"
             MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_ROOT="/data/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
             MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
-            echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model nor /shared/data/WRH/models exists on runner; using container-local ${MODEL_CACHE_ROOT}."
+            echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model nor /shared/data/WRH/models nor /data/models exists on runner; using container-local ${MODEL_CACHE_ROOT}."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
