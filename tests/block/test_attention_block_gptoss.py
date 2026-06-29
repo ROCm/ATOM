@@ -443,6 +443,98 @@ def make_attn(hf, layer_num, flash, kv_cache_dtype="bf16"):
     return attn
 
 
+def run_sweep(hf, cfg, backend, flash, args):
+    """Serving-scenario sweep (input/output = --sweep-io, default 8192/1024) on the
+    real OAIAttention: prefill (batch 1, latency + correctness) and a per-step decode
+    at each --conc over a pre-filled ctx=input+output cache (latency only)."""
+    import pandas as pd
+    from aiter.test_common import run_perftest
+    from atom.utils.forward_context import (
+        AttentionMetaData,
+        Context,
+        set_forward_context,
+    )
+
+    inp, out_len = args.sweep_io
+    ctx_len = inp + out_len
+    bsz = cfg.kv_cache_block_size
+    print(
+        f"sweep: input={inp} output={out_len} (decode ctx={ctx_len}) conc={args.conc}"
+    )
+    rows = []
+    for ln in (0, 1):
+        tag = "swa" if ln % 2 == 0 else "causal"
+        attn = make_attn(hf, ln, flash, kv_cache_dtype=args.kv_cache_dtype)
+        # prefill: correctness (sets cache + fwd ctx) then latency reusing that ctx.
+        err = run_prefill(attn, hf, cfg, 1, inp, ln, args, flash=flash)
+        ok = err == 0 or (isinstance(err, float) and err < 0.02)
+        hid = (torch.randn(inp, hf.hidden_size, device="cuda") * 0.1).to(torch.bfloat16)
+        pos = torch.arange(inp, dtype=torch.int64, device="cuda")
+        _, us = run_perftest(
+            attn, hid, pos, num_iters=args.iters, num_warmup=3, num_rotate_args=1
+        )
+        rows.append(
+            {
+                "phase": "prefill",
+                "layer": tag,
+                "conc": 1,
+                "us": round(us, 1),
+                "pass": ok,
+            }
+        )
+        # decode sweep reuses the SAME attn (re-creating would duplicate the
+        # static_forward_context registration for this layer).
+        for conc in args.conc:
+            _, _, bps = alloc_kv_cache(cfg, hf, conc, ctx_len, ln, flash_layout=flash)
+            bt = torch.arange(conc * bps, dtype=torch.int32, device="cuda").view(
+                conc, bps
+            )
+            cl = torch.full((conc,), ctx_len, dtype=torch.int32, device="cuda")
+            last = ctx_len - 1
+            slot = bt[:, last // bsz].to(torch.int64) * bsz + (last % bsz)
+            cu_q = torch.arange(conc + 1, dtype=torch.int32, device="cuda")
+            cu_k = torch.arange(
+                0, (conc + 1) * ctx_len, ctx_len, dtype=torch.int32, device="cuda"
+            )
+            pos = torch.full((conc,), last, dtype=torch.int64, device="cuda")
+            md = AttentionMetaData(
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=1,
+                max_seqlen_k=ctx_len,
+                min_seqlen_q=0,
+                slot_mapping=slot,
+                context_lens=cl,
+                block_tables=bt,
+                dropout_p=0.0,
+            )
+            set_forward_context(
+                md, cfg, Context(positions=pos, is_prefill=False, batch_size=conc)
+            )
+            hs = (torch.randn(conc, hf.hidden_size, device="cuda") * 0.1).to(
+                torch.bfloat16
+            )
+            _, us = run_perftest(
+                attn, hs, pos, num_iters=args.iters, num_warmup=3, num_rotate_args=1
+            )
+            rows.append(
+                {
+                    "phase": "decode",
+                    "layer": tag,
+                    "conc": conc,
+                    "us": round(us, 1),
+                    "pass": "(perf)",
+                }
+            )
+
+    print("\n" + pd.DataFrame(rows).to_string(index=False))
+    fail = sum(1 for r in rows if r["pass"] is False)
+    if fail:
+        print(f"\n{fail} prefill check(s) FAILED")
+        sys.exit(1)
+    print("\nSweep done (decode rows are latency-only).")
+
+
 def main():
     import aiter
 
@@ -472,6 +564,17 @@ def main():
     p.add_argument("--ctx-len", type=int, default=300)
     p.add_argument("--atol", type=float, default=2e-2)
     p.add_argument("--rtol", type=float, default=2e-2)
+    p.add_argument("--iters", type=int, default=10)
+    p.add_argument(
+        "--sweep",
+        action="store_true",
+        help="serving-scenario sweep: prefill + per-step decode over --conc at "
+        "input/output = --sweep-io (default 8192/1024)",
+    )
+    p.add_argument(
+        "--sweep-io", type=int, nargs=2, default=[8192, 1024], metavar=("IN", "OUT")
+    )
+    p.add_argument("--conc", type=int, nargs="+", default=[1, 16, 64, 128, 256, 512])
     args = p.parse_args()
 
     _init_tp1()
@@ -491,6 +594,9 @@ def main():
         hf, block_size=args.block_size, kv_cache_dtype=args.kv_cache_dtype
     )
     print(f"kv_cache_dtype={args.kv_cache_dtype} block_size={args.block_size}")
+    if args.sweep:
+        run_sweep(hf, cfg, backend, flash, args)
+        return
     layers = [0, 1] if args.layer == "both" else [int(args.layer)]
     phases = ["prefill", "decode"] if args.phase == "both" else [args.phase]
 
