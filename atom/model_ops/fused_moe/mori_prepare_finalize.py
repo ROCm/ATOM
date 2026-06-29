@@ -27,6 +27,19 @@ _NUM_TBO_UBATCHES = 2
 
 
 @lru_cache(maxsize=8)
+def _device_cu_count(device_index: int | None = None) -> int:
+    """Compute-unit (multiprocessor) count of the current CUDA/HIP device.
+
+    Used to cap mori IntraNode block_num so the kernels' grid-wide barrier
+    never asks for more co-resident blocks than the GPU has CUs (see
+    _get_dispatch_config). MI308X=80, MI300X=304, MI355X=256.
+    """
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@lru_cache(maxsize=8)
 def init_mori_op(
     rank: int,
     world_size: int,
@@ -160,11 +173,22 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         atom-vllm has no stable prefill/decode flag at this call site and
         instead selects by a token-count threshold; it overrides this method
         via a plugin patch, so keep this body frontend-agnostic.
+
+        block_num is capped at the device CU count: mori's IntraNode
+        dispatch/combine use a hand-rolled grid-wide barrier
+        (CrossDeviceBarrierIntraNodeKernel) that spins until *all* gridDim.x
+        blocks have arrived, which requires every block to be co-resident. The
+        combine block (1024 threads + larger dynamic smem) gets ~1 block/CU
+        occupancy, so launching more blocks than CUs (e.g. 128 on the 80-CU
+        MI308X) leaves the surplus blocks unscheduled -> the barrier never
+        completes -> warmup deadlocks. Capping at multi_processor_count keeps
+        big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
         """
+        mp = _device_cu_count()
         context = get_forward_context().context
         if context.is_prefill:
-            return 128, 16
-        return 64, 4
+            return min(128, mp), 16
+        return min(64, mp), 4
 
     # ---- Synchronous (non-TBO) path ----
 

@@ -22,7 +22,10 @@ from typing import Optional
 import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
-from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
+from atom.model_ops.fused_moe.mori_prepare_finalize import (
+    MoriPrepareAndFinalize,
+    _device_cu_count,
+)
 from atom.plugin.config import VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD
 
 _MORI_PATCH_APPLIED = False
@@ -108,9 +111,14 @@ def apply_vllm_mori_patch() -> None:
         assert (
             num_tokens is not None
         ), "num_tokens is required to choose MORI launch config in vLLM mode."
+        # Cap block_num at the device CU count: mori's IntraNode grid-wide
+        # barrier requires all gridDim.x blocks co-resident; >CU blocks (e.g.
+        # 128 on the 80-CU MI308X) deadlock at warmup. Mirrors the native
+        # MoriPrepareAndFinalize._get_dispatch_config cap.
+        mp = _device_cu_count()
         if num_tokens >= VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD:
-            return 128, 16
-        return 64, 4
+            return min(128, mp), 16
+        return min(64, mp), 4
 
     setattr(vllm_get_dispatch_config, "_atom_vllm_mori_patched", True)
     MoriPrepareAndFinalize._get_dispatch_config = vllm_get_dispatch_config
