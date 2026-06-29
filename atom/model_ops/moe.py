@@ -779,6 +779,39 @@ direct_register_custom_op(
 )
 
 
+def _interleave_gate_up_rows_(layer: torch.nn.Module) -> None:
+    """Reorder w13 gate/up rows from SEPARATED (gguu) to INTERLEAVED (gugu).
+
+    Operates in place on ``layer.w13_weight``, ``layer.w13_weight_scale`` and
+    ``layer.w13_bias`` (if present) along their row axis (dim=1), which is
+    ``2 * intermediate_size`` laid out as ``[gate(0..I-1) | up(0..I-1)]``. The
+    new order is ``[gate0, up0, gate1, up1, ...]`` so that a downstream consumer
+    splitting even/odd rows (the triton a16w4 SwiGLU kernel) reads matching
+    gate/up pairs. ``w2`` (down_proj) has no gate/up split and is untouched.
+
+    Idempotency guard: sets ``layer._w13_gate_up_interleaved`` so a double call
+    (e.g. process_weights_after_loading invoked twice) is a no-op.
+    """
+    if getattr(layer, "_w13_gate_up_interleaved", False):
+        return
+
+    def _interleave_rows(t: torch.Tensor) -> torch.Tensor:
+        # t: (E, 2I, ...) with rows [gate(I) | up(I)] -> [g0,u0,g1,u1,...]
+        two_i = t.shape[1]
+        assert two_i % 2 == 0, f"w13 row dim {two_i} not even"
+        i = two_i // 2
+        idx = torch.empty(two_i, dtype=torch.long, device=t.device)
+        idx[0::2] = torch.arange(i, device=t.device)  # gate -> even
+        idx[1::2] = torch.arange(i, device=t.device) + i  # up   -> odd
+        return t.index_select(1, idx).contiguous()
+
+    layer.w13_weight.data = _interleave_rows(layer.w13_weight.data)
+    layer.w13_weight_scale.data = _interleave_rows(layer.w13_weight_scale.data)
+    if getattr(layer, "w13_bias", None) is not None:
+        layer.w13_bias.data = _interleave_rows(layer.w13_bias.data)
+    layer._w13_gate_up_interleaved = True
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -938,6 +971,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
+        # Env-gated raw (pre-transform) MXFP4 expert weight stash, for the
+        # default-vs-triton fused_moe isolation test. The default (CK shuffle)
+        # and triton (_swizzle_mxfp4) paths transform these SAME raw tensors
+        # differently; saving them here lets the offline test apply both
+        # transforms and compare kernels on identical weights. No-op unless
+        # ATOM_MOE_RAWW_DUMP_DIR is set.
+        from atom.utils.debug_helper import maybe_dump_mxfp4_raw_weights
+
+        # maybe_dump_mxfp4_raw_weights(layer)
+
         if self.static_input_scales:
             layer.w13_input_scale = atom_parameter(
                 layer.w13_input_scale.max().to(torch.float32)
@@ -983,6 +1026,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.shared_w2_bias = layer.w2_bias.data[-n_shared:].contiguous()
                 else:
                     layer.shared_w2_bias = None
+
+            # gguu -> gugu interleave for the routed triton SwiGLU kernel.
+            #
+            # The checkpoint stores w13 gate/up rows SEPARATED ("gguu":
+            # [all-gate | all-up]). The aiter default CK fused_moe path consumes
+            # that directly. The triton a16w4 SwiGLU kernel, however, fuses the
+            # activation into the GEMM epilogue and splits each tile as
+            # INTERLEAVED ("gugu": a[...,::2]=gate, a[...,1::2]=up). Feeding gguu
+            # weights to that kernel mixes gate with gate and misreads up,
+            # corrupting the output. We interleave the routed w13 rows once here
+            # so the existing (well-tested) interleaved kernel produces results
+            # identical to the default path. w2 (down_proj) has no gate/up split.
+            #
+            # NOTE: this runs AFTER the shared-expert stash above, which keeps the
+            # shared experts in gguu for the dense swiglu_oai_split path. Only the
+            # SwiGLU triton branch needs interleaved rows; the SiLU branch uses
+            # fused_clamp_act_mul, which half-splits gguu — so gate on activation.
+            if getattr(layer, "activation", None) == ActivationType.Swiglu:
+                _interleave_gate_up_rows_(layer)
 
             (
                 w13_weight,
@@ -1231,12 +1293,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.fused_experts is None:
-            return fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
+            # Positional kernel args, then the keyword kernel args (incl.
+            # moe_extra_args: gate_mode / swiglu_limit). Built once so the same
+            # values feed both the kernel call and the env-gated I/O dump.
+            fused_moe_pos = (x, layer.w13_weight, layer.w2_weight, topk_weights, topk_ids)
+            fused_moe_kw = dict(
                 expert_mask=layer.expert_mask,
                 activation=activation,
                 quant_type=self.quant_type,
@@ -1251,6 +1312,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias2=layer.w2_bias,
                 **moe_extra_args,
             )
+            # Env-gated kernel I/O dump for offline correctness debugging.
+            from atom.utils.debug_helper import maybe_dump_fused_moe_io
+
+            _moe_dump_args = {
+                "x": x,
+                "w1": layer.w13_weight,
+                "w2": layer.w2_weight,
+                "topk_weights": topk_weights,
+                "topk_ids": topk_ids,
+                **fused_moe_kw,
+            }
+            layer_name = getattr(layer, "layer_name", "")
+            # maybe_dump_fused_moe_io(layer_name, _moe_dump_args)
+            moe_out = fused_moe(*fused_moe_pos, **fused_moe_kw)
+            # maybe_dump_fused_moe_io(layer_name, _moe_dump_args, output=moe_out)
+            return moe_out
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,

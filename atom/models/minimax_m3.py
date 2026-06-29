@@ -616,17 +616,17 @@ class MiniMaxM3DecoderLayer(nn.Module):
             aux_out.append(residual.clone())
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        maybe_dump_minimax_m3_layer(
-            hidden_states, self.layer_num, "attn", self._last_layer_idx
-        )
+        # maybe_dump_minimax_m3_layer(
+        #     hidden_states, self.layer_num, "attn", self._last_layer_idx
+        # )
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
-        maybe_dump_minimax_m3_layer(
-            hidden_states, self.layer_num, "moe", self._last_layer_idx
-        )
+        # maybe_dump_minimax_m3_layer(
+        #     hidden_states, self.layer_num, "moe", self._last_layer_idx
+        # )
         return hidden_states, residual
 
 
