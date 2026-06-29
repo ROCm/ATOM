@@ -494,7 +494,10 @@ class MooncakeConnector(KVConnectorBase):
     _MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024
 
     def register_kv_caches(
-        self, kv_caches: dict[str, Any], transfer_tensors: Any = None
+        self,
+        kv_caches: dict[str, Any],
+        transfer_tensors: Any = None,
+        num_blocks: int | None = None,
     ) -> None:
         """Register KV cache tensors with the Mooncake TransferEngine."""
         self.kv_caches = kv_caches

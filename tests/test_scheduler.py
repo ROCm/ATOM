@@ -2,6 +2,9 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
+from collections import deque
+from types import SimpleNamespace
+
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     Scheduler,
@@ -103,6 +106,42 @@ class TestSchedule:
         assert batch.total_tokens_num_prefill == 6
         assert list(batch.num_scheduled_tokens) == [4, 2]
 
+    def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+
+        batch1, _ = sched.schedule()
+        assert batch1.total_tokens_num_prefill == 6
+        assert list(batch1.scheduled_tokens) == list(range(6))
+        assert list(batch1.num_cached_tokens) == [0]
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+        assert seq.is_partial_prefill is True
+        assert seq.num_cached_tokens == 6
+
+        batch2, _ = sched.schedule()
+        assert batch2.total_tokens_num_prefill == 4
+        assert list(batch2.scheduled_tokens) == list(range(6, 10))
+        assert list(batch2.num_cached_tokens) == [6]
+
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
         sched.add(seq_factory([1, 2, 3, 4]))  # 1 block
@@ -134,6 +173,83 @@ class TestSchedule:
         statuses = {s1.status, s2.status}
         assert SequenceStatus.RUNNING in statuses
         assert SequenceStatus.WAITING in statuses
+
+    def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
+        sched = Scheduler.__new__(Scheduler)
+        fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
+        ready = SimpleNamespace(id=2, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
+        blocked = SimpleNamespace(id=3, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
+        sched.waiting = deque([fresh, ready, blocked])
+        sched.finished_recving_kv_req_ids = ["2"]
+        sched.failed_recving_kv_req_ids = []
+
+        sched._promote_ready_remote_kv_requests()
+
+        assert [seq.id for seq in sched.waiting] == [2, 1, 3]
+
+    def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
+        class _Connector:
+            def should_park_partial_prefill_for_load(self, seq):
+                return seq.id == 2
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = _Connector()
+        sched.waiting = deque()
+        sched._partial_prefill_count = 1
+        keep = SimpleNamespace(
+            id=1,
+            status=SequenceStatus.RUNNING,
+            is_partial_prefill=False,
+        )
+        ready = SimpleNamespace(
+            id=2,
+            status=SequenceStatus.RUNNING,
+            is_partial_prefill=True,
+        )
+        sched.running = deque([keep, ready])
+
+        sched._park_ready_offload_partial_prefills()
+
+        assert [seq.id for seq in sched.running] == [1]
+        assert [seq.id for seq in sched.waiting] == [2]
+        assert ready.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        assert ready.is_partial_prefill is False
+        assert ready._discard_next_deferred_output is True
+        assert sched._partial_prefill_count == 0
+
+    def test_offload_partial_handoff_discards_stale_deferred_output(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=10,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)), sampling_params=SamplingParams(max_tokens=4))
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.PREFILL
+        seq.num_cached_tokens = 8
+        seq._discard_next_deferred_output = True
+        sched.running = deque([seq])
+
+        sched.postprocess(
+            [seq],
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(999,)],
+                num_rejected=[0],
+                num_bonus=[0],
+                draft_token_ids=None,
+                is_deferred_out=True,
+            ),
+            batch=SimpleNamespace(req_ids=[seq.id], num_scheduled_tokens=[2]),
+        )
+
+        assert seq.num_cached_tokens == 10
+        assert seq._discard_next_deferred_output is False
+        assert 999 not in seq.output_tokens
+        assert seq.output_tokens == [sched.eos_token_id]
 
 
 # ── long_prefill_token_threshold ──────────────────────────────────────────
