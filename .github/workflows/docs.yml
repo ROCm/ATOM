@@ -49,6 +49,9 @@ jobs:
           retention-days: 7
 
   deploy-docs:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     needs: build-docs
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/docs-website')

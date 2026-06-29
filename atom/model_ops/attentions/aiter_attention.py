@@ -755,6 +755,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in range(num_layers):
                     _add_region(runner.kv_scale[0, layer_id])
                     _add_region(runner.kv_scale[1, layer_id])
+            # MiniMax-M3 sparse attention's per-token indexer-key cache
+            # (used for top-k block selection on the consumer).
+            index_cache = getattr(runner, "sparse_attention_index_cache", None)
+            if index_cache is not None:
+                for sparse_idx in range(index_cache.shape[0]):
+                    _add_region(index_cache[sparse_idx])
 
         return KVTransferTensors(
             block_regions=block_regions,
