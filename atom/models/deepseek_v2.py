@@ -1899,6 +1899,12 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_b_proj=self.kv_b_proj,
             o_proj=self.o_proj,
             indexer=self.indexer,
+            # v3.2 / GLM-5.2 runs sparse MLA on every layer. For GLM-5.2 IndexShare
+            # "shared" layers self.indexer is None, but they must still run sparse
+            # attention and reuse the prior full layer's top-k, so flag sparsity at
+            # the model level rather than per-layer.
+            is_sparse=self.is_v32,
+            topk_tokens=(config.index_topk if self.is_v32 else None),
         )
 
         self.mla_attn = Attention(
