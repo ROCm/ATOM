@@ -186,6 +186,9 @@ jobs:
               echo "GPU is clean."
           fi
 
+          echo "=== Cleaning up containers ==="
+          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
       - name: Start validation container
         run: |
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
