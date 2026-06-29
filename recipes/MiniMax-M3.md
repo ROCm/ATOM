@@ -170,7 +170,6 @@ draft_path=Inferact/MiniMax-M3-EAGLE3
 
 export ATOM_FORCE_ATTN_TRITON=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
