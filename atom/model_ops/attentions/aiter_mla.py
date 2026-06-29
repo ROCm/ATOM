@@ -837,6 +837,151 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dtype_q = self.dtype_q
         return attn_metadata, positions
 
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        """Build split-dispatch metadata for a mixed prefill+decode batch.
+
+        Returns one AttentionMetaData whose `prefill_attn_metadata` drives the
+        first `n_prefill_tokens` rows (MHA path) and whose `decode_attn_metadata`
+        drives the remaining decode rows (MLA latent path), plus a merged
+        `positions` tensor laid out [prefill | decode].
+
+        The prefill half reuses the tested `prepare_prefill`, then *clones* its
+        tensors off the shared `forward_vars` buffers so the decode half (which
+        rewrites those same buffers) cannot corrupt them.
+        """
+        assert not self.is_sparse, (
+            "Mixed prefill+decode batches do not yet support sparse MLA "
+            "(V3.2/V4 indexer). Disable --enable-mixed-prefill-decode."
+        )
+        var = self.model_runner.forward_vars
+        n_p_seqs = batch.total_seqs_num_prefill
+        n_p_tokens = batch.total_tokens_num_prefill
+        n_d_seqs = batch.total_seqs_num_decode
+        n_d_tokens = batch.total_tokens_num_decode
+        total_tokens = n_p_tokens + n_d_tokens
+
+        # ---- Prefill half: prefill rows are first, so prepare_prefill reads
+        # the correct [:n_p_seqs] slice. Capture positions before the decode
+        # half overwrites the shared positions buffer. ----
+        prefill_meta, _ = self.prepare_prefill(batch)
+        prefill_positions_np = var["positions"].np[:n_p_tokens].copy()
+
+        # Detach prefill metadata from shared forward_vars buffers.
+        for fname in (
+            "cu_seqlens_q",
+            "cu_seqlens_k",
+            "slot_mapping",
+            "context_lens",
+            "block_tables",
+            "kv_indptr",
+            "kv_indices",
+            "kv_last_page_lens",
+            "num_cached_tokens",
+            "seq_starts",
+        ):
+            t = getattr(prefill_meta, fname, None)
+            if isinstance(t, torch.Tensor):
+                setattr(prefill_meta, fname, t.clone())
+
+        # ---- Decode half: decode rows live at [n_p_seqs:] in batch arrays but
+        # are packed into forward_vars buffer rows [0:n_d_seqs] so the persistent
+        # MLA work-buffer builder (which indexes from 0) sees a contiguous batch.
+        d_ctx = np.asarray(batch.context_lens[n_p_seqs:], dtype=np.int32)
+        d_block_tables = batch.block_tables[n_p_seqs:]
+        d_last_block = batch.last_block_num_tokens[n_p_seqs:]
+        max_q_d = 1
+        max_k_d = int(d_ctx.max()) if n_d_seqs > 0 else 0
+
+        slot_d = [
+            bt[-1] * self.model_runner.block_size + lbt - 1
+            for bt, lbt in zip(d_block_tables, d_last_block)
+        ]
+        positions_d = (d_ctx - 1).astype(np.int32)
+
+        # Mixed batches always run eager, so the decode half is sized to the
+        # actual decode seq count (no CUDAGraph batch padding).
+        d_bs = n_d_seqs
+
+        block_tables_np = var["block_tables"].np
+        for i, bt in enumerate(d_block_tables):
+            block_tables_np[i] = 0
+            block_tables_np[i, : len(bt)] = bt
+
+        var["context_lens"].np[:d_bs] = d_ctx
+
+        num_blocks_per_seq = cdiv(d_ctx, self.block_size)
+        kv_indptr = np.cumsum(num_blocks_per_seq)
+        var["kv_indptr"].np[0] = 0
+        var["kv_indptr"].np[1 : d_bs + 1] = kv_indptr
+        var["kv_last_page_lens"].np[:d_bs] = d_last_block if self.block_size != 1 else 1
+        # Decode is one query token per seq: cu_seqlens_q = [0, 1, 2, ..., d_bs].
+        var["cu_seqlens_q"].np[: d_bs + 1] = np.arange(d_bs + 1, dtype=np.int32)
+        var["slot_mapping"].np[:d_bs] = slot_d
+
+        d_block_tables_gpu = var["block_tables"].copy_to_gpu(d_bs)
+        kv_indptr_gpu = var["kv_indptr"].copy_to_gpu(d_bs + 1)
+        context_lens_gpu = var["context_lens"].copy_to_gpu(d_bs)
+        cu_q_gpu = var["cu_seqlens_q"].copy_to_gpu(d_bs + 1)
+        klp_gpu = var["kv_last_page_lens"].copy_to_gpu(d_bs)
+        slot_d_gpu = var["slot_mapping"].copy_to_gpu(d_bs)
+
+        kv_indices_gpu = var["kv_indices"].gpu
+        kv_indices_generate_triton(
+            d_block_tables_gpu,
+            kv_indices_gpu,
+            kv_indptr_gpu,
+            self.block_ratio,
+            max_k_d,
+        )
+
+        ctx_ps = self.set_mla_persistent_worker_buffers(d_bs, max_q_d)
+
+        decode_meta = AttentionMetaData(
+            cu_seqlens_q=cu_q_gpu,
+            max_seqlen_q=max_q_d,
+            max_seqlen_k=max_k_d,
+            slot_mapping=slot_d_gpu[:n_d_seqs],
+            context_lens=context_lens_gpu,
+            block_tables=d_block_tables_gpu,
+            kv_indptr=kv_indptr_gpu,
+            kv_indices=kv_indices_gpu,
+            kv_last_page_lens=klp_gpu,
+            **ctx_ps,
+        )
+        decode_meta.dtype_q = self.dtype_q
+
+        # ---- Merge positions and slot_mapping ([prefill | decode]) ----
+        var["positions"].np[:n_p_tokens] = prefill_positions_np
+        var["positions"].np[n_p_tokens:total_tokens] = positions_d
+        positions = var["positions"].copy_to_gpu(total_tokens)
+
+        merged_slot = np.empty(total_tokens, dtype=np.int64)
+        prefill_slot = prefill_meta.slot_mapping
+        merged_slot[:n_p_tokens] = (
+            prefill_slot.cpu().numpy()
+            if isinstance(prefill_slot, torch.Tensor)
+            else prefill_slot
+        )
+        merged_slot[n_p_tokens:total_tokens] = slot_d
+        # from_numpy keeps the tensor on CPU regardless of the active default-device
+        # guard (torch.tensor(..., pin_memory=True) raises under a CUDA guard).
+        merged_slot_gpu = torch.from_numpy(merged_slot).to(
+            self.device, non_blocking=True
+        )
+
+        attn_metadata = AttentionMetaData(
+            slot_mapping=merged_slot_gpu,
+            # Surface prefill cu_seqlens_q on the top-level metadata so the
+            # ParallelLMHead mixed-batch gather (embed_head.py) can find the
+            # per-prefill-seq last-token indices without reaching into the
+            # nested prefill metadata.
+            cu_seqlens_q=prefill_meta.cu_seqlens_q,
+            prefill_attn_metadata=prefill_meta,
+            decode_attn_metadata=decode_meta,
+        )
+        attn_metadata.dtype_q = self.dtype_q
+        return attn_metadata, positions
+
     def _build_mla_chunk_meta(
         self, batch: ScheduledBatch, bs: int
     ) -> Optional[MLAChunkContextMetadata]:

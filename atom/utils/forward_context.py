@@ -326,6 +326,12 @@ class Context:
     # that need the token ids but cannot receive them as a function arg
     # (the op signature is fixed by the consumer's plugin contract).
     input_ids: Optional[torch.Tensor] = None
+    # Mixed prefill+decode (Phase 2). When True, the first num_prefill_tokens
+    # rows of q/k/v are prefill chunks and the rest are decode tokens; the
+    # attention backend splits them via prefill_attn_metadata / decode_attn_metadata.
+    is_mixed: bool = False
+    num_prefill_tokens: int = 0
+    num_prefill_seqs: int = 0
 
     def __init__(
         self,
@@ -338,6 +344,9 @@ class Context:
         dp_uniform_decode: bool = True,
         forward_mode: Optional[ForwardMode] = None,
         input_ids: Optional[torch.Tensor] = None,
+        is_mixed: bool = False,
+        num_prefill_tokens: int = 0,
+        num_prefill_seqs: int = 0,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -348,6 +357,9 @@ class Context:
         self.dp_uniform_decode = dp_uniform_decode
         self.forward_mode = forward_mode
         self.input_ids = input_ids
+        self.is_mixed = is_mixed
+        self.num_prefill_tokens = num_prefill_tokens
+        self.num_prefill_seqs = num_prefill_seqs
 
 
 @dataclass
@@ -391,6 +403,15 @@ class AttentionMetaData:
     num_cached_tokens: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
 
+    # Mixed prefill+decode (Phase 2) split-dispatch sub-metadata. For a mixed
+    # batch the builder returns ONE AttentionMetaData whose `slot_mapping` covers
+    # all tokens (merged prefill-then-decode), and whose attention dispatch is
+    # driven by these two nested objects: `prefill_attn_metadata` for the first
+    # `context.num_prefill_tokens` rows and `decode_attn_metadata` for the rest.
+    # None for non-mixed batches.
+    prefill_attn_metadata: Optional["AttentionMetaData"] = None
+    decode_attn_metadata: Optional["AttentionMetaData"] = None
+
     def __init__(
         self,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -421,7 +442,11 @@ class AttentionMetaData:
         total_kv: Optional[int] = None,
         num_cached_tokens: Optional[torch.Tensor] = None,
         seq_starts: Optional[torch.Tensor] = None,
+        prefill_attn_metadata: Optional["AttentionMetaData"] = None,
+        decode_attn_metadata: Optional["AttentionMetaData"] = None,
     ):
+        self.prefill_attn_metadata = prefill_attn_metadata
+        self.decode_attn_metadata = decode_attn_metadata
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens

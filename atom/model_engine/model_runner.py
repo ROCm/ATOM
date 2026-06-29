@@ -95,7 +95,26 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = True
+        # Deferred output is disabled when running in P/D disaggregation mode
+        # (kv_transfer_config is set), enabled otherwise.
+        # TODO: In P/D disaggregation mode, if have issue, we can disable it
+        # Mixed prefill+decode: the deferred GPU-gather path has a known
+        # accuracy bug (idle decode seqs read a placeholder token across a
+        # prefill chunk — R1 GSM8K 0.87 vs 0.9469). It is NOT a memory bug:
+        # verified crash-free at conc 2048 / ISL 8192 with deferred forced on.
+        # Disable deferred under the mixed flag until the accuracy bug is fixed.
+        self.is_deferred_out = not getattr(
+            runner.config, "enable_mixed_prefill_decode", False
+        )
+        # Escape hatch: ATOM_FORCE_DEFERRED=1 forces deferred output ON even
+        # under the mixed flag. Deferred+mixed has a known accuracy bug (not a
+        # crash — verified crash-free at conc 2048 / ISL 8192) but is faster, so
+        # this lets us measure mixed+deferred throughput while the accuracy fix
+        # is pending. Do NOT use for accuracy-sensitive runs.
+        import os as _os
+
+        if _os.environ.get("ATOM_FORCE_DEFERRED") == "1":
+            self.is_deferred_out = True
 
         self.runner = runner
         device = runner.device
@@ -360,6 +379,7 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
+        is_mixed = getattr(batch, "is_mixed", False)
         """for prefill: all input ids are new"""
         self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
             :total_tokens_prefill
@@ -367,6 +387,75 @@ class tokenIDProcessor:
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
         self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+
+        if is_mixed:
+            # Mixed batch layout: [prefill_tokens | decode_tokens]. The prefill
+            # region is already written above. Fill the decode region (one token
+            # per decode seq, in batch order — which matches the decode attention
+            # metadata's row order) starting at `decode_offset`.
+            # MTP / speculative decode with mixed batches is a separate follow-up
+            # (the per-seq multi-token layout isn't wired into this branch).
+            assert not self.use_spec, (
+                "Mixed prefill+decode batches do not yet support MTP / speculative "
+                "decode (follow-up). Disable --enable-mixed-prefill-decode for now."
+            )
+            decode_offset = total_tokens_prefill
+            sched_decode = scheduled_tokens[
+                decode_offset : decode_offset + total_tokens_decode
+            ]
+
+            # Non-deferred OR first step (no prior batch to gather from): decode
+            # inputs come straight from scheduled_tokens. This is the path
+            # already verified at GSM8K parity on R1 / V4-Pro.
+            if not self.is_deferred_out or self.prev_batch is None:
+                self.input_ids.np[
+                    decode_offset : decode_offset + total_tokens_decode
+                ] = sched_decode
+                self.input_ids.copy_to_gpu(total_tokens)
+                return self.input_ids.gpu[:total_tokens]
+
+            # Deferred path: each decode seq's input is the token sampled for it
+            # last step, kept on-GPU in `prev_token_ids` (ordered by
+            # prev_batch.req_ids). Map current decode seqs — batch positions
+            # [n_prefill_seqs:] — to their prev_batch slot. A decode seq is
+            # ALWAYS in prev_batch in steady state (it decoded last step); a
+            # genuinely-new decode row (just finished prefill elsewhere) falls
+            # back to scheduled_tokens. Prefill rows are never gathered.
+            #
+            # Destination index = decode_offset + i, where i is the decode seq's
+            # position within the decode segment — identical to the decode
+            # attention metadata row order, guaranteeing alignment.
+            n_prefill_seqs = batch.total_seqs_num_prefill
+            prev_id_to_idx = {rid: j for j, rid in enumerate(self.prev_batch.req_ids)}
+            deferred_dst: list[int] = []
+            deferred_prev: list[int] = []
+            for i, rid in enumerate(batch.req_ids[n_prefill_seqs:]):
+                prev_idx = prev_id_to_idx.get(rid)
+                if prev_idx is not None:
+                    deferred_dst.append(decode_offset + i)
+                    deferred_prev.append(prev_idx)
+
+            # Baseline the whole decode region from scheduled_tokens (correct for
+            # any new decode seq not in prev_batch). Deferred positions are then
+            # overwritten GPU-side by the gather below.
+            self.input_ids.np[decode_offset : decode_offset + total_tokens_decode] = (
+                sched_decode
+            )
+            self.input_ids.copy_to_gpu(total_tokens)
+
+            if deferred_dst:
+                self.input_ids_loc.np[: len(deferred_prev)] = deferred_prev
+                prev_idx_gpu = self.input_ids_loc.copy_to_gpu(len(deferred_prev))
+                gathered = torch.gather(self.prev_token_ids, 0, prev_idx_gpu)
+                dst_gpu = torch.as_tensor(
+                    deferred_dst, dtype=torch.long, device=self.input_ids.gpu.device
+                )
+                self.input_ids.gpu[dst_gpu] = gathered.to(self.input_ids.gpu.dtype)
+
+            # prev_batch / prev_token_ids are advanced by prepare_sampled_ids
+            # (postprocess) after sampling — NOT here, exactly like the non-mixed
+            # deferred path.
+            return self.input_ids.gpu[:total_tokens]
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
@@ -1669,6 +1758,10 @@ class ModelRunner:
         With the packed-reduce path the eligibility (local + cross-DP AND)
         is decided in ``_preprocess``; here we just realise the split.
         """
+        if getattr(batch, "is_mixed", False):
+            # TBO ubatch splitting on a [prefill | decode] layout is not yet
+            # supported (P2-M5 follow-up). Run mixed batches without TBO.
+            return None
         if not tbo_collective_active:
             return None
 
@@ -1767,6 +1860,7 @@ class ModelRunner:
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
+        is_mixed = getattr(batch, "is_mixed", False)
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
@@ -1823,11 +1917,19 @@ class ModelRunner:
             graph_bs=graph_bs,
             dp_uniform_decode=dp_uniform_decode,
             forward_mode=forward_mode,
+            is_mixed=is_mixed,
+            num_prefill_tokens=batch.total_tokens_num_prefill if is_mixed else 0,
+            num_prefill_seqs=batch.total_seqs_num_prefill if is_mixed else 0,
         )
 
         actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
+        if is_mixed and hasattr(self, "drafter") and not batch.is_dummy_run:
+            raise NotImplementedError(
+                "Mixed prefill+decode batches do not yet support MTP / speculative "
+                "decode (P2-M4 follow-up). Disable --enable-mixed-prefill-decode."
+            )
         if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
             scheduled_bs = batch.total_seqs_num_decode
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
