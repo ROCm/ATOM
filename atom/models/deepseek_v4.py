@@ -2763,6 +2763,7 @@ class MoE(nn.Module):
             top_k=self.n_activated_experts,
             hidden_size=self.dim,
             intermediate_size=args.moe_inter_dim,
+            layer_id=self.layer_id,
             reduce_results=False,
             renormalize=True,
             quant_config=qc,
