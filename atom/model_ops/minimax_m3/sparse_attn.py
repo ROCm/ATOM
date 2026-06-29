@@ -156,9 +156,7 @@ def _sparse_decode_unified_attention(
     # key_cache: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     block_size = k_cache_view.shape[3]
     # Each token is its own length-1 sequence (decode); cu_seqlens_q = 0..num_seqs.
-    cu_seqlens_q = torch.arange(
-        num_seqs + 1, dtype=torch.int32, device=q_view.device
-    )
+    cu_seqlens_q = torch.arange(num_seqs + 1, dtype=torch.int32, device=q_view.device)
     # Safe upper bound: full block table width * page size (>= every sparse_ctx).
     max_seqlen_k = int(sparse_bt.shape[1]) * int(block_size)
 
