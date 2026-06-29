@@ -187,7 +187,9 @@ def _patch_vllm_draft_positions_on_metadata() -> None:
             common_attn_metadata.positions = self._get_positions(num_tokens)
         return original_build(self, common_attn_metadata, draft_index)
 
-    setattr(wrapped_build_per_group_and_layer_attn_metadata, "_atom_positions_patched", True)
+    setattr(
+        wrapped_build_per_group_and_layer_attn_metadata, "_atom_positions_patched", True
+    )
     SpecDecodeBaseProposer.build_per_group_and_layer_attn_metadata = (
         wrapped_build_per_group_and_layer_attn_metadata
     )

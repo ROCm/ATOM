@@ -193,12 +193,13 @@ def slice_deepseek_v4_proxy_cache_views(
 
 
 class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
-    # Decode (query_len == 1) is the only shape we capture in a full CUDA/HIP
-    # graph: it has a fixed per-step kernel grid and the per-fwd index/indptr/
-    # slot/compress-plan tensors are staged into persistent fixed-address
-    # buffers here in build() (outside the captured region) so replay re-reads
-    # the same addresses. Prefill/mixed batches stay eager (FULL_DECODE_ONLY).
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # Decode is full-graph safe for uniform query batches, including speculative
+    # decode where each request contributes 1 + num_speculative_tokens queries.
+    # The per-fwd index/indptr/slot/compress-plan tensors are staged into
+    # persistent fixed-address buffers here in build() (outside the captured
+    # region), so replay re-reads the same addresses. Prefill/mixed batches stay
+    # on the piecewise/eager path.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -445,7 +446,9 @@ def _compressed_layer_cache_index(ratios, layer_id: int, ratio: int) -> int:
 def _v4_padded_token_count(common_attn_metadata, total: int) -> int:
     num_actual = int(getattr(common_attn_metadata, "num_actual_tokens", total) or total)
     slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
-    slot_tokens = int(slot_mapping.numel()) if isinstance(slot_mapping, torch.Tensor) else 0
+    slot_tokens = (
+        int(slot_mapping.numel()) if isinstance(slot_mapping, torch.Tensor) else 0
+    )
     return max(total, num_actual, slot_tokens)
 
 
