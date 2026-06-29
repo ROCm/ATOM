@@ -469,6 +469,7 @@ class LinearBase(nn.Module):
         online_quant_func = get_hip_quant(online_quant_type)
         assert online_quant_dtype in [
             torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
             torch.float4_e2m1fn_x2,
         ], (
             f"Unsupported online quant: "
@@ -519,9 +520,21 @@ class LinearBase(nn.Module):
         elif self.quant_type == QuantType.per_1x32:
             # dequant MXFP8 (FP8 elements + 1x32 E8M0 shared scale)
             weight = weight_dequant_mxfp8(weight, weight_scale)
-        q_weight, weight_scale = online_quant_func(
-            weight, quant_dtype=online_quant_dtype
-        )
+
+        if online_quant_type == QuantType.per_1x128:
+            # Linear per_1x128 path uses blockscale GEMM, which consumes
+            # 128x128 weight scales shaped as (N//128, K//128).
+            from quantization.quark.utils import (
+                quantize_weight_to_fp8_128x128_blockscale,
+            )
+
+            q_weight, weight_scale = quantize_weight_to_fp8_128x128_blockscale(
+                weight, online_quant_dtype
+            )
+        else:
+            q_weight, weight_scale = online_quant_func(
+                weight, quant_dtype=online_quant_dtype
+            )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
                 q_weight, weight_scale
@@ -533,8 +546,11 @@ class LinearBase(nn.Module):
         self.quant_type = online_quant_type
         self.params_dtype = online_quant_dtype
         self.quant_func = online_quant_func
+        # online_quant_func already returns fnuz when quant_dtype=fnuz on gfx942;
+        # only normalize when output is still non-fnuz.
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
+            and q_weight.dtype != torch.float8_e4m3fnuz
         )
         self._online_quant_info = {
             "layer": self.prefix,
