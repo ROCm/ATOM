@@ -901,7 +901,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         del ubatch_idx
-        from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+        from atom.utils.tbo.ubatch_splitting import (
+            derive_prefill_lens_from_positions,
+            split_attn_metadata,
+        )
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
         self._attach_tbo_token_split_straddle_prefix(ub_attn, ub_slice)
@@ -913,12 +916,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
             ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
             ub_cu_seqlens_q = ub_attn.cu_seqlens_q[: ub_num_reqs + 1]
-            ub_query_lens = ub_cu_seqlens_q[1:] - ub_cu_seqlens_q[:ub_num_reqs]
-            ub_seq_lens = (
-                ub_attn.context_lens[:ub_num_reqs]
-                if ub_attn.has_cached
-                else ub_query_lens
+            var = self.model_runner.forward_vars
+            _, ub_seq_lens_np = derive_prefill_lens_from_positions(
+                var["positions"].np[
+                    ub_slice.token_slice.start : ub_slice.token_slice.stop
+                ],
+                var["cu_seqlens_q"].np,
+                ub_slice,
             )
+            ub_seq_lens = torch.from_numpy(ub_seq_lens_np).to(
+                self.device, non_blocking=True
+            )
+            ub_max_seq_len = int(ub_seq_lens_np.max()) if ub_num_reqs > 0 else 0
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 ub_attn.block_tables[:ub_num_reqs],
                 ub_seq_lens,
@@ -930,7 +939,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_table=sparse_block_tables,
                 slot_mapping=ub_attn.slot_mapping,
                 max_query_len=ub_attn.max_seqlen_q,
-                max_seq_len=ub_attn.max_seqlen_k,
+                max_seq_len=ub_max_seq_len,
                 num_prefills=ub_num_reqs,
                 num_prefill_tokens=ub_num_tokens,
             )
@@ -971,8 +980,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             cached = state.num_cached[rs.start : rs.stop].astype(np.int64)
         else:
             cached = np.zeros(ub_num_reqs, dtype=np.int64)
-        ctx_lens = cached + new_lens
-        ctx_lens[0] += prefix_len
+        cached_prefix_lens = cached.copy()
+        cached_prefix_lens[0] += prefix_len
+        ctx_lens = cached_prefix_lens + new_lens
         total_kv = int(ctx_lens.sum())
 
         max_blocks = max(
@@ -995,9 +1005,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ub_attn.block_tables = torch.from_numpy(bt).to(device, non_blocking=True)
         ub_attn.cu_seqlens_k = torch.from_numpy(cu_k).to(device, non_blocking=True)
         ub_attn.seq_starts = torch.zeros(ub_num_reqs, dtype=torch.int32, device=device)
-        ub_attn.num_cached_tokens = torch.from_numpy(ctx_lens.astype(np.int32)).to(
-            device, non_blocking=True
-        )
+        ub_attn.num_cached_tokens = torch.from_numpy(
+            cached_prefix_lens.astype(np.int32)
+        ).to(device, non_blocking=True)
         ub_attn.max_seqlen_k = int(ctx_lens.max())
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):

@@ -19,6 +19,36 @@ def prefill_token_split_enabled(config=None) -> bool:
     return envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
 
 
+def derive_prefill_lens_from_positions(
+    positions,
+    full_cu_seqlens_q,
+    ub_slice,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (extend_lens, context_lens) for a prefill ubatch.
+
+    ``positions`` are the absolute positions for this ubatch's new tokens.
+    For token-midpoint splits this preserves the absolute prefix length of a
+    straddled request instead of treating the ubatch as a standalone prompt.
+    """
+    rs = ub_slice.request_slice
+    ts = ub_slice.token_slice
+    ub_num_reqs = rs.stop - rs.start
+    positions_np = np.asarray(positions)
+    full_cu = np.asarray(full_cu_seqlens_q)
+
+    req_global_starts = full_cu[rs.start : rs.stop].astype(np.int64)
+    req_global_ends = full_cu[rs.start + 1 : rs.stop + 1].astype(np.int64)
+    clamped_starts = np.maximum(req_global_starts, ts.start)
+    clamped_ends = np.minimum(req_global_ends, ts.stop)
+    extend_lens = (clamped_ends - clamped_starts).astype(np.int32)
+
+    ub_cu = np.zeros(ub_num_reqs + 1, dtype=np.int32)
+    np.cumsum(extend_lens, dtype=np.int32, out=ub_cu[1:])
+    start_positions = positions_np[ub_cu[:ub_num_reqs]].astype(np.int32)
+    context_lens = (start_positions + extend_lens).astype(np.int32)
+    return extend_lens, context_lens
+
+
 @dataclass
 class UBatchSlice:
     """Describes which portion of a batch belongs to a micro-batch."""
@@ -242,10 +272,22 @@ def split_attn_metadata(
             )
             ub_slot_mapping = torch.cat([ub_slot_mapping, pad])
 
-    # context_lens: slice by request
+    # context_lens: slice by request.  For pure prefill token-splits a request
+    # can be split across ubatches, so the visible K length for the first/last
+    # partial request is the clamped ubatch-local query length, not the full
+    # original request length.
     ub_context_lens = None
     if attn_metadata.context_lens is not None:
-        ub_context_lens = attn_metadata.context_lens[rs]
+        if (
+            not getattr(attn_metadata, "has_cached", False)
+            and ub_cu_seqlens_q is not None
+        ):
+            ub_context_lens = (
+                ub_cu_seqlens_q[1 : ub_num_reqs + 1]
+                - ub_cu_seqlens_q[:ub_num_reqs]
+            ).to(attn_metadata.context_lens.dtype)
+        else:
+            ub_context_lens = attn_metadata.context_lens[rs]
         if padded_bs > ub_num_reqs:
             pad = torch.zeros(
                 padded_bs - ub_num_reqs,

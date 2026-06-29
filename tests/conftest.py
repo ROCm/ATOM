@@ -57,6 +57,7 @@ class _StubParallelConfig:
 _atom_config.Config = _StubConfig
 _atom_config.KVCacheTensor = _StubKVCacheTensor
 _atom_config.ParallelConfig = _StubParallelConfig
+_atom_config.get_current_atom_config = lambda: None
 sys.modules["atom.config"] = _atom_config
 
 # ── 4. Stub zmq / zmq.asyncio if not installed ────────────────────────────
