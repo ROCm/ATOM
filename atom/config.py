@@ -1078,6 +1078,11 @@ class Config:
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # EPLB module-A runtime flags (env -> config centralized).
+    eplb_enable: bool = field(default_factory=lambda: envs.ATOM_EPLB_ENABLE)
+    eplb_load_window_size: int = field(
+        default_factory=lambda: envs.ATOM_EPLB_LOAD_WINDOW_SIZE
+    )
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
@@ -1100,6 +1105,8 @@ class Config:
     def __post_init__(self):
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
+        self.eplb_load_window_size = int(self.eplb_load_window_size)
+        assert self.eplb_load_window_size > 0, "eplb_load_window_size must be > 0"
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
