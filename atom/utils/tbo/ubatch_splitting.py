@@ -14,11 +14,6 @@ from atom.utils.forward_context import AttentionMetaData
 logger = logging.getLogger("atom")
 
 
-def prefill_token_split_enabled(config=None) -> bool:
-    del config
-    return envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-
-
 def derive_prefill_lens_from_positions(
     positions,
     full_cu_seqlens_q,
@@ -81,7 +76,7 @@ def maybe_create_ubatch_slices(
     # even with a single request (bs=1) — only require that there are at
     # least `num_ubatches` tokens to go around. The request-boundary path
     # below still needs num_reqs >= num_ubatches.
-    token_split = num_scheduled_tokens is not None and prefill_token_split_enabled()
+    token_split = num_scheduled_tokens is not None and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
     if not token_split and num_reqs < num_ubatches:
         return None
 
@@ -283,8 +278,7 @@ def split_attn_metadata(
             and ub_cu_seqlens_q is not None
         ):
             ub_context_lens = (
-                ub_cu_seqlens_q[1 : ub_num_reqs + 1]
-                - ub_cu_seqlens_q[:ub_num_reqs]
+                ub_cu_seqlens_q[1 : ub_num_reqs + 1] - ub_cu_seqlens_q[:ub_num_reqs]
             ).to(attn_metadata.context_lens.dtype)
         else:
             ub_context_lens = attn_metadata.context_lens[rs]
