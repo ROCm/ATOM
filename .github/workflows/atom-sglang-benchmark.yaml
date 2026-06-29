@@ -861,6 +861,9 @@ jobs:
       atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
   summarize-benchmark-result:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     if: >-
       always()
       && needs.resolve-atom-source.result == 'success'

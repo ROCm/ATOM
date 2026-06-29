@@ -3,6 +3,7 @@
 
 """Pydantic request/response models for the OpenAI-compatible API."""
 
+import json
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -25,6 +26,30 @@ STREAM_DONE_MESSAGE = "data: [DONE]\n\n"
 # ============================================================================
 # Request Models
 # ============================================================================
+
+
+def _normalize_tool_call_arguments(tool_calls: Any) -> Any:
+    """Deserialize ``function.arguments`` from a JSON string to a mapping.
+
+    OpenAI clients send tool-call arguments as a JSON *string*, but chat
+    templates (Qwen3 qwen3_coder/qwen3_xml, Hermes, etc.) iterate
+    ``tool_call.arguments.items()`` and require a mapping. Mirrors how vLLM and
+    SGLang deserialize arguments before applying the chat template.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    normalized = []
+    for tc in tool_calls:
+        if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+            fn = dict(tc["function"])
+            if isinstance(fn.get("arguments"), str):
+                try:
+                    fn["arguments"] = json.loads(fn["arguments"])
+                except (ValueError, TypeError):
+                    pass
+            tc = {**tc, "function": fn}
+        normalized.append(tc)
+    return normalized
 
 
 class ChatMessage(BaseModel):
@@ -59,7 +84,11 @@ class ChatMessage(BaseModel):
         extras = self.model_extra or {}
         for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
             if key in extras:
-                d[key] = extras[key]
+                d[key] = (
+                    _normalize_tool_call_arguments(extras[key])
+                    if key == "tool_calls"
+                    else extras[key]
+                )
         return d
 
 

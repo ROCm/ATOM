@@ -158,6 +158,9 @@ jobs:
       atom_commit: ${{ inputs.atom_commit || '' }}
 
   summarize-benchmark-result:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     if: always()
     name: Summarize benchmark result
     needs: [benchmark]
@@ -364,7 +367,10 @@ jobs:
           ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Docker Login
-        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Start container + download model
         uses: ./.github/actions/atom-bench-container

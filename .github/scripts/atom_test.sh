@@ -428,25 +428,33 @@ if [ "$TYPE" == "benchmark" ]; then
     PROFILE_ARG="--profile"
     echo "Profiling enabled via --profile flag"
   fi
+  # Build the benchmark command as an array so the printed command is exactly
+  # what runs (no echo/cmd drift). $PROFILE_ARG and $BENCH_EXTRA_ARGS stay
+  # unquoted so they word-split into 0+ args, matching the previous behavior.
+  BENCH_CMD=(
+    python -m atom.benchmarks.benchmark_serving
+    --model="$MODEL_PATH" --backend=vllm --base-url="http://localhost:${ATOM_SERVER_PORT}"
+    --dataset-name=random
+    --random-input-len="$ISL" --random-output-len="$OSL" --random-range-ratio="$RANDOM_RANGE_RATIO"
+    --max-concurrency="$CONC"
+    --num-prompts="${NUM_PROMPTS_OVERRIDE:-$(( CONC * 10 ))}"
+    --trust-remote-code
+    --num-warmups="$(( CONC * 2 ))"
+    --request-rate=inf --ignore-eos
+    --save-result --percentile-metrics="ttft,tpot,itl,e2el"
+    --result-dir=. --result-filename="${RESULT_FILENAME}.json"
+    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-}
+  )
+  echo "Benchmark command:"
+  printf '%q ' "${BENCH_CMD[@]}"
+  echo
   # Background the benchmark + tee pipeline in its own process group so
   # wait_infer_drain.sh can supervise the engine in the foreground and
   # SIGTERM the whole group on hang/fault. Same pattern as the accuracy
   # block — see comments there.
   set -m
   (
-    python -m atom.benchmarks.benchmark_serving \
-      --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:${ATOM_SERVER_PORT}" \
-      --dataset-name=random \
-      --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
-      --max-concurrency=$CONC \
-      --num-prompts=${NUM_PROMPTS_OVERRIDE:-$(( $CONC * 10 ))} \
-      --trust-remote-code \
-      --num-warmups=$(( $CONC * 2 )) \
-      --request-rate=inf --ignore-eos \
-      --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
-      --result-dir=. --result-filename=${RESULT_FILENAME}.json \
-      $PROFILE_ARG ${BENCH_EXTRA_ARGS:-} \
-      2>&1 | tee "$ATOM_CLIENT_LOG"
+    "${BENCH_CMD[@]}" 2>&1 | tee "$ATOM_CLIENT_LOG"
   ) &
   CLIENT_PID=$!
   set +m

@@ -78,6 +78,7 @@ def _install_api_server_stubs() -> list[str]:
     return injected
 
 
+_injected_modules: list[str] = []  # set in try; kept defined for `finally`
 try:
     _injected_modules = _install_api_server_stubs()
     import importlib
@@ -86,7 +87,12 @@ try:
 except Exception as exc:  # pragma: no cover - environment-dependent skip
     api_server = None  # type: ignore[assignment]
     _import_error = exc
-    _injected_modules = []
+    # NB: do NOT reset _injected_modules here. When api_server import fails
+    # (e.g. PIL absent on the non-GPU runner), the stubs injected by
+    # _install_api_server_stubs() must still be torn down in `finally`;
+    # clearing the list here would leak them into sys.modules and pollute
+    # tests collected later (notably tests/test_arg_utils_spec.py, which then
+    # sees a stub EngineArgs instead of the real one).
 else:
     _import_error = None
 finally:

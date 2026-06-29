@@ -289,8 +289,10 @@ def _prepare_multimodal_inputs(
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
 # Per-seq `call_soon_threadsafe` floods the API event loop at high batch size
-# (one call per token). Instead the callback only decodes + buffers; the mgr
-# flushes a whole step with one scheduled call (see `flush_stream_batch`).
+# (one call per token). Instead the callback only buffers the raw chunk; the
+# mgr flushes a whole step with a single `tokenizer.batch_decode` (one
+# GIL-released call instead of one decode per seq) plus one scheduled call per
+# loop (see `flush_stream_batch`).
 import threading as _threading  # noqa: E402
 
 _stream_batch_tls = _threading.local()
@@ -302,13 +304,14 @@ def _send_stream_chunk_direct(
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
 ) -> None:
-    """Decode the chunk and buffer it; dispatch happens in flush_stream_batch."""
-    global tokenizer
+    """Buffer the chunk; decode + dispatch happen batched in flush_stream_batch.
 
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+    ``text`` is intentionally left unset here — it is filled by a single
+    ``tokenizer.batch_decode`` over the whole step in :func:`flush_stream_batch`,
+    avoiding one decode call per seq on the output thread.
+    """
     started_at = _request_start_times.get(request_id)
     chunk_data = {
-        "text": new_text,
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
@@ -333,12 +336,25 @@ def _drain_batch_into_queues(items: list) -> None:
 
 
 def flush_stream_batch() -> None:
-    """Flush a step's buffered chunks: one call_soon_threadsafe per loop
-    (normally one — all requests on a rank share the API loop)."""
+    """Flush a step's buffered chunks: one ``batch_decode`` for the whole step,
+    then one call_soon_threadsafe per loop (normally one — all requests on a
+    rank share the API loop)."""
+    global tokenizer
+
     buf = getattr(_stream_batch_tls, "buf", None)
     if not buf:
         return
     _stream_batch_tls.buf = []
+    # Decode the whole step in a single call. batch_decode is element-wise
+    # identical to per-seq decode but acquires/releases the GIL once instead of
+    # once per seq, cutting GIL ping-pong against the other rank output threads
+    # and the API event loop at high batch size.
+    texts = tokenizer.batch_decode(
+        [chunk["token_ids"] for _loop, _q, chunk in buf],
+        skip_special_tokens=True,
+    )
+    for (_loop, _q, chunk), text in zip(buf, texts):
+        chunk["text"] = text
     # Group by loop (normally a single loop). dict preserves insertion order
     # so per-request chunk ordering within the step is maintained.
     by_loop: Dict[AbstractEventLoop, list] = {}
@@ -359,6 +375,12 @@ def _send_stream_chunk_tagged(
     Pushes ``(sibling_index, chunk_data)`` tuples onto a single shared
     queue so the merge-stream consumer in :mod:`serving_chat` /
     :mod:`serving_completion` can demultiplex by index.
+
+    Unlike :func:`_send_stream_chunk_direct`, this fan-out path decodes and
+    dispatches immediately rather than going through the batched flush: it
+    serves ``SamplingParams.n > 1`` (a handful of siblings of one request),
+    not the many-concurrent-requests regime that motivates batch decoding, so
+    a separate per-step buffer here would add complexity for little gain.
     """
     global tokenizer
 
@@ -677,8 +699,13 @@ async def setup_streaming_request(
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
     multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, asyncio.Queue]:
-    """Set up a streaming request with the engine."""
+) -> Tuple[int, asyncio.Queue, int]:
+    """Set up a streaming request with the engine.
+
+    Returns ``(seq_id, stream_queue, num_prompt_tokens)``. ``num_prompt_tokens``
+    is the engine-computed prompt length so the stream response generator does
+    not have to re-tokenize the prompt on the event loop.
+    """
     global engine, _stream_queues, _seq_id_to_request_id
     global _stream_loops, _request_start_times
 
@@ -710,7 +737,7 @@ async def setup_streaming_request(
     logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}")
     engine.core_mgr.add_request([seq])
 
-    return seq_id, stream_queue
+    return seq_id, stream_queue, seq.num_prompt_tokens
 
 
 def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
@@ -736,12 +763,16 @@ async def setup_streaming_request_fanout(
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
     multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], asyncio.Queue]:
+) -> Tuple[List[int], asyncio.Queue, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
     Creates ``sampling_params.n`` sibling sequences sharing one output
     queue. Every callback pushes ``(sibling_index, chunk_data)`` tuples so
     the merge-stream consumer can rewrite ``choices[0].index`` correctly.
+
+    Returns ``(seq_ids, shared_queue, num_prompt_tokens)``. All siblings
+    tokenize the same prompt once, so ``num_prompt_tokens`` is shared and lets
+    the stream response generator skip re-tokenizing on the event loop.
     """
     global engine, _stream_queues, _seq_id_to_request_id
     global _stream_loops, _request_start_times
@@ -784,7 +815,7 @@ async def setup_streaming_request_fanout(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
     engine.core_mgr.add_request(seqs)
-    return seq_ids, shared_queue
+    return seq_ids, shared_queue, seqs[0].num_prompt_tokens
 
 
 # ============================================================================
@@ -871,9 +902,14 @@ async def chat_completions(request: ChatCompletionRequest):
 
         is_multimodal = _has_multimodal_content(messages)
         if is_multimodal:
-            token_ids, multimodal_data = _prepare_multimodal_inputs(
-                messages,
-                merged_kwargs,
+            # Image loading (blocking network I/O, up to a 30s urlopen) plus
+            # processor preprocessing are heavy and would stall the event loop;
+            # run them in a worker thread. Warm the processor on the loop first
+            # so concurrent cold-start requests don't race on its lazy init.
+            _get_multimodal_processor()
+            loop = asyncio.get_running_loop()
+            token_ids, multimodal_data = await loop.run_in_executor(
+                None, _prepare_multimodal_inputs, messages, merged_kwargs
             )
         else:
             prompt = apply_chat_template(
@@ -889,24 +925,26 @@ async def chat_completions(request: ChatCompletionRequest):
             stream_input = token_ids if is_multimodal else prompt
             stream_multimodal_data = multimodal_data if is_multimodal else None
             if effective_n > 1:
-                seq_ids, stream_queue = await setup_streaming_request_fanout(
-                    stream_input,
-                    sampling_params,
-                    request_id,
-                    multimodal_data=stream_multimodal_data,
-                    kv_transfer_params=request.kv_transfer_params,
+                seq_ids, stream_queue, num_prompt_tokens = (
+                    await setup_streaming_request_fanout(
+                        stream_input,
+                        sampling_params,
+                        request_id,
+                        multimodal_data=stream_multimodal_data,
+                        kv_transfer_params=request.kv_transfer_params,
+                    )
                 )
                 gen = stream_chat_response_fanout(
                     request_id,
                     model_name,
-                    stream_input,
                     stream_queue,
                     seq_ids,
-                    tokenizer,
+                    num_prompt_tokens,
                     cleanup_streaming_request,
+                    tools=request.tools,
                 )
             else:
-                seq_id, stream_queue = await setup_streaming_request(
+                seq_id, stream_queue, num_prompt_tokens = await setup_streaming_request(
                     stream_input,
                     sampling_params,
                     request_id,
@@ -916,11 +954,11 @@ async def chat_completions(request: ChatCompletionRequest):
                 gen = stream_chat_response(
                     request_id,
                     model_name,
-                    stream_input,
                     stream_queue,
                     seq_id,
-                    tokenizer,
+                    num_prompt_tokens,
                     cleanup_streaming_request,
+                    tools=request.tools,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -938,7 +976,9 @@ async def chat_completions(request: ChatCompletionRequest):
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_chat_response_multi(request_id, model_name, outputs)
+            resp = build_chat_response_multi(
+                request_id, model_name, outputs, tools=request.tools
+            )
         elif is_multimodal:
             final_output = None
             async for output in generate_async_multimodal(
@@ -951,7 +991,11 @@ async def chat_completions(request: ChatCompletionRequest):
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
-                request_id, model_name, final_output["text"], final_output
+                request_id,
+                model_name,
+                final_output["text"],
+                final_output,
+                tools=request.tools,
             )
         elif effective_n > 1:
             outputs = await generate_async_fanout(
@@ -962,7 +1006,9 @@ async def chat_completions(request: ChatCompletionRequest):
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_chat_response_multi(request_id, model_name, outputs)
+            resp = build_chat_response_multi(
+                request_id, model_name, outputs, tools=request.tools
+            )
         else:
             final_output = None
             async for output in generate_async(
@@ -975,7 +1021,11 @@ async def chat_completions(request: ChatCompletionRequest):
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
-                request_id, model_name, final_output["text"], final_output
+                request_id,
+                model_name,
+                final_output["text"],
+                final_output,
+                tools=request.tools,
             )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
@@ -1014,23 +1064,24 @@ async def completions(request: CompletionRequest):
         # Streaming
         if request.stream:
             if effective_n > 1:
-                seq_ids, stream_queue = await setup_streaming_request_fanout(
-                    request.prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                seq_ids, stream_queue, num_prompt_tokens = (
+                    await setup_streaming_request_fanout(
+                        request.prompt,
+                        sampling_params,
+                        request_id,
+                        kv_transfer_params=request.kv_transfer_params,
+                    )
                 )
                 gen = stream_completion_response_fanout(
                     request_id,
                     model_name,
-                    request.prompt,
                     stream_queue,
                     seq_ids,
-                    tokenizer,
+                    num_prompt_tokens,
                     cleanup_streaming_request,
                 )
             else:
-                seq_id, stream_queue = await setup_streaming_request(
+                seq_id, stream_queue, num_prompt_tokens = await setup_streaming_request(
                     request.prompt,
                     sampling_params,
                     request_id,
@@ -1039,10 +1090,9 @@ async def completions(request: CompletionRequest):
                 gen = stream_completion_response(
                     request_id,
                     model_name,
-                    request.prompt,
                     stream_queue,
                     seq_id,
-                    tokenizer,
+                    num_prompt_tokens,
                     cleanup_streaming_request,
                 )
             return StreamingResponse(
@@ -1155,7 +1205,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         if request.stream:
             # Streaming response
-            seq_id, stream_queue = await setup_streaming_request(
+            seq_id, stream_queue, _num_prompt_tokens = await setup_streaming_request(
                 prompt, sampling_params, request_id
             )
 
@@ -1520,8 +1570,24 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    logger.info(f"Starting server on {args.host}:{args.server_port}...")
-    uvicorn.run(app, host=args.host, port=args.server_port)
+    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
+    # which is markedly faster at the SSE socket I/O (sock.send / selector
+    # register-unregister) that saturates the event loop under high streaming
+    # concurrency. Fall back to the default loop if uvloop is unavailable.
+    try:
+        import uvloop  # noqa: F401
+
+        loop_impl = "uvloop"
+    except ImportError:
+        loop_impl = "auto"
+        logger.warning(
+            "uvloop not installed; falling back to the default asyncio loop."
+        )
+
+    logger.info(
+        f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
+    )
+    uvicorn.run(app, host=args.host, port=args.server_port, loop=loop_impl)
 
 
 if __name__ == "__main__":
