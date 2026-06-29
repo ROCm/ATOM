@@ -35,36 +35,19 @@ inputs:
 runs:
   using: composite
   steps:
+    # Container boilerplate is shared with the test/accuracy jobs. benchmark
+    # always pulls the (often `latest`) image fresh, runs with --network=host,
+    # and passes its -e ISL/OSL/... knobs through extra-run-flags.
     - name: Start CI container
-      shell: bash
-      env:
-        GITHUB_WORKSPACE: ${{ github.workspace }}
-        MODEL_ENV_VARS: ${{ inputs.env-vars }}
-        HF_TOKEN: ${{ inputs.hf-token }}
-      run: |
-        docker ps -aq -f name="${{ inputs.container-name }}" | xargs -r docker stop | xargs -r docker rm
-        DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
-        MODEL_MOUNT=""
-        [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
-
-        # env_vars come in via the env block (not the command line) so literal
-        # newlines in model env_vars can't break the host shell or silently
-        # drop the first variable.
-        ENV_FILE="/tmp/atom_${{ inputs.container-name }}_env.txt"
-        printenv MODEL_ENV_VARS 2>/dev/null | grep -v '^$' > "$ENV_FILE" || true
-
-        docker run -dt --device=/dev/kfd $DEVICE_FLAG \
-          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
-          -w /workspace --ipc=host --network=host --group-add video \
-          --shm-size=16G --privileged --cap-add=SYS_PTRACE \
-          -e HF_TOKEN="${HF_TOKEN:-}" \
-          --security-opt seccomp=unconfined \
-          --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
-          -e ATOM_DISABLE_MMAP=true \
-          ${{ inputs.container-env }} \
-          --env-file "$ENV_FILE" \
-          --name "${{ inputs.container-name }}" \
-          "${{ inputs.image }}"
+      uses: ./.github/actions/setup-gpu-container
+      with:
+        container-name: ${{ inputs.container-name }}
+        base-image: ${{ inputs.image }}
+        env-vars: ${{ inputs.env-vars }}
+        hf-token: ${{ inputs.hf-token }}
+        network-host: "true"
+        pull-policy: "always"
+        extra-run-flags: ${{ inputs.container-env }}
 
     - name: Download model
       shell: bash
