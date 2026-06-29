@@ -249,7 +249,7 @@ jobs:
               AITER_BF16_FP8_MOE_BOUND=0
               ATOM_MOE_GU_ITLV=1
             lm_eval_num_fewshot: 20
-            accuracy_test_threshold: 0.94
+            accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"

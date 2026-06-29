@@ -252,6 +252,64 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
             raise RuntimeError("ATOM V4 proxy pool has no full->SWA mapping")
         return self.full_to_swa_index_mapping[kv_indices]
 
+    @staticmethod
+    def _block_pairs(tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> torch.Tensor:
+        """Convert SGLang token relocation into unique V4 block relocation pairs.
+
+        SGLang calls move_kv_cache with logical token locations.  ATOM V4 stores
+        persistent CSA/HCA history by 128-token blocks, so prefix-cache
+        relocation must first collapse token locs to block ids and drop no-op
+        copies within the same block.
+        """
+        if tgt_loc.numel() != src_loc.numel():
+            raise ValueError(
+                "ATOM V4 KV relocation expects matching target/source sizes: "
+                f"{tgt_loc.numel()} vs {src_loc.numel()}"
+            )
+        if tgt_loc.numel() == 0:
+            return torch.empty((0, 2), dtype=torch.long)
+
+        tgt = tgt_loc.reshape(-1).to(dtype=torch.int64)
+        src = src_loc.reshape(-1).to(dtype=torch.int64)
+        valid = (tgt >= 0) & (src >= 0)
+        if not bool(valid.any().item()):
+            return torch.empty((0, 2), dtype=torch.long)
+
+        tgt_blocks = torch.div(
+            tgt[valid], ATOM_DEEPSEEK_V4_BLOCK_SIZE, rounding_mode="floor"
+        )
+        src_blocks = torch.div(
+            src[valid], ATOM_DEEPSEEK_V4_BLOCK_SIZE, rounding_mode="floor"
+        )
+        keep = tgt_blocks != src_blocks
+        if not bool(keep.any().item()):
+            return torch.empty((0, 2), dtype=torch.long)
+
+        pairs = torch.stack([tgt_blocks[keep], src_blocks[keep]], dim=1)
+        return torch.unique(pairs.cpu(), dim=0)
+
+    @staticmethod
+    def _copy_block_views(views: list[torch.Tensor], block_pairs: torch.Tensor) -> None:
+        """Copy compressed KV blocks between proxy views during radix relocation."""
+        if not views or block_pairs.numel() == 0:
+            return
+
+        tgt_blocks = block_pairs[:, 0]
+        src_blocks = block_pairs[:, 1]
+        for view in views:
+            num_blocks = int(view.shape[0])
+            valid = (
+                (src_blocks >= 0)
+                & (src_blocks < num_blocks)
+                & (tgt_blocks >= 0)
+                & (tgt_blocks < num_blocks)
+            )
+            if not bool(valid.any().item()):
+                continue
+            src_idx = src_blocks[valid].to(device=view.device)
+            tgt_idx = tgt_blocks[valid].to(device=view.device)
+            view.index_copy_(0, tgt_idx, view.index_select(0, src_idx).clone())
+
     def set_swa_loc(self, loc: torch.Tensor) -> None:
         # SGLang 0.5.12 requires BaseSWAKVPool subclasses to expose this hook.
         # DSV4 pools do not use the generic precomputed SWA location path, and
@@ -277,14 +335,44 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         raise NotImplementedError("ATOM V4 proxy pool is not a regular SGLang KV pool")
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
-        raise RuntimeError(
-            "ATOM V4 proxy pool does not support SGLang KV relocation yet. "
-            "Run with --disable-radix-cache for the first bridge version."
-        )
+        """Implement the KV relocation hook required when SGLang radix cache is on.
+
+        Prefix cache lets SGLang move logical KV locations after cached blocks are
+        inserted or reused.  The proxy pool mirrors that move into ATOM's
+        block-addressed CSA/HCA views and remaps the first-block -> state-slot
+        table so the SWA ring and compressor state continue to belong to the same
+        logical request after relocation.
+        """
+        block_pairs = self._block_pairs(tgt_loc, src_loc)
+        if block_pairs.numel() == 0:
+            return
+
+        # SGLang relocates by full-token locations.  ATOM V4 stores persistent
+        # compressed history by 128-token blocks, while SWA history lives in a
+        # per-request state slot keyed by the request's first block.
+        self._copy_block_views(self.views["csa_main"], block_pairs)
+        self._copy_block_views(self.views["csa_indexer"], block_pairs)
+        self._copy_block_views(self.views["hca_main"], block_pairs)
+
+        allocator = getattr(self, "_atom_v4_slot_allocator", None)
+        if allocator is not None:
+            allocator.remap_blocks(block_pairs[:, 1], block_pairs[:, 0])
+
+        if _debug_enabled():
+            logger.info(
+                "ATOM V4 proxy relocated %d KV blocks for SGLang radix cache",
+                block_pairs.shape[0],
+            )
 
 
 def install_deepseek_v4_proxy_pool_patch() -> None:
-    """Patch SGLang's DSV4 pool constructor before ModelRunner._init_pools()."""
+    """Patch SGLang's DSV4 pool constructor before ModelRunner._init_pools().
+
+    This makes SGLang allocate the ATOM proxy pool instead of the stock DSV4 KV
+    pool, while leaving SGLang's scheduler/radix-cache code unchanged.  The proxy
+    still satisfies SGLang's TokenToKVPool contract but exposes ATOM V4's SWA,
+    CSA, HCA, and indexer views to the model.
+    """
 
     import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
@@ -336,6 +424,13 @@ def _bind_compressor_state(
 
 
 def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
+    """Bind the SGLang-visible proxy arena to ATOM V4 attention modules.
+
+    Prefix cache stores and reuses SGLang logical KV indices, but the actual V4
+    kernels read ATOM-owned views.  Binding once per arena keeps both sides
+    looking at the same storage: SGLang manages logical locs, ATOM kernels read
+    and write the carved SWA/CSA/HCA tensors.
+    """
     if not getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
         return False
     ptr = proxy_pool.raw_arena.untyped_storage().data_ptr()
@@ -387,6 +482,15 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
 
 
 class _V4StateSlotAllocator:
+    """Track which ATOM per-request state slot belongs to each first KV block.
+
+    SGLang radix cache identifies a cached request by logical KV blocks, while
+    ATOM V4 keeps SWA ring and compressor state in a separate per-request slot.
+    This allocator bridges the two: fresh prefills get/reset a slot, prefix hits
+    reuse the slot mapped from their first block, and KV relocation updates that
+    mapping.
+    """
+
     def __init__(self, num_slots: int):
         self.num_slots = max(1, int(num_slots))
         self._block_to_slot: dict[int, int] = {}
@@ -396,6 +500,7 @@ class _V4StateSlotAllocator:
         self._step = 0
 
     def assign(self, first_block_ids, fresh_mask) -> tuple[np.ndarray, set[int]]:
+        """Return state slots for the batch and identify slots that need reset."""
         self._step += 1
         fb = (
             first_block_ids.tolist()
@@ -421,6 +526,50 @@ class _V4StateSlotAllocator:
             self._last_seen[slot] = self._step
             slots.append(slot)
         return np.asarray(slots, dtype=np.int32), reset
+
+    def remap_blocks(self, src_block_ids, tgt_block_ids) -> None:
+        """Move first-block -> state-slot ownership after SGLang KV relocation.
+
+        Without this remap, a radix-cache relocation could copy CSA/HCA blocks to
+        the new logical block id while decode/prefix prefill still looked up the
+        SWA ring via the old first block.
+        """
+        src = (
+            src_block_ids.tolist()
+            if hasattr(src_block_ids, "tolist")
+            else list(src_block_ids)
+        )
+        tgt = (
+            tgt_block_ids.tolist()
+            if hasattr(tgt_block_ids, "tolist")
+            else list(tgt_block_ids)
+        )
+        updates: dict[int, int] = {}
+        for src_block, tgt_block in zip(src, tgt):
+            src_block = int(src_block)
+            tgt_block = int(tgt_block)
+            if src_block == tgt_block:
+                continue
+            slot = self._block_to_slot.get(src_block)
+            if slot is not None:
+                updates[tgt_block] = slot
+        if not updates:
+            return
+
+        moved_slots = set(updates.values())
+        for block, slot in list(self._block_to_slot.items()):
+            if slot in moved_slots or block in updates:
+                self._block_to_slot.pop(block, None)
+                if slot not in moved_slots:
+                    self._slot_to_block[slot] = -1
+                    if slot not in self._free:
+                        self._free.append(slot)
+
+        for block, slot in updates.items():
+            self._block_to_slot[block] = slot
+            self._slot_to_block[slot] = block
+            if slot in self._free:
+                self._free.remove(slot)
 
     def _acquire(self, active: set[int]) -> int:
         if self._free:
@@ -558,13 +707,64 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
     )
 
 
+def _get_extend_lens_cpu(
+    forward_batch, positions: Optional[torch.Tensor] = None
+) -> Optional[np.ndarray]:
+    """Read per-request suffix lengths from SGLang ForwardBatch.
+
+    Prefix-cache hits have `seq_lens = cached prefix + suffix`, but ATOM's
+    prefill metadata needs only the suffix token counts to build cu_seqlens_q and
+    batch_id_per_token.  Different SGLang paths expose that length under slightly
+    different fields, so this helper normalizes them.
+    """
+    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if extend_lens is not None:
+        return np.asarray(extend_lens, dtype=np.int32)
+
+    extend_lens_t = getattr(forward_batch, "extend_seq_lens", None)
+    if extend_lens_t is not None:
+        return extend_lens_t.detach().cpu().numpy().astype(np.int32)
+
+    extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
+    if extend_start_loc is None or positions is None:
+        return None
+
+    return np.diff(
+        torch.nn.functional.pad(extend_start_loc, (0, 1), value=positions.numel())
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.int32)
+    )
+
+
 def _infer_atom_attn_state(forward_batch) -> Any:
+    """Map SGLang forward mode to the ATOM V4 attention state.
+
+    The important prefix-cache case is a prefill batch with non-zero
+    `extend_prefix_lens`: SGLang is only forwarding the suffix, so ATOM must use
+    PREFILL_PREFIX and read prefix_swa/prefix_csa/prefix_hca instead of treating
+    the batch as a fresh PREFILL_NATIVE from position 0.
+    """
     from atom.utils.forward_context import AttnState
 
     mode = forward_batch.forward_mode
     if mode.is_decode_or_idle():
         return AttnState.DECODE
-    # Prefix-cache is intentionally not supported in the first proxy version.
+
+    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if prefix_lens is None:
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+    if prefix_lens is None:
+        return AttnState.PREFILL_NATIVE
+
+    batch_size = int(forward_batch.batch_size)
+    if torch.is_tensor(prefix_lens):
+        has_prefix = bool(prefix_lens[:batch_size].gt(0).any().item())
+    else:
+        has_prefix = any(x > 0 for x in prefix_lens[:batch_size])
+    if has_prefix:
+        return AttnState.PREFILL_PREFIX
     return AttnState.PREFILL_NATIVE
 
 
@@ -594,6 +794,13 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     req_to_token_pool,
     model: Any = None,
 ):
+    """Build fixed-address ATOM V4 decode metadata for SGLang graph replay.
+
+    Decode graph capture reuses tensor addresses, so this path stages new
+    SGLang req/block/slot information into persistent buffers instead of
+    replacing metadata tensors.  Keeping the state-slot mapping here is required
+    for cached-prefix requests after they leave prefill and enter decode.
+    """
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
     from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_hca_compress_tail
     from atom.utils.forward_context import AttentionMetaData, AttnState
@@ -783,6 +990,14 @@ def build_atom_v4_attention_metadata_from_sglang(
     proxy_pool: ATOMDeepSeekV4ProxyKVPool,
     req_to_token_pool,
 ):
+    """Translate SGLang ForwardBatch into ATOM V4 attention metadata.
+
+    This is the main bridge that makes prefix cache usable without changing
+    SGLang.  SGLang supplies logical req_to_token/block tables plus suffix-only
+    input tokens; this function reconstructs ATOM's state slots, committed
+    CSA/HCA counts, prefix/extend index arrays, and the correct PREFILL_PREFIX
+    state for radix-cache hits.
+    """
     from atom.utils.forward_context import AttentionMetaData
 
     state = _infer_atom_attn_state(forward_batch)
@@ -797,23 +1012,9 @@ def build_atom_v4_attention_metadata_from_sglang(
         batch_np = np.arange(num_reqs, dtype=np.int32)
         pos_np = positions[:num_reqs].detach().cpu().numpy().astype(np.int32)
     else:
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        extend_lens = _get_extend_lens_cpu(forward_batch, positions)
         if extend_lens is None:
-            extend_lens_t = getattr(forward_batch, "extend_seq_lens", None)
-            if extend_lens_t is not None:
-                extend_lens = extend_lens_t.detach().cpu().numpy().astype(np.int32)
-            else:
-                extend_lens = np.diff(
-                    torch.nn.functional.pad(
-                        forward_batch.extend_start_loc, (0, 1), value=positions.numel()
-                    )
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
-                )
-        else:
-            extend_lens = np.asarray(extend_lens, dtype=np.int32)
+            raise RuntimeError("SGLang DeepSeek-V4 prefill metadata lacks extend lens")
         lens = extend_lens[:num_reqs].astype(np.int32)
         q_np = np.zeros(num_reqs + 1, dtype=np.int32)
         q_np[1:] = np.cumsum(lens, dtype=np.int32)
@@ -975,6 +1176,13 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
 
 
 def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) -> None:
+    """Create ATOM V4 prefix/suffix index arrays for SGLang prefill.
+
+    For a prefix-cache hit, SGLang forwards only suffix tokens while block_tables
+    still describe the full logical sequence.  The generated indices split each
+    token's attention into the freshly computed suffix (`kv_indices_extend`) and
+    the reusable prefix windows/compressed blocks (`kv_indices_prefix_*`).
+    """
     from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
 
     T = len(batch_np)
@@ -1094,6 +1302,13 @@ def _populate_indexer(md, batch_np, positions, device) -> None:
 
 
 def maybe_get_proxy_pool_from_sglang_backend():
+    """Find the active ATOM proxy pool from SGLang runtime objects.
+
+    Attention code may run either with the backend already installed in
+    SGLang's forward context or through the plugin wrapper's current
+    ForwardBatch.  Returning the proxy pool plus req_to_token_pool gives the V4
+    metadata builder access to the same logical KV mapping used by radix cache.
+    """
     backend = None
     try:
         from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -1120,6 +1335,7 @@ def maybe_get_proxy_pool_from_sglang_backend():
 
 
 def reset_deepseek_v4_state_slots(model, slots) -> None:
+    """Clear SWA and compressor state for newly assigned fresh-prefill slots."""
     if not slots:
         return
     idx = None
