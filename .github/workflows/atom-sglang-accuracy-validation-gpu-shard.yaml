@@ -175,6 +175,17 @@ jobs:
             echo "No Python processes found on this machine."
           fi
 
+          sleep 2
+
+          echo "=== Verifying GPU cleanup ==="
+          remaining=$(fuser /dev/kfd /dev/dri/renderD* 2>/dev/null | tr ' ' '\n' | sort -u || true)
+          if [ -n "$remaining" ]; then
+              echo "WARNING: GPU still has processes:"
+              echo "$remaining"
+          else
+              echo "GPU is clean."
+          fi
+
       - name: Start validation container
         run: |
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
