@@ -20,7 +20,6 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
 
-
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
 # ---------------------------------------------------------------------------
@@ -29,8 +28,14 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
 class FakeSchedSub:
     """Scheduler-side sub-connector mock."""
 
-    def __init__(self, *, match=(0, False), is_producer=False, is_offload=False,
-                 offload_methods=False):
+    def __init__(
+        self,
+        *,
+        match=(0, False),
+        is_producer=False,
+        is_offload=False,
+        offload_methods=False,
+    ):
         self._match = match
         self.is_producer = is_producer
         if is_offload:
@@ -188,16 +193,18 @@ def test_build_connector_meta_wraps_subs_in_order():
 
 
 def test_role_attrs_aggregate():
-    sched = _sched([
-        FakeSchedSub(is_producer=True),
-        FakeSchedSub(is_offload=True, offload_methods=True),
-    ])
+    sched = _sched(
+        [
+            FakeSchedSub(is_producer=True),
+            FakeSchedSub(is_offload=True, offload_methods=True),
+        ]
+    )
     assert sched.is_producer is True
     assert sched.is_offload is True
 
 
 def test_offload_methods_forwarded_to_owning_sub():
-    moriio = FakeSchedSub(is_producer=True)            # no offload methods
+    moriio = FakeSchedSub(is_producer=True)  # no offload methods
     off = FakeSchedSub(is_offload=True, offload_methods=True)
     off.park = True
     off.partial_park = True
@@ -241,8 +248,8 @@ def test_register_kv_caches_fans_out():
 def test_start_load_kv_routes_by_index_and_records_saves():
     a, b = FakeWorkerSub(is_producer=True), FakeWorkerSub()
     w = _worker([a, b])
-    m0 = ConnectorMetadata()               # moriio sub-meta (no .requests)
-    m1 = _save_meta(101, 102)              # offload sub-meta with two saves
+    m0 = ConnectorMetadata()  # moriio sub-meta (no .requests)
+    m1 = _save_meta(101, 102)  # offload sub-meta with two saves
     w.start_load_kv(MultiConnectorMetadata([m0, m1]))
     assert a.loaded_meta is m0
     assert b.loaded_meta is m1
@@ -251,11 +258,11 @@ def test_start_load_kv_routes_by_index_and_records_saves():
 
 def test_get_finished_unions_and_normalizes_tuple():
     # moriio returns a legacy tuple; offload returns KVConnectorOutput.
-    moriio = FakeWorkerSub(finished=(set(), {"d1"}))          # recving d1
+    moriio = FakeWorkerSub(finished=(set(), {"d1"}))  # recving d1
     off = FakeWorkerSub(
         finished=KVConnectorOutput(finished_recving={"d2"}, failed_recving={"f1"})
     )
-    w = _worker([moriio, off])              # not producer
+    w = _worker([moriio, off])  # not producer
     out = w.get_finished()
     assert out.finished_recving == {"d1", "d2"}
     assert out.failed_recving == {"f1"}
@@ -268,7 +275,7 @@ def test_recv_blocks_concat():
 
 def test_non_producer_passes_saving_through():
     off = FakeWorkerSub(finished=KVConnectorOutput(finished_saving={"s1"}))
-    w = _worker([off])                      # is_producer False
+    w = _worker([off])  # is_producer False
     out = w.get_finished()
     assert out.finished_saving == {"s1"}
 
@@ -294,7 +301,7 @@ def test_send_is_withheld_until_save_completes():
     moriio._finished = ({9}, set())
     off._finished = KVConnectorOutput()
     out1 = w.get_finished()
-    assert out1.finished_sending == set()        # withheld
+    assert out1.finished_sending == set()  # withheld
     assert out1.finished_saving == set()
 
     # Step 2: offload reports save done -> both released together.
@@ -303,7 +310,7 @@ def test_send_is_withheld_until_save_completes():
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
     assert out2.finished_saving == {9}
-    assert w._pending_save == set()              # cleared after release
+    assert w._pending_save == set()  # cleared after release
 
 
 def test_save_then_send_also_pairs():

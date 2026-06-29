@@ -290,9 +290,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
-        self.is_offload = any(
-            getattr(c, "is_offload", False) for c in self._connectors
-        )
+        self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
 
     # -- base interface -----------------------------------------------------
 
@@ -329,13 +327,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
 
     def adjust_prefill_chunk_after_alloc(self, seq: Any, chunk: int) -> int:
         c = _first_with(self._connectors, "adjust_prefill_chunk_after_alloc")
-        return c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
+        return (
+            c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
+        )
 
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
         c = _first_with(self._connectors, "should_park_partial_prefill_for_load")
-        return (
-            c.should_park_partial_prefill_for_load(seq) if c is not None else False
-        )
+        return c.should_park_partial_prefill_for_load(seq) if c is not None else False
 
     def should_defer_free(self, seq: Any) -> bool:
         # Defer if ANY sub wants to defer (so neither a pending save nor a
