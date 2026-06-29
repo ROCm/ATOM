@@ -41,7 +41,7 @@ from unittest.mock import patch
 logger = logging.getLogger("atom")
 
 
-def set_ulimit() -> None:
+def set_ulimit(target_soft: int = 65536, target_hard: int = 524288) -> None:
     try:
         import resource
     except ImportError:
@@ -49,14 +49,23 @@ def set_ulimit() -> None:
         return
     rt = resource.RLIMIT_NOFILE
     soft, hard = resource.getrlimit(rt)
-    if soft >= hard:
+
+    new_hard = hard if hard == resource.RLIM_INFINITY else max(hard, target_hard)
+    new_soft = target_soft if new_hard == resource.RLIM_INFINITY else min(target_soft, new_hard)
+
+    if soft >= new_soft and hard >= new_hard:
         return
     try:
-        resource.setrlimit(rt, (hard, hard))
-        logger.info("Raised RLIMIT_NOFILE soft limit %d -> %d", soft, hard)
-    except (ValueError, OSError) as e:
-        logger.warning("Failed to raise RLIMIT_NOFILE soft=%d hard=%d: %s", soft, hard, e)
-
+        resource.setrlimit(rt, (new_soft, new_hard))
+        logger.info("Raised RLIMIT_NOFILE %d:%d -> %d:%d", soft, hard, new_soft, new_hard)
+    except (ValueError, OSError):
+        fallback_soft = min(target_soft, hard)
+        if fallback_soft > soft:
+            try:
+                resource.setrlimit(rt, (fallback_soft, hard))
+                logger.info("Raised RLIMIT_NOFILE soft %d -> %d (hard=%d)", soft, fallback_soft, hard)
+            except (ValueError, OSError) as e:
+                logger.warning("Failed to raise RLIMIT_NOFILE soft=%d hard=%d: %s", soft, hard, e)
 
 @contextlib.contextmanager
 def set_device_control_env_var(config: "Config", local_dp_rank: int):
