@@ -124,3 +124,41 @@ def weight_dequant_mxfp8(
     y = x.to(torch.float32).reshape(M, n_blocks, block_size)
     y = y * scale.unsqueeze(-1)
     return y.reshape(M, K).to(out_dtype)
+
+
+def quantize_weight_to_fp8_128x128_blockscale(weight, quant_dtype):
+    """Quantize a 2D weight to FP8 with 128x128 block scales.
+
+    Returns:
+        q_weight: quantized weight with the same shape as input ``weight``.
+        scale: per-block scale with shape ``(ceil(N/128), ceil(K/128))``.
+    """
+    assert weight.dim() == 2, f"expected 2D weight, got shape={tuple(weight.shape)}"
+
+    w = weight.to(torch.float32).contiguous()
+    n, k = w.shape
+    n_blocks = (n + 127) // 128
+    k_blocks = (k + 127) // 128
+    n_padded = n_blocks * 128
+    k_padded = k_blocks * 128
+
+    if n_padded != n or k_padded != k:
+        w = torch.nn.functional.pad(w, (0, k_padded - k, 0, n_padded - n))
+
+    w_blocks = w.view(n_blocks, 128, k_blocks, 128).permute(0, 2, 1, 3).contiguous()
+
+    finfo = torch.finfo(quant_dtype)
+    block_amax = w_blocks.abs().amax(dim=(2, 3))
+    scale = (block_amax / finfo.max).clamp_min(torch.finfo(torch.float32).tiny)
+
+    q_blocks = torch.clamp(
+        w_blocks / scale.unsqueeze(-1).unsqueeze(-1), min=finfo.min, max=finfo.max
+    ).to(quant_dtype)
+
+    q_weight = (
+        q_blocks.permute(0, 2, 1, 3)
+        .contiguous()
+        .view(n_padded, k_padded)[:n, :k]
+        .contiguous()
+    )
+    return q_weight, scale.contiguous()

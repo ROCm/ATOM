@@ -218,8 +218,9 @@ class QuarkOnlineParser(QuantConfigParser):
         if not isinstance(online_quant_config, dict):
             raise TypeError("online_quant_config must be a dict parsed from JSON.")
 
-        SCHEME_MAP = {
+        scheme_map = {
             "ptpc": QuantType.per_Token,
+            "per_block": QuantType.per_1x128,
         }
 
         def _parse_online_quant_format(quant_format_str: str) -> LayerQuantConfig:
@@ -231,10 +232,14 @@ class QuarkOnlineParser(QuantConfigParser):
                 quant_type = QuantType.per_1x32
                 dtype_str = quant_format_str[2:]
             else:
-                parts = quant_format_str.split("_", 1)
-                if len(parts) == 2 and parts[0] in SCHEME_MAP:
-                    quant_type = SCHEME_MAP[parts[0]]
-                    dtype_str = parts[1]
+                matched_scheme = None
+                for scheme in sorted(scheme_map, key=len, reverse=True):
+                    if quant_format_str.startswith(scheme + "_"):
+                        matched_scheme = scheme
+                        break
+                if matched_scheme is not None:
+                    quant_type = scheme_map[matched_scheme]
+                    dtype_str = quant_format_str[len(matched_scheme) + 1 :]
                 else:
                     raise ValueError(
                         f"Unsupported online quant format: '{quant_format_str}'. "
