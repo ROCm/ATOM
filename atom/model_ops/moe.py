@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -101,13 +102,21 @@ class FusedMoEParallelConfig:
     local_ep_size: int
 
     @property
-    def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled
-        return self.dp_size > 1 and self.use_ep and _has_module("mori")
+    def all2all_backend(self) -> str | None:
+        backend_checks = {
+            "mori": lambda: _has_module("mori"),
+            "flydsl": lambda: _has_module("flydsl"),
+        }
+
+        backend = os.environ.get("ATOM_EP_BACKEND", "mori").strip().lower()
+        check = backend_checks.get(backend)
+        if check is None:
+            return None
+        return backend if check() else None
 
     @property
-    def use_mori_kernels(self):
-        return True
+    def use_all2all_kernels(self):
+        return self.dp_size > 1 and self.use_ep and self.all2all_backend is not None
 
     @staticmethod
     def make(
@@ -384,14 +393,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> FusedMoEPrepareAndFinalize | None:
         from aiter.dist.parallel_state import get_ep_group
 
-        all2all_manager = get_ep_group().device_communicator.all2all_manager
+        backend = moe.moe_parallel_config.all2all_backend
+        if backend is None:
+            return None
+
+        ep_communicator = get_ep_group().device_communicator
+        ep_communicator.all2all_backend = backend
+        all2all_manager = ep_communicator.all2all_manager
         assert all2all_manager is not None
 
-        prepare_finalize: FusedMoEPrepareAndFinalize | None = None
-
-        # TODO: could allow this now
-        # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
-        if moe.use_mori_kernels:
+        def _build_mori_prepare_finalize() -> FusedMoEPrepareAndFinalize:
             assert quant_config is not None
             # For PTPC (per token per channel) quant, the scale dim for each token is 1
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
@@ -494,8 +505,82 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 tbo_mori_ops=tbo_mori_ops,
                 low_latency=low_latency,
             )
+            return prepare_finalize
 
-        return prepare_finalize
+        def _build_flydsl_prepare_finalize() -> FusedMoEPrepareAndFinalize:
+            from atom.model_ops.fused_moe.all2all_prepare_finalize import (
+                All2AllPrepareAndFinalize,
+                _make_comm_op,
+                _NUM_TBO_UBATCHES,
+            )
+            from atom.utils.tbo.ubatching import tbo_enabled
+            from atom.config import get_current_atom_config
+
+
+            all_to_all_args = dict(
+                rank=all2all_manager.rank,
+                num_ep_ranks=all2all_manager.world_size,
+                quant_dtype=None,
+                token_hidden_size=moe.hidden_dim,
+                scale_dim=scale_dim,
+                scale_type_size=scale_type_size,
+                max_num_tokens_per_dp_rank=16384,
+                input_dtype=moe.in_dtype,
+                num_local_experts=moe.num_experts // all2all_manager.world_size,
+                num_experts_per_token=moe.experts_per_token,
+            )
+
+            handle = all2all_manager.get_handle(all_to_all_args)
+            is_async = tbo_enabled()
+            atom_config = get_current_atom_config()
+            low_latency = getattr(atom_config, "enable_low_latency", False)
+
+            _comm_ops = None
+            if is_async:
+                config_key = tuple(sorted(all_to_all_args.items()))
+                _comm_ops = [
+                    _make_comm_op(all2all_manager, config_key, i)
+                    for i in range(_NUM_TBO_UBATCHES)
+                ]
+
+
+            # Dispatch quant: derive from model activation dtype (fp8/fp4).
+            # scale is per_1x32 e8m0 → scale_dim = hidden//32, scale_type_size = 1.
+            dispatch_quant_dtype: torch.dtype | None = None
+            model_dispatch_quant = MoEActivationQuant.from_model_config(
+                moe.a_quant_dtype if isinstance(moe.a_quant_dtype, str) else None
+            )
+            if model_dispatch_quant == MoEActivationQuant.FP8:
+                dispatch_quant_dtype = dtypes.fp8
+            elif model_dispatch_quant == MoEActivationQuant.FP4:
+                dispatch_quant_dtype = dtypes.fp4x2
+
+            if dispatch_quant_dtype is not None and moe.hidden_dim % 32 != 0:
+                dispatch_quant_dtype = None
+
+            if dispatch_quant_dtype is not None:
+                scale_dim = moe.hidden_dim // 32
+                scale_type_size = 1  # e8m0
+            else:
+                scale_dim = 0
+                scale_type_size = 0
+
+            prepare_finalize = All2AllPrepareAndFinalize(
+                handle,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_dispatchers=all2all_manager.world_size,
+                dispatch_quant_dtype=dispatch_quant_dtype,
+                is_async=is_async,
+                comm_ops=_comm_ops,
+                low_latency=low_latency,
+            )
+            return prepare_finalize
+
+        prepare_finalize_builders = {
+            "mori": _build_mori_prepare_finalize,
+            "flydsl": _build_flydsl_prepare_finalize,
+        }
+        return prepare_finalize_builders[backend]()
 
     def maybe_make_prepare_finalize(self) -> FusedMoEPrepareAndFinalize | None:
         # if True:
