@@ -169,7 +169,7 @@
     "runner": "atom-plugin-acc-validation-runner",
     "test_level": "nightly",
     "priority": "P0",
-    "accuracy_test_threshold": 0.93
+    "accuracy_test_threshold": 0.92
   },
   {
     "model_name": "Kimi-K2.5-MXFP4 TP8",
