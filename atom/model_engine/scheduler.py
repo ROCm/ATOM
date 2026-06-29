@@ -415,6 +415,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.long_prefill_token_threshold = config.long_prefill_token_threshold
         self.max_model_len = config.max_model_len
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
@@ -453,6 +454,42 @@ class Scheduler:
             CacheStats() if config.enable_prefix_caching else None
         )
         self.enable_chunked_prefill = config.enable_chunked_prefill
+        # V4 SWA correctness on a prefix-cache hit. V4's sliding-window state is
+        # a per-request ring (NOT shared across blocks), so on a hit the new
+        # request's ring is empty and a tail token whose SWA window reaches back
+        # into the cached region would read garbage. Fix: pull the forward start
+        # back by enough whole blocks that the last `window` cached tokens are
+        # re-forwarded, repopulating the ring. The compressed-KV hit (n_committed
+        # = context_len // ratio) is UNAFFECTED because context_lens =
+        # num_cached + num_scheduled is invariant under this shift. Only V4 needs
+        # this; 0 disables (e.g. once SWA gets per-block shared storage, "fix C").
+        # See docs / plan: V4 prefix cache fix B'.
+        # NOTE: V4 detection must use `architectures`, not `model_type` — the
+        # config registry maps "deepseek_v4" -> "deepseek_v3" so model_type
+        # reads as v3 (same reason config.py:1118 uses architectures).
+        self._v4_swa_warmup_blocks = 0
+        _hf = getattr(config, "hf_config", None)
+        _arches = getattr(_hf, "architectures", None) or []
+        _is_v4 = any("DeepseekV4" in str(a) for a in _arches)
+        if config.enable_prefix_caching and _is_v4:
+            import math as _math
+
+            window = int(getattr(_hf, "sliding_window", 128) or 128)
+            # The SWA ring's physical stride is `win_with_spec = window + mtp_k`
+            # (MTP draft tokens get their own ring slots). A tail token's window
+            # can reach back `win_with_spec - 1` ring slots, so the re-forwarded
+            # region must cover that many tokens — not just `window`. Verified:
+            # with mtp_k=1, rolling back only `window`(128) leaves the deepest
+            # reach-back (r=4) reading one stale slot -> DIVERGE.
+            mtp_k = (
+                config.speculative_config.num_speculative_tokens
+                if config.speculative_config is not None
+                else 0
+            )
+            win_with_spec = window + int(mtp_k or 0)
+            self._v4_swa_warmup_blocks = _math.ceil(
+                win_with_spec / self.block_manager.block_size
+            )
         # Number of running seqs currently mid-prefill (per-seq state lives in
         # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
         # of `schedule()` can skip the running-queue scan entirely on
@@ -721,7 +758,9 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+                remaining = seq.num_tokens - seq.num_cached_tokens
+                if 0 < self.long_prefill_token_threshold < remaining:
+                    remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = min(remaining, budget_remaining)
                 if chunk <= 0:
@@ -814,6 +853,16 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
+            # V4 SWA fix (B'): drop the last `_v4_swa_warmup_blocks` hit blocks so
+            # those tokens are re-forwarded, repopulating the per-request SWA
+            # ring (see __init__). Compressed-KV n_committed is unaffected
+            # (context_lens = cached + scheduled stays = prompt length). Only
+            # fires on a real hit (>0); a full miss is untouched.
+            if self._v4_swa_warmup_blocks and num_cached_blocks > 0:
+                num_cached_blocks = max(
+                    0, num_cached_blocks - self._v4_swa_warmup_blocks
+                )
+
             # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
             # their decoded tokens — preempt() frees their KV blocks but keeps
             # the token_ids, so num_tokens > num_prompt_tokens and those tokens
@@ -821,6 +870,11 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.block_size
             )
+            if (
+                self.enable_chunked_prefill
+                and 0 < self.long_prefill_token_threshold < num_new_tokens
+            ):
+                num_new_tokens = self.long_prefill_token_threshold
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
             if self.enable_chunked_prefill:
                 chunk = min(num_new_tokens, budget_remaining)
@@ -1036,6 +1090,12 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
+                # Prefill is partial until the whole PROMPT's KV is computed.
+                # Compare against num_prompt_tokens, not num_tokens: once a
+                # completion token is appended (this step's sampled token, or an
+                # externally-appended EOS), num_tokens > num_prompt_tokens and
+                # comparing against it would wrongly keep a finished prefill
+                # flagged partial — which makes the EOS/finish loop below skip it.
                 now_partial = seq.num_cached_tokens < seq.num_prompt_tokens
                 if now_partial != seq.is_partial_prefill:
                     self._partial_prefill_count += 1 if now_partial else -1
@@ -1226,6 +1286,19 @@ class Scheduler:
             # no-op).
             if stop_at_idx is not None and stop_at_idx < num_new_token - 1:
                 num_tokens -= (num_new_token - 1) - stop_at_idx
+                # The same truncation MUST apply to the EMITTED tokens, not just
+                # the internal seq length. The client-visible text is built from
+                # RequestOutput.output_tokens (an accumulation of `new_tokens`) by
+                # generate_async / the streaming callback — NOT from
+                # completion_token_ids (which the `seq.num_tokens` write above
+                # governs). Without trimming `new_tokens` here, the post-stop
+                # tokens the rejection sampler emits past EOS (it does not inspect
+                # EOS) leak into the response: strict-match still finds the answer,
+                # but flexible-extract's last-number picks up the leaked trailing
+                # digit. `injected_t0` (if present) prepends one slot not counted
+                # in stop_at_idx / num_new_token, so offset the cut by it.
+                keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
+                new_tokens = new_tokens[:keep]
 
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:
@@ -1384,8 +1457,8 @@ class Scheduler:
     def get_next_batch_info(self) -> tuple[bool, int, int]:
         # Check for partial prefills in running (chunked prefill resume)
         for seq in self.running:
-            if seq.num_cached_tokens < seq.num_prompt_tokens:
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+            if seq.num_cached_tokens < seq.num_tokens:
+                remaining = seq.num_tokens - seq.num_cached_tokens
                 chunk = min(remaining, self.max_num_batched_tokens)
                 return (True, chunk, 1)
         # Only consider waiting seqs that are not blocked on a remote KV

@@ -21,6 +21,7 @@ _ATOM_ENV_VARS = [
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_PROFILER_MORE",
+    "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
     "ATOM_DISABLE_VLLM_PLUGIN",
@@ -73,6 +74,9 @@ class TestEnvsDefaults:
     def test_profiler_more_default(self):
         assert _get_envs().ATOM_PROFILER_MORE is False
 
+    def test_profiler_timeout_default(self):
+        assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
+
     def test_log_more_default(self):
         assert _get_envs().ATOM_LOG_MORE is False
 
@@ -111,6 +115,10 @@ class TestEnvsOverrides:
     def test_profiler_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
         assert _get_envs().ATOM_PROFILER_MORE is True
+
+    def test_profiler_timeout_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")
+        assert _get_envs().ATOM_PROFILER_TIMEOUT == 900.0
 
     def test_log_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_LOG_MORE", "1")

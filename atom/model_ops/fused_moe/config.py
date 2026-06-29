@@ -353,7 +353,3 @@ class FusedMoEConfig:
     @property
     def use_ep(self):
         return self.moe_parallel_config.use_ep
-
-    @property
-    def use_mori_kernels(self):
-        return self.moe_parallel_config.use_mori_kernels

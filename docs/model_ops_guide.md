@@ -289,8 +289,8 @@ class FusedMoEParallelConfig:
 ```
 
 Key properties:
-- `use_all2all_kernels`: `True` when `dp_size > 1`, EP is enabled, and MORI is available.
-- `use_mori_kernels`: Always `True` (currently).
+- `use_all2all_kernels`: `True` when `dp_size > 1`, EP is enabled, and the selected all2all backend is available.
+- `all2all_backend`: Resolved backend name (`"mori"` / `"flydsl"`), or `None` when all2all is unavailable.
 
 ### 4.5 MORI Integration (`fused_moe/mori_prepare_finalize.py`)
 
