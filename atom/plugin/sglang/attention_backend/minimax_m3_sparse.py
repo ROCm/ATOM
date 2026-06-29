@@ -408,13 +408,17 @@ def _sgl_m3_sparse_decode_merge_kernel(
     d_mask = off_d < head_dim
     m = tl.full((), float("-inf"), dtype=tl.float32)
     for c in range(num_chunks):
-        l = tl.load(lse_partial + c * stride_lc + pid_b * stride_lb + pid_h * stride_lh)
-        m = tl.maximum(m, l)
+        lse_value = tl.load(
+            lse_partial + c * stride_lc + pid_b * stride_lb + pid_h * stride_lh
+        )
+        m = tl.maximum(m, lse_value)
     acc = tl.zeros((BLOCK_SIZE_D,), dtype=tl.float32)
     denom = tl.full((), 0.0, dtype=tl.float32)
     for c in range(num_chunks):
-        l = tl.load(lse_partial + c * stride_lc + pid_b * stride_lb + pid_h * stride_lh)
-        w = tl.exp2(l - m)
+        lse_value = tl.load(
+            lse_partial + c * stride_lc + pid_b * stride_lb + pid_h * stride_lh
+        )
+        w = tl.exp2(lse_value - m)
         vals = tl.load(
             o_partial
             + c * stride_oc
