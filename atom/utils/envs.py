@@ -183,6 +183,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
+    # MiniMax-M3 per-layer attn/moe hidden dump + mean/var print. Captures one
+    # prefill step and one decode step (decode = num_tokens == 1), then exits
+    # after the last layer's MoE of the first decode step. Requires eager mode
+    # (--enforce-eager) so the submodule forward hooks fire during decode.
+    "ATOM_M3_DUMP_DIR": lambda: os.getenv("ATOM_M3_DUMP_DIR", ""),
+    "ATOM_M3_DUMP_EXIT": lambda: os.getenv("ATOM_M3_DUMP_EXIT", "1") == "1",
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),

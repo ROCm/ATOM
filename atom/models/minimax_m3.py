@@ -43,6 +43,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils.debug_helper import maybe_dump_minimax_m3_layer
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import PretrainedConfig
@@ -588,6 +589,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Debug dump bookkeeping (env-gated; see maybe_dump_minimax_m3_layer).
+        self.layer_num = layer_num
+        self._last_layer_idx = config.num_hidden_layers - 1
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -611,11 +616,17 @@ class MiniMaxM3DecoderLayer(nn.Module):
             aux_out.append(residual.clone())
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        maybe_dump_minimax_m3_layer(
+            hidden_states, self.layer_num, "attn", self._last_layer_idx
+        )
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
+        maybe_dump_minimax_m3_layer(
+            hidden_states, self.layer_num, "moe", self._last_layer_idx
+        )
         return hidden_states, residual
 
 

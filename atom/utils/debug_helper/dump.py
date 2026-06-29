@@ -10,6 +10,8 @@ Env vars (all defined in atom/utils/envs.py):
   ATOM_FWD_DUMP_LAYER_ATTR / ATOM_FWD_DUMP_ONE_SHOT
   ATOM_WEIGHT_DUMP_DIR / ATOM_WEIGHT_DUMP_LAYERS / ATOM_WEIGHT_DUMP_EXIT
   ATOM_DEBUG_TOPK / ATOM_DEBUG_TOPK_PATH
+  ATOM_M3_DUMP_DIR / ATOM_M3_DUMP_EXIT
+  ATOM_MINIMAX_DUMP_DIR / ATOM_MINIMAX_DUMP_ABORT
 
 Output file naming
 ------------------
@@ -33,6 +35,7 @@ Inside Sampler.forward (optional):
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from typing import Optional
@@ -156,6 +159,126 @@ def install_block_forward_hooks(model: torch.nn.Module) -> int:
         mod.register_forward_hook(_make_hook(lid, cls))
         n += 1
     return n
+
+
+# === MiniMax-M3 per-layer attn/moe dump (call-site helper) ===========
+
+# Tracks which (layer, stage) pairs are already saved per step kind, so each is
+# dumped exactly once for the first prefill step and once for the first decode step.
+_M3_DONE: dict[str, set[tuple[int, str]]] = {"prefill": set(), "decode": set()}
+
+
+def _is_dummy_run() -> bool:
+    """True if the current forward is a warmup / CUDAGraph-capture dummy run.
+
+    Reads is_dummy_run off the forward context's Context. Returns False when no
+    context is available (e.g. unit tests calling the dump helper directly), so
+    standalone usage still dumps.
+    """
+    try:
+        from atom.utils.forward_context import get_forward_context
+
+        ctx = get_forward_context().context
+        return bool(getattr(ctx, "is_dummy_run", False))
+    except Exception:
+        return False
+
+
+def maybe_dump_minimax_m3_layer(
+    hidden_states: torch.Tensor,
+    layer_idx: int,
+    stage: str,
+    last_layer_idx: int,
+) -> None:
+    """Print mean/var and dump a MiniMax-M3 layer hidden state. Env-gated no-op.
+
+    No-op unless ATOM_M3_DUMP_DIR is set, so it is safe to leave wired into the
+    model forward in production (zero overhead on the unset path). Intended to be
+    called from MiniMaxM3DecoderLayer.forward right after the attention block
+    output (stage="attn") and after the MoE/MLP block output (stage="moe").
+
+    Warmup / CUDAGraph-capture dummy forwards are skipped (gated on the forward
+    context's is_dummy_run flag), so only real request data is dumped.
+
+    Captures the first prefill step and the first decode step only. The step kind
+    is inferred from the token count: decode == 1 token (per the num_tokens==1
+    rule), otherwise prefill. Each (layer, stage) is saved once per kind, so later
+    prefill/decode steps are ignored.
+
+    Files: {ATOM_M3_DUMP_DIR}/{kind}_layer{LL}_{stage}_rank{R}.pt
+
+    When ATOM_M3_DUMP_EXIT is set (default), the process exits right after the last
+    layer's MoE output of the first decode step.
+
+    Requires eager execution (--enforce-eager / --level 0): with compilation on,
+    the model forward is traced by Dynamo and the .item()/torch.save calls here
+    are not traceable. Leaving the env unset keeps this a pure no-op, so compiled
+    runs are unaffected.
+    """
+    dump_dir = envs.ATOM_M3_DUMP_DIR
+    if not dump_dir:
+        return
+    if not isinstance(hidden_states, torch.Tensor):
+        return
+
+    # Skip warmup / capture dummy forwards — only dump real request data. The
+    # warmup pass sets is_dummy_run=True on the forward context (see
+    # model_runner.warmup_model). Absent a context (e.g. unit tests), treat as
+    # real so standalone calls still dump.
+    if _is_dummy_run():
+        return
+
+    kind = "decode" if hidden_states.shape[0] == 1 else "prefill"
+    key = (layer_idx, stage)
+    if key in _M3_DONE[kind]:
+        return
+    _M3_DONE[kind].add(key)
+
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = _get_rank()
+    logger = logging.getLogger("atom")
+
+    tf = hidden_states.detach().float()
+    mean = tf.mean().item()
+    var = tf.var().item()
+    logger.info(
+        f"[M3_DUMP] {kind} layer{layer_idx:03d} {stage}: "
+        f"mean={mean:.6e} var={var:.6e} shape={tuple(hidden_states.shape)} "
+        f"rank={rank}"
+    )
+    fname = os.path.join(
+        dump_dir, f"{kind}_layer{layer_idx:03d}_{stage}_rank{rank}.pt"
+    )
+    torch.save(
+        {
+            "hidden": hidden_states.detach().cpu(),
+            "shape": tuple(hidden_states.shape),
+            "layer": layer_idx,
+            "stage": stage,
+            "kind": kind,
+            "mean": mean,
+            "var": var,
+        },
+        fname,
+    )
+
+    # Exit after the last layer's MoE output of the first decode step.
+    if (
+        envs.ATOM_M3_DUMP_EXIT
+        and kind == "decode"
+        and stage == "moe"
+        and layer_idx == last_layer_idx
+    ):
+        logger.info(
+            "[M3_DUMP] captured first decode step through last layer "
+            f"{layer_idx}; exiting."
+        )
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        sys.exit(0)
 
 
 # === Weight dump =====================================================
