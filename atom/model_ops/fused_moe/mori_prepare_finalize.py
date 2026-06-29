@@ -153,8 +153,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         return tbo_active()
 
-    def _get_dispatch_config(self):
-        """Return (block_num, warp_per_block) based on prefill vs decode."""
+    def _get_dispatch_config(self, num_tokens: int | None = None) -> tuple[int, int]:
+        """Return (block_num, warp_per_block) based on runtime mode.
+
+        Default policy keys off the forward-context prefill/decode flag.
+        atom-vllm has no stable prefill/decode flag at this call site and
+        instead selects by a token-count threshold; it overrides this method
+        via a plugin patch, so keep this body frontend-agnostic.
+        """
         context = get_forward_context().context
         if context.is_prefill:
             return 128, 16
@@ -193,7 +199,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
 
-        block_num, warp_per_block = self._get_dispatch_config()
+        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
 
         (
             dispatch_a1,
@@ -227,7 +233,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> torch.Tensor:
         num_token = topk_ids.shape[0]
 
-        block_num, warp_per_block = self._get_dispatch_config()
+        block_num, warp_per_block = self._get_dispatch_config(num_token)
 
         result = self._sync_mori_op.combine(
             fused_expert_output,
@@ -326,7 +332,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             tbo_switch_to_compute_sync,
         )
 
-        block_num, warp_per_block = self._get_dispatch_config()
+        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
 
         ubatch_id = tbo_current_ubatch_id()
         mori_op = self._tbo_mori_ops[ubatch_id]
@@ -413,7 +419,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             tbo_switch_to_compute_sync,
         )
 
-        block_num, warp_per_block = self._get_dispatch_config()
+        block_num, warp_per_block = self._get_dispatch_config(num_token)
 
         ubatch_id = tbo_current_ubatch_id()
         mori_op = self._tbo_mori_ops[ubatch_id]

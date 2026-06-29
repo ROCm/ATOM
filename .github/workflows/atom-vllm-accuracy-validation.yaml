@@ -36,6 +36,7 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
@@ -79,6 +80,7 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
@@ -122,6 +124,7 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
@@ -165,6 +168,7 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
@@ -208,6 +212,7 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
@@ -251,6 +256,7 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
@@ -294,6 +300,7 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
@@ -337,6 +344,7 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
