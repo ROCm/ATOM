@@ -133,6 +133,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
+    # --- EPLB (expert load balancing) ---
+    # Master switch for module-A online load statistics.
+    "ATOM_EPLB_ENABLE": lambda: os.getenv("ATOM_EPLB_ENABLE", "0") == "1",
+    # Number of recent forward passes kept in the expert-load ring buffer.
+    "ATOM_EPLB_LOAD_WINDOW_SIZE": lambda: int(
+        os.getenv("ATOM_EPLB_LOAD_WINDOW_SIZE", "1000")
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"

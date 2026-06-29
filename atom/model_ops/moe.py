@@ -21,6 +21,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.model_loader.weight_utils import set_weight_attrs
+from atom.model_ops.eplb import get_expert_load_monitor
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -64,6 +65,24 @@ from torch import nn
 from transformers import PretrainedConfig
 
 logger = logging.getLogger("atom")
+
+
+def _record_eplb_expert_load(layer: torch.nn.Module, topk_ids: torch.Tensor) -> None:
+    atom_cfg = get_current_atom_config()
+    if not getattr(atom_cfg, "eplb_enable", False):
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    if not isinstance(layer_id, int):
+        return
+    num_physical = int(getattr(layer, "global_num_experts", -1))
+    if num_physical <= 0:
+        return
+    monitor = get_expert_load_monitor(
+        enabled=True, window_size=atom_cfg.eplb_load_window_size
+    )
+    monitor.record(
+        layer_id=layer_id, topk_physical=topk_ids, num_physical=num_physical
+    )
 
 
 class MoEActivationQuant(Enum):
@@ -380,6 +399,44 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
         raise NotImplementedError
+
+    def _select_experts_with_eplb_record(
+        self,
+        *,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        renormalize: bool,
+        topk_group: Optional[int],
+        num_expert_group: Optional[int],
+        custom_routing_function: Optional[Callable],
+        scoring_func: str,
+        e_score_correction_bias: Optional[torch.Tensor],
+        num_routing_experts: int,
+        num_fused_shared_experts: int,
+        fused_shared_experts_scoring_func: Optional[str],
+        routed_scaling_factor: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_routing_experts=num_routing_experts,
+            num_fused_shared_experts=num_fused_shared_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        _record_eplb_expert_load(layer, topk_ids)
+        return topk_weights, topk_ids
 
     @staticmethod
     def _maybe_make_prepare_finalize(
@@ -1210,7 +1267,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 act_quant=self.act_quant,
             )
 
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        topk_weights, topk_ids = self._select_experts_with_eplb_record(
+            layer=layer,
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -2285,6 +2343,7 @@ class FusedMoE(torch.nn.Module):
         tp_size: Optional[int] = None,
         ep_size: Optional[int] = None,
         dp_size: Optional[int] = None,
+        layer_id: Optional[int] = None,
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
@@ -2297,6 +2356,7 @@ class FusedMoE(torch.nn.Module):
         shared_expert_prefix: Optional[str] = None,
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.prefix = prefix
         layer_quant_config = (
             quant_config.get_layer_quant_config(prefix, check_children=True)
