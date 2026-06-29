@@ -102,22 +102,23 @@ jobs:
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_ROOT=""
           MODEL_CACHE_DESC=""
+          MODEL_MOUNT_PATH="/models"
 
           if [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_ROOT="/shared/data/WRH/models"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/mnt/raid0/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/data/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/data/pretrained_model"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/data/models" ]; then
             MODEL_CACHE_ROOT="/data/models"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
@@ -129,6 +130,7 @@ jobs:
           echo "MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+          echo "MODEL_MOUNT_PATH=${MODEL_MOUNT_PATH}" >> "$GITHUB_ENV"
 
       - name: Clean up GPU and Python processes
         run: |
@@ -243,7 +245,7 @@ jobs:
             exit 0
           fi
 
-          model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           if $CONTAINER_ENGINE exec \
             -e MODEL_DIR="$model_dir" \
             "$CONTAINER_NAME" \
@@ -259,7 +261,7 @@ jobs:
       - name: Download model if needed
         run: |
           set -euo pipefail
-          model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           if [ "${SGLANG_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
             echo "Using local model path ${SGLANG_RESOLVED_MODEL_PATH}; skip download."
             exit 0
@@ -333,8 +335,8 @@ jobs:
             exit 0
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_CACHE_ROOT}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
-            echo "Using mounted model path: ${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_MOUNT_PATH}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: ${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           else
             echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
