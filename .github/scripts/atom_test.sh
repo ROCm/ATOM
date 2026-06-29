@@ -47,6 +47,7 @@ PY
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
+  echo "[fd-diag] host=$(hostname) soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
   # Clear stale compile cache to avoid NameError from outdated generated code
   echo "Clearing compile cache..."
   rm -rf ~/.cache/atom/*

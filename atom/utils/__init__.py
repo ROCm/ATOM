@@ -41,52 +41,21 @@ from unittest.mock import patch
 logger = logging.getLogger("atom")
 
 
-def set_ulimit(target_soft_limit: int = 65535) -> None:
-    """Raise the open-file soft limit toward ``target_soft_limit`` (capped at
-    the hard limit).
-
-    High streaming concurrency needs roughly one file descriptor per in-flight
-    connection plus the engine's ZMQ/shared-memory fds. The default soft
-    ``RLIMIT_NOFILE`` (~1024) is exhausted under large concurrency (e.g. the
-    conc=1000 accuracy job), surfacing as EMFILE on ``accept()`` — which drops
-    incoming connections. vLLM and SGLang raise this at process startup for the
-    same reason; ATOM must too (the mesh launch scripts already pass
-    ``--ulimit nofile`` to docker, but plain server launches do not).
-    """
+def set_ulimit() -> None:
     try:
         import resource
-    except ImportError:  # POSIX-only; Windows has no RLIMIT_NOFILE.
+    except ImportError:
         logger.warning("resource module unavailable (non-POSIX); skipping ulimit bump.")
         return
-
-    resource_type = resource.RLIMIT_NOFILE
-    soft, hard = resource.getrlimit(resource_type)
-    desired = (
-        target_soft_limit
-        if hard == resource.RLIM_INFINITY
-        else min(target_soft_limit, hard)
-    )
-    if soft >= desired:
+    rt = resource.RLIMIT_NOFILE
+    soft, hard = resource.getrlimit(rt)
+    if soft >= hard:
         return
     try:
-        resource.setrlimit(resource_type, (desired, hard))
-        logger.info(
-            "Raised RLIMIT_NOFILE soft limit %d -> %d (hard=%d)", soft, desired, hard
-        )
+        resource.setrlimit(rt, (hard, hard))
+        logger.info("Raised RLIMIT_NOFILE soft limit %d -> %d", soft, hard)
     except (ValueError, OSError) as e:
-        logger.warning(
-            "Found RLIMIT_NOFILE soft=%d hard=%d and failed to automatically "
-            "raise the soft limit to %d (error: %s). This can cause fd-limit "
-            "errors like `OSError: [Errno 24] Too many open files` under high "
-            "connection concurrency. The hard limit is the ceiling and cannot "
-            "be raised from inside the process — raise it where the server is "
-            "launched: docker `--ulimit nofile=65536:524288`, systemd "
-            "`LimitNOFILE=`, or /etc/security/limits.conf.",
-            soft,
-            hard,
-            desired,
-            e,
-        )
+        logger.warning("Failed to raise RLIMIT_NOFILE soft=%d hard=%d: %s", soft, hard, e)
 
 
 @contextlib.contextmanager
