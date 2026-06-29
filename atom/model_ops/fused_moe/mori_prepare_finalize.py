@@ -11,6 +11,7 @@ import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.utils.forward_context import get_forward_context
 from aiter import QuantType, dtypes
+from aiter.jit.utils.chip_info import get_cu_num
 
 try:
     import mori
@@ -24,19 +25,6 @@ logger = logging.getLogger("atom")
 
 
 _NUM_TBO_UBATCHES = 2
-
-
-@lru_cache(maxsize=8)
-def _device_cu_count(device_index: int | None = None) -> int:
-    """Compute-unit (multiprocessor) count of the current CUDA/HIP device.
-
-    Used to cap mori IntraNode block_num so the kernels' grid-wide barrier
-    never asks for more co-resident blocks than the GPU has CUs (see
-    _get_dispatch_config). MI308X=80, MI300X=304, MI355X=256.
-    """
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 @lru_cache(maxsize=8)
@@ -184,7 +172,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         completes -> warmup deadlocks. Capping at multi_processor_count keeps
         big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
         """
-        mp = _device_cu_count()
+        mp = get_cu_num()
         context = get_forward_context().context
         if context.is_prefill:
             return min(128, mp), 16

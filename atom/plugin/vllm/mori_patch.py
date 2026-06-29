@@ -22,11 +22,9 @@ from typing import Optional
 import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
-from atom.model_ops.fused_moe.mori_prepare_finalize import (
-    MoriPrepareAndFinalize,
-    _device_cu_count,
-)
+from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
 from atom.plugin.config import VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD
+from aiter.jit.utils.chip_info import get_cu_num
 
 _MORI_PATCH_APPLIED = False
 
@@ -115,7 +113,7 @@ def apply_vllm_mori_patch() -> None:
         # barrier requires all gridDim.x blocks co-resident; >CU blocks (e.g.
         # 128 on the 80-CU MI308X) deadlock at warmup. Mirrors the native
         # MoriPrepareAndFinalize._get_dispatch_config cap.
-        mp = _device_cu_count()
+        mp = get_cu_num()
         if num_tokens >= VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD:
             return min(128, mp), 16
         return min(64, mp), 4
