@@ -253,13 +253,19 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
     def _ensure_fp8_scales(self, kv_cache: torch.Tensor):
         if self.kv_cache_dtype != "fp8":
             return None, None
-        if self.k_scale is None or self.v_scale is None:
-            _kv, num_blocks, block_size, num_kv_heads, _head_dim = kv_cache.shape
+        _kv, num_blocks, block_size, num_kv_heads, _head_dim = kv_cache.shape
+        max_kv_tokens = num_blocks * block_size
+        expected_shape = (num_kv_heads, max_kv_tokens)
+        if (
+            self.k_scale is None
+            or self.v_scale is None
+            or self.k_scale.shape != expected_shape
+            or self.k_scale.device != kv_cache.device
+        ):
             self.kv_scale = torch.zeros(
                 2,
-                num_blocks,
                 num_kv_heads,
-                block_size,
+                max_kv_tokens,
                 dtype=dtypes.fp32,
                 device=kv_cache.device,
             )
@@ -356,6 +362,8 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         q = query.view(-1, self.num_heads, self.head_dim)
         out = output.view(-1, self.num_heads, self.head_dim)
         kv_cache = self.kv_cache.permute(1, 0, 2, 3, 4)
+        k_scale = self.k_scale if self.kv_cache_dtype == "fp8" else None
+        v_scale = self.v_scale if self.kv_cache_dtype == "fp8" else None
         if self.kv_cache_dtype == "fp8":
             target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
             kv_cache = kv_cache.view(target_dtype)
@@ -407,6 +415,8 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 self.num_kv_heads,
                 self.scale,
                 out[:num_decode_tokens],
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
 
         if num_prefill_tokens > 0 and main_metadata.prefill is not None:
@@ -444,6 +454,8 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 self.num_kv_heads,
                 self.scale,
                 out[start:stop],
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         return output
 
