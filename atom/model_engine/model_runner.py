@@ -616,6 +616,7 @@ class ModelRunner:
         )
 
         self.use_aux_hidden_state_outputs = False
+        self.use_dspark_aux_capture = False
         self._aux_hidden_states = None
         self.tokenID_processor = tokenIDProcessor(
             self,
@@ -690,6 +691,19 @@ class ModelRunner:
                 self.model.set_aux_hidden_state_layers(tuple(aux_ids))
                 self.use_aux_hidden_state_outputs = True
                 logger.info(f"Eagle3 aux hidden state layers: {aux_ids}")
+
+        # DSpark draft consumes target hidden states from configured target
+        # layers (dspark_target_layer_ids, e.g. [58,59,60]). The reference
+        # captures the per-layer mHC residual reduced over the hc axis
+        # (mean over dim=1: [N, hc, dim] -> [N, dim]) and concatenates the
+        # selected layers. V4ForCausalLM is @support_torch_compile (must not be
+        # edited), so we capture via forward hooks on the target decoder layers.
+        if (
+            self.config.speculative_config
+            and get_pp_group().is_last_rank
+            and getattr(self.config.speculative_config, "use_dspark", lambda: False)()
+        ):
+            self._install_dspark_aux_hooks()
 
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
@@ -1002,6 +1016,97 @@ class ModelRunner:
     def debug(self, *args: Any):
         if self.rank == 0:
             logger.info(*args)
+
+    def _install_dspark_aux_hooks(self) -> None:
+        """Capture DSpark target hidden states via forward hooks.
+
+        DSpark's draft reads, for each configured target layer L, the layer's
+        output mHC residual reduced over the hc axis (mean(dim=1):
+        [N, hc, dim] -> [N, dim]), and concatenates the selected layers into
+        [N, len(target_layers)*dim].
+
+        ATOM's V4 decoder ``Block`` returns an ``HCState`` whose ``residual`` is
+        the PRE-layer residual; the layer's actual output residual is synthesized
+        by the NEXT layer's ``fuse_hc`` via ``hc_post(x_prev, residual, post,
+        comb)``. We reproduce that here inside the hook using the same block's
+        ``hc_post`` so the captured tensor matches the post-layer residual.
+
+        The captured per-layer [N, dim] tensors are stashed on the runner and
+        read out in run_model as ``self._aux_hidden_states`` (list, target order).
+        """
+        spec_cfg = self.config.speculative_config
+        draft_cfg = spec_cfg.draft_model_hf_config
+        target_layer_ids = tuple(
+            int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
+        )
+        if not target_layer_ids:
+            raise ValueError(
+                "DSpark requires dspark_target_layer_ids on the draft config."
+            )
+
+        base = getattr(self.model, "language_model", self.model)
+        inner = base.model  # DeepseekV4Model
+        layers = inner.layers
+        hidden_size = self.config.hf_config.hidden_size
+        max_tokens = self.config.max_num_batched_tokens
+
+        self._dspark_target_layer_ids = target_layer_ids
+        # Preallocated fixed-address buffers, one per target layer, written
+        # in-place by the hooks. A Python dict write (cache[lid] = ...) is NOT
+        # cudagraph-safe: it is a host-side side effect that the compiler's
+        # buffer-mutation guard rejects (it never re-runs on graph replay, so the
+        # captured tensors would silently go stale). In-place ``copy_`` into a
+        # static buffer captures into the graph and replays correctly.
+        self._dspark_aux_buffers = [
+            torch.zeros(
+                max_tokens, hidden_size, device=self.device, dtype=self.config.torch_dtype
+            )
+            for _ in target_layer_ids
+        ]
+        # Map layer id -> buffer index (closed over by each hook; read-only).
+        layer_to_buf = {lid: i for i, lid in enumerate(target_layer_ids)}
+
+        def _make_hook(buf_idx: int, block):
+            buffer = self._dspark_aux_buffers[buf_idx]
+
+            def _hook(_module, _inputs, output):
+                # output is the HCState returned by Block.forward.
+                residual = getattr(output, "residual", None)
+                x_prev = getattr(output, "x_prev", None)
+                post = getattr(output, "post_mix", None)
+                comb = getattr(output, "comb_mix", None)
+                if residual is None:
+                    return
+                if x_prev is not None and post is not None and comb is not None:
+                    # Synthesize the post-layer residual [N, hc, dim].
+                    out_res = block.hc_post(x_prev, residual, post, comb)
+                else:
+                    out_res = residual
+                # Reduce over the hc axis to [N, dim] and write in-place into the
+                # fixed buffer (cudagraph-safe; no host-side dict mutation).
+                reduced = out_res.mean(dim=1)
+                buffer[: reduced.shape[0]].copy_(reduced)
+
+            return _hook
+
+        n_layers = len(layers)
+        for lid in target_layer_ids:
+            if lid < 0 or lid >= n_layers:
+                raise ValueError(
+                    f"dspark_target_layer_id {lid} out of range [0,{n_layers})."
+                )
+            layers[lid].register_forward_hook(_make_hook(layer_to_buf[lid], layers[lid]))
+
+        self.use_dspark_aux_capture = True
+        logger.info(f"DSpark aux capture hooks on target layers: {target_layer_ids}")
+
+    def _collect_dspark_aux(self, num_tokens: int) -> None:
+        """Assemble captured per-layer aux tensors (sliced to num_tokens)."""
+        if not getattr(self, "use_dspark_aux_capture", False):
+            return
+        self._aux_hidden_states = [
+            buf[:num_tokens] for buf in self._dspark_aux_buffers
+        ]
 
     def _run_dummy_drafter(self, hidden_states, draft_bs=None):
         """Run drafter forward for DP synchronization (no real proposal)."""
@@ -1995,6 +2100,9 @@ class ModelRunner:
                 else:
                     hidden_states = model_output
                     self._aux_hidden_states = None
+                # DSpark captures aux hidden states via forward hooks (the model
+                # itself returns only hidden_states); assemble them in order.
+                self._collect_dspark_aux(hidden_states.shape[0])
                 logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
@@ -2020,6 +2128,9 @@ class ModelRunner:
                     ]
                 else:
                     self._aux_hidden_states = None
+                # DSpark: hooks write aux hidden into fixed preallocated buffers
+                # in-place (cudagraph-safe); slice to this step's token count.
+                self._collect_dspark_aux(num_tokens)
                 if self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:num_tokens]
                 else:
@@ -2145,6 +2256,16 @@ class ModelRunner:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
 
+        # DSpark Phase 2: carry this step's per-request ell back to the scheduler
+        # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
+        # ordering ambiguity). The worker already built this map in propose() via
+        # record_dspark_ell(batch.req_ids).
+        dspark_ell = None
+        if getattr(self, "drafter", None) is not None and getattr(
+            self.drafter, "dspark_confidence_schedule", False
+        ):
+            dspark_ell = dict(getattr(self.drafter, "_dspark_ell_by_req", {}) or {})
+
         return ScheduledBatchOutput(
             req_ids=req_ids_out,
             token_ids=token_ids_out,
@@ -2153,6 +2274,7 @@ class ModelRunner:
             num_rejected=prev_rejected_num,
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
+            dspark_ell=dspark_ell,
         )
 
     @torch.inference_mode()
@@ -2227,6 +2349,12 @@ class ModelRunner:
             last_token_indices=last_token_indices,
             aux_hidden_states=self._aux_hidden_states,
         )
+        # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
+        # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
+        # reordered) batch. Keying by req_id (not batch position) is required:
+        # continuous batching reorders requests between steps.
+        if getattr(self.drafter, "dspark_confidence_schedule", False):
+            self.drafter.record_dspark_ell(batch.req_ids[: batch.total_seqs_num])
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     @torch.inference_mode()
@@ -2397,6 +2525,11 @@ class ModelRunner:
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
 
+        # DSpark Phase 2: calibrate the SPS(B) throughput profile from the just-
+        # captured target graphs (each is a B = bs*max_q_len token forward, i.e.
+        # exactly one verification step at batch B). Cheap, GPU-only, one-shot.
+        self._maybe_calibrate_dspark_sps(max_q_len)
+
         # Post-init memory validation
         free_after, total_after = torch.cuda.mem_get_info()
         actual_usage = total_after - free_after
@@ -2417,3 +2550,70 @@ class ModelRunner:
             )
 
         return time.time() - start_time, self.graph_bs
+
+    @torch.inference_mode()
+    def _maybe_calibrate_dspark_sps(self, max_q_len: int, n_iters: int = 20) -> None:
+        """Profile SPS(B) by timing the captured target graphs, then hand a dense
+        cost table to the DSpark drafter (paper §3.2.2, scheduler input).
+
+        Each captured graph ``self.graphs[(bs, max_q_len)]`` is a forward over
+        ``B = bs * max_q_len`` tokens — exactly one verification step at batch B.
+        We replay each a few times, take the median step time, and densify the
+        (B, steps/sec) samples into ``sps_table[B]``. No-op unless a DSpark
+        drafter with confidence scheduling enabled is present.
+        """
+        from atom.utils import envs
+
+        drafter = getattr(self, "drafter", None)
+        if drafter is None or not getattr(drafter, "use_dspark", False):
+            return
+        if not getattr(drafter, "dspark_confidence_schedule", False):
+            return
+        if not getattr(self, "graphs", None):
+            return
+        if envs.ATOM_DSPARK_DISABLE_SPS_CALIB:
+            logger.info("DSpark SPS calibration disabled; using synthetic stub.")
+            return
+
+        from atom.spec_decode.dspark_scheduler import build_sps_table
+
+        token_points: list[int] = []
+        sps_points: list[float] = []
+        for bs in self.graph_bs:
+            graph = self.graphs.get((bs, max_q_len))
+            if graph is None:
+                continue
+            B = bs * max_q_len
+            # Warm replay, then timed replays (median for robustness to jitter).
+            graph.replay()
+            torch.cuda.synchronize()
+            times_ms: list[float] = []
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            for _ in range(n_iters):
+                start.record()
+                graph.replay()
+                end.record()
+                end.synchronize()
+                times_ms.append(start.elapsed_time(end))
+            times_ms.sort()
+            median_ms = times_ms[len(times_ms) // 2]
+            if median_ms <= 0:
+                continue
+            token_points.append(B)
+            sps_points.append(1000.0 / median_ms)  # steps per second
+
+        if not token_points:
+            logger.warning("DSpark SPS calibration found no timeable graphs.")
+            return
+
+        max_b = self.config.max_num_seqs * max_q_len
+        sps_table = build_sps_table(token_points, sps_points, max_b).to(self.device)
+        drafter.dspark_sps_table = sps_table
+        logger.info(
+            "DSpark SPS calibrated over %d points (B=%d..%d), table size %d.",
+            len(token_points),
+            token_points[0],
+            token_points[-1],
+            sps_table.numel(),
+        )

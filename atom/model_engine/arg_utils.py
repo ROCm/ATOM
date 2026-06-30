@@ -171,7 +171,7 @@ class EngineArgs:
             "--method",
             type=str,
             default=None,
-            choices=["mtp", "eagle3"],
+            choices=["mtp", "eagle3", "dspark"],
             help="Speculative method",
         )
         parser.add_argument(

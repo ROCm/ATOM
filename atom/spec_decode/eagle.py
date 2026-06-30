@@ -1,6 +1,6 @@
 import copy
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -24,6 +24,7 @@ logger = logging.getLogger("atom")
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
+    "DeepseekV4DSparkModel": "atom.models.deepseek_v4_dspark.DeepseekV4DSpark",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
     "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
@@ -170,7 +171,37 @@ class EagleProposer:
     ):
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
-        self.mtp_k: int = self.speculative_config.num_speculative_tokens or 0
+        # DSpark is a parallel block drafter: the verify length is the draft
+        # block size, drafted in a single backbone pass (not mtp_k serial steps).
+        self.use_dspark = bool(
+            getattr(self.speculative_config, "use_dspark", lambda: False)()
+        )
+        if self.use_dspark:
+            draft_cfg = self.speculative_config.draft_model_hf_config
+            self.dspark_block_size = int(getattr(draft_cfg, "dspark_block_size"))
+            # num_speculative_tokens may be unset for DSpark; default to the
+            # full block (Phase 1 uses a static verify length == block size).
+            self.mtp_k: int = (
+                self.speculative_config.num_speculative_tokens
+                or self.dspark_block_size
+            )
+            # Phase 2: confidence-scheduled verification (Level B, variable-length
+            # verify). propose() stores the scheduler-chosen ell here; the next
+            # step's calc_spec_decode_metadata consumes it (eager-only for now).
+            self.dspark_confidence_schedule = bool(
+                envs.ATOM_DSPARK_CONFIDENCE_SCHEDULE
+            )
+            self._dspark_last_ell: Optional[torch.Tensor] = None
+            # req_id -> ell map from the PREVIOUS step's propose(), used to re-map
+            # ell onto the next step's (possibly reordered) batch by req_id.
+            self._dspark_ell_by_req: dict = {}
+            # SPS(B) throughput profile + STS temperatures are bound later
+            # (engine warmup / checkpoint). Until then: a synthetic monotone SPS
+            # stub and T=1 (uncalibrated) keep the path lossless and testable.
+            self.dspark_sps_table: Optional[torch.Tensor] = None
+            self.dspark_sts_temperatures: Optional[torch.Tensor] = None
+        else:
+            self.mtp_k: int = self.speculative_config.num_speculative_tokens or 0
 
         self.runner = runner
         self.dtype = self.config.torch_dtype
@@ -285,6 +316,12 @@ class EagleProposer:
         # their own setattr-rebinding and short-circuit the default path.
         if hasattr(self.model, "share_with_target"):
             self.model.share_with_target(target_base, loaded)
+            if self.use_dspark and hasattr(self.model, "reset_kv_cache"):
+                # Allocate DSpark's private rolling target-KV window now that the
+                # device/dtype and max concurrency are known.
+                self.model.reset_kv_cache(
+                    self.config.max_num_seqs, self.device, self.dtype
+                )
             return
 
         # Share embed_tokens with the target model
@@ -339,6 +376,199 @@ class EagleProposer:
             num_local_tokens,
         )
 
+    def _propose_dspark(
+        self,
+        *,
+        target_token_ids: torch.Tensor,   # [num_tokens]
+        target_positions: torch.Tensor,   # [num_tokens]
+        num_reject_tokens: torch.Tensor,  # [batch]
+        next_token_ids: torch.Tensor,     # [batch] verified anchor token x0
+        last_token_indices: torch.Tensor,  # [batch] flat index of each anchor row
+        aux_hidden_states: Optional[list[torch.Tensor]],
+    ) -> torch.Tensor:
+        """DSpark block drafting: ONE parallel backbone pass + Markov sampling.
+
+        Unlike the serial Eagle/MTP path (a python loop running the draft model
+        mtp_k times), DSpark generates the whole block in a single forward_spec
+        call. The sequential dependency lives inside the lightweight Markov head,
+        not in repeated heavyweight backbone passes.
+
+        GPU-VERIFY: this path needs an MI3xx run against the reference DSpark to
+        confirm (a) the rolling target-KV window is populated correctly across
+        prefix-cache hits, and (b) the sampled block matches the reference.
+        """
+        forward_context = get_forward_context()
+        context = forward_context.context
+        attn_metadata = forward_context.attn_metadata
+        context.is_draft = True
+        bs = context.batch_size
+
+        if aux_hidden_states is None:
+            raise RuntimeError(
+                "DSpark requires target auxiliary hidden states from "
+                "dspark_target_layer_ids; none were captured."
+            )
+        # Concatenate the configured target layers -> [num_tokens, dim*L].
+        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+
+        # Anchor token x0 per request = the just-verified target token, located
+        # at last_token_indices in the flat batch.
+        anchor_ids = next_token_ids
+        anchor_positions = torch.index_select(
+            target_positions, 0, last_token_indices
+        )
+        main_hidden = torch.index_select(main_hidden_all, 0, last_token_indices)
+        # Rolling-KV cache rows MUST be the persistent per-request state slot,
+        # NOT a fresh arange(bs). The DSpark window is a ring buffer that
+        # accumulates target KV across decode steps; under continuous batching a
+        # request's position in the batch drifts between steps, so arange(bs)
+        # would scatter each request's history across different rows (reading
+        # back stale/foreign KV -> first-token rejection spikes, acceptance
+        # collapse). state_slot_mapping is the same stable per-seq slot the V4
+        # target uses for its own SWA cache, so DSpark's window stays aligned.
+        state_slot = getattr(attn_metadata, "state_slot_mapping", None)
+        if state_slot is not None:
+            cache_indices = state_slot[:bs].to(torch.long)
+        else:
+            cache_indices = torch.arange(
+                bs, device=anchor_ids.device, dtype=torch.long
+            )
+
+        # Prefill warmup: seed each request's rolling window with the last
+        # min(seq_len, window) target tokens BEFORE drafting. Right after
+        # prefill the window is otherwise empty (only the anchor would be
+        # written), so the first draft block sees almost no target context and
+        # rejects early. Writing the prefill tail lifts first-block acceptance
+        # to the steady-state level. Decode steps skip this (the ring buffer is
+        # already populated from prior steps).
+        if context.is_prefill:
+            cu_seqlens_q = getattr(attn_metadata, "cu_seqlens_q", None)
+            if cu_seqlens_q is not None:
+                window = int(self.model.model.mtp[0].window_size)
+                seqlens = cu_seqlens_q[1 : bs + 1] - cu_seqlens_q[:bs]
+                write_per_batch = int(min(int(seqlens.max().item()), window))
+                self.model.precompute_context_kv(
+                    main_hidden_all,
+                    target_positions,
+                    cache_indices,
+                    cu_seqlens_q=cu_seqlens_q[: bs + 1],
+                    write_per_batch=write_per_batch,
+                )
+
+        # Refresh the rolling target-KV window with the new anchor row, then
+        # draft the block in a single backbone pass.
+        self.model.precompute_context_kv(
+            main_hidden, anchor_positions, cache_indices
+        )
+        draft_token_ids, confidence = self.model.forward_spec(
+            anchor_ids, main_hidden, anchor_positions, cache_indices
+        )
+        draft_token_ids = draft_token_ids[:, : self.mtp_k]
+        # Phase 2: confidence-scheduled verification. The hardware-aware prefix
+        # scheduler (paper Algorithm 1) consumes the confidence head to pick a
+        # per-request verify length ell_r. We compute ell here and stash it; the
+        # actual variable-length verification (Level B) is applied downstream by
+        # truncating each request's scheduled spec tokens to ell_r, which frees
+        # batch capacity instead of the no-op in-block masking of Level A.
+        if self.dspark_confidence_schedule and confidence is not None:
+            self._dspark_last_ell = self._compute_schedule_ell(
+                confidence[:, : self.mtp_k]
+            )
+        else:
+            self._dspark_last_ell = None
+        return draft_token_ids
+
+    def _compute_schedule_ell(
+        self,
+        confidence: torch.Tensor,  # [bs, L] per-position acceptance probs
+    ) -> torch.Tensor:
+        """Run the Hardware-Aware Prefix Scheduler (paper Algorithm 1) and return
+        the per-request verify length ``ell`` as an int tensor [bs].
+
+        This ONLY computes ell — it does not touch the draft tokens. The actual
+        variable-length verification (Level B) consumes ell downstream to size
+        each request's verification batch, which is where the throughput win
+        comes from. Kept sync-free (no .item()/.tolist()) for the decode hot path.
+        """
+        from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths_tensor
+
+        bs, L = confidence.shape
+        sps_table = self.dspark_sps_table
+        if sps_table is None:
+            # Synthetic monotone-decreasing SPS stub until real calibration lands.
+            sps_table = torch.linspace(
+                1.0, 0.1, steps=bs * (L + 1) + 1, device=confidence.device
+            )
+        ell_t = schedule_prefix_lengths_tensor(
+            confidence.detach(),
+            sps_table,
+            sts_temperatures=self.dspark_sts_temperatures,
+        )
+        if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+            self._dspark_dbg_step = getattr(self, "_dspark_dbg_step", 0) + 1
+            if self._dspark_dbg_step % 50 == 1:
+                avg_ell = float(ell_t.float().mean())
+                trunc = float((ell_t < L).float().mean())
+                logger.info(
+                    "DSpark schedule[step %d]: bs=%d L=%d avg_ell=%.2f "
+                    "trunc_rate=%.1f%%",
+                    self._dspark_dbg_step, bs, L, avg_ell, trunc * 100.0,
+                )
+        self._record_dspark_shadow_savings(ell_t, bs, L)
+        return ell_t
+
+    def _record_dspark_shadow_savings(
+        self, ell_t: torch.Tensor, bs: int, mtp_k: int
+    ) -> None:
+        """Shadow-mode savings accounting (no effect on verification / output).
+
+        Quantifies, per concurrency level, how many target-verify tokens the
+        scheduler WOULD save vs the static mtp_k baseline, under two policies:
+
+          * per-request (paper Algorithm 1): each request verifies ell_r
+              saved = sum_r (mtp_k - ell_r)
+          * batch-uniform L (our CUDA-graph-friendly simplification, L=max ell_r)
+              saved = bs * (mtp_k - max_r ell_r)
+
+        The gap between the two is exactly what batch-uniform L gives up by
+        making every request match the strongest one. Paper Figure 8 shows the
+        budget only shrinks at HIGH concurrency, so we bucket by bs to see where
+        (and whether) either policy actually saves on this deployment.
+        """
+        if not getattr(self, "dspark_confidence_schedule", False):
+            return
+        baseline = bs * mtp_k  # static: every request verifies mtp_k draft tokens
+        per_req_verified = int(ell_t.sum().item())
+        uniform_verified = bs * int(ell_t.max().item())
+        per_req_saved = baseline - per_req_verified
+        uniform_saved = baseline - uniform_verified
+
+        st = getattr(self, "_dspark_shadow", None)
+        if st is None:
+            st = {}  # bs -> [steps, baseline_sum, per_req_saved_sum, uniform_saved_sum]
+            self._dspark_shadow = st
+        rec = st.setdefault(bs, [0, 0, 0, 0])
+        rec[0] += 1
+        rec[1] += baseline
+        rec[2] += per_req_saved
+        rec[3] += uniform_saved
+
+        self._dspark_shadow_step = getattr(self, "_dspark_shadow_step", 0) + 1
+        if self._dspark_shadow_step % 100 == 0:
+            for cbs in sorted(st):
+                steps, base, pr, uni = st[cbs]
+                if base == 0:
+                    continue
+                logger.info(
+                    "DSpark shadow-savings bs=%d: steps=%d | per-request saves "
+                    "%.1f%% of verify | batch-uniform-L saves %.1f%% | "
+                    "uniform keeps %.1f%% of the per-request win",
+                    cbs, steps,
+                    100.0 * pr / base,
+                    100.0 * uni / base,
+                    (100.0 * uni / pr) if pr > 0 else 0.0,
+                )
+
     def propose(
         self,
         # [num_tokens]
@@ -353,6 +583,16 @@ class EagleProposer:
         last_token_indices: torch.Tensor,
         aux_hidden_states: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
+
+        if self.use_dspark:
+            return self._propose_dspark(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                num_reject_tokens=num_reject_tokens,
+                next_token_ids=next_token_ids,
+                last_token_indices=last_token_indices,
+                aux_hidden_states=aux_hidden_states,
+            )
 
         forward_context = get_forward_context()
         context = forward_context.context
@@ -525,6 +765,98 @@ class EagleProposer:
 
         return token_indices
 
+    def record_dspark_ell(self, req_ids: Sequence) -> None:
+        """Stash this step's ell keyed by req_id (called after propose()).
+
+        ell was computed in propose() ordered by THIS step's decode batch. We
+        save {req_id: ell} so the NEXT step can re-map it onto its own (possibly
+        reordered) batch by req_id — batch position is not stable across steps
+        under continuous batching.
+        """
+        ell = getattr(self, "_dspark_last_ell", None)
+        if ell is None:
+            self._dspark_ell_by_req = {}
+            return
+        ell_np = ell.detach().to("cpu").numpy().astype(np.int32)
+        n = min(len(req_ids), ell_np.shape[0])
+        self._dspark_ell_by_req = {req_ids[i]: int(ell_np[i]) for i in range(n)}
+
+    def _dspark_uniform_verify_len(self, req_ids: Sequence) -> int:
+        """Batch-level uniform verify length L for this step (paper §5.2 top-K).
+
+        Re-maps the previous step's per-req ell onto the current batch by req_id,
+        then takes L = max over the batch (round up to a single uniform length so
+        the verify block stays a regular matrix — simplest, and the shape Level B
+        graph buckets will need anyway). Requests with no prior ell (just-started)
+        fall back to mtp_k, so a fresh request never gets under-verified.
+
+        Returns L in 1..mtp_k. L == mtp_k means "no truncation this step".
+        """
+        by_req = getattr(self, "_dspark_ell_by_req", None)
+        if not by_req:
+            return self.mtp_k
+        L = 0
+        for rid in req_ids:
+            # Missing req (new this step) -> mtp_k so it is fully verified.
+            L = max(L, by_req.get(rid, self.mtp_k))
+        return int(min(max(L, 1), self.mtp_k))
+
+    def _dspark_per_request_ell(self, req_ids: Sequence) -> np.ndarray:
+        """Per-request verify length [bs] re-mapped onto the current batch.
+
+        This is the production policy (paper Algorithm 1 per-request, not the
+        batch-uniform L of §13 which only captured 15% of the win). For each
+        request in THIS step's batch order, look up the ell its own previous
+        step produced (keyed by req_id, so continuous-batching reorders are
+        handled). A request with no prior ell (new this step) gets mtp_k so it
+        is never under-verified. Values clamped to 1..mtp_k.
+        """
+        n = len(req_ids)
+        out = np.full(n, self.mtp_k, dtype=np.int32)
+        by_req = getattr(self, "_dspark_ell_by_req", None)
+        if not by_req:
+            return out
+        for i, rid in enumerate(req_ids):
+            v = by_req.get(rid)
+            if v is not None:
+                out[i] = min(max(int(v), 1), self.mtp_k)
+        return out
+
+    def _dspark_verify_lengths(self, scheduled_bs: int) -> np.ndarray:
+        """Per-request verify length for this step's verification.
+
+        NOT WIRED YET (Level B). calc_spec_decode_metadata intentionally uses a
+        static mtp_k instead of calling this, because shrinking num_draft_tokens
+        alone (without also shrinking model_runner tokens_per_seq + all the
+        bonus/target index math) desynchronizes the flat-batch indices and
+        breaks losslessness (GSM8K 98% -> 52%). This helper keeps the correct
+        ell + alignment-guard logic ready for the full Level B wiring (which must
+        change tokens_per_seq, KV reservation, and CUDA graph buckets together).
+
+        Returns the scheduler-chosen ell_r when available and consistent with
+        the current batch; otherwise the static mtp_k. Eager-only: variable
+        query length is incompatible with the fixed-shape decode CUDA graph.
+
+        Alignment guard: ell is produced by the previous step's propose() ordered
+        by that step's batch. If the batch size changed (continuous batching
+        added/removed requests) we cannot safely reuse it, so fall back to mtp_k.
+        Both paths are lossless; the fallback only forgoes truncation that step.
+        """
+        static = np.full(scheduled_bs, self.mtp_k, dtype=np.int32)
+        if not getattr(self, "dspark_confidence_schedule", False):
+            return static
+        if not self.config.enforce_eager:
+            # Variable-length verify needs eager (fixed decode graph otherwise).
+            return static
+        ell = getattr(self, "_dspark_last_ell", None)
+        if ell is None or ell.numel() != scheduled_bs:
+            return static
+        # ell in 0..mtp_k; clamp to >=1 (verifying 0 draft tokens degenerates the
+        # index math; 1 keeps at least the first speculative position).
+        ell_np = ell.detach().to("cpu").numpy().astype(np.int32)
+        np.clip(ell_np, 1, self.mtp_k, out=ell_np)
+        return ell_np
+
     def calc_spec_decode_metadata(
         self,
         num_sampled_tokens: np.ndarray,
@@ -532,7 +864,24 @@ class EagleProposer:
         input_ids: torch.Tensor,
     ) -> SpecDecodeMetadata:
         scheduled_bs = len(num_sampled_tokens)
-        sum_drafted_tokens = self.mtp_k * scheduled_bs
+
+        # Verify length is STATIC mtp_k here. The DSpark scheduler still computes
+        # ell_r in propose() and stashes it on self._dspark_last_ell, but this
+        # metadata MUST stay at mtp_k:
+        #   target forward always produces mtp_k+1 logits per request
+        #   (model_runner tokens_per_seq = num_spec_tokens+1 is fixed by the
+        #   input build + decode CUDA graph shape). num_sampled / cu_num_sampled /
+        #   bonus_logits_indices are all derived from that mtp_k+1 layout. If we
+        #   shrink num_draft_tokens to ell here WITHOUT also shrinking
+        #   tokens_per_seq, the draft/target/bonus indices desynchronize across
+        #   the flat batch (one request's bonus lands on another's logits) ->
+        #   wrong outputs (observed: GSM8K 98% -> 52%).
+        # Real variable-length verification (Level B) requires changing
+        # tokens_per_seq + every downstream index together (paper §5.2: top-K
+        # batch-capacity K + two-steps-prior causal barrier). Until then we keep
+        # mtp_k (lossless, parity Phase 1) and only collect ell for Level B.
+        num_draft_tokens = np.full(scheduled_bs, self.mtp_k, dtype=np.int32)
+        sum_drafted_tokens = int(num_draft_tokens.sum())
 
         # Compute the bonus logits indices.
         bonus_logits_indices = cu_num_sampled_tokens - 1
@@ -540,7 +889,6 @@ class EagleProposer:
         # Compute the draft logits indices.
         # cu_num_draft_tokens: [3, 3, 5, 5, 6]
         # arange: [0, 1, 2, 0, 1, 0]
-        num_draft_tokens = np.full(scheduled_bs, self.mtp_k, dtype=np.int32)
         cu_num_draft_tokens, arange = self.runner._get_cumsum_and_arange(
             num_draft_tokens, cumsum_dtype=np.int32
         )

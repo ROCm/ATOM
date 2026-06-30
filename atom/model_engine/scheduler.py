@@ -375,6 +375,7 @@ class ScheduledBatchOutput:
         is_deferred_out: bool = False,
         is_prev_prefill=False,
         logprobs=None,
+        dspark_ell: Optional[np.ndarray] = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -384,6 +385,11 @@ class ScheduledBatchOutput:
         self.is_deferred_out = is_deferred_out
         self.is_prev_prefill = is_prev_prefill
         self.logprobs = logprobs  # Optional[dict[int, float]]
+        # DSpark Phase 2: {req_id: ell_r} from this step's propose() — the
+        # scheduler-chosen verify length per request. Rides back to the
+        # (main-process) scheduler so the NEXT step can size each request's
+        # verification to ell_r+1. None when DSpark scheduling is off.
+        self.dspark_ell = dspark_ell
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: Optional[dict[int, int]] = None
 
@@ -1126,6 +1132,14 @@ class Scheduler:
                     self.spec_stats.update(num_new_token)
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
+                # DSpark Phase 2: stash this step's scheduler-chosen ell on the
+                # seq so the NEXT decode schedule can size its verification to
+                # ell+1. Keyed by req_id (order-safe). Missing -> leave default
+                # (mtp_k), so a request never gets under-verified.
+                if fwd_output.dspark_ell is not None:
+                    ell_r = fwd_output.dspark_ell.get(seq.id)
+                    if ell_r is not None:
+                        seq.dspark_next_ell = int(ell_r)
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
