@@ -714,6 +714,8 @@ class DisaggCoreManager(CoreManager):
         self.stream_outputs_queue = queue.Queue()
         self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
+        # Batched stream-flush hook, resolved lazily (avoids import cycle).
+        self._flush_stream_batch_fn = None
         self.engine_core_processes = []
         self.input_sockets = []
         self.output_sockets = []
