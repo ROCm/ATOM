@@ -201,8 +201,9 @@
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extraArgs": "--data-parallel-size 8 --enable-expert-parallel",
     "env_vars": "MORI_SHMEM_MODE=ISOLATION",
-    "runner": "linux-atom-mi35x-8",
+    "runner": "atom-plugin-acc-validation-runner",
     "test_level": "nightly",
+    "priority": "P1",
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
