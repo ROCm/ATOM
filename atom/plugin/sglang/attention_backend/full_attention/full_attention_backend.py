@@ -1583,14 +1583,20 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def _should_use_native_dense_mha(self, layer) -> bool:
         sliding_window_size = getattr(layer, "sliding_window_size", None)
-        return (
+        is_standard_dense = (
             not self.use_mla
             and not layer.is_cross_attention
-            and layer.head_dim == 256
-            and layer.qk_head_dim == 256
-            and layer.v_head_dim == 256
+            and layer.head_dim == layer.qk_head_dim
+            and layer.head_dim == layer.v_head_dim
             and (sliding_window_size is None or sliding_window_size <= -1)
         )
+        if not is_standard_dense:
+            return False
+
+        if self.page_size == 1:
+            return True
+
+        return layer.head_dim == 256
 
     def _kv_descales(self, layer):
         if self.kv_cache_dtype != dtypes.fp8:
