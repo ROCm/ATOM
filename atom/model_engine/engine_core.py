@@ -263,21 +263,13 @@ class EngineCore:
             self.output_queue.put_nowait(rejected)
 
         if result is None:
-            if self.kv_transfer_enabled:
-                kvoutput = self.runner_mgr.call_func_with_aggregation(
-                    "async_proc_aggregation"
-                )
-                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            self._advance_idle_kv_transfer()
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
-            if self.kv_transfer_enabled:
-                kvoutput = self.runner_mgr.call_func_with_aggregation(
-                    "async_proc_aggregation"
-                )
-                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            self._advance_idle_kv_transfer()
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
@@ -297,11 +289,7 @@ class EngineCore:
             )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        if self.kv_transfer_enabled:
-            kvoutput = self.runner_mgr.call_func_with_aggregation(
-                "async_proc_aggregation"
-            )
-            self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
@@ -329,6 +317,29 @@ class EngineCore:
             self.output_queue.put_nowait(finished_seqs)
 
         return True
+
+    def _advance_idle_kv_transfer(self) -> None:
+        # No forward batch will run this tick, but offload load/save work may
+        # still need to be dispatched or reported back to the scheduler.
+        self._dispatch_idle_offload_work()
+        self._poll_kv_transfer_progress()
+
+    def _poll_kv_transfer_progress(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+    def _dispatch_idle_offload_work(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not getattr(connector, "is_offload", False):
+            return
+        meta = connector.build_connector_meta()
+        if meta is None or not getattr(meta, "requests", None):
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", meta)
 
     def pull_and_process_input_queue(self):
         recv_reqs = []

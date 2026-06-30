@@ -21,7 +21,15 @@ from aiter.rotary_embedding import get_rope
 from atom.config import Config
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
+from atom.model_ops.fused_aux_rmsnorm import (
+    fused_dual_rmsnorm_cat,
+    fused_group_rmsnorm,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
@@ -29,8 +37,16 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from torch import nn
+
+# AR+RMSNorm fusion: when on (default), RowParallel o_proj/down_proj skip their
+# own all-reduce (reduce_results=False) and the downstream RMSNorm fuses
+# all-reduce + residual-add + norm into one kernel. Only active at TP>1; the
+# RMSNorm/RowParallel paths fall back to plain behavior at TP1. Same env and
+# kernel as ATOM's mainline TP models (deepseek_v2, qwen3_moe, ...).
+ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 
 
 class Eagle3LlamaAttention(nn.Module):
@@ -49,6 +65,7 @@ class Eagle3LlamaAttention(nn.Module):
         cache_config: str = "bf16",
         prefix: str = "",
         layer_num: int = 0,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -85,6 +102,7 @@ class Eagle3LlamaAttention(nn.Module):
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=False,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -142,9 +160,19 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         cache_config: str = "bf16",
         prefix: str = "",
         layer_num: int = 0,
+        norm_output: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+
+        # Point 1 (always): o_proj skips its all-reduce so post_attention_layernorm
+        # fuses all-reduce + residual-add + norm. Point 2 (norm_output only):
+        # down_proj skips its all-reduce so the model's final self.norm fuses it;
+        # for the legacy (norm_output=False) path the output norm is deferred to
+        # compute_logits with no adjacent residual-add, so down_proj all-reduces
+        # normally.
+        attn_reduce = not ENABLE_ALLREDUCE_RMSNORM_FUSION
+        mlp_reduce = not (ENABLE_ALLREDUCE_RMSNORM_FUSION and norm_output)
 
         self.self_attn = Eagle3LlamaAttention(
             config=config,
@@ -156,40 +184,71 @@ class Eagle3LlamaDecoderLayer(nn.Module):
             cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
+            reduce_results=attn_reduce,
         )
 
         self.mlp = Eagle3LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             prefix=f"{prefix}.mlp",
+            reduce_results=mlp_reduce,
         )
 
         # Dual norms matching checkpoint keys: midlayer.input_layernorm, midlayer.hidden_norm
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
+
+    def _dual_norm_cat(
+        self, embeds: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """RMS-norm embeds and the carried hidden by their own weights and concat
+        into the [N, 2*hidden] QKV input.
+
+        Single fused Triton launch (one [N, 2H] write) instead of two RMSNorm
+        launches + a concat. Falls back to the aiter RMSNorm + torch.cat path
+        when the kernel's preconditions don't hold (non-CUDA / non-contiguous /
+        shape mismatch). input_layernorm and hidden_norm share rms_norm_eps.
+        """
+        if (
+            embeds.is_cuda
+            and embeds.is_contiguous()
+            and hidden_states.is_contiguous()
+            and embeds.shape == hidden_states.shape
+        ):
+            return fused_dual_rmsnorm_cat(
+                embeds,
+                hidden_states,
+                self.input_layernorm.weight,
+                self.hidden_norm.weight,
+                self.input_layernorm.eps,
+            )
+        normed_embeds = self.input_layernorm(embeds)
+        normed_hidden = self.hidden_norm(hidden_states)
+        return torch.cat([normed_embeds, normed_hidden], dim=-1)
 
     def forward(
         self,
         positions: torch.Tensor,
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        normed_embeds = self.input_layernorm(embeds)
-        normed_hidden = self.hidden_norm(hidden_states)
-        # Concat for attention input: [N, hidden*2]
-        attn_input = torch.cat([normed_embeds, normed_hidden], dim=-1)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_input = self._dual_norm_cat(embeds, hidden_states)
         attn_output = self.self_attn(positions, attn_input)
-        # Residual connection on hidden_states
-        hidden_states = hidden_states + attn_output
-        # MLP with pre-norm + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fused (all-reduce +) residual-add + pre-MLP norm in one kernel:
+        #   residual      = [all_reduce(attn_output)] + hidden_states
+        #   hidden_states = post_attention_layernorm(residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            attn_output, hidden_states
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        # Return the MLP output and its residual; the model fuses the final
+        # residual-add with the output norm (norm_output) or adds plainly.
+        return hidden_states, residual
 
 
 class Eagle3LlamaMLP(nn.Module):
@@ -200,6 +259,7 @@ class Eagle3LlamaMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -212,6 +272,7 @@ class Eagle3LlamaMLP(nn.Module):
             input_size=intermediate_size,
             output_size=hidden_size,
             bias=False,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
@@ -243,6 +304,13 @@ class Eagle3LlamaModel(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    # The single decoder layer is named `midlayer` here, but some EAGLE3
+    # checkpoints ship it as `layers.0.*` (e.g. the torchspec-format
+    # Inferact/MiniMax-M3-EAGLE3) instead of the kimi-k2.5 `midlayer.*` layout.
+    # Translate that prefix on load. No-op for `midlayer.*` checkpoints (the
+    # substring is absent), so both naming conventions load correctly.
+    weights_mapping = {"layers.0.": "midlayer."}
+
     def __init__(self, atom_config: Config, prefix: str = "", layer_offset: int = 0):
         super().__init__()
         config = atom_config.hf_config
@@ -267,10 +335,20 @@ class Eagle3LlamaModel(nn.Module):
         self.num_aux_hidden_states = num_aux
         self.norm_output = getattr(config, "norm_output", False)
 
-        # Independent embedding (vocab matches target model)
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
-        )
+        # Independent embedding (vocab matches target model). The draft embed is
+        # NOT shared with the (still TP-sharded) lm_head, so it can be replicated
+        # full on every rank — a local lookup with no post-embedding all-reduce.
+        # Bit-identical to the sharded path; on by default (trades memory for one
+        # fewer collective per draft step). Falls back to the sharded embedding
+        # when ATOM_EAGLE_REPLICATE_EMBED=0.
+        if envs.ATOM_EAGLE_REPLICATE_EMBED:
+            self.embed_tokens = ReplicatedEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
 
         # Aux fusion: [N, target_hidden_size * num_aux] -> [N, hidden_size]
         self.fc = ReplicatedLinear(
@@ -296,30 +374,82 @@ class Eagle3LlamaModel(nn.Module):
             cache_config=cache_config,
             prefix="midlayer",
             layer_num=layer_offset,
+            norm_output=self.norm_output,
         )
 
-        # Final norm
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Final norm. Point 2: on the norm_output path it fuses down_proj's
+        # all-reduce + residual-add + norm. On the legacy path it stays plain
+        # (called without residual in compute_logits), so no fusion here.
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.norm_output,
+        )
 
         # Independent lm_head (not shared with target model)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
 
-    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project concatenated aux hidden states through fc.
+    def combine_hidden_states(self, aux_hidden_states) -> torch.Tensor:
+        """Project the per-layer aux hidden states through fc.
 
         Args:
-            hidden_states: [N, target_hidden_size * num_aux_hidden_states]
+            aux_hidden_states: either a list/tuple of per-layer aux tensors
+                ([N, target_hidden_size] each) — preferred, skips an extra
+                concat — or a single pre-concatenated
+                [N, target_hidden_size * num_aux_hidden_states] tensor
+                (back-compat).
 
         Returns:
             [N, hidden_size] projected hidden states
         """
-        if self.fc_norm is not None:
-            chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
-            hidden_states = torch.cat(
+        is_list = isinstance(aux_hidden_states, (list, tuple))
+        if self.fc_norm is None:
+            if is_list:
+                fc_in = (
+                    aux_hidden_states[0]
+                    if len(aux_hidden_states) == 1
+                    else torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                fc_in = aux_hidden_states
+            return self.fc(fc_in)
+
+        # fc_norm path: per-group RMSNorm, then fc. Use the single-launch fused
+        # kernel (one RMSNorm over all aux chunks) instead of per-chunk RMSNorm
+        # + concat; fall back to the torch path only when the fused kernel's
+        # preconditions don't hold (non-CUDA / non-contiguous / shape mismatch).
+        x = torch.cat(aux_hidden_states, dim=-1) if is_list else aux_hidden_states
+        if (
+            x.is_cuda
+            and x.is_contiguous()
+            and x.shape[-1] == self.num_aux_hidden_states * self.fc_norm[0].dim
+        ):
+            fc_in = fused_group_rmsnorm(
+                x,
+                self._fc_norm_weight_stacked(),
+                self.fc_norm[0].eps,
+                self.num_aux_hidden_states,
+            )
+        else:
+            chunks = (
+                aux_hidden_states
+                if is_list
+                else x.chunk(self.num_aux_hidden_states, dim=-1)
+            )
+            fc_in = torch.cat(
                 [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
                 dim=-1,
             )
-        return self.fc(hidden_states)
+        return self.fc(fc_in)
+
+    def _fc_norm_weight_stacked(self) -> torch.Tensor:
+        """Per-group fc_norm weights stacked to [num_aux, H] (cached)."""
+        ref = self.fc_norm[0].weight
+        w = getattr(self, "_fc_norm_w_cache", None)
+        if w is None or w.device != ref.device or w.dtype != ref.dtype:
+            w = torch.stack([m.weight for m in self.fc_norm], dim=0).contiguous()
+            self._fc_norm_w_cache = w
+        return w
 
     def forward(
         self,
@@ -334,8 +464,16 @@ class Eagle3LlamaModel(nn.Module):
         compute_logits() is norm-aware, so EagleProposer only sees one tensor.
         """
         embeds = self.embed_tokens(input_ids)
-        hidden_states = self.midlayer(positions, embeds, hidden_states)
-        return self.norm(hidden_states) if self.norm_output else hidden_states
+        hidden_states, residual = self.midlayer(positions, embeds, hidden_states)
+        if self.norm_output:
+            # EAGLE 3.1: fused final residual-add + output RMSNorm (one kernel).
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            # EAGLE 3 / K2.5: carry the pre-norm hidden forward; the norm is
+            # deferred to compute_logits, so the add stays standalone here
+            # (byte-equivalent to the legacy path).
+            hidden_states = residual + hidden_states
+        return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Only norm the legacy pre-norm path; norm_output already normed in
@@ -343,3 +481,12 @@ class Eagle3LlamaModel(nn.Module):
         if not self.norm_output:
             hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
+
+    def compute_draft_token(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy draft token via distributed argmax — avoids all-gathering the
+        full [N, vocab] logits every draft step. Token-identical to
+        compute_logits(...).argmax(-1); norm handling mirrors compute_logits.
+        """
+        if not self.norm_output:
+            hidden_states = self.norm(hidden_states)
+        return self.lm_head.compute_argmax_token(hidden_states)

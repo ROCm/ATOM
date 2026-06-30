@@ -21,7 +21,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 
 
 class KVConnectorBase(ABC):
@@ -31,11 +31,17 @@ class KVConnectorBase(ABC):
 
     @abstractmethod
     def register_kv_caches(
-        self, kv_caches: dict[str, Any], transfer_tensors: Any = None
+        self,
+        kv_caches: dict[str, Any],
+        transfer_tensors: Any = None,
+        num_blocks: int | None = None,
     ) -> None:
         """Register local KV cache tensors for remote access.
 
-        Called once after model loading and KV cache allocation.
+        Called once after model loading and KV cache allocation. ``num_blocks``
+        is the physical KV block count (used by the offload connector to
+        byte-slice MLA's token-major latent cache); connectors that don't need
+        it may ignore it.
         """
         ...
 
@@ -48,8 +54,11 @@ class KVConnectorBase(ABC):
         ...
 
     @abstractmethod
-    def get_finished(self) -> tuple[set, set]:
-        """Return ``(done_sending, done_recving)`` request ID sets.
+    def get_finished(self) -> tuple[set, set] | KVConnectorOutput:
+        """Return transfer completion status.
+
+        Older connectors may return ``(done_sending, done_recving)``. Connectors
+        that need richer semantics can return :class:`KVConnectorOutput`.
 
         Called by the worker each engine step to report transfer status.
         """

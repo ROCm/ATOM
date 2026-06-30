@@ -26,6 +26,9 @@ from atom.utils import envs
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
+import triton
+import triton.language as tl
+
 logger = logging.getLogger("atom")
 
 functools_partial = functools.partial
@@ -35,6 +38,19 @@ _aiter_triton_fp8_bmm = (
 batched_gemm_a16wfp4 = _fp4_bmm_module.batched_gemm_a16wfp4
 fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 fused_gemm_afp4wfp4_preshuffle_split_cat = None
+
+_MLA_PERSISTENT_METADATA_FIELDS = (
+    "work_meta_data",
+    "work_indptr",
+    "work_info_set",
+    "reduce_indptr",
+    "reduce_final_map",
+    "reduce_partial_map",
+)
+
+
+def disabled_mla_persistent_metadata() -> dict[str, None]:
+    return {field: None for field in _MLA_PERSISTENT_METADATA_FIELDS}
 
 
 if use_triton_gemm():
@@ -127,6 +143,75 @@ def reorg_kvcache(
     assert reorganized_k_pe.shape[0] == sum_seq_len
     assert max_seq_len_check == max_seq_len
     return reorganized_kv_c_normed, reorganized_k_pe
+
+
+@triton.jit
+def mla_fold_kv_metadata_kernel(
+    paged_kv_indptr_ptr,  # [num_reqs + 1]   int32
+    paged_kv_indices_ptr,  # [>= paged_kv_indptr[-1]]  int32
+    fold_kv_indptr_ptr,  # [num_reqs * FOLD_FACTOR + 1]  int32, entry [0] pre-zeroed
+    fold_kv_indices_ptr,  # [>= FOLD_FACTOR * paged_kv_indptr[-1] + TAIL_PADDING] int32
+    FOLD_FACTOR: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Build folded kv metadata for the MLA nhead -> nhead/FOLD_FACTOR
+    workaround. Each original batch's KV-index segment is replicated
+    FOLD_FACTOR times back-to-back in `fold_kv_indices`, and `fold_kv_indptr`
+    gets the matching expanded indptr.
+    """
+    orig_batch = tl.program_id(0)
+    fold_idx = tl.program_id(1)
+
+    seq_start = tl.load(paged_kv_indptr_ptr + orig_batch)
+    seq_end = tl.load(paged_kv_indptr_ptr + orig_batch + 1)
+    seq_len = seq_end - seq_start
+
+    # Each (orig_batch, fold_idx) program writes its one indptr entry.
+    # Entry 0 of fold_kv_indptr stays at its pre-init zero.
+    out_indptr_idx = orig_batch * FOLD_FACTOR + fold_idx + 1
+    out_indptr_val = FOLD_FACTOR * seq_start + (fold_idx + 1) * seq_len
+    tl.store(fold_kv_indptr_ptr + out_indptr_idx, out_indptr_val)
+
+    # Copy the KV-index segment for synthetic batch (orig_batch, fold_idx).
+    dst_start = FOLD_FACTOR * seq_start + fold_idx * seq_len
+
+    for offset_start in range(0, seq_len, BLOCK_SIZE):
+        offsets = offset_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < seq_len
+        src = tl.load(paged_kv_indices_ptr + seq_start + offsets, mask=mask)
+        tl.store(fold_kv_indices_ptr + dst_start + offsets, src, mask=mask)
+
+
+def mla_fold_kv_metadata_triton(
+    paged_kv_indptr,
+    paged_kv_indices,
+    fold_kv_indptr,
+    fold_kv_indices,
+    fold_factor,
+    num_reqs,
+):
+    """Populate `fold_kv_indptr` and `fold_kv_indices` in-place for the
+    MLA nhead-fold workaround. All input/output tensors must already be
+    allocated; this kernel only writes.
+    Args:
+        paged_kv_indptr: [num_reqs+1] int32, the original kv indptr.
+        paged_kv_indices: [paged_kv_indptr[-1]] int32, original kv indices.
+        fold_kv_indptr: [num_reqs*fold_factor + 1] int32, output indptr.
+        fold_kv_indices: [fold_factor * paged_kv_indptr[-1]] int32.
+        fold_factor: integer fold factor (e.g. 4 for nhead 32 -> 8).
+        num_reqs: number of decode requests (size of `paged_kv_indptr` - 1).
+    """
+    if num_reqs == 0:
+        return
+    grid = (num_reqs, fold_factor)
+    mla_fold_kv_metadata_kernel[grid](
+        paged_kv_indptr,
+        paged_kv_indices,
+        fold_kv_indptr,
+        fold_kv_indices,
+        FOLD_FACTOR=fold_factor,
+        BLOCK_SIZE=256,
+    )
 
 
 class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
@@ -700,6 +785,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 prefix_lse=context_lse,
                 suffix_output=suffix_output,
                 suffix_lse=suffix_lse,
+                prefill_tokens_with_context=(
+                    attn_metadata.prefill.chunked_context.prefill_tokens_with_context
+                ),
             )
         else:
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
@@ -725,7 +813,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        use_persistent_mode = not (
+        use_persistent_mode = attn_metadata.decode.use_persistent_metadata and not (
             self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
         )
         if not use_persistent_mode:
@@ -748,14 +836,39 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         paged_kv_indptr = attn_metadata.decode.paged_kv_indptr
         paged_kv_indices = attn_metadata.decode.paged_kv_indices
 
+        qo_indptr = attn_metadata.decode.qo_indptr
+        paged_kv_last_page_len = attn_metadata.decode.paged_kv_last_page_len
+
+        fold_factor = attn_metadata.decode.fold_factor
+        do_fold = fold_factor is not None and fold_factor > 1
+        if do_fold:
+            decode_md = attn_metadata.decode
+
+            # Fold buffers are populated by the metadata builder outside the
+            # CUDA graph capture region
+            assert decode_md.fold_kv_indptr is not None
+            assert decode_md.fold_kv_indices is not None
+            assert decode_md.fold_qo_indptr is not None
+            assert decode_md.fold_kv_last_page_len is not None
+            paged_kv_indptr = decode_md.fold_kv_indptr
+            paged_kv_indices = decode_md.fold_kv_indices
+            qo_indptr = decode_md.fold_qo_indptr
+            paged_kv_last_page_len = decode_md.fold_kv_last_page_len
+
+            ori_total_s, ori_nhead = q.shape[0], q.shape[1]
+            new_nhead = ori_nhead // fold_factor
+            new_total_s = ori_total_s * fold_factor
+            q = q.view(new_total_s, new_nhead, -1)
+            o = o.view(new_total_s, new_nhead, -1)
+
         mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
-            attn_metadata.decode.qo_indptr,
+            qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
-            attn_metadata.decode.paged_kv_last_page_len,
+            paged_kv_last_page_len,
             attn_metadata.decode.max_qo_len,
             sm_scale=self.scale,
             work_meta_data=work_meta_data,
@@ -767,6 +880,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
         )
+        if do_fold:
+            o = o.view(ori_total_s, ori_nhead, -1)
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :]
         return o, None
