@@ -203,6 +203,7 @@
     "env_vars": "MORI_SHMEM_MODE=ISOLATION",
     "runner": "atom-plugin-acc-validation-runner",
     "test_level": "nightly",
+    "priority": "P1",
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
