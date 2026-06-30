@@ -181,7 +181,6 @@ class MiniMaxM2Attention(nn.Module):
             dtype=getattr(quant_config, "torch_dtype", None),
         )
         self.rotary_dim = rotary_dim
-        self.kv_cache_dtype = kv_cache_dtype
         cos = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
         sin = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
         self.register_buffer(
