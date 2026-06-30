@@ -3,7 +3,8 @@ description: >-
   Start the ROCm CI container for test / accuracy jobs: clean up any old
   container of the same name, resolve the render-device flag and optional
   /models mount, write the model env-file, then docker run. De-inlined from the
-  identical "Start CI container" steps in atom-test and atomesh-accuracy-validation.
+  identical "Start CI container" steps in atom-test and atomesh-accuracy-validation,
+  and also reused by atom-bench-container (which adds model download on top).
   The caller handles checkout, GPU preflight, and container teardown.
 
 inputs:
@@ -18,8 +19,17 @@ inputs:
     required: false
     default: ""
   runner:
-    description: Job runner label (matrix.runner); drives the --pull policy.
-    required: true
+    description: >-
+      Job runner label (matrix.runner); drives the --pull policy when
+      pull-policy is unset. Optional — leave empty when pull-policy is given.
+    required: false
+    default: ""
+  pull-policy:
+    description: >-
+      Explicit docker run --pull policy (always/missing/never). When set it
+      takes precedence; when empty the runner-based heuristic below decides.
+    required: false
+    default: ""
   env-vars:
     description: Newline-separated KEY=VAL model env vars (written to an env-file).
     required: false
@@ -40,6 +50,13 @@ inputs:
     description: Extra docker run flags injected verbatim before --env-file.
     required: false
     default: ""
+  disable-mmap:
+    description: >-
+      When 'true' (default) inject `-e ATOM_DISABLE_MMAP=true`. Set 'false' for
+      callers whose container never set it (e.g. mmstar) to stay byte-for-byte
+      equivalent.
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -55,8 +72,10 @@ runs:
         RESOLVED_ATOM_BASE_IMAGE: ${{ inputs.resolved-image }}
         ATOM_DASHBOARD_DOCKER_IMAGE: ${{ inputs.dashboard-image }}
         RUNNER_LABEL: ${{ inputs.runner }}
+        PULL_POLICY: ${{ inputs.pull-policy }}
         NETWORK_HOST: ${{ inputs.network-host }}
         EXTRA_RUN_FLAGS: ${{ inputs.extra-run-flags }}
+        DISABLE_MMAP: ${{ inputs.disable-mmap }}
       run: |
         echo "Clean up containers..."
         (docker ps -aq -f name="^${CONTAINER_NAME}$" | xargs -r docker stop) || true
@@ -75,16 +94,21 @@ runs:
           MODEL_MOUNT=""
         fi
 
-        # Write env_vars via env block (avoids expression injection)
-        printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
+        # Write env_vars via env block (avoids expression injection). Key the
+        # env-file by container name so concurrent containers on one runner
+        # (e.g. benchmark + regression) don't clobber each other's file.
+        ENV_FILE="/tmp/atom_${CONTAINER_NAME}_env.txt"
+        printenv MODEL_ENV_VARS | grep -v '^$' > "$ENV_FILE" || true
 
         IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
         echo "Starting container with image: $IMAGE_TAG"
         echo "Model-specific environment variables:"
-        cat /tmp/env_file.txt
+        cat "$ENV_FILE"
 
         PULL_FLAG=""
-        if [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
+        if [ -n "${PULL_POLICY:-}" ]; then
+          PULL_FLAG="--pull ${PULL_POLICY}"
+        elif [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
           PULL_FLAG=""
         elif [ "${RUNNER_LABEL}" = "atom-mi355-8gpu.predownload" ] || [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8" ]; then
           PULL_FLAG="--pull always"
@@ -92,6 +116,9 @@ runs:
 
         NETWORK_FLAG=""
         [ "${NETWORK_HOST}" = "true" ] && NETWORK_FLAG="--network=host"
+
+        MMAP_FLAG=""
+        [ "${DISABLE_MMAP}" = "true" ] && MMAP_FLAG="-e ATOM_DISABLE_MMAP=true"
 
         docker run -dt $PULL_FLAG $NETWORK_FLAG --device=/dev/kfd $DEVICE_FLAG \
         -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
@@ -104,12 +131,10 @@ runs:
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
         $EXTRA_RUN_FLAGS \
-        --env-file /tmp/env_file.txt \
+        --env-file "$ENV_FILE" \
         --security-opt seccomp=unconfined \
         --ulimit memlock=-1 \
         --ulimit stack=67108864 \
-        -e ATOM_DISABLE_MMAP=true \
-        -v "${GITHUB_WORKSPACE}:/workspace" \
-        -w /workspace \
+        $MMAP_FLAG \
         --name "$CONTAINER_NAME" \
         $IMAGE_TAG
