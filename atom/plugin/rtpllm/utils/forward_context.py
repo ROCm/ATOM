@@ -1052,8 +1052,19 @@ class RTPForwardContext:
         cg_bufs: dict | None,
         in_capture: bool,
     ) -> torch.Tensor | None:
+        # NOTE: kv_cache_block_id_device is RTP-LLM's cache-store physical block table.
+        # RTP-LLM does NOT refresh it inside the CUDA/HIP graph on replay -- by design only
+        # kv_cache_kernel_block_id_device is D2D-refreshed, and cache store runs outside the
+        # graph (see RTP-LLM cuda_graph_runner.cc and OpDefs.h). Returning it under capture
+        # bakes a stale block_table / slot_mapping into the graph, so every replay step
+        # reads/writes KV at the frozen capture-time physical blocks -> garbled output.
+        # Under capture we must rebuild the physical table from the (refreshed) kernel table.
         physical_block_table = getattr(attn_inputs, "kv_cache_block_id_device", None)
-        if physical_block_table is not None and physical_block_table.numel() > 0:
+        if (
+            not in_capture
+            and physical_block_table is not None
+            and physical_block_table.numel() > 0
+        ):
             return physical_block_table
         kernel_block_table = cls._select_block_table_for_layer(attn_inputs=attn_inputs)
         if kernel_block_table is None or kernel_block_table.numel() == 0:
@@ -1796,8 +1807,19 @@ class RTPForwardMLAContext(RTPForwardContext):
         cg_bufs: dict | None,
         in_capture: bool,
     ) -> torch.Tensor | None:
+        # NOTE: kv_cache_block_id_device is RTP-LLM's cache-store physical block table.
+        # RTP-LLM does NOT refresh it inside the CUDA/HIP graph on replay -- by design only
+        # kv_cache_kernel_block_id_device is D2D-refreshed, and cache store runs outside the
+        # graph (see RTP-LLM cuda_graph_runner.cc and OpDefs.h). Returning it under capture
+        # bakes a stale block_table / slot_mapping into the graph, so every replay step
+        # reads/writes KV at the frozen capture-time physical blocks -> garbled output.
+        # Under capture we must rebuild the physical table from the (refreshed) kernel table.
         physical_block_table = getattr(attn_inputs, "kv_cache_block_id_device", None)
-        if physical_block_table is not None and physical_block_table.numel() > 0:
+        if (
+            not in_capture
+            and physical_block_table is not None
+            and physical_block_table.numel() > 0
+        ):
             return physical_block_table
         kernel_block_table = cls._select_block_table_for_layer(attn_inputs=attn_inputs)
         if kernel_block_table is None or kernel_block_table.numel() == 0:
