@@ -77,7 +77,7 @@ models:
       nightly:
         - name: ds-v4-1p1d-tp8
           topology: 1p1d
-          nodes: [mia1-p02-g47, mia1-p02-g44]
+          nodes: [mia1-p02-g42, mia1-p02-g47]
           isl: [8192]
           osl: 1024
           concurrency: [64, 128]
