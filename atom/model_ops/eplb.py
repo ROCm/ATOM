@@ -18,23 +18,30 @@ def count_physical_load(
     """Count per-physical expert load for one pass.
 
     Invalid ids (`<0` or `>= num_physical`) are ignored.
+
+    Capture-safe: uses only fixed-shape elementwise ops + scatter_add_, so it
+    can run inside a hip/cuda graph capture (decode path). Avoids torch.bincount,
+    boolean-mask indexing, and `.any()` host-syncs -- all of which raise
+    "operation not permitted when stream is capturing".
     """
     assert topk_physical.dtype in (
         torch.int32,
         torch.int64,
     ), f"topk_physical must be int32 or int64, got {topk_physical.dtype}"
+    counts = torch.zeros(
+        num_physical, dtype=torch.int32, device=topk_physical.device
+    )
+    # numel() reads static shape metadata (a host int), safe during capture.
     if topk_physical.numel() == 0:
-        return torch.zeros(
-            num_physical, dtype=torch.int32, device=topk_physical.device
-        )
+        return counts
 
     flat = topk_physical.reshape(-1).to(torch.int64)
     valid = (flat >= 0) & (flat < num_physical)
-    if valid.any():
-        counts = torch.bincount(flat[valid], minlength=num_physical)
-    else:
-        counts = torch.zeros(num_physical, dtype=torch.int64, device=flat.device)
-    return counts.to(torch.int32)
+    # Route invalid ids to slot 0 but contribute 0 so they don't affect counts.
+    safe_idx = torch.where(valid, flat, torch.zeros_like(flat))
+    contrib = valid.to(torch.int32)
+    counts.scatter_add_(0, safe_idx, contrib)
+    return counts
 
 
 class ExpertLoadMonitor:
@@ -333,6 +340,7 @@ def get_eplb_manager(
     if (
         _MANAGER is None
         or _MANAGER.enabled != enabled
+        or _MANAGER.monitor is not monitor
         or _MANAGER.monitor.window_size != monitor.window_size
         or _MANAGER.rebalance_interval != int(rebalance_interval)
         or _MANAGER.rebalance_min_balancedness != float(rebalance_min_balancedness)
