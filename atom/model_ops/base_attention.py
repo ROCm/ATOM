@@ -364,7 +364,7 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
         )
     else:
-        output = self.impl.forward(
+        return self.impl.forward(
             query=q,
             key=k,
             value=v,
@@ -372,13 +372,6 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
-        if getattr(self.impl, "is_indexed_sparse_attention", False):
-            from atom.utils.forward_context import get_forward_context
-            from atom.utils.tbo import tbo_yield
-
-            if get_forward_context().context.is_prefill:
-                tbo_yield()
-        return output
 
 
 def linear_attention_with_output_base_fake(

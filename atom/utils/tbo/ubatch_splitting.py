@@ -19,11 +19,12 @@ def derive_prefill_lens_from_positions(
     full_cu_seqlens_q,
     ub_slice,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (extend_lens, context_lens) for a prefill ubatch.
+    """Return (extend_lens, seq_lens) for a prefill ubatch.
 
     ``positions`` are the absolute positions for this ubatch's new tokens.
-    For token-midpoint splits this preserves the absolute prefix length of a
-    straddled request instead of treating the ubatch as a standalone prompt.
+    ``seq_lens`` are the total visible sequence lengths for sparse metadata,
+    preserving the absolute prefix length of a straddled request instead of
+    treating the ubatch as a standalone prompt.
     """
     rs = ub_slice.request_slice
     ts = ub_slice.token_slice
@@ -40,8 +41,8 @@ def derive_prefill_lens_from_positions(
     ub_cu = np.zeros(ub_num_reqs + 1, dtype=np.int32)
     np.cumsum(extend_lens, dtype=np.int32, out=ub_cu[1:])
     start_positions = positions_np[ub_cu[:ub_num_reqs]].astype(np.int32)
-    context_lens = (start_positions + extend_lens).astype(np.int32)
-    return extend_lens, context_lens
+    seq_lens = (start_positions + extend_lens).astype(np.int32)
+    return extend_lens, seq_lens
 
 
 @dataclass

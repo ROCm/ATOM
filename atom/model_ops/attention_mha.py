@@ -1344,6 +1344,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         output = output.view(*q.shape)
         self._index_q = None
         self._index_q_cache_key_info = None
+        from atom.utils.tbo.ubatching import tbo_active
+
+        if tbo_active():
+            from atom.utils.tbo.ubatching import tbo_yield
+
+            tbo_yield()
         return output
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
