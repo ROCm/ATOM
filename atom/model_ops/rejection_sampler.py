@@ -80,9 +80,14 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
 
-    # Create output buffer.
-    output_token_ids = torch.empty(
+    # Create output buffer. Initialize to -1 (the truncation sentinel) rather
+    # than empty: with variable-length verification (DSpark Phase 2) a request
+    # may verify fewer than num_spec_steps tokens, so the kernel only writes
+    # positions [0 .. num_draft_tokens]; the unwritten tail must read as -1 so
+    # downstream first-`-1` truncation does not pick up uninitialized garbage.
+    output_token_ids = torch.full(
         (batch_size, num_spec_steps + 1),
+        -1,
         dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
         device=device,
     )
