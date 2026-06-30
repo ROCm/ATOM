@@ -43,7 +43,6 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.utils.debug_helper import maybe_dump_minimax_m3_layer
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import PretrainedConfig
@@ -317,26 +316,6 @@ class MiniMaxM3MoE(nn.Module):
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
 
-        import os as _os_m3
-
-        _md = _os_m3.getenv("ATOM_M3_MOEOUT_DIR")
-        if _md:
-            _ln = getattr(getattr(self, "experts", None), "layer_name", "")
-            import re as _re_m3
-
-            _m = _re_m3.search(r"\.layers\.(\d+)\.", _ln)
-            if _m and int(_m.group(1)) in (3, 30, 59):
-                import torch as _t_m3
-                import torch.distributed as _dist_m3
-
-                _os_m3.makedirs(_md, exist_ok=True)
-                _rk = _dist_m3.get_rank() if _dist_m3.is_initialized() else 0
-                _kind = "decode" if hidden_states.shape[0] == 1 else "prefill"
-                _t_m3.save(
-                    {"out": routed_output.detach().cpu(), "in": hidden_states.detach().cpu()},
-                    _os_m3.path.join(_md, f"moeout_l{_m.group(1)}_{_kind}_rank{_rk}.pt"),
-                )
-
         return routed_output.view(orig_shape)
 
 
@@ -609,10 +588,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # Debug dump bookkeeping (env-gated; see maybe_dump_minimax_m3_layer).
-        self.layer_num = layer_num
-        self._last_layer_idx = config.num_hidden_layers - 1
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -636,17 +611,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
             aux_out.append(residual.clone())
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        # maybe_dump_minimax_m3_layer(
-        #     hidden_states, self.layer_num, "attn", self._last_layer_idx
-        # )
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
-        # maybe_dump_minimax_m3_layer(
-        #     hidden_states, self.layer_num, "moe", self._last_layer_idx
-        # )
         return hidden_states, residual
 
 

@@ -1002,16 +1002,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
-        # Env-gated raw (pre-transform) MXFP4 expert weight stash, for the
-        # default-vs-triton fused_moe isolation test. The default (CK shuffle)
-        # and triton (_swizzle_mxfp4) paths transform these SAME raw tensors
-        # differently; saving them here lets the offline test apply both
-        # transforms and compare kernels on identical weights. No-op unless
-        # ATOM_MOE_RAWW_DUMP_DIR is set.
-        from atom.utils.debug_helper import maybe_dump_mxfp4_raw_weights
-
-        maybe_dump_mxfp4_raw_weights(layer)
-
         if self.static_input_scales:
             layer.w13_input_scale = atom_parameter(
                 layer.w13_input_scale.max().to(torch.float32)
@@ -1273,11 +1263,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     _moe_result = _moe_result + self._apply_shared_experts_dense(
                         layer, x, activation
                     )
-                from atom.utils.debug_helper import maybe_dump_moe_apply_io
-
-                maybe_dump_moe_apply_io(
-                    getattr(layer, "layer_name", ""), x, router_logits, _moe_result
-                )
                 return _moe_result
 
             assert (
@@ -1335,11 +1320,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.fused_experts is None:
-            # Positional kernel args, then the keyword kernel args (incl.
-            # moe_extra_args: gate_mode / swiglu_limit). Built once so the same
-            # values feed both the kernel call and the env-gated I/O dump.
-            fused_moe_pos = (x, layer.w13_weight, layer.w2_weight, topk_weights, topk_ids)
-            fused_moe_kw = dict(
+            return fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
                 expert_mask=layer.expert_mask,
                 activation=activation,
                 quant_type=self.quant_type,
@@ -1354,25 +1340,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias2=layer.w2_bias,
                 **moe_extra_args,
             )
-            # Env-gated kernel I/O dump for offline correctness debugging.
-            from atom.utils.debug_helper import maybe_dump_fused_moe_io
-
-            _moe_dump_args = {
-                "x": x,
-                "w1": layer.w13_weight,
-                "w2": layer.w2_weight,
-                "topk_weights": topk_weights,
-                "topk_ids": topk_ids,
-                **fused_moe_kw,
-            }
-            layer_name = getattr(layer, "layer_name", "")
-            maybe_dump_fused_moe_io(layer_name, _moe_dump_args)
-            moe_out = fused_moe(*fused_moe_pos, **fused_moe_kw)
-            maybe_dump_fused_moe_io(layer_name, _moe_dump_args, output=moe_out)
-            from atom.utils.debug_helper import maybe_dump_moe_apply_io
-
-            maybe_dump_moe_apply_io(layer_name, x, router_logits, moe_out)
-            return moe_out
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -1468,9 +1435,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     out_dtype=x.dtype,
                 )
             else:
-                intermediate = torch.empty(
-                    (M, half_n), device=x.device, dtype=x.dtype
-                )
+                intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
                 fused_clamp_act_mul(
                     gate_up,
                     out=intermediate,

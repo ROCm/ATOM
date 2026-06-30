@@ -31,10 +31,6 @@ from atom.utils.debug_helper.compare import (
 )
 from atom.utils.debug_helper.dump import (
     install_block_forward_hooks,
-    maybe_dump_fused_moe_io,
-    maybe_dump_minimax_m3_layer,
-    maybe_dump_moe_apply_io,
-    maybe_dump_mxfp4_raw_weights,
     maybe_dump_weights_and_exit,
     maybe_log_topk,
 )
@@ -47,10 +43,6 @@ from atom.utils.debug_helper.ref_patch import (
 __all__ = [
     # dump
     "install_block_forward_hooks",
-    "maybe_dump_fused_moe_io",
-    "maybe_dump_minimax_m3_layer",
-    "maybe_dump_moe_apply_io",
-    "maybe_dump_mxfp4_raw_weights",
     "maybe_dump_weights_and_exit",
     "maybe_log_topk",
     # compare primitives

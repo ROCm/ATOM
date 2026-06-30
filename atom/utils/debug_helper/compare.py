@@ -371,39 +371,6 @@ def cmd_layer_bisect(args: argparse.Namespace) -> int:
     return rc
 
 
-def cmd_moe_apply(args: argparse.Namespace) -> int:
-    """Compare MoE apply() boundary dumps from two runs (default vs triton).
-
-    Each dir holds apply_{kind}_{layer}_rank{R}.pt with keys x / router_logits /
-    output (written by maybe_dump_moe_apply_io). Matches files by basename across
-    --a (e.g. default / correct) and --b (e.g. triton / broken) and prints, per
-    file, cos for x, router_logits, output. The first stage where cos drops tells
-    you the divergence:
-      - router_logits drops  -> routing bug
-      - x matches, output drops -> kernel / weight-layout / scale bug
-    """
-    a_files = {os.path.basename(p): p for p in glob.glob(os.path.join(args.a, "*.pt"))}
-    b_files = {os.path.basename(p): p for p in glob.glob(os.path.join(args.b, "*.pt"))}
-    common = sorted(set(a_files) & set(b_files))
-    if not common:
-        print(f"no matching files between {args.a} and {args.b}")
-        return 1
-    print(f"{'file':45s} {'stage':14s} {'cos':>9s} {'max_abs':>10s} {'rel':>9s}")
-    for name in common:
-        a = torch.load(a_files[name], map_location="cpu", weights_only=False)
-        b = torch.load(b_files[name], map_location="cpu", weights_only=False)
-        for stage in ("x", "router_logits", "output"):
-            ta, tb = a.get(stage), b.get(stage)
-            if ta is None or tb is None:
-                continue
-            cos, ma, rel = cos_max(ta, tb)
-            print(
-                f"{name[:45]:45s} {stage:14s} {flag_for(cos, rel)} "
-                f"{cos:9.6f} {ma:10.3e} {rel:9.3e}"
-            )
-    return 0
-
-
 def cmd_schema(args: argparse.Namespace) -> int:
     """Show schema diff between two dump files."""
     a = torch.load(args.a, map_location="cpu", weights_only=False)
@@ -437,13 +404,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     lb.add_argument("--rank", type=int, default=0)
     lb.add_argument("--threshold", type=float, default=COS_NUM_DRIFT)
     lb.set_defaults(func=cmd_layer_bisect)
-
-    ma = sub.add_parser(
-        "moe-apply", help="Compare MoE apply() dumps (default dir vs triton dir)"
-    )
-    ma.add_argument("--a", required=True, help="dir A (e.g. default / correct run)")
-    ma.add_argument("--b", required=True, help="dir B (e.g. triton / broken run)")
-    ma.set_defaults(func=cmd_moe_apply)
 
     sc = sub.add_parser("schema", help="Schema diff between two dump files")
     sc.add_argument("--a", required=True)

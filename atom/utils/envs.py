@@ -183,28 +183,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
-    # MiniMax-M3 per-layer attn/moe hidden dump + mean/var print. Captures one
-    # prefill step and one decode step (decode = num_tokens == 1), then exits
-    # after the last layer's MoE of the first decode step. Requires eager mode
-    # (--enforce-eager) so the submodule forward hooks fire during decode.
-    "ATOM_M3_DUMP_DIR": lambda: os.getenv("ATOM_M3_DUMP_DIR", ""),
-    "ATOM_M3_DUMP_EXIT": lambda: os.getenv("ATOM_M3_DUMP_EXIT", "1") == "1",
-    # fused_moe kernel I/O dump — saves all kernel tensor args (activations,
-    # expert weights, scales, routing, biases) + the kernel output for one
-    # prefill and one decode step per layer, for offline kernel-correctness
-    # replay. Requires eager mode. ATOM_MOE_DUMP_LAYERS optionally restricts to a
-    # comma-separated set of layer indices (default: all).
-    "ATOM_MOE_DUMP_DIR": lambda: os.getenv("ATOM_MOE_DUMP_DIR", ""),
-    "ATOM_MOE_DUMP_LAYERS": lambda: os.getenv("ATOM_MOE_DUMP_LAYERS", ""),
-    # Raw (pre-transform) MXFP4 expert weight stash for the default-vs-triton
-    # fused_moe isolation test. Saves w13/w2 weight+scale+bias per MoE layer
-    # before process_weights_after_loading shuffles/swizzles them.
-    "ATOM_MOE_RAWW_DUMP_DIR": lambda: os.getenv("ATOM_MOE_RAWW_DUMP_DIR", ""),
-    "ATOM_MOE_RAWW_DUMP_LAYERS": lambda: os.getenv("ATOM_MOE_RAWW_DUMP_LAYERS", ""),
-    # MoE apply() boundary dump (x / router_logits / output) for comparing the
-    # default (ATOM_USE_TRITON_MOE=0) vs triton (=1) paths across two runs.
-    "ATOM_MOE_APPLY_DUMP_DIR": lambda: os.getenv("ATOM_MOE_APPLY_DUMP_DIR", ""),
-    "ATOM_MOE_APPLY_DUMP_LAYERS": lambda: os.getenv("ATOM_MOE_APPLY_DUMP_LAYERS", ""),
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),
