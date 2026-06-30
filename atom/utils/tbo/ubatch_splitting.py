@@ -268,21 +268,10 @@ def split_attn_metadata(
             )
             ub_slot_mapping = torch.cat([ub_slot_mapping, pad])
 
-    # context_lens: slice by request.  For pure prefill token-splits a request
-    # can be split across ubatches, so the visible K length for the first/last
-    # partial request is the clamped ubatch-local query length, not the full
-    # original request length.
+    # context_lens: slice by request
     ub_context_lens = None
     if attn_metadata.context_lens is not None:
-        if (
-            not getattr(attn_metadata, "has_cached", False)
-            and ub_cu_seqlens_q is not None
-        ):
-            ub_context_lens = (
-                ub_cu_seqlens_q[1 : ub_num_reqs + 1] - ub_cu_seqlens_q[:ub_num_reqs]
-            ).to(attn_metadata.context_lens.dtype)
-        else:
-            ub_context_lens = attn_metadata.context_lens[rs]
+        ub_context_lens = attn_metadata.context_lens[rs]
         if padded_bs > ub_num_reqs:
             pad = torch.zeros(
                 padded_bs - ub_num_reqs,
