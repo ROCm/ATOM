@@ -36,6 +36,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
   Total                                      = ~26.5 MB / slot
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type, cast
@@ -43,6 +44,7 @@ from typing import Any, Dict, Optional, Type, cast
 import numpy as np
 import torch
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
@@ -60,6 +62,8 @@ from atom.utils.forward_context import (
     Context,
     get_forward_context,
 )
+
+logger = logging.getLogger("atom")
 
 # FP4 indexer persistent-grid schedule params, shared by both the decode
 # (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels. The
@@ -343,7 +347,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # written by `fused_compress_attn(quant_mode="fp4")`. The scoring path
         # auto-detects FP4 via `kv_cache.dtype == uint8`. Default off → the
         # existing FP8 (+fp32 scale) path is byte-identical.
-        self._indexer_fp4 = os.environ.get("ATOM_V4_INDEXER_FP4", "0") == "1"
+        # Switch: `--enable-deepseek-v4-fp4-indexer`. The FP4 mqa-logits /
+        # scatter kernels are gfx950 (MI355X / CDNA4) only; on any other arch
+        # warn and fall back to the FP8 indexer instead of failing.
+        _fp4_requested = bool(
+            getattr(model_runner.config, "enable_deepseek_v4_fp4_indexer", False)
+        )
+        if _fp4_requested and get_gfx() != "gfx950":
+            logger.warning(
+                "--enable-deepseek-v4-fp4-indexer requires a gfx950 (MI355X / "
+                "CDNA4) GPU; current arch is %r. Falling back to the FP8 "
+                "indexer.",
+                get_gfx(),
+            )
+            _fp4_requested = False
+        self._indexer_fp4 = _fp4_requested
         # FP4 KV tile geometry (group_size 32; 16 packed bytes per group).
         self._idx_k_tiles = self.index_head_dim // 128
 
@@ -794,7 +812,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if self._indexer_fp4 and is_pd:
             raise NotImplementedError(
                 "KV transfer (disaggregated serving) is not supported with "
-                "ATOM_V4_INDEXER_FP4=1 yet (FP4 indexer scale pool unmapped)."
+                "--enable-deepseek-v4-fp4-indexer yet (FP4 indexer scale pool "
+                "unmapped)."
             )
         if self._indexer_fp4:
             # Single-node FP4 indexer: the FP8 region map below references the

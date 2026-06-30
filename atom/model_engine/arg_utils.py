@@ -49,6 +49,7 @@ class EngineArgs:
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
+    enable_deepseek_v4_fp4_indexer: bool = False
     enable_tbo: Optional[str] = None
     all2all_backend: Optional[str] = None
     method: Optional[str] = None
@@ -146,6 +147,12 @@ class EngineArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enable DP attention.",
+        )
+        parser.add_argument(
+            "--enable-deepseek-v4-fp4-indexer",
+            action="store_true",
+            help="Enable the FP4 CSA Indexer KV cache for DeepSeek-V4 (gfx950). "
+            "Default off → FP8 indexer.",
         )
         parser.add_argument(
             "--enable-tbo",

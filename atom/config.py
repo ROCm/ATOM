@@ -1047,6 +1047,10 @@ class Config:
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
+    # Opt-in FP4 CSA Indexer KV cache for DeepSeek-V4 (gfx950). When set, the
+    # indexer KV is stored as packed FP4 E2M1 + per-group(32) e8m0 scale and
+    # scored by the `pa_mqa_logits_fp4` kernels. Default off → FP8 indexer.
+    enable_deepseek_v4_fp4_indexer: bool = False
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
@@ -1241,6 +1245,7 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(self.enable_deepseek_v4_fp4_indexer)
         factors.append(
             (
                 getattr(self.hf_config, "use_index_cache", False),
