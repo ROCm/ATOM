@@ -317,6 +317,26 @@ class MiniMaxM3MoE(nn.Module):
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
 
+        import os as _os_m3
+
+        _md = _os_m3.getenv("ATOM_M3_MOEOUT_DIR")
+        if _md:
+            _ln = getattr(getattr(self, "experts", None), "layer_name", "")
+            import re as _re_m3
+
+            _m = _re_m3.search(r"\.layers\.(\d+)\.", _ln)
+            if _m and int(_m.group(1)) in (3, 30, 59):
+                import torch as _t_m3
+                import torch.distributed as _dist_m3
+
+                _os_m3.makedirs(_md, exist_ok=True)
+                _rk = _dist_m3.get_rank() if _dist_m3.is_initialized() else 0
+                _kind = "decode" if hidden_states.shape[0] == 1 else "prefill"
+                _t_m3.save(
+                    {"out": routed_output.detach().cpu(), "in": hidden_states.detach().cpu()},
+                    _os_m3.path.join(_md, f"moeout_l{_m.group(1)}_{_kind}_rank{_rk}.pt"),
+                )
+
         return routed_output.view(orig_shape)
 
 

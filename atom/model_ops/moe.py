@@ -1010,7 +1010,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # ATOM_MOE_RAWW_DUMP_DIR is set.
         from atom.utils.debug_helper import maybe_dump_mxfp4_raw_weights
 
-        # maybe_dump_mxfp4_raw_weights(layer)
+        maybe_dump_mxfp4_raw_weights(layer)
 
         if self.static_input_scales:
             layer.w13_input_scale = atom_parameter(
@@ -1037,24 +1037,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the MoE-kernel-only CDNA4 layout.
             n_shared = layer.num_fused_shared_experts
             if n_shared > 0:
+                # IMPORTANT: .clone() (not .contiguous()). A uint8 view of a
+                # contiguous slice is already contiguous, so .contiguous() returns
+                # a tensor that SHARES storage with w13_weight. The gguu->gugu
+                # interleave below mutates w13_weight in place, which would then
+                # corrupt these stashed shared weights (consumed by the gguu
+                # half-split swiglu_oai_split). Clone to fully detach.
                 layer.shared_w13_weight = (
-                    layer.w13_weight.data[-n_shared:].view(torch.uint8).contiguous()
+                    layer.w13_weight.data[-n_shared:].view(torch.uint8).clone()
                 )
                 layer.shared_w13_weight_scale = layer.w13_weight_scale.data[
                     -n_shared:
-                ].contiguous()
+                ].clone()
                 layer.shared_w2_weight = (
-                    layer.w2_weight.data[-n_shared:].view(torch.uint8).contiguous()
+                    layer.w2_weight.data[-n_shared:].view(torch.uint8).clone()
                 )
                 layer.shared_w2_weight_scale = layer.w2_weight_scale.data[
                     -n_shared:
-                ].contiguous()
+                ].clone()
                 if layer.w13_bias is not None:
-                    layer.shared_w13_bias = layer.w13_bias.data[-n_shared:].contiguous()
+                    layer.shared_w13_bias = layer.w13_bias.data[-n_shared:].clone()
                 else:
                     layer.shared_w13_bias = None
                 if layer.w2_bias is not None:
-                    layer.shared_w2_bias = layer.w2_bias.data[-n_shared:].contiguous()
+                    layer.shared_w2_bias = layer.w2_bias.data[-n_shared:].clone()
                 else:
                     layer.shared_w2_bias = None
 
@@ -1267,6 +1273,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     _moe_result = _moe_result + self._apply_shared_experts_dense(
                         layer, x, activation
                     )
+                from atom.utils.debug_helper import maybe_dump_moe_apply_io
+
+                maybe_dump_moe_apply_io(
+                    getattr(layer, "layer_name", ""), x, router_logits, _moe_result
+                )
                 return _moe_result
 
             assert (
@@ -1355,9 +1366,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 **fused_moe_kw,
             }
             layer_name = getattr(layer, "layer_name", "")
-            # maybe_dump_fused_moe_io(layer_name, _moe_dump_args)
+            maybe_dump_fused_moe_io(layer_name, _moe_dump_args)
             moe_out = fused_moe(*fused_moe_pos, **fused_moe_kw)
-            # maybe_dump_fused_moe_io(layer_name, _moe_dump_args, output=moe_out)
+            maybe_dump_fused_moe_io(layer_name, _moe_dump_args, output=moe_out)
+            from atom.utils.debug_helper import maybe_dump_moe_apply_io
+
+            maybe_dump_moe_apply_io(layer_name, x, router_logits, moe_out)
             return moe_out
         return self.fused_experts(
             hidden_states=x,

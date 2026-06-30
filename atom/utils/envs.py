@@ -201,6 +201,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before process_weights_after_loading shuffles/swizzles them.
     "ATOM_MOE_RAWW_DUMP_DIR": lambda: os.getenv("ATOM_MOE_RAWW_DUMP_DIR", ""),
     "ATOM_MOE_RAWW_DUMP_LAYERS": lambda: os.getenv("ATOM_MOE_RAWW_DUMP_LAYERS", ""),
+    # MoE apply() boundary dump (x / router_logits / output) for comparing the
+    # default (ATOM_USE_TRITON_MOE=0) vs triton (=1) paths across two runs.
+    "ATOM_MOE_APPLY_DUMP_DIR": lambda: os.getenv("ATOM_MOE_APPLY_DUMP_DIR", ""),
+    "ATOM_MOE_APPLY_DUMP_LAYERS": lambda: os.getenv("ATOM_MOE_APPLY_DUMP_LAYERS", ""),
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),

@@ -395,6 +395,97 @@ def maybe_dump_fused_moe_io(
     )
 
 
+# === MoE apply() boundary dump (default-vs-triton compare) ===========
+
+# (layer, kind) already dumped — capture first prefill + first decode per layer.
+_MOE_APPLY_DONE: set[tuple[str, str]] = set()
+
+
+def maybe_dump_moe_apply_io(
+    layer_name: str,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Dump the MoE apply() boundary: x, router_logits, output. Env-gated no-op.
+
+    No-op unless ATOM_MOE_APPLY_DUMP_DIR is set. These three tensors exist on
+    BOTH the aiter default and triton paths, so dumping from one run with
+    ATOM_USE_TRITON_MOE=0 (correct) and another with =1 (broken) lets the compare
+    CLI diff them per layer to localize divergence:
+      - x identical, router_logits identical, output differs -> kernel/layout bug
+      - router_logits differ                                  -> routing bug
+
+    Skips warmup/dummy forwards. Captures first prefill + first decode per layer.
+    Optional layer filter via ATOM_MOE_APPLY_DUMP_LAYERS (comma-separated).
+    File: {dir}/apply_{kind}_{safe_layer}_rank{R}.pt
+    Requires eager mode.
+    """
+    dump_dir = envs.ATOM_MOE_APPLY_DUMP_DIR
+    if not dump_dir:
+        return
+    _dbg = os.getenv("ATOM_MOE_APPLY_DUMP_DEBUG") == "1"
+    # ATOM_MOE_APPLY_DUMP_ALL=1 bypasses the dummy/warmup skip — keep only the
+    # LAST write per (layer,kind) so the final real forward wins over warmups.
+    _skip_dummy = os.getenv("ATOM_MOE_APPLY_DUMP_ALL") != "1"
+    if _skip_dummy and _is_dummy_run():
+        if _dbg:
+            print(f"[MOE_APPLY_DBG] skip dummy_run layer={layer_name}", flush=True)
+        return
+    if not isinstance(x, torch.Tensor):
+        return
+    kind = "decode" if x.shape[0] == 1 else "prefill"
+
+    wanted = _parse_layer_set(envs.ATOM_MOE_APPLY_DUMP_LAYERS)
+    if wanted is not None:
+        import re
+
+        m = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+        if m is None or int(m.group(1)) not in wanted:
+            if _dbg:
+                print(
+                    f"[MOE_APPLY_DBG] skip filter layer={layer_name!r} "
+                    f"match={None if m is None else m.group(1)}",
+                    flush=True,
+                )
+            return
+    if _dbg:
+        print(
+            f"[MOE_APPLY_DBG] WRITING layer={layer_name!r} kind={kind} "
+            f"x={tuple(x.shape)}",
+            flush=True,
+        )
+
+    key = (layer_name, kind)
+    if _skip_dummy:
+        # Normal mode: first real call wins, dedup to avoid file churn.
+        if key in _MOE_APPLY_DONE:
+            return
+        _MOE_APPLY_DONE.add(key)
+    # ALL mode: overwrite each call so the LAST (real) forward wins.
+
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = _get_rank()
+    safe = layer_name.replace("/", "_").replace(".", "_") or "moe"
+    fname = os.path.join(dump_dir, f"apply_{kind}_{safe}_rank{rank}.pt")
+    torch.save(
+        {
+            "_layer_name": layer_name,
+            "_kind": kind,
+            "_rank": rank,
+            "x": x.detach().cpu(),
+            "router_logits": router_logits.detach().cpu(),
+            "output": output.detach().cpu(),
+        },
+        fname,
+    )
+    of = output.detach().float()
+    logging.getLogger("atom").info(
+        f"[MOE_APPLY] {kind} {layer_name}: x={tuple(x.shape)} "
+        f"out mean={of.mean().item():.6e} var={of.var().item():.6e} rank={rank}"
+    )
+
+
 # === MXFP4 raw expert weight stash (isolation test) ==================
 
 _MOE_RAWW_DONE: set[str] = set()
