@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import Optional
 
 import torch
@@ -16,27 +15,6 @@ disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
 # those 2 models are covering most of dense and moe models
 ATOM_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMForCausalLM"
 ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMMoEForCausalLM"
-MINIMAX_M3_COMMUNITY_CAUSAL_LM = (
-    "atom.plugin.vllm.models.minimax_m3.amd.model:MiniMaxM3SparseForCausalLM"
-)
-MINIMAX_M3_COMMUNITY_CONDITIONAL_GENERATION = (
-    "atom.plugin.vllm.models.minimax_m3.amd.model:"
-    "MiniMaxM3SparseForConditionalGeneration"
-)
-_USE_MINIMAX_M3_COMMUNITY_MODEL = (
-    os.getenv("ATOM_M3_USE_COMMUNITY_MODEL_BASELINE", "0").lower()
-    in ("1", "true", "yes", "on")
-)
-MINIMAX_M3_CAUSAL_LM_TARGET = (
-    MINIMAX_M3_COMMUNITY_CAUSAL_LM
-    if _USE_MINIMAX_M3_COMMUNITY_MODEL
-    else ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER
-)
-MINIMAX_M3_CONDITIONAL_GENERATION_TARGET = (
-    MINIMAX_M3_COMMUNITY_CONDITIONAL_GENERATION
-    if _USE_MINIMAX_M3_COMMUNITY_MODEL
-    else ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER
-)
 
 # when register new model to vllm, add here
 # Keys is from hf config arch name
@@ -58,8 +36,8 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
-    "MiniMaxM3SparseForCausalLM": MINIMAX_M3_CAUSAL_LM_TARGET,
-    "MiniMaxM3SparseForConditionalGeneration": MINIMAX_M3_CONDITIONAL_GENERATION_TARGET,
+    "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "MiniMaxM3SparseForConditionalGeneration": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
 }
 
 

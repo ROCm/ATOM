@@ -3,7 +3,6 @@
 
 """Inference-only MiniMax-M3 model support for ATOM."""
 
-import os
 from typing import Optional, Union
 
 import torch
@@ -14,7 +13,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
-from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -61,13 +60,6 @@ def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
     if freq is None:
         return set()
     return {i for i, enabled in enumerate(freq) if enabled != 0}
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.lower() in ("1", "true", "yes", "on")
 
 
 def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]:
@@ -554,73 +546,17 @@ class MiniMaxM3DecoderLayer(nn.Module):
         layer_num: int = 0,
     ) -> None:
         super().__init__()
-        atom_config = get_current_atom_config()
-        use_community_attention_default = atom_config.plugin_config is not None
         is_sparse_attention_layer = layer_num in _sparse_attention_layer_ids(config)
-        use_community_sparse_attention = (
-            is_sparse_attention_layer
-            and atom_config.plugin_config is not None
-            and _env_flag(
-                "ATOM_M3_USE_COMMUNITY_ATTENTION_BASELINE",
-                default=use_community_attention_default,
-            )
+        attn_cls = (
+            MiniMaxM3SparseAttention if is_sparse_attention_layer else MiniMaxM3Attention
         )
-        use_community_dense_attention = (
-            not is_sparse_attention_layer
-            and atom_config.plugin_config is not None
-            and _env_flag(
-                "ATOM_M3_USE_COMMUNITY_DENSE_ATTENTION_BASELINE",
-                default=use_community_attention_default,
-            )
+        self.self_attn = attn_cls(
+            config=config,
+            layer_id=layer_num,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+            cache_config=cache_config,
         )
-        if use_community_sparse_attention:
-            from atom.plugin.vllm.models.minimax_m3.amd.model import (
-                MiniMaxM3SparseAttention as CommunityMiniMaxM3SparseAttention,
-            )
-
-            vllm_config = atom_config.plugin_config.vllm_config
-            sparse_cfg = config.sparse_attention_config
-            tp_size = get_tensor_model_parallel_world_size()
-            num_index_heads = max(1, sparse_cfg["sparse_num_index_heads"] // tp_size)
-            topk_indices_buffer = torch.empty(
-                num_index_heads,
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                sparse_cfg["sparse_topk_blocks"],
-                dtype=torch.int32,
-            )
-            self.self_attn = CommunityMiniMaxM3SparseAttention(
-                config=config,
-                layer_id=layer_num,
-                quant_config=quant_config,
-                prefix=f"{prefix}.self_attn",
-                cache_config=atom_config.plugin_config.vllm_cache_config,
-                topk_indices_buffer=topk_indices_buffer,
-            )
-        elif use_community_dense_attention:
-            from atom.plugin.vllm.models.minimax_m3.amd.model import (
-                MiniMaxM3Attention as CommunityMiniMaxM3Attention,
-            )
-
-            self.self_attn = CommunityMiniMaxM3Attention(
-                config=config,
-                layer_id=layer_num,
-                quant_config=quant_config,
-                prefix=f"{prefix}.self_attn",
-                cache_config=atom_config.plugin_config.vllm_cache_config,
-            )
-        else:
-            attn_cls = (
-                MiniMaxM3SparseAttention
-                if is_sparse_attention_layer
-                else MiniMaxM3Attention
-            )
-            self.self_attn = attn_cls(
-                config=config,
-                layer_id=layer_num,
-                quant_config=quant_config,
-                prefix=f"{prefix}.self_attn",
-                cache_config=cache_config,
-            )
 
         self.is_moe_layer = _is_moe_layer(config, layer_num)
         if self.is_moe_layer:
