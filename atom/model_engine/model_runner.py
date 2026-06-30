@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import gc
 import logging
 import math
 import os
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -1594,7 +1595,18 @@ class ModelRunner:
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
-        set_kv_cache_data(kv_cache_data, config, transfer_tensors)
+        if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
+            draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
+            if draft_regions:
+                transfer_tensors.block_regions.extend(draft_regions)
+        # Pass the physical block count so the offload connector can byte-slice
+        # MLA's token-major latent cache (shape[0] is tokens, not blocks there).
+        set_kv_cache_data(
+            kv_cache_data,
+            config,
+            transfer_tensors,
+            num_blocks=self.num_physical_kvcache_blocks,
+        )
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -2194,8 +2206,20 @@ class ModelRunner:
         """Collect finished send/recv status from the KV connector."""
         connector = get_kvconnector()
         if connector is None:
-            return KVConnectorOutput(finished_sending=[], finished_recving=[])
-        done_sending, done_recving = connector.get_finished()
+            return KVConnectorOutput()
+
+        finished = connector.get_finished()
+        # New connectors may return the full KVConnectorOutput so they can
+        # report richer states. LMCache offload uses failed_recving to wake a
+        # request for local recompute, and finished_saving to release blocks
+        # whose free was deferred while a background save read their KV.
+        if isinstance(finished, KVConnectorOutput):
+            return finished
+
+        # Legacy P/D connectors still return the old
+        # (done_sending, done_recving) tuple. Normalize it so EngineCore and
+        # Scheduler only need to consume KVConnectorOutput.
+        done_sending, done_recving = finished
 
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
@@ -2283,7 +2307,18 @@ class ModelRunner:
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
         self.logits_in_graph = self.world_size == 1 and not is_tbo
 
-        with graph_capture() as gc:
+        @contextmanager
+        def pause_gc():
+            # No GC during capture: a finalizer's hipModuleUnload aborts it (HIP 900).
+            gc.collect()
+            gc.disable()
+            try:
+                yield
+            finally:
+                gc.enable()
+                gc.collect()
+
+        with pause_gc(), graph_capture() as capture_ctx:
             capture_range = (
                 tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
             )
@@ -2362,7 +2397,7 @@ class ModelRunner:
                             input_ids[:num_tokens],
                             positions[:num_tokens],
                             self.graph_pool,
-                            gc.stream,
+                            capture_ctx.stream,
                             output_buffer=outputs[:num_tokens],
                         )
                         graph_aux = None
@@ -2374,7 +2409,9 @@ class ModelRunner:
                             if self.use_mrope
                             else positions[:num_tokens]
                         )
-                        with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
+                        with torch.cuda.graph(
+                            graph, self.graph_pool, stream=capture_ctx.stream
+                        ):
                             model_output = self.model(
                                 input_ids[:num_tokens],
                                 model_positions,

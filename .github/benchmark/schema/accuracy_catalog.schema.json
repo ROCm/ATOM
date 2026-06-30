@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ROCm/ATOM/.github/benchmark/schema/accuracy_catalog.schema.json",
+  "title": "ATOM accuracy catalog",
+  "description": "Schema for the flat accuracy-validation catalogs: models_accuracy.json, oot_models_accuracy.json, sglang_models_accuracy.json. Locks the current shape so typos / stray fields fail CI. Tolerates the existing extraArgs/extra_args and accuracy_threshold/accuracy_test_threshold spellings (drift to be normalized in a separate PR).",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "model_name",
+      "model_path",
+      "env_vars",
+      "runner",
+      "test_level"
+    ],
+    "properties": {
+      "model_name": { "type": "string", "minLength": 1 },
+      "model_path": { "type": "string", "minLength": 1 },
+      "env_vars": { "type": "string" },
+      "runner": { "type": "string", "minLength": 1 },
+      "test_level": { "type": "string", "enum": ["pr", "nightly", "main"] },
+      "accuracy_baseline": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+
+      "extraArgs": { "type": "string" },
+      "extra_args": { "type": "string" },
+
+      "accuracy_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+      "accuracy_test_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+
+      "accuracy_baseline_model": { "type": "string" },
+      "client_command": { "type": "string" },
+      "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
+      "lm_eval_num_fewshot": { "type": "integer", "minimum": 0 },
+      "lm_eval_num_concurrent": { "type": "integer", "minimum": 1 },
+      "_baseline_note": { "type": "string" }
+    }
+  }
+}

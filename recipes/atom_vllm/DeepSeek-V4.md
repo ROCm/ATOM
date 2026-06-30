@@ -2,16 +2,8 @@
 
 This recipe shows how to run `deepseek-ai/DeepSeek-V4-Flash` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
-## Step 1: Pull the OOT Docker & install ATOM branch hexwang/enable_dsv4
 
-```bash
-docker pull rocm/atom-dev:vllm-latest
-cd /app/ATOM
-git fetch origin hexwang/enable_dsv4
-git checkout hexwang/enable_dsv4
-```
-
-## Step 2: Launch vLLM Server
+## Step 1: Launch vLLM Server
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 

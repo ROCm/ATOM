@@ -9,6 +9,11 @@ on:
     # from") as the ATOM branch selector, so users do not need to type branch
     # names.
     inputs:
+      run_dsv4_prefix_cache_tp8:
+        description: "DeepSeek-V4-Pro Prefix Cache TP8"
+        required: false
+        type: boolean
+        default: false
       run_dsv32_fp8_tp4:
         description: "DeepSeek-V3.2-FP8 TP4"
         required: false
@@ -172,6 +177,7 @@ jobs:
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          RUN_DSV4_PREFIX_CACHE_TP8: ${{ inputs.run_dsv4_prefix_cache_tp8 }}
           RUN_DSR1_FP8_TP4: ${{ inputs.run_dsr1_fp8_tp4 }}
           RUN_DSV32_FP8_TP4: ${{ inputs.run_dsv32_fp8_tp4 }}
           RUN_DSV32_FP8_TP4_DP4_EP4: ${{ inputs.run_dsv32_fp8_tp4_dp4_ep4 }}
@@ -209,6 +215,15 @@ jobs:
           run_mi355_all = os.environ.get("RUN_MI355_ALL", "").lower() == "true"
           run_mi308_all = os.environ.get("RUN_MI308_ALL", "").lower() == "true"
           models = [
+              {
+                  "toggle_env": "RUN_DSV4_PREFIX_CACHE_TP8",
+                  "model_name": "DeepSeek-V4-Pro Prefix Cache TP8",
+                  "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --enable-cache-report --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4",
+                  "accuracy_test_threshold": 0.94,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=true\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
               {
                   "toggle_env": "RUN_DSR1_FP8_TP4",
                   "model_name": "DeepSeek-R1-FP8 TP4",
