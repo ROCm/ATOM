@@ -151,7 +151,7 @@ class RTPForwardContext:
             device=device,
         )
         cu_seqlens = RTPForwardContext._non_empty_int32(
-            getattr(attn_inputs, "cu_seqlens", None),
+            getattr(attn_inputs, "cu_seqlens_device", None),
             device=device,
         )
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
@@ -183,7 +183,7 @@ class RTPForwardContext:
         # Decode: query length is runtime step token count (usually 1 per sequence),
         # not prompt input_lengths.
         sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-            getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+            getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
             device=device,
         )
         sequence_lengths = RTPForwardContext._non_empty_int32(
@@ -262,7 +262,7 @@ class RTPForwardContext:
 
         if is_prefill:
             prefix_lengths = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "prefix_lengths_d", None),
+                getattr(attn_inputs, "prefix_lengths_device", None),
                 device=device,
             )
             if prefix_lengths is None:
@@ -283,7 +283,7 @@ class RTPForwardContext:
         else:
             # RTP decode kernels use sequence_lengths_plus_1_d as canonical runtime value.
             sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
                 device=device,
             )
             if sequence_lengths_plus_1 is not None:
@@ -621,7 +621,7 @@ class RTPForwardContext:
             # For chunked prefill, prefix_lengths can remain per-chunk while
             # sequence_lengths_plus_1_d tracks the true cumulative context length.
             sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
                 device=device,
             )
             if sequence_lengths_plus_1 is not None:
@@ -633,7 +633,7 @@ class RTPForwardContext:
                     )
                 return sequence_lengths_plus_1.contiguous()
             prefix_lengths = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "prefix_lengths_d", None),
+                getattr(attn_inputs, "prefix_lengths_device", None),
                 device=device,
             )
             if prefix_lengths is None:
@@ -654,7 +654,7 @@ class RTPForwardContext:
             return (prefix_lengths + input_lengths).contiguous()
 
         sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-            getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+            getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
             device=device,
         )
         if sequence_lengths_plus_1 is not None:
@@ -1871,7 +1871,7 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if is_prefill:
             prefix_lengths = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "prefix_lengths_d", None),
+                getattr(attn_inputs, "prefix_lengths_device", None),
                 device=device,
             )
             if prefix_lengths is None:
@@ -1896,7 +1896,7 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         )
         if non_cuda_graph_mode:
             sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
                 device=device,
             )
             if sequence_lengths_plus_1 is not None:
@@ -1923,7 +1923,7 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
 
         if not non_cuda_graph_mode:
             sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
                 device=device,
             )
             if sequence_lengths_plus_1 is not None:
