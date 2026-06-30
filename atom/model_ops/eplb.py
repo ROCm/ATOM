@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from functools import wraps
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.config import get_current_atom_config
+
+import logging
+
+logger = logging.getLogger("atom")
 
 def count_physical_load(
     topk_physical: torch.Tensor, num_physical: int
@@ -134,6 +138,7 @@ class ExpertLoadMonitor:
 
 
 _MONITOR: Optional[ExpertLoadMonitor] = None
+_MANAGER: Optional["EPLBManager"] = None
 
 
 def get_expert_load_monitor(*, enabled: bool, window_size: int) -> ExpertLoadMonitor:
@@ -147,6 +152,127 @@ def get_expert_load_monitor(*, enabled: bool, window_size: int) -> ExpertLoadMon
     return _MONITOR
 
 
+class EPLBManager:
+    """Module-B scheduler/trigger manager.
+
+    Scope for now:
+    - periodic step progression on every forward (including dummy)
+    - balancedness gate on module-A physical load
+    - trigger callback skeleton for future rebalance execution
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        monitor: ExpertLoadMonitor,
+        rebalance_interval: int,
+        rebalance_min_balancedness: float,
+        rebalance_balancedness_agg: str,
+        on_rebalance: Optional[Callable[[], None]] = None,
+    ):
+        self.enabled = enabled
+        self.monitor = monitor
+        self.rebalance_interval = int(rebalance_interval)
+        self.rebalance_min_balancedness = float(rebalance_min_balancedness)
+        self.rebalance_balancedness_agg = str(rebalance_balancedness_agg).lower()
+        self.on_rebalance = on_rebalance
+        assert self.rebalance_interval > 0, "eplb_rebalance_interval must be > 0"
+        assert (
+            self.rebalance_interval >= self.monitor.window_size
+        ), "eplb_rebalance_interval must be >= eplb_load_window_size"
+        assert self.rebalance_balancedness_agg in (
+            "min",
+            "mean",
+        ), "eplb_rebalance_balancedness_agg must be one of {'min','mean'}"
+        self._gen = self._entrypoint()
+        self._rebalance_count = 0
+        self._last_balancedness: Optional[float] = None
+
+    @property
+    def rebalance_count(self) -> int:
+        return self._rebalance_count
+
+    @property
+    def last_balancedness(self) -> Optional[float]:
+        return self._last_balancedness
+
+    def on_forward_pass_end(self, is_dummy_run: bool) -> None:
+        # Keep scheduler lockstep regardless of dummy/non-dummy.
+        _ = is_dummy_run
+        if not self.enabled:
+            return
+        next(self._gen)
+
+    def trigger_offline_rebalance(self, reason: str = "manual") -> None:
+        if not self.enabled:
+            return
+        logger.info("EPLB offline rebalance triggered: reason=%s", reason)
+        self._do_rebalance(force=True)
+
+    def _entrypoint(self):
+        while True:
+            for _ in range(self.rebalance_interval):
+                yield
+            self._do_rebalance(force=False)
+
+    def _do_rebalance(self, *, force: bool) -> None:
+        if not force:
+            physical_load = self.monitor.dump_global_physical_load()
+            if physical_load is None:
+                return
+            if not self._need_rebalance(physical_load):
+                return
+        self._rebalance_count += 1
+        if self.on_rebalance is not None:
+            self.on_rebalance()
+
+    def _need_rebalance(self, physical_load: torch.Tensor) -> bool:
+        balancedness = self._compute_balancedness(physical_load)
+        self._last_balancedness = balancedness
+        return balancedness < self.rebalance_min_balancedness
+
+    def _compute_balancedness(self, physical_load: torch.Tensor) -> float:
+        # per-layer balancedness = mean / max over physical experts
+        load_f = physical_load.to(torch.float32)
+        per_layer_max = load_f.max(dim=1).values
+        per_layer_mean = load_f.mean(dim=1)
+        per_layer_bal = torch.ones_like(per_layer_mean)
+        nonzero = per_layer_max > 0
+        per_layer_bal[nonzero] = per_layer_mean[nonzero] / per_layer_max[nonzero]
+        if self.rebalance_balancedness_agg == "mean":
+            return float(per_layer_bal.mean().item())
+        return float(per_layer_bal.min().item())
+
+
+def get_eplb_manager(
+    *,
+    enabled: bool,
+    monitor: ExpertLoadMonitor,
+    rebalance_interval: int,
+    rebalance_min_balancedness: float,
+    rebalance_balancedness_agg: str,
+) -> EPLBManager:
+    global _MANAGER
+    if (
+        _MANAGER is None
+        or _MANAGER.enabled != enabled
+        or _MANAGER.monitor.window_size != monitor.window_size
+        or _MANAGER.rebalance_interval != int(rebalance_interval)
+        or _MANAGER.rebalance_min_balancedness != float(rebalance_min_balancedness)
+        or _MANAGER.rebalance_balancedness_agg
+        != str(rebalance_balancedness_agg).lower()
+    ):
+        _MANAGER = EPLBManager(
+            enabled=enabled,
+            monitor=monitor,
+            rebalance_interval=rebalance_interval,
+            rebalance_min_balancedness=rebalance_min_balancedness,
+            rebalance_balancedness_agg=rebalance_balancedness_agg,
+        )
+    return _MANAGER
+
+
 def with_eplb_forward_monitor(fn):
     @wraps(fn)
     def wrapper(self, batch, *args, **kwargs):
@@ -156,10 +282,19 @@ def with_eplb_forward_monitor(fn):
         monitor = get_expert_load_monitor(
             enabled=True, window_size=cfg.eplb_load_window_size
         )
+        manager = get_eplb_manager(
+            enabled=True,
+            monitor=monitor,
+            rebalance_interval=cfg.eplb_rebalance_interval,
+            rebalance_min_balancedness=cfg.eplb_rebalance_min_balancedness,
+            rebalance_balancedness_agg=cfg.eplb_rebalance_balancedness_agg,
+        )
         monitor.on_forward_start()
         try:
             return fn(self, batch, *args, **kwargs)
         finally:
-            monitor.on_forward_end(getattr(batch, "is_dummy_run", False))
+            is_dummy_run = getattr(batch, "is_dummy_run", False)
+            monitor.on_forward_end(is_dummy_run)
+            manager.on_forward_pass_end(is_dummy_run)
 
     return wrapper

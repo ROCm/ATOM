@@ -140,6 +140,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_LOAD_WINDOW_SIZE": lambda: int(
         os.getenv("ATOM_EPLB_LOAD_WINDOW_SIZE", "1000")
     ),
+    # Rebalance trigger cadence in number of forward passes.
+    "ATOM_EPLB_REBALANCE_INTERVAL": lambda: int(
+        os.getenv("ATOM_EPLB_REBALANCE_INTERVAL", "3000")
+    ),
+    # Trigger only when aggregated balancedness is below this threshold.
+    "ATOM_EPLB_REBALANCE_MIN_BALANCEDNESS": lambda: float(
+        os.getenv("ATOM_EPLB_REBALANCE_MIN_BALANCEDNESS", "0.8")
+    ),
+    # Cross-layer aggregation mode for per-layer balancedness.
+    "ATOM_EPLB_REBALANCE_BALANCEDNESS_AGG": lambda: os.getenv(
+        "ATOM_EPLB_REBALANCE_BALANCEDNESS_AGG", "min"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
