@@ -21,7 +21,9 @@ from atom.model_ops.v4_kernels.fused_compress import (
     fused_compress_attn,
     fused_compress_attn_reference,
 )
-from atom.model_ops.v4_kernels.indexer_weights import scale_indexer_weights
+from atom.model_ops.v4_kernels.indexer_weights import (
+    scale_indexer_weights,
+)
 from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_decode_reference,

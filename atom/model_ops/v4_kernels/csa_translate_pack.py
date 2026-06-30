@@ -191,7 +191,7 @@ def csa_translate_pack(
                                    `[indptr[t], indptr[t]+valid_k[t])`.
       swa_pages:                   SWA region size — `num_slots * window_size`,
                                    fixed at CG capture time. Keyword-only.
-      csa_block_capacity:          `block_size // ratio = 128 // 4 = 32`
+      csa_block_capacity:          `block_size // ratio = 256 // 4 = 64`
                                    (constexpr; triton can strength-reduce
                                    // and %). Keyword-only.
       window_size:                 SWA window. When > 0 the kernel computes

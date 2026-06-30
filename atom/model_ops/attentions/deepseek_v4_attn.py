@@ -23,7 +23,8 @@ PR3-pre2c-B (this revision): classical KV cache (compressed entries) moved
                    under the block_table per paper §3.6.1. Three pools allocated
                    (csa_main_kv / csa_idx_kv / hca_main_kv), shape
                    `[num_blocks, n_layers_of_type, k, head_dim]`. block_size =
-                   lcm(m, m') = 128 original tokens. Compressor + Indexer
+                   2*lcm(m, m') = 256 original tokens (k1_csa=64 so the FP4
+                   indexer kernels run N_PHYS=1). Compressor + Indexer
                    .kv_cache attributes bound to per-layer pool slices.
 PR3-main:   multi-sequence dispatch (slot=0 -> per-seq slot).
 
@@ -59,6 +60,15 @@ from atom.utils.forward_context import (
     Context,
     get_forward_context,
 )
+
+# FP4 indexer persistent-grid schedule params, shared by both the decode
+# (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels. The
+# metadata builder precomputes each path's cta_info with these and the score
+# calls pass block_k/parallel_unit_num so the cta_info layout + grid agree.
+# MUST match the values in `Indexer._score_topk_{decode,prefill}_fp4`. Mirror
+# the kernel defaults (parallel_unit_num=512, block_k=256).
+_FP4_DECODE_PARALLEL_UNIT_NUM = 512
+_FP4_DECODE_BLOCK_K = 256
 
 # ---------------------------------------------------------------------------
 # Typed metadata surface for V4. The base AttentionMetaData class is shared
@@ -256,13 +266,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     """Per-request cache owner for V4's state-cache buffers.
 
     Inherits CommonAttentionBuilder for the standard prefill/decode prep
-    (slot_mapping, block_tables, cu_seqlens). PR3-pre2c-B sets `block_size`
-    to lcm(m, m') = 128 (V4-Pro: m=4 CSA, m'=128 HCA), matching paper §3.6.1's
-    requirement that each classical KV cache block hold an integral number of
-    compressed entries per layer (k1=lcm/m=32 CSA, k2=lcm/m'=1 HCA).
+    (slot_mapping, block_tables, cu_seqlens). `block_size` is 2*lcm(m, m') =
+    256 (V4-Pro: m=4 CSA, m'=128 HCA), a multiple of lcm so each classical KV
+    cache block still holds an integral number of compressed entries per layer
+    (k1=block_size/m=64 CSA, k2=block_size/m'=2 HCA). We use 2*lcm (not lcm)
+    because the FP4 paged-MQA-logits indexer kernels require the indexer
+    kv_block_size (= k1_csa) to be 64 for N_PHYS=1. Must equal
+    `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
 
-    block_size = 128
+    block_size = 256
 
     # Number of micro-batches for Two-Batch Overlap (TBO).
     _NUM_TBO_UBATCHES = 2
@@ -308,11 +321,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # max-density ratio (1 indexer slot per 4 source tokens).
         self.max_model_len_idx = model_runner.config.max_model_len // 4
 
-        # Classical KV pool geometry. block_size=128 original tokens means
-        # each V4 block holds k1=128/4=32 CSA entries and k2=128/128=1 HCA
-        # entry per layer (paper §3.6.1).
-        self.k1_csa = self.block_size // 4  # = 32
-        self.k2_hca = self.block_size // 128  # = 1
+        # Classical KV pool geometry. block_size=256 original tokens means
+        # each V4 block holds k1=256/4=64 CSA entries and k2=256/128=2 HCA
+        # entries per layer (paper §3.6.1; block_size is a multiple of lcm).
+        self.k1_csa = self.block_size // 4  # = 64
+        self.k2_hca = self.block_size // 128  # = 2
 
         self._state_dtype = torch.float32  # fp32 required for softmax-pool
         self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
@@ -322,6 +335,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # unaligned-access slowdowns). Written by `indexer_k_quant_and_cache`,
         # read by `cp_gather_indexer_k_quant_cache`.
         self._aligned_index_dim = ((self.index_head_dim + 4 + 15) // 16) * 16
+
+        # Opt-in FP4 indexer cache (gfx950). When set, the CSA Indexer KV is
+        # stored as packed FP4 E2M1 + per-group(32) e8m0 scale in the
+        # `pa_mqa_logits_fp4` preshuffle layout (data
+        # [NB, k_tiles, 4, k1, 16] uint8 + scale [NB, k_tiles, 4, k1] uint8)
+        # written by `fused_compress_attn(quant_mode="fp4")`. The scoring path
+        # auto-detects FP4 via `kv_cache.dtype == uint8`. Default off → the
+        # existing FP8 (+fp32 scale) path is byte-identical.
+        self._indexer_fp4 = os.environ.get("ATOM_V4_INDEXER_FP4", "0") == "1"
+        # FP4 KV tile geometry (group_size 32; 16 packed bytes per group).
+        self._idx_k_tiles = self.index_head_dim // 128
 
         # MTP token-per-fwd factor for paged-decode buffer sizing. V4-Pro
         # `num_nextn_predict_layers = 1` → mtp_k = 1 → max_q_len = 2 per req.
@@ -430,20 +454,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def compute_block_bytes(self) -> int:
         """Per-V4-block bytes for the three classical KV pools.
 
-        Each V4 block (block_size=128 original tokens) stores per layer:
-          - CSA Main:   k1=32 entries × head_dim BF16
-          - CSA Indexer: k1=32 entries × aligned_index_dim bytes FP8
+        Each V4 block (block_size=256 original tokens) stores per layer:
+          - CSA Main:   k1=64 entries × head_dim BF16
+          - CSA Indexer: k1=64 entries × aligned_index_dim bytes FP8
                         (= ((index_head_dim + 4 + 15) // 16) * 16 — 16-byte
                         alignment matches V3.2 sparse MLA index cache and
                         avoids unaligned-access slowdowns in torch inductor.
                         FP8 quantized data + 4-byte fp32 scale interleaved
                         per row; written by `indexer_k_quant_and_cache`,
                         read by `cp_gather_indexer_k_quant_cache`).
-          - HCA Main:   k2=1 entry × head_dim BF16
+          - HCA Main:   k2=2 entries × head_dim BF16
         """
         elem_bf16 = self._classical_dtype.itemsize
         csa_main_per_block = self.k1_csa * self.head_dim * elem_bf16
-        csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
+        if self._indexer_fp4:
+            # FP4: packed data (k_tiles*4*k1*16 bytes) + e8m0 scale
+            # (k_tiles*4*k1 bytes) per block, in two separate uint8 pools.
+            csa_idx_per_block = (
+                self._idx_k_tiles * 4 * self.k1_csa * 16
+                + self._idx_k_tiles * 4 * self.k1_csa
+            )
+        else:
+            csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
         hca_main_per_block = self.k2_hca * self.head_dim * elem_bf16
         return (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
@@ -471,6 +503,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         device = runner.device
         num_blocks = runner.num_physical_kvcache_blocks
         n_csa = len(self.csa_layers)
+        if self._indexer_fp4:
+            # FP4 indexer cache: packed E2M1 data + e8m0 scale in the
+            # `pa_mqa_logits_fp4` preshuffle layout. Two uint8 pools, both
+            # layer-major so each per-CSA slice `pool[pos]` is contiguous.
+            kt = self._idx_k_tiles
+            return {
+                "v4_csa_idx_kv": torch.zeros(
+                    (n_csa, num_blocks, kt, 4, self.k1_csa, 16),
+                    dtype=torch.uint8,
+                    device=device,
+                ),
+                "v4_csa_idx_kv_scale": torch.zeros(
+                    (n_csa, num_blocks, kt, 4, self.k1_csa),
+                    dtype=torch.uint8,
+                    device=device,
+                ),
+            }
         return {
             "v4_csa_idx_kv": torch.zeros(
                 (n_csa, num_blocks, self.k1_csa, self._aligned_index_dim),
@@ -641,6 +690,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             layer_id_from_prefix = int(module.prefix.split(".")[1])
             pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
             module.kv_cache = runner.v4_csa_idx_kv[pos]
+            if self._indexer_fp4:
+                # FP4: separate e8m0 scale pool consumed by the
+                # `pa_mqa_logits_fp4` kernels alongside `kv_cache`.
+                module.kv_scale = runner.v4_csa_idx_kv_scale[pos]
             return None
 
         if isinstance(module, _V4Compressor):
@@ -664,26 +717,32 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # needed; matches CSA Main's path).
                 idx_kv = runner.v4_csa_idx_kv[pos]
                 module.kv_cache = idx_kv
-                # FP8 quant path: bind a strided fp32 view of the per-block
-                # scale region. Layout per block: [k1*head_dim FP8 region]
-                # then [k1 fp32 scale region] then padding (cache_kernels.cu
-                # :1209-1239). Strides expressed in fp32 elements.
-                nb, k1, aligned_dim = idx_kv.shape
-                head_dim = self.index_head_dim
-                assert (
-                    k1 * aligned_dim
-                ) % 4 == 0, f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
-                block_fp32_stride = (k1 * aligned_dim) // 4
-                scale_fp32_offset = (k1 * head_dim) // 4
-                module.cache_scale = (
-                    idx_kv.view(torch.float32)
-                    .view(-1)
-                    .as_strided(
-                        size=(nb, k1),
-                        stride=(block_fp32_stride, 1),
-                        storage_offset=scale_fp32_offset,
+                if self._indexer_fp4:
+                    # FP4 path: bind the matching uint8 e8m0 scale pool.
+                    # `fused_compress_attn(quant_mode="fp4")` writes both in
+                    # the `pa_mqa_logits_fp4` preshuffle layout.
+                    module.cache_scale = runner.v4_csa_idx_kv_scale[pos]
+                else:
+                    # FP8 quant path: bind a strided fp32 view of the per-block
+                    # scale region. Layout per block: [k1*head_dim FP8 region]
+                    # then [k1 fp32 scale region] then padding (cache_kernels.cu
+                    # :1209-1239). Strides expressed in fp32 elements.
+                    nb, k1, aligned_dim = idx_kv.shape
+                    head_dim = self.index_head_dim
+                    assert (
+                        k1 * aligned_dim
+                    ) % 4 == 0, f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
+                    block_fp32_stride = (k1 * aligned_dim) // 4
+                    scale_fp32_offset = (k1 * head_dim) // 4
+                    module.cache_scale = (
+                        idx_kv.view(torch.float32)
+                        .view(-1)
+                        .as_strided(
+                            size=(nb, k1),
+                            stride=(block_fp32_stride, 1),
+                            storage_offset=scale_fp32_offset,
+                        )
                     )
-                )
             elif ratio == 4:
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_main_kv_state[pos]
@@ -723,6 +782,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         runner = self.model_runner
         if not hasattr(runner, "v4_unified_kv"):
+            return None
+
+        # `get_kv_transfer_tensors` is called unconditionally on every
+        # `allocate_kv_cache` (not just under disagg); returning None means
+        # "no transfer region." Only fail when disaggregated serving is
+        # actually enabled — the FP4 indexer's separate uint8 e8m0 scale pool
+        # is not yet described by the region map below, so a real transfer
+        # would move a half-described cache.
+        is_pd = bool(getattr(runner.config, "kv_transfer_config", None))
+        if self._indexer_fp4 and is_pd:
+            raise NotImplementedError(
+                "KV transfer (disaggregated serving) is not supported with "
+                "ATOM_V4_INDEXER_FP4=1 yet (FP4 indexer scale pool unmapped)."
+            )
+        if self._indexer_fp4:
+            # Single-node FP4 indexer: the FP8 region map below references the
+            # absent fp8 idx pool (`v4_csa_idx_kv` is uint8 here, no scale
+            # region). No transfer is active, so skip building regions.
             return None
 
         num_slots = runner.max_per_req_cache_slots
@@ -884,9 +961,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (cp_gather + fp8_mqa_logits + per-row prefill top-k), so they are
         # dead work on the decode hot path. ~50μs / fwd saved at bs=1024.
         if attn_metadata.state is AttnState.DECODE:
-            return {
+            meta = {
                 "n_committed_per_seq_gpu": attn_metadata.n_committed_csa_per_seq,
             }
+            if self._indexer_fp4:
+                # CUDAGraph-safe FP4 decode: precompute the persistent-grid
+                # schedule eagerly here (runs pre-replay during build()) into a
+                # fixed-address buffer. compute_varctx_schedule is pure
+                # on-device torch (no host sync) and emits a CONSTANT [P, 4]
+                # cta_info with total_ctas == P fixed — so the captured kernel
+                # reads fresh per-fwd contents from a stable pointer. next_n is
+                # the decode q-len bucket (1 + spec steps), fixed at capture.
+                from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import (
+                    compute_varctx_schedule,
+                )
+
+                next_n = max(1, int(attn_metadata.max_seqlen_q))
+                _, cta_info, _ = compute_varctx_schedule(
+                    attn_metadata.n_committed_csa_per_seq,
+                    self._fp4_decode_block_k,
+                    self._fp4_decode_parallel_unit_num,
+                    self.max_model_len_idx,
+                    next_n=next_n,
+                )
+                self._v4_fp4_cta_info.copy_(cta_info)
+                meta["fp4_cta_info"] = self._v4_fp4_cta_info
+                meta["fp4_total_ctas"] = self._fp4_decode_parallel_unit_num
+            return meta
 
         ratio = 4  # CSA — also referenced by `visible_end_gpu` below
         n_committed_per_seq = attn_metadata.n_committed_csa_per_seq_cpu[:bs]
@@ -946,7 +1047,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             seq_base_per_token_gpu + visible_end_gpu
         )  # [total_tokens] int32 — fp8_mqa_logits per-token end offset
 
-        return {
+        meta = {
             "total_committed": total_committed,
             "cu_committed_gpu": cu_committed_gpu,
             "n_committed_per_seq_gpu": n_committed_per_seq_gpu,  # int32, [bs]
@@ -958,7 +1059,54 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "seq_base_per_token_gpu": seq_base_per_token_gpu,
             "cu_starts_gpu": seq_base_per_token_gpu,  # alias for fp8_mqa_logits
             "cu_ends_gpu": cu_ends_gpu,
+            # Seq-local per-token causal upper bound — consumed by the FP4
+            # prefill path as `local_ends` (the FP4 kernel + top-k are
+            # seq-local, vs the FP8 path's GLOBAL packed cu_ends).
+            "visible_end_gpu": visible_end_gpu,
         }
+
+        if self._indexer_fp4:
+            # Precompute the FP4 prefill persistent-grid schedule here (instead
+            # of inside flydsl_pa_mqa_logits_fp4_prefill) so the kernel call is
+            # a pure launch. Prefill is eager (dynamic total_tokens), so this is
+            # a per-fwd tensor, not a fixed buffer. Inputs match the score
+            # call: row_to_batch = batch_id_per_token, local_starts = 0,
+            # local_ends = visible_end. block_k / parallel_unit_num MUST match
+            # the values passed to the kernel in `_score_topk_prefill_fp4`.
+            from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+                compute_prefill_schedule,
+            )
+
+            local_starts = torch.zeros_like(visible_end_gpu)
+            # parallel_unit_num is the persistent-grid CTA-count CAP; the
+            # schedule uses as many CTAs as it can up to this P (smaller P ->
+            # larger `safe` chunk-fold -> fewer, more-serial CTAs). It bounds
+            # TWO independent axes:
+            #   - rows: every (row, chunk-split) needs a slot. A prefill fwd has
+            #     one row PER QUERY TOKEN, so P must be >= prefill row count or
+            #     surplus rows are silently dropped (logits stay at the -inf/NaN
+            #     pre-fill -> wrong top-k). This is what `prefill_rows` covers.
+            #   - chunks (context length): the 512 floor keeps enough CTAs to
+            #     split a long context across the GPU even when rows are few
+            #     (matters for decode; harmless here where rows dominate).
+            # max() of both axes -> correct rows AND adequate chunk parallelism.
+            prefill_rows = int(visible_end_gpu.shape[0])
+            prefill_parallel_unit_num = max(
+                self._fp4_decode_parallel_unit_num, prefill_rows
+            )
+            _, prefill_cta_info, prefill_n_ctas = compute_prefill_schedule(
+                batch_id_per_token_gpu.to(torch.int32),
+                local_starts,
+                visible_end_gpu,
+                self._fp4_decode_block_k,
+                prefill_parallel_unit_num,
+                self.max_model_len_idx,
+            )
+            meta["fp4_prefill_cta_info"] = prefill_cta_info
+            meta["fp4_prefill_n_ctas"] = prefill_n_ctas
+            meta["fp4_prefill_local_starts"] = local_starts
+
+        return meta
 
     def prepare_mtp_decode(
         self,
@@ -2497,6 +2645,34 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # for cu_seq_lens. Also reused as cu_starts/cu_ends for fp8_mqa_logits
         # (which accepts both int32 and int64).
         bufs["v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
+        # FP4 indexer decode: fixed-address [P, 4] cta_info schedule buffer for
+        # the `pa_mqa_logits_fp4` kernel. The schedule (compute_varctx_schedule)
+        # is pure on-device torch (no host sync) and emits a CONSTANT-shape
+        # [P, 4] tensor with total_ctas == P fixed — so building it eagerly in
+        # `_build_v4_indexer_meta` (pre-replay) into this fixed address makes
+        # the captured kernel CUDAGraph-safe (grid = P is baked; only the buffer
+        # CONTENTS change per fwd, refreshed before each replay). Plain GPU
+        # tensor (not CpuGpuBuffer): no CPU mirror, written by a device kernel.
+        # P / block_k MUST match the values passed to flydsl_pa_mqa_logits_fp4.
+        if self._indexer_fp4:
+            # P = persistent-grid CTA-count CAP, bounding two axes (see the
+            # prefill build for the full note):
+            #   - rows: a decode fwd has one row per decode token (= bs*next_n),
+            #     so P must be >= max_decode_tokens (T_dec) or surplus rows are
+            #     silently dropped (logits stay at the -inf pre-fill -> wrong
+            #     top-k).
+            #   - chunks: the 512 floor keeps enough CTAs to split a long
+            #     context across the GPU when the batch is small (e.g. bs=8,
+            #     ctx=128k -> only 8 rows; without the floor the schedule would
+            #     fold the whole context onto 8 serial CTAs and starve the GPU).
+            # The fixed CG cta_info buffer below is sized to this same P.
+            self._fp4_decode_parallel_unit_num = max(
+                _FP4_DECODE_PARALLEL_UNIT_NUM, T_dec
+            )
+            self._fp4_decode_block_k = _FP4_DECODE_BLOCK_K
+            self._v4_fp4_cta_info = torch.zeros(
+                (self._fp4_decode_parallel_unit_num, 4), **i32
+            )
         # NOTE: decode-path `logits` ([T, max_model_len_idx] fp32) and
         # `topk_indices` ([T, index_topk] int32) are NOT pre-allocated —
         # they are write-once GPU scratch with no CPU mirror, allocated

@@ -104,8 +104,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
 #
-# Each V4 block (block_size=lcm(m, m')=128 original tokens) holds k_per_block
-# compressed entries per layer (k1=32 for CSA, k2=1 for HCA). Compressor.forward
+# Each V4 block (block_size=2*lcm(m, m')=256 original tokens) holds k_per_block
+# compressed entries per layer (k1=64 for CSA, k2=2 for HCA). Compressor.forward
 # scatters newly-compressed entries into block-table-indexed slots; sparse_attn
 # input gathers all committed entries up to the current position.
 #
@@ -114,10 +114,21 @@ logger = logging.getLogger(__name__)
 # per-seq dispatch.
 # ---------------------------------------------------------------------------
 
-# V4 paper §3.6.1: classical-KV block_size = lcm(m, m'). For V4-Pro / V4-Flash
-# this is lcm(4, 128) = 128 original tokens. Kept as a constant so Compressor
-# code does not need to import the builder.
-_V4_BLOCK_SIZE: int = 128
+# V4 paper §3.6.1: classical-KV block_size = a multiple of lcm(m, m'). For
+# V4-Pro / V4-Flash lcm(4, 128) = 128; we use 2*lcm = 256 original tokens so
+# k1_csa = 256/4 = 64 (the FP4 indexer kernels need kv_block_size=64). Kept as
+# a constant so Compressor code does not need to import the builder. MUST match
+# DeepseekV4AttentionMetadataBuilder.block_size and config.kv_cache_block_size.
+_V4_BLOCK_SIZE: int = 256
+
+# FP4 indexer decode (`pa_mqa_logits_fp4`) persistent-grid schedule params.
+# MUST match `_FP4_DECODE_PARALLEL_UNIT_NUM` / `_FP4_DECODE_BLOCK_K` in
+# deepseek_v4_attn.py — the metadata builder precomputes cta_info with those
+# values and `_score_topk_decode_fp4` passes block_k/parallel_unit_num so the
+# captured kernel's fixed grid (total_ctas == parallel_unit_num) and cta_info
+# layout agree.
+_V4_FP4_DECODE_PARALLEL_UNIT_NUM = 512
+_V4_FP4_DECODE_BLOCK_K = 256
 
 _V4_RMSNORM_BACKEND = os.environ.get("ATOM_V4_RMSNORM_BACKEND", "triton")
 _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
@@ -1016,6 +1027,13 @@ class Compressor(nn.Module):
         # builder when the cache is FP8 (strided fp32 view of the per-block
         # scale region).
         is_quant = self.kv_cache is not None and self.kv_cache.dtype != torch.bfloat16
+        # FP4 indexer cache is uint8 (packed E2M1 + e8m0 scale); FP8 indexer is
+        # torch.float8. CSA/HCA Main stay BF16 (is_quant=False).
+        _quant_mode = (
+            "fp4"
+            if (is_quant and self.kv_cache.dtype == torch.uint8)
+            else ("fp8" if is_quant else "none")
+        )
         # Skip the kernel's cache scatter during warmup (kv_cache/block_tables
         # not yet bound).
         if block_tables is None or self.kv_cache is None:
@@ -1047,7 +1065,12 @@ class Compressor(nn.Module):
             cache_scale=self.cache_scale if is_quant else None,
             use_ue8m0=(self.scale_fmt == "ue8m0"),
             preshuffle=True,
-            fp8_max=(torch.finfo(self.kv_cache.dtype).max if is_quant else None),
+            fp8_max=(
+                torch.finfo(self.kv_cache.dtype).max
+                if (is_quant and _quant_mode == "fp8")
+                else None
+            ),
+            quant_mode=_quant_mode,
         )
         update_compressor_states(
             kv,
@@ -1189,6 +1212,49 @@ class Indexer(nn.Module):
         # the per-(token, head) fp8 block scale (head_dim == group => one/row).
         # `_weights_scale` precomputed in __init__.
         # self.rotary_emb(positions, q[..., -rd:]); q = rotate_activation(q)
+        if self.kv_cache is not None and self.kv_cache.dtype == torch.uint8:
+            # ── FP4 indexer path ──────────────────────────────────────────
+            # Q is FP4-quantized (E2M1 + per-group(32) e8m0) in the
+            # `pa_mqa_logits_fp4` preshuffle layout. The MQA-logits kernel
+            # dequants Q internally via e8m0, so `weights` carry ONLY the
+            # static `_weights_scale` (no per-row q_scale premultiply).
+            d_packed = self.head_dim // 2
+            k_tiles = self.head_dim // 128
+            qs_pad = ((self.n_heads // 16 + 3) // 4) * 4
+            q_fp4 = torch.empty(
+                (total_tokens, self.n_heads, d_packed),
+                dtype=torch.uint8,
+                device=q.device,
+            )
+            q_scale = torch.empty(
+                (total_tokens, k_tiles, 4, 16, qs_pad),
+                dtype=torch.uint8,
+                device=q.device,
+            )
+            rope_rotate_activation(
+                q_fp4.view(dtypes.fp4x2),
+                q,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                positions,
+                rd,
+                scale=q_scale,
+                group_size=32,
+                shuffle_scale=True,
+            )
+            # weights_proj output (bf16) goes straight to the MQA-logits kernel:
+            # it loads weights as bf16 and applies the static `_weights_scale`
+            # internally (passed as `weight_scale`), so no float cast, no
+            # q_scale premultiply (kernel dequants Q via e8m0), no pre-scale
+            # launch.
+            weights = self.weights_proj(x_full)
+            # Stash q_scale for the opaque dispatch op (read synchronously by
+            # `indexer_score_topk` on this same module); q_fp4 rides the q arg.
+            self._q_scale_fp4 = q_scale
+            return torch.ops.aiter.indexer_score_topk(
+                q_fp4, weights, self.prefix, self.index_topk
+            )  # [total_tokens, index_topk] int32
+
         q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
         q_scale = torch.empty(
             (total_tokens * self.n_heads, self.head_dim // self._q_quant_group),
@@ -1202,7 +1268,7 @@ class Indexer(nn.Module):
             self.rotary_emb.sin_cache,
             positions,
             rd,
-            out_scale=q_scale,
+            scale=q_scale,
             group_size=self._q_quant_group,
         )
         q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
@@ -1240,6 +1306,20 @@ class Indexer(nn.Module):
         fc = get_forward_context()
         indexer_meta = fc.attn_metadata.indexer_meta
         block_tables = fc.attn_metadata.block_tables  # [bs, max_blocks_per_seq] int32
+
+        # FP4 indexer cache (uint8) → FP4 paged MQA-logits kernels. The FP8
+        # cache (torch.float8) stays on the existing cp_gather/deepgemm paths.
+        # q here is actually q_fp4; the paired q_scale was stashed on `self`
+        # by `forward_batched` (read synchronously, same fwd).
+        if self.kv_cache is not None and self.kv_cache.dtype == torch.uint8:
+            q_scale = self._q_scale_fp4
+            if fc.context.is_prefill:
+                return self._score_topk_prefill_fp4(
+                    q_fp8, q_scale, block_tables, weights, indexer_meta, topk
+                )
+            return self._score_topk_decode_fp4(
+                q_fp8, q_scale, block_tables, weights, indexer_meta, topk
+            )
 
         # No host-side `if total_committed == 0: return torch.full(-1)`
         # short-circuit — that would freeze a Python branch into the
@@ -1299,6 +1379,7 @@ class Indexer(nn.Module):
             weights=weights,
             cu_starts=cu_starts,
             cu_ends=cu_ends,
+            clean_logits=False,
         )  # [total_tokens, total_committed] fp32; outside [start,end) is -inf
 
         # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
@@ -1394,7 +1475,7 @@ class Indexer(nn.Module):
             n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
             block_tables,
             self._max_model_len_idx,
-            KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
+            KVBlockSize=self.kv_cache.size(1),  # k1_csa = 64
             Preshuffle=True,
         )
         # Per-fwd write-once int32 scratch. Kernel writes exactly `index_topk`
@@ -1402,6 +1483,201 @@ class Indexer(nn.Module):
         # for the same reason as `logits` above.
         topk_local = torch.empty(
             total_tokens, self.index_topk, dtype=torch.int32, device=q_fp8.device
+        )
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            n_committed_per_seq_gpu,
+            topk_local,
+            total_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
+        )
+        return topk_local  # [total_tokens, index_topk] int32, raw seq-local
+
+    # ── FP4 indexer scoring (gfx950) ──────────────────────────────────────
+    # Both paths read the paged FP4 indexer cache directly via `block_tables`
+    # (no cp_gather / deepgemm); Q is FP4 (`q_fp4`/`q_scale`). The flydsl
+    # kernels emit SEQ-LOCAL logits, so prefill needs no `seq_base` subtract
+    # (unlike the FP8 GLOBAL-output path). Decode is CUDAGraph-safe: the
+    # persistent-grid schedule (cta_info) is precomputed by the metadata
+    # builder into a fixed buffer and the grid (total_ctas) is fixed at
+    # parallel_unit_num. Prefill stays eager (dynamic total_tokens).
+
+    def _score_topk_prefill_fp4(
+        self,
+        q_fp4: torch.Tensor,  # [total_tokens, n_heads, head_dim//2] uint8
+        q_scale: torch.Tensor,  # [total_tokens, K_TILES, 4, 16, QS_PAD] uint8
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """Ragged-prefill FP4: `flydsl_pa_mqa_logits_fp4_prefill` reads the
+        paged FP4 cache per query row over its seq-local window
+        `[0, visible_end)`. Output logits are seq-local, so the prefill top-k
+        indices are returned directly. Eager-only (dynamic total_tokens).
+
+        The persistent-grid schedule (cta_info/n_ctas) is precomputed by the
+        metadata builder (`_build_v4_indexer_meta`) and passed in, so the kernel
+        call is a pure launch — block_k/parallel_unit_num here MUST match the
+        values the schedule was built with (`_V4_FP4_DECODE_*`)."""
+        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+            flydsl_pa_mqa_logits_fp4_prefill,
+        )
+
+        device = q_fp4.device
+        total_tokens = q_fp4.size(0)
+        row_to_batch = indexer_meta["batch_id_per_token_gpu"].to(torch.int32)
+        local_ends = indexer_meta["visible_end_gpu"]  # [total_tokens] int32
+        local_starts = indexer_meta["fp4_prefill_local_starts"]
+        cta_info = indexer_meta["fp4_prefill_cta_info"]
+        n_ctas = indexer_meta["fp4_prefill_n_ctas"]
+        max_seq_len = self._max_model_len_idx
+        kv_block_size = self.kv_cache.size(3)  # k1_csa = 64
+        # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
+        # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64
+        # (TILES_PER_BLOCK = 64/MFMA_N(16) = 4 = NTPW). block_size=256 → k1_csa=64
+        # satisfies this; guard so an unsupported block size fails loudly here
+        # instead of reading scales with the wrong interleave.
+        assert kv_block_size == 64, (
+            f"FP4 indexer requires kv_block_size (k1_csa) == 64 for the packed "
+            f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
+            f"block_size=256 (k1_csa=block_size//4)."
+        )
+
+        # Write-once GPU scratch, NOT -inf-filled. The kernel writes every
+        # column in `[local_start, local_end)` for each row, and
+        # `top_k_per_row_prefill` scans only `[rowStarts, rowEnds)` =
+        # `[0, visible_end)` per row — exactly the written range. Cells past
+        # `local_end` are never read, so a `torch.full(-inf)` pre-fill (the
+        # kernel's default when `out=None`) is pure waste: at width
+        # `max_model_len_idx` it was ~290μs × (#CSA layers) of FillFunc before
+        # a ~6μs mqa kernel. Mirrors the FP8 decode path's `torch.empty` logits.
+        logits = torch.empty(
+            total_tokens, max_seq_len, dtype=torch.float32, device=device
+        )
+        flydsl_pa_mqa_logits_fp4_prefill(
+            q_fp4,
+            q_scale,
+            self.kv_cache,
+            self.kv_scale,
+            block_tables,
+            weights,
+            row_to_batch,
+            local_starts,
+            local_ends,
+            max_seq_len,
+            weight_scale=self._weights_scale,
+            block_k=_V4_FP4_DECODE_BLOCK_K,
+            kv_block_size=kv_block_size,
+            parallel_unit_num=_V4_FP4_DECODE_PARALLEL_UNIT_NUM,
+            out=logits,
+            cta_info=cta_info,
+            n_ctas=n_ctas,
+        )  # [total_tokens, max_seq_len] fp32, seq-local; only [0,end) written
+
+        topk_local = torch.empty(
+            (total_tokens, topk), dtype=torch.int32, device=device
+        )
+        top_k_per_row_prefill(
+            logits,
+            local_starts,
+            local_ends,
+            topk_local,
+            None,
+            total_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
+        )
+        return topk_local  # [total_tokens, topk] int32, raw seq-local
+
+    def _score_topk_decode_fp4(
+        self,
+        q_fp4: torch.Tensor,  # [total_tokens, n_heads, head_dim//2] uint8
+        q_scale: torch.Tensor,  # [total_tokens, K_TILES, 4, 16, QS_PAD] uint8
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """Decode/varctx FP4: `flydsl_pa_mqa_logits_fp4` reads the paged FP4
+        cache directly over each seq's `[0, n_committed)` window. Output is
+        seq-local `[bs*next_n, max_model_len_idx]`, consumed by
+        `top_k_per_row_decode` exactly like the FP8 deepgemm path.
+
+        CUDAGraph-safe: the persistent-grid schedule (`cta_info`/`total_ctas`)
+        is precomputed eagerly by `_build_v4_indexer_meta` into a fixed-address
+        buffer (pre-replay) and passed in here, so the captured kernel uses a
+        fixed grid (total_ctas == parallel_unit_num) reading fresh per-fwd
+        schedule contents from a stable pointer — no host sync, no
+        data-dependent grid. `block_k`/`parallel_unit_num` must match the
+        values the schedule was built with (see `_FP4_DECODE_*` constants).
+        """
+        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import (
+            flydsl_pa_mqa_logits_fp4,
+        )
+
+        fc = get_forward_context()
+        total_tokens = q_fp4.size(0)
+        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
+        next_n = max(1, int(fc.attn_metadata.max_seqlen_q))
+        bs = total_tokens // next_n
+        k_tiles = self.head_dim // 128
+        qs_pad = q_scale.shape[-1]
+        q_4d = q_fp4.view(bs, next_n, self.n_heads, self.head_dim // 2)
+        q_scale_6d = q_scale.view(bs, next_n, k_tiles, 4, 16, qs_pad)
+        max_seq_len = self._max_model_len_idx
+        kv_block_size = self.kv_cache.size(3)  # k1_csa = 64
+        # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
+        # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64
+        # (TILES_PER_BLOCK = 64/MFMA_N(16) = 4 = NTPW). block_size=256 → k1_csa=64
+        # satisfies this; guard so an unsupported block size fails loudly here
+        # instead of reading scales with the wrong interleave.
+        assert kv_block_size == 64, (
+            f"FP4 indexer requires kv_block_size (k1_csa) == 64 for the packed "
+            f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
+            f"block_size=256 (k1_csa=block_size//4)."
+        )
+
+        # Precomputed schedule from the metadata builder (always present on the
+        # FP4 decode path). When `cta_info` is passed the kernel skips its
+        # internal compute_varctx_schedule AND its out.fill_(-inf).
+        cta_info = indexer_meta["fp4_cta_info"]
+        total_ctas = indexer_meta["fp4_total_ctas"]
+        # Write-once GPU scratch, NOT -inf-filled (mirrors the FP8 decode path).
+        # The kernel writes every column in `[0, context_len)` per row and
+        # `top_k_per_row_decode` bounds each row by `n_committed_per_seq` (==
+        # context_len) — so cells past it are never read. A `torch.full(-inf)`
+        # pre-fill would be wasted ~290μs FillFunc work at width
+        # `max_model_len_idx`. CG-safe: torch.empty lands in the graph's private
+        # pool at a stable address across replays at this captured shape.
+        logits = torch.empty(
+            total_tokens, max_seq_len, dtype=torch.float32, device=q_fp4.device
+        )
+        flydsl_pa_mqa_logits_fp4(
+            q_4d,
+            q_scale_6d,
+            self.kv_cache,
+            self.kv_scale,
+            block_tables,
+            weights,
+            n_committed_per_seq_gpu,
+            max_seq_len,
+            weight_scale=self._weights_scale,
+            next_n=next_n,
+            block_k=_V4_FP4_DECODE_BLOCK_K,
+            kv_block_size=kv_block_size,
+            parallel_unit_num=_V4_FP4_DECODE_PARALLEL_UNIT_NUM,
+            out=logits,
+            cta_info=cta_info,
+            total_ctas=total_ctas,
+        )  # [bs*next_n, max_seq_len] fp32, seq-local
+
+        topk_local = torch.empty(
+            total_tokens, self.index_topk, dtype=torch.int32, device=q_fp4.device
         )
         top_k_per_row_decode(
             logits,
@@ -1970,7 +2246,7 @@ class DeepseekV4Attention(nn.Module):
             to csa_translate_pack so the kernel can compute per-token
             `valid_k` inline.
         """
-        # csa_block_capacity = block_size // ratio = 128 // 4 = 32.
+        # csa_block_capacity = block_size // ratio = 256 // 4 = 64.
         # Derived from constants (not `compressor.kv_cache.size(1)`) because
         # warmup runs before `build_kv_cache_tensor` binds compressor.kv_cache,
         # and this method now fires for both decode and prefill (including
