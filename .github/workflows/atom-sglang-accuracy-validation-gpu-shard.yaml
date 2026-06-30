@@ -353,6 +353,18 @@ jobs:
           STREAM_SGLANG_LOGS: "1"
           LM_EVAL_TASK: "gsm8k"
         run: |
+          set -euo pipefail
+
+          # Avoid long-running podman/docker exec sessions waiting on runtime
+          # exit files. Run the accuracy driver inside the container and poll it
+          # from short host-side exec calls.
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '
+            rm -f \
+              /tmp/atom_sglang_accuracy_driver.done \
+              /tmp/atom_sglang_accuracy_driver.exit \
+              /tmp/atom_sglang_accuracy_driver.log
+          '
+
           $CONTAINER_ENGINE exec \
             -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
             -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
@@ -365,10 +377,53 @@ jobs:
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
-            "$CONTAINER_NAME" bash -lc "
-              set -euo pipefail
-              bash .github/scripts/atom_sglang_test.sh accuracy
-            "
+            "$CONTAINER_NAME" bash -lc '
+              (
+                set +e
+                bash .github/scripts/atom_sglang_test.sh accuracy > /tmp/atom_sglang_accuracy_driver.log 2>&1
+                rc=$?
+                echo "$rc" > /tmp/atom_sglang_accuracy_driver.exit
+                touch /tmp/atom_sglang_accuracy_driver.done
+              ) &
+              echo "Started SGLANG accuracy driver pid=$!"
+            '
+
+          last_driver_log_line=0
+          emit_driver_logs() {
+            local current_line_count
+            current_line_count="$(
+              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc \
+                'if [ -f /tmp/atom_sglang_accuracy_driver.log ]; then wc -l < /tmp/atom_sglang_accuracy_driver.log; else echo 0; fi' \
+                2>/dev/null || echo 0
+            )"
+            current_line_count=${current_line_count//$'\r'/}
+            if [ "${current_line_count:-0}" -le "${last_driver_log_line}" ]; then
+              return 0
+            fi
+
+            echo ""
+            echo "========== New SGLANG accuracy driver output =========="
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc \
+              "sed -n '$((last_driver_log_line + 1)),${current_line_count}p' /tmp/atom_sglang_accuracy_driver.log" || true
+            last_driver_log_line=${current_line_count}
+          }
+
+          echo "Waiting for SGLANG accuracy driver to finish..."
+          while true; do
+            if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '[ -f /tmp/atom_sglang_accuracy_driver.done ]'; then
+              emit_driver_logs
+              break
+            fi
+            emit_driver_logs
+            sleep 60
+          done
+
+          accuracy_rc="$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'cat /tmp/atom_sglang_accuracy_driver.exit')"
+          if [ "${accuracy_rc}" != "0" ]; then
+            echo "SGLANG accuracy driver failed with exit code ${accuracy_rc}"
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/atom_sglang_accuracy_driver.log 2>/dev/null || true'
+            exit "${accuracy_rc}"
+          fi
 
       - name: Check SGLANG accuracy test results
         if: success()
