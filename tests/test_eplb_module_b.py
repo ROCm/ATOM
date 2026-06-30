@@ -44,8 +44,11 @@ def test_manager_steps_with_dummy_and_triggers_by_interval(monkeypatch):
         on_rebalance=lambda: triggered.__setitem__("n", triggered["n"] + 1),
     )
 
+    # interval=3: call 1-3 consume scheduler yields; rebalance runs on call 4.
     manager.on_forward_pass_end(is_dummy_run=False)
     manager.on_forward_pass_end(is_dummy_run=True)
+    manager.on_forward_pass_end(is_dummy_run=False)
+    assert triggered["n"] == 0
     manager.on_forward_pass_end(is_dummy_run=False)
     assert triggered["n"] == 1
     assert manager.rebalance_count == 1

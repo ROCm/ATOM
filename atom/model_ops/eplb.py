@@ -12,6 +12,250 @@ import logging
 
 logger = logging.getLogger("atom")
 
+
+def balanced_packing(
+    weight: torch.Tensor, num_packs: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack weighted items into equal-size packs with greedy LPT.
+
+    Args:
+        weight: [num_layers, num_items], non-negative.
+        num_packs: number of packs.
+
+    Returns:
+        pack_index: [num_layers, num_items] int32
+        rank_in_pack: [num_layers, num_items] int32
+    """
+    assert weight.dim() == 2, "weight must be rank-2 [num_layers, num_items]"
+    assert num_packs > 0, "num_packs must be > 0"
+    num_layers, num_items = weight.shape
+    assert (
+        num_items % num_packs == 0
+    ), "num_items must be divisible by num_packs for equal-cardinality packing"
+    cap = num_items // num_packs
+    pack_index = torch.empty_like(weight, dtype=torch.int32)
+    rank_in_pack = torch.empty_like(weight, dtype=torch.int32)
+    for l in range(num_layers):
+        # Descending by weight, tie-break by original index (stable argsort).
+        order = torch.argsort(weight[l], descending=True, stable=True).tolist()
+        loads = [0.0] * num_packs
+        counts = [0] * num_packs
+        for item in order:
+            candidates = [p for p in range(num_packs) if counts[p] < cap]
+            # Deterministic tie-break: lower load, then lower count, then lower pack id.
+            best = min(candidates, key=lambda p: (loads[p], counts[p], p))
+            pack_index[l, item] = best
+            rank_in_pack[l, item] = counts[best]
+            counts[best] += 1
+            loads[best] += float(weight[l, item].item())
+    return pack_index, rank_in_pack
+
+
+def replicate_experts(
+    weight: torch.Tensor, num_physical: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Greedy replication by max(weight / replica_count).
+
+    Args:
+        weight: [num_layers, num_logical]
+        num_physical: total physical experts per layer.
+
+    Returns:
+        physical_to_logical: [num_layers, num_physical] int32
+        physical_rank: [num_layers, num_physical] int32
+        logical_replica_count(logcnt): [num_layers, num_logical] int32
+    """
+    assert weight.dim() == 2, "weight must be rank-2 [num_layers, num_logical]"
+    num_layers, num_logical = weight.shape
+    assert num_logical > 0, "num_logical must be > 0"
+    assert (
+        num_physical >= num_logical
+    ), "num_physical must be >= num_logical for replication"
+    logcnt = torch.ones((num_layers, num_logical), dtype=torch.int32, device=weight.device)
+    extra = num_physical - num_logical
+    if extra > 0:
+        weight_f = weight.to(torch.float32)
+        for l in range(num_layers):
+            for _ in range(extra):
+                score = weight_f[l] / logcnt[l].to(torch.float32)
+                target = int(torch.argmax(score).item())
+                logcnt[l, target] += 1
+    phy2log = torch.empty((num_layers, num_physical), dtype=torch.int32, device=weight.device)
+    phyrank = torch.empty((num_layers, num_physical), dtype=torch.int32, device=weight.device)
+    for l in range(num_layers):
+        k = 0
+        for e in range(num_logical):
+            cnt = int(logcnt[l, e].item())
+            for r in range(cnt):
+                phy2log[l, k] = e
+                phyrank[l, k] = r
+                k += 1
+        assert k == num_physical
+    return phy2log, phyrank, logcnt
+
+
+def _build_logical_to_physical_map(
+    physical_to_logical: torch.Tensor,
+    physical_rank: torch.Tensor,
+    logcnt: torch.Tensor,
+) -> torch.Tensor:
+    """Build padded logical_to_physical map from p2l + rank + logcnt."""
+    num_layers, num_physical = physical_to_logical.shape
+    assert (
+        physical_rank.shape == physical_to_logical.shape
+    ), "physical_rank shape must match physical_to_logical"
+    _, num_logical = logcnt.shape
+    cur = int(logcnt.max().item())
+    out = torch.full(
+        (num_layers, num_logical, cur),
+        -1,
+        dtype=torch.int32,
+        device=physical_to_logical.device,
+    )
+    for l in range(num_layers):
+        for p in range(num_physical):
+            e = int(physical_to_logical[l, p].item())
+            rank = int(physical_rank[l, p].item())
+            max_rank = int(logcnt[l, e].item())
+            assert 0 <= rank < max_rank, "physical rank out of logical expert range"
+            assert out[l, e, rank] == -1, "duplicate physical rank for logical expert"
+            out[l, e, rank] = p
+        for e in range(num_logical):
+            need = int(logcnt[l, e].item())
+            if need == 0:
+                continue
+            got = int((out[l, e, :need] >= 0).sum().item())
+            assert got == need, "logical expert has missing physical ranks"
+    return out
+
+
+def _rebalance_single_layer_global(
+    weight_l: torch.Tensor, num_physical: int, num_gpus: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (physical_to_logical[num_physical], phyrank[num_physical], logcnt[num_logical])."""
+    num_logical = weight_l.numel()
+    phy2log, phyrank, logcnt = replicate_experts(
+        weight_l.view(1, num_logical), num_physical
+    )
+    phy2log_l = phy2log[0].clone()
+    phyrank_l = phyrank[0].clone()
+    logcnt_l = logcnt[0].clone()
+    # Step-3 pack physical slots onto GPUs (equal cardinality per GPU).
+    per_phy_load = weight_l.to(torch.float32)[phy2log_l] / logcnt_l[phy2log_l].to(torch.float32)
+    pack_idx, rank_in_pack = balanced_packing(per_phy_load.view(1, -1), num_gpus)
+    pack_idx = pack_idx[0].to(torch.int64)
+    rank_in_pack = rank_in_pack[0].to(torch.int64)
+    phy_per_gpu = num_physical // num_gpus
+    new_phy_index = pack_idx * phy_per_gpu + rank_in_pack
+    reordered = torch.empty_like(phy2log_l)
+    reordered_rank = torch.empty_like(phyrank_l)
+    reordered[new_phy_index] = phy2log_l
+    reordered_rank[new_phy_index] = phyrank_l
+    return reordered, reordered_rank, logcnt_l
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    *,
+    num_physical: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+    enable_hierarchical: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Module-C entrypoint.
+
+    Returns:
+        physical_to_logical_map: [num_layers, num_physical] int32
+        logical_to_physical_map: [num_layers, num_logical, cur] int32 (cur=max(logcnt))
+        logcnt: [num_layers, num_logical] int32
+    """
+    assert weight.dim() == 2, "weight must be rank-2 [num_layers, num_logical]"
+    num_layers, num_logical = weight.shape
+    assert num_layers > 0 and num_logical > 0
+    assert num_groups > 0 and num_nodes > 0 and num_gpus > 0
+    assert num_logical % num_groups == 0, "num_logical must be divisible by num_groups"
+    assert num_groups % num_nodes == 0, "num_groups must be divisible by num_nodes"
+    assert num_gpus % num_nodes == 0, "num_gpus must be divisible by num_nodes"
+    assert num_physical % num_gpus == 0, "num_physical must be divisible by num_gpus"
+    assert num_physical >= num_logical
+
+    p2l = torch.empty((num_layers, num_physical), dtype=torch.int32, device=weight.device)
+    phyrank = torch.empty((num_layers, num_physical), dtype=torch.int32, device=weight.device)
+    logcnt = torch.zeros((num_layers, num_logical), dtype=torch.int32, device=weight.device)
+
+    if not enable_hierarchical or num_groups == 1 or num_nodes == 1:
+        for l in range(num_layers):
+            p2l_l, rank_l, cnt_l = _rebalance_single_layer_global(
+                weight[l], num_physical, num_gpus
+            )
+            p2l[l] = p2l_l
+            phyrank[l] = rank_l
+            logcnt[l] = cnt_l
+        l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+        return p2l, l2p, logcnt
+
+    # Hierarchical path: group->node assignment, then node-local rebalance.
+    group_size = num_logical // num_groups
+    groups_per_node = num_groups // num_nodes
+    gpus_per_node = num_gpus // num_nodes
+    phy_per_node = num_physical // num_nodes
+    phy_per_gpu = num_physical // num_gpus
+
+    for l in range(num_layers):
+        group_weight = weight[l].view(num_groups, group_size).sum(dim=1).view(1, -1)
+        group_to_node, _ = balanced_packing(group_weight, num_nodes)
+        group_to_node = group_to_node[0]
+
+        logical_ids_per_node = []
+        for n in range(num_nodes):
+            node_groups = [
+                g for g in range(num_groups) if int(group_to_node[g].item()) == n
+            ]
+            # determinism in case of equal packing loads
+            node_groups.sort()
+            assert len(node_groups) == groups_per_node
+            node_logical = []
+            for g in node_groups:
+                start = g * group_size
+                node_logical.extend(range(start, start + group_size))
+            logical_ids_per_node.append(node_logical)
+
+        p2l_l = torch.empty((num_physical,), dtype=torch.int32, device=weight.device)
+        phyrank_l = torch.empty((num_physical,), dtype=torch.int32, device=weight.device)
+        cnt_l = torch.zeros((num_logical,), dtype=torch.int32, device=weight.device)
+
+        for node_id in range(num_nodes):
+            node_logical_ids = logical_ids_per_node[node_id]
+            node_weight = weight[l, node_logical_ids]
+            node_p2l_local, node_rank_local, node_cnt_local = _rebalance_single_layer_global(
+                node_weight, phy_per_node, gpus_per_node
+            )
+            node_global_logical = torch.tensor(
+                node_logical_ids, dtype=torch.int64, device=weight.device
+            )[node_p2l_local.to(torch.int64)].to(torch.int32)
+            for e_local, e_global in enumerate(node_logical_ids):
+                cnt_l[e_global] = node_cnt_local[e_local]
+
+            # Map node-local physical index to global physical index.
+            local_gpu = torch.div(
+                torch.arange(phy_per_node, device=weight.device), phy_per_gpu, rounding_mode="floor"
+            )
+            local_rank = torch.remainder(
+                torch.arange(phy_per_node, device=weight.device), phy_per_gpu
+            )
+            global_gpu = node_id * gpus_per_node + local_gpu
+            global_phy = global_gpu * phy_per_gpu + local_rank
+            p2l_l[global_phy.to(torch.int64)] = node_global_logical
+            phyrank_l[global_phy.to(torch.int64)] = node_rank_local
+
+        p2l[l] = p2l_l
+        phyrank[l] = phyrank_l
+        logcnt[l] = cnt_l
+
+    l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+    return p2l, l2p, logcnt
+
 def count_physical_load(
     topk_physical: torch.Tensor, num_physical: int
 ) -> torch.Tensor:
