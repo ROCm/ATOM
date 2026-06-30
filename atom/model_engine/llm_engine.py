@@ -79,20 +79,16 @@ class LLMEngine:
                 "them (use -tp N -pcp M without DP-attention, or -dp N "
                 "--enable-dp-attention without -pcp)."
             )
-        # PCP and TBO (two-batch overlap) are not yet compatible: TBO's
-        # UBatchWrapper calls ForCausalLM.forward once per micro-batch with a
-        # sub-slice of tokens, and PCP stripe-splits at that entry — so each
-        # ubatch would be split independently (double-split), giving each rank
-        # ~1/(2*pcp) tokens and a corrupted all-gather restore.
+        # PCP + TBO prefill: supported via coordinated splitting (P1).
+        # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
+        # per-request ubatch split are unverified).
         if config.prefill_context_parallel_size > 1 and config.enable_tbo:
-            raise ValueError(
-                "prefill_context_parallel_size > 1 (-pcp) combined with "
-                "--enable-tbo is not supported yet (may be supported in a "
-                "future release): TBO calls ForCausalLM.forward per micro-batch "
-                "with a token sub-slice, so PCP would stripe-split each ubatch "
-                "independently (double-split) and corrupt the output. For now, "
-                "disable one of them."
-            )
+            if config.enable_tbo_decode:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) combined with "
+                    "--enable-tbo all (decode TBO) is not supported yet. "
+                    "Use --enable-tbo (prefill only) with -pcp."
+                )
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size

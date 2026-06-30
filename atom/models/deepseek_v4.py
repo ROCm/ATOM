@@ -1006,7 +1006,17 @@ class Compressor(nn.Module):
         # state_slot_mapping passed to fused_compress_attn are full-sequence
         # (never split in the builder), so they match the gathered `combined`.
         if _pcp_active():
+            from atom.utils.tbo.ubatching import (
+                tbo_active as _tbo_active,
+                tbo_yield_and_switch_from_compute_to_comm,
+                tbo_switch_to_compute_sync,
+            )
+            _tbo = _tbo_active()
+            if _tbo:
+                tbo_yield_and_switch_from_compute_to_comm()
             combined = pcp_allgather_rerange(combined, get_pcp_world_size())
+            if _tbo:
+                tbo_switch_to_compute_sync()
         # TBO decode: copy `combined` into a fixed-address buffer so CUDAGraph
         # capture/replay see a stable pointer (allocator may re-place it).
         from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
@@ -1927,6 +1937,14 @@ class DeepseekV4Attention(nn.Module):
             pcp_on = _pcp_active()
             if pcp_on:
                 pcp_ws = get_pcp_world_size()
+                from atom.utils.tbo.ubatching import (
+                    tbo_active as _tbo_active_attn,
+                    tbo_yield_and_switch_from_compute_to_comm,
+                    tbo_switch_to_compute_sync,
+                )
+                _tbo_attn = _tbo_active_attn()
+                if _tbo_attn:
+                    tbo_yield_and_switch_from_compute_to_comm()
                 kv_full = pcp_allgather_rerange(kv, pcp_ws)
                 # positions must match kv_full's full-sequence coords for the
                 # swa_write ring addressing (`positions[src] % cache_size`).
@@ -1935,6 +1953,8 @@ class DeepseekV4Attention(nn.Module):
                 # the same rerange used for kv (NOT fc.context.positions, which
                 # the builder reindexed to 1/W).
                 positions_full = pcp_allgather_rerange(positions, pcp_ws)
+                if _tbo_attn:
+                    tbo_switch_to_compute_sync()
             else:
                 kv_full = kv
                 positions_full = positions
@@ -2159,10 +2179,12 @@ class MoE(nn.Module):
     `FusedMoE.select_experts(scoring_func="sqrtsoftplus", e_score_correction_bias=...)`,
     which we extended in atom/model_ops/moe.py to add the V4 path.
 
-    Hash routing for `layer_id < n_hash_layers` (first 3 V4 layers) is NOT yet
-    wired through FusedMoE — the `tid2eid` buffer is declared so weight loading
-    completes, but inference uses the standard sqrtsoftplus path. Hash layers
-    will produce incorrect routing; correct hash routing lands in PR3+.
+    Hash routing for `layer_id < n_hash_layers` (first 3 V4 layers) is wired
+    through FusedMoE via the `custom_routing_function` hook: hash layers load a
+    `tid2eid` table (token-id -> expert-id) instead of `gate.bias`, and
+    `select_experts` gives `custom_routing_function` precedence over the
+    standard sqrtsoftplus path. Expert *selection* comes from `tid2eid[input_ids]`
+    while expert *weights* still use sqrtsoftplus(gate_logits). Accuracy verified.
     """
 
     def __init__(
@@ -2835,10 +2857,27 @@ def moe_pcp_merge_forward(
     ws = get_pcp_world_size()
     x = hidden_states
     if do_prefill:
+        from atom.utils.tbo.ubatching import (
+            tbo_active as _tbo_active,
+            tbo_yield_and_switch_from_compute_to_comm,
+            tbo_switch_to_compute_sync,
+        )
+        _tbo = _tbo_active()
+        # allgather: when TBO is active, yield to the partner ubatch so its
+        # compute overlaps this collective on the comm stream (P2 overlap).
+        if _tbo:
+            tbo_yield_and_switch_from_compute_to_comm()
         x = pcp_allgather_rankmajor(x, ws)  # [1/W,dim] -> [full,dim]
+        if _tbo:
+            tbo_switch_to_compute_sync()
     x = _run_moe(moe, x)
     if do_prefill:
+        # reduce_scatter: same yield pattern.
+        if _tbo:
+            tbo_yield_and_switch_from_compute_to_comm()
         x = pcp_reduce_scatter(x, ws)  # [full,dim] -> [1/W,dim]
+        if _tbo:
+            tbo_switch_to_compute_sync()
     elif do_decode:
         x = pcp_all_reduce(x)  # sum pcp half (decode tokens are pcp-redundant)
     return x
@@ -3139,22 +3178,30 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
         full_padded_ids = None
         if use_pcp:
+            from atom.utils.tbo.ubatching import tbo_active as _tbo_active
             pcp_size = get_pcp_world_size()
-            n_global = input_ids.shape[0]
-            pad = pcp_pad_len(n_global, pcp_size) - n_global
-            if pad > 0:
-                input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
-                positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
-            input_ids = pcp_round_robin_split(input_ids, pcp_size)
-            positions = pcp_round_robin_split(positions, pcp_size)
-            # Scheme B: each Block rank-major all-gathers hidden before MoE
-            # (pcp_allgather_rankmajor = plain all_gather(dim=0), RANK-MAJOR
-            # order: [rank0's stripe | rank1's stripe | ...]). The hash MoE
-            # indexes input_ids per hidden row, so the ids must be gathered in
-            # the SAME rank-major order. pcp_allgather_rankmajor is int-safe
-            # (plain all_gather), so reuse it for the ids too.
-            if moe_merge:
-                full_padded_ids = pcp_allgather_rankmajor(input_ids, pcp_size)
+            if _tbo_active():
+                # PCP+TBO prefill (障碍 A, b1): the split was done upstream in
+                # run_model; input_ids is already 1/(2*pcp) tokens. full_padded_ids
+                # was precomputed there and stored in ctx.context.input_ids (carried
+                # into this ubatch context by _make_ubatch_context). Nothing to do.
+                pass
+            else:
+                n_global = input_ids.shape[0]
+                pad = pcp_pad_len(n_global, pcp_size) - n_global
+                if pad > 0:
+                    input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
+                    positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
+                input_ids = pcp_round_robin_split(input_ids, pcp_size)
+                positions = pcp_round_robin_split(positions, pcp_size)
+                # Scheme B: each Block rank-major all-gathers hidden before MoE
+                # (pcp_allgather_rankmajor = plain all_gather(dim=0), RANK-MAJOR
+                # order: [rank0's stripe | rank1's stripe | ...]). The hash MoE
+                # indexes input_ids per hidden row, so the ids must be gathered in
+                # the SAME rank-major order. pcp_allgather_rankmajor is int-safe
+                # (plain all_gather), so reuse it for the ids too.
+                if moe_merge:
+                    full_padded_ids = pcp_allgather_rankmajor(input_ids, pcp_size)
 
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
@@ -3170,19 +3217,33 @@ class DeepseekV4ForCausalLM(nn.Module):
             # so inline costs ~nothing in overlap.
             ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         elif moe_merge:
-            # Scheme B: hash MoE runs on the rank-major full token set (each
-            # Block rank-major all-gathers hidden before MoE), so the ids it
-            # indexes must be the matching rank-major full ids.
-            ctx.context.input_ids = full_padded_ids
+            if full_padded_ids is not None:
+                # Normal PCP path: set ids from the just-computed all-gather.
+                ctx.context.input_ids = full_padded_ids
+            else:
+                # PCP+TBO path: input_ids is the per-ubatch slice of local ids
+                # (set by _make_ubatch_context from run_model's local ids).
+                # Allgather across PCP ranks to get padded_total//2 ids,
+                # matching what moe_pcp_merge_forward allgathers for hidden states.
+                # Both PCP ranks call this at the same TBO ubatch phase → synchronized.
+                ctx.context.input_ids = pcp_allgather_rankmajor(
+                    input_ids.flatten(), pcp_size
+                )
         else:
             ctx.context.input_ids = input_ids
         h = self.model(input_ids, positions)
 
         # ----- PCP: all-gather shards, restore original order, drop pad -----
         if use_pcp:
-            h = pcp_allgather_rerange(h, pcp_size)
-            if pad > 0:
-                h = h[:n_global]
+            if _tbo_active():
+                # PCP+TBO: skip the all-gather here. Each ubatch returns its
+                # local (1/(2*pcp)) shard; run_model does a single
+                # pcp_allgather_rerange after UBatchWrapper cats both shards.
+                pass
+            else:
+                h = pcp_allgather_rerange(h, pcp_size)
+                if pad > 0:
+                    h = h[:n_global]
         return h
 
     def compute_logits(

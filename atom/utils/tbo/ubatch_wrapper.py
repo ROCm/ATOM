@@ -506,6 +506,15 @@ class UBatchWrapper(nn.Module):
             batch_size=ub_num_reqs,
             graph_bs=graph_bs,
             is_draft=ctx.context.is_draft,
+            # Carry over per-ubatch slice of input_ids for hash MoE (PCP+TBO mode).
+            # run_model stores local (1/pcp) ids; each ubatch takes its token_slice.
+            # ForCausalLM.forward then allgathers the slice to get ids matching the
+            # MoE's per-ubatch allgathered hidden states (padded_total//2 tokens).
+            input_ids=(
+                ctx.context.input_ids[ub_slice.token_slice]
+                if ctx.context.input_ids is not None
+                else None
+            ),
         )
 
         return ForwardContext(

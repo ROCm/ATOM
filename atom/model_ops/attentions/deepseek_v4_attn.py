@@ -1616,6 +1616,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ts = ub_slice.token_slice
         ub_num_reqs = rs.stop - rs.start
         ub_num_tokens = ts.stop - ts.start
+        # ub_num_tokens above counts the full token_slice width (= padded size
+        # when PCP+TBO inserts dummy tokens to keep cross-rank alignment).
+        # real_num_tokens is computed below from sum(extend_lens_np) after
+        # clamping, which excludes dummy-padding rows (extend_lens==0 for them).
+        # Passed as `total_tokens` to _attach_v4_per_fwd_meta so that
+        # batch_id_unpadded_np[:total_tokens] = ... doesn't broadcast-error.
 
         if src.state_slot_mapping is not None:
             ub_attn.state_slot_mapping = src.state_slot_mapping[rs]
@@ -1632,6 +1638,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         extend_lens_np = (clamped_ends - clamped_starts).astype(np.int32)
         ub_cu = np.zeros(ub_num_reqs + 1, dtype=np.int32)
         np.cumsum(extend_lens_np, dtype=np.int32, out=ub_cu[1:])
+        # Real (non-dummy) token count = sum of clamped extend lengths.
+        # Equals ub_num_tokens in standard TBO; may be smaller when PCP+TBO
+        # pads token_slice to a pcp-aligned boundary (Option B).
+        real_num_tokens = int(ub_cu[ub_num_reqs])
         ub_start_pos_for_ctx = positions_np[ub_cu[:ub_num_reqs]].astype(np.int32)
         context_lens_np = (ub_start_pos_for_ctx + extend_lens_np).astype(np.int32)
         from atom.model_ops.v4_kernels import make_compress_plans
@@ -1669,9 +1679,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 extend_lens_np,  # ubatch's per-seq token counts
                 ub_attn.state_slot_mapping_cpu,
                 ub_num_reqs,
-                ub_num_tokens,
+                real_num_tokens,  # actual tokens only (excludes PCP dummy padding)
             )
 
+            # Option A: real_num_tokens == ub_num_tokens (no dummy, since
+            # _preprocess gates on n_prefill % (2*pcp)==0). All downstream
+            # functions receive ub_num_tokens consistently.
+            # Option B (arbitrary length, with dummy tokens) requires per-ubatch
+            # reindex — see PCP_TBO.md §11 for the full analysis and remaining work.
             positions_gpu = var["positions"].gpu[ts.start : ts.stop]
             self._attach_v4_indexer_meta(
                 ub_attn,

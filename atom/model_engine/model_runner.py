@@ -38,10 +38,17 @@ from atom.utils import (
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.utils.forward_context import get_kvconnector
 from atom.utils.tbo import (
+    UBatchSlice,
     UBatchWrapper,
     local_tbo_precompute,
     maybe_create_ubatch_slices,
     sync_dp_for_tbo,
+)
+from atom.distributed.pcp_utils import (
+    pcp_allgather_rankmajor,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+    pcp_round_robin_split,
 )
 from atom.utils.forward_context import (
     Context,
@@ -1733,6 +1740,27 @@ class ModelRunner:
                 self.config, batch, is_prefill, num_scheduled_tokens
             )
 
+        # PCP+TBO prefill (障碍 A, b1): the PCP split happens in run_model,
+        # before UBatchWrapper. Each ubatch sees 1/(2*pcp) tokens. Override the
+        # local TBO eligibility/sizes with the local (1/pcp) token count so
+        # ub_slices are created in 1/pcp space rather than the global space.
+        #
+        # 选项 A（务实先验证）：仅当 total_prefill_tokens 被 2*pcp 整除时启用 TBO。
+        # 此时各 PCP rank 真实 token 数相等、每 ubatch = local//2 跨 rank 一致、
+        # 无 dummy padding token → 回避跨 rank allgather size mismatch（Bug5）。
+        # 不整除时 local_eligible=False → tbo_collective_active=False → 回退非 TBO。
+        # 选项 B（任意长度）需 per-ubatch reindex，见 PCP_TBO.md §11。
+        pcp_size = self.config.prefill_context_parallel_size
+        if tbo_on and is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            n_prefill = batch.total_tokens_num_prefill
+            if n_prefill % (2 * pcp_size) == 0:
+                local_tokens = n_prefill // pcp_size
+                local_eligible = local_tokens >= 2
+                local_ub0 = local_tokens // 2
+                local_ub1 = local_tokens - local_ub0
+            else:
+                local_eligible = False
+
         if dp_size <= 1:
             # Single-rank: TBO decision is purely local; no collective needed.
             # dp_uniform_decode=True mirrors the DP-disabled case in the
@@ -1853,14 +1881,87 @@ class ModelRunner:
                 input_ids,
             )
 
-        ubatch_slices = self._maybe_create_tbo_slices(
-            batch,
-            is_prefill,
-            scheduled_bs if not is_prefill else 0,
-            actual_num_tokens,
-            num_scheduled_tokens,
-            tbo_collective_active,
+        pcp_size = self.config.prefill_context_parallel_size
+        _pcp_tbo_prefill = (
+            is_prefill and pcp_size > 1 and tbo_collective_active
+            and not batch.is_dummy_run
         )
+        if _pcp_tbo_prefill:
+            # Compute padded local token count and local cu_seqlens_q first;
+            # both are needed to determine correct per-ubatch request boundaries.
+            padded_total = pcp_pad_len(batch.total_tokens_num_prefill, pcp_size, num_ubatches=2)
+            local_tokens = padded_total // pcp_size
+            half = local_tokens // 2
+            num_prefill_reqs = batch.total_seqs_num_prefill
+
+            # Local cu_seqlens_q: derived from attn_metadata.batch_id_per_token
+            # which _apply_pcp_reindex already reduced to 1/pcp space.
+            # build_ubatch_prefill_metadata reads forward_vars["cu_seqlens_q"] (set
+            # to global values in prepare_prefill); overwrite with local values now.
+            bid = attn_metadata.batch_id_per_token
+            valid_bid = bid[bid >= 0]
+            if valid_bid.numel() > 0:
+                local_counts_np = (
+                    torch.bincount(valid_bid.to(torch.int64), minlength=num_prefill_reqs)
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                local_counts_np = np.zeros(num_prefill_reqs, dtype=np.int64)
+            local_cu = np.zeros(num_prefill_reqs + 1, dtype=np.int32)
+            local_cu[1:] = local_counts_np.cumsum()
+            self.forward_vars["cu_seqlens_q"].np[: num_prefill_reqs + 1] = local_cu
+
+            # token_slice boundary MUST use local_tokens//2 (padded, cross-rank
+            # consistent via N·pcp pad), NOT real_local//2 (per-rank real count).
+            # real_local differs across ranks when total is not divisible by pcp
+            # (e.g. 8193 → rank0=4097, rank1=4096), so using it for token_slice
+            # makes ubatch1 sizes diverge across ranks → RCCL allgather hang (Bug5).
+            # Dummy tokens in [real_local:local_tokens] are handled by real_num_tokens
+            # inside build_ubatch_prefill_metadata (_attach_v4_per_fwd_meta receives
+            # real_num_tokens = sum(extend_lens) instead of ub_num_tokens).
+
+            # Determine per-ubatch request boundaries from local_cu, using padded
+            # half as the split point so both ranks see the same boundary.
+            req_stop_ub0 = int(np.searchsorted(local_cu[:num_prefill_reqs], half, side='left'))
+            req_stop_ub0 = max(1, min(req_stop_ub0, num_prefill_reqs))
+            req_start_ub1 = int(np.searchsorted(local_cu[1:num_prefill_reqs + 1], half + 1, side='left'))
+            req_start_ub1 = max(0, min(req_start_ub1, num_prefill_reqs - 1))
+
+            ubatch_slices = [
+                UBatchSlice(
+                    request_slice=slice(0, req_stop_ub0),
+                    token_slice=slice(0, half),           # padded half, cross-rank consistent
+                ),
+                UBatchSlice(
+                    request_slice=slice(req_start_ub1, num_prefill_reqs),
+                    token_slice=slice(half, local_tokens), # padded boundary
+                ),
+            ]
+
+            # Local positions: round-robin split of the global positions tensor.
+            # build_ubatch_prefill_metadata reads forward_vars["positions"].np/gpu;
+            # overwrite with local (1/pcp) values so per-ubatch indexing is correct.
+            n_global_pos = positions.shape[0]
+            pos_padded = positions
+            if padded_total > n_global_pos:
+                pos_padded = torch.cat(
+                    [positions, positions.new_zeros(padded_total - n_global_pos)]
+                )
+            local_positions = pcp_round_robin_split(pos_padded, pcp_size)
+            self.forward_vars["positions"].np[:local_tokens] = (
+                local_positions.cpu().numpy()
+            )
+            self.forward_vars["positions"].copy_to_gpu(local_tokens)
+        else:
+            ubatch_slices = self._maybe_create_tbo_slices(
+                batch,
+                is_prefill,
+                scheduled_bs if not is_prefill else 0,
+                actual_num_tokens,
+                num_scheduled_tokens,
+                tbo_collective_active,
+            )
 
         set_forward_context(
             attn_metadata=attn_metadata,
@@ -1965,6 +2066,38 @@ class ModelRunner:
         # internally short-circuits for prefill / cudagraph.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
+        # PCP+TBO prefill (障碍 A, b1): apply PCP split here, before UBatchWrapper,
+        # so each ubatch receives 1/(2*pcp) tokens and ub_slices (in 1/pcp space)
+        # align with the metadata already reindexed by _apply_pcp_reindex.
+        _pcp_size = self.config.prefill_context_parallel_size
+        _pcp_tbo_prefill = (
+            _pcp_size > 1
+            and isinstance(self.model, UBatchWrapper)
+            and forward_context.ubatch_slices is not None
+            and is_prefill
+            and not forward_context.context.is_dummy_run
+        )
+        if _pcp_tbo_prefill:
+            n_global = input_ids.shape[0]
+            _padded = pcp_pad_len(n_global, _pcp_size, num_ubatches=2)
+            if _padded > n_global:
+                _pad = _padded - n_global
+                input_ids = torch.cat([input_ids, input_ids.new_zeros(_pad)])
+                positions = torch.cat([positions, positions.new_zeros(_pad)])
+            input_ids = pcp_round_robin_split(input_ids, _pcp_size)
+            positions = pcp_round_robin_split(positions, _pcp_size)
+            # Update context.positions to the local (1/pcp) version so that
+            # _make_ubatch_context slices it correctly in 1/pcp space.
+            forward_context.context.positions = positions
+            # Store local (1/pcp) input_ids for hash MoE (mode B, moe_pcp_merge).
+            # _make_ubatch_context will slice [token_slice] per ubatch; each
+            # ForCausalLM.forward then allgathers its per-ubatch slice across PCP
+            # ranks, giving padded_total//2 ids — matching what moe_pcp_merge_forward
+            # allgathers for hidden states. Pre-allgathering here would give
+            # padded_total ids, which mismatches MoE's padded_total//2 num_tokens.
+            if self.config.parallel_config.moe_pcp_merge:
+                forward_context.context.input_ids = input_ids  # local, 1/pcp tokens
+
         if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
@@ -2014,6 +2147,19 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
+                # PCP+TBO prefill: UBatchWrapper has concatenated the two ubatch
+                # shards (each 1/(2*pcp) tokens); do the single pcp_allgather_rerange
+                # here and crop to n_global. ForCausalLM.forward skipped this step
+                # to avoid 2 concurrent RCCL calls from the two ubatch threads.
+                if _pcp_tbo_prefill:
+                    if self.use_aux_hidden_state_outputs:
+                        _h, _aux = model_output
+                        _h = pcp_allgather_rerange(_h, _pcp_size)[:n_global]
+                        model_output = (_h, _aux)
+                    else:
+                        model_output = pcp_allgather_rerange(
+                            model_output, _pcp_size
+                        )[:n_global]
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, self._aux_hidden_states = model_output
                 else:

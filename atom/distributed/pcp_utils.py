@@ -13,6 +13,8 @@ Ported from SGLang's DSA round-robin CP path
 `layers/utils/cp_utils.py:cp_all_gather_rerange_output`).
 """
 
+import itertools
+import logging
 from typing import Optional
 
 import torch
@@ -22,6 +24,43 @@ from aiter.dist.parallel_state import (
     get_prefill_context_model_parallel_rank,
     get_prefill_context_model_parallel_world_size,
 )
+
+logger = logging.getLogger("atom")
+
+# Monotonic counter so debug lines can be matched against RCCL WorkNCCL SeqNum
+# when locating a PCP+TBO collective hang. GIL-protected; shared across the 2
+# TBO ubatch threads (the issue order across threads is exactly what we trace).
+_pcp_comm_seq = itertools.count()
+
+
+def _tbo_debug_collective(fn: str, input_: torch.Tensor) -> None:
+    """Emit a WARNING-level trace for one PCP collective when ATOM_TBO_DEBUG=1.
+
+    Logs (in issue order) the call site, input shape/numel, the current TBO
+    ubatch id, and the PCP rank — so the last line before an RCCL allgather
+    timeout pinpoints which collective (attention KV/compressor/indexer vs MoE
+    hidden) deadlocked, and on which ubatch.
+    """
+    from atom.utils import envs
+
+    if not envs.ATOM_TBO_DEBUG:
+        return
+    try:
+        from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
+
+        ub = tbo_current_ubatch_id() if tbo_active() else -1
+    except Exception:
+        ub = -1
+    seq = next(_pcp_comm_seq)
+    logger.warning(
+        "[TBO_DEBUG] seq=%d %s in_shape=%s numel=%d ubatch=%d pcp_rank=%d",
+        seq,
+        fn,
+        tuple(input_.shape),
+        input_.numel(),
+        ub,
+        get_prefill_context_model_parallel_rank(),
+    )
 
 
 def get_pcp_world_size() -> int:
@@ -39,22 +78,29 @@ def pcp_is_enabled() -> bool:
 def pcp_pad_len(
     total_tokens: int,
     pcp_size: Optional[int] = None,
+    num_ubatches: int = 1,
 ) -> int:
-    """Padded token count so the global sequence is divisible by pcp_size.
+    """Padded token count so the global sequence is divisible by pcp_size * num_ubatches.
 
     Round-robin split requires the global token count to be divisible by pcp_size
     (see SGLang `can_dsa_cp_split` assert / HIP `apply_cp_reindex`). Returns the
     padded length (>= total_tokens); callers pad per-token tensors to this
     length with dummy tokens (KV length 0) before splitting.
+
+    When TBO is active with N ubatches, pass num_ubatches=N so each per-rank
+    shard (total // pcp_size) is also divisible by N — guaranteeing every
+    ubatch is a pcp_size multiple and the token-midpoint split lands on an
+    exact pcp_size boundary.
     """
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
-    if pcp_size <= 1:
+    divisor = pcp_size * max(num_ubatches, 1)
+    if divisor <= 1:
         return total_tokens
-    rem = total_tokens % pcp_size
+    rem = total_tokens % divisor
     if rem == 0:
         return total_tokens
-    return total_tokens + (pcp_size - rem)
+    return total_tokens + (divisor - rem)
 
 
 def pcp_round_robin_split(
@@ -96,6 +142,7 @@ def pcp_allgather_rerange(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
+    _tbo_debug_collective("pcp_allgather_rerange", input_)
     group = get_pcp_group()
     # aiter all_gather(dim=0) returns rank-major concat: [pcp*L, *rest].
     gathered = group.all_gather(input_.contiguous(), dim=0)
@@ -138,6 +185,7 @@ def pcp_allgather_rankmajor(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
+    _tbo_debug_collective("pcp_allgather_rankmajor", input_)
     return get_pcp_group().all_gather(input_.contiguous(), dim=0)
 
 
@@ -150,6 +198,7 @@ def pcp_reduce_scatter(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
+    _tbo_debug_collective("pcp_reduce_scatter", input_)
     return get_pcp_group().reduce_scatter(input_.contiguous(), dim=0)
 
 
@@ -163,6 +212,7 @@ def pcp_all_reduce(input_: torch.Tensor, pcp_size: Optional[int] = None) -> torc
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
+    _tbo_debug_collective("pcp_all_reduce", input_)
     return get_pcp_group().all_reduce(input_)
 
 
