@@ -558,9 +558,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         layer_num: int = 0,
     ) -> None:
         super().__init__()
-        is_sparse_attention_layer = layer_num in _sparse_attention_layer_ids(config)
         attn_cls = (
-            MiniMaxM3SparseAttention if is_sparse_attention_layer else MiniMaxM3Attention
+            MiniMaxM3SparseAttention
+            if layer_num in _sparse_attention_layer_ids(config)
+            else MiniMaxM3Attention
         )
         self.self_attn = attn_cls(
             config=config,
