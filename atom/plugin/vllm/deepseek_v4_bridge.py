@@ -205,12 +205,37 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.vllm_config = vllm_config
         self.device = device
-        # Pure decodes (query_len == 1) get pulled to the front of the batch so
-        # vLLM can classify a uniform-decode batch and dispatch the captured
-        # decode graph. The plugin reads the (reordered) CommonAttentionMetadata
-        # transparently; the per-request state slot is keyed on the first block
-        # id, so it is invariant to reordering.
-        self.reorder_batch_threshold = 1
+        # Decodes get pulled to the front of the batch so vLLM can classify a
+        # uniform-decode batch and dispatch the captured decode graph. The plugin
+        # reads the (reordered) CommonAttentionMetadata transparently; the
+        # per-request state slot is keyed on the req id, so it is invariant to
+        # reordering.
+        #
+        # With speculative decoding (MTP) each request's verify step carries
+        # ``1 + num_speculative_tokens`` query rows, so the decode threshold must
+        # be raised accordingly -- otherwise the verify batch is misclassified as
+        # prefill/mixed and the captured uniform-decode graph is fed mismatched
+        # metadata (garbage outputs, and an illegal access once the V4 compressor
+        # side-stream is captured). Use vLLM's own spec-as-decode computation
+        # (``1 + num_speculative_tokens``, doubled for parallel drafting) so this
+        # tracks the upstream contract for spec-decode-capable backends.
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # Number of MTP draft tokens per step (0 when spec decode is off). The
+        # spec-verify batch carries ``1 + num_spec_tokens`` uniform query rows;
+        # the metadata builder must classify that as DECODE (not PREFILL) so it
+        # stages into the persistent fixed-address decode buffers the captured
+        # FULL graph replays against. Kept consistent with the reorder threshold.
+        self._num_spec_tokens = _v4_spec_steps(vllm_config)
+        # CUDA/HIP-graph capture token-bucket sizes. vLLM pads the decode model
+        # forward (``positions``/hidden states) up to one of these even under
+        # PIECEWISE, where it leaves the attention-metadata token count
+        # unpadded. The decode metadata token-pad is rounded up to the same
+        # bucket so the ``batch_id == -1`` sentinel tail covers the padded rows
+        # the fused decode ``qk_norm_rope`` iterates over.
+        cc = getattr(vllm_config, "compilation_config", None)
+        self._cg_token_sizes = sorted(
+            {int(s) for s in (getattr(cc, "cudagraph_capture_sizes", None) or [])}
+        )
 
     def build(
         self, common_prefix_len: int, common_attn_metadata, fast_build: bool = False
@@ -283,6 +308,8 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
             decode_bufs=decode_bufs,
             capturing=capturing,
             req_ids=req_ids,
+            num_spec_tokens=self._num_spec_tokens,
+            cudagraph_token_sizes=self._cg_token_sizes,
         )
         # Native ATOM enables V4 compressor side-stream launches only while the
         # forward is being captured into a HIP/CUDA graph. vLLM builds this metadata
@@ -450,6 +477,34 @@ def _v4_padded_token_count(common_attn_metadata, total: int) -> int:
         int(slot_mapping.numel()) if isinstance(slot_mapping, torch.Tensor) else 0
     )
     return max(total, num_actual, slot_tokens)
+
+
+def _v4_round_to_cudagraph_bucket(n: int, sizes) -> int:
+    """Round ``n`` up to the smallest CUDA/HIP-graph capture size >= ``n``.
+
+    vLLM only pads the *attention metadata* token count to a capture-size
+    bucket when the decode dispatches the FULL graph (``pad_attn`` is
+    ``cudagraph_mode == FULL``). Under PIECEWISE, the metadata is left at the
+    real (unpadded) token count, yet the model forward still receives
+    ``positions``/hidden states padded to a piecewise capture-size bucket
+    (fixed shapes are required to replay the captured piecewise regions). The
+    fused decode ``qk_norm_rope`` reads ``T = positions.shape[0]`` (the padded
+    forward width) and asserts ``len(batch_id_per_token) >= T``; if the V4
+    decode metadata is sized to the unpadded count the padded tail tokens read
+    ``batch_id_per_token`` out of bounds (illegal access / launch failure under
+    load). Rounding the decode token-pad count up to the same bucket vLLM pads
+    the forward to keeps the ``batch_id == -1`` sentinel tail long enough to
+    cover those padded rows. Batches larger than the max capture size run eager
+    (no padding), so ``n`` passes through unchanged.
+    """
+    if not sizes:
+        return n
+    if n > sizes[-1]:
+        return n
+    for s in sizes:
+        if s >= n:
+            return s
+    return n
 
 
 class _V4DecodeMetaBuffers:
@@ -692,12 +747,32 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
                 compressor.score_state[idx] = float("-inf")
 
 
-def _infer_atom_attn_state(common_attn_metadata):
+def _infer_atom_attn_state(common_attn_metadata, num_spec_tokens: int = 0):
+    """Classify the batch as DECODE / PREFILL_PREFIX / PREFILL_NATIVE.
+
+    A speculative-decode verify (MTP) step contributes a *uniform*
+    ``1 + num_speculative_tokens`` query rows per request, so its
+    ``max_query_len`` is ``1 + num_spec_tokens`` (== 2 for the default MTP
+    k=1), NOT 1. vLLM batches exactly these query lengths as a uniform decode
+    (its ``reorder_batch_threshold`` is ``1 + num_speculative_tokens`` for
+    spec-as-decode backends) and dispatches the captured FULL decode graph for
+    them. ATOM must agree: a batch whose longest query fits inside the spec
+    decode block is DECODE, so the build stages the per-fwd metadata into the
+    persistent fixed-address decode buffers that the captured graph replays
+    against. The old ``max_query_len == 1`` test classified the verify batch as
+    PREFILL, which builds fresh per-step tensors at new addresses; the captured
+    decode graph then replays against stale addresses -> garbage outputs under
+    cudagraph (eager is unaffected because nothing is captured). Mirrors native
+    ATOM, where the verify step is ``AttnState.DECODE`` with
+    ``max_seqlen_q == num_spec_step + 1`` (deepseek_v4_attn.py:prepare_decode).
+    """
     from atom.utils.forward_context import AttnState
 
     if common_attn_metadata is None:
         return AttnState.PREFILL_NATIVE
-    if getattr(common_attn_metadata, "max_query_len", 0) == 1:
+    max_q = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
+    decode_q = 1 + max(0, int(num_spec_tokens))
+    if 1 <= max_q <= decode_q:
         return AttnState.DECODE
     num_computed = getattr(common_attn_metadata, "_num_computed_tokens_cpu", None)
     if num_computed is not None and bool((num_computed > 0).any().item()):
@@ -847,6 +922,8 @@ def build_atom_v4_attention_metadata(
     decode_bufs=None,
     capturing=False,
     req_ids=None,
+    num_spec_tokens=0,
+    cudagraph_token_sizes=None,
 ):
     """Translate a vLLM ``CommonAttentionMetadata`` into ATOM's V4
     ``AttentionMetaData``.
@@ -871,7 +948,7 @@ def build_atom_v4_attention_metadata(
 
     if common_attn_metadata is None:
         return AttentionMetaData()
-    state = _infer_atom_attn_state(common_attn_metadata)
+    state = _infer_atom_attn_state(common_attn_metadata, num_spec_tokens)
     is_decode = state.value == "decode"
     device = common_attn_metadata.seq_lens.device
     num_reqs = int(common_attn_metadata.num_reqs)
@@ -941,6 +1018,14 @@ def build_atom_v4_attention_metadata(
     # input/slot tensors; use slot_mapping length so ATOM metadata also carries
     # a sentinel tail for padded draft slots.
     T_pad = _v4_padded_token_count(common_attn_metadata, total)
+    # The model forward runs over ``positions`` padded to a CUDA/HIP-graph
+    # capture-size bucket even when vLLM leaves the *attention metadata* token
+    # count unpadded (PIECEWISE decode: ``pad_attn`` is FULL-only). Size the
+    # decode token-pad (and thus the ``batch_id == -1`` sentinel tail) to that
+    # same bucket so the fused decode ``qk_norm_rope`` never reads
+    # ``batch_id_per_token`` past its end for the padded tail rows.
+    if is_decode:
+        T_pad = _v4_round_to_cudagraph_bucket(T_pad, cudagraph_token_sizes)
 
     # ---- per-request state slot ----
     # Real per-request state slots are assigned only for genuine (non-capture)
@@ -1466,6 +1551,12 @@ def atom_deepseek_v4_forward_context(
         # bound): build inline with fresh tensors. Never captured.
         if common_attn_metadata is not None:
             common_attn_metadata.positions = positions
+        _spec_cfg = getattr(atom_config, "speculative_config", None)
+        _num_spec = (
+            int(getattr(_spec_cfg, "num_speculative_tokens", 0) or 0)
+            if _spec_cfg is not None
+            else 0
+        )
         attn_metadata = build_atom_v4_attention_metadata(
             common_attn_metadata,
             meta_params=meta_params,
@@ -1475,6 +1566,7 @@ def atom_deepseek_v4_forward_context(
                 if state_model is not None
                 else None
             ),
+            num_spec_tokens=_num_spec,
         )
         # Selective per-slot reset: clear only the slots the allocator just
         # bound to a fresh request (replaces the old global position-0 reset,

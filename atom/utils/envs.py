@@ -133,6 +133,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
+    # Force the DeepSeek-V4 Compressor(s) to run synchronously on the main
+    # stream instead of the alt/indexer side streams (disables the #1166
+    # multistream side-launch). Diagnostic/safety switch for the captured
+    # decode graph; "1" disables async compress.
+    "ATOM_V4_DISABLE_ASYNC_COMPRESS": lambda: (
+        os.getenv("ATOM_V4_DISABLE_ASYNC_COMPRESS", "0").lower() == "1"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
