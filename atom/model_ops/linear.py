@@ -32,7 +32,11 @@ from atom.model_ops.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-from atom.quantization.quark.utils import weight_dequant_fp8, weight_dequant_mxfp8
+from atom.quantization.quark.utils import (
+    quant_weight_online,
+    weight_dequant_fp8,
+    weight_dequant_mxfp8,
+)
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -466,7 +470,7 @@ class LinearBase(nn.Module):
             self.quant_type, self.params_dtype, online_layer_quant_config
         ):
             return
-        online_quant_func = get_hip_quant(online_quant_type)
+
         assert online_quant_dtype in [
             torch.float8_e4m3fn,
             torch.float4_e2m1fn_x2,
@@ -519,8 +523,9 @@ class LinearBase(nn.Module):
         elif self.quant_type == QuantType.per_1x32:
             # dequant MXFP8 (FP8 elements + 1x32 E8M0 shared scale)
             weight = weight_dequant_mxfp8(weight, weight_scale)
-        q_weight, weight_scale = online_quant_func(
-            weight, quant_dtype=online_quant_dtype
+
+        q_weight, weight_scale = quant_weight_online(
+            weight, online_quant_type, online_quant_dtype
         )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
@@ -532,7 +537,7 @@ class LinearBase(nn.Module):
         # Update quant state
         self.quant_type = online_quant_type
         self.params_dtype = online_quant_dtype
-        self.quant_func = online_quant_func
+        self.quant_func = get_hip_quant(online_quant_type)
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
         )
