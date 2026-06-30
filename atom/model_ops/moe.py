@@ -240,7 +240,7 @@ def pad_for_all_gather(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
     padding_shape[0] = max_batch_size
     padded_x = torch.empty(padding_shape, device=x.device, dtype=x.dtype)
     padded_x[:original_batch_size, :].copy_(x)
-    padded_x[original_batch_size:, :].zero_()
+    # padded_x[original_batch_size:, :].zero_()
     return padded_x, original_batch_size
 
 
