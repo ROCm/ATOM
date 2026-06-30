@@ -350,6 +350,8 @@ jobs:
           MAX_WAIT_RETRIES: "120"
           STREAM_SGLANG_LOGS: "1"
           LM_EVAL_TASK: "gsm8k"
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
+          LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent }}
         run: |
           $CONTAINER_ENGINE exec \
             -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
@@ -363,6 +365,8 @@ jobs:
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
+            -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
               bash .github/scripts/atom_sglang_test.sh accuracy
