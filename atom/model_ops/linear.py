@@ -32,7 +32,11 @@ from atom.model_ops.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-from atom.quantization.quark.utils import weight_dequant_fp8, weight_dequant_mxfp8
+from atom.quantization.quark.utils import (
+    weight_dequant_fp8,
+    weight_dequant_mxfp8,
+    quantize_weight_to_fp8_128x128_blockscale,
+)
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -524,10 +528,6 @@ class LinearBase(nn.Module):
         if online_quant_type == QuantType.per_1x128:
             # Linear per_1x128 path uses blockscale GEMM, which consumes
             # 128x128 weight scales shaped as (N//128, K//128).
-            from quantization.quark.utils import (
-                quantize_weight_to_fp8_128x128_blockscale,
-            )
-
             q_weight, weight_scale = quantize_weight_to_fp8_128x128_blockscale(
                 weight, online_quant_dtype
             )
@@ -541,6 +541,8 @@ class LinearBase(nn.Module):
             )
         self.weight = nn.Parameter(q_weight, requires_grad=False)
         self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+        self.weight.weight_loader_process = self.weight_loader_process
+        self.weight_scale.weight_loader_process = self.weight_loader_process
 
         # Update quant state
         self.quant_type = online_quant_type
