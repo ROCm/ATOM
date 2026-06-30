@@ -2009,6 +2009,34 @@ class ModelRunner:
                 graph_bs = context.graph_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
                 graph_key = (graph_bs, max_q_len)
+                # [CUQ_DUAL] dual probe over [: graph_bs+1] (full convert-kernel grid)
+                import torch as _t
+                _k = min(graph_bs + 1, 257)
+                if not hasattr(self, "_cuq_snap"):
+                    _dev = self.forward_vars["cu_seqlens_q"].gpu.device
+                    self._cuq_snap = _t.zeros(3000, 257, dtype=_t.int32, device=_dev)
+                    self._cuq_snap_n = 0
+                    self._cuq_step = 0
+                self._cuq_step += 1
+                if self._cuq_step > 1000:
+                    if self._cuq_step % 500 == 0:
+                        _np = self.forward_vars["cu_seqlens_q"].np
+                        logger.warning("[CUQ_DUAL]_HOST step=%d graph_bs=%d head=%s tail=%s",
+                                       self._cuq_step, graph_bs,
+                                       _np[:min(16, _k)].tolist(),
+                                       _np[max(_k - 3, 0):_k].tolist())
+                    if self._cuq_snap_n < 3000:
+                        self._cuq_snap[self._cuq_snap_n, :_k].copy_(
+                            self.forward_vars["cu_seqlens_q"].gpu[:_k])
+                        self._cuq_snap_n += 1
+                        if self._cuq_snap_n == 3000:
+                            import threading as _thr
+                            _snap = self._cuq_snap
+                            _rank = getattr(self, "rank", 0)
+                            _p = "/it-share/jiaolyu/glm52_repro/g43dbg_cuq_rank%d.pt" % _rank
+                            _thr.Thread(target=lambda: (_t.save(_snap.cpu(), _p),
+                                logger.warning("[CUQ_DUAL]_D2D saved %s", _p)),
+                                daemon=True).start()
                 self.graphs[graph_key].replay()
                 num_tokens = context.batch_size * max_q_len
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
