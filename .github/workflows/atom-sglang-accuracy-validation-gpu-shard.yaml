@@ -115,10 +115,14 @@ jobs:
             MODEL_CACHE_ROOT="/data/pretrained_model"
             MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_ROOT="/data/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
             MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
-            echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model nor /shared/data/WRH/models exists on runner; using container-local ${MODEL_CACHE_ROOT}."
+            echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model nor /shared/data/WRH/models nor /data/models exists on runner; using container-local ${MODEL_CACHE_ROOT}."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -126,12 +130,67 @@ jobs:
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
-      - name: Clean up old containers
+      - name: Clean up GPU and Python processes
         run: |
-          containers=$($CONTAINER_ENGINE ps -q)
-          if [ -n "$containers" ]; then
-            $CONTAINER_ENGINE kill $containers || true
+          set -euo pipefail
+
+          echo "=== Cleaning up GPU processes ==="
+          gpu_pids=""
+          for dev in /dev/kfd /dev/dri/renderD*; do
+            if [ -e "$dev" ]; then
+              dev_pids=$(fuser "$dev" 2>/dev/null || true)
+              if [ -n "$dev_pids" ]; then
+                gpu_pids="${gpu_pids} ${dev_pids}"
+              fi
+            fi
+          done
+          gpu_pids=$(printf '%s\n' $gpu_pids 2>/dev/null | awk '!seen[$1]++' | tr '\n' ' ' || true)
+          if [ -n "$gpu_pids" ]; then
+            echo "Killing GPU processes: $gpu_pids"
+            echo "$gpu_pids" | xargs -r kill -9 || true
+          else
+            echo "No GPU processes found."
           fi
+
+          echo "=== Cleaning up Python processes on this machine ==="
+          keep_pids=" $$ $PPID "
+          pid="$PPID"
+          while [ -n "$pid" ] && [ "$pid" != "0" ]; do
+            keep_pids="${keep_pids} ${pid} "
+            pid="$(ps -o ppid= -p "$pid" 2>/dev/null | awk '{print $1}' || true)"
+          done
+
+          python_pids=$(ps -eo pid=,comm= \
+            | awk -v keep="$keep_pids" '
+                keep ~ (" " $1 " ") { next }
+                $2 ~ /^python([0-9.]+)?$/ { print $1 }
+                $2 ~ /^python[0-9.]+-?dbg$/ { print $1 }
+                $2 ~ /^ipython$/ { print $1 }
+                $2 ~ /^pytest$/ { print $1 }
+                $2 ~ /^uvicorn$/ { print $1 }
+                $2 ~ /^gunicorn$/ { print $1 }
+                $2 ~ /^sglang$/ { print $1 }
+                $2 ~ /^vllm$/ { print $1 }
+              ' || true)
+          if [ -n "$python_pids" ]; then
+            echo "Killing Python processes on this machine: $python_pids"
+            echo "$python_pids" | xargs -r kill -9 || true
+          else
+            echo "No Python processes found on this machine."
+          fi
+
+          sleep 2
+
+          echo "=== Verifying GPU cleanup ==="
+          remaining=$(fuser /dev/kfd /dev/dri/renderD* 2>/dev/null | tr ' ' '\n' | sort -u || true)
+          if [ -n "$remaining" ]; then
+              echo "WARNING: GPU still has processes:"
+              echo "$remaining"
+          else
+              echo "GPU is clean."
+          fi
+
+          echo "=== Cleaning up containers ==="
           $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
       - name: Start validation container
@@ -356,7 +415,7 @@ jobs:
 
       - name: Upload model artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sglang-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |

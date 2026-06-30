@@ -214,6 +214,9 @@ jobs:
           if-no-files-found: ignore
 
   dashboard:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     name: Update Mocker Benchmark Dashboard
     needs: [run_atomesh_mocker_benchmark]
     if: >-

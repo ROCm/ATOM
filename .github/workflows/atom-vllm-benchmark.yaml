@@ -2139,6 +2139,9 @@ jobs:
           fi
 
   summarize-benchmark-result:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     if: >-
       always()
       && needs.resolve-atom-source.result == 'success'

@@ -686,6 +686,14 @@ def save_to_pytorch_benchmark_format(
 
 
 def main(args: argparse.Namespace):
+    # Raise the open-file soft limit before opening any connections. At high
+    # --max-concurrency each in-flight request is a socket (fd); the default
+    # RLIMIT_NOFILE soft (~1024) is exhausted client-side (EMFILE on socket()),
+    # silently dropping requests so most never reach the server. The server
+    # already calls set_ulimit() at startup; the client must too.
+    from atom.utils import set_ulimit
+
+    set_ulimit()
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
