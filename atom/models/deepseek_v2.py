@@ -68,7 +68,6 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    maybe_shuffle_weight_for_preshuffle_gemm,
     use_fp4_non_shuffle_triton_gemm,
     use_triton_gemm,
 )
@@ -725,11 +724,11 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
 
-    # This fused path always calls aiter's *preshuffle* blockscale GEMMs, which
-    # need a 16x16-shuffled weight. Under the non-preshuffle triton path the
-    # loader leaves fused_qkv_a_proj.weight unshuffled, so shuffle it here.
-    # (Flag-gated logic lives in linear.maybe_shuffle_weight_for_preshuffle_gemm.)
-    weight_qkv_a_proj = maybe_shuffle_weight_for_preshuffle_gemm(weight_qkv_a_proj)
+    # NOTE: this fused path always calls aiter's *preshuffle* blockscale GEMMs,
+    # which require a 16x16-shuffled weight. fused_qkv_a_proj is flagged with
+    # needs_preshuffled_weight=True so the loader shuffles it once even under the
+    # non-preshuffle path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) -- see
+    # LinearBase.process_weights_after_loading.
 
     if hidden_states_quant_scale is None:
         if M <= 32:
@@ -1752,6 +1751,11 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype=source_quant_dtype,
                 prefix=f"{prefix}.fused_qkv_a_proj",
             )
+            # The fused qkv_a_proj forward calls *preshuffle* blockscale GEMMs, so
+            # its weight must be 16x16-shuffled even when the global non-preshuffle
+            # path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) is selected. The loader
+            # honors this flag in LinearBase.process_weights_after_loading.
+            self.fused_qkv_a_proj.needs_preshuffled_weight = True
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,

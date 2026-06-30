@@ -19,7 +19,6 @@ from aiter import (
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
-from aiter.ops.shuffle import shuffle_weight
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
@@ -45,25 +44,6 @@ logger = logging.getLogger("atom")
 
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
-
-
-def maybe_shuffle_weight_for_preshuffle_gemm(weight: torch.Tensor) -> torch.Tensor:
-    """Return a 16x16-shuffled copy of *weight* for the non-preshuffle triton path.
-
-    Preshuffle blockscale GEMMs (``gemm_a8w8_blockscale_(b)preshuffle``,
-    ``gemm_a16w8_blockscale_preshuffle``) require a 16x16-shuffled weight. With
-    ``ATOM_USE_TRITON_GEMM=1`` and ``ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0`` the
-    loader keeps blockscale weights in their raw ``(N, K)`` layout (so the generic
-    dense linears can use the non-preshuffle triton kernel). Model code that still
-    calls a preshuffle kernel on such a weight (e.g. DeepSeek ``qkv_a_proj``) must
-    shuffle it at the call site; this helper centralizes that under the triton flag.
-
-    When PRESHUFFLE is enabled the loader has already shuffled the weight, so this
-    is a no-op (re-shuffling would corrupt it). ``weight_scale`` needs no shuffle.
-    """
-    if use_triton_gemm() and not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
-        return shuffle_weight(weight, layout=(16, 16))
-    return weight
 
 
 def use_fp4_non_shuffle_triton_gemm() -> bool:
@@ -375,6 +355,45 @@ def gemm_a8w8_per_tensor_impl(
     )
 
 
+def gemm_a8w8_per_token_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@mark_trace(torch_compile=False)
+@torch_compile_guard(gen_fake=gemm_a8w8_per_token_fake, mutates_args=[])
+def gemm_a8w8_per_token_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    # The triton a8w8 kernel natively applies a per-row (activation) and
+    # per-column (weight) scale -- exactly per-token-per-channel. The scales are
+    # already (M, 1) / (N, 1); flatten them to the (M,) / (N,) vectors the kernel
+    # expects. Unlike the AITER bpreshuffle path this consumes the unshuffled
+    # (N, K) weight, so the loader must skip the per_Token weight shuffle when
+    # use_triton_gemm() is enabled (see process_weights_after_loading).
+    x_scale_vec = x_scale.reshape(-1).to(torch.float32).contiguous()
+    w_scale_vec = w_scale.reshape(-1).to(torch.float32).contiguous()
+    return gemm_a8w8_triton(
+        x,
+        weight,
+        x_scale_vec,
+        w_scale_vec,
+        bias=bias,
+        dtype=dtype,
+    )
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -585,6 +604,7 @@ class LinearBase(nn.Module):
         )
         assert self.quant_type in [
             QuantType.No,
+            QuantType.per_Tensor,
             QuantType.per_1x128,
             QuantType.per_1x32,
         ], (
@@ -628,6 +648,19 @@ class LinearBase(nn.Module):
         elif self.quant_type == QuantType.per_1x32:
             # dequant MXFP8 (FP8 elements + 1x32 E8M0 shared scale)
             weight = weight_dequant_mxfp8(weight, weight_scale)
+        elif self.quant_type == QuantType.per_Tensor:
+            # dequant per-tensor fp8: weight (N, K) * per-partition scalar scale.
+            # Merged layers (qkv/gate_up) carry one scale per output partition.
+            w = weight.to(torch.float32)
+            ws = weight_scale.reshape(-1)
+            if ws.numel() <= 1:
+                w = w * ws.reshape(())
+            else:
+                off = 0
+                for i, sz in enumerate(self.output_partition_sizes):
+                    w[off : off + sz] = w[off : off + sz] * ws[i]
+                    off += sz
+            weight = w.to(get_current_atom_config().torch_dtype)
 
         q_weight, weight_scale = quant_weight_online(
             weight, online_quant_type, online_quant_dtype
@@ -646,6 +679,15 @@ class LinearBase(nn.Module):
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
         )
+        # A dynamic online target (e.g. ptpc per_Token) quantizes activations at
+        # runtime. Drop any static input_scale inherited from a static per_Tensor
+        # source, otherwise the per-token quant kernel rejects it
+        # ("unsupported: static per token quant").
+        if (
+            online_layer_quant_config.is_dynamic
+            and getattr(self, "input_scale", None) is not None
+        ):
+            self.input_scale = None
         self._online_quant_info = {
             "layer": self.prefix,
             "quant_type": online_quant_type.name,
@@ -704,6 +746,9 @@ class LinearBase(nn.Module):
             need_shuffle = (
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
+                # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
+                # weight; only the AITER bpreshuffle fallback needs the shuffle.
+                and not (use_triton_gemm() and gemm_a8w8_triton is not None)
             ) or (
                 self.quant_type == QuantType.per_1x32
                 and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
@@ -711,6 +756,15 @@ class LinearBase(nn.Module):
             # per_1x128 only needs shuffle when using the preshuffle GEMM path
             if not need_shuffle and self.quant_type == QuantType.per_1x128:
                 need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+                # Modules whose fused forward calls a *preshuffle* blockscale GEMM
+                # directly (e.g. DeepSeek fused qkv_a_proj) need the 16x16-shuffled
+                # weight even under the non-preshuffle path
+                # (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0). Shuffle once here at
+                # load time instead of per-forward.
+                if not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE and getattr(
+                    self, "needs_preshuffled_weight", False
+                ):
+                    need_shuffle = True
             if need_shuffle:
                 if self.weight.dim() == 2:
                     shuffle_weights(self.weight)
@@ -775,6 +829,16 @@ class LinearBase(nn.Module):
                         x_scale,
                         self.weight_scale,
                         self.bias,
+                        dtype=otype,
+                    )
+                elif use_triton_gemm() and gemm_a8w8_triton is not None:
+                    # Triton a8w8 per-token-per-channel GEMM (unshuffled weight).
+                    y = gemm_a8w8_per_token_impl(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        bias=self.bias,
                         dtype=otype,
                     )
                 else:
