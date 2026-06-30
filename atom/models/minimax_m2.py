@@ -10,7 +10,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from aiter.ops.fused_qk_norm_rope_cache_quant import minimax_qk_norm_rope_tp1
+from aiter.ops.fused_qk_norm_rope_cache_quant import minimax_qk_norm_rope
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
@@ -262,7 +262,7 @@ class MiniMaxM2Attention(nn.Module):
             else:
                 q_weight = self.q_norm.weight
                 k_weight = self.k_norm.weight
-                q, k, v = minimax_qk_norm_rope_tp1(
+                q, k, v = minimax_qk_norm_rope(
                     qkv,
                     q_weight,
                     k_weight,
