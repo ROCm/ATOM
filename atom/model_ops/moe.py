@@ -1170,9 +1170,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
-                    # The expert_map arg carries the 0/1 expert_mask, but triton routing
-                    # remap needs the global-to-local int index map (-1 for non-local)
-                    expert_map=layer.expert_map,
+                    expert_map=expert_map,
                     act_quant=self.act_quant,
                 )
 
@@ -1206,7 +1204,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
                 swiglu_limit=getattr(layer, "swiglu_limit", 7.0),
-                expert_map=layer.expert_map,
+                expert_map=expert_map,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 act_quant=self.act_quant,
@@ -3410,10 +3408,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            # Non-triton routing consume 0/1 expert_masks indexed by global
-            # expert id. For triton routing that needs index map, read the
-            # layer.expert_map directly in Mxfp4MoEMethod.apply.
-            expert_map=self.expert_mask,
+            expert_map=self.expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
@@ -3471,10 +3466,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            # Non-triton routing consume 0/1 expert_masks indexed by global
-            # expert id. For triton routing that needs index map, read the
-            # layer.expert_map directly in Mxfp4MoEMethod.apply.
-            expert_map=self.expert_mask,
+            expert_map=self.expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
