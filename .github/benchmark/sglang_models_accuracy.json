@@ -306,7 +306,7 @@
   {
     "model_name": "MI308 Qwen3-32B-FP8 TP1",
     "model_path": "Qwen/Qwen3-32B-FP8",
-    "extraArgs": "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+    "extraArgs": "--tensor-parallel-size 1 --mem-fraction-static 0.9 --page-size 16 --reasoning-parser qwen3 --disable-radix-cache",
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
     "runner": "atom-mi308-8gpu-plugins-benchmark",
     "test_level": "nightly",
@@ -318,7 +318,7 @@
   {
     "model_name": "MI308 Qwen3-32B-FP8 TP8",
     "model_path": "Qwen/Qwen3-32B-FP8",
-    "extraArgs": "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+    "extraArgs": "--tensor-parallel-size 8 --mem-fraction-static 0.9 --page-size 16 --reasoning-parser qwen3 --disable-radix-cache",
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
     "runner": "atom-mi308-8gpu-plugins-benchmark",
     "test_level": "nightly",
