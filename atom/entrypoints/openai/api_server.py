@@ -87,6 +87,7 @@ processor: Optional[Any] = None
 model_name: str = ""
 default_chat_template_kwargs: Dict[str, Any] = {}
 custom_message_encoder: Optional[Any] = None
+use_harmony: bool = False
 _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
@@ -943,6 +944,45 @@ async def general_error_handler(request: Request, exc: Exception):
     )
 
 
+def _build_harmony_chat_response(
+    request_id: str, model: str, final_output: Dict[str, Any]
+) -> "ChatCompletionResponse":
+    """Build a non-streaming chat response using Harmony token-level parsing."""
+    from .harmony_parser import HarmonyStreamParser
+    from .protocol import ChatCompletionResponse
+
+    parser = HarmonyStreamParser()
+    reasoning, content, tool_calls = parser.parse_full(
+        final_output.get("token_ids", [])
+    )
+
+    message: Dict[str, Any] = {"role": "assistant", "content": content or ""}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    finish_reason = "tool_calls" if tool_calls else (final_output.get("finish_reason") or "stop")
+    return ChatCompletionResponse(
+        id=request_id,
+        created=int(time.time()),
+        model=model,
+        choices=[{"index": 0, "message": message, "finish_reason": finish_reason}],
+        usage={
+            "prompt_tokens": final_output.get("num_tokens_input", 0),
+            "completion_tokens": final_output.get("num_tokens_output", 0),
+            "total_tokens": final_output.get("num_tokens_input", 0)
+            + final_output.get("num_tokens_output", 0),
+            "prompt_tokens_details": {
+                "cached_tokens": final_output.get("num_cached_tokens", 0)
+            },
+            "ttft_s": round(final_output.get("ttft", 0.0), 4),
+            "tpot_s": round(final_output.get("tpot", 0.0), 4),
+            "latency_s": round(final_output.get("latency", 0.0), 4),
+        },
+    )
+
+
 # ---- Endpoints ----
 
 
@@ -979,6 +1019,7 @@ async def chat_completions(request: ChatCompletionRequest):
         _log_request_event("request", request_id, request.model_dump())
 
         is_multimodal = _has_multimodal_content(messages)
+        is_harmony = use_harmony and not is_multimodal
         if is_multimodal:
             # Image loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
@@ -989,6 +1030,22 @@ async def chat_completions(request: ChatCompletionRequest):
             token_ids, multimodal_data = await loop.run_in_executor(
                 None, _prepare_multimodal_inputs, messages, merged_kwargs
             )
+        elif is_harmony:
+            from .harmony_utils import (
+                build_harmony_preamble,
+                extract_instructions_from_messages,
+                parse_chat_inputs_to_harmony_messages,
+                render_for_completion,
+            )
+
+            chat_msgs = [msg.to_template_dict() for msg in messages]
+            instructions, chat_msgs = extract_instructions_from_messages(chat_msgs)
+            harmony_msgs = build_harmony_preamble(
+                instructions=instructions,
+                tools=request.get_tools_as_dicts(),
+            )
+            harmony_msgs.extend(parse_chat_inputs_to_harmony_messages(chat_msgs))
+            prompt = render_for_completion(harmony_msgs)  # List[int]
         else:
             prompt = apply_chat_template(
                 tokenizer,
@@ -1037,6 +1094,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     num_prompt_tokens,
                     cleanup_streaming_request,
                     tools=request.get_tools_as_dicts(),
+                    use_harmony=is_harmony,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -1098,13 +1156,18 @@ async def chat_completions(request: ChatCompletionRequest):
                 final_output = output
             if final_output is None:
                 raise RuntimeError("No output generated")
-            resp = build_chat_response(
-                request_id,
-                model_name,
-                final_output["text"],
-                final_output,
-                tools=request.get_tools_as_dicts(),
-            )
+            if is_harmony:
+                resp = _build_harmony_chat_response(
+                    request_id, model_name, final_output
+                )
+            else:
+                resp = build_chat_response(
+                    request_id,
+                    model_name,
+                    final_output["text"],
+                    final_output,
+                    tools=request.get_tools_as_dicts(),
+                )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
 
@@ -1235,33 +1298,52 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         merged_kwargs = dict(default_chat_template_kwargs)
         openai_tools = anthropic_to_openai_tools(request.tools)
-        # Convert Anthropic tool_choice to OpenAI format for the chat template
-        tc = request.tool_choice
-        if tc is not None:
-            if isinstance(tc, dict):
-                tc_type = tc.get("type", "auto")
-                if tc_type == "any":
-                    merged_kwargs["tool_choice"] = "required"
-                elif tc_type == "tool":
-                    merged_kwargs["tool_choice"] = {
-                        "type": "function",
-                        "function": {"name": tc.get("name", "")},
-                    }
-                elif tc_type == "none":
-                    merged_kwargs["tool_choice"] = "none"
-                else:
-                    merged_kwargs["tool_choice"] = "auto"
-            elif isinstance(tc, str):
-                merged_kwargs["tool_choice"] = tc
-        elif openai_tools:
-            merged_kwargs["tool_choice"] = "auto"
-        prompt = apply_chat_template(
-            tokenizer,
-            custom_message_encoder,
-            [msg.to_template_dict() for msg in messages],
-            tools=openai_tools,
-            **merged_kwargs,
-        )
+        is_harmony_request = use_harmony
+
+        if is_harmony_request:
+            from .harmony_utils import (
+                build_harmony_preamble,
+                extract_instructions_from_messages,
+                parse_chat_inputs_to_harmony_messages,
+                render_for_completion,
+            )
+
+            chat_msgs = [msg.to_template_dict() for msg in messages]
+            instructions, chat_msgs = extract_instructions_from_messages(chat_msgs)
+            harmony_msgs = build_harmony_preamble(
+                instructions=instructions,
+                tools=openai_tools,
+            )
+            harmony_msgs.extend(parse_chat_inputs_to_harmony_messages(chat_msgs))
+            prompt = render_for_completion(harmony_msgs)  # List[int]
+        else:
+            # Convert Anthropic tool_choice to OpenAI format for the chat template
+            tc = request.tool_choice
+            if tc is not None:
+                if isinstance(tc, dict):
+                    tc_type = tc.get("type", "auto")
+                    if tc_type == "any":
+                        merged_kwargs["tool_choice"] = "required"
+                    elif tc_type == "tool":
+                        merged_kwargs["tool_choice"] = {
+                            "type": "function",
+                            "function": {"name": tc.get("name", "")},
+                        }
+                    elif tc_type == "none":
+                        merged_kwargs["tool_choice"] = "none"
+                    else:
+                        merged_kwargs["tool_choice"] = "auto"
+                elif isinstance(tc, str):
+                    merged_kwargs["tool_choice"] = tc
+            elif openai_tools:
+                merged_kwargs["tool_choice"] = "auto"
+            prompt = apply_chat_template(
+                tokenizer,
+                custom_message_encoder,
+                [msg.to_template_dict() for msg in messages],
+                tools=openai_tools,
+                **merged_kwargs,
+            )
 
         sampling_params = _build_sampling_params(
             temperature=request.temperature or 1.0,
@@ -1273,7 +1355,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         request_id = uuid.uuid4().hex[:24]
-        input_tokens = len(tokenizer.encode(prompt))
+        if isinstance(prompt, list):
+            input_tokens = len(prompt)
+        else:
+            input_tokens = len(tokenizer.encode(prompt))
 
         max_ctx = None
         for _path in (
@@ -1298,8 +1383,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             logger.warning(
                 f"Prompt too long ({input_tokens} > {max_input}), truncating"
             )
-            token_ids = tokenizer.encode(prompt)[:max_input]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
+            if isinstance(prompt, list):
+                prompt = prompt[:max_input]
+            else:
+                token_ids = tokenizer.encode(prompt)[:max_input]
+                prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
             input_tokens = max_input
 
         if request.stream:
@@ -1312,8 +1400,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 from .reasoning import ReasoningFilter
                 from .tool_parser import ToolCallStreamParser
 
+                if is_harmony_request:
+                    from .harmony_parser import HarmonyStreamParser
+
+                    harmony_parser = HarmonyStreamParser()
                 reasoning_filter = ReasoningFilter()
-                if prompt.rstrip().endswith("<think>"):
+                if isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
                     reasoning_filter.state = 1
                 tool_parser = ToolCallStreamParser(tools=openai_tools)
                 block_index = 0
@@ -1336,8 +1428,88 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             )
                             message_started = True
                         new_text = chunk_data["text"]
-                        output_tokens += len(chunk_data.get("token_ids", []))
+                        token_ids = chunk_data.get("token_ids", [])
+                        output_tokens += len(token_ids)
                         finished = chunk_data.get("finished", False)
+
+                        if is_harmony_request:
+                            # Harmony: token-level parsing
+                            h_events = harmony_parser.process_tokens(token_ids)
+                            if finished:
+                                h_events.extend(harmony_parser.flush())
+                            for etype, edata in h_events:
+                                if etype == "reasoning":
+                                    if not _thinking_enabled:
+                                        yield "event: ping\ndata: " + json.dumps(
+                                            {"type": "ping"}
+                                        ) + "\n\n"
+                                        continue
+                                    if not started_thinking and not started_text:
+                                        yield stream_content_block_start(
+                                            block_index, "thinking"
+                                        )
+                                        started_thinking = True
+                                    if started_thinking:
+                                        yield stream_content_block_delta(
+                                            block_index, edata, "thinking"
+                                        )
+                                elif etype == "content":
+                                    if started_thinking and not started_text:
+                                        yield stream_signature_delta(block_index)
+                                        yield stream_content_block_stop(block_index)
+                                        block_index += 1
+                                    if not started_text:
+                                        yield stream_content_block_start(
+                                            block_index, "text"
+                                        )
+                                        started_text = True
+                                    yield stream_content_block_delta(
+                                        block_index, edata, "text"
+                                    )
+                                elif etype == "tool_call_start":
+                                    has_tool_calls = True
+                                    stop_reason = "tool_use"
+                                    if started_text:
+                                        yield stream_content_block_stop(block_index)
+                                        block_index += 1
+                                        started_text = False
+                                    elif started_thinking:
+                                        yield stream_signature_delta(block_index)
+                                        yield stream_content_block_stop(block_index)
+                                        block_index += 1
+                                        started_thinking = False
+                                    fn = edata.get("function", {})
+                                    yield stream_content_block_start(
+                                        block_index,
+                                        "tool_use",
+                                        tool_use_id=edata.get("id", ""),
+                                        tool_name=fn.get("name", ""),
+                                    )
+                                elif etype == "tool_call_args":
+                                    fn = edata.get("function", {})
+                                    yield stream_content_block_delta(
+                                        block_index,
+                                        fn.get("arguments", ""),
+                                        "tool_use",
+                                    )
+                                elif etype == "tool_call_end":
+                                    yield stream_content_block_stop(block_index)
+                                    block_index += 1
+
+                            if finished:
+                                if not started_text and not has_tool_calls:
+                                    if started_thinking:
+                                        yield stream_signature_delta(block_index)
+                                        yield stream_content_block_stop(block_index)
+                                        block_index += 1
+                                    yield stream_content_block_start(block_index, "text")
+                                    started_text = True
+                                if started_text:
+                                    yield stream_content_block_stop(block_index)
+                                yield stream_message_delta(stop_reason, output_tokens)
+                                yield stream_message_stop()
+                                break
+                            continue
 
                         # Phase 1: Reasoning filter
                         segments = reasoning_filter.process(new_text)
@@ -1486,10 +1658,32 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if final_output is None:
             raise RuntimeError("No output generated")
 
-        raw_text = final_output["text"]
-        reasoning_content, content_with_tools = separate_reasoning(raw_text)
-        content_text, tool_calls = parse_tool_calls(content_with_tools, openai_tools)
-        output_tokens = len(tokenizer.encode(raw_text))
+        if is_harmony_request:
+            from .harmony_parser import HarmonyStreamParser
+            from .tool_parser import ToolCall
+
+            h_parser = HarmonyStreamParser()
+            reasoning_content, content_text, h_tool_calls = h_parser.parse_full(
+                final_output.get("token_ids", [])
+            )
+            # Convert to ToolCall objects for build_anthropic_response
+            tool_calls = [
+                ToolCall(
+                    id=tc["id"],
+                    type="function",
+                    function=tc["function"],
+                )
+                for tc in h_tool_calls
+            ] if h_tool_calls else []
+        else:
+            raw_text = final_output["text"]
+            reasoning_content, content_with_tools = separate_reasoning(raw_text)
+            content_text, tool_calls = parse_tool_calls(
+                content_with_tools, openai_tools
+            )
+        output_tokens = final_output.get("num_tokens_output", 0) or len(
+            final_output.get("token_ids", [])
+        )
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         if not getattr(request, "thinking", None):
             reasoning_content = None
@@ -1497,7 +1691,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         return build_anthropic_response(
             request_id=request_id,
             model=model_name,
-            content_text=content_text,
+            content_text=content_text or "",
             reasoning_content=reasoning_content,
             tool_calls=tool_calls if tool_calls else None,
             input_tokens=input_tokens,
@@ -1643,6 +1837,17 @@ def main():
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
     model_name = args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
+
+    # Detect GPT-OSS models that require Harmony encoding
+    try:
+        from atom.config import get_hf_config
+
+        _hf_cfg = get_hf_config(args.model, args.trust_remote_code)
+        if getattr(_hf_cfg, "model_type", "") == "gpt_oss":
+            use_harmony = True
+            logger.info("GPT-OSS model detected: enabling Harmony tool calling")
+    except Exception:
+        pass
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
