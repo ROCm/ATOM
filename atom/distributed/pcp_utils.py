@@ -15,9 +15,26 @@ Ported from SGLang's DSA round-robin CP path
 
 import itertools
 import logging
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
+
+
+class PcpBalGroup(NamedTuple):
+    """One request group for PCP+TBO balanced prefill (PCP_TBO.md §12).
+
+    A prefill batch is split into request groups at request boundaries (never
+    inside a sequence); each group is processed as an independent non-TBO PCP
+    mini-batch (padded to a pcp multiple, round-robin striped, reindexed on its
+    own). Consumed by ModelRunner.run_model (per-group stripe / restore) and the
+    attn builder's `_build_ubatch_prefill_metadata_balanced` (slice + reindex).
+    """
+
+    req_start: int   # first request index of this group (inclusive)
+    req_stop: int    # last request index of this group (exclusive)
+    tok_start: int   # global token offset of the group's first token
+    tok_end: int     # global token offset past the group's last REAL token
+    pad_total: int   # tok count padded to a pcp multiple = pcp_pad_len(tok_end-tok_start, pcp)
 
 from aiter.dist.parallel_state import (
     get_pcp_group,

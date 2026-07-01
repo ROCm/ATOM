@@ -1469,7 +1469,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # model.forward entry round-robin-splits hidden/positions to 1/W, so the
         # per-query (per-token) metadata must be reduced to the SAME owned-query
         # set. Per-seq / KV-write fields stay full (every rank keeps full KV).
-        if pcp_is_enabled() and not batch.is_dummy_run:
+        # PCP+TBO balanced (§12): DEFER reindex to per-group in
+        # build_ubatch_prefill_metadata (each request group reindexed
+        # independently on its own pcp pad). Keep the FULL un-reindexed metadata
+        # here so build_ubatch can slice it per group.
+        _bal = getattr(self.model_runner, "_pcp_tbo_balanced_active", False)
+        if pcp_is_enabled() and not batch.is_dummy_run and not _bal:
             # Gate on `not is_dummy_run`: ForCausalLM.forward's round-robin-split is
             # skipped on dummy/warmup runs (_pcp_active() returns False there),
             # so reindexing metadata to 1/W here would pair full-size
@@ -1515,6 +1520,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         pcp_size = get_pcp_world_size()
         device = attn_metadata.batch_id_per_token.device
         # Pad to a multiple of pcp_size; dummy (pad) queries get zero-length KV.
+        # This runs on the non-TBO PCP path (full-batch reindex) and, under
+        # PCP+TBO balanced (§12), per request GROUP (each group reindexed
+        # independently on its own pcp pad). Either way the divisor is pcp_size.
         padded_total = pcp_pad_len(total_tokens, pcp_size)
         n_pad = padded_total - total_tokens
         owned_q = pcp_round_robin_query_indices(padded_total, pcp_size).to(device)
@@ -1605,8 +1613,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         padded_bs: int,
         ubatch_idx: int = 0,
     ) -> AttentionMetaData_DSV4:
-        """Split prefill AttentionMetaData for V4 TBO micro-batches."""
+        """Split prefill AttentionMetaData for V4 TBO micro-batches.
+
+        Two paths:
+        - PCP+TBO balanced (§12, current PCP+TBO scheme): dispatches to
+          `_build_ubatch_prefill_metadata_balanced(attn_metadata, ubatch_idx)`,
+          which derives the group from `model_runner._pcp_bal_groups[ubatch_idx]`
+          and **ignores `ub_slice` / `padded_bs`** (the group's request/token
+          ranges come from the PcpBalGroup, not the ub_slice).
+        - Non-balanced TBO (token-split, §11): uses `ub_slice` / `padded_bs`.
+        """
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+
+        # PCP+TBO balanced (§12): each ubatch = one request group processed as an
+        # independent non-TBO PCP mini-batch. Slice the FULL (un-reindexed)
+        # metadata to the group + call _apply_pcp_reindex on it (reuse the proven
+        # reindex). Bypasses the token-split rebuild path entirely.
+        if getattr(self.model_runner, "_pcp_tbo_balanced_active", False) and getattr(
+            self.model_runner, "_pcp_bal_groups", None
+        ) is not None:
+            return self._build_ubatch_prefill_metadata_balanced(
+                attn_metadata, ubatch_idx
+            )
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
         ub_attn.__class__ = AttentionMetaData_DSV4
@@ -1682,11 +1710,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 real_num_tokens,  # actual tokens only (excludes PCP dummy padding)
             )
 
-            # Option A: real_num_tokens == ub_num_tokens (no dummy, since
-            # _preprocess gates on n_prefill % (2*pcp)==0). All downstream
-            # functions receive ub_num_tokens consistently.
-            # Option B (arbitrary length, with dummy tokens) requires per-ubatch
-            # reindex — see PCP_TBO.md §11 for the full analysis and remaining work.
+            # Option B (PCP+TBO arbitrary length) — Path 3 (four steps).
+            # See PCP_TBO.md §11.7 for full analysis / path comparison.
+            #
+            # Step 1: _attach_v4_per_fwd_meta already received real_num_tokens.
+            # Extend batch_id_per_token from real_num_tokens to ub_num_tokens
+            # with -1 sentinel so downstream kernels that use batch_id_per_token
+            # see the correct padded size matching ub_num_tokens.
+            if real_num_tokens < ub_num_tokens and ub_attn.batch_id_per_token is not None:
+                dummy_count = ub_num_tokens - real_num_tokens
+                ub_attn.batch_id_per_token = torch.cat([
+                    ub_attn.batch_id_per_token,
+                    ub_attn.batch_id_per_token.new_full((dummy_count,), -1),
+                ])
+
+            # Step 2: indexer gets ub_num_tokens so indexer_meta matches Q shape.
+            # Model forward's Q tensor has ub_num_tokens rows; _score_topk_prefill
+            # requires seq_base.shape == topk_global.shape == ub_num_tokens.
             positions_gpu = var["positions"].gpu[ts.start : ts.stop]
             self._attach_v4_indexer_meta(
                 ub_attn,
@@ -1695,26 +1735,55 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 positions_gpu=positions_gpu,
             )
 
-            # start_pos = position of first token of each seq in this ubatch.
+            # Step 3: paged prefill meta uses real_num_tokens + clipped positions_np
+            # so that positions_arr and chunk_start_pt have matching sizes inside fn.
             ub_start_pos_per_seq_np = positions_np[ub_cu[:ub_num_reqs]]
-            ub_positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+            ub_positions_gpu = var["positions"].gpu[ts.start : ts.start + real_num_tokens]
             ub_block_tables_gpu = var["block_tables"].gpu[rs.start : rs.stop]
             ub_cu_q_per_seq_gpu = torch.from_numpy(
                 np.ascontiguousarray(ub_cu[:ub_num_reqs], dtype=np.int32)
             ).to(self.device, non_blocking=True)
             self._build_paged_prefill_meta(
                 ub_attn,
-                positions_np,
+                positions_np[:real_num_tokens],   # clip to real tokens only
                 ub_cu,
                 extend_lens_np,
                 ub_start_pos_per_seq_np,
                 ub_attn.state_slot_mapping_cpu,
                 ub_num_reqs,
-                ub_num_tokens,
+                real_num_tokens,
                 positions_gpu=ub_positions_gpu,
                 cu_q_per_seq_gpu=ub_cu_q_per_seq_gpu,
                 block_tables_gpu=ub_block_tables_gpu,
             )
+
+            # Step 4 (Option B): pad paged-prefill per-token ragged/dense
+            # buffers from real_num_tokens to ub_num_tokens so ALL per-token
+            # metadata matches the model-forward token count (x.size(0) =
+            # ub_num_tokens; kernels read T from tensor shapes, see §11.4/§11.7).
+            # _build_paged_prefill_meta above built them at real_num_tokens
+            # (it can't take ub_num_tokens directly — its internal
+            # np.repeat(batch_id) is real_num_tokens while positions_arr[:T]
+            # would be ub_num_tokens → shape mismatch). Append n_pad dummy
+            # queries: pcp_pad_indptr repeats the last prefix-sum (zero-length
+            # KV), pcp_pad_dense appends zeros (skip=0) — identical to
+            # _apply_pcp_reindex's dummy handling, so downstream kernels skip
+            # them via batch_id=-1. No-op when real==ub (ubatch0 / divisible).
+            n_pad_ub = ub_num_tokens - real_num_tokens
+            if n_pad_ub > 0:
+                for ind_attr in (
+                    "kv_indptr_prefix_swa",
+                    "kv_indptr_prefix_csa",
+                    "kv_indptr_prefix_hca",
+                    "kv_indptr_extend",
+                ):
+                    indptr = getattr(ub_attn, ind_attr, None)
+                    if indptr is not None:
+                        setattr(ub_attn, ind_attr, pcp_pad_indptr(indptr, n_pad_ub))
+                if ub_attn.skip_prefix_len_csa is not None:
+                    ub_attn.skip_prefix_len_csa = pcp_pad_dense(
+                        ub_attn.skip_prefix_len_csa, n_pad_ub
+                    )
         finally:
             bt[:ub_num_reqs] = saved_bt
             var["context_lens"].np[:ub_num_reqs] = saved_ctx
@@ -1738,6 +1807,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if ub_attn.cu_seqlens_k is not None:
             ub_attn.cu_seqlens_k = ub_cu_gpu
 
+        # NOTE: this token-split (§11) build path is retained for the non-balanced
+        # TBO+PCP case, but the current PCP+TBO scheme is b2+balanced (§12), which
+        # dispatches to `_build_ubatch_prefill_metadata_balanced` at the top of
+        # `build_ubatch_prefill_metadata` and never reaches here.
+
         # Clone all GPU tensors that are views into shared CpuGpuBuffers.
         # Without this, building the next ubatch overwrites this ubatch's
         # data via the same underlying buffer.
@@ -1755,6 +1829,139 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 im["n_committed_per_seq_gpu"] = im["n_committed_per_seq_gpu"].clone()
 
         return ub_attn
+
+    def _build_ubatch_prefill_metadata_balanced(
+        self,
+        attn_metadata: AttentionMetaData,
+        ubatch_idx: int,
+    ) -> AttentionMetaData_DSV4:
+        """PCP+TBO balanced (§12): build one request group's metadata as an
+        independent non-TBO PCP mini-batch.
+
+        `attn_metadata` is the FULL, UN-reindexed metadata (global). We slice it
+        to this group's requests + global token range, then run the proven
+        `_apply_pcp_reindex` on the group (pads the group to a pcp multiple and
+        round-robin strides to 1/pcp — matching run_model's per-group stripe).
+        Per-seq / KV-write fields (cu_seqlens_q, compress_plans, state_slot) stay
+        GLOBAL for the group (the compressor/swa_write see the group's full
+        all-gathered tokens), exactly as non-TBO PCP does for the whole batch.
+        """
+        from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
+        from atom.model_ops.v4_kernels import make_compress_plans
+
+        mr = self.model_runner
+        grp = mr._pcp_bal_groups[ubatch_idx]  # PcpBalGroup
+        rs0, rs1 = grp.req_start, grp.req_stop
+        gts, gte = grp.tok_start, grp.tok_end
+        H = grp.pad_total
+        group_bs = rs1 - rs0
+        group_total = gte - gts  # group's global token count (real, pre-pad)
+        device = self.device
+        var = mr.forward_vars
+        src = cast(AttentionMetaData_DSV4, attn_metadata)
+
+        # ---- base fields via split on the GROUP's GLOBAL token range ----
+        # full metadata is global, so a global token_slice slices cu_seqlens_q /
+        # slot_mapping / context_lens correctly (per-request, rebased).
+        g_slice = UBatchSlice(
+            request_slice=slice(rs0, rs1),
+            token_slice=slice(gts, gte),
+        )
+        ub = split_attn_metadata(attn_metadata, g_slice, group_bs)
+        ub.__class__ = AttentionMetaData_DSV4
+        # split_attn_metadata doesn't carry these: state drives prefill/decode
+        # dispatch; indexer_meta must be non-None so _apply_pcp_reindex rebuilds
+        # it for the group (it rebuilds from batch_id+positions, ignoring content).
+        ub.state = src.state
+        ub.indexer_meta = src.indexer_meta
+
+        # ---- per-seq DSV4 fields sliced by request ----
+        if src.state_slot_mapping is not None:
+            ub.state_slot_mapping = src.state_slot_mapping[rs0:rs1].contiguous()
+        if src.state_slot_mapping_cpu is not None:
+            ub.state_slot_mapping_cpu = src.state_slot_mapping_cpu[rs0:rs1]
+        if src.n_committed_csa_per_seq is not None:
+            ub.n_committed_csa_per_seq = src.n_committed_csa_per_seq[rs0:rs1].contiguous()
+        if src.n_committed_csa_per_seq_cpu is not None:
+            ub.n_committed_csa_per_seq_cpu = src.n_committed_csa_per_seq_cpu[rs0:rs1]
+        if src.n_committed_hca_per_seq_cpu is not None:
+            ub.n_committed_hca_per_seq_cpu = src.n_committed_hca_per_seq_cpu[rs0:rs1]
+
+        # ---- per-token DSV4 fields sliced by the GLOBAL token range [gts,gte) ----
+        owned = torch.arange(gts, gte, device=device)
+        for ind_attr, idx_attr in (
+            ("kv_indptr_prefix_swa", "kv_indices_prefix_swa"),
+            ("kv_indptr_prefix_csa", "kv_indices_prefix_csa"),
+            ("kv_indptr_prefix_hca", "kv_indices_prefix_hca"),
+            ("kv_indptr_extend", "kv_indices_extend"),
+        ):
+            indptr = getattr(src, ind_attr, None)
+            indices = getattr(src, idx_attr, None)
+            if indptr is None or indices is None:
+                continue
+            ni, nx = pcp_reindex_ragged(indptr, indices, owned)
+            # kv_indices_extend are ROW offsets into the per-fwd kv_full tensor.
+            # In the full metadata they index the WHOLE sequence's kv_full [0,T);
+            # for this group kv_full only holds the group's tokens (global order
+            # [gts,gte) → rows [0, gte-gts)), so rebase by gts. (prefix indices
+            # point into unified_kv by absolute cache slot — no rebase.) Balanced
+            # splits on request boundaries so each query's SWA window stays within
+            # its sequence (within the group) → row >= gts, rebased value >= 0.
+            if idx_attr == "kv_indices_extend" and nx.numel() > 0:
+                nx = nx - gts
+            setattr(ub, ind_attr, ni)
+            setattr(ub, idx_attr, nx)
+        # batch_id_per_token: slice + rebase global req id → group-local (keep -1).
+        if src.batch_id_per_token is not None:
+            bid = src.batch_id_per_token[gts:gte].clone()
+            ub.batch_id_per_token = torch.where(bid >= 0, bid - rs0, bid)
+        if src.skip_prefix_len_csa is not None:
+            ub.skip_prefix_len_csa = src.skip_prefix_len_csa[gts:gte].contiguous()
+        ub.swa_pages = src.swa_pages
+
+        # ---- compress_plans: group's GLOBAL per-request (compressor all-gathers
+        # the group to full order). Built from global cu / context_lens slices. ----
+        if self._unique_compress_ratios_overlap:
+            gcu = var["cu_seqlens_q"].np  # GLOBAL (not overwritten for balanced)
+            ext = (gcu[rs0 + 1 : rs1 + 1] - gcu[rs0:rs1]).astype(np.int32)
+            ctx = np.asarray(var["context_lens"].np[rs0:rs1], dtype=np.int32)
+            plan_bufs = self._get_ubatch_compress_plan_buffers(ubatch_idx)
+            ub.compress_plans = make_compress_plans(
+                np.ascontiguousarray(ext, dtype=np.int32),
+                np.ascontiguousarray(ctx, dtype=np.int32),
+                self._unique_compress_ratios_overlap,
+                plan_buffers=plan_bufs,
+                decode_capacity_per_ratio=None,
+            )
+        else:
+            ub.compress_plans = {}
+
+        # ---- reindex the group to 1/pcp (proven path) ----
+        # positions: group's GLOBAL positions (forward_vars stay global for
+        # balanced). _apply_pcp_reindex pads group_total to pcp + strides —
+        # matching run_model's per-group pcp_round_robin_split.
+        group_positions = var["positions"].gpu[gts:gte]
+        self._apply_pcp_reindex(ub, group_positions, group_bs, group_total)
+
+        # max_seqlen_q from the group's per-request extend lengths.
+        if ub.cu_seqlens_q is not None and group_bs > 0:
+            per_req_q = ub.cu_seqlens_q[1 : group_bs + 1] - ub.cu_seqlens_q[:group_bs]
+            if per_req_q.numel() > 0:
+                ub.max_seqlen_q = int(per_req_q.max().item())
+
+        # Clone GPU tensors that are slices/views into shared CpuGpuBuffers, so a
+        # later ubatch (or fwd) reusing the same buffer can't overwrite this
+        # ubatch's data (mirrors the non-balanced path's clones).
+        # n_committed_csa_per_seq is a view of src's shared buffer (the [rs0:rs1]
+        # .contiguous() slice above stays a view when already contiguous).
+        if ub.n_committed_csa_per_seq is not None:
+            ub.n_committed_csa_per_seq = ub.n_committed_csa_per_seq.clone()
+        if ub.indexer_meta is not None:
+            im = ub.indexer_meta
+            for k in ("cu_committed_gpu", "batch_id_per_token_gpu", "n_committed_per_seq_gpu"):
+                if im.get(k) is not None:
+                    im[k] = im[k].clone()
+        return ub
 
     def _attach_v4_per_fwd_meta(
         self,
