@@ -1306,6 +1306,28 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         md.skip_prefix_len_csa = empty.clone()
         return
 
+    # ----- Exact per-seq chunk start (sync-free; robust to spec-decode) ------
+    # chunk_start == the global position of each sequence's FIRST token this
+    # forward (== num_computed_tokens by definition). Derive it from the real
+    # per-token ``positions`` rather than ``seq_len - query_len``: in
+    # speculative-decode (MTP) mixed prefill+verify batches
+    # ``seq_lens_cpu_upper_bound`` can OVERESTIMATE seq_len, so
+    # ``seq_len - query_len`` exceeds a verify token's true position. That makes
+    # ``prefix_swa_count = chunk_start - swa_low`` exceed the window ``win``, and
+    # the index kernel (``BLOCK_N = next_pow2(win) == win``) only writes the
+    # first ``win`` slots, leaving the overflow slot UNINITIALIZED -> a garbage
+    # paged offset -> illegal memory access in sparse_attn_v4_paged_prefill.
+    # The first-token position is exact and guarantees token_pos_in_chunk >= 0
+    # for every token, capping prefix_swa_count at ``win``. Both the CPU indptr
+    # sizing below and the Triton scatter kernel read this same array, so they
+    # stay consistent.
+    lens_cs = np.diff(q_np[: num_reqs + 1]).astype(np.int64)
+    first_tok = q_np[:num_reqs].astype(np.int64)
+    chunk_start_seq = md.chunk_start_per_seq_cpu[:num_reqs].astype(np.int32).copy()
+    has_tok = lens_cs > 0
+    chunk_start_seq[has_tok] = pos_np[first_tok[has_tok]].astype(np.int32)
+    md.chunk_start_per_seq_cpu = chunk_start_seq
+
     # ----- Per-token counts (CPU numpy; cumsum gives indptr totals w/o D2H) ---
     chunk_start_pt = md.chunk_start_per_seq_cpu[batch_np]
     token_pos_in_chunk = pos_np - chunk_start_pt

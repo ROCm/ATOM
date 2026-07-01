@@ -576,6 +576,16 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         otherwise feed the post-logits hidden shape expected by older MTP
         models.
         """
+        # Prefer the persistent in-graph residual buffer on the native V4 model.
+        # It is refreshed by a captured `copy_` every forward (including FULL
+        # cudagraph replay), so the MTP draft always gets the current decode
+        # step's pre-hc_head residual. vLLM slices it to the active token count.
+        inner = getattr(self.model, "model", None)
+        buf = getattr(inner, "_mtp_hidden_buffer", None)
+        if buf is not None:
+            return buf
+
+        # Fallback (non-V4 / buffer unavailable): the cached residual tensor.
         hidden_states = self.__dict__.get("_mtp_target_hidden_states")
         if getattr(hidden_states, "dim", lambda: None)() == 3:
             hidden_states = hidden_states.flatten(1)
