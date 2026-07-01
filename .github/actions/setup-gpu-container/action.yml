@@ -1,0 +1,140 @@
+name: Setup GPU container
+description: >-
+  Start the ROCm CI container for test / accuracy jobs: clean up any old
+  container of the same name, resolve the render-device flag and optional
+  /models mount, write the model env-file, then docker run. De-inlined from the
+  identical "Start CI container" steps in atom-test and atomesh-accuracy-validation,
+  and also reused by atom-bench-container (which adds model download on top).
+  The caller handles checkout, GPU preflight, and container teardown.
+
+inputs:
+  container-name:
+    description: Name for the started container.
+    required: true
+  base-image:
+    description: Fallback image when no resolved image is provided (ATOM_BASE_IMAGE).
+    required: true
+  resolved-image:
+    description: Pre-resolved immutable image; takes precedence over base-image.
+    required: false
+    default: ""
+  runner:
+    description: >-
+      Job runner label (matrix.runner); drives the --pull policy when
+      pull-policy is unset. Optional — leave empty when pull-policy is given.
+    required: false
+    default: ""
+  pull-policy:
+    description: >-
+      Explicit docker run --pull policy (always/missing/never). When set it
+      takes precedence; when empty the runner-based heuristic below decides.
+    required: false
+    default: ""
+  env-vars:
+    description: Newline-separated KEY=VAL model env vars (written to an env-file).
+    required: false
+    default: ""
+  hf-token:
+    description: HuggingFace token, forwarded into the container.
+    required: false
+    default: ""
+  dashboard-image:
+    description: Value for the container's ATOM_DOCKER_IMAGE env var.
+    required: false
+    default: ""
+  network-host:
+    description: "'true' adds --network=host to docker run."
+    required: false
+    default: "false"
+  extra-run-flags:
+    description: Extra docker run flags injected verbatim before --env-file.
+    required: false
+    default: ""
+  disable-mmap:
+    description: >-
+      When 'true' (default) inject `-e ATOM_DISABLE_MMAP=true`. Set 'false' for
+      callers whose container never set it (e.g. mmstar) to stay byte-for-byte
+      equivalent.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Start CI container
+      shell: bash
+      env:
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+        MODEL_ENV_VARS: ${{ inputs.env-vars }}
+        HF_TOKEN: ${{ inputs.hf-token }}
+        CONTAINER_NAME: ${{ inputs.container-name }}
+        ATOM_BASE_IMAGE: ${{ inputs.base-image }}
+        RESOLVED_ATOM_BASE_IMAGE: ${{ inputs.resolved-image }}
+        ATOM_DASHBOARD_DOCKER_IMAGE: ${{ inputs.dashboard-image }}
+        RUNNER_LABEL: ${{ inputs.runner }}
+        PULL_POLICY: ${{ inputs.pull-policy }}
+        NETWORK_HOST: ${{ inputs.network-host }}
+        EXTRA_RUN_FLAGS: ${{ inputs.extra-run-flags }}
+        DISABLE_MMAP: ${{ inputs.disable-mmap }}
+      run: |
+        echo "Clean up containers..."
+        (docker ps -aq -f name="^${CONTAINER_NAME}$" | xargs -r docker stop) || true
+        (docker ps -aq -f name="^${CONTAINER_NAME}$" | xargs -r docker rm) || true
+
+        if [ -f "/etc/podinfo/gha-render-devices" ]; then
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+        else
+          DEVICE_FLAG="--device /dev/dri"
+        fi
+
+        if [ -d "/models" ]; then
+          MODEL_MOUNT="-v /models:/models"
+        else
+          echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
+          MODEL_MOUNT=""
+        fi
+
+        # Write env_vars via env block (avoids expression injection). Key the
+        # env-file by container name so concurrent containers on one runner
+        # (e.g. benchmark + regression) don't clobber each other's file.
+        ENV_FILE="/tmp/atom_${CONTAINER_NAME}_env.txt"
+        printenv MODEL_ENV_VARS | grep -v '^$' > "$ENV_FILE" || true
+
+        IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
+        echo "Starting container with image: $IMAGE_TAG"
+        echo "Model-specific environment variables:"
+        cat "$ENV_FILE"
+
+        PULL_FLAG=""
+        if [ -n "${PULL_POLICY:-}" ]; then
+          PULL_FLAG="--pull ${PULL_POLICY}"
+        elif [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
+          PULL_FLAG=""
+        elif [ "${RUNNER_LABEL}" = "atom-mi355-8gpu.predownload" ] || [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8" ]; then
+          PULL_FLAG="--pull always"
+        fi
+
+        NETWORK_FLAG=""
+        [ "${NETWORK_HOST}" = "true" ] && NETWORK_FLAG="--network=host"
+
+        MMAP_FLAG=""
+        [ "${DISABLE_MMAP}" = "true" ] && MMAP_FLAG="-e ATOM_DISABLE_MMAP=true"
+
+        docker run -dt $PULL_FLAG $NETWORK_FLAG --device=/dev/kfd $DEVICE_FLAG \
+        -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+        $MODEL_MOUNT \
+        -w /workspace \
+        --ipc=host --group-add video \
+        --shm-size=16G \
+        --privileged \
+        --cap-add=SYS_PTRACE \
+        -e HF_TOKEN="${HF_TOKEN:-}" \
+        -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
+        $EXTRA_RUN_FLAGS \
+        --env-file "$ENV_FILE" \
+        --security-opt seccomp=unconfined \
+        --ulimit memlock=-1 \
+        --ulimit stack=67108864 \
+        $MMAP_FLAG \
+        --name "$CONTAINER_NAME" \
+        $IMAGE_TAG

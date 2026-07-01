@@ -86,6 +86,7 @@ MODEL_ADAPTER_SPECS = {
         prepare_config=_prepare_kimi_k25_config,
         install_adapters=_install_deepseek_mla_adapters,
     ),
+    "Qwen3ForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3NextForCausalLM": SGLangModelAdapterSpec(
         wrapper_binds_gdn_context=True,
@@ -114,6 +115,7 @@ MODEL_ARCH_SPECS = {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "MiniMaxM2ForCausalLM",

@@ -6,9 +6,14 @@ from dataclasses import dataclass
 import torch
 
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
+from aiter.jit.utils.chip_info import get_gfx
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
+from atom.plugin.vllm.attention.layer_mla import (
+    disabled_mla_persistent_metadata,
+    mla_fold_kv_metadata_triton,
+)
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -132,16 +137,28 @@ class AiterMlaDecodeMetadataForVllm:
     attn_out_dtype: torch.dtype = torch.bfloat16
     # The max query output length: int
     max_qo_len: int | None = None
+    # Whether dense MLA persistent metadata was built for this decode batch.
+    use_persistent_metadata: bool = False
+    # The fold factor for handling mqa_ratio=64 in non-persistent mode
+    fold_factor: int | None = None
+    # Fold buffers for the MLA nhead-fold workaround. These are populated by
+    # the metadata builder outside the CUDA graph capture region
+    fold_kv_indptr: torch.Tensor | None = None
+    fold_kv_indices: torch.Tensor | None = None
+    fold_qo_indptr: torch.Tensor | None = None
+    fold_kv_last_page_len: torch.Tensor | None = None
 
 
 @dataclass
 class AiterMlaPersistentMetadataForVllm:
-    work_meta_data: torch.Tensor
-    work_indptr: torch.Tensor
-    work_info_set: torch.Tensor
-    reduce_indptr: torch.Tensor
-    reduce_final_map: torch.Tensor
-    reduce_partial_map: torch.Tensor
+    # All fields are None when persistent metadata is disabled
+    # (see disabled_mla_persistent_metadata()), e.g. under DP.
+    work_meta_data: torch.Tensor | None
+    work_indptr: torch.Tensor | None
+    work_info_set: torch.Tensor | None
+    reduce_indptr: torch.Tensor | None
+    reduce_final_map: torch.Tensor | None
+    reduce_partial_map: torch.Tensor | None
 
 
 @dataclass
@@ -160,6 +177,7 @@ class AiterMlaPrefillMetadataForVllm:
         workspace: torch.Tensor
         token_to_seq: torch.Tensor
         chunk_total_token: list[int]
+        prefill_tokens_with_context: int | None = None
 
         # for mla DCP
         padded_local_chunk_seq_lens: list[list[int]] | None = None
@@ -508,10 +526,6 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
-        num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
-        if num_computed_tokens_cpu is None:
-            num_computed_tokens_cpu = seq_lens - query_lens_cpu
-
         prefill_max_query_len = decode_max_query_len = (
             common_attn_metadata.max_query_len
         )
@@ -556,7 +570,11 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             num_extends_slice = slice(num_decodes, num_decodes + num_extends)
             query_lens_extend = query_lens_cpu[num_extends_slice]
             seq_lens_extend = seq_lens[num_extends_slice]
-            computed_kv_lens = num_computed_tokens_cpu[num_extends_slice]
+            # In DBO, the second ubatch's continuation request keeps the full
+            # seq_len but has its query_len reduced by split_attn_metadata, so
+            # use seq_len - query_len to correctly count the KV that precedes
+            # this ubatch's queries
+            computed_kv_lens = seq_lens_extend - query_lens_extend
 
             swa_metadata = None
             if self.aot_sliding_window is not None:
@@ -823,6 +841,10 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
+        self.dtype_kv = get_aiter_kv_cache_dtype(config)
+        # MLA decode path in ATOM-vLLM quantizes Q to FP8 when the KV cache is FP8,
+        # so aiter metadata must be sized/generated with the same dtype.
+        self.dtype_q = dtypes.fp8 if self.dtype_kv == dtypes.fp8 else torch.bfloat16
 
         self.paged_kv_last_page_len = torch.ones(
             max_num_reqs, dtype=torch.int32, device=device
@@ -846,8 +868,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             max_num_reqs,
             1,
             self.padded_num_attention_heads,
-            torch.bfloat16,
-            get_aiter_kv_cache_dtype(config),
+            self.dtype_q,
+            self.dtype_kv,
             is_sparse=False,
             fast_mode=True,
         )
@@ -874,6 +896,45 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 device=self.device,
             ),
         }
+
+        # Workaround for the missing MLA fp8/fp8 nhead=64 qseqlen=1
+        # non-persistent kernel on gfx950. Leverage the pre-existing
+        # 8-head non-persistent kernels, folding the q/o tensors to
+        # 8 heads
+        self._mla_fold_enabled = (
+            self.padded_num_attention_heads in [64, 32]
+            and self.dtype_kv == dtypes.fp8
+            and get_gfx() == "gfx950"
+        )
+        self._mla_fold_factor = (
+            self.padded_num_attention_heads // 8 if self._mla_fold_enabled else 1
+        )
+        # For 64-head fp8/fp8 qseqlen=1 MLA, use native persistent instead of fold
+        self._mla_dp_native_persistent_enabled = (
+            self._mla_fold_enabled
+            and self.padded_num_attention_heads == 64
+            and self.dtype_q == dtypes.fp8
+            and self.dtype_kv == dtypes.fp8
+        )
+
+        # Allocate the fold buffers for the nhead-folding workaround outside CUDA
+        # graph capture and refill them in `_build_decode`.
+        if self._mla_fold_enabled and not self._mla_dp_native_persistent_enabled:
+            fold_factor = self._mla_fold_factor
+            max_fold_bs = max_num_reqs * fold_factor
+            self.fold_kv_indptr = torch.zeros(
+                max_fold_bs + 1, dtype=torch.int32, device=device
+            )
+            self.fold_kv_indices = torch.empty(
+                max_num_pages * fold_factor, dtype=torch.int32, device=device
+            )
+            # qo_indptr and last_page_len are constant for qseqlen==1 decode.
+            self.fold_qo_indptr = torch.arange(
+                max_fold_bs + 1, dtype=torch.int32, device=device
+            )
+            self.fold_kv_last_page_len = torch.ones(
+                max_fold_bs, dtype=torch.int32, device=device
+            )
 
     # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
@@ -907,6 +968,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             reduce_final_map,
             reduce_partial_map,
             page_size=self.block_size,
+            dtype_q=self.dtype_q,
+            dtype_kv=self.dtype_kv,
             **split_params,
         )
         return {
@@ -981,12 +1044,57 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
-            num_reqs,
-            qo_indptr,
-            max_qo_len,
+        # Disable persistent MLA in DP mode: pre-computed metadata buffers
+        # are invalid when request counts vary across DP ranks each step.
+        dp_enabled = get_dp_group().world_size > 1
+        use_persistent_metadata = (not dp_enabled) or (
+            self._mla_dp_native_persistent_enabled and max_qo_len == 1
         )
-        self.mla_persistent_metadata.update(ctx_mla_ps)
+        if use_persistent_metadata:
+            ctx_mla_ps = self._set_mla_persistent_worker_buffers(
+                num_reqs,
+                qo_indptr,
+                max_qo_len,
+            )
+            self.mla_persistent_metadata.update(ctx_mla_ps)
+
+        fold_factor = (
+            self._mla_fold_factor
+            if (
+                self._mla_fold_enabled
+                and dp_enabled
+                and max_qo_len == 1
+                and not use_persistent_metadata
+            )
+            else None
+        )
+
+        fold_kv_indptr = fold_kv_indices = None
+        fold_qo_indptr = fold_kv_last_page_len = None
+        if fold_factor is not None and fold_factor > 1:
+            new_bs = num_reqs * fold_factor
+            # Keep the view sized to this step's worst case so aiter's
+            # non-persistent split heuristic sees avg_kv == max_seq_len.
+            # During full CUDA graph capture max_seq_len is max_model_len,
+            # which is the replay upper bound.
+            fold_kv_indices_len = num_reqs * max_seq_len * fold_factor
+            assert fold_kv_indices_len <= self.fold_kv_indices.numel(), (
+                f"fold_kv_indices overflow: need {fold_kv_indices_len}, "
+                f"have {self.fold_kv_indices.numel()}"
+            )
+            fold_kv_indptr = self.fold_kv_indptr[: new_bs + 1]
+            fold_kv_indices = self.fold_kv_indices[:fold_kv_indices_len]
+            fold_qo_indptr = self.fold_qo_indptr[: new_bs + 1]
+            fold_kv_last_page_len = self.fold_kv_last_page_len[:new_bs]
+
+            mla_fold_kv_metadata_triton(
+                paged_kv_indptr,
+                paged_kv_indices,
+                fold_kv_indptr,
+                fold_kv_indices,
+                fold_factor=fold_factor,
+                num_reqs=num_reqs,
+            )
 
         attn_metadata = AiterMlaDecodeMetadataForVllm(
             block_table=block_table_tensor,
@@ -998,6 +1106,12 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
             max_qo_len=max_qo_len,
             attn_out_dtype=self.decode_attn_out_dtype,
+            use_persistent_metadata=use_persistent_metadata,
+            fold_factor=fold_factor,
+            fold_kv_indptr=fold_kv_indptr,
+            fold_kv_indices=fold_kv_indices,
+            fold_qo_indptr=fold_qo_indptr,
+            fold_kv_last_page_len=fold_kv_last_page_len,
         )
 
         return attn_metadata
@@ -1053,17 +1167,29 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
         prefill_metadata = None
         if num_prefills > 0:
-            num_computed_tokens_cpu = (
-                common_attn_metadata.compute_num_computed_tokens().cpu()
-            )
-
             reqs_start = num_decodes  # prefill_start
 
-            context_lens_cpu = num_computed_tokens_cpu[reqs_start:num_reqs]
+            # In DBO, an ubatch can contain only part of a prefill request.
+            # Derive context lengths from the sliced CPU query lengths and
+            # seq_lens upper bound to match upstream vLLM's MLA builder,
+            # instead of forcing a device->host sync through
+            # compute_num_computed_tokens().
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
+            prefill_query_lens_cpu = (
+                query_start_loc_cpu[reqs_start + 1 : num_reqs + 1]
+                - query_start_loc_cpu[reqs_start:num_reqs]
+            )
+            context_lens_cpu = (
+                seq_lens_cpu[reqs_start:num_reqs] - prefill_query_lens_cpu
+            )
             max_context_len_cpu = context_lens_cpu.max().item()
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
             prefill_query_start_loc = (
                 query_start_loc[reqs_start:] - query_start_loc[reqs_start]
+            )
+            prefill_query_start_loc_cpu = (
+                query_start_loc_cpu[reqs_start:] - query_start_loc_cpu[reqs_start]
             )
 
             chunked_context_metadata = None
@@ -1190,6 +1316,11 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 chunked_context_metadata_cls = (
                     AiterMlaPrefillMetadataForVllm.AiterMlaChunkedContextMetadataForVllm
                 )
+                prefill_tokens_with_context = None
+                if num_prefills_with_context_cpu > 0:
+                    prefill_tokens_with_context = prefill_query_start_loc_cpu[
+                        num_prefills_with_context_cpu
+                    ].item()
                 if self.dcp_world_size > 1:
                     chunked_context_metadata = chunked_context_metadata_cls(
                         cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
@@ -1209,6 +1340,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
+                        prefill_tokens_with_context=prefill_tokens_with_context,
                     )
                 else:
                     chunked_context_metadata = chunked_context_metadata_cls(
@@ -1222,6 +1354,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         ),
                         chunk_total_token=chunk_total_token,
                         workspace=self.chunked_prefill_workspace,
+                        prefill_tokens_with_context=prefill_tokens_with_context,
                     )
 
                 assert (
@@ -1280,9 +1413,15 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
 
         # TODO: support mtp
-        persistent_metadata = AiterMlaPersistentMetadataForVllm(
-            **self.mla_persistent_metadata
+        use_persistent_metadata = (
+            decode_metadata is not None and decode_metadata.use_persistent_metadata
         )
+        ctx_mla_ps = (
+            self.mla_persistent_metadata
+            if use_persistent_metadata
+            else disabled_mla_persistent_metadata()
+        )
+        persistent_metadata = AiterMlaPersistentMetadataForVllm(**ctx_mla_ps)
 
         attn_metadata.persistent_metadata = persistent_metadata
         return attn_metadata
@@ -1346,48 +1485,20 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.paged_kv_last_page_len = torch.ones(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
-        self.paged_kv_indices = torch.zeros(
-            [max_num_batched_tokens * self.topk_tokens],
-            dtype=torch.int32,
-            device=device,
-        )
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
-        default_sfc = (
-            get_current_atom_config().compilation_config.static_forward_context
+        # The indexer writes topk indices to paged_kv_indices and sparse MLA reads
+        # from this buffer. The indexer module is shared across ubatches in DBO
+        # settings, so we bind a single shared buffer onto every indexer this builder
+        # serves and let other ubatches for the same layer reuse it so that sparse
+        # MLA doesn't read from unwritten per-builder buffers
+        self.paged_kv_indices = self._bind_shared_sparse_kv_indices(
+            layer_names,
+            config,
+            device,
+            max_num_batched_tokens * self.topk_tokens,
         )
-        vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
-        for layer_name in layer_names or []:
-            attention_prefix = (
-                layer_name[: -len(".attn")]
-                if layer_name.endswith(".attn")
-                else layer_name
-            )
-            indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
-            owner_atom_config = getattr(indexer_cache, "atom_config", None)
-            sfc = (
-                owner_atom_config.compilation_config.static_forward_context
-                if owner_atom_config is not None
-                else default_sfc
-            )
-            indexer = sfc.get(f"{attention_prefix}.indexer")
-            if indexer is not None:
-                indexer.sparse_kv_indices_buffer = self.paged_kv_indices
-            sparse_attn = sfc.get(attention_prefix)
-            if sparse_attn is not None and hasattr(
-                sparse_attn, "sparse_kv_indices_buffer"
-            ):
-                sparse_attn.sparse_kv_indices_buffer = self.paged_kv_indices
-            if indexer is None or sparse_attn is None:
-                logger.warning(
-                    "Sparse MLA buffer binding incomplete for %s "
-                    "(indexer=%s, sparse_attn=%s, owner_atom_config=%s)",
-                    attention_prefix,
-                    indexer is not None,
-                    sparse_attn is not None,
-                    owner_atom_config is not None,
-                )
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -1433,6 +1544,71 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self._prev_req_extent = 0
         self._prev_indices_extent = 0
         self._prev_metadata_key = None
+
+    def _bind_shared_sparse_kv_indices(self, layer_names, config, device, numel):
+        # Resolve and bind a single shared paged_kv_indices buffer.
+        # Reuse the buffer the other ubatch already bound if it exists, otherwise
+        # allocate a new one
+        default_sfc = (
+            get_current_atom_config().compilation_config.static_forward_context
+        )
+        vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
+
+        def _resolve_indexer(layer_name):
+            attention_prefix = (
+                layer_name[: -len(".attn")]
+                if layer_name.endswith(".attn")
+                else layer_name
+            )
+            indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
+            owner_atom_config = getattr(indexer_cache, "atom_config", None)
+            sfc = (
+                owner_atom_config.compilation_config.static_forward_context
+                if owner_atom_config is not None
+                else default_sfc
+            )
+            return (
+                attention_prefix,
+                sfc.get(f"{attention_prefix}.indexer"),
+                sfc.get(attention_prefix),
+                owner_atom_config,
+            )
+
+        # Reuse the buffer a sibling ubatch builder already bound onto the shared
+        # indexer module (the indexer's initial torch.empty(0) has numel 0, so the
+        # first builder allocates and later builders reuse). Reusing -- never
+        # re-allocating -- keeps the tensor identity stable for torch.compile and
+        # the device address stable for CUDA graphs.
+        shared_buffer = None
+        for layer_name in layer_names or []:
+            _, indexer, _, _ = _resolve_indexer(layer_name)
+            existing_buffer = getattr(indexer, "sparse_kv_indices_buffer", None)
+            if existing_buffer is not None and existing_buffer.numel() >= numel:
+                shared_buffer = existing_buffer
+                break
+        if shared_buffer is None:
+            shared_buffer = torch.zeros([numel], dtype=torch.int32, device=device)
+
+        for layer_name in layer_names or []:
+            attention_prefix, indexer, sparse_attn, owner_atom_config = (
+                _resolve_indexer(layer_name)
+            )
+            if indexer is not None:
+                indexer.sparse_kv_indices_buffer = shared_buffer
+            if sparse_attn is not None and hasattr(
+                sparse_attn, "sparse_kv_indices_buffer"
+            ):
+                sparse_attn.sparse_kv_indices_buffer = shared_buffer
+            if indexer is None or sparse_attn is None:
+                logger.warning(
+                    "Sparse MLA buffer binding incomplete for %s "
+                    "(indexer=%s, sparse_attn=%s, owner_atom_config=%s)",
+                    attention_prefix,
+                    indexer is not None,
+                    sparse_attn is not None,
+                    owner_atom_config is not None,
+                )
+        return shared_buffer
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         num_tokens = common_attn_metadata.num_actual_tokens
