@@ -417,11 +417,11 @@ python -m atom.benchmarks.benchmark_serving \
     --percentile-metrics="ttft,tpot,itl,e2el"
 ```
 
-### Online Quant Config for PD
+### Online Quant Config Reference
 
 The `--online_quant_config` flag converts attention and dense MLP linear weights
-to PTPC FP8 at load time. The `exclude_layer` list differs by model variant and
-parallelism mode:
+to PTPC FP8 at load time. It applies to all modes (standalone, PD, DPA).
+The `exclude_layer` list differs by model variant and parallelism mode:
 
 | Mode | Model | `exclude_layer` |
 |------|-------|-----------------|
