@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
 
 def deep_merge(*items: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, Any] = {}
@@ -31,6 +33,35 @@ def normalize_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def resolve_env_refs(value: str) -> str:
+    def expand_env(match: re.Match[str]) -> str:
+        name = match.group(1)
+        env_value = os.environ.get(name, "").strip()
+        if not env_value:
+            raise ValueError(f"Environment variable {name} is not set")
+        return env_value
+
+    return ENV_REF_RE.sub(expand_env, value)
+
+
+def resolve_nodes(value: Any) -> list[str]:
+    nodes: list[str] = []
+    for item in normalize_list(value):
+        text = str(item).strip()
+        expanded = resolve_env_refs(text)
+        nodes.extend(node.strip() for node in expanded.split(",") if node.strip())
+    return nodes
+
+
+def resolve_runner(runner_cfg: dict[str, Any]) -> dict[str, Any]:
+    runner = copy.deepcopy(runner_cfg)
+    for key in ("slurm_account", "slurm_partition", "slurm_submit_runner"):
+        value = runner.get(key)
+        if isinstance(value, str):
+            runner[key] = resolve_env_refs(value)
+    return runner
 
 
 def slug(value: str) -> str:
@@ -104,7 +135,7 @@ def build_cell(
             f"Only atom backend is currently supported, got {backend_name}"
         )
 
-    nodes = [str(node) for node in normalize_list(suite_cfg.get("nodes"))]
+    nodes = resolve_nodes(suite_cfg.get("nodes"))
     if len(nodes) < 2:
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} needs at least two nodes"
@@ -126,7 +157,9 @@ def build_cell(
         model_cfg.get("server", {}).get("common_args", {}),
         suite_cfg.get("server", {}).get("common_args", {}),
     )
-    runner_cfg = deep_merge(defaults.get("runner", {}), suite_cfg.get("runner", {}))
+    runner_cfg = resolve_runner(
+        deep_merge(defaults.get("runner", {}), suite_cfg.get("runner", {}))
+    )
     benchmark_cfg = deep_merge(
         defaults.get("benchmark", {}),
         suite_cfg.get("benchmark", {}),

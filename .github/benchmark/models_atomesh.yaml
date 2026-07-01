@@ -1,8 +1,8 @@
 defaults:
   runner:
-    slurm_account: amd-frameworks
-    slurm_partition: amd-frameworks
-    slurm_submit_runner: atomesh-cicd
+    slurm_account: "${ATOMESH_SLURM_ACCOUNT}"
+    slurm_partition: "${ATOMESH_SLURM_PARTITION}"
+    slurm_submit_runner: "${ATOMESH_SLURM_SUBMIT_RUNNER}"
     gpus_per_node: 8
     cpus_per_task: 114
     time_limit: "06:00:00"
@@ -67,7 +67,7 @@ models:
       smoke:
         - name: ds-v4-1p1d-tp8-smoke
           topology: 1p1d
-          nodes: [mia1-p02-g42, mia1-p02-g44]
+          nodes: "${ATOMESH_1P1D_NODES}"
           isl: [8192]
           osl: 1024
           concurrency: [4, 8]
@@ -77,7 +77,7 @@ models:
       nightly:
         - name: ds-v4-1p1d-tp8
           topology: 1p1d
-          nodes: [mia1-p02-g42, mia1-p02-g47]
+          nodes: "${ATOMESH_1P1D_NODES}"
           isl: [8192]
           osl: 1024
           concurrency: [64, 128]
@@ -85,7 +85,7 @@ models:
 
         - name: ds-v4-2p1d-dpa-tp8
           topology: 2p1d_dpa
-          nodes: [mia1-p02-g42, mia1-p02-g44, mia1-p02-g47]
+          nodes: "${ATOMESH_2P1D_NODES}"
           isl: [8192]
           osl: 1024
           concurrency: [256, 512]

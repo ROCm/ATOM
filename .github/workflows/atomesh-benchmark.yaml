@@ -17,8 +17,8 @@ on:
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
-    # Nightly at 03:00 Beijing time (19:00 UTC)
-    - cron: '0 19 * * *'
+    # Nightly at 00:01 Beijing time (16:01 UTC)
+    - cron: '1 16 * * *'
   workflow_dispatch:
     inputs:
       suite:
@@ -37,13 +37,45 @@ on:
       atomesh_image:
         description: 'Override ATOM docker image'
         required: false
-        default: ''
+        default: rocm/atom-dev:latest
+        type: string
+      atomesh_slurm_account:
+        description: 'Slurm account'
+        required: false
+        default: amd-frameworks
+        type: string
+      atomesh_slurm_partition:
+        description: 'Slurm partition'
+        required: false
+        default: amd-frameworks
+        type: string
+      atomesh_slurm_submit_runner:
+        description: 'GitHub runner label used to submit Slurm jobs'
+        required: false
+        default: atomesh-cicd
+        type: string
+      atomesh_1p1d_nodes:
+        description: 'Comma-separated ATOMesh 1P1D nodes'
+        required: false
+        default: mia1-p02-g42,mia1-p02-g44
+        type: string
+      atomesh_2p1d_nodes:
+        description: 'Comma-separated ATOMesh 2P1D nodes'
+        required: false
+        default: mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
         type: string
       run_model_benchmark:
         description: 'Run model Slurm benchmark for workflow_dispatch'
         required: false
         default: false
         type: boolean
+
+env:
+  ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account || 'amd-frameworks' }}
+  ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition || 'amd-frameworks' }}
+  ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || 'atomesh-cicd' }}
+  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes || 'mia1-p02-g42,mia1-p02-g44' }}
+  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47' }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
