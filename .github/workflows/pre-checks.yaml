@@ -62,3 +62,46 @@ jobs:
             -reporter=github-pr-review \
             -filter-mode=diff_context \
             -fail-on-error=true
+
+  validate-catalog:
+    name: Validate accuracy catalogs against schema
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Python environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip3 install jsonschema
+      - name: Validate catalogs
+        run: python3 .github/scripts/validate_catalog.py
+
+  unit-tests:
+    name: Run non-GPU unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs full history/tags for versioning
+      - name: Set up Python environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip3 install torch --index-url https://download.pytorch.org/whl/cpu
+          pip3 install -e .
+          pip3 install pytest msgpack quart
+      - name: Run unit tests
+        env:
+          UNIT_TEST_REPORT: unit-report.xml
+        run: bash .github/scripts/run_unit_tests.sh
+      - name: Upload JUnit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-report
+          path: unit-report.xml

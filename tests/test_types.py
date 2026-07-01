@@ -3,8 +3,6 @@
 
 """Unit tests for atom.kv_transfer.disaggregation.types dataclasses and ConnectorMetadata."""
 
-import pytest
-
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     RemoteAllocInfo,
@@ -125,11 +123,18 @@ class TestConnectorMetadata:
         assert meta.reqs_to_recv["req-a"].remote_engine_id == "engine-a"
         assert meta.reqs_to_recv["req-b"].remote_engine_id == "engine-b"
 
-    def test_missing_required_param_raises(self):
+    def test_missing_optional_param_defaults_to_none(self):
+        """_build_req_meta parses leniently via dict.get: absent fields become
+        None rather than raising, so the connector can tolerate partial
+        transfer-param payloads."""
         meta = ConnectorMetadata()
-        incomplete = {"remote_block_ids": [1]}  # missing many required fields
-        with pytest.raises(KeyError):
-            meta.add_new_req_to_recv("req-x", [0], incomplete)
+        incomplete = {"remote_block_ids": [1]}  # only one field present
+        meta.add_new_req_to_recv("req-x", [0], incomplete)
+        rm = meta.reqs_to_recv["req-x"]
+        assert rm.remote_block_ids == [1]
+        assert rm.remote_engine_id is None
+        assert rm.remote_host is None
+        assert rm.remote_port is None
 
     def test_defaults_for_optional_params(self):
         minimal = {
