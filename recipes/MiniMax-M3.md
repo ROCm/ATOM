@@ -301,6 +301,7 @@ python3 -m atom.entrypoints.openai_server \
     --max-num-seqs 256 \
     --max-num-batched-tokens 32768 \
     --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}' \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
     --no-enable_prefix_caching \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     2>&1 | tee prefill.log
@@ -333,6 +334,7 @@ python3 -m atom.entrypoints.openai_server \
     --max-num-seqs 256 \
     --max-num-batched-tokens 32768 \
     --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
     --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
     --no-enable_prefix_caching \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
@@ -415,6 +417,22 @@ python -m atom.benchmarks.benchmark_serving \
     --percentile-metrics="ttft,tpot,itl,e2el"
 ```
 
+### Online Quant Config for PD
+
+The `--online_quant_config` flag converts attention and dense MLP linear weights
+to PTPC FP8 at load time. The `exclude_layer` list differs by model variant and
+parallelism mode:
+
+| Mode | Model | `exclude_layer` |
+|------|-------|-----------------|
+| TP-only or DPA | MXFP4 | `"lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"` |
+| TP-only | MXFP8 | same as MXFP4 above |
+| DPA | MXFP8 | `"lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"` |
+
+The DPA + MXFP8 variant uses a broader exclude pattern (`*.gate.*`,
+`*.block_sparse_moe.experts*`) to avoid quantizing the MoE gate and expert
+weights that are already in FP8 format.
+
 ## PD Disaggregation — Multi-Node 2P+1D with DPA + TBO
 
 For high-concurrency workloads, scale out to **2 prefill instances + 1 decode
@@ -471,6 +489,7 @@ python3 -m atom.entrypoints.openai_server \
     --max-num-seqs 256 \
     --max-num-batched-tokens 32768 \
     --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}' \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
     --no-enable_prefix_caching \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     2>&1 | tee prefill.log
@@ -504,6 +523,7 @@ python3 -m atom.entrypoints.openai_server \
     --max-num-seqs 1024 \
     --max-num-batched-tokens 32768 \
     --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
     --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
     --no-enable_prefix_caching \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
