@@ -57,7 +57,7 @@ def resolve_nodes(value: Any) -> list[str]:
 
 def resolve_runner(runner_cfg: dict[str, Any]) -> dict[str, Any]:
     runner = copy.deepcopy(runner_cfg)
-    for key in ("slurm_account", "slurm_partition", "slurm_submit_runner"):
+    for key in ("slurm_account", "slurm_partition", "slurm_submit_runner", "log_root"):
         value = runner.get(key)
         if isinstance(value, str):
             runner[key] = resolve_env_refs(value)

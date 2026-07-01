@@ -54,6 +54,11 @@ on:
         required: false
         default: atomesh-cicd
         type: string
+      atomesh_log_root:
+        description: 'Root directory for ATOMesh Slurm logs'
+        required: false
+        default: /it-share/ATOMESH_LOG/
+        type: string
       atomesh_1p1d_nodes:
         description: 'Comma-separated ATOMesh 1P1D nodes'
         required: false
@@ -74,6 +79,7 @@ env:
   ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account || 'amd-frameworks' }}
   ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition || 'amd-frameworks' }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || 'atomesh-cicd' }}
+  ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root || '/it-share/ATOMESH_LOG/' }}
   ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes || 'mia1-p02-g42,mia1-p02-g44' }}
   ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47' }}
 

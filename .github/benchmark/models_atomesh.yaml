@@ -5,8 +5,8 @@ defaults:
     slurm_submit_runner: "${ATOMESH_SLURM_SUBMIT_RUNNER}"
     gpus_per_node: 8
     cpus_per_task: 114
-    time_limit: "06:00:00"
-    log_root: /it-share/ATOMESH_LOG/
+    time_limit: "08:00:00"
+    log_root: "${ATOMESH_LOG_ROOT}"
   benchmark:
     random_range_ratio: 0.8
     request_rate: inf
