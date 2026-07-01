@@ -46,9 +46,9 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
         self.forward_metadata = forward_batch
         is_draft_extend = bool(
-            getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
-                include_v2=True
-            )
+            getattr(
+                forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False
+            )(include_v2=True)
         )
         draft_extend_runner = getattr(
             self, "_atom_dsv4_draft_extend_graph_runner", None
@@ -93,9 +93,9 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
                 )
             )
         elif forward_batch.forward_mode.is_target_verify() or bool(
-            getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
-                include_v2=True
-            )
+            getattr(
+                forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False
+            )(include_v2=True)
         ):
             self.atom_v4_graph_metadata = (
                 build_atom_v4_verify_graph_metadata_from_sglang(
@@ -257,7 +257,9 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
         tokens_per_req = int(tokens_per_req)
         if positions is None:
             base = (seq_lens[:bs].to(torch.int64) - tokens_per_req).clamp_min_(0)
-            offsets = torch.arange(tokens_per_req, dtype=torch.int64, device=self.device)
+            offsets = torch.arange(
+                tokens_per_req, dtype=torch.int64, device=self.device
+            )
             positions = (base[:, None] + offsets[None, :]).reshape(-1)
         elif positions.shape[0] < bs * tokens_per_req:
             padded_positions = torch.zeros(
@@ -454,9 +456,11 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
         forward_mode = (
             ForwardMode.TARGET_VERIFY
             if is_target_verify_graph
-            else ForwardMode.DRAFT_EXTEND_V2
-            if is_draft_extend_graph
-            else ForwardMode.DECODE
+            else (
+                ForwardMode.DRAFT_EXTEND_V2
+                if is_draft_extend_graph
+                else ForwardMode.DECODE
+            )
         )
         self._cuda_graph_seq_len_fill_value = (
             max(tokens_per_req, 1024) if is_graph_extend else 1
@@ -565,9 +569,7 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
             req_pool_indices=buffers.req_pool_indices[: int(cuda_graph_bs)],
             seq_lens=buffers.seq_lens[: int(cuda_graph_bs)],
             seq_lens_cpu=(
-                seq_lens_cpu[: int(cuda_graph_bs)]
-                if seq_lens_cpu is not None
-                else None
+                seq_lens_cpu[: int(cuda_graph_bs)] if seq_lens_cpu is not None else None
             ),
             forward_mode=forward_mode,
             out_cache_loc=buffers.out_cache_loc[:total],

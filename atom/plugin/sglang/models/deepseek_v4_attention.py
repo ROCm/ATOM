@@ -12,7 +12,6 @@ import types
 import torch
 from torch import nn
 
-
 _draft_extend_fused_swa_ctx = contextvars.ContextVar(
     "atom_sglang_dsv4_draft_extend_fused_swa_ctx",
     default=None,
@@ -55,10 +54,14 @@ def _install_draft_extend_fused_swa_patch() -> None:
 
     def indexer_score_topk(self, q_fp8, weights, topk):
         fc = dsv4.get_forward_context()
-        if bool(getattr(fc.attn_metadata, "use_decode_indexer_for_verify_graph", False)):
+        if bool(
+            getattr(fc.attn_metadata, "use_decode_indexer_for_verify_graph", False)
+        ):
             indexer_meta = fc.attn_metadata.indexer_meta
             block_tables = fc.attn_metadata.block_tables
-            return self._score_topk_decode(q_fp8, weights, block_tables, indexer_meta, topk)
+            return self._score_topk_decode(
+                q_fp8, weights, block_tables, indexer_meta, topk
+            )
         return original_indexer_score_topk(self, q_fp8, weights, topk)
 
     def _score_topk_decode(self, q_fp8, weights, block_tables, indexer_meta, topk):
@@ -156,7 +159,9 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
             getattr(attn_md, "is_dsv4_draft_extend_graph", False)
         )
 
-        def call_original(x_arg: torch.Tensor, positions_arg: torch.Tensor) -> torch.Tensor:
+        def call_original(
+            x_arg: torch.Tensor, positions_arg: torch.Tensor
+        ) -> torch.Tensor:
             if not is_draft_extend_graph:
                 return self._sglang_v4_forward_impl(x_arg, positions_arg)
             token = _draft_extend_fused_swa_ctx.set(

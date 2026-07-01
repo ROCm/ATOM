@@ -39,6 +39,7 @@ __all__ = [
     "plugin_runtime_scope",
 ]
 
+
 class _ComputeLogitsHeadAdapter(nn.Module):
     """Expose ATOM `compute_logits` through SGLang's lm_head call contract."""
 

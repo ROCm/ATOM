@@ -365,12 +365,6 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         if allocator is not None:
             allocator.remap_blocks(block_pairs[:, 1], block_pairs[:, 0])
 
-        if _debug_enabled():
-            logger.info(
-                "ATOM V4 proxy relocated %d KV blocks for SGLang radix cache",
-                block_pairs.shape[0],
-            )
-
 
 def install_deepseek_v4_proxy_pool_patch() -> None:
     """Patch SGLang's DSV4 pool constructor before ModelRunner._init_pools().
@@ -806,6 +800,7 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         plan_buffers=bufs.plan_buffers,
         decode_capacity_per_ratio=bufs.decode_compress_cap,
     )
+
 
 def _get_extend_lens_cpu(
     forward_batch, positions: Optional[torch.Tensor] = None
@@ -1374,7 +1369,9 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.compress_plans = (
         _make_verify_graph_compress_plans(lens, seq_np, bufs)
         if is_draft_extend
-        else _make_verify_graph_compress_plans_from_positions(pos_np, batch_np, bs, bufs)
+        else _make_verify_graph_compress_plans_from_positions(
+            pos_np, batch_np, bs, bufs
+        )
     )
 
     win = int(md.swa_window)
@@ -1441,14 +1438,11 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         [np.zeros(1, dtype=np.int32), np.cumsum(n_csa, dtype=np.int32)]
     )
     cu_committed_cpu[-1] = max(int(cu_committed_cpu[-1]), 1)
-    cu_committed_gpu = bufs.stage(
-        bufs.indexer_cu_committed, cu_committed_cpu, bs + 1
-    )
+    cu_committed_gpu = bufs.stage(bufs.indexer_cu_committed, cu_committed_cpu, bs + 1)
     seq_base_cpu = cu_committed_cpu[batch_np].astype(np.int32)
-    visible_end_cpu = (
-        seq_base_cpu
-        + np.minimum((pos_np + 1) // 4, n_csa[batch_np]).astype(np.int32)
-    )
+    visible_end_cpu = seq_base_cpu + np.minimum(
+        (pos_np + 1) // 4, n_csa[batch_np]
+    ).astype(np.int32)
     seq_base_gpu = bufs.stage(bufs.indexer_seq_base, seq_base_cpu, total)
     visible_end_gpu = bufs.stage(bufs.indexer_cu_ends, visible_end_cpu, total)
     md.indexer_meta = {
@@ -1540,8 +1534,8 @@ def build_atom_v4_attention_metadata_from_sglang(
                 ]
             ).astype(np.int32)
         else:
-            pos_np = positions[: int(lens.sum())].detach().cpu().numpy().astype(
-                np.int32
+            pos_np = (
+                positions[: int(lens.sum())].detach().cpu().numpy().astype(np.int32)
             )
 
     total = int(lens.sum())
