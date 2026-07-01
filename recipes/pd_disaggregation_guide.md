@@ -4,6 +4,9 @@ Prefill-Decode disaggregation splits inference into two stages on separate nodes
 - **Producer** (prefill): runs prompt prefill, pushes KV cache via RDMA
 - **Consumer** (decode): receives KV cache, runs autoregressive decode
 
+Routing between clients and the P/D instances is handled by **atomesh**, a
+lightweight Rust router that replaces the legacy Python proxy.
+
 ## Prerequisites
 
 - Two nodes with AMD MI300X GPUs (8 GPUs each for TP=8)
@@ -95,118 +98,122 @@ export LOCAL_IP=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk '{print 
 echo "Local IP: ${LOCAL_IP}"
 ```
 
-### Step 1: Start Proxy (on producer node)
-
-The proxy handles routing between producer and consumer:
+### Step 1: Start Producer (prefill node)
 
 ```bash
-python -m atom.kv_transfer.disaggregation.proxy --port 10001
-```
-
-### Step 2: Start Producer (prefill node)
-
-```bash
-ATOM_DISABLE_MMAP=true \
-NCCL_SOCKET_IFNAME=lo \
 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-R1/ \
   --kv_cache_dtype fp8 \
   -tp 8 \
-  --server-port 8003 \
+  --server-port 8010 \
   --kv-transfer-config '{
     "kv_role": "kv_producer",
     "kv_connector": "mooncake",
-    "proxy_ip": "'"${LOCAL_IP}"'",
-    "proxy_ping_port": 36367,
-    "http_port": 8003
+    "handshake_port": 6301
   }' \
   2>&1 | tee producer.log
 ```
 
-### Step 3: Start Consumer (decode node)
-
-Replace `PRODUCER_IP` with the producer node's IP:
+### Step 2: Start Consumer (decode node)
 
 ```bash
-export PRODUCER_IP=<producer-node-ip>
-
-ATOM_DISABLE_MMAP=true \
-NCCL_SOCKET_IFNAME=lo \
 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-R1/ \
   --kv_cache_dtype fp8 \
   -tp 8 \
-  --server-port 8004 \
+  --server-port 8020 \
   --kv-transfer-config '{
     "kv_role": "kv_consumer",
     "kv_connector": "mooncake",
-    "proxy_ip": "'"${PRODUCER_IP}"'",
-    "proxy_ping_port": 36367,
-    "http_port": 8004
+    "handshake_port": 6301
   }' \
   2>&1 | tee consumer.log
 ```
+
+### Step 3: Start Router (atomesh)
+
+Once both servers are healthy, start the atomesh router on either node:
+
+```bash
+export PREFILL_IP=<prefill-node-ip>
+export DECODE_IP=<decode-node-ip>
+
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://${PREFILL_IP}:8010" \
+    --decode  "http://${DECODE_IP}:8020" \
+    --policy random \
+    --backend atom \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker
+```
+
+Send requests to the router at `http://<router-ip>:8000`.
 
 ## DeepSeek V4-Pro
 
 V4-Pro requires additional env vars for its hash-routed MoE to work correctly in PD mode.
 
-### Step 1: Start Proxy
-
-```bash
-python -m atom.kv_transfer.disaggregation.proxy --port 10001
-```
-
-### Step 2: Start Producer (prefill node)
+### Step 1: Start Producer (prefill node)
 
 ```bash
 export LOCAL_IP=<this-node-ip>
 
 AITER_BF16_FP8_MOE_BOUND=0 \
 ATOM_MOE_GU_ITLV=1 \
-ATOM_DISABLE_MMAP=true \
-NCCL_SOCKET_IFNAME=lo \
 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-V4-Pro/ \
   --kv_cache_dtype fp8 \
   -tp 8 \
-  --server-port 8003 \
+  --server-port 8010 \
   --kv-transfer-config '{
     "kv_role": "kv_producer",
     "kv_connector": "mooncake",
-    "proxy_ip": "'"${LOCAL_IP}"'",
-    "proxy_ping_port": 36367,
-    "http_port": 8003
+    "handshake_port": 6301
   }' \
   2>&1 | tee producer.log
 ```
 
-### Step 3: Start Consumer (decode node)
+### Step 2: Start Consumer (decode node)
 
 ```bash
-export PRODUCER_IP=<producer-node-ip>
-
 AITER_BF16_FP8_MOE_BOUND=0 \
 ATOM_MOE_GU_ITLV=1 \
-ATOM_DISABLE_MMAP=true \
-NCCL_SOCKET_IFNAME=eno0 \
 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-V4-Pro/ \
   --kv_cache_dtype fp8 \
   -tp 8 \
-  --server-port 8004 \
+  --server-port 8020 \
   --kv-transfer-config '{
     "kv_role": "kv_consumer",
     "kv_connector": "mooncake",
-    "proxy_ip": "'"${PRODUCER_IP}"'",
-    "proxy_ping_port": 36367,
-    "http_port": 8004
+    "handshake_port": 6301
   }' \
   2>&1 | tee consumer.log
+```
+
+### Step 3: Start Router (atomesh)
+
+```bash
+export PREFILL_IP=<prefill-node-ip>
+export DECODE_IP=<decode-node-ip>
+
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://${PREFILL_IP}:8010" \
+    --decode  "http://${DECODE_IP}:8020" \
+    --policy random \
+    --backend atom \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker
 ```
 
 V4-specific env vars:
@@ -295,14 +302,12 @@ rm -rf /root/.cache/atom/* 2>/dev/null || true
 
 python3 -m atom.entrypoints.openai_server \
     --model /data/models/MiniMax-M2.7/ \
-    --host 0.0.0.0 --server-port 8030 \
+    --host 0.0.0.0 --server-port 8010 \
     --trust-remote-code \
     -tp 2 \
-    --port 8006 \
     --kv_cache_dtype fp8 \
     --gpu-memory-utilization 0.75 \
-    --torch-profiler-dir /it-share/lirzhang/trace/prefill \
-    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"'"${NODE_IP}"'","handshake_port":6301}'
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}'
 ```
 
 **Decode (GPU 4,5 → node 1):**
@@ -322,20 +327,33 @@ rm -rf /root/.cache/atom/* 2>/dev/null || true
 
 python3 -m atom.entrypoints.openai_server \
     --model /data/models/MiniMax-M2.7/ \
-    --host 0.0.0.0 --server-port 8031 \
+    --host 0.0.0.0 --server-port 8020 \
     --trust-remote-code \
     -tp 2 \
-    --port 8007 \
     --kv_cache_dtype fp8 \
     --gpu-memory-utilization 0.75 \
-    --torch-profiler-dir /it-share/lirzhang/trace/decode \
-    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"'"${NODE_IP}"'","handshake_port":6302,"http_port":8041}'
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}'
+```
+
+**Router (atomesh):**
+
+```bash
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://${NODE_IP}:8010" \
+    --decode  "http://${NODE_IP}:8020" \
+    --policy random \
+    --backend atom \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker
 ```
 
 > Each process pins to the NUMA node local to its GPUs (`0,1`/`2,3` → node 0;
 > `4,5`/`6,7` → node 1). For a 2P1D / 1P2D mesh, bump every deterministic id
-> (`server-port`, `--port`, `handshake_port`, `http_port`) per extra process so
-> they don't collide.
+> (`server-port`, `handshake_port`) per extra process so they don't collide.
+> Send all client requests to the **router** endpoint (`http://<node-ip>:8000`).
 
 ### Indexing rule (important under HIP_VISIBLE_DEVICES masking)
 
@@ -378,11 +396,11 @@ hardcode `ATOM_NUMA_NODE`.
 
 ### Step 4: Validate Accuracy
 
-Run GSM8K evaluation against the consumer endpoint:
+Run GSM8K evaluation against the **router** endpoint:
 
 ```bash
 lm_eval --model local-chat-completions \
-  --model_args "model=DeepSeek-R1,base_url=http://${CONSUMER_IP}:8004/v1,tokenizer_backend=huggingface,pretrained=/data/models/DeepSeek-R1/" \
+  --model_args "model=DeepSeek-R1,base_url=http://${ROUTER_IP}:8000/v1,tokenizer_backend=huggingface,pretrained=/data/models/DeepSeek-R1/" \
   --tasks gsm8k_cot \
   --batch_size 1 \
   --limit 100 \

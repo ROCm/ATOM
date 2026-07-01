@@ -5,6 +5,9 @@ separate GPU instances. The prefill node computes KV caches and transfers
 them to the decode node via RDMA, so the decode node can skip prefill
 entirely and start generating tokens immediately.
 
+Routing between clients and the P/D instances is handled by **atomesh**, a
+lightweight Rust router.
+
 ## MORI (Modular RDMA Interface)
 
 The underlying KV cache transfer is powered by
@@ -30,37 +33,23 @@ independently reads its own KV slice, so the transfer is fully parallel
 across the tensor-parallel group.
 
 ```
-  Client ──▶ Proxy (:10001)
+  Client ──▶ Router (atomesh :8000)
                 │
                 ▼
          Prefill Node (kv_producer)     # 1. compute KV caches
                 │
                 ▼
-             Proxy                      # 2. receive block metadata
+         Decode Node (kv_consumer)      # 2. RDMA read KV, generate tokens
                 │
                 ▼
-         Decode Node (kv_consumer)      # 3. RDMA read KV, generate tokens
-                │
-                ▼
-             Proxy ──▶ Client           # 4. stream response back
+             Router ──▶ Client          # 3. stream response back
 ```
 
 ## How to Run
 
 ### TP-only Mode (Tensor Parallelism)
-```
-pip install msgpack msgspec quart
-```
 
-#### 1. Start the Proxy
-
-```bash
-python -m atom.kv_transfer.disaggregation.proxy
-# or with custom port:
-python -m atom.kv_transfer.disaggregation.proxy --port 10001
-```
-
-#### 2. Start the Prefill Node
+#### 1. Start the Prefill Node
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -68,10 +57,11 @@ python -m atom.entrypoints.openai_server \
   --model /path/to/model \
   --block-size 16 \
   -tp 8 \
-  --kv-transfer-config '{"kv_role":"kv_producer","proxy_ip":"<PROXY_IP>","proxy_ping_port":36367,"http_prt":8000}'
+  --server-port 8010 \
+  --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}'
 ```
 
-#### 3. Start the Decode Node
+#### 2. Start the Decode Node
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -79,13 +69,29 @@ python -m atom.entrypoints.openai_server \
   --model /path/to/model \
   --block-size 16 \
   -tp 8 \
-  --kv-transfer-config '{"kv_role":"kv_consumer","proxy_ip":"<PROXY_IP>","proxy_ping_port":36367,"http_prt":8000}'
+  --server-port 8020 \
+  --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}'
 ```
 
-#### 4. Send Requests (to the Proxy)
+#### 3. Start the Router (atomesh)
 
 ```bash
-curl -s http://<PROXY_IP>:10001/v1/completions \
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://<PREFILL_IP>:8010" \
+    --decode  "http://<DECODE_IP>:8020" \
+    --policy random \
+    --backend atom \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker
+```
+
+#### 4. Send Requests (to the Router)
+
+```bash
+curl -s http://<ROUTER_IP>:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt":"1 2 3 4 5","max_tokens":10,"temperature":0}'
 ```
@@ -103,21 +109,11 @@ Key differences from TP-only mode:
 - Set `MORI_SHMEM_MODE=ISOLATION` to separate MoRI (MoE all-to-all) and
   MORI-IO (KV transfer) symmetric heap memory pools — without this, the two
   subsystems compete for the same memory and cause OOM during warmup.
-- The prefill node reports its `dp_rank` back to the proxy so the decode node
-  knows which DP rank's KV cache to read.
 - Each decode DP rank binds MORI-IO sessions to **all** prefill DP ranks
   (not just its own), because any prefill DP rank may have processed the
   request.
 
-#### 1. Start the Proxy
-
-Same as TP-only:
-
-```bash
-python -m atom.kv_transfer.disaggregation.proxy --port 10001
-```
-
-#### 2. Start the Prefill Node
+#### 1. Start the Prefill Node
 
 ```bash
 export MORI_SHMEM_MODE=ISOLATION
@@ -127,12 +123,13 @@ python -m atom.entrypoints.openai_server \
   --model /path/to/model \
   --block-size 16 \
   -tp 8 \
+  --server-port 8010 \
   --enable-dp-attention \
   --enable-expert-parallel \
-  --kv-transfer-config '{"kv_role":"kv_producer","proxy_ip":"<PROXY_IP>","proxy_ping_port":36367,"http_prt":8000}'
+  --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}'
 ```
 
-#### 3. Start the Decode Node
+#### 2. Start the Decode Node
 
 ```bash
 export MORI_SHMEM_MODE=ISOLATION
@@ -142,17 +139,33 @@ python -m atom.entrypoints.openai_server \
   --model /path/to/model \
   --block-size 16 \
   -tp 8 \
+  --server-port 8020 \
   --enable-dp-attention \
   --enable-expert-parallel \
-  --kv-transfer-config '{"kv_role":"kv_consumer","proxy_ip":"<PROXY_IP>","proxy_ping_port":36367,"http_prt":8000}'
+  --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}'
+```
+
+#### 3. Start the Router (atomesh)
+
+```bash
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://<PREFILL_IP>:8010" \
+    --decode  "http://<DECODE_IP>:8020" \
+    --policy random \
+    --backend atom \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker
 ```
 
 #### 4. Send Requests
 
-Same as TP-only — requests go through the proxy:
+Same as TP-only — requests go through the router:
 
 ```bash
-curl -s http://<PROXY_IP>:10001/v1/completions \
+curl -s http://<ROUTER_IP>:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt":"1 2 3 4 5","max_tokens":10,"temperature":0}'
 ```
@@ -185,11 +198,8 @@ Example with tuning:
 --kv-transfer-config '{
   "kv_role": "kv_consumer",
   "kv_connector": "moriio",
-  "proxy_ip": "<RDMA_IP>",
-  "proxy_ping_port": 36367,
-  "http_port": 8004,
+  "handshake_port": 6301,
   "qp_per_transfer": 8,
   "num_worker_threads": 8
 }'
 ```
-

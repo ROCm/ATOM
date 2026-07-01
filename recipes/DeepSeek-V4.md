@@ -72,68 +72,69 @@ For V4-Flash-Base's HF `quantization_config = {"quant_method": "fp8", "fmt": "e4
 
 ### PD Disaggregation with Mooncake (Prefill/Decode Separation)
 
-Run prefill and decode on separate nodes with Mooncake RDMA KV cache transfer.
+Run prefill and decode on separate nodes with Mooncake RDMA KV cache transfer,
+routed through atomesh.
 
-#### 1. Start Proxy (on producer node)
-
-```bash
-python -m atom.kv_transfer.disaggregation.proxy --port 10001
-```
-
-#### 2. Start Producer (prefill node)
+#### 1. Start Producer (prefill node)
 
 ```bash
-export LOCAL_IP=<this-node-ip>
-
 AITER_BF16_FP8_MOE_BOUND=0 \
 ATOM_MOE_GU_ITLV=1 \
-ATOM_DISABLE_MMAP=true \
-NCCL_SOCKET_IFNAME=lo \
 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-V4-Pro/ \
   --kv_cache_dtype fp8 \
   -tp 8 \
-  --server-port 8003 \
+  --server-port 8010 \
   --kv-transfer-config '{
     "kv_role": "kv_producer",
     "kv_connector": "mooncake",
-    "proxy_ip": "'"${LOCAL_IP}"'",
-    "proxy_ping_port": 36367,
-    "http_port": 8003
+    "handshake_port": 6301
   }' \
   2>&1 | tee producer.log
 ```
 
-#### 3. Start Consumer (decode node)
+#### 2. Start Consumer (decode node)
 
 ```bash
-export PRODUCER_IP=<producer-node-ip>
-
 AITER_BF16_FP8_MOE_BOUND=0 \
 ATOM_MOE_GU_ITLV=1 \
-ATOM_DISABLE_MMAP=true \
-NCCL_SOCKET_IFNAME=eno0 \
 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-V4-Pro/ \
   --kv_cache_dtype fp8 \
   -tp 8 \
-  --server-port 8004 \
+  --server-port 8020 \
   --kv-transfer-config '{
     "kv_role": "kv_consumer",
     "kv_connector": "mooncake",
-    "proxy_ip": "'"${PRODUCER_IP}"'",
-    "proxy_ping_port": 36367,
-    "http_port": 8004
+    "handshake_port": 6301
   }' \
   2>&1 | tee consumer.log
 ```
 
-#### 4. Send Requests
+#### 3. Start Router (atomesh)
 
 ```bash
-curl -s http://${PRODUCER_IP}:10001/v1/completions \
+export PREFILL_IP=<prefill-node-ip>
+export DECODE_IP=<decode-node-ip>
+
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://${PREFILL_IP}:8010" \
+    --decode  "http://${DECODE_IP}:8020" \
+    --policy random \
+    --backend atom \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker
+```
+
+#### 4. Send Requests (to the Router)
+
+```bash
+curl -s http://<ROUTER_IP>:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt":"1 2 3 4 5","max_tokens":10,"temperature":0}'
 ```
