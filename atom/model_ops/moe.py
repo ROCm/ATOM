@@ -42,7 +42,6 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
-from atom.plugin.prepare import is_vllm
 from atom.model_ops.utils import (
     _has_module,
     atom_parameter,
