@@ -765,19 +765,62 @@ def _infer_atom_attn_state(common_attn_metadata, num_spec_tokens: int = 0):
     cudagraph (eager is unaffected because nothing is captured). Mirrors native
     ATOM, where the verify step is ``AttnState.DECODE`` with
     ``max_seqlen_q == num_spec_step + 1`` (deepseek_v4_attn.py:prepare_decode).
+
+    ``max_query_len`` alone is NOT sufficient, though. vLLM's batch reorder
+    (``reorder_batch_to_split_decodes_and_prefills``) groups by *scheduled token
+    count*, so a request whose current step has ``<= 1 + num_spec`` query tokens
+    but is still PREFILLING -- a fresh <=decode_q-token prompt (``num_computed ==
+    0``) or a chunked-prefill tail whose remaining tokens are ``<= decode_q``
+    (a "short extend") -- can sit in the same batch as real decodes. If the
+    batch has no longer prefill row to push ``max_query_len`` past ``decode_q``,
+    the ``max_q``-only test would misclassify it as DECODE and feed those
+    prefill rows through the fixed-shape paged decode path: ``_score_topk_decode``
+    reshapes ``[bs, next_n]`` assuming ONE uniform decode length (a ragged
+    ``[4,4,4,1]`` breaks the view) and a fresh row (no committed K) needs the
+    prefill index build, not the decode one. So gate DECODE on vLLM's own
+    uniform-decode predicate plus a prefill guard (see ``_is_pure_uniform_decode``),
+    using CPU-resident metadata only (NO H2D/D2H sync). A non-uniform or
+    prefill-containing batch cannot be a FULL-captured decode anyway (capture is
+    gated on ``batch_descriptor.uniform``), so routing it to PREFILL -- where
+    ``_populate_indexer``'s leading-uniform-decode split already peels the decode
+    prefix onto the paged path and folds the rest onto the dense path -- is both
+    correct and capture-safe.
     """
     from atom.utils.forward_context import AttnState
 
     if common_attn_metadata is None:
         return AttnState.PREFILL_NATIVE
-    max_q = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
     decode_q = 1 + max(0, int(num_spec_tokens))
-    if 1 <= max_q <= decode_q:
+    if _is_pure_uniform_decode(common_attn_metadata, decode_q):
         return AttnState.DECODE
     num_computed = getattr(common_attn_metadata, "_num_computed_tokens_cpu", None)
     if num_computed is not None and bool((num_computed > 0).any().item()):
         return AttnState.PREFILL_PREFIX
     return AttnState.PREFILL_NATIVE
+
+
+def _is_pure_uniform_decode(common_attn_metadata, decode_q: int) -> bool:
+    """True iff the batch is the exact uniform decode vLLM captures a graph for.
+
+    Reuses vLLM'sown uniform-decode definition (``GPUModelRunner._is_uniform_decode``):
+    ``max_query_len == decode_q`` and ``num_actual_tokens == decode_q * num_reqs``
+    -- pure scalars already on ``common_attn_metadata`` (padded decode rows are
+    also ``decode_q`` long, so the product identity still holds). That aligns our
+    DECODE state exactly with when vLLM dispatches its captured FULL decode graph.
+    Since the predicate is purely shape-based, it is paired with ``is_prefilling``
+    (a CPU bool ``num_computed < num_prompt``, padded rows zeroed) to reject a
+    fresh ``decode_q``-length prompt / extend that is uniform yet not a real
+    decode (no committed K -> needs the prefill index build, not paged decode).
+    """
+    num_reqs = int(getattr(common_attn_metadata, "num_reqs", 0) or 0)
+    if num_reqs <= 0:
+        return False
+    is_pref = getattr(common_attn_metadata, "is_prefilling", None)
+    if is_pref is not None and bool(is_pref[:num_reqs].any()):
+        return False
+    max_q = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
+    num_tokens = int(getattr(common_attn_metadata, "num_actual_tokens", 0) or 0)
+    return max_q == decode_q and num_tokens == decode_q * num_reqs
 
 
 def _counts_to_indptr(counts: np.ndarray) -> np.ndarray:
