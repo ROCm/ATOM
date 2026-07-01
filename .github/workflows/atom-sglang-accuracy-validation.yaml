@@ -119,11 +119,21 @@ on:
         required: false
         type: boolean
         default: false
-      run_mi308_all:
-        description: "Run all MI308 gsm8k accuracy cases on atom-mi308-8gpu-plugins-benchmark"
+      model_mi308:
+        description: "Manual MI308 accuracy model selection"
         required: false
-        type: boolean
-        default: false
+        type: choice
+        default: none
+        options:
+          - none
+          - all
+          - MI308 Qwen3.5-397B-A17B-FP8 TP4
+          - MI308 Qwen3.5-397B-A17B-FP8 TP8
+          - MI308 Qwen3.5-35B-A3B-FP8 TP1
+          - MI308 Qwen3-32B-FP8 TP1
+          - MI308 Qwen3-32B-FP8 TP8
+          - MI308 GLM-5.1-FP8 TP8
+          - MI308 DeepSeek-V4-Flash
       rebuild_atom_base_from_dockerfile:
         description: "Full build image before validation"
         required: false
@@ -199,7 +209,7 @@ jobs:
           RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GLM51_FP8_TP8: ${{ inputs.run_glm51_fp8_tp8 }}
           RUN_MI355_ALL: ${{ inputs.run_mi355_all }}
-          RUN_MI308_ALL: ${{ inputs.run_mi308_all }}
+          MODEL_MI308: ${{ inputs.model_mi308 || 'none' }}
           REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
         run: |
           set -euo pipefail
@@ -213,7 +223,7 @@ jobs:
 
           event = os.environ["GITHUB_EVENT_NAME"]
           run_mi355_all = os.environ.get("RUN_MI355_ALL", "").lower() == "true"
-          run_mi308_all = os.environ.get("RUN_MI308_ALL", "").lower() == "true"
+          model_mi308 = os.environ.get("MODEL_MI308", "none")
           models = [
               {
                   "toggle_env": "RUN_DSV4_PREFIX_CACHE_TP8",
@@ -406,7 +416,7 @@ jobs:
               },
           ]
 
-          # MI308 gsm8k accuracy: nightly schedule only (no workflow_dispatch inputs; GitHub limits 25 inputs).
+          # MI308 gsm8k accuracy: nightly schedule by default; manual runs select one case or all cases via model_mi308.
           mi308_models = [
               {
                   "model_name": "MI308 Qwen3.5-397B-A17B-FP8 TP4",
@@ -475,8 +485,12 @@ jobs:
           for model in models:
               toggle = model.get("toggle_env")
               if toggle is None:
-                  # MI308-only rows: nightly schedule, or manual when run_mi308_all is checked.
-                  enabled = (event != "workflow_dispatch") or run_mi308_all
+                  # MI308-only rows: all cases on nightly schedule; manual runs select one case or all cases.
+                  enabled = (
+                      event != "workflow_dispatch"
+                      or model_mi308 == "all"
+                      or model["model_name"] == model_mi308
+                  )
               else:
                   enabled = event != "workflow_dispatch" or run_mi355_all or os.environ.get(toggle, "").lower() == "true"
               if enabled:
