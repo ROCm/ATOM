@@ -159,6 +159,34 @@ jobs:
             --cell-json "$CELL_JSON" \
             --result-dir "$RESULT_DIR"
 
+      - name: Summarize ${{ matrix.id }} benchmark result
+        if: always()
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p atomesh-results
+          SUMMARY_PATH="atomesh-results/${MATRIX_ID}-summary.md"
+          DASHBOARD_INPUT="atomesh-results/${MATRIX_ID}-benchmark-action.json"
+
+          python3 .github/scripts/atomesh/process_result.py \
+            "atomesh-results/${MATRIX_ID}" \
+            --output "${DASHBOARD_INPUT}" \
+            --summary "${SUMMARY_PATH}" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          {
+            echo "## ${MATRIX_ID}"
+            echo
+            if [ -f "atomesh-results/${MATRIX_ID}.slurm-job-id" ]; then
+              echo "Slurm job: $(cat "atomesh-results/${MATRIX_ID}.slurm-job-id")"
+              echo
+            fi
+            cat "${SUMMARY_PATH}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cat "${SUMMARY_PATH}"
+
       - name: Upload model benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v7
