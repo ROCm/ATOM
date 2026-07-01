@@ -85,6 +85,50 @@ def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoder]:
     return _load_encoder_from_dir(_resolve_model_path(model_path))
 
 
+def _content_str(c: Any) -> str:
+    if isinstance(c, list):
+        return "\n".join(
+            b.get("text", "")
+            for b in c
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return c or ""
+
+
+def _normalize_for_v4(messages: List[dict], tools: Optional[List[dict]]) -> List[dict]:
+    """Prepare messages for DeepSeek-V4's ``encode_messages``.
+
+    Two things:
+    1. **Hoist system messages to the front.** Clients (notably Claude Code) send
+       a trailing ``system``-role message (its "skills" list) AFTER the user turn.
+       ``encode_messages`` only appends the ``<｜Assistant｜>`` generation marker
+       after a *user*/developer message, so a trailing system message leaves the
+       prompt ending mid-system-text and the model just *continues* it instead of
+       answering. Merging all system content into one leading system message keeps
+       the final turn a user turn, so the assistant marker is emitted.
+    2. **Attach tools** to that leading system message (``encode_messages`` reads
+       tool schemas from a system message's ``tools`` field).
+    Does not mutate the input.
+    """
+    sys_parts, others = [], []
+    for m in messages:
+        (sys_parts if m.get("role") == "system" else others).append(dict(m))
+
+    if not sys_parts and not tools:
+        return [dict(m) for m in messages]
+
+    merged = "\n\n".join(
+        s for s in (_content_str(m.get("content")) for m in sys_parts) if s
+    )
+    sys_msg: dict = {"role": "system", "content": merged}
+    for m in sys_parts:  # preserve any pre-attached tools
+        if m.get("tools"):
+            sys_msg["tools"] = m["tools"]
+    if tools:
+        sys_msg["tools"] = tools
+    return [sys_msg] + others
+
+
 def apply_chat_template(
     tokenizer: Any,
     custom_encoder: Optional[MessageEncoder],
@@ -97,18 +141,15 @@ def apply_chat_template(
 
     Dispatches to ``custom_encoder`` if one was discovered for this model,
     otherwise to ``tokenizer.apply_chat_template``. Jinja-only kwargs
-    (``tokenize``, ``add_generation_prompt``) are stripped on the custom
-    path; ``tools`` are forwarded only on the Jinja path (custom encoders
-    don't currently have a tools API — caller is warned and tools are
-    dropped).
+    (``tokenize``, ``add_generation_prompt``) are stripped on the custom path.
+    ``tools`` are supported on both paths: custom encoders (e.g. DeepSeek-V4's
+    ``encode_messages``) read tool schemas from a system message's ``tools``
+    field, so we attach them there before encoding.
     """
     if custom_encoder is not None:
         for k in ("tokenize", "add_generation_prompt"):
             kwargs.pop(k, None)
-        if tools:
-            logger.warning(
-                "tools= is not supported with the custom message encoder; ignoring."
-            )
+        messages = _normalize_for_v4(messages, tools)
         return custom_encoder(messages, **kwargs)
 
     kwargs["tokenize"] = False

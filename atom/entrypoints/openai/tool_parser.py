@@ -183,21 +183,155 @@ def _parse_qwen_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCal
     return content.strip(), tool_calls
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 DSML tool-call format
+# ---------------------------------------------------------------------------
+#
+#     <｜DSML｜tool_calls>
+#     <｜DSML｜invoke name="NAME">
+#     <｜DSML｜parameter name="PNAME" string="true|false">VALUE</｜DSML｜parameter>
+#     ...
+#     </｜DSML｜invoke>
+#     </｜DSML｜tool_calls>
+#
+# string="true"  -> value is a raw string; string="false" -> value is JSON.
+# DeepSeek-V4-Flash occasionally malforms this (singular ``tool_call``, a missing
+# ``invoke`` wrapper, or params without ``string=``); the parser recovers those
+# best-effort: it infers a dropped tool name from the parameter signature vs the
+# request's ``tools`` and infers a missing value type from the schema / JSON.
+
+_DSML = "｜DSML｜"
+# The model often DROPS the ``｜DSML｜`` marker and emits bare
+# ``<invoke name=...>``/``<parameter ...>``/``<tool_calls>`` tags, so the marker
+# is matched OPTIONALLY everywhere.
+_OPT = r"(?:" + re.escape(_DSML) + r")?"  # optional ｜DSML｜ prefix
+_DSML_PARAM_RE = re.compile(
+    r"<" + _OPT + r'parameter\s+name="(.*?)"(?:\s+string="(true|false)")?\s*>'
+    r"(.*?)</" + _OPT + r"parameter>",
+    re.DOTALL,
+)
+_DSML_INVOKE_RE = re.compile(
+    r"<" + _OPT + r'invoke\s+name="(.*?)"\s*>(.*?)</' + _OPT + r"invoke>",
+    re.DOTALL,
+)
+# Region-start markers, both marked and marker-less variants.
+_DSML_STARTS = (
+    "<" + _DSML + "tool_call",  # marked (covers tool_call / tool_calls)
+    "<" + _DSML + "invoke",  # marked invoke
+    "<invoke name=",  # marker-less invoke (common malform)
+    "<tool_calls>",  # marker-less section open
+)
+
+
+def _dsml_start(text: str) -> int:
+    """Index of the earliest DSML tool-call marker (marked or marker-less), or -1."""
+    positions = [i for i in (text.find(m) for m in _DSML_STARTS) if i != -1]
+    return min(positions) if positions else -1
+
+
+def _is_dsml(text: str) -> bool:
+    return _dsml_start(text) != -1
+
+
+def _dsml_coerce(value: str, string_attr: Optional[str], ptype: Any) -> Any:
+    if string_attr == "true":
+        return value
+    if string_attr == "false":
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    # attr absent -> use declared schema type if known, else infer via JSON.
+    if ptype is not None:
+        return _coerce_param_value(value, ptype)
+    v = value.strip()
+    try:
+        return json.loads(v)
+    except Exception:
+        return v
+
+
+def _infer_dsml_name(
+    arg_names: set, param_types: Dict[str, Dict[str, Any]]
+) -> Optional[str]:
+    """Pick the request tool whose parameter set best matches ``arg_names``."""
+    best, best_score = None, -1e9
+    for name, props in param_types.items():
+        p = set(props)
+        if not p:
+            continue
+        score = len(p & arg_names) - 0.1 * len(p ^ arg_names)
+        if score > best_score:
+            best_score, best = score, name
+    return best
+
+
+def _parse_dsml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+    """Parse DeepSeek-V4 DSML tool calls; return (leading_content, tool_calls)."""
+    param_types = _build_param_types(tools)
+    start = _dsml_start(text)
+    if start == -1:
+        return text.strip(), []
+    content = text[:start]
+    region = text[start:]
+
+    calls: List[Tuple[str, Dict[str, Any]]] = []
+    invokes = list(_DSML_INVOKE_RE.finditer(region))
+    if invokes:
+        for m in invokes:
+            name = m.group(1)
+            types = param_types.get(name, {})
+            args = {
+                pm.group(1): _dsml_coerce(
+                    pm.group(3), pm.group(2), types.get(pm.group(1))
+                )
+                for pm in _DSML_PARAM_RE.finditer(m.group(2))
+            }
+            calls.append((name, args))
+    else:
+        # malformed: no complete invoke wrapper -> collect params, infer tool name
+        raw = {
+            pm.group(1): (pm.group(3), pm.group(2))
+            for pm in _DSML_PARAM_RE.finditer(region)
+        }
+        if raw:
+            name = _infer_dsml_name(set(raw), param_types) or "unknown"
+            types = param_types.get(name, {})
+            args = {k: _dsml_coerce(v, s, types.get(k)) for k, (v, s) in raw.items()}
+            calls.append((name, args))
+
+    tool_calls = [
+        ToolCall(
+            id=_unique_tool_call_id(),
+            type="function",
+            function={"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        )
+        for name, args in calls
+    ]
+    if _DSML in content:  # scrub any stray marker fragment
+        content = content.split("<" + _DSML, 1)[0]
+    return content.strip(), tool_calls
+
+
 def parse_tool_calls(
     text: str, tools: Optional[list] = None
 ) -> Tuple[str, List[ToolCall]]:
     """Parse tool calls from model output text.
 
     Args:
-        text: Raw model output that may contain tool calls (Kimi token format
-            or Qwen3 XML format).
-        tools: Optional request tool definitions; used to type-coerce Qwen XML
-            parameter values to their declared JSON-Schema types.
+        text: Raw model output that may contain tool calls (DeepSeek-V4 DSML,
+            Kimi token format, or Qwen3 XML format).
+        tools: Optional request tool definitions; used to type-coerce parameter
+            values to their declared JSON-Schema types.
 
     Returns:
         Tuple of (content_text, list_of_tool_calls). ``content_text`` has the
         tool-call sections removed.
     """
+    # DeepSeek-V4 DSML format
+    if _is_dsml(text):
+        return _parse_dsml(text, tools)
+
     # Qwen3 XML format
     if _is_qwen_xml(text):
         return _parse_qwen_xml(text, tools)
@@ -277,13 +411,15 @@ class ToolCallStreamParser:
     current_index: int = 0
     _emitted_calls: int = 0
     tools: Optional[list] = None
-    fmt: Optional[str] = None  # None (undecided) | "kimi" | "qwen"
+    fmt: Optional[str] = None  # None (undecided) | "kimi" | "qwen" | "dsml"
 
     def process(self, text: str) -> list:
         """Process a text chunk and return list of (event_type, data) tuples."""
         if self.fmt is None:
             self.buf += text
-            if _QWEN_TOOL_PREFIX in self.buf or "<tool_call>" in self.buf:
+            if _is_dsml(self.buf):
+                self.fmt = "dsml"
+            elif _QWEN_TOOL_PREFIX in self.buf or "<tool_call>" in self.buf:
                 self.fmt = "qwen"
             elif "<|tool_calls_section_begin|>" in self.buf:
                 self.fmt = "kimi"
@@ -297,9 +433,71 @@ class ToolCallStreamParser:
             # Format decided: replay the accumulated buffer through the handler.
             text, self.buf = self.buf, ""
 
+        if self.fmt == "dsml":
+            return self._process_dsml(text)
         if self.fmt == "qwen":
             return self._process_qwen(text)
         return self._process_kimi(text)
+
+    # -- DeepSeek-V4 DSML ---------------------------------------------------
+    def _process_dsml(self, text: str) -> list:
+        results: list = []
+        self.buf += text
+        if self.state == 0:
+            m = _dsml_start(self.buf)
+            if m != -1:
+                before = self.buf[:m]
+                if before:
+                    results.append(("content", before))
+                self.buf = self.buf[m:]
+                self.state = 1
+            else:
+                # Emit content but hold back a possible partial '<...' marker tail.
+                cut = self.buf.rfind("<")
+                if cut == -1:
+                    if self.buf:
+                        results.append(("content", self.buf))
+                        self.buf = ""
+                elif cut > 0:
+                    results.append(("content", self.buf[:cut]))
+                    self.buf = self.buf[cut:]
+        return results
+
+    def _flush_dsml(self) -> list:
+        results: list = []
+        if self.state == 0:
+            if self.buf:
+                results.append(("content", self.buf))
+                self.buf = ""
+            return results
+        _content, tool_calls = _parse_dsml(self.buf, self.tools)
+        self.buf = ""
+        for tc in tool_calls:
+            results.append(
+                (
+                    "tool_call_start",
+                    {
+                        "index": self.current_index,
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function["name"], "arguments": ""},
+                    },
+                )
+            )
+            results.append(
+                (
+                    "tool_call_args",
+                    {
+                        "index": self.current_index,
+                        "function": {"arguments": tc.function["arguments"]},
+                    },
+                )
+            )
+            self.current_index += 1
+            self._emitted_calls += 1
+        if self._emitted_calls > 0:
+            results.append(("tool_call_end", None))
+        return results
 
     # -- Qwen3 XML ----------------------------------------------------------
     def _process_qwen(self, text: str) -> list:
@@ -449,6 +647,8 @@ class ToolCallStreamParser:
 
     def flush(self) -> list:
         """Flush remaining buffer content."""
+        if self.fmt == "dsml":
+            return self._flush_dsml()
         if self.fmt == "qwen":
             return self._flush_qwen()
         results = []
