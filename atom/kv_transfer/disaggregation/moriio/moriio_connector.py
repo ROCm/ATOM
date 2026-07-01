@@ -90,7 +90,6 @@ class MoRIIOConnector(KVConnectorBase):
 
         kv_transfer_config = config.kv_transfer_config
         self.local_ip = get_ip()
-        self._local_ping_port = get_open_port()
 
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
@@ -186,16 +185,6 @@ class MoRIIOConnector(KVConnectorBase):
 
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
-
-        # Start service-discovery ping (only on rank 0)
-        if self.tp_rank == 0 and self.dp_rank == 0:
-            self._ping_thread = threading.Thread(
-                target=self._service_discovery_ping,
-                args=(self.zmq_context,),
-                daemon=True,
-                name="kv-connector-ping",
-            )
-            self._ping_thread.start()
 
     def register_kv_caches(
         self,
@@ -640,67 +629,6 @@ class MoRIIOConnector(KVConnectorBase):
             remote_dp_rank,
             notify_port,
         )
-
-    def _service_discovery_ping(self, zmq_context: zmq.Context) -> None:
-        """Periodically register with the proxy for service discovery (rank 0 only)."""
-        http_endpoint = f"http://{self.request_address}/v1/completions"
-        role_code = "P" if self.is_producer else "D"
-        retry_count = 0
-        msg_index = 1
-        proxy_path = f"tcp://{self.proxy_ip}:{self.proxy_ping_port}"
-
-        with zmq_context.socket(zmq.DEALER) as sock:
-            sock.connect(proxy_path)
-
-            while True:
-                try:
-                    registration_data = {
-                        "type": "register",
-                        "role": role_code,
-                        "index": str(msg_index),
-                        "request_address": http_endpoint,
-                        "handshake_port": self.base_handshake_port,
-                        "dp_size": self.dp_size,
-                        "tp_size": self.tp_size,
-                        "transfer_mode": "read",
-                    }
-                    sock.send(msgpack.dumps(registration_data))
-                    logger.debug(
-                        "Ping #%d sent to %s (role=%s)",
-                        msg_index,
-                        proxy_path,
-                        role_code,
-                    )
-                    retry_count = 0
-
-                except ConnectionRefusedError:
-                    logger.info(
-                        "Proxy connection refused: %s:%s -> %s",
-                        self.local_ip,
-                        self._local_ping_port,
-                        proxy_path,
-                    )
-                    retry_count += 1
-
-                except OSError as e:
-                    logger.info("OS error during ping: %s", e)
-                    retry_count += 1
-
-                except Exception as e:
-                    logger.info("Unexpected ping error: %s", e)
-                    retry_count += 1
-                    if retry_count >= MoRIIOConstants.MAX_PING_RETRIES:
-                        logger.error(
-                            "Ping failed after %d retries, aborting",
-                            MoRIIOConstants.MAX_PING_RETRIES,
-                        )
-                        raise RuntimeError(
-                            f"Service discovery ping failed after {retry_count} retries"
-                        ) from e
-
-                finally:
-                    time.sleep(MoRIIOConstants.PING_INTERVAL_SECONDS)
-                    msg_index += 1
 
     def _handshake_listener(
         self,
