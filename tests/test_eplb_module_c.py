@@ -56,7 +56,9 @@ def test_build_logical_to_physical_map_rejects_rank_out_of_logical_range():
     p2l = torch.tensor([[0, 1, 1]], dtype=torch.int32)
     phyrank = torch.tensor([[0, 2, 0]], dtype=torch.int32)
     logcnt = torch.tensor([[1, 2]], dtype=torch.int32)
-    with pytest.raises(AssertionError, match="physical rank out of logical expert range"):
+    with pytest.raises(
+        AssertionError, match="physical rank out of logical expert range"
+    ):
         _build_logical_to_physical_map(p2l, phyrank, logcnt)
 
 
@@ -88,19 +90,43 @@ def test_rebalance_experts_global_invariants():
     "kwargs,err",
     [
         (
-            dict(num_physical=8, num_groups=3, num_nodes=1, num_gpus=4, enable_hierarchical=True),
+            dict(
+                num_physical=8,
+                num_groups=3,
+                num_nodes=1,
+                num_gpus=4,
+                enable_hierarchical=True,
+            ),
             "num_logical must be divisible by num_groups",
         ),
         (
-            dict(num_physical=8, num_groups=4, num_nodes=3, num_gpus=6, enable_hierarchical=True),
+            dict(
+                num_physical=8,
+                num_groups=4,
+                num_nodes=3,
+                num_gpus=6,
+                enable_hierarchical=True,
+            ),
             "num_groups must be divisible by num_nodes",
         ),
         (
-            dict(num_physical=8, num_groups=4, num_nodes=2, num_gpus=3, enable_hierarchical=True),
+            dict(
+                num_physical=8,
+                num_groups=4,
+                num_nodes=2,
+                num_gpus=3,
+                enable_hierarchical=True,
+            ),
             "num_gpus must be divisible by num_nodes",
         ),
         (
-            dict(num_physical=10, num_groups=4, num_nodes=2, num_gpus=4, enable_hierarchical=True),
+            dict(
+                num_physical=10,
+                num_groups=4,
+                num_nodes=2,
+                num_gpus=4,
+                enable_hierarchical=True,
+            ),
             "num_physical must be divisible by num_gpus",
         ),
     ],

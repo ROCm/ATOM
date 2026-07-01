@@ -2,6 +2,7 @@
 # Tests for atom/model_ops/eplb.py (Module-D migration planning/execution)
 
 import pytest
+from contextlib import contextmanager
 
 torch = pytest.importorskip("torch")
 
@@ -78,6 +79,36 @@ def test_migrate_single_layer_local_copy_only():
     assert temp[1, 0].item() == pytest.approx(10.0)
 
 
+def test_migrate_single_layer_runs_local_copy_on_given_stream(monkeypatch):
+    old_p2l = torch.tensor([0, 1], dtype=torch.int32)
+    new_p2l = torch.tensor([1, 0], dtype=torch.int32)
+    w = torch.tensor([[10.0], [20.0]], dtype=torch.float32)
+    temp = torch.zeros_like(w)
+    seen = {"stream": None}
+
+    @contextmanager
+    def _fake_stream_ctx(s):
+        seen["stream"] = s
+        yield
+
+    monkeypatch.setattr(torch.cuda, "stream", _fake_stream_ctx)
+    stream_obj = object()
+    eplb._migrate_single_layer(
+        routed_experts_weights=[w],
+        temp_buffers=[temp],
+        old_p2l_layer=old_p2l,
+        new_p2l_layer=new_p2l,
+        num_local_physical_experts=2,
+        num_gpu_per_node=1,
+        rank=0,
+        world_size=1,
+        ep_group=None,
+        p2p_batch_chunk_size=32,
+        cuda_stream=stream_obj,
+    )
+    assert seen["stream"] is stream_obj
+
+
 def test_effective_p2p_chunk_size_rocm_clamp():
     # ROCm forbids one-shot when requested >= num_logical_experts.
     out = eplb._effective_p2p_chunk_size(
@@ -107,7 +138,7 @@ def test_select_source_rank_prefers_same_node():
     assert src == 0
 
 
-def test_migrate_experts_chunk_reads_config_and_returns_none(monkeypatch):
+def test_migrate_experts_chunk_reads_config_and_returns_plan(monkeypatch):
     class _Meta:
         def __init__(self, p2l):
             self.physical_to_logical_map = p2l
@@ -130,7 +161,11 @@ def test_migrate_experts_chunk_reads_config_and_returns_none(monkeypatch):
     monkeypatch.setattr(
         atom_config,
         "get_current_atom_config",
-        lambda: type("Cfg", (), {"eplb_p2p_batch_chunk_size": 17})(),
+        lambda: type(
+            "Cfg",
+            (),
+            {"eplb_config": type("ECfg", (), {"p2p_batch_chunk_size": 17})()},
+        )(),
     )
 
     ret = eplb.migrate_experts_chunk(
@@ -144,5 +179,5 @@ def test_migrate_experts_chunk_reads_config_and_returns_none(monkeypatch):
         rank=0,
         p2p_batch_chunk_size=None,
     )
-    assert ret is None
+    assert ret == {0: []}
     assert called["chunk"] == 17

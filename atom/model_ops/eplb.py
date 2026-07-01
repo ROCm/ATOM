@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -49,21 +50,35 @@ def balanced_packing(
         num_items % num_packs == 0
     ), "num_items must be divisible by num_packs for equal-cardinality packing"
     cap = num_items // num_packs
-    pack_index = torch.empty_like(weight, dtype=torch.int32)
-    rank_in_pack = torch.empty_like(weight, dtype=torch.int32)
+    # Do all bookkeeping in Python lists (per-element tensor index/.item() carries
+    # dispatch overhead even on CPU); materialize tensors once at the end.
+    weight_rows = weight.cpu().tolist()
+    pack_index_rows: list[list[int]] = []
+    rank_in_pack_rows: list[list[int]] = []
     for l in range(num_layers):
-        # Descending by weight, tie-break by original index (stable argsort).
-        order = torch.argsort(weight[l], descending=True, stable=True).tolist()
+        wl = weight_rows[l]
+        # Descending by weight, tie-break by original index (stable).
+        order = sorted(range(num_items), key=lambda i: (-wl[i], i))
         loads = [0.0] * num_packs
         counts = [0] * num_packs
+        pi = [0] * num_items
+        rip = [0] * num_items
         for item in order:
-            candidates = [p for p in range(num_packs) if counts[p] < cap]
             # Deterministic tie-break: lower load, then lower count, then lower pack id.
-            best = min(candidates, key=lambda p: (loads[p], counts[p], p))
-            pack_index[l, item] = best
-            rank_in_pack[l, item] = counts[best]
+            best = min(
+                (p for p in range(num_packs) if counts[p] < cap),
+                key=lambda p: (loads[p], counts[p], p),
+            )
+            pi[item] = best
+            rip[item] = counts[best]
             counts[best] += 1
-            loads[best] += float(weight[l, item].item())
+            loads[best] += wl[item]
+        pack_index_rows.append(pi)
+        rank_in_pack_rows.append(rip)
+    pack_index = torch.tensor(pack_index_rows, dtype=torch.int32, device=weight.device)
+    rank_in_pack = torch.tensor(
+        rank_in_pack_rows, dtype=torch.int32, device=weight.device
+    )
     return pack_index, rank_in_pack
 
 
@@ -87,26 +102,34 @@ def replicate_experts(
     assert (
         num_physical >= num_logical
     ), "num_physical must be >= num_logical for replication"
-    logcnt = torch.ones((num_layers, num_logical), dtype=torch.int32, device=weight.device)
     extra = num_physical - num_logical
-    if extra > 0:
-        weight_f = weight.to(torch.float32)
-        for l in range(num_layers):
-            for _ in range(extra):
-                score = weight_f[l] / logcnt[l].to(torch.float32)
-                target = int(torch.argmax(score).item())
-                logcnt[l, target] += 1
-    phy2log = torch.empty((num_layers, num_physical), dtype=torch.int32, device=weight.device)
-    phyrank = torch.empty((num_layers, num_physical), dtype=torch.int32, device=weight.device)
+    weight_rows = weight.to(torch.float32).cpu().tolist()
+    logcnt_rows: list[list[int]] = []
+    phy2log_rows: list[list[int]] = []
+    phyrank_rows: list[list[int]] = []
     for l in range(num_layers):
+        wl = weight_rows[l]
+        cnt_l = [1] * num_logical
+        for _ in range(extra):
+            # Greedy: replicate the expert with the highest per-replica load.
+            target = max(range(num_logical), key=lambda e: wl[e] / cnt_l[e])
+            cnt_l[target] += 1
+        logcnt_rows.append(cnt_l)
+        p2l = [0] * num_physical
+        prank = [0] * num_physical
         k = 0
         for e in range(num_logical):
-            cnt = int(logcnt[l, e].item())
-            for r in range(cnt):
-                phy2log[l, k] = e
-                phyrank[l, k] = r
+            for r in range(cnt_l[e]):
+                p2l[k] = e
+                prank[k] = r
                 k += 1
         assert k == num_physical
+        phy2log_rows.append(p2l)
+        phyrank_rows.append(prank)
+    dev = weight.device
+    logcnt = torch.tensor(logcnt_rows, dtype=torch.int32, device=dev)
+    phy2log = torch.tensor(phy2log_rows, dtype=torch.int32, device=dev)
+    phyrank = torch.tensor(phyrank_rows, dtype=torch.int32, device=dev)
     return phy2log, phyrank, logcnt
 
 
@@ -122,27 +145,29 @@ def _build_logical_to_physical_map(
     ), "physical_rank shape must match physical_to_logical"
     _, num_logical = logcnt.shape
     cur = int(logcnt.max().item())
-    out = torch.full(
-        (num_layers, num_logical, cur),
-        -1,
-        dtype=torch.int32,
-        device=physical_to_logical.device,
-    )
+    p2l_rows = physical_to_logical.cpu().tolist()
+    prank_rows = physical_rank.cpu().tolist()
+    logcnt_rows = logcnt.cpu().tolist()
+    out_rows: list[list[list[int]]] = []
     for l in range(num_layers):
+        p2l_l = p2l_rows[l]
+        prank_l = prank_rows[l]
+        cnt_l = logcnt_rows[l]
+        row = [[-1] * cur for _ in range(num_logical)]
         for p in range(num_physical):
-            e = int(physical_to_logical[l, p].item())
-            rank = int(physical_rank[l, p].item())
-            max_rank = int(logcnt[l, e].item())
-            assert 0 <= rank < max_rank, "physical rank out of logical expert range"
-            assert out[l, e, rank] == -1, "duplicate physical rank for logical expert"
-            out[l, e, rank] = p
+            e = p2l_l[p]
+            rank = prank_l[p]
+            assert 0 <= rank < cnt_l[e], "physical rank out of logical expert range"
+            assert row[e][rank] == -1, "duplicate physical rank for logical expert"
+            row[e][rank] = p
         for e in range(num_logical):
-            need = int(logcnt[l, e].item())
+            need = cnt_l[e]
             if need == 0:
                 continue
-            got = int((out[l, e, :need] >= 0).sum().item())
+            got = sum(1 for r in range(need) if row[e][r] >= 0)
             assert got == need, "logical expert has missing physical ranks"
-    return out
+        out_rows.append(row)
+    return torch.tensor(out_rows, dtype=torch.int32, device=physical_to_logical.device)
 
 
 def _rebalance_single_layer_global(
@@ -157,7 +182,9 @@ def _rebalance_single_layer_global(
     phyrank_l = phyrank[0].clone()
     logcnt_l = logcnt[0].clone()
     # Step-3 pack physical slots onto GPUs (equal cardinality per GPU).
-    per_phy_load = weight_l.to(torch.float32)[phy2log_l] / logcnt_l[phy2log_l].to(torch.float32)
+    per_phy_load = weight_l.to(torch.float32)[phy2log_l] / logcnt_l[phy2log_l].to(
+        torch.float32
+    )
     pack_idx, rank_in_pack = balanced_packing(per_phy_load.view(1, -1), num_gpus)
     pack_idx = pack_idx[0].to(torch.int64)
     rank_in_pack = rank_in_pack[0].to(torch.int64)
@@ -196,9 +223,15 @@ def rebalance_experts(
     assert num_physical % num_gpus == 0, "num_physical must be divisible by num_gpus"
     assert num_physical >= num_logical
 
-    p2l = torch.empty((num_layers, num_physical), dtype=torch.int32, device=weight.device)
-    phyrank = torch.empty((num_layers, num_physical), dtype=torch.int32, device=weight.device)
-    logcnt = torch.zeros((num_layers, num_logical), dtype=torch.int32, device=weight.device)
+    p2l = torch.empty(
+        (num_layers, num_physical), dtype=torch.int32, device=weight.device
+    )
+    phyrank = torch.empty(
+        (num_layers, num_physical), dtype=torch.int32, device=weight.device
+    )
+    logcnt = torch.zeros(
+        (num_layers, num_logical), dtype=torch.int32, device=weight.device
+    )
 
     if not enable_hierarchical or num_groups == 1 or num_nodes == 1:
         for l in range(num_layers):
@@ -238,14 +271,16 @@ def rebalance_experts(
             logical_ids_per_node.append(node_logical)
 
         p2l_l = torch.empty((num_physical,), dtype=torch.int32, device=weight.device)
-        phyrank_l = torch.empty((num_physical,), dtype=torch.int32, device=weight.device)
+        phyrank_l = torch.empty(
+            (num_physical,), dtype=torch.int32, device=weight.device
+        )
         cnt_l = torch.zeros((num_logical,), dtype=torch.int32, device=weight.device)
 
         for node_id in range(num_nodes):
             node_logical_ids = logical_ids_per_node[node_id]
             node_weight = weight[l, node_logical_ids]
-            node_p2l_local, node_rank_local, node_cnt_local = _rebalance_single_layer_global(
-                node_weight, phy_per_node, gpus_per_node
+            node_p2l_local, node_rank_local, node_cnt_local = (
+                _rebalance_single_layer_global(node_weight, phy_per_node, gpus_per_node)
             )
             node_global_logical = torch.tensor(
                 node_logical_ids, dtype=torch.int64, device=weight.device
@@ -255,7 +290,9 @@ def rebalance_experts(
 
             # Map node-local physical index to global physical index.
             local_gpu = torch.div(
-                torch.arange(phy_per_node, device=weight.device), phy_per_gpu, rounding_mode="floor"
+                torch.arange(phy_per_node, device=weight.device),
+                phy_per_gpu,
+                rounding_mode="floor",
             )
             local_rank = torch.remainder(
                 torch.arange(phy_per_node, device=weight.device), phy_per_gpu
@@ -271,6 +308,299 @@ def rebalance_experts(
 
     l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
     return p2l, l2p, logcnt
+
+
+def _pad_logical_to_physical(
+    l2p_var: torch.Tensor, max_num_replicas: int
+) -> torch.Tensor:
+    """Pad module-C's variable-width [L, Lg, cur] map to fixed [L, Lg, R]."""
+    num_layers, num_logical, cur = l2p_var.shape
+    assert (
+        cur <= max_num_replicas
+    ), f"cur={cur} exceeds max_num_replicas={max_num_replicas}"
+    out = torch.full(
+        (num_layers, num_logical, max_num_replicas),
+        -1,
+        dtype=torch.int32,
+        device=l2p_var.device,
+    )
+    out[:, :, :cur] = l2p_var.to(torch.int32)
+    return out
+
+
+def _build_expert_map(
+    *,
+    num_layers: int,
+    num_physical: int,
+    num_local_physical: int,
+    ep_rank: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-rank physical-slot -> local index map ([L, P], -1 if not on this rank).
+
+    Physical slots are packed contiguously onto GPUs by module-C, so a rank owns
+    the contiguous block [ep_rank*num_local, (ep_rank+1)*num_local); this map is
+    layer-invariant but stored per-layer for uniform in-place commit.
+    """
+    expert_map = torch.full(
+        (num_layers, num_physical), -1, dtype=torch.int32, device=device
+    )
+    base = ep_rank * num_local_physical
+    local_ids = torch.arange(num_local_physical, dtype=torch.int32, device=device)
+    expert_map[:, base : base + num_local_physical] = local_ids.unsqueeze(0).expand(
+        num_layers, -1
+    )
+    return expert_map
+
+
+def _build_rank_dispatch_map(
+    *,
+    logical_to_physical_map: torch.Tensor,
+    logical_replica_count: torch.Tensor,
+    num_local_physical: int,
+    ep_rank: int,
+) -> torch.Tensor:
+    """Per-rank locality-aware replica choice ([L, Lg] -> physical slot id).
+
+    For each logical expert this rank picks ONE physical replica to dispatch to:
+    prefer a replica owned by this rank (local, no cross-GPU cost); otherwise
+    spread deterministically across replicas by `ep_rank % replica_count`.
+    """
+    num_layers, num_logical, _ = logical_to_physical_map.shape
+    device = logical_to_physical_map.device
+    l2p_rows = logical_to_physical_map.cpu().tolist()
+    cnt_rows = logical_replica_count.cpu().tolist()
+    out_rows: list[list[int]] = []
+    for l in range(num_layers):
+        l2p_l = l2p_rows[l]
+        cnt_l = cnt_rows[l]
+        row = [0] * num_logical
+        for e in range(num_logical):
+            cnt = cnt_l[e]
+            assert cnt >= 1, "every logical expert must have >= 1 replica"
+            reps = l2p_l[e]
+            chosen = -1
+            for i in range(cnt):
+                p = reps[i]
+                if p // num_local_physical == ep_rank:
+                    chosen = p
+                    break
+            if chosen < 0:
+                chosen = reps[ep_rank % cnt]
+            row[e] = chosen
+        out_rows.append(row)
+    return torch.tensor(out_rows, dtype=torch.int32, device=device)
+
+
+@dataclass
+class ExpertLocationMetadata:
+    """Central EPLB shared state: physical/logical placement maps.
+
+    Base maps (module-C output, deterministic & identical across ranks):
+      - physical_to_logical_map [L, P]        physical slot -> logical expert
+      - logical_to_physical_map [L, Lg, R]    logical -> physical replicas (-1 padded to R)
+      - logical_replica_count   [L, Lg]       replicas per logical (<= R)
+    Per-rank derived maps (base maps + EP topology):
+      - expert_map                            [L, P]  physical slot -> local index (-1 non-local)
+      - logical_to_rank_dispatch_physical_map [L, Lg] this rank's chosen replica per logical
+
+    R = max_num_replicas is the init-fixed budget (num_redundant + 1); tensors keep
+    fixed addresses so `update` can write in place (copy_) under cudagraph capture.
+    """
+
+    num_layers: int
+    num_logical_experts: int
+    num_physical_experts: int
+    max_num_replicas: int
+    ep_size: int
+    ep_rank: int
+    num_local_physical_experts: int
+    physical_to_logical_map: torch.Tensor
+    logical_to_physical_map: torch.Tensor
+    logical_replica_count: torch.Tensor
+    expert_map: torch.Tensor
+    logical_to_rank_dispatch_physical_map: torch.Tensor
+
+    def __post_init__(self) -> None:
+        L, P = self.num_layers, self.num_physical_experts
+        Lg, R = self.num_logical_experts, self.max_num_replicas
+        assert self.physical_to_logical_map.shape == (L, P)
+        assert self.logical_to_physical_map.shape == (L, Lg, R)
+        assert self.logical_replica_count.shape == (L, Lg)
+        assert self.expert_map.shape == (L, P)
+        assert self.logical_to_rank_dispatch_physical_map.shape == (L, Lg)
+        assert P == self.ep_size * self.num_local_physical_experts
+
+    @classmethod
+    def from_rebalance_result(
+        cls,
+        *,
+        physical_to_logical_map: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+        ep_size: int,
+        ep_rank: int,
+        max_num_replicas: int,
+    ) -> "ExpertLocationMetadata":
+        """Assemble metadata from module-C output (pad + derive per-rank maps)."""
+        num_layers, num_physical = physical_to_logical_map.shape
+        _, num_logical = logical_replica_count.shape
+        assert num_physical % ep_size == 0, "num_physical must be divisible by ep_size"
+        num_local = num_physical // ep_size
+        l2p_padded = _pad_logical_to_physical(logical_to_physical_map, max_num_replicas)
+        expert_map = _build_expert_map(
+            num_layers=num_layers,
+            num_physical=num_physical,
+            num_local_physical=num_local,
+            ep_rank=ep_rank,
+            device=physical_to_logical_map.device,
+        )
+        dispatch = _build_rank_dispatch_map(
+            logical_to_physical_map=l2p_padded,
+            logical_replica_count=logical_replica_count,
+            num_local_physical=num_local,
+            ep_rank=ep_rank,
+        )
+        return cls(
+            num_layers=num_layers,
+            num_logical_experts=num_logical,
+            num_physical_experts=num_physical,
+            max_num_replicas=max_num_replicas,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            num_local_physical_experts=num_local,
+            physical_to_logical_map=physical_to_logical_map.contiguous().to(
+                torch.int32
+            ),
+            logical_to_physical_map=l2p_padded,
+            logical_replica_count=logical_replica_count.contiguous().to(torch.int32),
+            expert_map=expert_map,
+            logical_to_rank_dispatch_physical_map=dispatch,
+        )
+
+    @classmethod
+    def from_trivial(
+        cls,
+        *,
+        num_layers: int,
+        num_logical_experts: int,
+        num_physical_experts: Optional[int] = None,
+        ep_size: int,
+        ep_rank: int,
+        device: Optional[torch.device] = None,
+    ) -> "ExpertLocationMetadata":
+        """Initial placement following the SGLang/vllm convention.
+
+        Physical slot i maps to logical expert i % num_logical_experts.
+        Redundant slots are assigned valid logical experts immediately (no -1
+        cold-start gap), matching the round-robin used by both SGLang
+        (init_trivial) and vllm (build_initial_global_physical_to_logical_map).
+        """
+        dev = device if device is not None else torch.device("cpu")
+        num_physical = (
+            num_logical_experts
+            if num_physical_experts is None
+            else int(num_physical_experts)
+        )
+        assert num_physical >= num_logical_experts
+        num_redundant = num_physical - num_logical_experts
+
+        # p2l: slot i → logical i % num_logical (round-robin)
+        p2l = (
+            torch.arange(num_physical, dtype=torch.int32, device=dev)
+            .remainder(num_logical_experts)
+            .unsqueeze(0)
+            .expand(num_layers, -1)
+            .contiguous()
+        )
+
+        # logcnt: first num_redundant experts get 2 replicas, rest get 1
+        logcnt = torch.ones(
+            (num_layers, num_logical_experts), dtype=torch.int32, device=dev
+        )
+        if num_redundant > 0:
+            logcnt[:, :num_redundant] = 2
+
+        # l2p: [num_layers, num_logical, actual_max_replicas]
+        # slot e → expert e (primary); slot e+num_logical → expert e (redundant, if e < num_redundant)
+        actual_max = 2 if num_redundant > 0 else 1
+        l2p = torch.full(
+            (num_layers, num_logical_experts, actual_max),
+            -1,
+            dtype=torch.int32,
+            device=dev,
+        )
+        l2p[:, :, 0] = (
+            torch.arange(num_logical_experts, dtype=torch.int32, device=dev)
+            .unsqueeze(0)
+            .expand(num_layers, -1)
+        )
+        if num_redundant > 0:
+            extra = torch.arange(
+                num_logical_experts,
+                num_logical_experts + num_redundant,
+                dtype=torch.int32,
+                device=dev,
+            )
+            l2p[:, :num_redundant, 1] = extra.unsqueeze(0).expand(num_layers, -1)
+
+        return cls.from_rebalance_result(
+            physical_to_logical_map=p2l,
+            logical_to_physical_map=l2p,
+            logical_replica_count=logcnt,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            max_num_replicas=num_redundant + 1,
+        )
+
+    def update(self, other: "ExpertLocationMetadata", layer_ids: list[int]) -> None:
+        """In-place atomic commit of all maps for the given layers (module-E §5).
+
+        Same-shape copy_ into fixed-address live tensors (cudagraph-safe). Both
+        metas must share num_logical / num_physical / max_num_replicas / ep_rank.
+        """
+        assert (
+            self.max_num_replicas == other.max_num_replicas
+        ), "max_num_replicas budget mismatch (live vs new)"
+        assert self.physical_to_logical_map.shape == other.physical_to_logical_map.shape
+        assert self.logical_to_physical_map.shape == other.logical_to_physical_map.shape
+        assert self.ep_rank == other.ep_rank, "per-rank maps must be same rank"
+        for layer_id in layer_ids:
+            self.physical_to_logical_map[layer_id].copy_(
+                other.physical_to_logical_map[layer_id]
+            )
+            self.logical_to_physical_map[layer_id].copy_(
+                other.logical_to_physical_map[layer_id]
+            )
+            self.logical_replica_count[layer_id].copy_(
+                other.logical_replica_count[layer_id]
+            )
+            self.expert_map[layer_id].copy_(other.expert_map[layer_id])
+            self.logical_to_rank_dispatch_physical_map[layer_id].copy_(
+                other.logical_to_rank_dispatch_physical_map[layer_id]
+            )
+
+
+def physical_load_to_logical_load(
+    physical_load: torch.Tensor,
+    physical_to_logical_map: torch.Tensor,
+    num_logical_experts: int,
+) -> torch.Tensor:
+    """Fold [layers, physical] load into [layers, logical] by live placement."""
+    assert physical_load.dim() == 2
+    assert physical_to_logical_map.shape == physical_load.shape
+    out = torch.zeros(
+        (physical_load.shape[0], num_logical_experts),
+        dtype=physical_load.dtype,
+        device=physical_load.device,
+    )
+    idx = physical_to_logical_map.to(torch.int64)
+    valid = idx >= 0
+    safe_idx = torch.where(valid, idx, torch.zeros_like(idx))
+    out.scatter_add_(
+        1, safe_idx, torch.where(valid, physical_load, torch.zeros_like(physical_load))
+    )
+    return out
 
 
 def _assign_sender_for_receiver(
@@ -307,23 +637,20 @@ def _select_source_rank_for_receiver(
     """
     assert num_gpu_per_node > 0
     recv_node = recv_rank // num_gpu_per_node
-    same_node_senders = [r for r in ranks_to_send if (r // num_gpu_per_node) == recv_node]
+    same_node_senders = [
+        r for r in ranks_to_send if (r // num_gpu_per_node) == recv_node
+    ]
     if len(same_node_senders) > 0:
-        same_node_recvs = [r for r in ranks_to_recv if (r // num_gpu_per_node) == recv_node]
-        return _assign_sender_for_receiver(same_node_senders, same_node_recvs, recv_rank)
+        same_node_recvs = [
+            r for r in ranks_to_recv if (r // num_gpu_per_node) == recv_node
+        ]
+        return _assign_sender_for_receiver(
+            same_node_senders, same_node_recvs, recv_rank
+        )
     return _assign_sender_for_receiver(ranks_to_send, ranks_to_recv, recv_rank)
 
 
-def _is_rocm_backend() -> bool:
-    return torch.version.hip is not None
-
-
-def _effective_p2p_chunk_size(
-    *, requested: int, num_logical_experts: int, is_rocm: bool
-) -> int:
-    if not is_rocm:
-        return max(1, int(requested))
-    # ROCm mitigation: forbid one-shot when >= num_logical_experts.
+def _effective_p2p_chunk_size(*, requested: int, num_logical_experts: int) -> int:
     if num_logical_experts <= 1:
         return 1
     req = max(1, int(requested))
@@ -340,44 +667,56 @@ def _effective_p2p_chunk_size(
     return req
 
 
+def _as_p2p_bytes(t: torch.Tensor) -> torch.Tensor:
+    """Reinterpret a tensor as uint8 for NCCL/RCCL P2P.
+
+    NCCL/RCCL send/recv rejects packed low-bit dtypes (e.g. float4_e2m1fn_x2)
+    and some fp8 dtypes. Weight migration is a raw byte copy, so a uint8 view is
+    dtype-agnostic and correct. Both send and recv apply this, so element counts
+    stay matched. The slice must be contiguous (true for empty_like temp buffers
+    and contiguous expert-weight rows) so the uint8 view aliases the same storage
+    — required for irecv to write into the real buffer rather than a copy.
+    """
+    if t.dtype == torch.uint8:
+        return t
+    if not t.is_contiguous():
+        t = t.contiguous()
+    return t.view(torch.uint8)
+
+
 def _execute_batched_p2p_ops(
     *,
     ops_by_logical: dict[int, list[Any]],
     num_logical_experts: int,
     p2p_batch_chunk_size: int,
+    cuda_stream: Optional[torch.cuda.Stream] = None,
 ) -> None:
     total_ops = sum(len(v) for v in ops_by_logical.values())
     if total_ops == 0:
         return
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized for EPLB migration P2P")
+        raise RuntimeError(
+            "torch.distributed must be initialized for EPLB migration P2P"
+        )
 
-    is_rocm = _is_rocm_backend()
     chunk = _effective_p2p_chunk_size(
-        requested=p2p_batch_chunk_size,
-        num_logical_experts=num_logical_experts,
-        is_rocm=is_rocm,
+        requested=p2p_batch_chunk_size, num_logical_experts=num_logical_experts
     )
 
-    if not is_rocm:
-        all_ops = []
-        for logical_id in sorted(ops_by_logical):
-            all_ops.extend(ops_by_logical[logical_id])
-        reqs = torch.distributed.batch_isend_irecv(all_ops)
-        for req in reqs:
-            req.wait()
-        return
-
-    for start in range(0, num_logical_experts, chunk):
-        end = min(start + chunk, num_logical_experts)
-        batch = []
-        for logical_id in range(start, end):
-            batch.extend(ops_by_logical.get(logical_id, []))
-        if not batch:
-            continue
-        reqs = torch.distributed.batch_isend_irecv(batch)
-        for req in reqs:
-            req.wait()
+    stream_ctx = (
+        torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
+    )
+    with stream_ctx:
+        for start in range(0, num_logical_experts, chunk):
+            end = min(start + chunk, num_logical_experts)
+            batch = []
+            for logical_id in range(start, end):
+                batch.extend(ops_by_logical.get(logical_id, []))
+            if not batch:
+                continue
+            reqs = torch.distributed.batch_isend_irecv(batch)
+            for req in reqs:
+                req.wait()
 
 
 def _plan_single_layer_migration(
@@ -397,16 +736,23 @@ def _plan_single_layer_migration(
     assert num_local_physical_experts > 0
     assert num_physical == world_size * num_local_physical_experts
     assert num_gpu_per_node > 0 and world_size % num_gpu_per_node == 0
+    # Convert index tensors to Python lists once: planning does many per-element
+    # reads; each tensor.item() carries dispatch overhead (a GPU sync if on device).
+    # vllm does the same with .cpu().numpy().
+    old_list = old_p2l_layer.tolist()
+    new_list = new_p2l_layer.tolist()
     base = rank * num_local_physical_experts
-    old_local = old_p2l_layer[base : base + num_local_physical_experts]
-    new_local = new_p2l_layer[base : base + num_local_physical_experts]
+    old_local = old_list[base : base + num_local_physical_experts]
+    new_local = new_list[base : base + num_local_physical_experts]
 
     # old holders: logical -> ranks that currently own it
     holders_by_logical: dict[int, list[int]] = {}
     holder_seen_by_logical: dict[int, set[int]] = {}
     src_slot_by_rank_logical: dict[tuple[int, int], int] = {}
     for gslot in range(num_physical):
-        logical = int(old_p2l_layer[gslot].item())
+        logical = old_list[gslot]
+        if logical < 0:
+            continue
         r = gslot // num_local_physical_experts
         if logical not in holders_by_logical:
             holders_by_logical[logical] = []
@@ -421,17 +767,19 @@ def _plan_single_layer_migration(
     # local old slots by logical
     local_old_slots_by_logical: dict[int, list[int]] = {}
     for lslot in range(num_local_physical_experts):
-        logical = int(old_local[lslot].item())
+        logical = old_local[lslot]
+        if logical < 0:
+            continue
         local_old_slots_by_logical.setdefault(logical, []).append(lslot)
 
     # ranks that need remote receive for each logical
     recv_ranks_by_logical: dict[int, list[int]] = {}
     for r in range(world_size):
         rbase = r * num_local_physical_experts
-        old_r = old_p2l_layer[rbase : rbase + num_local_physical_experts]
-        new_r = new_p2l_layer[rbase : rbase + num_local_physical_experts]
-        old_set = set(int(x.item()) for x in old_r)
-        new_set = set(int(x.item()) for x in new_r)
+        old_r = old_list[rbase : rbase + num_local_physical_experts]
+        new_r = new_list[rbase : rbase + num_local_physical_experts]
+        old_set = set(x for x in old_r if x >= 0)
+        new_set = set(x for x in new_r if x >= 0)
         for logical in sorted(new_set):
             if logical not in old_set:
                 recv_ranks_by_logical.setdefault(logical, []).append(r)
@@ -443,8 +791,8 @@ def _plan_single_layer_migration(
     primary_dst_by_logical: dict[int, int] = {}
 
     for dst in range(num_local_physical_experts):
-        old_logical = int(old_local[dst].item())
-        new_logical = int(new_local[dst].item())
+        old_logical = old_local[dst]
+        new_logical = new_local[dst]
         if old_logical == new_logical:
             continue  # unchanged
 
@@ -462,10 +810,12 @@ def _plan_single_layer_migration(
 
         ranks_to_send = holders_by_logical.get(new_logical, [])
         ranks_to_recv = recv_ranks_by_logical.get(new_logical, [])
-        assert len(ranks_to_send) > 0, f"no sender rank found for logical expert {new_logical}"
-        assert rank in ranks_to_recv, (
-            f"rank={rank} expects remote logical expert {new_logical}, but not in recv set"
-        )
+        assert (
+            len(ranks_to_send) > 0
+        ), f"no sender rank found for logical expert {new_logical}"
+        assert (
+            rank in ranks_to_recv
+        ), f"rank={rank} expects remote logical expert {new_logical}, but not in recv set"
         src_rank = _select_source_rank_for_receiver(
             ranks_to_send=ranks_to_send,
             ranks_to_recv=ranks_to_recv,
@@ -524,6 +874,7 @@ def _migrate_single_layer(
     world_size: int,
     ep_group: Any,
     p2p_batch_chunk_size: int = 32,
+    cuda_stream: Optional[torch.cuda.Stream] = None,
 ) -> BufferCopyPlan:
     """Migrate one layer into temp buffers and return BufferCopyPlan for module-E."""
     assert len(routed_experts_weights) == len(temp_buffers)
@@ -533,19 +884,25 @@ def _migrate_single_layer(
         assert w.shape[0] == num_local_physical_experts
         assert b.shape[0] == num_local_physical_experts
 
-    buffer_copy_plan, local_copy_actions, send_actions, recv_actions = _plan_single_layer_migration(
-        old_p2l_layer=old_p2l_layer,
-        new_p2l_layer=new_p2l_layer,
-        num_local_physical_experts=num_local_physical_experts,
-        num_gpu_per_node=num_gpu_per_node,
-        rank=rank,
-        world_size=world_size,
+    buffer_copy_plan, local_copy_actions, send_actions, recv_actions = (
+        _plan_single_layer_migration(
+            old_p2l_layer=old_p2l_layer,
+            new_p2l_layer=new_p2l_layer,
+            num_local_physical_experts=num_local_physical_experts,
+            num_gpu_per_node=num_gpu_per_node,
+            rank=rank,
+            world_size=world_size,
+        )
     )
 
-    # Local copy path (case-2).
-    for action in local_copy_actions:
-        for w, b in zip(routed_experts_weights, temp_buffers):
-            b[action.dst_slot].copy_(w[action.src_slot])
+    stream_ctx = (
+        torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
+    )
+    # Local copy path (case-2) must run on the same stream as P2P + commit.
+    with stream_ctx:
+        for action in local_copy_actions:
+            for w, b in zip(routed_experts_weights, temp_buffers):
+                b[action.dst_slot].copy_(w[action.src_slot])
 
     # Build and execute P2P ops for case-4/5.
     ops_by_logical: dict[int, list[Any]] = {}
@@ -553,7 +910,7 @@ def _migrate_single_layer(
         for w in routed_experts_weights:
             op = torch.distributed.P2POp(
                 torch.distributed.isend,
-                w[action.local_slot],
+                _as_p2p_bytes(w[action.local_slot]),
                 action.peer_rank,
                 ep_group,
             )
@@ -562,7 +919,7 @@ def _migrate_single_layer(
         for b in temp_buffers:
             op = torch.distributed.P2POp(
                 torch.distributed.irecv,
-                b[action.local_slot],
+                _as_p2p_bytes(b[action.local_slot]),
                 action.peer_rank,
                 ep_group,
             )
@@ -572,6 +929,7 @@ def _migrate_single_layer(
         ops_by_logical=ops_by_logical,
         num_logical_experts=int(old_p2l_layer.max().item()) + 1,
         p2p_batch_chunk_size=p2p_batch_chunk_size,
+        cuda_stream=cuda_stream,
     )
     return buffer_copy_plan
 
@@ -586,15 +944,17 @@ def migrate_experts_chunk(
     nnodes: int,
     rank: int,
     p2p_batch_chunk_size: Optional[int] = None,
-) -> None:
-    """Chunk-level D entrypoint: fill temp buffers in-place."""
+    cuda_stream: Optional[torch.cuda.Stream] = None,
+) -> dict[int, BufferCopyPlan]:
+    """Chunk-level D entrypoint: fill temp buffers and return per-layer plans."""
     assert nnodes > 0
     if p2p_batch_chunk_size is None:
         # Lazy import to avoid module-load circular dependencies.
         from atom.config import get_current_atom_config
 
         cfg = get_current_atom_config()
-        p2p_batch_chunk_size = int(getattr(cfg, "eplb_p2p_batch_chunk_size", 32))
+        p2p_batch_chunk_size = int(getattr(cfg.eplb_config, "p2p_batch_chunk_size", 32))
+    plans: dict[int, BufferCopyPlan] = {}
     for layer_id in layer_ids:
         old_p2l_layer = old_meta.physical_to_logical_map[layer_id]
         new_p2l_layer = new_meta.physical_to_logical_map[layer_id]
@@ -607,7 +967,7 @@ def migrate_experts_chunk(
         world_size = num_physical // num_local_physical
         assert world_size % nnodes == 0
         num_gpu_per_node = world_size // nnodes
-        _ = _migrate_single_layer(
+        plans[layer_id] = _migrate_single_layer(
             routed_experts_weights=routed_weights,
             temp_buffers=temp_buffers,
             old_p2l_layer=old_p2l_layer,
@@ -618,12 +978,126 @@ def migrate_experts_chunk(
             world_size=world_size,
             ep_group=ep_group,
             p2p_batch_chunk_size=p2p_batch_chunk_size,
+            cuda_stream=cuda_stream,
+        )
+    return plans
+
+
+def move_from_buffer(
+    plan: BufferCopyPlan,
+    temp_buffers: list[torch.Tensor],
+    expert_weights: list[torch.Tensor],
+    cuda_stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Module-E step-1: apply temp->weight copies in-place."""
+    assert len(temp_buffers) == len(expert_weights)
+    if len(temp_buffers) == 0:
+        return
+    num_slots = int(temp_buffers[0].shape[0])
+    for b, w in zip(temp_buffers, expert_weights):
+        assert b.shape[0] == num_slots
+        assert w.shape[0] == num_slots
+    stream_ctx = (
+        torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
+    )
+    with stream_ctx:
+        for src_slot, dst_slot in plan:
+            assert 0 <= src_slot < num_slots
+            assert 0 <= dst_slot < num_slots
+            for b, w in zip(temp_buffers, expert_weights):
+                # Keep fixed tensor addresses for cudagraph compatibility.
+                w[dst_slot].copy_(b[src_slot])
+
+
+def commit_layer(
+    plan: BufferCopyPlan,
+    temp_buffers: list[torch.Tensor],
+    expert_weights: list[torch.Tensor],
+    live_meta: Any,
+    new_meta: Any,
+    layer_id: int,
+    cuda_stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Module-E single-layer atomic commit: temp->weight then metadata update."""
+    stream_ctx = (
+        torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
+    )
+    with stream_ctx:
+        move_from_buffer(plan, temp_buffers, expert_weights, cuda_stream=None)
+        # Metadata owns in-place update of all coupled maps for this layer.
+        live_meta.update(new_meta, [layer_id])
+
+
+def commit_experts_chunk(
+    *,
+    layer_ids: list[int],
+    plans: dict[int, BufferCopyPlan],
+    temp_buffers: list[torch.Tensor],
+    expert_weights_of_layer: dict[int, list[torch.Tensor]],
+    live_meta: Any,
+    new_meta: Any,
+    cuda_stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Module-E explicit chunk orchestration driven by upper-layer plans."""
+    for layer_id in layer_ids:
+        plan = plans[layer_id]
+        expert_weights = expert_weights_of_layer[layer_id]
+        commit_layer(
+            plan=plan,
+            temp_buffers=temp_buffers,
+            expert_weights=expert_weights,
+            live_meta=live_meta,
+            new_meta=new_meta,
+            layer_id=layer_id,
+            cuda_stream=cuda_stream,
         )
 
 
-def count_physical_load(
-    topk_physical: torch.Tensor, num_physical: int
-) -> torch.Tensor:
+def migrate_and_commit_chunk(
+    *,
+    layer_ids: list[int],
+    old_meta: Any,
+    new_meta: Any,
+    expert_weights_of_layer: dict[int, list[torch.Tensor]],
+    temp_buffers: list[torch.Tensor],
+    ep_group: Any,
+    nnodes: int,
+    rank: int,
+    live_meta: Any,
+    p2p_batch_chunk_size: Optional[int] = None,
+    cuda_stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Explicit upper-layer orchestration: per-layer D migrate -> E commit.
+
+    temp_buffers are sized for one layer and intentionally reused.  Do not
+    migrate the whole chunk before committing, or earlier layers would read the
+    last migrated layer's staged data.
+    """
+    for layer_id in layer_ids:
+        plans = migrate_experts_chunk(
+            layer_ids=[layer_id],
+            old_meta=old_meta,
+            new_meta=new_meta,
+            expert_weights_of_layer=expert_weights_of_layer,
+            temp_buffers=temp_buffers,
+            ep_group=ep_group,
+            nnodes=nnodes,
+            rank=rank,
+            p2p_batch_chunk_size=p2p_batch_chunk_size,
+            cuda_stream=cuda_stream,
+        )
+        commit_experts_chunk(
+            layer_ids=[layer_id],
+            plans=plans,
+            temp_buffers=temp_buffers,
+            expert_weights_of_layer=expert_weights_of_layer,
+            live_meta=live_meta,
+            new_meta=new_meta,
+            cuda_stream=cuda_stream,
+        )
+
+
+def count_physical_load(topk_physical: torch.Tensor, num_physical: int) -> torch.Tensor:
     """Count per-physical expert load for one pass.
 
     Invalid ids (`<0` or `>= num_physical`) are ignored.
@@ -637,9 +1111,7 @@ def count_physical_load(
         torch.int32,
         torch.int64,
     ), f"topk_physical must be int32 or int64, got {topk_physical.dtype}"
-    counts = torch.zeros(
-        num_physical, dtype=torch.int32, device=topk_physical.device
-    )
+    counts = torch.zeros(num_physical, dtype=torch.int32, device=topk_physical.device)
     # numel() reads static shape metadata (a host int), safe during capture.
     if topk_physical.numel() == 0:
         return counts
@@ -664,67 +1136,85 @@ class ExpertLoadMonitor:
         self._device: Optional[torch.device] = None
         self._cur_pass_count: Optional[torch.Tensor] = None
         self._expert_load_window: Optional[torch.Tensor] = None
-        self._is_frozen: bool = False
         self._logged_first_record: bool = False
+        self._logged_logical_without_metadata: bool = False
+        self._load_group: Optional[Any] = None
 
-    def freeze(self) -> None:
-        """Lock tensor addresses before cudagraph capture.
+    def set_load_group(self, group: Any) -> None:
+        self._load_group = group
 
-        After this call, _ensure_capacity will raise if any new layer_id or
-        num_physical is seen — prevents silent stale-address writes inside a
-        captured graph.
-        """
-        self._is_frozen = True
-
-    def _ensure_capacity(
-        self, *, layer_id: int, num_physical: int, device: torch.device
+    def initialize(
+        self, *, num_layers: int, num_physical: int, device: torch.device
     ) -> None:
-        need_layers = max(self._num_layers, layer_id + 1)
-        need_physical = max(self._num_physical, num_physical)
-        need_alloc = (
-            self._cur_pass_count is None
-            or self._expert_load_window is None
-            or self._device != device
-            or need_layers != self._num_layers
-            or need_physical != self._num_physical
-        )
-        if not need_alloc:
+        """Allocate fixed-address load tensors once during EPLB runtime init."""
+        if not self.enabled:
             return
-        if self._is_frozen:
+        num_layers = int(num_layers)
+        num_physical = int(num_physical)
+        device = torch.device(device)
+        if num_layers <= 0 or num_physical <= 0:
+            raise ValueError(
+                "ExpertLoadMonitor requires positive dimensions: "
+                f"num_layers={num_layers}, num_physical={num_physical}"
+            )
+        if self._cur_pass_count is not None or self._expert_load_window is not None:
+            if (
+                self._cur_pass_count is not None
+                and self._expert_load_window is not None
+                and self._num_layers == num_layers
+                and self._num_physical == num_physical
+                and self._device == device
+            ):
+                return
             raise RuntimeError(
-                f"ExpertLoadMonitor is frozen (post-cudagraph-capture) but "
-                f"_ensure_capacity was triggered: layer_id={layer_id}, "
-                f"num_physical={num_physical} vs current "
-                f"({self._num_layers}, {self._num_physical}). "
-                "Call monitor.freeze() only after all layers have been seen."
+                "ExpertLoadMonitor is already initialized; runtime resizing is "
+                "not allowed because CUDA graphs may capture these tensor "
+                "addresses. Existing capacity/device="
+                f"({self._num_layers}, {self._num_physical}, {self._device}), "
+                f"requested=({num_layers}, {num_physical}, {device})."
             )
 
-        new_cur = torch.zeros(
-            (need_layers, need_physical), dtype=torch.int32, device=device
+        self._cur_pass_count = torch.zeros(
+            (num_layers, num_physical), dtype=torch.int32, device=device
         )
-        new_window = torch.zeros(
-            (self.window_size, need_layers, need_physical),
+        self._expert_load_window = torch.zeros(
+            (self.window_size, num_layers, num_physical),
             dtype=torch.int32,
             device=device,
         )
-
-        if (
-            self._cur_pass_count is not None
-            and self._expert_load_window is not None
-            and self._device == device
-            and self._num_layers > 0
-            and self._num_physical > 0
-        ):
-            old_l = self._num_layers
-            old_p = self._num_physical
-            new_cur[:old_l, :old_p].copy_(self._cur_pass_count)
-            new_window[:, :old_l, :old_p].copy_(self._expert_load_window)
-
-        self._cur_pass_count = new_cur
-        self._expert_load_window = new_window
-        self._num_layers = need_layers
-        self._num_physical = need_physical
+        self._num_layers = num_layers
+        self._num_physical = num_physical
         self._device = device
+
+    def initialize_for_metadata(self, meta: "ExpertLocationMetadata") -> None:
+        """Preallocate fixed-address load tensors for all EPLB layers."""
+        self.initialize(
+            num_layers=meta.num_layers,
+            num_physical=meta.num_physical_experts,
+            device=meta.expert_map.device,
+        )
+
+    def ensure_capacity_for_metadata(self, meta: "ExpertLocationMetadata") -> None:
+        """Compatibility wrapper for the old lazy-capacity API."""
+        self.initialize_for_metadata(meta)
+
+    def _validate_record_shape(
+        self, *, layer_id: int, num_physical: int, device: torch.device
+    ) -> None:
+        assert (
+            self._cur_pass_count is not None and self._expert_load_window is not None
+        ), (
+            "ExpertLoadMonitor.record() called before initialization; "
+            "initialize the EPLB runtime before warmup/cudagraph capture."
+        )
+        assert (
+            self._device == device
+        ), f"ExpertLoadMonitor.record() device mismatch: initialized on {self._device}, got {device}."
+        assert layer_id < self._num_layers and num_physical == self._num_physical, (
+            f"ExpertLoadMonitor.record() is outside initialized capacity: "
+            f"layer_id={layer_id}, num_physical={num_physical}; "
+            f"capacity=({self._num_layers}, {self._num_physical})."
+        )
 
     def on_forward_start(self) -> None:
         if not self.enabled or self._cur_pass_count is None:
@@ -736,8 +1226,10 @@ class ExpertLoadMonitor:
     ) -> None:
         if not self.enabled or layer_id < 0:
             return
-        self._ensure_capacity(
-            layer_id=layer_id, num_physical=num_physical, device=topk_physical.device
+        self._validate_record_shape(
+            layer_id=layer_id,
+            num_physical=num_physical,
+            device=topk_physical.device,
         )
         assert self._cur_pass_count is not None
         load = count_physical_load(topk_physical, self._num_physical)
@@ -746,11 +1238,10 @@ class ExpertLoadMonitor:
             self._logged_first_record = True
             logger.info(
                 "EPLB monitor first record: layer_id=%d num_physical=%d "
-                "topk_shape=%s nonzero_experts=%d (stats hook is live)",
+                "topk_shape=%s (stats hook is live)",
                 layer_id,
                 self._num_physical,
                 tuple(topk_physical.shape),
-                int((load > 0).sum().item()),
             )
 
     def on_forward_end(self, is_dummy_run: bool) -> None:
@@ -773,16 +1264,42 @@ class ExpertLoadMonitor:
         else:
             local = self._expert_load_window[: self._filled].sum(dim=0)
 
-        tp_group = get_tp_group()
-        if tp_group.world_size > 1:
+        group = self._load_group if self._load_group is not None else get_tp_group()
+        world_size = int(getattr(group, "world_size", 1))
+        if world_size > 1:
             # Group all_reduce path is float-oriented in this stack.
-            global_load = tp_group.all_reduce(local.to(torch.float32), ca_fp8_quant=False)
+            global_load = group.all_reduce(local.to(torch.float32), ca_fp8_quant=False)
             return global_load.round().to(torch.int32)
         return local
 
     def dump_global_logical_load(self) -> Optional[torch.Tensor]:
-        # First integration stage keeps physical==logical.
-        return self.dump_global_physical_load()
+        physical = self.dump_global_physical_load()
+        if physical is None:
+            return None
+        meta = get_live_expert_location_metadata()
+        if meta is None:
+            if not self._logged_logical_without_metadata and self._num_physical > 0:
+                self._logged_logical_without_metadata = True
+                logger.warning(
+                    "EPLB logical load requested before runtime metadata is "
+                    "available; returning physical load as a compatibility fallback"
+                )
+            return physical
+        if physical.shape != meta.physical_to_logical_map.shape:
+            target = torch.zeros(
+                meta.physical_to_logical_map.shape,
+                dtype=physical.dtype,
+                device=physical.device,
+            )
+            layers = min(target.shape[0], physical.shape[0])
+            physical_slots = min(target.shape[1], physical.shape[1])
+            target[:layers, :physical_slots].copy_(physical[:layers, :physical_slots])
+            physical = target
+        return physical_load_to_logical_load(
+            physical,
+            meta.physical_to_logical_map,
+            meta.num_logical_experts,
+        )
 
 
 _MONITOR: Optional[ExpertLoadMonitor] = None
@@ -800,13 +1317,17 @@ def get_expert_load_monitor(*, enabled: bool, window_size: int) -> ExpertLoadMon
     return _MONITOR
 
 
+def get_live_expert_location_metadata() -> Optional[ExpertLocationMetadata]:
+    return _MANAGER.live_metadata if _MANAGER is not None else None
+
+
 class EPLBManager:
     """Module-B scheduler/trigger manager.
 
     Scope for now:
     - periodic step progression on every forward (including dummy)
     - balancedness gate on module-A physical load
-    - trigger callback skeleton for future rebalance execution
+    - state-machine trigger for owner-provided C/D/E execution
     """
 
     def __init__(
@@ -817,14 +1338,12 @@ class EPLBManager:
         rebalance_interval: int,
         rebalance_min_balancedness: float,
         rebalance_balancedness_agg: str,
-        on_rebalance: Optional[Callable[[], None]] = None,
     ):
         self.enabled = enabled
         self.monitor = monitor
         self.rebalance_interval = int(rebalance_interval)
         self.rebalance_min_balancedness = float(rebalance_min_balancedness)
         self.rebalance_balancedness_agg = str(rebalance_balancedness_agg).lower()
-        self.on_rebalance = on_rebalance
         assert self.rebalance_interval > 0, "eplb_rebalance_interval must be > 0"
         assert (
             self.rebalance_interval >= self.monitor.window_size
@@ -836,6 +1355,259 @@ class EPLBManager:
         self._gen = self._entrypoint()
         self._rebalance_count = 0
         self._last_balancedness: Optional[float] = None
+        self._runtime_owner: Optional[Any] = None
+        self.live_metadata: Optional[ExpertLocationMetadata] = None
+        self._moe_layers: dict[int, Any] = {}
+        self._expert_weights_of_layer: dict[int, list[torch.Tensor]] = {}
+        self._reusable_temp_buffers: Optional[list[torch.Tensor]] = None
+        self._expert_map_tails: dict[int, torch.Tensor] = {}
+        self._ep_group: Optional[Any] = None
+        self._ep_rank: int = 0
+        self._nnodes: int = 1
+        self._rebalance_layers_per_chunk: int = 64
+        self._p2p_batch_chunk_size: int = 32
+        self._logged_runtime_owner_without_model: bool = False
+        self._logged_no_moe_layers: bool = False
+        self._logged_missing_ep_group: bool = False
+
+    def bind_runtime_owner(self, owner: Any, *, strict: bool = False) -> bool:
+        """Bind upper-layer runtime owner used by default rebalance execution."""
+        self._runtime_owner = owner
+        return self._maybe_initialize_runtime(owner, strict=strict)
+
+    def _maybe_initialize_runtime(self, owner: Any, *, strict: bool = False) -> bool:
+        if self.live_metadata is not None:
+            return True
+        model = getattr(owner, "model", None)
+        if model is None or not hasattr(model, "modules"):
+            if strict:
+                raise RuntimeError(
+                    "EPLB is enabled but the runtime owner has no model.modules(); "
+                    "cannot initialize manager-owned ExpertLocationMetadata"
+                )
+            if not self._logged_runtime_owner_without_model:
+                self._logged_runtime_owner_without_model = True
+                logger.warning(
+                    "EPLB runtime owner has no model.modules(); manager metadata is not initialized"
+                )
+            return False
+
+        layers: dict[int, Any] = {}
+        for module in model.modules():
+            layer_id = getattr(module, "layer_id", None)
+            if not isinstance(layer_id, int):
+                continue
+            if not bool(getattr(module, "use_ep", False)):
+                continue
+            if not all(hasattr(module, name) for name in ("w13_weight", "w2_weight")):
+                continue
+            layers[layer_id] = module
+        if not layers:
+            if strict:
+                raise RuntimeError(
+                    "EPLB is enabled but no EP MoE layers with expert weights "
+                    "were found; check enable_expert_parallel and model wiring"
+                )
+            if not self._logged_no_moe_layers:
+                self._logged_no_moe_layers = True
+                logger.warning(
+                    "EPLB runtime initialization found no EP MoE layers; "
+                    "manager metadata is not initialized"
+                )
+            return False
+
+        first_layer = layers[min(layers)]
+        num_logical = int(
+            getattr(first_layer, "num_logical_experts", first_layer.global_num_experts)
+        )
+        num_physical = int(getattr(first_layer, "num_physical_experts", num_logical))
+        ep_size = int(getattr(first_layer, "ep_size"))
+        ep_rank = int(getattr(first_layer, "ep_rank"))
+        if num_physical % ep_size != 0:
+            raise RuntimeError(
+                "EPLB physical experts must be divisible by ep_size: "
+                f"num_physical={num_physical}, ep_size={ep_size}"
+            )
+        for layer_id, layer in layers.items():
+            layer_logical = int(
+                getattr(layer, "num_logical_experts", layer.global_num_experts)
+            )
+            layer_physical = int(getattr(layer, "num_physical_experts", layer_logical))
+            layer_ep_size = int(getattr(layer, "ep_size"))
+            if (
+                layer_logical != num_logical
+                or layer_physical != num_physical
+                or layer_ep_size != ep_size
+            ):
+                raise RuntimeError(
+                    "EPLB requires a uniform MoE layout across managed layers: "
+                    f"layer_id={layer_id}, logical={layer_logical}, "
+                    f"physical={layer_physical}, ep_size={layer_ep_size}; "
+                    f"expected logical={num_logical}, physical={num_physical}, "
+                    f"ep_size={ep_size}"
+                )
+        device = first_layer.w13_weight.device
+        self.live_metadata = ExpertLocationMetadata.from_trivial(
+            num_layers=max(layers) + 1,
+            num_logical_experts=num_logical,
+            num_physical_experts=num_physical,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            device=device,
+        )
+        self._moe_layers = layers
+        self._expert_weights_of_layer = {
+            layer_id: self._collect_expert_weight_tensors(layer)
+            for layer_id, layer in layers.items()
+        }
+        # Pre-allocate ONE layer's temp buffers, reused across every layer and
+        # every rebalance. Allocating per-layer per-rebalance (torch.empty_like)
+        # under a loaded server (KV budget full) spikes memory and OOMs. Reserved
+        # here — before KV-cache sizing (model_runner initializes EPLB first) — so
+        # the KV budget accounts for it. All DSv4 MoE layers share expert shape.
+        first_id = min(layers)
+        self._reusable_temp_buffers = [
+            torch.empty_like(w) for w in self._expert_weights_of_layer[first_id]
+        ]
+        self._bind_layer_expert_maps()
+
+        try:
+            from aiter.dist.parallel_state import get_ep_group
+
+            ep = get_ep_group()
+            self.monitor.set_load_group(ep)
+            self._ep_group = ep.device_group
+            self._ep_rank = int(ep.rank_in_group)
+        except Exception as exc:
+            self._ep_group = None
+            self._ep_rank = ep_rank
+            if not self._logged_missing_ep_group:
+                self._logged_missing_ep_group = True
+                logger.warning(
+                    "EPLB EP process group is unavailable; runtime rebalance will be skipped"
+                )
+            if strict:
+                raise RuntimeError(
+                    "EPLB is enabled but EP process group is unavailable; "
+                    "manager-owned runtime metadata cannot safely rebalance"
+                ) from exc
+
+        try:
+            from atom.config import get_current_atom_config
+
+            cfg = get_current_atom_config().eplb_config
+            self._rebalance_layers_per_chunk = int(
+                getattr(cfg, "rebalance_layers_per_chunk", 64)
+            )
+            self._p2p_batch_chunk_size = int(getattr(cfg, "p2p_batch_chunk_size", 32))
+        except Exception:
+            self._rebalance_layers_per_chunk = 64
+            self._p2p_batch_chunk_size = 32
+
+        logger.info(
+            "EPLB runtime initialized: layers=%d num_logical=%d "
+            "num_physical=%d ep_size=%d ep_rank=%d",
+            len(layers),
+            num_logical,
+            num_physical,
+            ep_size,
+            ep_rank,
+        )
+        self.monitor.initialize_for_metadata(self.live_metadata)
+        return True
+
+    def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
+        assert self.live_metadata is not None
+        num_local = self.live_metadata.num_local_physical_experts
+        names = (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_input_scale",
+            "w2_input_scale",
+            "w13_bias",
+            "w2_bias",
+        )
+        # Infer the per-rank expert count from a reliable per-expert weight tensor
+        # (w13/w2_weight have dim0 == #experts on this rank). Shuffled FP4 scales
+        # are FLATTENED to [#experts * per_expert_rows, K] (expert-contiguous), so
+        # they must be reshaped back to per-expert [#experts, N, K] before per-slot
+        # migration — otherwise `tensor[:num_local]` slices raw rows (a fraction of
+        # one expert) and migration moves the wrong scale bytes → relocated experts
+        # get mismatched scales → wrong FP4 dequant → accuracy loss (no crash).
+        ref_experts = None
+        for _nm in ("w13_weight", "w2_weight"):
+            _t = getattr(layer, _nm, None)
+            if isinstance(_t, torch.Tensor) and _t.dim() > 0:
+                ref_experts = int(_t.shape[0])
+                break
+        tensors: list[torch.Tensor] = []
+        for name in names:
+            tensor = getattr(layer, name, None)
+            if not (isinstance(tensor, torch.Tensor) and tensor.dim() > 0):
+                continue
+            d0 = int(tensor.shape[0])
+            if ref_experts is not None and d0 == ref_experts:
+                per_expert = tensor
+            elif ref_experts is not None and d0 > ref_experts and d0 % ref_experts == 0:
+                # Flattened [#experts * N, ...] -> per-expert view [#experts, N, ...].
+                # reshape on a contiguous tensor returns a view sharing storage, so
+                # in-place migration copy_ updates the real tensor the kernel reads.
+                per_expert = tensor.reshape(
+                    ref_experts, d0 // ref_experts, *tensor.shape[1:]
+                )
+            else:
+                # Not per-expert mappable (e.g. global/per-tensor scalar). Skip —
+                # such tensors are not relocated with experts.
+                continue
+            if int(per_expert.shape[0]) >= num_local:
+                tensors.append(per_expert[:num_local])
+        return tensors
+
+    def _bind_layer_expert_maps(self) -> None:
+        assert self.live_metadata is not None
+        num_physical = self.live_metadata.num_physical_experts
+        for layer_id, layer in self._moe_layers.items():
+            old_map = getattr(layer, "expert_map", None)
+            if isinstance(old_map, torch.Tensor) and old_map.numel() > int(
+                getattr(layer, "global_num_experts", num_physical)
+            ):
+                tail = old_map[int(getattr(layer, "global_num_experts")) :].clone()
+            else:
+                tail = torch.empty(
+                    0, dtype=torch.int32, device=self.live_metadata.expert_map.device
+                )
+            self._expert_map_tails[layer_id] = tail
+            runtime_map = torch.empty(
+                num_physical + int(tail.numel()),
+                dtype=torch.int32,
+                device=self.live_metadata.expert_map.device,
+            )
+            runtime_map[:num_physical].copy_(self.live_metadata.expert_map[layer_id])
+            if tail.numel() > 0:
+                runtime_map[num_physical:].copy_(tail.to(runtime_map.device))
+            layer.expert_map = runtime_map
+            if getattr(layer, "expert_mask", None) is not None:
+                layer.expert_mask = (runtime_map > -1).to(torch.int32)
+
+    def _refresh_layer_expert_map(self, layer_id: int) -> None:
+        assert self.live_metadata is not None
+        layer = self._moe_layers[layer_id]
+        num_physical = self.live_metadata.num_physical_experts
+        layer.expert_map[:num_physical].copy_(self.live_metadata.expert_map[layer_id])
+        if getattr(layer, "expert_mask", None) is not None:
+            layer.expert_mask.copy_((layer.expert_map > -1).to(torch.int32))
+
+    def _run_bound_rebalance(
+        self, cuda_stream: Optional[torch.cuda.Stream]
+    ) -> Optional[Any]:
+        """Manager-owned rebalance dispatch for C/D/E execution."""
+        if self._runtime_owner is not None:
+            run_rebalance = getattr(self._runtime_owner, "run_eplb_rebalance", None)
+            if callable(run_rebalance):
+                return run_rebalance(cuda_stream)
+        return None
 
     @property
     def rebalance_count(self) -> int:
@@ -889,19 +1661,174 @@ class EPLBManager:
     def _execute_rebalance(self):
         """Generator: the actual rebalance work, chunked across forwards.
 
-        Phase 1: no chunks (C/D/E not implemented), yields nothing.
-        When D/E are added, replace the body with:
-            for chunk in self._chunk_layers(all_moe_layer_ids):
-                yield
-                migrate_and_commit(new_meta, layer_ids=chunk)
+        For the integrated path, runtime owner should implement:
+            plans = migrate_experts_chunk(...)
+            commit_experts_chunk(..., plans=plans)
+        with the same cuda stream and eager window.
         """
         self._rebalance_count += 1
-        if self.on_rebalance is not None:
-            self.on_rebalance()
-        # Marks this as a generator function so `yield from _execute_rebalance()`
-        # works today; the real yields will be added with D/E.
+        # Run migration on the default/current stream (aligned with SGLang &
+        # vllm). A dedicated stream would run the P2P + weight copies CONCURRENTLY
+        # with the just-submitted (but not yet GPU-complete) forward pass on the
+        # default stream, overwriting expert weights mid-read → HSA hardware
+        # exception. Same-stream ordering makes migration naturally queue after
+        # the last forward pass's kernels, no synchronize needed.
+        cuda_stream = None
+        if self.live_metadata is not None and self._moe_layers:
+            yield from self._execute_runtime_rebalance(cuda_stream)
+        else:
+            work = self._run_bound_rebalance(cuda_stream)
+            # Backward-compatible test/debug hook when no model runtime exists.
+            if work is not None and hasattr(work, "__next__"):
+                yield from work
+        if cuda_stream is not None:
+            # Preserve eager-window atomicity: subsequent forward work must
+            # observe all migration/commit effects from this rebalance.
+            torch.cuda.current_stream().wait_stream(cuda_stream)
+        # Keep this a generator even if owner path is one-shot.
         if False:  # pragma: no cover
             yield
+
+    def _execute_runtime_rebalance(self, cuda_stream: Optional[torch.cuda.Stream]):
+        import time as _time
+
+        assert self.live_metadata is not None
+        if self._ep_group is None:
+            logger.warning("EPLB rebalance skipped: EP process group is unavailable")
+            return
+
+        physical_load = self.monitor.dump_global_physical_load()
+        if physical_load is None:
+            return
+        physical_load = self._align_physical_load(physical_load)
+        logical_load = physical_load_to_logical_load(
+            physical_load,
+            self.live_metadata.physical_to_logical_map,
+            self.live_metadata.num_logical_experts,
+        )
+
+        first_layer = self._moe_layers[min(self._moe_layers)]
+        num_groups = int(getattr(first_layer, "num_expert_group", None) or 1)
+        num_nodes = self._nnodes
+        ep_size = self.live_metadata.ep_size
+        _ep_rank = self.live_metadata.ep_rank
+        _rc = self._rebalance_count
+
+        _t0 = _time.perf_counter()
+        p2l, l2p, logcnt = rebalance_experts(
+            logical_load,
+            num_physical=self.live_metadata.num_physical_experts,
+            num_groups=num_groups,
+            num_nodes=num_nodes,
+            num_gpus=ep_size,
+            enable_hierarchical=(num_groups > 1 and num_nodes > 1),
+        )
+        new_meta = ExpertLocationMetadata.from_rebalance_result(
+            physical_to_logical_map=p2l,
+            logical_to_physical_map=l2p,
+            logical_replica_count=logcnt,
+            ep_size=self.live_metadata.ep_size,
+            ep_rank=self.live_metadata.ep_rank,
+            max_num_replicas=self.live_metadata.max_num_replicas,
+        )
+
+        chunk_size = max(1, int(self._rebalance_layers_per_chunk))
+        layer_ids = sorted(self._moe_layers)
+        num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
+        _t_rearrange_ms = (_time.perf_counter() - _t0) * 1000.0
+        logger.info(
+            "EPLB rebalance #%d ep_rank=%d: rearrange=%.1fms; migrating %d layers "
+            "in %d chunks (size=%d)",
+            _rc,
+            _ep_rank,
+            _t_rearrange_ms,
+            len(layer_ids),
+            num_chunks,
+            chunk_size,
+        )
+
+        # Diagnostic: relocation's benefit is per-GPU total-load balance (not per-
+        # expert). Compare per-GPU balancedness (mean/max over ranks) old vs new to
+        # confirm the new placement actually flattens per-GPU load.
+        try:
+            _ep = int(self.live_metadata.ep_size)
+            _ll = logical_load.detach().to("cpu", torch.float32)
+
+            def _pergpu_bal(_p2l_map: torch.Tensor) -> float:
+                _pm = _p2l_map.detach().to("cpu")
+                _safe = _pm.clamp(min=0).to(torch.int64)
+                _slot = torch.gather(_ll, 1, _safe)
+                _slot = torch.where(_pm >= 0, _slot, torch.zeros_like(_slot))
+                _Ln, _P = _pm.shape
+                _perg = _slot.view(_Ln, _ep, _P // _ep).sum(dim=2)
+                _mx = _perg.max(dim=1).values
+                _mn = _perg.mean(dim=1)
+                _b = torch.where(_mx > 0, _mn / _mx, torch.ones_like(_mn))
+                return float(_b.mean().item())
+
+            _old_b = _pergpu_bal(self.live_metadata.physical_to_logical_map)
+            _new_b = _pergpu_bal(new_meta.physical_to_logical_map)
+            logger.info(
+                "EPLB rebalance #%d ep_rank=%d per-GPU balancedness: old=%.3f -> new=%.3f",
+                _rc,
+                _ep_rank,
+                _old_b,
+                _new_b,
+            )
+        except Exception as _e:  # pragma: no cover - diagnostic only
+            logger.warning("EPLB per-GPU balancedness diag failed: %s", _e)
+
+        for start in range(0, len(layer_ids), chunk_size):
+            chunk = layer_ids[start : start + chunk_size]
+            yield
+            _tc = _time.perf_counter()
+            for layer_id in chunk:
+                # Reuse the pre-allocated single-layer temp buffers (allocated once
+                # at init) across every layer/rebalance — no serving-time alloc, no
+                # OOM spike. Each layer's migrate+commit finishes before the next
+                # reuses them. Same approach as vllm's shared weights_buffer.
+                temp_buffers = self._reusable_temp_buffers
+                migrate_and_commit_chunk(
+                    layer_ids=[layer_id],
+                    old_meta=self.live_metadata,
+                    new_meta=new_meta,
+                    expert_weights_of_layer=self._expert_weights_of_layer,
+                    temp_buffers=temp_buffers,
+                    ep_group=self._ep_group,
+                    nnodes=self._nnodes,
+                    rank=self._ep_rank,
+                    live_meta=self.live_metadata,
+                    p2p_batch_chunk_size=self._p2p_batch_chunk_size,
+                    cuda_stream=cuda_stream,
+                )
+                self._refresh_layer_expert_map(layer_id)
+            if cuda_stream is not None:
+                torch.cuda.current_stream().wait_stream(cuda_stream)
+            _chunk_ms = (_time.perf_counter() - _tc) * 1000.0
+            logger.info(
+                "EPLB rebalance #%d ep_rank=%d chunk %d/%d layers=%s migrate=%.1fms",
+                _rc,
+                _ep_rank,
+                start // chunk_size + 1,
+                num_chunks,
+                chunk,
+                _chunk_ms,
+            )
+
+    def _align_physical_load(self, physical_load: torch.Tensor) -> torch.Tensor:
+        assert self.live_metadata is not None
+        target = torch.zeros(
+            (
+                self.live_metadata.num_layers,
+                self.live_metadata.num_physical_experts,
+            ),
+            dtype=physical_load.dtype,
+            device=physical_load.device,
+        )
+        layers = min(target.shape[0], physical_load.shape[0])
+        physical = min(target.shape[1], physical_load.shape[1])
+        target[:layers, :physical].copy_(physical_load[:layers, :physical])
+        return target
 
     def _need_rebalance(self, physical_load: torch.Tensor) -> bool:
         balancedness = self._compute_balancedness_and_update(physical_load)
@@ -966,26 +1893,51 @@ def get_eplb_manager(
     return _MANAGER
 
 
+def _get_configured_eplb_manager() -> Optional[EPLBManager]:
+    from atom.config import get_current_atom_config
+
+    cfg = get_current_atom_config()
+    if not getattr(cfg, "eplb_enable", False):
+        return None
+    monitor = get_expert_load_monitor(
+        enabled=True, window_size=cfg.eplb_config.load_window_size
+    )
+    return get_eplb_manager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=cfg.eplb_config.rebalance_interval,
+        rebalance_min_balancedness=cfg.eplb_config.rebalance_min_balancedness,
+        rebalance_balancedness_agg=cfg.eplb_config.rebalance_balancedness_agg,
+    )
+
+
+def initialize_eplb_runtime(
+    owner: Any, *, strict: bool = True
+) -> Optional[EPLBManager]:
+    """Initialize manager-owned EPLB runtime state before warmup/capture."""
+    manager = _get_configured_eplb_manager()
+    if manager is None:
+        return None
+    manager.bind_runtime_owner(owner, strict=strict)
+    return manager
+
+
 def with_eplb_forward_monitor(fn):
+    # Resolve once on the first call: if EPLB is disabled at that point the
+    # inner function is replaced with a direct pass-through so subsequent calls
+    # pay no overhead. _MANAGER is set by initialize_eplb_runtime() during
+    # model runner init, which always precedes the first forward pass.
+    resolved_manager: list[EPLBManager | None] = []
+
     @wraps(fn)
     def wrapper(self, batch, *args, **kwargs):
-        # Lazy import to avoid a circular import at module load time
-        # (atom.config <-> atom.model_ops).
-        from atom.config import get_current_atom_config
-
-        cfg = get_current_atom_config()
-        if not getattr(cfg, "eplb_enable", False):
+        if not resolved_manager:
+            resolved_manager.append(_MANAGER)
+        manager = resolved_manager[0]
+        if manager is None:
             return fn(self, batch, *args, **kwargs)
-        monitor = get_expert_load_monitor(
-            enabled=True, window_size=cfg.eplb_load_window_size
-        )
-        manager = get_eplb_manager(
-            enabled=True,
-            monitor=monitor,
-            rebalance_interval=cfg.eplb_rebalance_interval,
-            rebalance_min_balancedness=cfg.eplb_rebalance_min_balancedness,
-            rebalance_balancedness_agg=cfg.eplb_rebalance_balancedness_agg,
-        )
+        manager.bind_runtime_owner(self, strict=False)
+        monitor = manager.monitor
         monitor.on_forward_start()
         try:
             return fn(self, batch, *args, **kwargs)
@@ -995,3 +1947,55 @@ def with_eplb_forward_monitor(fn):
             manager.on_forward_pass_end(is_dummy_run)
 
     return wrapper
+
+
+def eplb_map_logical_to_physical(
+    layer: Any, topk_ids: "torch.Tensor"
+) -> "torch.Tensor":
+    """Remap router logical expert ids to physical slot ids for EP dispatch.
+
+    Returns topk_ids unchanged when EPLB metadata is unavailable (non-EP or
+    pre-rebalance), so callers need no EPLB-awareness guard.
+    """
+    meta = get_live_expert_location_metadata()
+    layer_id = getattr(layer, "layer_id", None)
+    if meta is None or not isinstance(layer_id, int):
+        return topk_ids
+    dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id].to(
+        device=topk_ids.device
+    )
+    num_logical = int(dispatch.numel())
+    id_delta = int(meta.num_physical_experts - meta.num_logical_experts)
+    topk_i64 = topk_ids.to(torch.int64)
+    valid = (topk_i64 >= 0) & (topk_i64 < num_logical)
+    safe_logical = torch.where(valid, topk_i64, torch.zeros_like(topk_i64))
+    mapped = dispatch[safe_logical].to(topk_ids.dtype)
+    shifted_tail = (topk_i64 + id_delta).to(topk_ids.dtype)
+    tail_or_invalid = torch.where(topk_i64 >= num_logical, shifted_tail, topk_ids)
+    return torch.where(valid, mapped, tail_or_invalid)
+
+
+def record_eplb_expert_load(layer: Any, topk_physical: "torch.Tensor") -> None:
+    """Record per-physical-slot token counts for EPLB load monitoring."""
+    from atom.config import get_current_atom_config
+
+    atom_cfg = get_current_atom_config()
+    if not getattr(atom_cfg, "eplb_enable", False):
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    if not isinstance(layer_id, int):
+        return
+    meta = get_live_expert_location_metadata()
+    num_physical = (
+        int(meta.num_physical_experts)
+        if meta is not None
+        else int(getattr(layer, "global_num_experts", -1))
+    )
+    if num_physical <= 0:
+        return
+    monitor = get_expert_load_monitor(
+        enabled=True, window_size=atom_cfg.eplb_config.load_window_size
+    )
+    monitor.record(
+        layer_id=layer_id, topk_physical=topk_physical, num_physical=num_physical
+    )

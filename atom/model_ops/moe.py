@@ -25,7 +25,10 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.model_loader.weight_utils import set_weight_attrs
-from atom.model_ops.eplb import get_expert_load_monitor
+from atom.model_ops.eplb import (
+    eplb_map_logical_to_physical,
+    record_eplb_expert_load,
+)
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -69,24 +72,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 logger = logging.getLogger("atom")
-
-
-def _record_eplb_expert_load(layer: torch.nn.Module, topk_ids: torch.Tensor) -> None:
-    atom_cfg = get_current_atom_config()
-    if not getattr(atom_cfg, "eplb_enable", False):
-        return
-    layer_id = getattr(layer, "layer_id", None)
-    if not isinstance(layer_id, int):
-        return
-    num_physical = int(getattr(layer, "global_num_experts", -1))
-    if num_physical <= 0:
-        return
-    monitor = get_expert_load_monitor(
-        enabled=True, window_size=atom_cfg.eplb_load_window_size
-    )
-    monitor.record(
-        layer_id=layer_id, topk_physical=topk_ids, num_physical=num_physical
-    )
 
 
 class MoEActivationQuant(Enum):
@@ -403,44 +388,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
         raise NotImplementedError
-
-    def _select_experts_with_eplb_record(
-        self,
-        *,
-        layer: torch.nn.Module,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        use_grouped_topk: bool,
-        top_k: int,
-        renormalize: bool,
-        topk_group: Optional[int],
-        num_expert_group: Optional[int],
-        custom_routing_function: Optional[Callable],
-        scoring_func: str,
-        e_score_correction_bias: Optional[torch.Tensor],
-        num_routing_experts: int,
-        num_fused_shared_experts: int,
-        fused_shared_experts_scoring_func: Optional[str],
-        routed_scaling_factor: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=num_routing_experts,
-            num_fused_shared_experts=num_fused_shared_experts,
-            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-        _record_eplb_expert_load(layer, topk_ids)
-        return topk_weights, topk_ids
 
     @staticmethod
     def _maybe_make_prepare_finalize(
@@ -1010,8 +957,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max().to(torch.float32)
             )
 
-        if self.use_triton:
-            from atom.config import get_current_atom_config
+        if self.use_triton and not (
+            getattr(get_current_atom_config(), "eplb_enable", False)
+            and getattr(layer, "num_redundant_experts", 0) > 0
+        ):
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
 
             atom_config = get_current_atom_config()
@@ -1352,8 +1301,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 act_quant=self.act_quant,
             )
 
-        topk_weights, topk_ids = self._select_experts_with_eplb_record(
-            layer=layer,
+        topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -1364,11 +1312,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=global_num_experts,
+            num_routing_experts=getattr(
+                layer, "num_logical_experts", global_num_experts
+            ),
             num_fused_shared_experts=layer.num_fused_shared_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        topk_ids = eplb_map_logical_to_physical(
+            layer, topk_ids
+        )  # logical → physical for EP dispatch
+        record_eplb_expert_load(layer, topk_ids)
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
@@ -1820,7 +1774,6 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
         """Apply compressed-tensors FP8 MoE computation."""
-        # Select top-k experts using router logits
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -1833,7 +1786,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
             num_fused_shared_experts=layer.num_fused_shared_experts,
-            num_routing_experts=layer.global_num_experts,
+            num_routing_experts=global_num_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
@@ -2470,19 +2423,33 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        self.global_num_experts = num_experts
+        self.num_logical_experts = num_experts
+        self.num_redundant_experts = (
+            int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
+            if self.use_ep and getattr(atom_config, "eplb_enable", False)
+            else 0
+        )
+        self.num_physical_experts = (
+            self.num_logical_experts + self.num_redundant_experts
+        )
+        if self.use_ep:
+            assert self.num_physical_experts % self.ep_size == 0, (
+                "EPLB physical experts must be divisible by ep_size: "
+                f"num_logical={self.num_logical_experts}, "
+                f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
+            )
+        self.global_num_experts = self.num_physical_experts
         self.register_buffer("expert_map", None, persistent=False)
         self.register_buffer("expert_mask", None, persistent=False)
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
+                global_num_experts=self.num_physical_experts,
             )
         else:
-            self.local_num_experts = self.global_num_experts
+            self.local_num_experts = self.num_physical_experts
         self.top_k = top_k
-        self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
         if shared_expert_prefix is None and prefix.endswith(".experts"):
@@ -2536,7 +2503,7 @@ class FusedMoE(torch.nn.Module):
             )
         if fuse_shared_experts and self.num_fused_shared_experts > 0:
             init_aiter_topK_meta_data(
-                n_routed_experts=self.global_num_experts,
+                n_routed_experts=self.num_logical_experts,
                 n_shared_experts=self.num_fused_shared_experts,
                 top_k=self.top_k,
                 tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
