@@ -171,9 +171,10 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
     # (index_head_dim=128, qk_rope_head_dim=64), same per_1x128 fp8 quant, and the
     # indexer rope is always neox for both. The fused kernel path is therefore
     # math-equivalent to the per-op path, so allow it here (gated by an env flag for
-    # easy rollback). The GEMM-merge of wk+weights_proj stays off for GLM — see
-    # _can_fuse_indexer_wk_weights_proj — because GLM checkpoints name the projections
-    # differently and are not pre-mergeable.
+    # easy rollback). This also enables the wk+weights_proj GEMM-merge for GLM — its
+    # checkpoint uses the standard indexer.wk / indexer.weights_proj tensor names
+    # (the "indexers_proj" alias only lives in the HF quant config), so the merge
+    # loads correctly; see _can_fuse_indexer_wk_weights_proj.
     if getattr(config, "model_type", None) == "glm_moe_dsa":
         if not ENABLE_GLM_FUSED_INDEXER:
             return False
@@ -201,14 +202,13 @@ def _can_fuse_indexer_wk_weights_proj(
         return False
     if not _supports_fused_indexer_kernel_config(config):
         return False
-    # GLM-5.2: enable the qk-rope+quant+cache kernel fusion but keep indexer.wk /
-    # indexer.weights_proj as separate checkpoint tensors. GLM checkpoints name
-    # weights_proj "indexers_proj" and don't ship a pre-mergeable wk_weights_proj
-    # layout, so the GEMM-merge (which relies on packed_modules_mapping merging two
-    # tensors) is left off until the loader is validated for GLM. The dominant win
-    # (rope+quant+cache fusion) does not require this merge.
-    if getattr(config, "model_type", None) == "glm_moe_dsa":
-        return False
+    # GLM-5.2 (glm_moe_dsa) reuses the same indexer weight layout as DeepSeek-V3.2:
+    # separate indexer.wk (fp8 block-scale) + indexer.weights_proj (bf16). The
+    # "indexers_proj" name only appears in the HF quant config's modules_to_not_convert
+    # list (remapped via quant_exclude_name_mapping); the actual checkpoint tensors use
+    # the standard indexer.wk / indexer.weights_proj paths, which is exactly what the
+    # packed_modules_mapping merge and IndexerWkWeightsProjLinear's fp8-wk load expect.
+    # So GLM takes the same wk+weights_proj GEMM-merge path as V3.2 below.
     if quant_config is None:
         return True
 
