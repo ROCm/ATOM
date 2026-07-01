@@ -102,22 +102,23 @@ jobs:
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_ROOT=""
           MODEL_CACHE_DESC=""
+          MODEL_MOUNT_PATH="/models"
 
           if [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_ROOT="/shared/data/WRH/models"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/mnt/raid0/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/data/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/data/pretrained_model"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/data/models" ]; then
             MODEL_CACHE_ROOT="/data/models"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
@@ -129,6 +130,7 @@ jobs:
           echo "MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+          echo "MODEL_MOUNT_PATH=${MODEL_MOUNT_PATH}" >> "$GITHUB_ENV"
 
       - name: Clean up GPU and Python processes
         run: |
@@ -243,7 +245,7 @@ jobs:
             exit 0
           fi
 
-          model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           if $CONTAINER_ENGINE exec \
             -e MODEL_DIR="$model_dir" \
             "$CONTAINER_NAME" \
@@ -259,7 +261,7 @@ jobs:
       - name: Download model if needed
         run: |
           set -euo pipefail
-          model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           if [ "${SGLANG_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
             echo "Using local model path ${SGLANG_RESOLVED_MODEL_PATH}; skip download."
             exit 0
@@ -333,8 +335,8 @@ jobs:
             exit 0
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_CACHE_ROOT}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
-            echo "Using mounted model path: ${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_MOUNT_PATH}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: ${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           else
             echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
@@ -350,7 +352,21 @@ jobs:
           MAX_WAIT_RETRIES: "120"
           STREAM_SGLANG_LOGS: "1"
           LM_EVAL_TASK: "gsm8k"
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
+          LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent }}
         run: |
+          set -euo pipefail
+
+          # Avoid long-running podman/docker exec sessions waiting on runtime
+          # exit files. Run the accuracy driver inside the container and poll it
+          # from short host-side exec calls.
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '
+            rm -f \
+              /tmp/atom_sglang_accuracy_driver.done \
+              /tmp/atom_sglang_accuracy_driver.exit \
+              /tmp/atom_sglang_accuracy_driver.log
+          '
+
           $CONTAINER_ENGINE exec \
             -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
             -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
@@ -363,10 +379,55 @@ jobs:
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
-            "$CONTAINER_NAME" bash -lc "
-              set -euo pipefail
-              bash .github/scripts/atom_sglang_test.sh accuracy
-            "
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
+            -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
+            "$CONTAINER_NAME" bash -lc '
+              (
+                set +e
+                bash .github/scripts/atom_sglang_test.sh accuracy > /tmp/atom_sglang_accuracy_driver.log 2>&1
+                rc=$?
+                echo "$rc" > /tmp/atom_sglang_accuracy_driver.exit
+                touch /tmp/atom_sglang_accuracy_driver.done
+              ) &
+              echo "Started SGLANG accuracy driver pid=$!"
+            '
+
+          last_driver_log_line=0
+          emit_driver_logs() {
+            local current_line_count
+            current_line_count="$(
+              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc \
+                'if [ -f /tmp/atom_sglang_accuracy_driver.log ]; then wc -l < /tmp/atom_sglang_accuracy_driver.log; else echo 0; fi' \
+                2>/dev/null || echo 0
+            )"
+            current_line_count=${current_line_count//$'\r'/}
+            if [ "${current_line_count:-0}" -le "${last_driver_log_line}" ]; then
+              return 0
+            fi
+
+            echo ""
+            echo "========== New SGLANG accuracy driver output =========="
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc \
+              "sed -n '$((last_driver_log_line + 1)),${current_line_count}p' /tmp/atom_sglang_accuracy_driver.log" || true
+            last_driver_log_line=${current_line_count}
+          }
+
+          echo "Waiting for SGLANG accuracy driver to finish..."
+          while true; do
+            if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '[ -f /tmp/atom_sglang_accuracy_driver.done ]'; then
+              emit_driver_logs
+              break
+            fi
+            emit_driver_logs
+            sleep 60
+          done
+
+          accuracy_rc="$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'cat /tmp/atom_sglang_accuracy_driver.exit')"
+          if [ "${accuracy_rc}" != "0" ]; then
+            echo "SGLANG accuracy driver failed with exit code ${accuracy_rc}"
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/atom_sglang_accuracy_driver.log 2>/dev/null || true'
+            exit "${accuracy_rc}"
+          fi
 
       - name: Check SGLANG accuracy test results
         if: success()
