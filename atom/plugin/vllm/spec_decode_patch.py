@@ -4,40 +4,6 @@ import logging
 logger = logging.getLogger("atom")
 
 
-def _patch_vllm_eagle_model_sharing() -> None:
-    """Let ATOM draft wrappers run their native target-sharing hook.
-
-    vLLM's default MTP sharing knows about common `embed_tokens` / `lm_head`
-    layouts. DeepSeek V4 in ATOM stores the target embedding/head under
-    `target.model.{embed,head}` and the draft assigns them to each MTP block
-    through `share_with_target()`, so invoke that hook after vLLM has loaded
-    the draft model.
-    """
-    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
-
-    original_load = eagle_utils.load_eagle_model
-    if getattr(original_load, "_atom_share_with_target_patched", False):
-        return
-
-    @functools.wraps(original_load)
-    def wrapped_load_eagle_model(target_model, vllm_config):
-        eagle_model = original_load(target_model, vllm_config)
-        draft_base = getattr(eagle_model, "model", eagle_model)
-        share = getattr(draft_base, "share_with_target", None)
-        if share is not None:
-            target_base = getattr(target_model, "model", target_model)
-            share(target_base, set())
-            logger.info(
-                "ATOM plugin: shared target weights with MTP draft via "
-                "%s.share_with_target().",
-                draft_base.__class__.__name__,
-            )
-        return eagle_model
-
-    setattr(wrapped_load_eagle_model, "_atom_share_with_target_patched", True)
-    eagle_utils.load_eagle_model = wrapped_load_eagle_model
-
-
 def _share_atom_draft_with_target(draft_wrapper, target_model) -> None:
     draft_base = getattr(draft_wrapper, "model", draft_wrapper)
     share = getattr(draft_base, "share_with_target", None)
@@ -53,7 +19,18 @@ def _share_atom_draft_with_target(draft_wrapper, target_model) -> None:
 
 
 def _patch_vllm_llm_base_model_sharing() -> None:
-    """Run ATOM draft sharing after vLLM's generic MTP sharing path."""
+    """Run ATOM draft sharing after vLLM's generic MTP sharing path, and widen
+    the proposer's ``allowed_attn_types`` with ``CommonAttentionMetadata`` for
+    the ATOM DeepSeek-V4 MTP draft only.
+
+    V4's proxy metadata builder returns the vLLM ``CommonAttentionMetadata``
+    itself (with ATOM's V4 metadata attached), so the propose-loop
+    ``isinstance(group_md, allowed_attn_types)`` gate must accept that base
+    type. Done here -- after the draft model is loaded and its type is known --
+    so the (over-broad) base type stays out of the whitelist for every other
+    MTP/eagle model, whose draft emits a concrete backend metadata type and
+    whose type check therefore stays strict.
+    """
     from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
     original_load = SpecDecodeBaseProposer.load_model
@@ -64,6 +41,16 @@ def _patch_vllm_llm_base_model_sharing() -> None:
     def wrapped_load_model(self, target_model):
         original_load(self, target_model)
         _share_atom_draft_with_target(getattr(self, "model", None), target_model)
+        if getattr(getattr(self, "model", None), "_is_deepseek_v4_mtp", False):
+            from vllm.v1.attention.backend import CommonAttentionMetadata
+
+            allowed = getattr(self, "allowed_attn_types", None)
+            if allowed is not None and CommonAttentionMetadata not in allowed:
+                self.allowed_attn_types = (*allowed, CommonAttentionMetadata)
+                logger.info(
+                    "ATOM plugin: allowed CommonAttentionMetadata for the "
+                    "DeepSeek-V4 MTP draft attention type check."
+                )
 
     setattr(wrapped_load_model, "_atom_share_with_target_patched", True)
     SpecDecodeBaseProposer.load_model = wrapped_load_model
@@ -163,19 +150,21 @@ def _patch_vllm_draft_positions_on_metadata() -> None:
         common_attn_metadata,
         draft_index: int = 0,
     ):
-        is_atom_v4_mtp = getattr(
-            getattr(self, "model", None), "_is_deepseek_v4_mtp", False
-        )
+        # Only ATOM DeepSeek-V4 MTP needs the draft's ``common_attn_metadata``
+        # augmented so the V4 sparse-attention bridge can pre-compute its topk
+        # (C128A) metadata: the padded token count / slot mapping (draft_index>0)
+        # and the per-token ``positions`` field. For every other MTP/eagle model
+        # defer entirely to vLLM's original builder so their behavior is
+        # byte-identical to upstream (the shared ``positions`` field in
+        # particular must not be overwritten for them).
+        if not getattr(getattr(self, "model", None), "_is_deepseek_v4_mtp", False):
+            return original_build(self, common_attn_metadata, draft_index)
         num_tokens = int(
             getattr(common_attn_metadata, "num_actual_tokens", 0)
             or getattr(common_attn_metadata, "num_tokens", 0)
             or 0
         )
-        if (
-            is_atom_v4_mtp
-            and draft_index > 0
-            and hasattr(common_attn_metadata, "batch_size")
-        ):
+        if draft_index > 0 and hasattr(common_attn_metadata, "batch_size"):
             _mode, num_tokens, _num_tokens_across_dp = (
                 self._determine_batch_execution_and_padding(
                     common_attn_metadata.batch_size()
@@ -244,7 +233,6 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
 
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
-    _patch_vllm_eagle_model_sharing()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
@@ -259,7 +247,6 @@ def apply_vllm_spec_decode_patch() -> None:
     from atom.utils.forward_context import (
         AttentionMetaData as AtomAttentionMetaData,
     )
-    from vllm.v1.attention.backend import CommonAttentionMetadata
     from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 
     original_init = SpecDecodeBaseProposer.__init__
@@ -270,8 +257,12 @@ def apply_vllm_spec_decode_patch() -> None:
         )
         return
 
+    # Concrete ATOM backend metadata types emitted by ATOM draft models. Adding
+    # these to any ATOM proposer's whitelist is safe (they are ATOM's own types;
+    # non-ATOM metadata never matches them). The over-broad base
+    # ``CommonAttentionMetadata`` is deliberately NOT added here -- it is added
+    # only for the V4 MTP draft in ``_patch_vllm_llm_base_model_sharing``.
     atom_allowed_attn_types = (
-        CommonAttentionMetadata,
         AtomAttentionMetaData,
         AiterMhaMetadataForVllm,
         AiterMlaMetadataForVllm,
