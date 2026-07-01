@@ -2,14 +2,12 @@ name: Atomesh Benchmark
 
 on:
   push:
-    branches: [main, zwan/mesh-model-ci]
+    branches: [main]
     paths:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
-      - '.github/dashboard/atomesh_index.html'
-      - 'docs/assets/atomesh_logo.png'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -18,8 +16,6 @@ on:
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
-      - '.github/dashboard/atomesh_index.html'
-      - 'docs/assets/atomesh_logo.png'
   schedule:
     # Nightly at 03:00 Beijing time (19:00 UTC)
     - cron: '0 19 * * *'
@@ -48,11 +44,6 @@ on:
         required: false
         default: false
         type: boolean
-      publish_dashboard:
-        description: 'Publish workflow_dispatch results to dashboard'
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
@@ -60,7 +51,7 @@ concurrency:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 jobs:
   load-config:
@@ -167,11 +158,11 @@ jobs:
           set -euo pipefail
           mkdir -p atomesh-results
           SUMMARY_PATH="atomesh-results/${MATRIX_ID}-summary.md"
-          DASHBOARD_INPUT="atomesh-results/${MATRIX_ID}-benchmark-action.json"
+          BENCHMARK_ACTION_INPUT="atomesh-results/${MATRIX_ID}-benchmark-action.json"
 
           python3 .github/scripts/atomesh/process_result.py \
             "atomesh-results/${MATRIX_ID}" \
-            --output "${DASHBOARD_INPUT}" \
+            --output "${BENCHMARK_ACTION_INPUT}" \
             --summary "${SUMMARY_PATH}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
@@ -212,75 +203,20 @@ jobs:
           merge-multiple: true
           path: atomesh-results
 
-      - name: Build dashboard input
+      - name: Build benchmark summary
         run: |
           set -euo pipefail
           python3 .github/scripts/atomesh/process_result.py \
             atomesh-results \
-            --output atomesh-benchmark-dashboard-input.json \
+            --output atomesh-benchmark-action.json \
             --summary atomesh-benchmark-summary.md \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           cat atomesh-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload dashboard input
+      - name: Upload benchmark summary
         uses: actions/upload-artifact@v7
         with:
-          name: atomesh-benchmark-dashboard-input
+          name: atomesh-benchmark-summary
           path: |
-            atomesh-benchmark-dashboard-input.json
+            atomesh-benchmark-action.json
             atomesh-benchmark-summary.md
-
-  dashboard:
-    name: Update ATOMesh Benchmark Dashboard
-    needs: [summarize-results]
-    if: >-
-      !cancelled()
-      && needs.summarize-results.result == 'success'
-      && (
-        github.event_name == 'schedule'
-        || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-        || (github.event_name == 'workflow_dispatch' && inputs.publish_dashboard)
-      )
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout ATOM repo
-        uses: actions/checkout@v6
-
-      - name: Download dashboard input
-        uses: actions/download-artifact@v8
-        with:
-          name: atomesh-benchmark-dashboard-input
-          path: atomesh-dashboard-input
-
-      - name: Store benchmark result to dashboard
-        if: hashFiles('atomesh-dashboard-input/atomesh-benchmark-dashboard-input.json') != ''
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          tool: customBiggerIsBetter
-          output-file-path: atomesh-dashboard-input/atomesh-benchmark-dashboard-input.json
-          gh-pages-branch: gh-pages
-          benchmark-data-dir-path: atomesh-benchmark-dashboard
-          auto-push: false
-          max-items-in-chart: 500
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Deploy ATOMesh benchmark dashboard to gh-pages
-        if: hashFiles('atomesh-dashboard-input/atomesh-benchmark-dashboard-input.json') != ''
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          DASHBOARD_TEMPLATE=$(mktemp)
-          LOGO_ASSET=$(mktemp)
-          cp .github/dashboard/atomesh_index.html "$DASHBOARD_TEMPLATE"
-          cp docs/assets/atomesh_logo.png "$LOGO_ASSET"
-          CURRENT_SHA=$(git rev-parse HEAD)
-          git fetch origin gh-pages
-          git checkout gh-pages
-          mkdir -p atomesh-benchmark-dashboard
-          cp "$DASHBOARD_TEMPLATE" atomesh-benchmark-dashboard/index.html
-          cp "$LOGO_ASSET" atomesh-benchmark-dashboard/atomesh_logo.png
-          git add atomesh-benchmark-dashboard/
-          git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
-          git push origin gh-pages
-          git checkout "$CURRENT_SHA"
