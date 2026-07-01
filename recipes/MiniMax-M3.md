@@ -259,3 +259,158 @@ Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
 | 16 | 160 | 78.17 | 430.34 | 2680.95 | 7.91 | 15.58 | 1876.30 | 16928.43 |
 | 32 | 320 | 125.69 | 609.24 | 5304.23 | 12.60 | 23.81 | 2355.93 | 21132.49 |
 | 64 | 640 | 198.58 | 966.20 | 10476.78 | 19.97 | 40.44 | 2973.94 | 26857.80 |
+
+## PD Disaggregation (Single-Node 1P+1D)
+
+Run prefill and decode as separate processes on the same node, each using 4 GPUs
+(TP=4). KV cache transfer via Mooncake RDMA, routed through atomesh.
+
+### Setup
+
+Start the container on the node with the RDMA-aware docker script:
+
+```bash
+DOCKER_IMAGE=rocm/atom-dev:latest bash atom/mesh/scripts/docker_start.sh
+docker exec -it atom_sglang_mesh bash
+```
+
+All commands below run **inside the container**.
+
+### Start Prefill Server (GPU 0-3)
+
+```bash
+export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export PYTHONUNBUFFERED=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=${NODE_IP}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+python3 -m atom.entrypoints.openai_server \
+    --model amd/MiniMax-M3-MXFP4 \
+    --host 0.0.0.0 --server-port 8010 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --kv_cache_dtype fp8 \
+    --block-size 128 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}' \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    2>&1 | tee prefill.log
+```
+
+### Start Decode Server (GPU 4-7)
+
+In a separate shell inside the same container:
+
+```bash
+export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+
+export HIP_VISIBLE_DEVICES=4,5,6,7
+export PYTHONUNBUFFERED=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=${NODE_IP}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+python3 -m atom.entrypoints.openai_server \
+    --model amd/MiniMax-M3-MXFP4 \
+    --host 0.0.0.0 --server-port 8020 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --kv_cache_dtype fp8 \
+    --block-size 128 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
+    --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    2>&1 | tee decode.log
+```
+
+### Start Router (atomesh)
+
+Wait for both servers to show `Application startup complete`, then in a third shell:
+
+```bash
+export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://${NODE_IP}:8010" \
+    --decode  "http://${NODE_IP}:8020" \
+    --policy random \
+    --backend atom \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker \
+    --prometheus-port 29100
+```
+
+### Verify
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"amd/MiniMax-M3-MXFP4","prompt":"Hello","max_tokens":32,"temperature":0}'
+```
+
+### PD + EAGLE3
+
+Add EAGLE3 speculative decoding to the PD setup by appending these flags to
+**both** the prefill and decode server commands:
+
+```
+--method eagle3 \
+--draft-model Inferact/MiniMax-M3-EAGLE3 \
+--num-speculative-tokens 3
+```
+
+The router command stays the same.
+
+### GSM8K Accuracy (via Router)
+
+```bash
+lm_eval --model local-chat-completions \
+    --model_args "model=amd/MiniMax-M3-MXFP4,base_url=http://127.0.0.1:8000/v1/chat/completions,num_concurrent=64,max_retries=3,max_gen_toks=16384" \
+    --tasks gsm8k \
+    --num_fewshot 5 \
+    --batch_size 65 \
+    --apply_chat_template \
+    --fewshot_as_multiturn
+```
+
+### Serving Benchmark (via Router)
+
+```bash
+ISL=8192
+OSL=1024
+CONC=16
+
+python -m atom.benchmarks.benchmark_serving \
+    --model=amd/MiniMax-M3-MXFP4 \
+    --backend=vllm \
+    --base-url=http://127.0.0.1:8000 \
+    --dataset-name=random \
+    --random-input-len="${ISL}" \
+    --random-output-len="${OSL}" \
+    --random-range-ratio=0.8 \
+    --num-prompts=$(( CONC * 10 )) \
+    --max-concurrency="${CONC}" \
+    --request-rate=inf \
+    --ignore-eos \
+    --save-result \
+    --percentile-metrics="ttft,tpot,itl,e2el"
+```
