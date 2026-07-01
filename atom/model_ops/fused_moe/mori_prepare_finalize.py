@@ -13,6 +13,7 @@ from atom.plugin.config import VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD
 from atom.plugin.prepare import is_vllm
 from atom.utils.forward_context import get_forward_context
 from aiter import QuantType, dtypes
+from aiter.jit.utils.chip_info import get_cu_num
 
 try:
     import mori
@@ -156,22 +157,28 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return tbo_active()
 
     def _get_dispatch_config(self, num_tokens: int | None = None) -> tuple[int, int]:
-        """Return (block_num, warp_per_block) based on runtime mode."""
-        if is_vllm():
-            # vLLM does not expose a stable prefill/decode flag here, so use a
-            # token-count threshold to keep MORI warmup and runtime selection
-            # deterministic in atom-vllm mode
-            assert (
-                num_tokens is not None
-            ), "num_tokens is required to choose MORI launch config in vLLM mode."
-            if num_tokens >= VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD:
-                return 128, 16
-            return 64, 4
+        """Return (block_num, warp_per_block) based on runtime mode.
 
+        Default policy keys off the forward-context prefill/decode flag.
+        atom-vllm has no stable prefill/decode flag at this call site and
+        instead selects by a token-count threshold; it overrides this method
+        via a plugin patch, so keep this body frontend-agnostic.
+
+        block_num is capped at the device CU count: mori's IntraNode
+        dispatch/combine use a hand-rolled grid-wide barrier
+        (CrossDeviceBarrierIntraNodeKernel) that spins until *all* gridDim.x
+        blocks have arrived, which requires every block to be co-resident. The
+        combine block (1024 threads + larger dynamic smem) gets ~1 block/CU
+        occupancy, so launching more blocks than CUs (e.g. 128 on the 80-CU
+        MI308X) leaves the surplus blocks unscheduled -> the barrier never
+        completes -> warmup deadlocks. Capping at multi_processor_count keeps
+        big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
+        """
+        mp = get_cu_num()
         context = get_forward_context().context
         if context.is_prefill:
-            return 128, 16
-        return 64, 4
+            return min(128, mp), 16
+        return min(64, mp), 4
 
     # ---- Synchronous (non-TBO) path ----
 

@@ -49,13 +49,6 @@ _MLA_PERSISTENT_METADATA_FIELDS = (
 )
 
 
-def get_mla_persistent_metadata_dtypes(
-    cache_dtype: str,
-) -> tuple[torch.dtype, torch.dtype]:
-    dtype_kv = dtypes.d_dtypes[cache_dtype]
-    return dtype_kv, dtype_kv
-
-
 def disabled_mla_persistent_metadata() -> dict[str, None]:
     return {field: None for field in _MLA_PERSISTENT_METADATA_FIELDS}
 
@@ -205,7 +198,7 @@ def mla_fold_kv_metadata_triton(
         paged_kv_indices: [paged_kv_indptr[-1]] int32, original kv indices.
         fold_kv_indptr: [num_reqs*fold_factor + 1] int32, output indptr.
         fold_kv_indices: [fold_factor * paged_kv_indptr[-1]] int32.
-        fold_factor: integer fold factor (e.g. 4 for nhead 64 -> 16).
+        fold_factor: integer fold factor (e.g. 4 for nhead 32 -> 8).
         num_reqs: number of decode requests (size of `paged_kv_indptr` - 1).
     """
     if num_reqs == 0:

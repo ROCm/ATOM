@@ -213,9 +213,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_prefix_swa: Optional[torch.Tensor] = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `prefix_swa_count`."""
     kv_indices_prefix_csa: Optional[torch.Tensor] = None
-    """[sum(prefix_swa_count + min(n_csa, index_topk))] int32 GPU — SWA
-    history (head) + CSA topk (tail) per token. SWA section is filled by
-    builder; CSA section is filled per-layer by `csa_translate_pack`."""
+    """[sum(prefix_swa_count + min(n_csa, index_topk))] int32 GPU — CSA topk
+    (head) + SWA history (tail) per token. CSA section is filled per-layer by
+    `csa_translate_pack`; SWA prefix section is filled by builder at the slice
+    tail (head-CSA / tail-SWA convention, matching decode, #1116)."""
     kv_indptr_prefix_csa: Optional[torch.Tensor] = None
     """[total_tokens + 1] int32 GPU — packed cumsum of
     `prefix_swa_count + min(n_committed_csa, index_topk)`."""
@@ -2082,9 +2083,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ),
             index_topk,
         ).astype(np.int32)
-        n_hca_per_token_np = n_committed_hca_per_seq_np[batch_id_per_token_np].astype(
-            np.int32
-        )
+        # Per-token CAUSAL HCA visibility (mirrors CSA above and the reference
+        # `get_compress_topk_idxs` prefill mask): token at `pos` sees only the
+        # `(pos+1)//128` HCA groups committed up to its own position, capped by
+        # the per-seq committed count. Without `(pos+1)//128`, every token used
+        # the per-seq `ctx_end//128`, over-reading FUTURE groups and making a
+        # token's output depend on the forward's total length (chunked breaks).
+        # MUST stay in sync with the kernel's inline cap in
+        # `_v4_paged_prefill_indices_kernel` (HCA_RATIO).
+        n_hca_per_token_np = np.minimum(
+            (positions_arr + 1) // 128,
+            n_committed_hca_per_seq_np[batch_id_per_token_np],
+        ).astype(np.int32)
 
         # 4 indptrs on CPU; last element = total (no D2H to size buffers).
         ext_indptr_np = np.zeros(T + 1, dtype=np.int32)
@@ -2166,11 +2176,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             swa_pages=swa_pages,
         )
 
-        # ----- skip_prefix_len_csa: per-token CSA section write offset -----
-        # csa_translate_pack consumes this as offset within
-        # `kv_indices_prefix_csa[indptr[t]:indptr[t+1]]` where the CSA topk
-        # section starts (after the SWA prefix segment). Matches the per-token
-        # prefix_swa_count vector we just computed on CPU.
+        # ----- skip_prefix_len_csa: per-token SWA prefix length -----
+        # csa_translate_pack consumes this to derive the CSA topk length
+        # `valid_k = (indptr[t+1]-indptr[t]) - skip` it writes at the HEAD of
+        # `kv_indices_prefix_csa[indptr[t]:indptr[t+1]]`; the SWA prefix
+        # (length `skip`) occupies the slice TAIL, written by the builder.
+        # Matches the per-token prefix_swa_count vector we just computed on CPU.
         skip_csa_gpu = torch.from_numpy(prefix_swa_count_np).to(
             device, non_blocking=True
         )

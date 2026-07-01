@@ -301,12 +301,22 @@ class MooncakeConnector(KVConnectorBase):
         if not ib_device:
             ib_device = os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
         if not ib_device:
-            gpu_idx = torch.cuda.current_device()
-            ib_device = f"rdma{gpu_idx}"
+            visible_idx = torch.cuda.current_device()
+            visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
+                "CUDA_VISIBLE_DEVICES"
+            )
+            if visible_env:
+                visible_list = [d for d in visible_env.split(",") if d != ""]
+                phys_idx = int(visible_list[visible_idx])
+            else:
+                phys_idx = visible_idx
+            ib_device = f"rdma{phys_idx}"
             logger.info(
-                "Auto-selecting RDMA device %s for GPU %d (tp_rank=%d)",
+                "Auto-selecting RDMA device %s for physical GPU %d "
+                "(visible_idx=%d, tp_rank=%d)",
                 ib_device,
-                gpu_idx,
+                phys_idx,
+                visible_idx,
                 self.tp_rank,
             )
 
@@ -484,7 +494,10 @@ class MooncakeConnector(KVConnectorBase):
     _MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024
 
     def register_kv_caches(
-        self, kv_caches: dict[str, Any], transfer_tensors: Any = None
+        self,
+        kv_caches: dict[str, Any],
+        transfer_tensors: Any = None,
+        num_blocks: int | None = None,
     ) -> None:
         """Register KV cache tensors with the Mooncake TransferEngine."""
         self.kv_caches = kv_caches

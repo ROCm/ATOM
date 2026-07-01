@@ -151,12 +151,14 @@ class AiterMlaDecodeMetadataForVllm:
 
 @dataclass
 class AiterMlaPersistentMetadataForVllm:
-    work_meta_data: torch.Tensor
-    work_indptr: torch.Tensor
-    work_info_set: torch.Tensor
-    reduce_indptr: torch.Tensor
-    reduce_final_map: torch.Tensor
-    reduce_partial_map: torch.Tensor
+    # All fields are None when persistent metadata is disabled
+    # (see disabled_mla_persistent_metadata()), e.g. under DP.
+    work_meta_data: torch.Tensor | None
+    work_indptr: torch.Tensor | None
+    work_info_set: torch.Tensor | None
+    reduce_indptr: torch.Tensor | None
+    reduce_final_map: torch.Tensor | None
+    reduce_partial_map: torch.Tensor | None
 
 
 @dataclass
@@ -1588,8 +1590,8 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             shared_buffer = torch.zeros([numel], dtype=torch.int32, device=device)
 
         for layer_name in layer_names or []:
-            attention_prefix, indexer, sparse_attn, owner_atom_config = _resolve_indexer(
-                layer_name
+            attention_prefix, indexer, sparse_attn, owner_atom_config = (
+                _resolve_indexer(layer_name)
             )
             if indexer is not None:
                 indexer.sparse_kv_indices_buffer = shared_buffer

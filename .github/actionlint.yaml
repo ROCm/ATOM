@@ -1,10 +1,13 @@
 self-hosted-runner:
   # Labels of self-hosted runner in array of strings.
   labels:
+    - atom-mi35x-8gpu-oot-acc
     - atom-mi355-8gpu.predownload
     - atom-mi355-8gpu-aac-runner
     - atom-mi355-8gpu-conductor-sgl-runner
+    - atom-mi355-8gpu-vllm-sgl-ci
     - atom-mi308-8gpu-plugins-benchmark
+    - atom-mi308-8gpu-vllm-sgl-ci
     - atom-plugin-acc-validation-runner
     - build-only-atom
     - linux-atom-do-mi350x-8

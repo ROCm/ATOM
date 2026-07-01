@@ -205,6 +205,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         enable_expert_parallel=vllm_parallel_config.enable_expert_parallel,
         master_addr=None,
         enable_dp_attention=False,
+        # vLLM EP shards MoE across the flattened DP x TP device space (and
+        # therefore disables fused shared experts); native uses per-DP MoE.
+        moe_ep_flatten_tp_across_dp=vllm_parallel_config.enable_expert_parallel,
         enable_tbo=vllm_enable_dbo,
         enable_tbo_decode=vllm_enable_dbo,
         plugin_config=plugin_config,
@@ -430,7 +433,7 @@ def _generate_atom_config_from_rtpllm_config(config: Any):
 
     return Config(
         model=rtpllm_model_config.ckpt_path,
-        max_num_batched_tokens=max(16384, max_generate_batch_size),
+        max_num_batched_tokens=max(max_model_len, max_generate_batch_size),
         max_num_seqs=max_generate_batch_size,
         max_model_len=max_model_len,
         gpu_memory_utilization=0.9,

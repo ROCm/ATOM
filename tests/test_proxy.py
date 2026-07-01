@@ -7,6 +7,11 @@ from __future__ import annotations
 
 import pytest
 
+# proxy pulls in optional P/D disaggregation deps; skip visibly when absent
+# (e.g. on the non-GPU unit gate) rather than erroring at collection.
+pytest.importorskip("msgpack", reason="proxy imports msgpack (optional P/D dep)")
+pytest.importorskip("quart", reason="proxy imports quart (optional P/D dep)")
+
 import atom.kv_transfer.disaggregation.proxy as proxy_mod
 from atom.kv_transfer.disaggregation.proxy import (
     _append_whole_dict_unique,
