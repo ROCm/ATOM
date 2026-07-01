@@ -7,7 +7,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ============================================================================
 # Constants
@@ -92,6 +92,34 @@ class ChatMessage(BaseModel):
         return d
 
 
+class FunctionDefinition(BaseModel):
+    """OpenAI function definition for tool calling."""
+
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class ChatCompletionToolsParam(BaseModel):
+    """A tool the model may call (OpenAI-compatible)."""
+
+    type: str = "function"
+    function: FunctionDefinition
+
+
+class ChatCompletionNamedFunction(BaseModel):
+    """Reference to a specific function by name for tool_choice."""
+
+    name: str
+
+
+class ChatCompletionNamedToolChoiceParam(BaseModel):
+    """Force the model to call a specific named tool."""
+
+    function: ChatCompletionNamedFunction
+    type: str = "function"
+
+
 class ChatCompletionRequest(BaseModel):
     """Request model for chat completions (OpenAI-compatible)."""
 
@@ -111,16 +139,73 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Tool calling
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Any] = (
-        None  # "auto", "none", "required", or {function: {name}}
-    )
+    tools: Optional[List[ChatCompletionToolsParam]] = None
+    tool_choice: Optional[Union[str, ChatCompletionNamedToolChoiceParam]] = None
     # Accepted for compatibility, not actively used:
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
     n: Optional[int] = 1
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_tool_usage(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        # Reject empty tools array (matches OpenAI API behaviour)
+        if data.get("tools") == []:
+            raise ValueError(
+                "`tools` must not be an empty array. "
+                "Either provide at least one tool or omit the field entirely."
+            )
+
+        # Default tool_choice to "auto" when tools are provided
+        if "tool_choice" not in data and data.get("tools"):
+            data["tool_choice"] = "auto"
+
+        # "none" needs no further validation
+        if data.get("tool_choice") == "none":
+            return data
+
+        # If tool_choice is set, tools must be present
+        if data.get("tool_choice") is not None:
+            if not data.get("tools"):
+                raise ValueError(
+                    "When using `tool_choice`, `tools` must be set."
+                )
+
+            choice = data["tool_choice"]
+            # Must be a known string or a named-tool dict
+            if choice not in ("auto", "required") and not isinstance(choice, dict):
+                raise ValueError(
+                    f"Invalid value for `tool_choice`: {choice!r}! "
+                    'Only named tools, "none", "auto" or "required" '
+                    "are supported."
+                )
+
+            # Validate named tool choice matches a provided tool
+            if isinstance(choice, dict):
+                fn = choice.get("function")
+                if not isinstance(fn, dict) or "name" not in fn:
+                    raise ValueError(
+                        "Invalid `tool_choice`: expected "
+                        '`{"type": "function", "function": {"name": "my_function"}}`'
+                    )
+                fn_name = fn["name"]
+                tool_names = {
+                    (t.get("function") or {}).get("name")
+                    for t in (data.get("tools") or [])
+                    if isinstance(t, dict)
+                }
+                if fn_name not in tool_names:
+                    raise ValueError(
+                        "The tool specified in `tool_choice` does not match "
+                        "any of the specified `tools`."
+                    )
+
+        return data
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""
@@ -138,6 +223,12 @@ class ChatCompletionRequest(BaseModel):
             return self.prompt
         else:
             raise ValueError("Either 'messages' or 'prompt' field is required")
+
+    def get_tools_as_dicts(self) -> Optional[List[Dict[str, Any]]]:
+        """Return tools as plain dicts for downstream consumers."""
+        if self.tools is None:
+            return None
+        return [t.model_dump() for t in self.tools]
 
 
 class CompletionRequest(BaseModel):
