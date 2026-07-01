@@ -1315,8 +1315,8 @@ def _convert_req_index_to_global_index_kernel(
     kv_end = tl.load(kv_indptr + batch_id + 1)
     out_kv_start = tl.load(page_kv_indptr + batch_id)
     kv_len = kv_end - kv_start
-    qo_start = tl.load(qo_indptr + batch_id)
-    qo_end = tl.load(qo_indptr + batch_id + 1)
+    qo_start = tl.load(qo_indptr + batch_id, cache_modifier=".cv")
+    qo_end = tl.load(qo_indptr + batch_id + 1, cache_modifier=".cv")
 
     for token_id in range(qo_start, qo_end):
         # Load token indices for this tile
