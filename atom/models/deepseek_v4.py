@@ -1604,12 +1604,8 @@ class DeepseekV4Attention(nn.Module):
 
         self.alt_stream = alt_stream
         self.indexer_stream = indexer_stream
-        from atom.utils import envs as _atom_envs
-
         self._use_async_compress = (
-            self.alt_stream is not None
-            and self.compressor is not None
-            and not _atom_envs.ATOM_V4_DISABLE_ASYNC_COMPRESS
+            self.alt_stream is not None and self.compressor is not None
         )
 
         self.layer_name = prefix
