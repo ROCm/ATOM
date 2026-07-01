@@ -99,7 +99,6 @@ def _v4_paged_prefill_indices_kernel(
     pos = tl.load(positions_ptr + t)
     chunk_start = tl.load(chunk_start_per_seq_ptr + bid)
     cu_q = tl.load(cu_seqlens_q_per_seq_ptr + bid)
-    state_slot = tl.load(state_slot_per_seq_ptr + bid)
     # Per-token CAUSAL HCA visibility: token at `pos` may see only the
     # `(pos+1)//HCA_RATIO` compressed groups committed up to its own position
     # (matches the reference `get_compress_topk_idxs` prefill mask, and mirrors
@@ -332,7 +331,6 @@ def write_v4_paged_prefill_indices_reference(
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
     cu_q_cpu = cu_seqlens_q_per_seq.cpu().tolist()
-    state_slot_cpu = state_slot_per_seq.cpu().tolist()
     n_hca_cpu = n_committed_hca_per_seq.cpu().tolist()
     block_tables_cpu = block_tables.cpu()
     swa_block_tables_cpu = swa_block_tables.cpu()
@@ -347,7 +345,6 @@ def write_v4_paged_prefill_indices_reference(
         pos = pos_cpu[t]
         chunk_start = cs_per_seq_cpu[bid]
         cu_q = cu_q_cpu[bid]
-        state_slot = state_slot_cpu[bid]
         # Per-token causal HCA cap (mirrors kernel + reference get_compress_topk_idxs).
         n_hca = min((pos + 1) // hca_ratio, n_hca_cpu[bid])
 
@@ -382,7 +379,9 @@ def write_v4_paged_prefill_indices_reference(
             phys = swa_block_tables_cpu[bid, blk.cpu()].to(
                 device=device, dtype=prefix_swa_indices.dtype
             )
-            paged = phys * block_size + (global_pos - blk.to(global_pos.dtype) * block_size)
+            paged = phys * block_size + (
+                global_pos - blk.to(global_pos.dtype) * block_size
+            )
             prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = paged
             # CSA: SWA prefix at the slice TAIL (head holds the CSA topk section
             # filled by csa_translate_pack). See the kernel comment above.

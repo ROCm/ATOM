@@ -151,7 +151,9 @@ def swa_write(
     """
     assert kv.dim() == 2, f"kv must be [T, D], got {kv.shape}"
     assert positions.dim() == 1
-    assert block_tables.dim() == 2, f"block_tables must be [bs, MB], got {block_tables.shape}"
+    assert (
+        block_tables.dim() == 2
+    ), f"block_tables must be [bs, MB], got {block_tables.shape}"
     bs = block_tables.shape[0]
     assert cu_seqlens_q.dim() == 1 and cu_seqlens_q.shape[0] >= bs + 1
     assert swa_region.dim() == 2, f"swa_region must be [P, D], got {swa_region.shape}"

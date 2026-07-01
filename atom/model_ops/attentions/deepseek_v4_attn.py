@@ -418,7 +418,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             for every Compressor instance (CSA Main / CSA Indexer / HCA Main).
         """
         elem_state = self._state_dtype.itemsize  # fp32 = 4
-        elem_swa = self._swa_dtype.itemsize  # bf16 = 2
         # Tail buffers (kv_state + score_state pair per Compressor instance).
         csa_main = self._numel(self.csa_main_state_shape) * 2 * elem_state
         csa_idx = self._numel(self.csa_idx_state_shape) * 2 * elem_state
@@ -779,7 +778,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # paged block_region (not a per-request ring slot). (M2 separate-pool PD
         # transfer, keyed by seq.swa_block_table, needs connector support — TODO.)
         swa_pages = (
-            self.model_runner.num_swa_blocks if self.swa_paged
+            self.model_runner.num_swa_blocks
+            if self.swa_paged
             else runner.num_physical_kvcache_blocks
         ) * self.block_size
         elem_bf16 = 2
@@ -1072,7 +1072,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         assert attn_metadata.context_lens is not None
         assert attn_metadata.state_slot_mapping is not None
         win = self.window_size  # SWA prefix max per token
-        cs = self.win_with_spec  # SWA ring stride = win + max_spec_steps
 
         # ----- GPU-side SWA indptr math (no CPU numpy, no D2H) -----
         # ctx_gpu is already correct (rolled-back by prepare_decode + bumped
@@ -1890,11 +1889,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         win = self.window_size  # per-token max SWA prefix slots
-        cs = self.win_with_spec  # (legacy ring stride; retained for unchanged refs)
         # M1 paged-SWA: SWA region is num_blocks*block_size rows; this boundary
         # offsets the HCA compress section in unified_kv.
         swa_pages = (
-            self.model_runner.num_swa_blocks if self.swa_paged
+            self.model_runner.num_swa_blocks
+            if self.swa_paged
             else self.model_runner.num_physical_kvcache_blocks
         ) * self.block_size
 
@@ -2121,7 +2120,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         device = self.device
         win = self.window_size  # per-token topk count
-        cs = self.win_with_spec  # SWA region per-slot stride (W + mtp_k)
         index_topk = self.index_topk
         T = total_tokens
         # warmup_model runs BEFORE allocate_kv_cache binds the paged pool
@@ -2135,7 +2133,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # M1 paged-SWA: SWA region = num_blocks*block_size (content-addressed),
         # boundary into the HCA compress section of unified_kv.
         swa_pages = (
-            self.model_runner.num_swa_blocks if self.swa_paged
+            self.model_runner.num_swa_blocks
+            if self.swa_paged
             else self.model_runner.num_physical_kvcache_blocks
         ) * self.block_size
         var = self.model_runner.forward_vars

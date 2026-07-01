@@ -115,10 +115,7 @@ class BlockManager:
     def _allocate_swa_block(self, block_id: int) -> Block:
         block = self.swa_blocks[block_id]
         assert block.ref_count == 0
-        if (
-            block.hash != -1
-            and self.swa_hash_to_block_id.get(block.hash) == block_id
-        ):
+        if block.hash != -1 and self.swa_hash_to_block_id.get(block.hash) == block_id:
             del self.swa_hash_to_block_id[block.hash]
         block.reset()
         self.swa_free_block_ids_set.discard(block_id)

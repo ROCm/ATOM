@@ -5,8 +5,10 @@ Validates the block-table addressing: writes the last-N tokens of each seq to
 the content-addressed SWA region and checks the Triton kernel matches the
 pure-PyTorch reference (and that a prefix-cache hit, modelled as two seqs
 sharing the same physical blocks, lands SWA in the SAME rows)."""
+
 import torch
 import pytest
+
 try:
     import atom.model_ops.v4_kernels  # noqa: F401  (triggers the heavy import chain)
 except Exception as _e:  # pre-existing atom.config circular import under bare pytest
@@ -17,10 +19,10 @@ dev = "cuda"
 torch.manual_seed(0)
 
 bs = 3
-block_size = 8           # small for the test (real V4 = 128)
+block_size = 8  # small for the test (real V4 = 128)
 head_dim = 16
 max_blocks = 6
-num_pages = 128          # >= max(phys)*block_size + block_size
+num_pages = 128  # >= max(phys)*block_size + block_size
 write_per_batch = block_size + 2
 
 # Per-seq token counts this fwd, and global positions (varied: some seqs start
@@ -30,10 +32,12 @@ start_pos = [0, 11, 4]
 cu = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
 cu[1:] = torch.cumsum(torch.tensor(tok_counts, dtype=torch.int32), 0)
 T = int(cu[-1])
-positions = torch.cat([
-    torch.arange(start_pos[b], start_pos[b] + tok_counts[b], dtype=torch.int32)
-    for b in range(bs)
-]).to(dev)
+positions = torch.cat(
+    [
+        torch.arange(start_pos[b], start_pos[b] + tok_counts[b], dtype=torch.int32)
+        for b in range(bs)
+    ]
+).to(dev)
 kv = torch.randn(T, head_dim, dtype=torch.bfloat16, device=dev)
 
 # Disjoint phys blocks per seq → writes never collide → deterministic match
@@ -50,7 +54,9 @@ swa_write_reference(kv, positions, cu, block_tables, ref, block_size, write_per_
 swa_write(kv, positions, cu, block_tables, out, block_size, write_per_batch)
 torch.cuda.synchronize()
 
-assert torch.equal(out, ref), f"kernel != reference; max|diff|={(out.float()-ref.float()).abs().max()}"
+assert torch.equal(
+    out, ref
+), f"kernel != reference; max|diff|={(out.float()-ref.float()).abs().max()}"
 print("PASS: kernel == reference")
 
 # Spot-check a known mapping: seq2 last token pos = start_pos[2]+tok_counts[2]-1.

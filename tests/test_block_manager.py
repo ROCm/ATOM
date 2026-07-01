@@ -363,15 +363,19 @@ class TestPrefixCachingEdgeCases:
 
 # ── M2 paged-SWA dual pool ───────────────────────────────────────────────────
 
-from conftest import MockConfig as _MC
+_MC = MockConfig
 
 
 def _swa_bm(num_blocks=10, num_swa=10, bs=4, window=8, prefix=True):
-    return BlockManager(_MC(
-        num_kvcache_blocks=num_blocks, num_swa_blocks=num_swa,
-        kv_cache_block_size=bs, swa_window_size=window,
-        enable_prefix_caching=prefix,
-    ))
+    return BlockManager(
+        _MC(
+            num_kvcache_blocks=num_blocks,
+            num_swa_blocks=num_swa,
+            kv_cache_block_size=bs,
+            swa_window_size=window,
+            enable_prefix_caching=prefix,
+        )
+    )
 
 
 class TestM2DualSwaPool:
@@ -444,7 +448,6 @@ class TestM2WindowFreeing:
         bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
         seq = seq_factory(list(range(1, 9)))  # 2 full blocks (len 8)
         bm.allocate(seq, bm.can_allocate(seq))
-        held0 = [s for s in seq.swa_block_table if s >= 0]
         # Decode forward to len 24 (window=8 → blocks covering <16 fall out).
         for t in range(8, 24):
             seq.append_token(1000 + t)
