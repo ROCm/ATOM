@@ -70,6 +70,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
+    # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
+    # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
+    # identical to V3.2, so the fusion is math-equivalent to the unfused path. Set to
+    # "0" to fall back to the per-op Python path if a regression is suspected.
+    "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
+        os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
