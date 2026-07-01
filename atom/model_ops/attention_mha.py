@@ -1206,13 +1206,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         return sm if sm is not None else attn_metadata
 
     def _topk_cache_state(self, sparse_metadata):
-        state = self.index_topk_cache_state
-        if state is None:
+        if self.index_topk_cache_state is None:
             return None
-        metadata_id = id(sparse_metadata)
-        if state.get("metadata_id") != metadata_id:
-            state.clear()
-            state["metadata_id"] = metadata_id
+        state = getattr(sparse_metadata, "_index_topk_cache_state", None)
+        if state is None:
+            state = {}
+            setattr(sparse_metadata, "_index_topk_cache_state", state)
         return state
 
     def _topk_cache_key(
@@ -1345,6 +1344,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         output = output.view(*q.shape)
         self._index_q = None
         self._index_q_cache_key_info = None
+        from atom.utils.tbo.ubatching import tbo_active
+
+        if tbo_active():
+            from atom.utils.tbo.ubatching import tbo_yield
+
+            tbo_yield()
         return output
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)

@@ -6,7 +6,6 @@
 from typing import Optional, Union
 
 import torch
-import aiter
 from aiter import ActivationType
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -19,7 +18,6 @@ from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
-    fused_qk_norm,
     fused_allreduce_gemma_rms_norm,
 )
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401

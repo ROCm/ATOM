@@ -13,6 +13,7 @@
 
 ## 📢 News
 
+- **[2026/06] Featured ROCm Blog:** [DP Attention and TBO for DeepSeek-V4 on MI355X](https://rocm.blogs.amd.com/software-tools-optimization/atom-optimiztion/README.html) highlights how ATOM optimizes DeepSeek-V4 inference on AMD Instinct MI355X GPUs with DP Attention using all-gather/reduce-scatter and Two-Batch Overlap, achieving strongly competitive DeepSeek-V4 inference performance.
 - **[2026/06]** Experimental **Navi 4 (RDNA4 / gfx1201)** support — AMD Radeon RX 9070 / RX 9070 XT and Radeon AI PRO R9700. See the [Qwen3-8B-FP8](recipes/Qwen3-8B-FP8.md) and [Ministral-3-8B](recipes/Ministral-3-8B.md) recipes.
 - **[2026/06]** ATOM now supports **GLM-5.2** (`glm_moe_dsa`) in FP8, including the new **IndexShare** DSA schedule (shared layers reuse the preceding full layer's indexer). See [GLM-5.2 recipe](recipes/GLM-5.md#glm-52-indexshare).
 - **[2026/05]** ATOM now supports **Qwen3.5 multimodal image+text inference** on the native engine and OpenAI-compatible chat API. See [Qwen3.5 multimodal recipe](recipes/Qwen3.5_multimodel.md).

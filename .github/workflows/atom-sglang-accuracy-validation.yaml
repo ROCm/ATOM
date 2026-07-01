@@ -120,7 +120,7 @@ on:
         type: boolean
         default: false
       run_mi308_all:
-        description: "Run all MI308 gsm8k accuracy cases (Qwen on atom-mi308-8gpu-plugins-benchmark)"
+        description: "Run all MI308 gsm8k accuracy cases on atom-mi308-8gpu-plugins-benchmark"
         required: false
         type: boolean
         default: false
@@ -446,6 +446,26 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.8,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+              },
+              {
+                  "model_name": "MI308 GLM-5.1-FP8 TP8",
+                  "model_path": "zai-org/GLM-5.1-FP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache",
+                  "lm_eval_num_fewshot": 20,
+                  "lm_eval_num_concurrent": 64,
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+              },
+              {
+                  "model_name": "MI308 DeepSeek-V4-Flash",
+                  "model_path": "deepseek-ai/DeepSeek-V4-Flash",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4",
+                  "lm_eval_num_fewshot": 5,
+                  "lm_eval_num_concurrent": 8,
+                  "accuracy_test_threshold": 0.94,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
                   "runner": "atom-mi308-8gpu-plugins-benchmark",
               },
           ]
