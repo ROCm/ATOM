@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import wraps
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -11,6 +12,21 @@ from aiter.dist.parallel_state import get_tp_group
 import logging
 
 logger = logging.getLogger("atom")
+
+BufferCopyPlan = list[tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class _LocalCopyAction:
+    src_slot: int
+    dst_slot: int
+
+
+@dataclass(frozen=True)
+class _P2PAction:
+    logical_expert_id: int
+    peer_rank: int
+    local_slot: int
 
 
 def balanced_packing(
@@ -255,6 +271,355 @@ def rebalance_experts(
 
     l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
     return p2l, l2p, logcnt
+
+
+def _assign_sender_for_receiver(
+    ranks_to_send: list[int], ranks_to_recv: list[int], recv_rank: int
+) -> int:
+    """Deterministic recv->sender mapping aligned with the design doc contract."""
+    assert len(ranks_to_send) > 0, "ranks_to_send must be non-empty"
+    assert recv_rank in ranks_to_recv, "recv_rank must exist in ranks_to_recv"
+    n_send = len(ranks_to_send)
+    n_recv = len(ranks_to_recv)
+    base = n_recv // n_send
+    rem = n_recv % n_send
+    recv_pos = ranks_to_recv.index(recv_rank)
+    if base > 0:
+        cut = base * n_send
+        if recv_pos < cut:
+            return ranks_to_send[recv_pos // base]
+        return ranks_to_send[recv_pos - cut]
+    # n_recv < n_send: first `rem` senders each serves one receiver.
+    return ranks_to_send[recv_pos]
+
+
+def _select_source_rank_for_receiver(
+    *,
+    ranks_to_send: list[int],
+    ranks_to_recv: list[int],
+    recv_rank: int,
+    num_gpu_per_node: int,
+) -> int:
+    """Node-aware deterministic source selection.
+
+    Prefer same-node senders when available; otherwise fallback to global senders.
+    Send/recv sides both call this function to keep pairwise symmetry.
+    """
+    assert num_gpu_per_node > 0
+    recv_node = recv_rank // num_gpu_per_node
+    same_node_senders = [r for r in ranks_to_send if (r // num_gpu_per_node) == recv_node]
+    if len(same_node_senders) > 0:
+        same_node_recvs = [r for r in ranks_to_recv if (r // num_gpu_per_node) == recv_node]
+        return _assign_sender_for_receiver(same_node_senders, same_node_recvs, recv_rank)
+    return _assign_sender_for_receiver(ranks_to_send, ranks_to_recv, recv_rank)
+
+
+def _is_rocm_backend() -> bool:
+    return torch.version.hip is not None
+
+
+def _effective_p2p_chunk_size(
+    *, requested: int, num_logical_experts: int, is_rocm: bool
+) -> int:
+    if not is_rocm:
+        return max(1, int(requested))
+    # ROCm mitigation: forbid one-shot when >= num_logical_experts.
+    if num_logical_experts <= 1:
+        return 1
+    req = max(1, int(requested))
+    max_allowed = num_logical_experts - 1
+    if req > max_allowed:
+        logger.warning(
+            "EPLB ROCm P2P chunk size clamped from %d to %d "
+            "(must be < num_logical_experts=%d).",
+            req,
+            max_allowed,
+            num_logical_experts,
+        )
+        return max_allowed
+    return req
+
+
+def _execute_batched_p2p_ops(
+    *,
+    ops_by_logical: dict[int, list[Any]],
+    num_logical_experts: int,
+    p2p_batch_chunk_size: int,
+) -> None:
+    total_ops = sum(len(v) for v in ops_by_logical.values())
+    if total_ops == 0:
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError("torch.distributed must be initialized for EPLB migration P2P")
+
+    is_rocm = _is_rocm_backend()
+    chunk = _effective_p2p_chunk_size(
+        requested=p2p_batch_chunk_size,
+        num_logical_experts=num_logical_experts,
+        is_rocm=is_rocm,
+    )
+
+    if not is_rocm:
+        all_ops = []
+        for logical_id in sorted(ops_by_logical):
+            all_ops.extend(ops_by_logical[logical_id])
+        reqs = torch.distributed.batch_isend_irecv(all_ops)
+        for req in reqs:
+            req.wait()
+        return
+
+    for start in range(0, num_logical_experts, chunk):
+        end = min(start + chunk, num_logical_experts)
+        batch = []
+        for logical_id in range(start, end):
+            batch.extend(ops_by_logical.get(logical_id, []))
+        if not batch:
+            continue
+        reqs = torch.distributed.batch_isend_irecv(batch)
+        for req in reqs:
+            req.wait()
+
+
+def _plan_single_layer_migration(
+    *,
+    old_p2l_layer: torch.Tensor,
+    new_p2l_layer: torch.Tensor,
+    num_local_physical_experts: int,
+    num_gpu_per_node: int,
+    rank: int,
+    world_size: int,
+) -> tuple[BufferCopyPlan, list[_LocalCopyAction], list[_P2PAction], list[_P2PAction]]:
+    """Plan local copies + send/recv P2P actions for one layer."""
+    assert old_p2l_layer.dim() == 1 and new_p2l_layer.dim() == 1
+    assert old_p2l_layer.shape == new_p2l_layer.shape
+    num_physical = old_p2l_layer.numel()
+    assert world_size > 0
+    assert num_local_physical_experts > 0
+    assert num_physical == world_size * num_local_physical_experts
+    assert num_gpu_per_node > 0 and world_size % num_gpu_per_node == 0
+    base = rank * num_local_physical_experts
+    old_local = old_p2l_layer[base : base + num_local_physical_experts]
+    new_local = new_p2l_layer[base : base + num_local_physical_experts]
+
+    # old holders: logical -> ranks that currently own it
+    holders_by_logical: dict[int, list[int]] = {}
+    holder_seen_by_logical: dict[int, set[int]] = {}
+    src_slot_by_rank_logical: dict[tuple[int, int], int] = {}
+    for gslot in range(num_physical):
+        logical = int(old_p2l_layer[gslot].item())
+        r = gslot // num_local_physical_experts
+        if logical not in holders_by_logical:
+            holders_by_logical[logical] = []
+            holder_seen_by_logical[logical] = set()
+        if r not in holder_seen_by_logical[logical]:
+            holders_by_logical[logical].append(r)
+            holder_seen_by_logical[logical].add(r)
+        key = (r, logical)
+        if key not in src_slot_by_rank_logical:
+            src_slot_by_rank_logical[key] = gslot % num_local_physical_experts
+
+    # local old slots by logical
+    local_old_slots_by_logical: dict[int, list[int]] = {}
+    for lslot in range(num_local_physical_experts):
+        logical = int(old_local[lslot].item())
+        local_old_slots_by_logical.setdefault(logical, []).append(lslot)
+
+    # ranks that need remote receive for each logical
+    recv_ranks_by_logical: dict[int, list[int]] = {}
+    for r in range(world_size):
+        rbase = r * num_local_physical_experts
+        old_r = old_p2l_layer[rbase : rbase + num_local_physical_experts]
+        new_r = new_p2l_layer[rbase : rbase + num_local_physical_experts]
+        old_set = set(int(x.item()) for x in old_r)
+        new_set = set(int(x.item()) for x in new_r)
+        for logical in sorted(new_set):
+            if logical not in old_set:
+                recv_ranks_by_logical.setdefault(logical, []).append(r)
+
+    buffer_copy_plan: BufferCopyPlan = []
+    local_copy_actions: list[_LocalCopyAction] = []
+    recv_actions: list[_P2PAction] = []
+    send_actions: list[_P2PAction] = []
+    primary_dst_by_logical: dict[int, int] = {}
+
+    for dst in range(num_local_physical_experts):
+        old_logical = int(old_local[dst].item())
+        new_logical = int(new_local[dst].item())
+        if old_logical == new_logical:
+            continue  # unchanged
+
+        if new_logical in primary_dst_by_logical:
+            buffer_copy_plan.append((primary_dst_by_logical[new_logical], dst))
+            continue  # free-rider
+
+        local_sources = local_old_slots_by_logical.get(new_logical, [])
+        if len(local_sources) > 0:
+            src = local_sources[0]
+            local_copy_actions.append(_LocalCopyAction(src_slot=src, dst_slot=dst))
+            buffer_copy_plan.append((dst, dst))
+            primary_dst_by_logical[new_logical] = dst
+            continue
+
+        ranks_to_send = holders_by_logical.get(new_logical, [])
+        ranks_to_recv = recv_ranks_by_logical.get(new_logical, [])
+        assert len(ranks_to_send) > 0, f"no sender rank found for logical expert {new_logical}"
+        assert rank in ranks_to_recv, (
+            f"rank={rank} expects remote logical expert {new_logical}, but not in recv set"
+        )
+        src_rank = _select_source_rank_for_receiver(
+            ranks_to_send=ranks_to_send,
+            ranks_to_recv=ranks_to_recv,
+            recv_rank=rank,
+            num_gpu_per_node=num_gpu_per_node,
+        )
+
+        recv_actions.append(
+            _P2PAction(
+                logical_expert_id=new_logical,
+                peer_rank=src_rank,
+                local_slot=dst,
+            )
+        )
+        buffer_copy_plan.append((dst, dst))
+        primary_dst_by_logical[new_logical] = dst
+
+    # Add send actions for any recv rank this rank is assigned to serve.
+    for logical, ranks_to_recv in recv_ranks_by_logical.items():
+        ranks_to_send = holders_by_logical.get(logical, [])
+        if rank not in ranks_to_send:
+            continue
+        src_slot = src_slot_by_rank_logical[(rank, logical)]
+        for recv_rank in ranks_to_recv:
+            assigned = _select_source_rank_for_receiver(
+                ranks_to_send=ranks_to_send,
+                ranks_to_recv=ranks_to_recv,
+                recv_rank=recv_rank,
+                num_gpu_per_node=num_gpu_per_node,
+            )
+            if assigned != rank:
+                continue
+            # same-rank "send" is impossible here because recv ranks are remote-only.
+            if recv_rank == rank:
+                continue
+            send_actions.append(
+                _P2PAction(
+                    logical_expert_id=logical,
+                    peer_rank=recv_rank,
+                    local_slot=src_slot,
+                )
+            )
+
+    _ = num_gpu_per_node  # reserved for future same-node/cross-node policy tuning
+    return buffer_copy_plan, local_copy_actions, send_actions, recv_actions
+
+
+def _migrate_single_layer(
+    routed_experts_weights: list[torch.Tensor],
+    temp_buffers: list[torch.Tensor],
+    old_p2l_layer: torch.Tensor,
+    new_p2l_layer: torch.Tensor,
+    num_local_physical_experts: int,
+    num_gpu_per_node: int,
+    rank: int,
+    world_size: int,
+    ep_group: Any,
+    p2p_batch_chunk_size: int = 32,
+) -> BufferCopyPlan:
+    """Migrate one layer into temp buffers and return BufferCopyPlan for module-E."""
+    assert len(routed_experts_weights) == len(temp_buffers)
+    if len(routed_experts_weights) == 0:
+        return []
+    for w, b in zip(routed_experts_weights, temp_buffers):
+        assert w.shape[0] == num_local_physical_experts
+        assert b.shape[0] == num_local_physical_experts
+
+    buffer_copy_plan, local_copy_actions, send_actions, recv_actions = _plan_single_layer_migration(
+        old_p2l_layer=old_p2l_layer,
+        new_p2l_layer=new_p2l_layer,
+        num_local_physical_experts=num_local_physical_experts,
+        num_gpu_per_node=num_gpu_per_node,
+        rank=rank,
+        world_size=world_size,
+    )
+
+    # Local copy path (case-2).
+    for action in local_copy_actions:
+        for w, b in zip(routed_experts_weights, temp_buffers):
+            b[action.dst_slot].copy_(w[action.src_slot])
+
+    # Build and execute P2P ops for case-4/5.
+    ops_by_logical: dict[int, list[Any]] = {}
+    for action in send_actions:
+        for w in routed_experts_weights:
+            op = torch.distributed.P2POp(
+                torch.distributed.isend,
+                w[action.local_slot],
+                action.peer_rank,
+                ep_group,
+            )
+            ops_by_logical.setdefault(action.logical_expert_id, []).append(op)
+    for action in recv_actions:
+        for b in temp_buffers:
+            op = torch.distributed.P2POp(
+                torch.distributed.irecv,
+                b[action.local_slot],
+                action.peer_rank,
+                ep_group,
+            )
+            ops_by_logical.setdefault(action.logical_expert_id, []).append(op)
+
+    _execute_batched_p2p_ops(
+        ops_by_logical=ops_by_logical,
+        num_logical_experts=int(old_p2l_layer.max().item()) + 1,
+        p2p_batch_chunk_size=p2p_batch_chunk_size,
+    )
+    return buffer_copy_plan
+
+
+def migrate_experts_chunk(
+    layer_ids: list[int],
+    old_meta: Any,
+    new_meta: Any,
+    expert_weights_of_layer: dict[int, list[torch.Tensor]],
+    temp_buffers: list[torch.Tensor],
+    ep_group: Any,
+    nnodes: int,
+    rank: int,
+    p2p_batch_chunk_size: Optional[int] = None,
+) -> None:
+    """Chunk-level D entrypoint: fill temp buffers in-place."""
+    assert nnodes > 0
+    if p2p_batch_chunk_size is None:
+        # Lazy import to avoid module-load circular dependencies.
+        from atom.config import get_current_atom_config
+
+        cfg = get_current_atom_config()
+        p2p_batch_chunk_size = int(getattr(cfg, "eplb_p2p_batch_chunk_size", 32))
+    for layer_id in layer_ids:
+        old_p2l_layer = old_meta.physical_to_logical_map[layer_id]
+        new_p2l_layer = new_meta.physical_to_logical_map[layer_id]
+        num_physical = old_p2l_layer.numel()
+        assert num_physical == new_p2l_layer.numel()
+        assert num_physical % nnodes == 0
+        routed_weights = expert_weights_of_layer[layer_id]
+        assert len(routed_weights) == len(temp_buffers)
+        num_local_physical = int(routed_weights[0].shape[0])
+        world_size = num_physical // num_local_physical
+        assert world_size % nnodes == 0
+        num_gpu_per_node = world_size // nnodes
+        _ = _migrate_single_layer(
+            routed_experts_weights=routed_weights,
+            temp_buffers=temp_buffers,
+            old_p2l_layer=old_p2l_layer,
+            new_p2l_layer=new_p2l_layer,
+            num_local_physical_experts=num_local_physical,
+            num_gpu_per_node=num_gpu_per_node,
+            rank=rank,
+            world_size=world_size,
+            ep_group=ep_group,
+            p2p_batch_chunk_size=p2p_batch_chunk_size,
+        )
+
 
 def count_physical_load(
     topk_physical: torch.Tensor, num_physical: int
