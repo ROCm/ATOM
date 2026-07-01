@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput, ReqId
 
 logger = logging.getLogger("atom")
 
@@ -48,8 +48,10 @@ class KVOutputAggregator:
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}")
         self._world_size = world_size
-        self._seen_sending: dict[str, set[int]] = {}
-        self._seen_recving: dict[str, set[int]] = {}
+        self._seen_sending: dict[ReqId, set[int]] = {}
+        self._seen_recving: dict[ReqId, set[int]] = {}
+        self._seen_recv_failed: dict[ReqId, set[int]] = {}
+        self._seen_saving: dict[ReqId, set[int]] = {}
 
     @property
     def world_size(self) -> int:
@@ -76,15 +78,36 @@ class KVOutputAggregator:
             if wo.finished_recving:
                 for rid in wo.finished_recving:
                     self._seen_recving.setdefault(rid, set()).add(worker_idx)
+            if wo.failed_recving:
+                for rid in wo.failed_recving:
+                    self._seen_recv_failed.setdefault(rid, set()).add(worker_idx)
+            if wo.finished_saving:
+                for rid in wo.finished_saving:
+                    self._seen_saving.setdefault(rid, set()).add(worker_idx)
 
         done_sending = {
             rid
             for rid, workers in self._seen_sending.items()
             if len(workers) >= self._world_size
         }
+        failed_recving = set()
+        recv_ids = set(self._seen_recving) | set(self._seen_recv_failed)
+        for rid in recv_ids:
+            done_workers = self._seen_recving.get(rid, set())
+            failed_workers = self._seen_recv_failed.get(rid, set())
+            if (
+                failed_workers
+                and len(done_workers | failed_workers) >= self._world_size
+            ):
+                failed_recving.add(rid)
         done_recving = {
             rid
             for rid, workers in self._seen_recving.items()
+            if len(workers) >= self._world_size and rid not in failed_recving
+        }
+        done_saving = {
+            rid
+            for rid, workers in self._seen_saving.items()
             if len(workers) >= self._world_size
         }
 
@@ -92,18 +115,32 @@ class KVOutputAggregator:
             del self._seen_sending[rid]
         for rid in done_recving:
             del self._seen_recving[rid]
+            self._seen_recv_failed.pop(rid, None)
+        for rid in failed_recving:
+            self._seen_recving.pop(rid, None)
+            self._seen_recv_failed.pop(rid, None)
+        for rid in done_saving:
+            del self._seen_saving[rid]
 
         return KVConnectorOutput(
             finished_sending=done_sending,
             finished_recving=done_recving,
+            failed_recving=failed_recving,
+            finished_saving=done_saving,
         )
 
     def reset(self) -> None:
         """Clear all internal tracking state."""
         self._seen_sending.clear()
         self._seen_recving.clear()
+        self._seen_recv_failed.clear()
+        self._seen_saving.clear()
 
     @property
     def pending_count(self) -> tuple[int, int]:
         """Return ``(num_pending_sending, num_pending_recving)``."""
-        return len(self._seen_sending), len(self._seen_recving)
+        return (
+            len(self._seen_sending),
+            len(set(self._seen_recving) | set(self._seen_recv_failed))
+            + len(self._seen_saving),
+        )

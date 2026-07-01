@@ -129,8 +129,10 @@ def init_aiter_dist(config: Config) -> None:
     Initialize aiter dist for using aiter custom collective op.
 
     In vLLM plugin mode, tries to reuse vLLM's TP group and inject aiter's ca_comm
-    first (single IPC init, avoids 2x reduce slowdown). Falls back to init_dist_env
-    if reuse fails.
+    first (single IPC init, avoids 2x reduce slowdown). For DP+EP, skip the
+    reuse fast path and let aiter initialize its own TP/PP/DP/EP groups so EP and
+    all2all ownership stays within the ATOM+vLLM stack. Falls back to init_dist_env if
+    reuse fails.
     """
     logger.info(
         "Initialize aiter dist for using aiter custom collective op for plugin mode"
@@ -145,10 +147,21 @@ def init_aiter_dist(config: Config) -> None:
         config.plugin_config.is_plugin_mode
     ), "Make sure ATOM is running in plugin mode"
 
-    if config.plugin_config.is_vllm:
-        from atom.plugin.vllm.tp_group_reuse import init_aiter_tp_from_vllm
+    use_vllm_atom_owned_ep = (
+        config.plugin_config.is_vllm
+        and config.enable_expert_parallel
+        and config.parallel_config.data_parallel_size > 1
+    )
 
-        if init_aiter_tp_from_vllm(tensor_parallel_size):
+    if use_vllm_atom_owned_ep:
+        logger.info(
+            "Skip vLLM TP reuse for OOT DP+EP so aiter owns TP/PP/DP/EP groups."
+        )
+
+    if config.plugin_config.is_vllm and not use_vllm_atom_owned_ep:
+        from atom.plugin.vllm.tp_group_reuse import init_aiter_dist_from_vllm
+
+        if init_aiter_dist_from_vllm(tensor_parallel_size):
             return
 
     # Fallback: create aiter's own groups (vLLM reuse failed or non-vLLM plugin)

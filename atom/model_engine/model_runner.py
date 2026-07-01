@@ -1599,7 +1599,14 @@ class ModelRunner:
             draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
             if draft_regions:
                 transfer_tensors.block_regions.extend(draft_regions)
-        set_kv_cache_data(kv_cache_data, config, transfer_tensors)
+        # Pass the physical block count so the offload connector can byte-slice
+        # MLA's token-major latent cache (shape[0] is tokens, not blocks there).
+        set_kv_cache_data(
+            kv_cache_data,
+            config,
+            transfer_tensors,
+            num_blocks=self.num_physical_kvcache_blocks,
+        )
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -2199,8 +2206,20 @@ class ModelRunner:
         """Collect finished send/recv status from the KV connector."""
         connector = get_kvconnector()
         if connector is None:
-            return KVConnectorOutput(finished_sending=[], finished_recving=[])
-        done_sending, done_recving = connector.get_finished()
+            return KVConnectorOutput()
+
+        finished = connector.get_finished()
+        # New connectors may return the full KVConnectorOutput so they can
+        # report richer states. LMCache offload uses failed_recving to wake a
+        # request for local recompute, and finished_saving to release blocks
+        # whose free was deferred while a background save read their KV.
+        if isinstance(finished, KVConnectorOutput):
+            return finished
+
+        # Legacy P/D connectors still return the old
+        # (done_sending, done_recving) tuple. Normalize it so EngineCore and
+        # Scheduler only need to consume KVConnectorOutput.
+        done_sending, done_recving = finished
 
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
@@ -2381,7 +2400,11 @@ class ModelRunner:
                             capture_ctx.stream,
                             output_buffer=outputs[:num_tokens],
                         )
-                        graph_aux = None
+                        graph_aux = (
+                            graph_output[1]
+                            if self.use_aux_hidden_state_outputs
+                            else None
+                        )
                     else:
                         # Standard single-stream capture
                         graph = torch.cuda.CUDAGraph()
