@@ -414,3 +414,167 @@ python -m atom.benchmarks.benchmark_serving \
     --save-result \
     --percentile-metrics="ttft,tpot,itl,e2el"
 ```
+
+## PD Disaggregation — Multi-Node 2P+1D with DPA + TBO
+
+For high-concurrency workloads, scale out to **2 prefill instances + 1 decode
+instance** across 3 nodes. Each instance uses TP=4 with Data-Parallel Attention
+(DPA) and Token-Budget Optimization (TBO) on prefill.
+
+### Topology
+
+```
+Node 0 (prefill-1)  ─┐
+                      ├──▶  atomesh router (:8000) ──▶ Client
+Node 1 (prefill-2)  ─┤
+                      │
+Node 2 (decode)     ──┘
+```
+
+- Prefill instances: TP=4, `--enable-dp-attention --enable-tbo prefill`
+- Decode instance: TP=4, `--enable-dp-attention`, higher `--max-num-seqs` (1024)
+- Each node runs its own container (avoids ATOM port 29500 conflicts)
+
+### Setup
+
+Start a container on **each of the 3 nodes** using the RDMA-aware docker script:
+
+```bash
+DOCKER_IMAGE=rocm/atom-dev:latest bash atom/mesh/scripts/docker_start.sh
+docker exec -it atom_sglang_mesh bash
+```
+
+### Start Prefill Server (Node 0 — prefill-1)
+
+```bash
+export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export PYTHONUNBUFFERED=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=${NODE_IP}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+python3 -m atom.entrypoints.openai_server \
+    --model amd/MiniMax-M3-MXFP4 \
+    --host 0.0.0.0 --server-port 8010 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --kv_cache_dtype fp8 \
+    --enable-dp-attention \
+    --enable-tbo prefill \
+    --block-size 128 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}' \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    2>&1 | tee prefill.log
+```
+
+Repeat on **Node 1 (prefill-2)** with the same command.
+
+### Start Decode Server (Node 2)
+
+```bash
+export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export PYTHONUNBUFFERED=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=${NODE_IP}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+python3 -m atom.entrypoints.openai_server \
+    --model amd/MiniMax-M3-MXFP4 \
+    --host 0.0.0.0 --server-port 8020 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --kv_cache_dtype fp8 \
+    --enable-dp-attention \
+    --block-size 128 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 \
+    --max-num-seqs 1024 \
+    --max-num-batched-tokens 32768 \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
+    --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    2>&1 | tee decode.log
+```
+
+Key differences from prefill:
+- `kv_role: kv_consumer`
+- `--enable-dp-attention` without `--enable-tbo` (TBO is prefill-only)
+- `--max-num-seqs 1024` — higher batch capacity for decode throughput
+- `--cudagraph-capture-sizes` — pre-captures graphs for common batch sizes
+
+### Start Router (atomesh)
+
+Wait for all 3 servers to show `Application startup complete`, then on any node:
+
+```bash
+export PREFILL_IP_1=<prefill-node-0-ip>
+export PREFILL_IP_2=<prefill-node-1-ip>
+export DECODE_IP=<decode-node-2-ip>
+
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://${PREFILL_IP_1}:8010" \
+    --prefill "http://${PREFILL_IP_2}:8010" \
+    --decode  "http://${DECODE_IP}:8020" \
+    --policy random \
+    --backend atom \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker \
+    --prometheus-port 29100
+```
+
+Note the **two `--prefill` flags** — atomesh round-robins requests across both
+prefill instances.
+
+### GSM8K Accuracy (via Router)
+
+```bash
+lm_eval --model local-chat-completions \
+    --model_args "model=amd/MiniMax-M3-MXFP4,base_url=http://127.0.0.1:8000/v1/chat/completions,num_concurrent=256,max_retries=3,max_gen_toks=16384" \
+    --tasks gsm8k \
+    --num_fewshot 5 \
+    --batch_size 65 \
+    --apply_chat_template \
+    --fewshot_as_multiturn
+```
+
+### Serving Benchmark (via Router)
+
+```bash
+ISL=8192
+OSL=1024
+CONC=256
+
+python -m atom.benchmarks.benchmark_serving \
+    --model=amd/MiniMax-M3-MXFP4 \
+    --backend=vllm \
+    --base-url=http://127.0.0.1:8000 \
+    --dataset-name=random \
+    --random-input-len="${ISL}" \
+    --random-output-len="${OSL}" \
+    --random-range-ratio=0.8 \
+    --num-prompts=$(( CONC * 10 )) \
+    --max-concurrency="${CONC}" \
+    --request-rate=inf \
+    --ignore-eos \
+    --save-result \
+    --percentile-metrics="ttft,tpot,itl,e2el"
+```
+
+Typical concurrency sweep: `CONC=256,512,768,1024` to find the throughput ceiling.
