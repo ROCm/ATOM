@@ -270,10 +270,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         self.is_consumer = not self.is_producer
 
-        # Networking / service discovery config
+        # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
-        self.proxy_ping_port = kv_transfer_config.get("proxy_ping_port", 36367)
-        self.proxy_ip = kv_transfer_config.get("proxy_ip")
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.protocol = kv_transfer_config.get("protocol", MOONCAKE_DEFAULT_PROTOCOL)
 

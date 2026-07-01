@@ -95,8 +95,6 @@ class MoRIIOConnector(KVConnectorBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.http_port = kv_transfer_config.get("http_port", 8000)
-        self.proxy_ping_port = kv_transfer_config.get("proxy_ping_port", 36367)
-        self.proxy_ip = kv_transfer_config.get("proxy_ip")
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.base_handshake_port = kv_transfer_config.get(
             "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
