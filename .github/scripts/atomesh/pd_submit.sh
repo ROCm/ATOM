@@ -77,6 +77,15 @@ def shell_value(value):
         return json.dumps(value, separators=(",", ":"))
     return value
 
+def csv_value(value):
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(item) for item in value)
+    return str(value)
+
 def q(value):
     return shlex.quote(str(shell_value(value)))
 
@@ -123,6 +132,9 @@ exports = {
     "EVAL_TASK": accuracy.get("task", "gsm8k"),
     "EVAL_FEWSHOT": accuracy.get("fewshot", 3),
     "EVAL_LIMIT": "" if accuracy.get("limit") is None else accuracy.get("limit"),
+    "EVAL_CONCURRENCY": csv_value(
+        accuracy.get("concurrency") or cell.get("concurrency", [])
+    ),
     "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
     "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),

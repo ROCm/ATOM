@@ -80,7 +80,7 @@ models:
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [8192]
           osl: 1024
-          concurrency: [64, 128]
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
           run_eval: true
 
         - name: ds-v4-2p1d-dpa-tp8
@@ -88,7 +88,7 @@ models:
           nodes: "${ATOMESH_2P1D_NODES}"
           isl: [8192]
           osl: 1024
-          concurrency: [256, 512]
+          concurrency: [256, 512, 1024, 2048]
           prefill:
             workers: 2
             tp: 8

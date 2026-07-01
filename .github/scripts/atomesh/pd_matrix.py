@@ -174,6 +174,14 @@ def build_cell(
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} must define isl and concurrency"
         )
+    accuracy_concurrency = [
+        int(value)
+        for value in normalize_list(
+            accuracy_cfg.get("concurrency")
+            or suite_cfg.get("eval_concurrency")
+            or concurrency
+        )
+    ]
 
     topology = str(suite_cfg["topology"])
     display_topology = format_display_topology(
@@ -221,6 +229,7 @@ def build_cell(
             "task": str(accuracy_cfg.get("task", "gsm8k")),
             "fewshot": int(accuracy_cfg.get("fewshot", 3)),
             "limit": suite_cfg.get("eval_limit", accuracy_cfg.get("limit")),
+            "concurrency": accuracy_concurrency,
         },
     }
 
