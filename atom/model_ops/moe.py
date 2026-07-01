@@ -431,11 +431,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # )
             # mori_dtype = torch.bfloat16
 
-            if is_vllm():
-                max_num_tokens_per_dp_rank = moe.max_num_tokens
-            else:
-                max_num_tokens_per_dp_rank = 16384
-
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,

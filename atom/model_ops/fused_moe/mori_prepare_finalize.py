@@ -9,8 +9,6 @@ import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
-from atom.plugin.config import VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD
-from atom.plugin.prepare import is_vllm
 from atom.utils.forward_context import get_forward_context
 from aiter import QuantType, dtypes
 from aiter.jit.utils.chip_info import get_cu_num

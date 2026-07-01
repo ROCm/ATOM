@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
 from atom.utils.tbo.ubatching import tbo_overlap_enabled
-from atom.plugin.prepare import is_vllm
 from atom.utils.forward_context import get_forward_context
 import torch
 from typing import Callable, Optional, final
