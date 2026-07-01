@@ -48,6 +48,7 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
 )
 from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.jit.utils.chip_info import get_gfx
 from atom.config import (
     Config,
     LayerQuantConfig,
