@@ -120,6 +120,9 @@ class Sequence:
         self.first_token_time = 0.0
         self.leave_time = 0.0
         self.leave_reason = ""
+        # Set True when the client disconnected; the scheduler finishes the seq
+        # at the next step via the normal stop path (frees KV, emits finished).
+        self.aborted = False
 
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
