@@ -265,6 +265,20 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         for i, block_table in enumerate(batch.block_tables):
             block_tables[i] = 0
             block_tables[i, : len(block_table)] = block_table
+        # M2 paged-SWA: fill the parallel SWA block table in lockstep (decode
+        # path). -1 sentinels (window-freed) are copied verbatim but never
+        # indexed by the SWA kernels.
+        swa_buf = var.get("swa_block_tables")
+        swa_tables = getattr(batch, "swa_block_tables", None)
+        if swa_buf is not None and swa_tables is not None:
+            swa_np = swa_buf.np
+            for i, swa_table in enumerate(swa_tables):
+                swa_np[i] = 0
+                if len(swa_table):
+                    # Clamp window-freed sentinels (-1) to 0: those blocks are
+                    # out of window and never indexed by the SWA kernels, but a
+                    # raw -1 phys would compute a negative paged offset → OOB.
+                    swa_np[i, : len(swa_table)] = [max(0, b) for b in swa_table]
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (

@@ -89,6 +89,88 @@ class BlockManager:
             range(num_per_req_cache_groups)
         )
 
+        # M2 paged-SWA: optional second block pool for the sliding-window KV,
+        # with an independent free-list/hash so out-of-window SWA blocks can be
+        # freed while the compressed blocks persist. `swa_enabled=False` →
+        # every SWA branch below short-circuits and the compressed path is
+        # byte-identical to before.
+        num_swa_blocks: int = getattr(config, "num_swa_blocks", 0)
+        self.swa_enabled: bool = num_swa_blocks > 0
+        self.swa_window: int = getattr(config, "swa_window_size", 0)
+        self.swa_blocks: list[Block] = [Block(i) for i in range(num_swa_blocks)]
+        self.swa_hash_to_block_id: dict[int, int] = dict()
+        self.swa_free_block_ids: deque[int] = deque(range(num_swa_blocks))
+        self.swa_free_block_ids_set: set[int] = set(range(num_swa_blocks))
+        self.swa_used_block_ids: set[int] = set()
+
+    # ---------------- SWA pool primitives (mirror the compressed pool) ------- #
+    def _pop_free_swa_block(self) -> int:
+        while self.swa_free_block_ids:
+            block_id = self.swa_free_block_ids.popleft()
+            if block_id in self.swa_free_block_ids_set:
+                self.swa_free_block_ids_set.discard(block_id)
+                return block_id
+        raise AssertionError("No free SWA blocks available")
+
+    def _allocate_swa_block(self, block_id: int) -> Block:
+        block = self.swa_blocks[block_id]
+        assert block.ref_count == 0
+        if block.hash != -1 and self.swa_hash_to_block_id.get(block.hash) == block_id:
+            del self.swa_hash_to_block_id[block.hash]
+        block.reset()
+        self.swa_free_block_ids_set.discard(block_id)
+        self.swa_used_block_ids.add(block_id)
+        return block
+
+    def _deallocate_swa_block(self, block_id: int):
+        assert self.swa_blocks[block_id].ref_count == 0
+        self.swa_used_block_ids.remove(block_id)
+        self.swa_free_block_ids.append(block_id)
+        self.swa_free_block_ids_set.add(block_id)
+
+    def _free_swa_out_of_window(self, seq: Sequence):
+        """M2 brick-2: release SWA blocks that have fallen fully behind the
+        sliding window — they're never read again by this request, and freeing
+        them bounds live SWA memory to ~window per request.
+
+        Block ``i`` covers tokens ``[i*bs, (i+1)*bs)``; the latest query (pos
+        ``seq_len-1``) attends down to ``seq_len-window``, so block ``i`` is
+        fully out of window once ``(i+1)*bs <= seq_len - window``. Freed blocks
+        keep their hash + KV until their pool slot is actually reused (lazy
+        eviction, same as the compressed pool), so a cross-request hit can still
+        reuse a freed-but-not-overwritten SWA block. The trailing window (plus
+        up to one boundary block) is retained for prefix reuse.
+        """
+        if not self.swa_enabled or self.swa_window <= 0:
+            return
+        seq_len = len(seq)
+        free_before = max(0, (seq_len - self.swa_window) // self.block_size)
+        free_before = min(free_before, len(seq.swa_block_table))
+        for i in range(free_before):
+            swa_id = seq.swa_block_table[i]
+            if swa_id < 0:
+                continue  # already window-freed
+            block = self.swa_blocks[swa_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_swa_block(swa_id)
+            seq.swa_block_table[i] = -1  # sentinel: out of window
+
+    def _allocate_swa_for_cached(self, h: int, token_ids: list[int], seq: Sequence):
+        """Claim the cached SWA block for hash `h` (caller guarantees it exists,
+        via the can_allocate intersection) and append to seq.swa_block_table.
+        Mirrors the compressed cached-hit claim."""
+        swa_id = self.swa_hash_to_block_id[h]
+        block = self.swa_blocks[swa_id]
+        if swa_id in self.swa_used_block_ids:
+            block.ref_count += 1
+        else:
+            assert block.ref_count == 0
+            block.ref_count = 1
+            self.swa_free_block_ids_set.discard(swa_id)
+            self.swa_used_block_ids.add(swa_id)
+        seq.swa_block_table.append(swa_id)
+
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
@@ -149,6 +231,10 @@ class BlockManager:
         if not self.enable_prefix_caching:
             if len(self.free_block_ids_set) < seq.num_blocks:
                 return -1
+            # M2: SWA pool allocates in parallel (1:1 with compressed in M2
+            # brick-1; brick-2 window-freeing reduces this). Require space.
+            if self.swa_enabled and len(self.swa_free_block_ids_set) < seq.num_blocks:
+                return -1
             return 0
         h = -1
         num_cached_blocks = 0
@@ -159,12 +245,25 @@ class BlockManager:
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
+            # M2: intersect with the SWA pool — a compressed hit is only usable
+            # if this block's SWA is ALSO still cached (the SWA pool evicts /
+            # window-frees independently). Stops the hit at the first block
+            # whose SWA is gone, so allocate() never reuses compressed-without-SWA.
+            if self.swa_enabled:
+                swa_id = self.swa_hash_to_block_id.get(h, -1)
+                if swa_id == -1 or self.swa_blocks[swa_id].token_ids != token_ids:
+                    break
             num_cached_blocks += 1
             # Hits on already-used blocks share refs; only free-pool hits
             # consume a free slot (claimed inline in allocate()).
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
         if len(self.free_block_ids_set) < num_new_blocks:
+            return -1
+        # M2 brick-1: SWA pool is parallel (a cached compressed block has its
+        # SWA cached too; allocate() mirrors the reuse), so SWA new-block demand
+        # equals the compressed one. Require the SWA pool can cover it.
+        if self.swa_enabled and len(self.swa_free_block_ids_set) < num_new_blocks:
             return -1
         return num_cached_blocks
 
@@ -196,10 +295,16 @@ class BlockManager:
                 self.free_block_ids_set.discard(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
+            if self.swa_enabled:
+                self._allocate_swa_for_cached(h, token_ids, seq)
         for _ in range(num_cached_blocks, seq.num_blocks):
             block_id = self._pop_free_block()
             self._allocate_block(block_id)
             seq.block_table.append(block_id)
+            if self.swa_enabled:
+                swa_id = self._pop_free_swa_block()
+                self._allocate_swa_block(swa_id)
+                seq.swa_block_table.append(swa_id)
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
         # Per-request cache: claim one slot index from the pre-allocated
@@ -241,6 +346,12 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+            # M2: publish the parallel SWA block under the same content hash so
+            # cross-request hits can reuse its sliding-window KV.
+            if self.swa_enabled and i < len(seq.swa_block_table):
+                swa_block = self.swa_blocks[seq.swa_block_table[i]]
+                swa_block.update(h, token_ids)
+                self.swa_hash_to_block_id[h] = swa_block.block_id
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
@@ -260,6 +371,15 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
+        if self.swa_enabled:
+            for swa_id in reversed(seq.swa_block_table):
+                if swa_id < 0:
+                    continue  # window-freed slot (brick-2)
+                block = self.swa_blocks[swa_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_swa_block(swa_id)
+            seq.swa_block_table.clear()
         seq.num_cached_tokens = 0
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
@@ -273,7 +393,11 @@ class BlockManager:
             seq_len + num_new_tokens + self.block_size - 1
         ) // self.block_size
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return len(self.free_block_ids_set) >= new_blocks_needed
+        if len(self.free_block_ids_set) < new_blocks_needed:
+            return False
+        if self.swa_enabled and len(self.swa_free_block_ids_set) < new_blocks_needed:
+            return False
+        return True
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         # Note: in disaggregated (P/D) mode the scheduler skips this call on
@@ -293,6 +417,13 @@ class BlockManager:
                 block_id = self._pop_free_block()
                 self._allocate_block(block_id)
                 block_table.append(block_id)
+                if self.swa_enabled:
+                    swa_id = self._pop_free_swa_block()
+                    self._allocate_swa_block(swa_id)
+                    seq.swa_block_table.append(swa_id)
+        # M2 brick-2: reclaim SWA blocks that just fell out of the window.
+        if self.swa_enabled:
+            self._free_swa_out_of_window(seq)
 
     # ---------------- KV event API ---------------- #
 
