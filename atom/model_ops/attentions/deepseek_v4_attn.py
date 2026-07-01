@@ -996,14 +996,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
 
                 next_n = max(1, int(attn_metadata.max_seqlen_q))
-                _, cta_info, _ = compute_varctx_schedule(
+                # Single-kernel schedule written straight into the fixed-address
+                # buffer (no intermediate alloc + copy). ~50 tiny torch launches
+                # -> 1 Triton launch (~300us -> ~40us per decode step).
+                compute_varctx_schedule(
                     attn_metadata.n_committed_csa_per_seq,
                     self._fp4_decode_block_k,
                     self._fp4_decode_parallel_unit_num,
                     self.max_model_len_idx,
                     next_n=next_n,
+                    cta_info_out=self._v4_fp4_cta_info,
                 )
-                self._v4_fp4_cta_info.copy_(cta_info)
                 meta["fp4_cta_info"] = self._v4_fp4_cta_info
                 meta["fp4_total_ctas"] = self._fp4_decode_parallel_unit_num
             return meta
