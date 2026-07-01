@@ -191,6 +191,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_REBALANCE_BALANCEDNESS_AGG": lambda: os.getenv(
         "ATOM_EPLB_REBALANCE_BALANCEDNESS_AGG", "min"
     ),
+    # ROCm-only P2P range batch granularity for EPLB migration module-D.
+    "ATOM_EPLB_P2P_BATCH_CHUNK_SIZE": lambda: int(
+        os.getenv("ATOM_EPLB_P2P_BATCH_CHUNK_SIZE", "32")
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"

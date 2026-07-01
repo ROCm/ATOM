@@ -1092,6 +1092,9 @@ class Config:
     eplb_rebalance_balancedness_agg: str = field(
         default_factory=lambda: envs.ATOM_EPLB_REBALANCE_BALANCEDNESS_AGG
     )
+    eplb_p2p_batch_chunk_size: int = field(
+        default_factory=lambda: envs.ATOM_EPLB_P2P_BATCH_CHUNK_SIZE
+    )
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
@@ -1131,6 +1134,10 @@ class Config:
             "min",
             "mean",
         }, "eplb_rebalance_balancedness_agg must be one of {'min','mean'}"
+        self.eplb_p2p_batch_chunk_size = int(self.eplb_p2p_batch_chunk_size)
+        assert (
+            self.eplb_p2p_batch_chunk_size > 0
+        ), "eplb_p2p_batch_chunk_size must be > 0"
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
