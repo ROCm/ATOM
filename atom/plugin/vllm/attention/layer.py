@@ -23,29 +23,34 @@ def _is_minimax_m3_model(atom_config) -> bool:
     )
 
 
-def _use_minimax_m3_dense_attention_for_vllm(atom_config, kwargs) -> bool:
+def _minimax_m3_attention_cls_for_vllm(atom_config, kwargs):
     if not _is_minimax_m3_model(atom_config):
-        return False
-    if kwargs.get("impl_cls") is not None:
-        return False
-    return (
+        return None
+    impl_cls = kwargs.get("impl_cls")
+    if impl_cls is not None:
+        from atom.model_ops.attention_mha import (
+            SparseMHAPagedAttentionImpl as AtomSparseMHAPagedAttentionImpl,
+        )
+
+        if impl_cls is AtomSparseMHAPagedAttentionImpl:
+            from atom.plugin.vllm.attention.minimax_m3_attnetion import (
+                MiniMaxM3SparseAttentionForVllm,
+            )
+
+            return MiniMaxM3SparseAttentionForVllm
+        return None
+
+    if (
         kwargs.get("rotary_emb") is not None
         and kwargs.get("q_norm") is not None
         and kwargs.get("k_norm") is not None
-    )
+    ):
+        from atom.plugin.vllm.attention.minimax_m3_attnetion import (
+            MiniMaxM3DenseAttentionForVllm,
+        )
 
-
-def _use_minimax_m3_sparse_attention_for_vllm(atom_config, kwargs) -> bool:
-    if not _is_minimax_m3_model(atom_config):
-        return False
-    impl_cls = kwargs.get("impl_cls")
-    if impl_cls is None:
-        return False
-    from atom.model_ops.attention_mha import (
-        SparseMHAPagedAttentionImpl as AtomSparseMHAPagedAttentionImpl,
-    )
-
-    return impl_cls is AtomSparseMHAPagedAttentionImpl
+        return MiniMaxM3DenseAttentionForVllm
+    return None
 
 
 class AttentionForVllm:
@@ -68,17 +73,10 @@ class AttentionForVllm:
                     *args, mla_modules=mla_modules, **kwargs
                 )
             return AttentionForVllmMLA(*args, mla_modules=mla_modules, **kwargs)
-        if _use_minimax_m3_sparse_attention_for_vllm(atom_config, kwargs):
-            from atom.plugin.vllm.attention.minimax_m3_attnetion import (
-                MiniMaxM3SparseAttentionForVllm,
-            )
-
-            return MiniMaxM3SparseAttentionForVllm(*args, **kwargs)
-        if _use_minimax_m3_dense_attention_for_vllm(atom_config, kwargs):
-            from atom.plugin.vllm.attention.minimax_m3_attnetion import (
-                MiniMaxM3DenseAttentionForVllm,
-            )
-
-            return MiniMaxM3DenseAttentionForVllm(*args, **kwargs)
+        minimax_m3_attention_cls = _minimax_m3_attention_cls_for_vllm(
+            atom_config, kwargs
+        )
+        if minimax_m3_attention_cls is not None:
+            return minimax_m3_attention_cls(*args, **kwargs)
         kwargs.pop("impl_cls", None)
         return AttentionForVllmMHA(*args, **kwargs)
