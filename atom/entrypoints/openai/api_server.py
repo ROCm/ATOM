@@ -1310,6 +1310,18 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
             chat_msgs = [msg.to_template_dict() for msg in messages]
             instructions, chat_msgs = extract_instructions_from_messages(chat_msgs)
+            logger.info(
+                "[harmony] instructions=%d chars, %d chat_msgs, %d tools",
+                len(instructions) if instructions else 0,
+                len(chat_msgs),
+                len(openai_tools) if openai_tools else 0,
+            )
+            for ci, cm in enumerate(chat_msgs):
+                logger.info(
+                    "[harmony] chat_msg[%d]: role=%s content_type=%s keys=%s",
+                    ci, cm.get("role"), type(cm.get("content")).__name__,
+                    list(cm.keys()),
+                )
             harmony_msgs = build_harmony_preamble(
                 instructions=instructions,
                 tools=openai_tools,

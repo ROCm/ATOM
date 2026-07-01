@@ -175,6 +175,10 @@ def _parse_single_message(
             func = call.get("function", {})
             name = func.get("name", "")
             arguments = func.get("arguments", "") or ""
+            # arguments may be a dict (deserialized by to_template_dict);
+            # Harmony requires a string
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments, ensure_ascii=False)
             msg = Message.from_role_and_content(Role.ASSISTANT, arguments)
             msg = msg.with_channel("commentary")
             msg = msg.with_recipient(f"functions.{name}")
@@ -257,6 +261,21 @@ def auto_drop_analysis_messages(msgs: List[Message]) -> List[Message]:
 def render_for_completion(messages: List[Message]) -> List[int]:
     """Render Harmony messages to prompt token IDs."""
     messages = auto_drop_analysis_messages(messages)
+    # Validate each message can serialize before building Conversation
+    for i, msg in enumerate(messages):
+        try:
+            msg.to_dict()
+        except NotImplementedError:
+            logger.error(
+                "Harmony message %d failed to_dict: role=%s channel=%s "
+                "recipient=%s content_types=%s",
+                i,
+                getattr(msg.author, "role", "?"),
+                getattr(msg, "channel", None),
+                getattr(msg, "recipient", None),
+                [type(c).__name__ for c in (msg.content or [])],
+            )
+            raise
     conversation = Conversation.from_messages(messages)
     return get_encoding().render_conversation_for_completion(
         conversation,
