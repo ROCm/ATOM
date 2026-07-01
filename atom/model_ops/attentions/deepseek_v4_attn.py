@@ -42,6 +42,7 @@ from typing import Any, Dict, Optional, Type, cast
 import numpy as np
 import torch
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
@@ -296,6 +297,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.index_head_dim = getattr(hf, "index_head_dim", 128)
         self.window_size = getattr(hf, "sliding_window", 128)
         self.index_topk = getattr(hf, "index_topk", 1024)
+        self.rope_head_dim = getattr(hf, "qk_rope_head_dim", 64)
         # MTP-portion of compress_ratios. `prepare_mtp_decode`'s direct-kernel
         # fast path only handles SWA (ratio=0) draft layers; non-zero ratios
         # would also need n_committed_{csa,hca} + HCA compress tail rebuilt.
@@ -316,8 +318,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.k2_hca = self.block_size // 128  # = 1
 
         self._state_dtype = torch.float32  # fp32 required for softmax-pool
-        self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
-        self._classical_dtype = torch.bfloat16  # CSA Main / HCA Main KV is BF16
+        # KV cache dtype gate. fp8 → 2buff native layout (nope fp8 + inline e8m0
+        # scale in a 512B entry; parallel bf16 rope pool). bf16 → unchanged.
+        self._kv_fp8 = model_runner.kv_cache_dtype == "fp8"
+        if self._kv_fp8:
+            # nope pool is fp8 (e4m3); SWA and classical (CSA/HCA Main) share it.
+            self._swa_dtype = dtypes.fp8
+            self._classical_dtype = dtypes.fp8
+            self._rope_dtype = torch.bfloat16  # rope pool is always bf16
+            # aiter prefill (op4) / decode (op5) hard-check gfx950 internally.
+            assert get_gfx() == "gfx950", (
+                "DeepSeek-V4 --kv_cache_dtype fp8 requires gfx950 (MI350); "
+                f"got {get_gfx()!r}. Use --kv_cache_dtype bf16 on this platform."
+            )
+        else:
+            self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
+            self._classical_dtype = torch.bfloat16  # CSA/HCA Main KV is BF16
+            self._rope_dtype = torch.bfloat16  # unused in bf16 path (symmetry)
         # CSA Indexer cache is FP8 + 4-byte fp32 scale per row, aligned to 16
         # bytes (matches V3.2 sparse MLA pattern; avoids torch inductor
         # unaligned-access slowdowns). Written by `indexer_k_quant_and_cache`,
@@ -408,7 +425,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             for every Compressor instance (CSA Main / CSA Indexer / HCA Main).
         """
         elem_state = self._state_dtype.itemsize  # fp32 = 4
-        elem_swa = self._swa_dtype.itemsize  # bf16 = 2
+        elem_swa = self._swa_dtype.itemsize  # fp8 = 1 or bf16 = 2
         # Tail buffers (kv_state + score_state pair per Compressor instance).
         csa_main = self._numel(self.csa_main_state_shape) * 2 * elem_state
         csa_idx = self._numel(self.csa_idx_state_shape) * 2 * elem_state
@@ -416,6 +433,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # SWA window per layer. Cache holds `win_with_spec = win + mtp_k`
         # slots so MTP draft tokens don't alias verified-token slots.
         swa_per_layer = self.win_with_spec * self.head_dim * elem_swa
+        if self._kv_fp8:
+            # 2buff: parallel bf16 rope pool [win_with_spec, rope_head_dim].
+            swa_per_layer += (
+                self.win_with_spec * self.rope_head_dim * self._rope_dtype.itemsize
+            )
         return (
             len(self.csa_layers) * (csa_main + csa_idx)
             + len(self.hca_layers) * hca_main
@@ -442,10 +464,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                         read by `cp_gather_indexer_k_quant_cache`).
           - HCA Main:   k2=1 entry × head_dim BF16
         """
-        elem_bf16 = self._classical_dtype.itemsize
-        csa_main_per_block = self.k1_csa * self.head_dim * elem_bf16
+        elem_nope = self._classical_dtype.itemsize  # fp8 = 1 or bf16 = 2
+        csa_main_per_block = self.k1_csa * self.head_dim * elem_nope
         csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
-        hca_main_per_block = self.k2_hca * self.head_dim * elem_bf16
+        hca_main_per_block = self.k2_hca * self.head_dim * elem_nope
+        if self._kv_fp8:
+            # 2buff: parallel bf16 rope pool per compress entry.
+            elem_rope = self._rope_dtype.itemsize
+            csa_main_per_block += self.k1_csa * self.rope_head_dim * elem_rope
+            hca_main_per_block += self.k2_hca * self.rope_head_dim * elem_rope
         return (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
             + len(self.hca_layers) * hca_main_per_block
@@ -507,7 +534,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         assert self._swa_dtype == self._classical_dtype, (
             "unified_kv requires SWA dtype == classical KV dtype "
-            f"(got SWA={self._swa_dtype}, classical={self._classical_dtype})"
+            f"(got SWA={self._swa_dtype}, classical={self._classical_dtype}). "
+            "fp8 path must set both to dtypes.fp8 (rope lives in a separate "
+            "bf16 pool); a genuine mismatch corrupts the unified layout."
         )
         device = self.model_runner.device
         num_blocks = self.model_runner.num_physical_kvcache_blocks
@@ -535,6 +564,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     device=device,
                 )
             )
+
+        # ---- 2buff fp8: parallel per-layer rope pool (bf16) ------------------
+        # Same [swa_pages + compress_pages] page count as unified_kv, but width
+        # = rope_head_dim (64) and dtype bf16 (rope is never quantized). bf16
+        # path: list of None (no rope pool; rope stays inline in unified_kv).
+        unified_kv_rope: list[Optional[torch.Tensor]] = []
+        if self._kv_fp8:
+            for layer_id in range(self.num_layers):
+                ratio = ratios[layer_id]
+                if ratio == 4:
+                    compress_pages = num_blocks * self.k1_csa
+                elif ratio == 128:
+                    compress_pages = num_blocks * self.k2_hca
+                else:
+                    compress_pages = 0  # Dense
+                unified_kv_rope.append(
+                    torch.zeros(
+                        (swa_pages + compress_pages, self.rope_head_dim),
+                        dtype=self._rope_dtype,
+                        device=device,
+                    )
+                )
+        else:
+            unified_kv_rope = [None] * self.num_layers
 
         # ---- Compressor state tensors (compute-contiguous) ------------------
         csa_main_kv = self._zero_state(
@@ -580,6 +633,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         return {
             "v4_unified_kv": unified_kv,
+            "v4_unified_kv_rope": unified_kv_rope,
             "v4_csa_main_kv_state": csa_main_kv,
             "v4_csa_main_score_state": csa_main_score,
             "v4_csa_idx_kv_state": csa_idx_kv,
@@ -626,6 +680,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             module.swa_kv = unified[:swa_pages].view(
                 num_slots, self.win_with_spec, self.head_dim
             )
+            module.kv_fp8 = self._kv_fp8
+            if self._kv_fp8:
+                rope = runner.v4_unified_kv_rope[module.layer_id]
+                module.unified_kv_rope = rope
+                module.swa_kv_rope = rope[:swa_pages].view(
+                    num_slots, self.win_with_spec, self.rope_head_dim
+                )
+            else:
+                module.unified_kv_rope = None
+                module.swa_kv_rope = None
             return None
 
         if isinstance(module, _V4Indexer):
@@ -685,6 +749,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                         storage_offset=scale_fp32_offset,
                     )
                 )
+                # Indexer-inner cache is always fp8 (independent of
+                # kv_cache_dtype); it has no separate rope pool.
+                module.write_mode = "indexer_fp8"
+                module.kv_cache_rope = None
             elif ratio == 4:
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_main_kv_state[pos]
@@ -698,6 +766,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_cache = unified[swa_pages:].view(
                     num_blocks, self.k1_csa, self.head_dim
                 )
+                if self._kv_fp8:
+                    rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
+                    module.kv_cache_rope = rope[swa_pages:].view(
+                        num_blocks, self.k1_csa, self.rope_head_dim
+                    )
+                    module.write_mode = "main_2buff_fp8"
+                else:
+                    module.kv_cache_rope = None
+                    module.write_mode = "bf16"
             elif ratio == 128:
                 pos = self.layer_id_to_hca_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_hca_main_kv_state[pos]
@@ -707,6 +784,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_cache = unified[swa_pages:].view(
                     num_blocks, self.k2_hca, self.head_dim
                 )
+                if self._kv_fp8:
+                    rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
+                    module.kv_cache_rope = rope[swa_pages:].view(
+                        num_blocks, self.k2_hca, self.rope_head_dim
+                    )
+                    module.write_mode = "main_2buff_fp8"
+                else:
+                    module.kv_cache_rope = None
+                    module.write_mode = "bf16"
             else:
                 raise ValueError(
                     f"Unknown V4 compress_ratio={ratio} on Compressor at "
@@ -724,6 +810,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         runner = self.model_runner
         if not hasattr(runner, "v4_unified_kv"):
+            return None
+        if self._kv_fp8:
+            # PD disaggregation with 2buff fp8 KV cache is not yet supported:
+            # the byte-region math below assumes a single bf16 unified pool and
+            # ignores the parallel rope pool. Disable KV transfer for fp8.
             return None
 
         num_slots = runner.max_per_req_cache_slots

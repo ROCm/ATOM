@@ -51,6 +51,8 @@ LAST `actual_count` tokens of seq `i` in `kv` / `positions`, no shared
 GPU index buffer needed (no DMA race window).
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -213,6 +215,183 @@ def swa_write_reference(
         slot = int(state_slot_per_seq[b].item())
         ring_idx = src_pos % cache_size
         swa_kv[slot, ring_idx] = src_kv
+
+
+def swa_write_2buff_prepacked(
+    k_packed: torch.Tensor,
+    k_rope: torch.Tensor,
+    positions: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    state_slot_per_seq: torch.Tensor,
+    swa_kv_nope: torch.Tensor,
+    swa_kv_rope: torch.Tensor,
+    cache_size: int,
+    write_per_batch: int,
+) -> None:
+    """Native 2buff fp8 SWA write: ring-scatter the LAST
+    ``min(tok_n_b, write_per_batch)`` tokens of every seq into the two
+    fp8/bf16 SWA rings. The K is ALREADY in the 2buff layout (nope-fp8
+    ``[T,512]`` + rope-bf16 ``[T,64]``) — produced upstream by aiter op
+    ``fused_qk_norm_rope_group_quant`` (the prefill K branch). This is a
+    pure dtype-agnostic scatter (reuses ``_swa_write_kernel`` once per ring);
+    NO torch quantization happens here.
+
+    Args:
+        k_packed:    [T, 512] fp8 — op1-quantized K nope+inline-scale+pad.
+        k_rope:      [T, 64]  bf16 — op1-rotated K-PE (not quantized).
+        swa_kv_nope: [num_slots, cache_size, 512] fp8 ring (2buff nope pool).
+        swa_kv_rope: [num_slots, cache_size, 64]  bf16 ring (rope pool).
+        (other args as ``swa_write``.)
+    """
+    from atom.model_ops.v4_kernels.v4_quant import (
+        V4_DIM_QK_PACKED,
+        V4_DIM_ROPE,
+    )
+
+    assert (
+        k_packed.dim() == 2 and k_packed.shape[1] == V4_DIM_QK_PACKED
+    ), f"k_packed must be [T,{V4_DIM_QK_PACKED}] fp8, got {tuple(k_packed.shape)}"
+    assert (
+        k_rope.dim() == 2 and k_rope.shape[1] == V4_DIM_ROPE
+    ), f"k_rope must be [T,{V4_DIM_ROPE}] bf16, got {tuple(k_rope.shape)}"
+    assert swa_kv_nope.dim() == 3 and swa_kv_nope.shape[2] == V4_DIM_QK_PACKED
+    assert swa_kv_rope.dim() == 3 and swa_kv_rope.shape[2] == V4_DIM_ROPE
+    assert swa_kv_nope.shape[1] == cache_size and swa_kv_rope.shape[1] == cache_size
+
+    swa_write(
+        k_packed.contiguous(),
+        positions,
+        cu_seqlens_q,
+        state_slot_per_seq,
+        swa_kv_nope,
+        cache_size,
+        write_per_batch,
+    )
+    swa_write(
+        k_rope.contiguous(),
+        positions,
+        cu_seqlens_q,
+        state_slot_per_seq,
+        swa_kv_rope,
+        cache_size,
+        write_per_batch,
+    )
+
+
+def qk_norm_rope_quant_2buff(
+    q: torch.Tensor,
+    kv_pre: torch.Tensor,
+    kv_weight: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    eps: float,
+    swa_scatter: bool = False,
+    state_slot_per_seq: Optional[torch.Tensor] = None,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    swa_kv_nope: Optional[torch.Tensor] = None,
+    swa_kv_rope: Optional[torch.Tensor] = None,
+):
+    """Single aiter HIP op (op1): Q+K RMSNorm + RoPE + fp8 2buff group-quant,
+    with an OPTIONAL fused SWA ring-scatter of the K row. All-native — NO torch
+    quantization, NO separate scatter launch. Sole entry point for the fp8
+    2buff Q/K quantization on both the decode and prefill paths.
+
+    - ``swa_scatter=False`` (prefill): quantize only. The returned
+      ``k_packed``/``k_rope`` feed op4 (``pa_sparse_prefill_fp8_opus``) and are
+      scattered into the SWA rings AFTER attention via
+      ``swa_write_2buff_prepacked`` (prefix must be read before it is
+      overwritten).
+    - ``swa_scatter=True`` (decode): op1 also scatters the K row into both SWA
+      rings in the same launch (``state_slot_per_seq`` / ``batch_id_per_token``
+      / ``swa_kv_nope`` / ``swa_kv_rope`` required). The returned K buffers are
+      throwaway. op1's scatter addresses identically to ``swa_write``: K lands
+      at ``swa_*[state_slot_per_seq[batch_id_per_token[t]],
+      positions[t] % cache_size, :]`` (ring derived from the buffer's dim-1
+      size inside the kernel; ``batch_id_per_token[t] < 0`` CG-pad tokens are
+      skipped).
+
+    Args:
+        q:          [T, H*D] bf16 — post-``wq_b`` Q (heads packed in last dim).
+        kv_pre:     [T, D]   bf16 — post-``wkv_a`` split KV row (pre norm/rope).
+        kv_weight:  [D]      bf16 — KV-side RMSNorm weight (Q is weightless).
+        cos_cache, sin_cache: RoPE tables, [max_pos, rope_head_dim/2].
+        positions:  [T'] int64 — absolute token positions (T' >= T).
+        swa_scatter: enable the fused decode SWA ring-scatter (see above).
+        state_slot_per_seq:   [bs] int32 — per-seq SWA ring slot (scatter only).
+        batch_id_per_token:   [T'] int32 — token→seq map, -1 on CG-pad tokens
+            (scatter only).
+        swa_kv_nope: [num_slots, cache_size, 512] fp8 ring (scatter only).
+        swa_kv_rope: [num_slots, cache_size, 64]  bf16 ring (scatter only).
+
+    Returns:
+        (q_packed, q_rope, k_packed, k_rope):
+          q_packed [T, H, 512] fp8 — Q nope fp8 + 14B dup e8m0 scale + pad.
+          q_rope   [T, H, 64]  bf16 — rotated Q-PE (not quantized).
+          k_packed [T, 1, 512] fp8 — K nope fp8 + scale + pad (throwaway when
+            ``swa_scatter`` — already in the rings).
+          k_rope   [T, 1, 64]  bf16 — rotated K-PE.
+    """
+    import aiter
+    from aiter import dtypes
+
+    from atom.model_ops.v4_kernels.v4_quant import (
+        V4_DIM_QK,
+        V4_DIM_QK_PACKED,
+        V4_DIM_ROPE,
+    )
+
+    assert (
+        q.dim() == 2 and q.shape[1] == n_local_heads * head_dim
+    ), f"q must be [T, H*D={n_local_heads * head_dim}], got {tuple(q.shape)}"
+    assert kv_pre.dim() == 2 and kv_pre.shape[1] == head_dim
+    assert head_dim == V4_DIM_QK, f"fused 2buff path requires head_dim={V4_DIM_QK}"
+    assert rope_head_dim == V4_DIM_ROPE
+
+    T = q.shape[0]
+    q3 = q.view(T, n_local_heads, head_dim)
+    kv3 = kv_pre.view(T, 1, head_dim)
+
+    swa_kwargs = {}
+    if swa_scatter:
+        assert (
+            state_slot_per_seq is not None
+            and batch_id_per_token is not None
+            and swa_kv_nope is not None
+            and swa_kv_rope is not None
+        ), "swa_scatter requires state_slot_per_seq/batch_id_per_token/swa_kv_*"
+        assert state_slot_per_seq.dtype == torch.int32
+        assert batch_id_per_token.dtype == torch.int32
+        assert swa_kv_nope.dim() == 3 and swa_kv_nope.shape[2] == V4_DIM_QK_PACKED
+        assert swa_kv_rope.dim() == 3 and swa_kv_rope.shape[2] == V4_DIM_ROPE
+        swa_kwargs = dict(
+            swa_nope_scale_buff=swa_kv_nope,
+            swa_rope_buff=swa_kv_rope,
+            state_slot_mapping=state_slot_per_seq,
+            batch_id_per_token=batch_id_per_token[:T],
+        )
+
+    # Fused Q+K norm+rope+fp8 group-quant (single HIP launch). fp8 Q output so
+    # op4/op5 consume it directly. When swa_scatter, op1 also writes the K row
+    # into both SWA rings (no separate swa_write). Buffers auto-allocated
+    # (zeroed pad).
+    return aiter.fused_qk_norm_rope_group_quant(
+        q3,
+        kv3,
+        kv_weight,
+        positions[:T],
+        cos_cache,
+        sin_cache,
+        eps,
+        is_neox=False,
+        q_out_dtype=dtypes.fp8,
+        quant_group_size=64,
+        scale_dtype="e8m0",
+        **swa_kwargs,
+    )
 
 
 # === Unified Compressor state save (plan path) ==========================

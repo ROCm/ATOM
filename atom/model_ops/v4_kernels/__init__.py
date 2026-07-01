@@ -43,11 +43,18 @@ from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
     qk_norm_rope_maybe_quant,
     qk_norm_rope_maybe_quant_reference,
 )
-from atom.model_ops.v4_kernels.state_writes import update_compressor_states, swa_write
+from atom.model_ops.v4_kernels.state_writes import (
+    qk_norm_rope_quant_2buff,
+    swa_write_2buff_prepacked,
+    update_compressor_states,
+    swa_write,
+)
 
 __all__ = [
     "update_compressor_states",
     "swa_write",
+    "swa_write_2buff_prepacked",
+    "qk_norm_rope_quant_2buff",
     "fused_compress_attn",
     "fused_compress_attn_reference",
     "sparse_attn_v4_paged_decode",

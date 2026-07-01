@@ -403,7 +403,13 @@ def fused_compress_attn(
     ] = None,  # fp32 [NB, k_per_block]; required when quant=True
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
-    fp8_max: Optional[float] = None,  # E4M3 max; required when quant=True
+    fp8_max: Optional[float] = None,  # E4M3 max; required when quant or main_2buff_fp8
+    # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
+    # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
+    # e8m0 nope-fp8 + inline dup-scale into `kv_cache` (fp8 [NB,k,512]) and bf16
+    # rope into `kv_cache_rope` (bf16 [NB,k,64]) via the flydsl group_fp8 scatter.
+    main_2buff_fp8: bool = False,
+    kv_cache_rope: Optional[torch.Tensor] = None,  # bf16 [NB,k_per_block,64]
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
     dispatched via SGLang-style packed plan.
@@ -462,6 +468,8 @@ def fused_compress_attn(
         and _shape_key == (512, 64, 128, False)
     )
     if _hca_use:
+        # main_2buff_fp8: native group_fp8 2buff scatter (nope-fp8 into
+        # kv_cache, bf16 rope into k_rope_cache). Otherwise plain bf16.
         flydsl_hca_compress_attn(
             kv_in=kv_in,
             score_in=score_in,
@@ -480,9 +488,15 @@ def fused_compress_attn(
             ratio=ratio,
             head_dim=head_dim,
             rope_head_dim=rope_head_dim,
+            quant=main_2buff_fp8,
+            k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
+            quant_group_size=64,
         )
         return
     if _flydsl_use:
+        # main_2buff_fp8: CSA Main native group_fp8 2buff (nope-fp8 + inline
+        # e8m0 into kv_cache, bf16 rope into k_rope_cache; scale carried inline
+        # so cache_scale stays None). Indexer-inner uses per_row_fp8 preshuffle.
         flydsl_fused_compress_attn(
             kv_in=kv_in,
             score_in=score_in,
@@ -502,10 +516,12 @@ def fused_compress_attn(
             ratio=ratio,
             head_dim=head_dim,
             rope_head_dim=rope_head_dim,
-            quant=quant,
+            quant=quant or main_2buff_fp8,
             cache_scale=cache_scale,
             use_ue8m0=use_ue8m0,
-            preshuffle=preshuffle,
+            preshuffle=preshuffle and not main_2buff_fp8,
+            quant_mode="group_fp8" if main_2buff_fp8 else "per_row_fp8",
+            k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
         )
         return
 
