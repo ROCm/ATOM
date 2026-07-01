@@ -137,7 +137,6 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
-    "DeepseekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
