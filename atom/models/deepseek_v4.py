@@ -1754,7 +1754,10 @@ class DeepseekV4Attention(nn.Module):
         if os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return torch.zeros_like(x)
         num_tokens = x.size(0)
-        cache_size = self.swa_kv.shape[1]
+        # M1 paged-SWA: swa_kv is now the flat [num_blocks*block_size, head_dim]
+        # content-addressed region; block_size (not a ring cache_size) is the
+        # paging stride.
+        swa_block_size = self.swa_block_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
@@ -1767,6 +1770,13 @@ class DeepseekV4Attention(nn.Module):
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
         block_tables_gpu = attn_md.block_tables
+        # M2 paged-SWA: swa_write targets the SWA pool via swa_block_tables when
+        # live; M1 fallback reuses the compressed block_tables (shared phys).
+        swa_block_tables_gpu = (
+            attn_md.swa_block_tables
+            if getattr(attn_md, "swa_block_tables", None) is not None
+            else block_tables_gpu
+        )
         state_slot_mapping = attn_md.state_slot_mapping
         plan_for_layer = compress_plans[ratio] if ratio else None
 
@@ -1809,6 +1819,11 @@ class DeepseekV4Attention(nn.Module):
         # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
         # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
         # covers exactly the tokens the old standalone swa_write did.
+        # M1 paged-SWA: do NOT fuse the SWA write into qk_norm_rope_maybe_quant.
+        # The fused (flydsl, aiter) path scatters into a per-request ring
+        # (swa_kv[slot, pos%cache]); paged content-addressing needs the
+        # block_tables-based swa_write below instead. Pass swa_kv=None so neither
+        # the flydsl nor the Triton-fallback fused write fires.
         q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
@@ -1822,15 +1837,22 @@ class DeepseekV4Attention(nn.Module):
             self.eps,
             quant_q=False,
             quant_k=False,
-            swa_kv=self.swa_kv if is_decode else None,
-            state_slot_mapping=state_slot_mapping if is_decode else None,
-            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
-            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
-            swa_cache_size=cache_size if is_decode else None,
-            swa_write_per_batch=(
-                min(attn_md.max_seqlen_q, cache_size) if is_decode else None
-            ),
+            swa_kv=None,
         )
+        # Decode SWA write (paged, content-addressed). Prefill writes its SWA
+        # AFTER sparse_attn (see below) so chunked prefix reads see prior-chunk
+        # contents; decode has no such ordering hazard, so write here before the
+        # decode attention reads the window.
+        if is_decode:
+            swa_write(
+                kv,
+                positions,
+                attn_md.cu_seqlens_q,
+                swa_block_tables_gpu,
+                self.swa_kv,
+                swa_block_size,
+                attn_md.max_seqlen_q,
+            )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
@@ -1908,17 +1930,19 @@ class DeepseekV4Attention(nn.Module):
                 self.attn_sink,
                 self.softmax_scale,
             )  # [S, H, head_dim]
-            # swa_write AFTER attn so chunked-prefill prefix SWA reads see
-            # prior-chunk's ring contents (current swa_write would overwrite
-            # ring slots `pos % cache_size` for positions in this chunk's tail).
+            # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
+            # prior chunk's contents (not this chunk's just-computed tail).
+            # M1 paged-SWA: content-addressed via block_tables; write EVERY token
+            # of the chunk (write_per_batch = max_seqlen_q) so each token's SWA
+            # is stored at its own block slot for cross-request prefix reuse.
             swa_write(
                 kv,
                 positions,
                 attn_md.cu_seqlens_q,
-                state_slot_mapping,
+                swa_block_tables_gpu,
                 self.swa_kv,
-                cache_size,
-                min(attn_md.max_seqlen_q, cache_size),
+                swa_block_size,
+                attn_md.max_seqlen_q,
             )
 
         # Inverse RoPE on output's rope dims to remove absolute-position

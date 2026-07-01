@@ -318,6 +318,11 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
+        # M2 paged-SWA: parallel SWA block table (independent physical pool;
+        # -1 sentinels for window-freed blocks). Same filter as block_tables.
+        self.swa_block_tables = [
+            seq.swa_block_table for seq in seqs.values() if seq.block_table
+        ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
