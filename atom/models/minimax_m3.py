@@ -585,8 +585,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        aux_out: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        capture_aux: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -599,8 +602,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # layer (post input-norm). Captured here, not as `hidden_states + residual`
         # in the model loop, because M3's fused all-reduce RMSNorm leaves that sum
         # TP-partial / NaN-prone under CUDAGraph.
-        if aux_out is not None:
-            aux_out.append(residual.clone())
+        aux_hidden_state = residual.clone() if capture_aux else None
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
@@ -608,6 +610,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
+        if aux_hidden_state is not None:
+            return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
 
@@ -669,7 +673,7 @@ class MiniMaxM3Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             hidden_states = (
                 inputs_embeds
@@ -684,10 +688,15 @@ class MiniMaxM3Model(nn.Module):
 
         aux_hidden_states: list[torch.Tensor] = []
         for idx in range(self.start_layer, self.end_layer):
-            aux_out = aux_hidden_states if idx in self.aux_hidden_state_layers else None
-            hidden_states, residual = self.layers[idx](
-                positions, hidden_states, residual, aux_out=aux_out
-            )
+            if idx in self.aux_hidden_state_layers:
+                hidden_states, residual, aux_hidden_state = self.layers[idx](
+                    positions, hidden_states, residual, capture_aux=True
+                )
+                aux_hidden_states.append(aux_hidden_state)
+            else:
+                hidden_states, residual = self.layers[idx](
+                    positions, hidden_states, residual
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

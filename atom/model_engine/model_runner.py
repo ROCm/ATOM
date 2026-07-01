@@ -2400,7 +2400,11 @@ class ModelRunner:
                             capture_ctx.stream,
                             output_buffer=outputs[:num_tokens],
                         )
-                        graph_aux = None
+                        graph_aux = (
+                            graph_output[1]
+                            if self.use_aux_hidden_state_outputs
+                            else None
+                        )
                     else:
                         # Standard single-stream capture
                         graph = torch.cuda.CUDAGraph()
