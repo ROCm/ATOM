@@ -53,6 +53,27 @@ def _materialize_dummy_hidden_states(
     return hidden_states.new_zeros(shape)
 
 
+def _reshape_mtp_hidden_states(hidden_states: torch.Tensor, *, hidden_size: int):
+    if hidden_states is None:
+        return None
+    if hidden_states.dim() == 3:
+        return hidden_states
+    if hidden_states.dim() != 2:
+        raise ValueError(
+            "DeepSeek-V4 MTP hidden_states must be rank-2 flattened or rank-3 "
+            f"mHC, got shape={tuple(hidden_states.shape)}"
+        )
+    width = int(hidden_states.shape[-1])
+    if width == hidden_size:
+        return hidden_states.unsqueeze(1)
+    if width % hidden_size != 0:
+        raise ValueError(
+            "DeepSeek-V4 MTP flattened hidden width must be divisible by "
+            f"hidden_size={hidden_size}, got width={width}"
+        )
+    return hidden_states.view(hidden_states.shape[0], width // hidden_size, hidden_size)
+
+
 def _install_deepseek_v4_mtp_adapters(model: nn.Module) -> None:
     from atom.plugin.sglang.models.deepseek_v4_attention import (
         patch_deepseek_v4_attention_for_sglang,
@@ -221,6 +242,44 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                         model_hidden_states,
                         length=int(runtime.positions.shape[0]),
                     )
+                elif (
+                    torch.is_tensor(model_hidden_states)
+                    and model_hidden_states.shape[0] != runtime.input_ids.shape[0]
+                    and bool(
+                        getattr(
+                            runtime.forward_batch.forward_mode,
+                            "is_draft_extend",
+                            lambda **kwargs: False,
+                        )(include_v2=True)
+                    )
+                ):
+                    tokens_per_req = int(
+                        getattr(
+                            getattr(runtime.forward_batch, "spec_info", None),
+                            "num_tokens_per_req",
+                            0,
+                        )
+                        or 0
+                    )
+                    if (
+                        tokens_per_req > 0
+                        and model_hidden_states.shape[0] * tokens_per_req
+                        == runtime.input_ids.shape[0]
+                    ):
+                        model_hidden_states = model_hidden_states.repeat_interleave(
+                            tokens_per_req, dim=0
+                        )
+                    else:
+                        raise RuntimeError(
+                            "DeepSeek-V4 MTP draft-extend hidden layout mismatch: "
+                            f"hidden={tuple(model_hidden_states.shape)}, "
+                            f"input_tokens={int(runtime.input_ids.shape[0])}, "
+                            f"tokens_per_req={tokens_per_req}"
+                        )
+                model_hidden_states = _reshape_mtp_hidden_states(
+                    model_hidden_states,
+                    hidden_size=int(self.config.hidden_size),
+                )
 
                 metadata = SGLangForwardBatchMetadata.build(runtime.forward_batch)
                 with SGLangForwardBatchMetadata.bind(metadata):

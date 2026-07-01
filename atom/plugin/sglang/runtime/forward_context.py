@@ -153,6 +153,7 @@ def _slice_v4_graph_metadata_for_capture(
     for name in (
         "batch_id_per_token",
         "batch_id_per_token_cpu",
+        "slot_mapping",
         "kv_indices_swa",
         "kv_indices_csa",
         "kv_indices_hca",
@@ -163,6 +164,17 @@ def _slice_v4_graph_metadata_for_capture(
         "skip_prefix_len_csa",
     ):
         _slice_attr(name, num_tokens)
+
+    for name in (
+        "kv_indptr_swa",
+        "kv_indptr_csa",
+        "kv_indptr_hca",
+        "kv_indptr_extend",
+        "kv_indptr_prefix_swa",
+        "kv_indptr_prefix_csa",
+        "kv_indptr_prefix_hca",
+    ):
+        _slice_attr(name, num_tokens + 1)
 
     for name in (
         "state_slot_mapping",
@@ -178,6 +190,9 @@ def _slice_v4_graph_metadata_for_capture(
     block_tables = getattr(md, "block_tables", None)
     if torch.is_tensor(block_tables):
         md.block_tables = block_tables[:bs]
+
+    for name in ("cu_seqlens_q", "cu_seqlens_k"):
+        _slice_attr(name, bs + 1)
 
     indexer_meta = getattr(md, "indexer_meta", None)
     if isinstance(indexer_meta, dict):
