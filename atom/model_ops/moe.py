@@ -785,6 +785,70 @@ direct_register_custom_op(
 )
 
 
+def _interleave_gate_up_rows_(layer: torch.nn.Module) -> None:
+    """Reorder w13 gate/up rows from SEPARATED (gguu) to INTERLEAVED (gugu).
+
+    Operates in place on ``layer.w13_weight``, ``layer.w13_weight_scale`` and
+    ``layer.w13_bias`` (if present) along their row axis (dim=1), which is
+    ``2 * intermediate_size`` laid out as ``[gate(0..I-1) | up(0..I-1)]``. The
+    new order is ``[gate0, up0, gate1, up1, ...]`` so that a downstream consumer
+    splitting even/odd rows (the triton a16w4 SwiGLU kernel) reads matching
+    gate/up pairs. ``w2`` (down_proj) has no gate/up split and is untouched.
+
+    The reorder is on whole rows (the ``2I`` axis); the MXFP4-packed pairs live
+    on the LAST axis (``H//2`` bytes/row), so reordering never splits a packed
+    byte. For FP4 we reorder a ``uint8`` view (bit-exact, no dequant/requant, no
+    scale recompute — torch has no ``index_select`` for ``float4_e2m1fn_x2``).
+
+    Memory: the permutation is applied **in place per expert**, reusing the
+    existing storage. A plain ``index_select(...).contiguous()`` over the whole
+    tensor would double peak memory (a full second copy of the ~GB-sized w13),
+    which OOMs across many layers at load time. Here the only transient is one
+    expert's rows (a few MB), so peak overhead is negligible.
+
+    Idempotency guard: sets ``layer._w13_gate_up_interleaved`` so a double call
+    (e.g. process_weights_after_loading invoked twice) is a no-op.
+    """
+    if getattr(layer, "_w13_gate_up_interleaved", False):
+        return
+
+    def _interleave_inplace(t: torch.Tensor) -> None:
+        """In-place row reorder [g..|u..] -> [g0,u0,g1,u1,...], per expert.
+
+        Only FP4 (float4_e2m1fn_x2) needs the uint8 view, because torch has no
+        index_select/reshape for it AND its bytes are row-contiguous so the row
+        reorder is exact. Other dtypes (uint8 e8m0 scale, bf16/float bias) are
+        reordered directly — viewing them as uint8 would reinterpret bytes and
+        corrupt the values.
+
+        Per expert e: view its 2I rows as (2, I, *rest), transpose to
+        (I, 2, *rest) (the gugu order); reshape forces one small (single-expert)
+        temp, then copy_ it back into the same storage. No full-tensor duplicate.
+        """
+        _fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+        if _fp4 is not None and t.dtype == _fp4:
+            buf = t.view(torch.uint8)
+        else:
+            buf = t
+
+        E, two_i = buf.shape[0], buf.shape[1]
+        assert two_i % 2 == 0, f"w13 row dim {two_i} not even"
+        i = two_i // 2
+        rest = buf.shape[2:]
+        for e in range(E):
+            rows = buf[e]  # view into storage, shape (2I, *rest)
+            gugu = (
+                rows.view(2, i, *rest).transpose(0, 1).reshape(two_i, *rest)
+            )  # one (single-expert) temp
+            rows.copy_(gugu)  # write back into the same storage
+
+    _interleave_inplace(layer.w13_weight.data)
+    _interleave_inplace(layer.w13_weight_scale.data)
+    if getattr(layer, "w13_bias", None) is not None:
+        _interleave_inplace(layer.w13_bias.data)
+    layer._w13_gate_up_interleaved = True
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -969,26 +1033,51 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the MoE-kernel-only CDNA4 layout.
             n_shared = layer.num_fused_shared_experts
             if n_shared > 0:
+                # IMPORTANT: .clone() (not .contiguous()). A uint8 view of a
+                # contiguous slice is already contiguous, so .contiguous() returns
+                # a tensor that SHARES storage with w13_weight. The gguu->gugu
+                # interleave below mutates w13_weight in place, which would then
+                # corrupt these stashed shared weights (consumed by the gguu
+                # half-split swiglu_oai_split). Clone to fully detach.
                 layer.shared_w13_weight = (
-                    layer.w13_weight.data[-n_shared:].view(torch.uint8).contiguous()
+                    layer.w13_weight.data[-n_shared:].view(torch.uint8).clone()
                 )
                 layer.shared_w13_weight_scale = layer.w13_weight_scale.data[
                     -n_shared:
-                ].contiguous()
+                ].clone()
                 layer.shared_w2_weight = (
-                    layer.w2_weight.data[-n_shared:].view(torch.uint8).contiguous()
+                    layer.w2_weight.data[-n_shared:].view(torch.uint8).clone()
                 )
                 layer.shared_w2_weight_scale = layer.w2_weight_scale.data[
                     -n_shared:
-                ].contiguous()
+                ].clone()
                 if layer.w13_bias is not None:
-                    layer.shared_w13_bias = layer.w13_bias.data[-n_shared:].contiguous()
+                    layer.shared_w13_bias = layer.w13_bias.data[-n_shared:].clone()
                 else:
                     layer.shared_w13_bias = None
                 if layer.w2_bias is not None:
-                    layer.shared_w2_bias = layer.w2_bias.data[-n_shared:].contiguous()
+                    layer.shared_w2_bias = layer.w2_bias.data[-n_shared:].clone()
                 else:
                     layer.shared_w2_bias = None
+
+            # gguu -> gugu interleave for the routed triton SwiGLU kernel.
+            #
+            # The checkpoint stores w13 gate/up rows SEPARATED ("gguu":
+            # [all-gate | all-up]). The aiter default CK fused_moe path consumes
+            # that directly. The triton a16w4 SwiGLU kernel, however, fuses the
+            # activation into the GEMM epilogue and splits each tile as
+            # INTERLEAVED ("gugu": a[...,::2]=gate, a[...,1::2]=up). Feeding gguu
+            # weights to that kernel mixes gate with gate and misreads up,
+            # corrupting the output. We interleave the routed w13 rows once here
+            # so the existing (well-tested) interleaved kernel produces results
+            # identical to the default path. w2 (down_proj) has no gate/up split.
+            #
+            # NOTE: this runs AFTER the shared-expert stash above, which keeps the
+            # shared experts in gguu for the dense swiglu_oai_split path. Only the
+            # SwiGLU triton branch needs interleaved rows; the SiLU branch uses
+            # fused_clamp_act_mul, which half-splits gguu — so gate on activation.
+            if getattr(layer, "activation", None) == ActivationType.Swiglu:
+                _interleave_gate_up_rows_(layer)
 
             (
                 w13_weight,
@@ -1303,15 +1392,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
         from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
 
-        # The dense shared-expert GEMM only implements the SiLU activation
-        # path; SwiGLU models have no fused shared experts, so this assert
-        # documents the supported scope.
-        assert (
-            activation != ActivationType.Swiglu
-        ), "dense shared-expert GEMM only supports the SiLU activation path"
+        from atom.model_ops.swiglu_oai import swiglu_oai_split
+
+        # Two activation flavours are supported, matching the routed experts:
+        #   * SiLU (DeepSeek): silu(gate) * clamp(up), split [gate | up] layout.
+        #   * SwiGLU-OAI (MiniMax-M3 / gpt-oss): gate * sigmoid(alpha*gate) *
+        #     (up + beta) with optional clamp. MiniMax-M3 does not interleave
+        #     gate/up, so the dense GEMM output is split [gate | up] - exactly
+        #     what swiglu_oai_split consumes (mirrors MiniMaxM3MLP.forward and
+        #     the routed swiglu_add_residual=True / alpha path).
+        is_swiglu = activation == ActivationType.Swiglu
 
         M = x.shape[0]
         swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
+        swiglu_alpha = getattr(layer, "swiglu_alpha", 1.702)
+        swiglu_beta = getattr(layer, "swiglu_beta", 1.0)
 
         use_a4w4 = self.act_quant == MoEActivationQuant.FP4
         if use_a4w4:
@@ -1337,14 +1432,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if shared_w13_bias is not None:
                 gate_up = gate_up + shared_w13_bias[e]
             half_n = gate_up.shape[-1] // 2
-            intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
-            fused_clamp_act_mul(
-                gate_up,
-                out=intermediate,
-                swiglu_limit=swiglu_limit,
-                activation="silu",
-                dtype_quant=None,
-            )
+            if is_swiglu:
+                intermediate = swiglu_oai_split(
+                    gate_up,
+                    alpha=swiglu_alpha,
+                    beta=swiglu_beta,
+                    limit=swiglu_limit if swiglu_limit > 0 else None,
+                    out_dtype=x.dtype,
+                )
+            else:
+                intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
+                fused_clamp_act_mul(
+                    gate_up,
+                    out=intermediate,
+                    swiglu_limit=swiglu_limit,
+                    activation="silu",
+                    dtype_quant=None,
+                )
             out_e = _shared_expert_gemm(
                 intermediate,
                 layer.shared_w2_weight[e],
