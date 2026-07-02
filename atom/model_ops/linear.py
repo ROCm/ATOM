@@ -547,6 +547,46 @@ class LinearBase(nn.Module):
             "quant_dtype": str(online_quant_dtype),
         }
 
+    def _pad_mxfp4_input_dim(self):
+        """Zero-pad the MXFP4 (per-1x32 fp4x2) contraction dim up to 256.
+
+        The a4w4 asm GEMM's preshuffle + e8m0 scale layout reads the K
+        dimension in 256-wide tiles. Per-rank shapes whose K is not a
+        multiple of 256 (e.g. the TP=8 shared-expert down_proj with
+        K=384) otherwise trigger an out-of-bounds GPU memory access
+        fault. Padded weight bytes are zero so the extra K contributes
+        nothing to the result. Mirrors FusedMoE's pad_align=256.
+        """
+        self._mxfp4_in_pad = 0
+        if not (
+            self.quant_type == QuantType.per_1x32
+            and self.params_dtype == dtypes.fp4x2
+            and self.weight.dim() == 2
+            and self.weight.data.dtype == dtypes.fp4x2
+        ):
+            return
+        weight_scale = getattr(self, "weight_scale", None)
+        if weight_scale is None:
+            return
+        align = 256
+        k = weight_scale.shape[-1] * MXFP4_QUANT_BLOCK_SIZE
+        k_pad = (k + align - 1) // align * align
+        if k_pad == k:
+            return
+        scale_pad = k_pad // MXFP4_QUANT_BLOCK_SIZE - weight_scale.shape[-1]
+        # weight_scale is e8m0 (exponent-only); 0.0 is not representable, so pad
+        # the raw bytes (0x00 -> 2^-127, harmless since padded weights are zero).
+        scale_u8 = weight_scale.data.view(torch.uint8)
+        self.weight_scale.data = torch.nn.functional.pad(scale_u8, (0, scale_pad)).view(
+            weight_scale.data.dtype
+        )
+        weight_u8 = self.weight.data.view(torch.uint8)
+        weight_pad = k_pad // 2 - weight_u8.shape[-1]
+        self.weight.data = torch.nn.functional.pad(weight_u8, (0, weight_pad)).view(
+            dtypes.fp4x2
+        )
+        self._mxfp4_in_pad = k_pad - k
+
     def process_weights_after_loading(self):
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
@@ -585,6 +625,7 @@ class LinearBase(nn.Module):
             )
             self.weight.data = w_q
             self.weight_scale = atom_parameter(w_s)
+            self._pad_mxfp4_input_dim()
             # Only quantized 2D GEMM weights use aiter's preshuffle layout.
             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
             # quantized models must keep that tensor unshuffled here.
@@ -596,6 +637,8 @@ class LinearBase(nn.Module):
                 self.quant_type == QuantType.per_1x32
                 and self.params_dtype == dtypes.fp4x2
             )
+            if is_fp4_blockscale:
+                self._pad_mxfp4_input_dim()
             need_shuffle = (
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
@@ -693,6 +736,9 @@ class LinearBase(nn.Module):
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
+                in_pad = getattr(self, "_mxfp4_in_pad", 0)
+                if in_pad and x_scale is None:
+                    x = torch.nn.functional.pad(x, (0, in_pad))
                 y = gemm_a4w4_quant(
                     x,
                     x_scale,
