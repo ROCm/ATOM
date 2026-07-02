@@ -209,6 +209,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # --- DSpark confidence-scheduled verification (Phase 2) ---
+    # Enable the hardware-aware prefix scheduler: consume the DSpark confidence
+    # head to pick a per-request verify length ell_r (paper Algorithm 1), then
+    # apply variable-length verification (Level B) downstream so the freed batch
+    # capacity actually lifts throughput.
+    # Default off -> Phase-1 behavior (static verify length == block size).
+    "ATOM_DSPARK_CONFIDENCE_SCHEDULE": lambda: (
+        os.getenv("ATOM_DSPARK_CONFIDENCE_SCHEDULE", "0") == "1"
+    ),
+    # Throttled diagnostics for the DSpark scheduler (avg verify length /
+    # truncation rate). Forces a host sync; keep off in perf runs.
+    "ATOM_DSPARK_DEBUG_SCHEDULE": lambda: (
+        os.getenv("ATOM_DSPARK_DEBUG_SCHEDULE", "0") == "1"
+    ),
+    # Disable SPS calibration (replays captured graphs at warmup). Set "1" to
+    # skip it and fall back to the synthetic SPS stub.
+    "ATOM_DSPARK_DISABLE_SPS_CALIB": lambda: (
+        os.getenv("ATOM_DSPARK_DISABLE_SPS_CALIB", "0") == "1"
+    ),
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
