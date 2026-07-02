@@ -211,7 +211,8 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/sglang_env_file.txt << 'EOF'
+          SGLANG_ENV_FILE="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/sglang_env_file.txt"
+          cat > "$SGLANG_ENV_FILE" << 'EOF'
           ${{ matrix.env_vars }}
           EOF
 
@@ -225,7 +226,7 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --env-file /tmp/sglang_env_file.txt \
+            --env-file "$SGLANG_ENV_FILE" \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
             "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
