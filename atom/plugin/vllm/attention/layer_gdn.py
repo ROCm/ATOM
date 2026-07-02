@@ -420,6 +420,7 @@ class GatedDeltaNet(nn.Module):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        kv_cache: torch.Tensor,
         layer_name: str,
     ):
         """
@@ -448,8 +449,10 @@ class GatedDeltaNet(nn.Module):
         non_spec_state_indices_tensor = (
             attn_metadata.non_spec_state_indices_tensor
         )  # noqa: E501
-        compilation_config = forward_context.no_compile_layers
-        self_kv_cache = compilation_config[layer_name].kv_cache
+        if kv_cache is None or kv_cache.numel() == 0:
+            compilation_config = forward_context.no_compile_layers
+            kv_cache = compilation_config[layer_name].kv_cache
+        self_kv_cache = kv_cache
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
