@@ -474,6 +474,7 @@ class LinearBase(nn.Module):
         assert online_quant_dtype in [
             torch.float8_e4m3fn,
             torch.float4_e2m1fn_x2,
+            torch.int8,
         ], (
             f"Unsupported online quant: "
             f"dtype={online_quant_dtype}, type={online_quant_type}"
@@ -654,6 +655,9 @@ class LinearBase(nn.Module):
                 )
             elif self.quant_type.value == QuantType.per_Token.value:
                 if self.params_dtype == dtypes.i8:
+                    # aiter's gemm_a8w8 routes to CK on gfx9 / Triton on RDNA
+                    # internally, and is torch.compile/graph-capture-safe via its
+                    # own @torch_compile_guard wrapper.
                     y = gemm_a8w8(
                         x,
                         self.weight,

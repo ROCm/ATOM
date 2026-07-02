@@ -16,6 +16,13 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     shared_expert_prefix: Optional[str] = None,
     routed_expert_prefix: Optional[str] = None,
 ) -> bool:
+    # aiter's shared-expert fusion rides the gfx9-only asm MoE kernels; on RDNA
+    # (gfx11/gfx12) keep the shared expert as a separate MLP so the routed MoE
+    # can use the portable Triton path.
+    from atom.utils.arch import aiter_hip_kernels_supported
+
+    if not aiter_hip_kernels_supported():
+        return False
     config = get_current_atom_config()
     if quant_config is None:
         quant_config = config.quant_config

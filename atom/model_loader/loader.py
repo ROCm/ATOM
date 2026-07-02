@@ -395,6 +395,10 @@ def load_model(
     fused_expert_params_mapping = []
     detect_fused_expert_fn = getattr(model, "detect_fused_expert_format", None)
     get_fused_expert_mapping_fn = getattr(model, "get_fused_expert_mapping", None)
+    # Drafter (eagle/MTP) load doesn't pass this explicitly; fall back to the
+    # model's own method so fused MoE expert weights aren't dropped for the draft.
+    if load_fused_expert_weights_fn is None:
+        load_fused_expert_weights_fn = getattr(model, "load_fused_expert_weights", None)
 
     # Track ckpt names that were silently dropped at `get_parameter`
     # AttributeError sites — these indicate weights_mapping bugs where the
