@@ -27,6 +27,11 @@ from atom.utils.decorators import mark_trace
 from atom.utils import envs
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
+from atom.utils.arch import aiter_hip_kernels_supported
+
+# aiter's fused HIP norm kernels emit gfx9-only instructions absent on RDNA;
+# fall back to the portable torch-native path on unsupported arches.
+_AITER_HIP_NORM_SUPPORTED = aiter_hip_kernels_supported()
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -754,6 +759,8 @@ class GemmaRMSNorm(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.use_fused_quant:
             return self._forward_fused_fp8(x, residual)
+        if not _AITER_HIP_NORM_SUPPORTED:
+            return self.forward_native(x, residual)
         return self.forward_cuda(x, residual)
 
 

@@ -11,6 +11,7 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
+from atom.utils import envs
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_attention import (
@@ -448,6 +449,25 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         batch: ScheduledBatch,
     ) -> GDNAttentionMetadata:
         attn_metadata, positions = super().prepare_prefill(batch)
+        # Hybrid (GDN + full-attention) models route their full-attention
+        # layers through unified_attention (TritonMHABackend impl), which
+        # needs block_tables even for pure prefill. The base/GDN builder
+        # leaves it None; populate it exactly as TritonMHAMetadataBuilder so
+        # the interleaved full-attention layers work on the unified path.
+        if attn_metadata.block_tables is None:
+            if envs.ATOM_USE_UNIFIED_ATTN and batch.block_tables:
+                bs = batch.total_seqs_num_prefill
+                self.prepare_block_tables(batch)
+                attn_metadata.block_tables = self.model_runner.forward_vars[
+                    "block_tables"
+                ].copy_to_gpu(bs)
+            else:
+                cu_k = attn_metadata.cu_seqlens_k
+                num_seqs = cu_k.shape[0] - 1
+                offsets = cu_k[:num_seqs]
+                attn_metadata.block_tables = offsets.unsqueeze(1) + torch.arange(
+                    attn_metadata.max_seqlen_k, dtype=torch.int32, device=cu_k.device
+                )
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
