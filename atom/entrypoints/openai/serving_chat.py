@@ -60,6 +60,7 @@ async def stream_chat_response(
     num_prompt_tokens: int,
     cleanup_fn,
     tools=None,
+    use_harmony: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -71,12 +72,13 @@ async def stream_chat_response(
     ``num_prompt_tokens`` is the engine-computed prompt length (``Sequence.
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
+
+    When ``use_harmony`` is True, uses the Harmony token-level parser for
+    GPT-OSS models instead of the text-based reasoning filter + tool parser.
     """
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
-    reasoning_filter = ReasoningFilter()
-    tool_parser = ToolCallStreamParser(tools=tools)
     has_tool_calls = False
 
     # Send initial role chunk
@@ -84,33 +86,99 @@ async def stream_chat_response(
 
     kv_transfer_params_value = None
 
-    while True:
-        chunk_data = await stream_queue.get()
-        new_text = chunk_data["text"]
-        num_tokens_output += len(chunk_data.get("token_ids", []))
-        _ct = chunk_data.get("num_cached_tokens", 0)
-        if _ct:
-            num_cached_tokens = _ct
+    if use_harmony:
+        from .harmony_parser import HarmonyStreamParser
 
-        if "kv_transfer_params" in chunk_data:
-            kv_transfer_params_value = chunk_data["kv_transfer_params"]
+        harmony_parser = HarmonyStreamParser()
 
-        # Phase 1: Process through reasoning filter
-        segments = reasoning_filter.process(new_text)
-        if chunk_data.get("finished", False):
-            segments.extend(reasoning_filter.flush())
+        while True:
+            chunk_data = await stream_queue.get()
+            token_ids = chunk_data.get("token_ids", [])
+            num_tokens_output += len(token_ids)
+            _ct = chunk_data.get("num_cached_tokens", 0)
+            if _ct:
+                num_cached_tokens = _ct
+            if "kv_transfer_params" in chunk_data:
+                kv_transfer_params_value = chunk_data["kv_transfer_params"]
+            finished = chunk_data.get("finished", False)
 
-        # Phase 2: For content segments, check for tool calls
-        for field, text in segments:
-            if field == "reasoning_content":
-                if text:
+            events = harmony_parser.process_tokens(token_ids)
+            if finished:
+                events.extend(harmony_parser.flush())
+
+            for etype, edata in events:
+                if etype == "reasoning":
                     yield create_chat_chunk(
-                        request_id, model, delta={"reasoning_content": text}
+                        request_id, model, delta={"reasoning_content": edata}
                     )
-            elif field == "content":
-                # Run through tool parser
-                events = tool_parser.process(text)
-                for event_type, data in events:
+                elif etype == "content":
+                    yield create_chat_chunk(
+                        request_id, model, delta={"content": edata}
+                    )
+                elif etype == "tool_call_start":
+                    has_tool_calls = True
+                    yield create_chat_chunk(
+                        request_id, model, delta={"tool_calls": [edata]}
+                    )
+                elif etype == "tool_call_args":
+                    yield create_chat_chunk(
+                        request_id, model, delta={"tool_calls": [edata]}
+                    )
+
+            if finished:
+                break
+    else:
+        reasoning_filter = ReasoningFilter()
+        tool_parser = ToolCallStreamParser(tools=tools)
+
+        while True:
+            chunk_data = await stream_queue.get()
+            new_text = chunk_data["text"]
+            num_tokens_output += len(chunk_data.get("token_ids", []))
+            _ct = chunk_data.get("num_cached_tokens", 0)
+            if _ct:
+                num_cached_tokens = _ct
+
+            if "kv_transfer_params" in chunk_data:
+                kv_transfer_params_value = chunk_data["kv_transfer_params"]
+
+            # Phase 1: Process through reasoning filter
+            segments = reasoning_filter.process(new_text)
+            if chunk_data.get("finished", False):
+                segments.extend(reasoning_filter.flush())
+
+            # Phase 2: For content segments, check for tool calls
+            for field, text in segments:
+                if field == "reasoning_content":
+                    if text:
+                        yield create_chat_chunk(
+                            request_id, model, delta={"reasoning_content": text}
+                        )
+                elif field == "content":
+                    # Run through tool parser
+                    events = tool_parser.process(text)
+                    for event_type, data in events:
+                        if event_type == "content":
+                            yield create_chat_chunk(
+                                request_id, model, delta={"content": data}
+                            )
+                        elif event_type == "tool_call_start":
+                            has_tool_calls = True
+                            yield create_chat_chunk(
+                                request_id,
+                                model,
+                                delta={"tool_calls": [data]},
+                            )
+                        elif event_type == "tool_call_args":
+                            yield create_chat_chunk(
+                                request_id,
+                                model,
+                                delta={"tool_calls": [data]},
+                            )
+
+            if chunk_data.get("finished", False):
+                # Flush tool parser
+                for event_type, data in tool_parser.flush():
                     if event_type == "content":
                         yield create_chat_chunk(
                             request_id, model, delta={"content": data}
@@ -118,32 +186,13 @@ async def stream_chat_response(
                     elif event_type == "tool_call_start":
                         has_tool_calls = True
                         yield create_chat_chunk(
-                            request_id,
-                            model,
-                            delta={"tool_calls": [data]},
+                            request_id, model, delta={"tool_calls": [data]}
                         )
                     elif event_type == "tool_call_args":
                         yield create_chat_chunk(
-                            request_id,
-                            model,
-                            delta={"tool_calls": [data]},
+                            request_id, model, delta={"tool_calls": [data]}
                         )
-
-        if chunk_data.get("finished", False):
-            # Flush tool parser
-            for event_type, data in tool_parser.flush():
-                if event_type == "content":
-                    yield create_chat_chunk(request_id, model, delta={"content": data})
-                elif event_type == "tool_call_start":
-                    has_tool_calls = True
-                    yield create_chat_chunk(
-                        request_id, model, delta={"tool_calls": [data]}
-                    )
-                elif event_type == "tool_call_args":
-                    yield create_chat_chunk(
-                        request_id, model, delta={"tool_calls": [data]}
-                    )
-            break
+                break
 
     cleanup_fn(request_id, seq_id)
 
