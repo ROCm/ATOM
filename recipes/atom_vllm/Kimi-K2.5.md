@@ -19,6 +19,10 @@ We adopt [amd/Kimi-K2.5-MXFP4-AttnFP8](https://huggingface.co/amd/Kimi-K2.5-MXFP
 ```bash
 # use quick allreduce to reduce TTFT
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+# use flydsl MoE sorting kernel
+export AITER_USE_FLYDSL_MOE_SORTING=1
+# cap the single-stage allreduce size (KB) to favor the faster path
+export AITER_AR_1STAGE_MAX_KB=512
 
 vllm serve amd/Kimi-K2.5-MXFP4-AttnFP8 \
     --host localhost \

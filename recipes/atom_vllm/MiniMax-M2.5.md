@@ -20,6 +20,8 @@ The following matches the vLLM-ATOM benchmark entries in `.github/benchmark/oot_
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_GLUON_PA_DECODE=1
+# cap the single-stage allreduce size (KB) to favor the faster path
+export AITER_AR_1STAGE_MAX_KB=2048
 
 vllm serve MiniMaxAI/MiniMax-M2.5 \
     --host localhost \
