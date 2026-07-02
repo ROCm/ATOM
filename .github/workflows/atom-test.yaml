@@ -265,6 +265,107 @@ jobs:
           GPU_PREFLIGHT_ALLOCATION_MB: "8"
         run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
 
+      - name: HIP single-process debug probe
+        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          docker exec -i "$CONTAINER_NAME" bash -s <<'SH' 2>&1 | tee atom_hip_single_process_probe.log
+          set -euo pipefail
+
+          echo "=== Environment and device mapping ==="
+          id
+          env | sort | grep -E '^(HIP|ROCR|CUDA|HSA|NCCL|RCCL|TORCH|LOCAL_RANK|RANK|WORLD_SIZE)=' || true
+          ls -l /dev/kfd /dev/dri || true
+          cat /opt/rocm/.info/version || true
+
+          echo "=== ROCm device state ==="
+          rocm-smi --showproductname || true
+          rocm-smi --showdriverversion || true
+          rocm-smi --showtopo || true
+          rocm-smi --showmemuse || true
+          rocm-smi --showpidgpus || true
+
+          echo "=== PyTorch single-process HIP init ==="
+          python3 - <<'PY'
+          import torch
+
+          print(f"torch={torch.__version__}")
+          print(f"torch.version.hip={getattr(torch.version, 'hip', None)}")
+          print(f"torch.cuda.is_available={torch.cuda.is_available()}")
+          count = torch.cuda.device_count()
+          print(f"torch.cuda.device_count={count}")
+          if not torch.cuda.is_available() or count <= 0:
+              raise RuntimeError("No available HIP devices for single-process probe")
+
+          for index in range(count):
+              torch.cuda.set_device(index)
+              tensor = torch.empty((1024, 1024), dtype=torch.float32, device=f"cuda:{index}")
+              torch.cuda.synchronize()
+              print(
+                  f"device[{index}]={torch.cuda.get_device_name(index)} "
+                  f"allocation_ok bytes={tensor.numel() * tensor.element_size()}"
+              )
+              del tensor
+              torch.cuda.empty_cache()
+          PY
+          SH
+
+      - name: HIP distributed TP4 smoke test
+        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          docker exec -i \
+            -e NCCL_DEBUG=INFO \
+            -e RCCL_LOG_LEVEL=INFO \
+            -e TORCH_DISTRIBUTED_DEBUG=DETAIL \
+            "$CONTAINER_NAME" \
+            bash -lc 'cat > /tmp/atom_torch_dist_smoke.py && python3 -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=4 /tmp/atom_torch_dist_smoke.py' <<'PY' 2>&1 | tee atom_hip_dist_tp4_smoke.log
+          import os
+
+          import torch
+          import torch.distributed as dist
+
+
+          def main() -> None:
+              rank = int(os.environ["RANK"])
+              local_rank = int(os.environ["LOCAL_RANK"])
+              world_size = int(os.environ["WORLD_SIZE"])
+
+              if not torch.cuda.is_available():
+                  raise RuntimeError("torch.cuda.is_available() is false")
+
+              device_count = torch.cuda.device_count()
+              if device_count < world_size:
+                  raise RuntimeError(
+                      f"Expected at least {world_size} HIP devices, found {device_count}"
+                  )
+
+              torch.cuda.set_device(local_rank)
+              dist.init_process_group(backend="nccl")
+
+              value = torch.tensor([rank + 1.0], device=f"cuda:{local_rank}")
+              dist.all_reduce(value, op=dist.ReduceOp.SUM)
+              torch.cuda.synchronize()
+
+              expected = world_size * (world_size + 1) / 2
+              actual = value.item()
+              print(
+                  f"rank={rank} local_rank={local_rank} "
+                  f"device={torch.cuda.get_device_name(local_rank)} "
+                  f"all_reduce={actual}"
+              )
+              if actual != expected:
+                  raise RuntimeError(f"all_reduce mismatch: expected {expected}, got {actual}")
+
+              dist.destroy_process_group()
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
       - name: Collect GPU info (inside container)
         id: gpu-info
         env:
@@ -416,6 +517,38 @@ jobs:
         if: always()
         run: |
           docker exec "$CONTAINER_NAME" cat /tmp/atom_client.log 2>/dev/null || true
+
+      - name: Collect HIP debug artifacts
+        if: always() && matrix.runner == 'linux-atom-do-mi350x-8'
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set +e
+            cp /tmp/atom_server.log /workspace/atom_server.log 2>/dev/null || true
+            cp /tmp/atom_client.log /workspace/atom_client.log 2>/dev/null || true
+            env | sort | grep -E "^(HIP|ROCR|CUDA|HSA|NCCL|RCCL|TORCH|LOCAL_RANK|RANK|WORLD_SIZE)=" > /workspace/hip_env_after.txt 2>&1 || true
+            ls -l /dev/kfd /dev/dri > /workspace/hip_devices_after.txt 2>&1 || true
+            rocm-smi --showmemuse > /workspace/rocm_mem_after.txt 2>&1 || true
+            rocm-smi --showpidgpus > /workspace/rocm_pids_after.txt 2>&1 || true
+            rocm-smi --showtopo > /workspace/rocm_topo_after.txt 2>&1 || true
+          ' || true
+
+      - name: Upload HIP debug artifacts
+        if: always() && matrix.runner == 'linux-atom-do-mi350x-8'
+        uses: actions/upload-artifact@v7
+        with:
+          name: hip-debug-${{ matrix.model_name }}-${{ github.run_id }}
+          path: |
+            atom_hip_single_process_probe.log
+            atom_hip_dist_tp4_smoke.log
+            atom_accuracy_output.txt
+            atom_server.log
+            atom_client.log
+            hip_env_after.txt
+            hip_devices_after.txt
+            rocm_mem_after.txt
+            rocm_pids_after.txt
+            rocm_topo_after.txt
+          if-no-files-found: ignore
 
       - name: Check accuracy test results
         if: success()
