@@ -1308,14 +1308,17 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 group_size=128,
                 transpose_bm=True,
             )
-
+        if fp8_attention:
+            q_out_dtype = current_platform.fp8_dtype()
+        else:
+            q_out_dtype = ql_nope.dtype
         q_out = torch.empty(
             (
                 ql_nope.shape[0],
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ),
-            dtype=ql_nope.dtype,
+            dtype=q_out_dtype,
             device=ql_nope.device,
         )
         if kv_cache.numel() > 0:
@@ -1341,15 +1344,6 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
 
-        if fp8_attention:
-            from vllm import _custom_ops as ops
-
-            # Reshape to 2D for scaled_fp8_quant, then restore
-            q_flat, _ = ops.scaled_fp8_quant(
-                q_out.reshape(q_out.shape[0], -1),
-                self._q_scale,
-            )
-            q_out = q_flat.reshape(q_out.shape)
         attn_out = self._forward_sparse_bf16_kv(q_out, kv_cache, attn_metadata)
 
         # V up-projection
