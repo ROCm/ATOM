@@ -979,6 +979,22 @@ class Scheduler:
             else:
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
+                elif self.mtp_k > 0:
+                    # A fresh decode seq (e.g. just transitioned from prefill)
+                    # has no drafts proposed yet. scheduled_spec_decode_tokens is
+                    # consumed positionally by batch order in
+                    # TokenIDProcessor.prepare_input_ids, so every decode seq must
+                    # contribute a row -- otherwise the array is compacted and the
+                    # positional index runs off the end (IndexError). This seq does
+                    # not accept drafts this step (num_new_token + num_rejected == 1),
+                    # so the draft-slot values are don't-cares; reuse the seq's own
+                    # scheduled decode tokens, which are guaranteed valid token ids.
+                    pad = seq.token_ids[-self.mtp_k :]
+                    if len(pad) < self.mtp_k:
+                        pad = [0] * (self.mtp_k - len(pad)) + list(pad)
+                    scheduled_spec_decode_tokens[seq.id] = np.asarray(
+                        pad, dtype=np.int32
+                    )
                 num_seqs_decode += 1
                 num_decode_tokens += num_new_tokens
                 # For PD first-decode: if T0 was injected, may_append is
