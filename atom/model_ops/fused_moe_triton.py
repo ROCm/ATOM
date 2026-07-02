@@ -25,7 +25,7 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from atom.utils import envs
 
-if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
+if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE or envs.ATOM_USE_TRITON_MOE_DECODE:
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
@@ -40,6 +40,7 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
         swizzle_scales as swizzle_scales_cdna4,
     )
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 from atom.model_ops.moe import MoEActivationQuant
 
@@ -386,4 +387,97 @@ def triton_kernel_fused_experts(
         return output_tensor
 
     output_tensor = output_tensor.view(M, K)
+    return output_tensor
+
+
+def triton_kernel_fused_experts_a8w4_silu(
+    output_tensor: torch.Tensor,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    topk: int,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_swizzle_layout,
+    w2_swizzle_layout,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 10.0,
+    apply_router_weight_on_input: bool = False,
+    global_num_experts: int = -1,
+    expert_map: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode-only A8W4 MoE for SiLU models (DSv4).
+
+    Pipeline: MXFP8 quant -> GEMM1(a8w4) -> SiLU -> MXFP8 quant -> GEMM2(a8w4).
+    Weights must be in preshuffled layout (shuffle_weight_gfx1250).
+    Scales must be GFX1250-swizzled.
+    """
+    assert hidden_states.ndim == 2
+    assert hidden_states.dtype == torch.bfloat16
+
+    M, K = hidden_states.shape
+    N = w1.shape[-1] * 16
+    half_N = N // 2
+
+    gammas = routing_data.gate_scal if routing_data else None
+
+    x_fp8, x_scale = downcast_to_mxfp(
+        hidden_states, torch.float8_e4m3fn, axis=-1
+    )
+
+    raw_intermediate = moe_gemm_a8w4(
+        x_fp8,
+        w1,
+        x_scale,
+        w13_scale,
+        a13_scale,
+        None,
+        w1_bias,
+        routing_data,
+        gather_indx=gather_indx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=w13_swizzle_layout,
+        apply_swiglu=False,
+        preshuffled=True,
+    )
+
+    raw_2d = raw_intermediate.view(M * topk, N)
+    intermediate = torch.empty(
+        (M * topk, half_N),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    fused_clamp_act_mul(
+        raw_2d,
+        out=intermediate,
+        swiglu_limit=swiglu_limit,
+        activation="silu",
+        dtype_quant=None,
+    )
+
+    interm_fp8, interm_scale = downcast_to_mxfp(
+        intermediate, torch.float8_e4m3fn, axis=-1
+    )
+
+    output_tensor = moe_gemm_a8w4(
+        interm_fp8,
+        w2,
+        interm_scale,
+        w2_scale,
+        a2_scale,
+        None,
+        w2_bias,
+        routing_data,
+        scatter_indx=scatter_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=w2_swizzle_layout,
+        preshuffled=True,
+    )
+
     return output_tensor

@@ -804,6 +804,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
             )
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
+        if envs.is_set("ATOM_USE_TRITON_MOE_DECODE"):
+            self.use_triton_decode = envs.ATOM_USE_TRITON_MOE_DECODE
+        else:
+            self.use_triton_decode = False
 
     def create_weights(
         self,
@@ -1012,6 +1016,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_swizzle_layout = w2_swizzle_layout
             return
 
+        if self.use_triton_decode:
+            orig_w13_weight_scale = layer.w13_weight_scale.data.clone()
+            orig_w2_weight_scale = layer.w2_weight_scale.data.clone()
+
         # shuffle weight
         layer.w13_weight.data = shuffle_weight(
             layer.w13_weight,
@@ -1046,6 +1054,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+
+        if self.use_triton_decode:
+            from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+                swizzle_scales as swizzle_scales_a8w4,
+            )
+
+            w13_u8 = layer.w13_weight.data
+            if w13_u8.dtype != torch.uint8:
+                w13_u8 = w13_u8.view(torch.uint8)
+            E_13, N_13, K_13 = w13_u8.shape
+            layer.w13_weight_preshuffled = w13_u8.view(
+                E_13, N_13 // 16, K_13 * 16
+            ).transpose(-1, -2)
+
+            w2_u8 = layer.w2_weight.data
+            if w2_u8.dtype != torch.uint8:
+                w2_u8 = w2_u8.view(torch.uint8)
+            E_2, N_2, K_2 = w2_u8.shape
+            layer.w2_weight_preshuffled = w2_u8.view(
+                E_2, N_2 // 16, K_2 * 16
+            ).transpose(-1, -2)
+
+            w13_scale_for_a8w4 = orig_w13_weight_scale.transpose(-2, -1)
+            w2_scale_for_a8w4 = orig_w2_weight_scale.transpose(-2, -1)
+
+            layer.w13_weight_scale_a8w4, layer.w13_swizzle_layout_a8w4 = (
+                swizzle_scales_a8w4(w13_scale_for_a8w4)
+            )
+            layer.w2_weight_scale_a8w4, layer.w2_swizzle_layout_a8w4 = (
+                swizzle_scales_a8w4(w2_scale_for_a8w4)
+            )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1090,6 +1129,59 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        if self.use_triton_decode and not get_forward_context().context.is_prefill:
+            from atom.model_ops.fused_moe_triton import (
+                triton_kernel_fused_experts_a8w4_silu,
+            )
+            from aiter.ops.triton.moe.moe_routing.routing import routing
+
+            n_expts_act = top_k
+
+            routing_data, gather_idx, scatter_idx = routing(
+                router_logits,
+                n_expts_act,
+                score_mode=scoring_func,
+                bias=(
+                    e_score_correction_bias.to(torch.float32)
+                    if e_score_correction_bias is not None
+                    else None
+                ),
+                renorm=renormalize,
+                routed_scaling_factor=layer.routed_scaling_factor,
+                use_grouped_topk=use_grouped_topk,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+            )
+            n_expts_act = routing_data.n_expts_act
+
+            num_tokens, n_expts_tot = router_logits.shape
+            if global_num_experts > 0:
+                n_expts_tot = global_num_experts
+
+            output = torch.empty_like(x)
+            return triton_kernel_fused_experts_a8w4_silu(
+                output,
+                x,
+                layer.w13_weight_preshuffled,
+                layer.w2_weight_preshuffled,
+                routing_data,
+                gather_idx,
+                scatter_idx,
+                topk=n_expts_act,
+                w13_scale=layer.w13_weight_scale_a8w4,
+                w2_scale=layer.w2_weight_scale_a8w4,
+                w13_swizzle_layout=layer.w13_swizzle_layout_a8w4,
+                w2_swizzle_layout=layer.w2_swizzle_layout_a8w4,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=n_expts_tot,
+                expert_map=expert_map,
+            )
+
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts,
