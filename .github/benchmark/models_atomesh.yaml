@@ -67,6 +67,7 @@ models:
       smoke:
         - name: ds-v4-1p1d-tp8-smoke
           topology: 1p1d
+          pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [8192]
           osl: 1024
@@ -77,6 +78,7 @@ models:
       nightly:
         - name: ds-v4-1p1d-tp8
           topology: 1p1d
+          pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [8192]
           osl: 1024
@@ -85,6 +87,7 @@ models:
 
         - name: ds-v4-2p1d-dpa-tp8
           topology: 2p1d_dpa
+          pd_worker_layout: multi_node
           nodes: "${ATOMESH_2P1D_NODES}"
           isl: [8192]
           osl: 1024
@@ -98,6 +101,75 @@ models:
             tp: 8
             extra_args: "--enable-dp-attention --enable-tbo"
           run_eval: true
+
+    accuracy:
+      task: gsm8k
+      fewshot: 3
+      limit: null
+
+  Kimi-K2.5-MXFP4:
+    backend: atom
+    model_path: /mnt/models/Kimi-K2.5-MXFP4/
+    precision: MXFP4
+    env:
+      common:
+        HSA_NO_SCRATCH_RECLAIM: "1"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        gpu_memory_utilization: 0.85
+        max_num_seqs: 256
+        extra_args: ""
+    suites:
+      nightly:
+        - name: kimi-k25-1p1d-tp4
+          topology: 1p1d
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+          benchmark:
+            wait_server_timeout: 1800
+          runner:
+            time_limit: "04:00:00"
+          run_eval: true
+          eval_concurrency: [64]
+
+        - name: kimi-k25-2p1d-tp4
+          topology: 2p1d
+          pd_worker_layout: prefill_single_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [128, 256, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          benchmark:
+            wait_server_timeout: 1800
+          runner:
+            time_limit: "06:00:00"
+          run_eval: true
+          eval_concurrency: [128]
 
     accuracy:
       task: gsm8k

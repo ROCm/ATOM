@@ -98,6 +98,7 @@ exports = {
     "PRECISION": cell.get("precision", ""),
     "TOPOLOGY": cell["topology"],
     "DISPLAY_TOPOLOGY": cell.get("display_topology", cell["topology"]),
+    "ATOMESH_PD_WORKER_LAYOUT": cell.get("pd_worker_layout", "multi_node"),
     "NODE_LIST": ",".join(cell["nodes"]),
     "NUM_NODES": cell["num_nodes"],
     "ISL_LIST": ",".join(str(v) for v in cell["isl"]),

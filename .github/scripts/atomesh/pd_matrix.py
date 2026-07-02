@@ -135,12 +135,6 @@ def build_cell(
             f"Only atom backend is currently supported, got {backend_name}"
         )
 
-    nodes = resolve_nodes(suite_cfg.get("nodes"))
-    if len(nodes) < 2:
-        raise ValueError(
-            f"{suite_cfg.get('name', model_name)} needs at least two nodes"
-        )
-
     prefill_cfg = deep_merge(
         backend_cfg.get("service", {}).get("prefill", {}),
         suite_cfg.get("prefill", {}),
@@ -153,6 +147,30 @@ def build_cell(
         backend_cfg.get("service", {}).get("router", {}),
         suite_cfg.get("router", {}),
     )
+    pd_worker_layout = str(suite_cfg.get("pd_worker_layout", "multi_node"))
+    single_node_pd = pd_worker_layout == "single_node"
+    prefill_single_node_pd = pd_worker_layout == "prefill_single_node"
+
+    nodes = resolve_nodes(suite_cfg.get("nodes"))
+    if single_node_pd:
+        if not nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs at least one node"
+            )
+        nodes = nodes[:1]
+    elif prefill_single_node_pd:
+        required_nodes = 1 + int(decode_cfg.get("workers", 1))
+        if len(nodes) < required_nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs at least "
+                f"{required_nodes} node(s)"
+            )
+        nodes = nodes[:required_nodes]
+    elif len(nodes) < 2:
+        raise ValueError(
+            f"{suite_cfg.get('name', model_name)} needs at least two nodes"
+        )
+
     server_args = deep_merge(
         model_cfg.get("server", {}).get("common_args", {}),
         suite_cfg.get("server", {}).get("common_args", {}),
@@ -200,6 +218,7 @@ def build_cell(
         "precision": str(model_cfg.get("precision", "")),
         "topology": topology,
         "display_topology": display_topology,
+        "pd_worker_layout": pd_worker_layout,
         "nodes": nodes,
         "num_nodes": len(nodes),
         "isl": isl,
