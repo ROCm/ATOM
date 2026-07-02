@@ -115,6 +115,51 @@ class TestParseToolCalls:
         assert tool_calls[0].function["arguments"] == args
 
 
+class TestParseHermesToolCalls:
+    """Hermes ``<tool_call>{json}</tool_call>`` format (Qwen3 default template)."""
+
+    def test_single_hermes_tool_call(self):
+        text = (
+            "I'll check the weather."
+            '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>'
+        )
+        content, tool_calls = parse_tool_calls(text)
+        assert content == "I'll check the weather."
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function["name"] == "get_weather"
+        assert '"city"' in tool_calls[0].function["arguments"]
+        assert tool_calls[0].type == "function"
+
+    def test_multiple_hermes_tool_calls(self):
+        text = (
+            '<tool_call>\n{"name": "search", "arguments": {"q": "test"}}\n</tool_call>'
+            '<tool_call>\n{"name": "fetch", "arguments": {"url": "http://example.com"}}\n</tool_call>'
+        )
+        content, tool_calls = parse_tool_calls(text)
+        assert len(tool_calls) == 2
+        assert tool_calls[0].function["name"] == "search"
+        assert tool_calls[1].function["name"] == "fetch"
+
+    def test_hermes_empty_arguments(self):
+        text = '<tool_call>\n{"name": "list_files", "arguments": {}}\n</tool_call>'
+        content, tool_calls = parse_tool_calls(text)
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function["name"] == "list_files"
+        assert tool_calls[0].function["arguments"] == "{}"
+
+    def test_hermes_unclosed_block(self):
+        text = '<tool_call>\n{"name": "run", "arguments": {"cmd": "ls"}}'
+        content, tool_calls = parse_tool_calls(text)
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function["name"] == "run"
+
+    def test_hermes_does_not_break_qwen_xml(self):
+        text = "<tool_call>\n<function=exec>\n<parameter=cmd>ls</parameter>\n</function>\n</tool_call>"
+        content, tool_calls = parse_tool_calls(text)
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function["name"] == "exec"
+
+
 # ============================================================================
 # ToolCallStreamParser Tests
 # ============================================================================
@@ -211,3 +256,26 @@ class TestToolCallStreamParser:
         assert len(starts) == 1
         ends = [d for t, d in results if t == "tool_call_end"]
         assert len(ends) == 1  # flush should emit tool_call_end
+
+    def test_hermes_tool_call_streaming(self):
+        tokens = [
+            "Let me read that.",
+            "<tool_",
+            'call>\n{"name": "read_file"',
+            ', "arguments": {"path": "/etc/hos',
+            'ts"}}\n</tool_call>',
+        ]
+        results = self._run_parser(tokens)
+        content = "".join(d for t, d in results if t == "content")
+        assert "Let me read that." in content
+
+        starts = [d for t, d in results if t == "tool_call_start"]
+        assert len(starts) == 1
+        assert starts[0]["function"]["name"] == "read_file"
+
+        args = [d for t, d in results if t == "tool_call_args"]
+        assert len(args) == 1
+        assert "/etc/hosts" in args[0]["function"]["arguments"]
+
+        ends = [d for t, d in results if t == "tool_call_end"]
+        assert len(ends) == 1
