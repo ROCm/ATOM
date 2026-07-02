@@ -147,6 +147,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         if hasattr(self.model, "get_embed_and_head"):
             return self.model.get_embed_and_head()
 
+        if self.model_arch == "DeepseekV4ForCausalLM":
+            return self.model.model.embed.weight, self.model.model.head.weight
+
         embed_owner = (
             self.model.model
             if hasattr(self.model, "model")
@@ -269,20 +272,13 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states = runtime.trim_output(hidden_states)
 
                 if self.pp_group.is_last_rank:
-                    if self.model_arch == "DeepseekV4ForCausalLM" and not getattr(
-                        forward_batch, "return_logprob", False
-                    ):
-                        if forward_batch.forward_mode.is_decode_or_idle():
-                            pruned_states = hidden_states
-                        elif forward_batch.forward_mode.is_extend():
-                            last_index = (
-                                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-                            )
-                            pruned_states = hidden_states[last_index]
-                        else:
-                            pruned_states = hidden_states
-                        return LogitsProcessorOutput(
-                            next_token_logits=self.model.compute_logits(pruned_states)
+                    if self.model_arch == "DeepseekV4ForCausalLM":
+                        return self.logits_processor(
+                            input_ids,
+                            hidden_states,
+                            self.logits_head,
+                            forward_batch,
+                            hidden_states_before_norm=hidden_states,
                         )
                     return self.logits_processor(
                         input_ids,
