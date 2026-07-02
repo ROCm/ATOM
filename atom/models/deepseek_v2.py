@@ -36,14 +36,12 @@ from aiter import (
     get_hip_quant,
     indexer_k_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
-    is_prezero_free,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.tuned_gemm import tgemm
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
 from aiter.ops.triton.fused_mxfp4_quant import (
@@ -74,6 +72,7 @@ from atom.model_ops.linear import (
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.prezero import ar_rmsnorm_maybe_prezero_, mm_maybe_prezero_
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
@@ -876,21 +875,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
-@torch_compile_guard(
-    mutates_args=["out"], gen_fake=lambda out, a, weight, bias=None: None
-)
-def _mm_prezero_(
-    out: torch.Tensor,
-    a: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-) -> None:
-    # The out buffer was pre-zeroed for free by the preceding fused
-    # allreduce-rmsnorm, so skip the in-kernel zero-init and let the split-K
-    # GEMM atomic-add into it (zero_init=False == prezero).
-    tgemm.mm(a, weight, bias, zero_init=False, out=out)
-
-
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -1021,7 +1005,12 @@ class DeepseekV2MoE(nn.Module):
         gate_prezero: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if gate_prezero is not None:
-            _mm_prezero_(gate_prezero, hidden_states, self.gate.weight)
+            mm_maybe_prezero_(
+                gate_prezero,
+                hidden_states,
+                self.gate.weight,
+                self.gate.weight.shape[0],
+            )
             router_logits = gate_prezero
         else:
             router_logits = self.gate(hidden_states)
@@ -1088,6 +1077,12 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states, shared_output, hidden_states
         )
         return final_hidden_states
+
+    @property
+    def gate_prezero_n(self) -> int:
+        if self._use_dual_stream:
+            return 0
+        return self.gate.weight.shape[0]
 
     def forward(
         self,
@@ -1947,6 +1942,14 @@ class DeepseekV2MLAAttention(nn.Module):
             if layer_quant_dtype in (dtypes.fp8, dtypes.fp4x2):
                 self.fuse_qknorm_quant = True
 
+        if self.q_lora_rank is not None:
+            n_qb = (
+                self.q_b_proj.weight.shape[0]
+                if self.q_b_proj.quant_type.value == QuantType.No.value
+                else 0
+            )
+            self.q_b_proj.prezero_n_total = self.fused_qkv_a_proj.weight.shape[0] + n_qb
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1985,8 +1988,11 @@ class DeepseekV2MLAAttention(nn.Module):
                 hidden_states_or_q_c_scale = q_c_scale
             else:
                 if qkva_prezero is not None:
-                    _mm_prezero_(
-                        qkva_prezero, hidden_states, self.fused_qkv_a_proj.weight
+                    mm_maybe_prezero_(
+                        qkva_prezero,
+                        hidden_states,
+                        self.fused_qkv_a_proj.weight,
+                        self.q_b_proj.prezero_n_total,
                     )
                     qkv_lora = qkva_prezero
                 else:
@@ -2183,12 +2189,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        zero_fill = None
         qkva_prezero = None
         qb_prezero = None
-        _pz_ctx = (
-            get_forward_context().context if envs.ATOM_ENABLE_SPLITK_PREZERO else None
-        )
         if self.fuse_input_norm_quant:
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
@@ -2248,49 +2250,36 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 if (
-                    _pz_ctx is not None
-                    and not _pz_ctx.is_prefill
+                    envs.ATOM_ENABLE_SPLITK_PREZERO
                     and getattr(self.self_attn, "fused_qkv_a_proj", None) is not None
                     and self.input_layernorm.fused_allreduce
                     and self.input_layernorm.tp_size > 1
                 ):
-                    # Zero one buffer for free on the fused allreduce-rmsnorm's
-                    # idle CUs, then hand its contiguous blocks to the qkv_a and
-                    # (optionally) q_b split-K GEMMs to atomic-add into. q_b rides
-                    # the same input_layernorm zeroing even though its own
-                    # preceding norm (q_a_layernorm) is a plain local RMSNorm.
                     m = hidden_states.shape[0]
+                    n_total = self.self_attn.q_b_proj.prezero_n_total
                     n_qkva = self.self_attn.fused_qkv_a_proj.weight.shape[0]
-                    q_b_proj = getattr(self.self_attn, "q_b_proj", None)
-                    # q_b prezero only covers the bf16 q up-proj; a quantized
-                    # q_b_proj keeps its own quant GEMM (no prezero).
-                    n_qb = (
-                        q_b_proj.weight.shape[0]
-                        if q_b_proj is not None
-                        and q_b_proj.quant_type.value == QuantType.No.value
-                        else 0
+                    zero_fill = torch.empty(
+                        m,
+                        n_total,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
                     )
-                    if n_qb and is_prezero_free(_pz_ctx.graph_bs, n_qkva + n_qb):
-                        zero_fill = torch.empty(
-                            m,
-                            n_qkva + n_qb,
-                            dtype=hidden_states.dtype,
-                            device=hidden_states.device,
-                        )
-                        flat = zero_fill.view(-1)
-                        qkva_prezero = flat[: m * n_qkva].view(m, n_qkva)
-                        qb_prezero = flat[m * n_qkva :].view(m, n_qb)
-                    elif is_prezero_free(_pz_ctx.graph_bs, n_qkva):
-                        zero_fill = torch.empty(
-                            m,
-                            n_qkva,
-                            dtype=hidden_states.dtype,
-                            device=hidden_states.device,
-                        )
-                        qkva_prezero = zero_fill
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states, residual, zero_fill=zero_fill
-                )
+                    flat = zero_fill.view(-1)
+                    qkva_prezero = flat[: m * n_qkva].view(m, n_qkva)
+                    if n_total > n_qkva:
+                        qb_prezero = flat[m * n_qkva :].view(m, n_total - n_qkva)
+                    hidden_states, residual = ar_rmsnorm_maybe_prezero_(
+                        hidden_states,
+                        residual,
+                        self.input_layernorm.weight,
+                        self.input_layernorm.eps,
+                        zero_fill,
+                        n_total,
+                    )
+                else:
+                    hidden_states, residual = self.input_layernorm(
+                        hidden_states, residual
+                    )
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -2311,26 +2300,33 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         gate_zero = None
+        n_experts = (
+            self.mlp.gate_prezero_n if isinstance(self.mlp, DeepseekV2MoE) else 0
+        )
         if (
-            _pz_ctx is not None
-            and not _pz_ctx.is_prefill
-            and isinstance(self.mlp, DeepseekV2MoE)
-            and not self.mlp._use_dual_stream
+            envs.ATOM_ENABLE_SPLITK_PREZERO
+            and n_experts
             and self.post_attention_layernorm.fused_allreduce
             and self.post_attention_layernorm.tp_size > 1
-            and is_prezero_free(_pz_ctx.graph_bs, self.mlp.gate.weight.shape[0])
         ):
-            # The fused allreduce-rmsnorm zeroes this gate buffer on idle CUs; the
-            # MoE then atomic-adds the split-K gate GEMM into it.
             gate_zero = torch.empty(
                 hidden_states.shape[0],
-                self.mlp.gate.weight.shape[0],
+                n_experts,
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual, zero_fill=gate_zero
-        )
+            hidden_states, residual = ar_rmsnorm_maybe_prezero_(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+                gate_zero,
+                n_experts,
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         if isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, gate_prezero=gate_zero)
         else:

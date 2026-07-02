@@ -32,6 +32,8 @@ except ImportError:
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.tuned_gemm import tgemm
+
+from atom.model_ops.prezero import prezero_active
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
 )
@@ -371,10 +373,8 @@ class MLAAttention(nn.Module):
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
     def _q_proj_and_k_up_proj(self, x, x_scale=None, qb_prezero=None):
         if qb_prezero is not None:
-            # The q up-proj output buffer was pre-zeroed for free by the layer's
-            # fused allreduce-rmsnorm; run the bf16 q_b GEMM as a split-K
-            # atomic-add into it (zero_init=False) instead of allocating fresh.
-            tgemm.mm(x, self.q_proj.weight, None, zero_init=False, out=qb_prezero)
+            active = prezero_active(self.q_proj.prezero_n_total)
+            tgemm.mm(x, self.q_proj.weight, None, zero_init=not active, out=qb_prezero)
             q_proj_out = qb_prezero
         else:
             q_proj_out = self.q_proj(x, x_scale)
