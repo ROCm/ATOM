@@ -2115,12 +2115,31 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
             )
+        # Fuse activation quant into AR+RMSNorm when fused_qkv_a_proj is
+        # per-1x128/per-token FP8, so the kernel emits the (fp8, scale) it
+        # consumes directly. Independent of the non-AR fuse_input_norm_quant path.
+        qkv_proj = getattr(self.self_attn, "fused_qkv_a_proj", None)
+        input_norm_fused_quant = (
+            not self.self_attn.is_v32
+            and qkv_proj is not None
+            and qkv_proj.params_dtype == dtypes.fp8
+            and qkv_proj.quant_type.value
+            in (QuantType.per_1x128.value, QuantType.per_Token.value)
+        )
+        fused_allreduce = (
+            self.fuse_ar_input_norm and self.layer_idx > 0 and not is_mtp_block
+        )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=self.fuse_ar_input_norm
-            and self.layer_idx > 0
-            and not is_mtp_block,
+            fused_allreduce=fused_allreduce,
+            fused_quant=fused_allreduce and input_norm_fused_quant,
+            quant_config=quant_config,
+            prefix=(
+                f"{prefix}.self_attn.fused_qkv_a_proj"
+                if qkv_proj is not None
+                else f"{prefix}.self_attn.q_a_proj"
+            ),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,

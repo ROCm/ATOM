@@ -331,6 +331,34 @@ class RMSNorm(nn.Module):
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
                 return x, residual
+        if (
+            self.fused_allreduce
+            and self.tp_size > 1
+            and self.use_fused_quant
+            and residual is not None
+        ):
+            # Combined AllReduce + RMSNorm + FP8 quant: the downstream GEMM
+            # (e.g. qkv_proj) consumes the (fp8, scale) output directly, skipping
+            # a separate quant kernel. `_aiter_transpose_scale` (resolved at
+            # init) selects the scale layout matching that GEMM (column-major for
+            # the preshuffle path, row-major otherwise). The fused kernel does
+            # not support non-contiguous input.
+            assert self.quant_type.value in (
+                _QV_PER_1X128,
+                _QV_PER_TOKEN,
+            ), "Unsupported quant type for fused allreduce rmsnorm quant"
+            # Unified kernel: `quant_type` selects the epilogue (per-token vs
+            # per-group); group_size / transpose_scale apply to per-group only.
+            x, residual, x_scale = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                x.contiguous(),
+                residual,
+                self.weight,
+                self.eps,
+                quant_type=self.quant_type,
+                group_size=128,
+                transpose_scale=self._aiter_transpose_scale,
+            )
+            return (x, x_scale), residual
         if self.fused_allreduce and self.tp_size > 1:
             assert (
                 residual is not None
