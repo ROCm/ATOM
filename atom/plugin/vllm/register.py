@@ -96,6 +96,14 @@ def register_model() -> None:
 
     _set_plugin_mode()
 
+    from atom.plugin.vllm.dbo_backend_patch import (
+        patch_vllm_dbo_backend,
+        patch_atom_dbo_bridge,
+    )
+
+    patch_vllm_dbo_backend()
+    patch_atom_dbo_bridge()
+
     import vllm.model_executor.models.registry as vllm_model_registry
 
     any_updated = False
