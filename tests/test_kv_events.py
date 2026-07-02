@@ -75,6 +75,32 @@ class TestEventSchema:
         assert dec.medium == MEDIUM_GPU
         assert dec.block_size == 4
 
+    def test_block_stored_token_offset_roundtrip(self):
+        # token_offset records the sequence position the first block of the run
+        # covers, so consumers can map each block to [offset + i*block_size, ...).
+        evt = BlockStored(
+            block_hashes=[111, 222],
+            parent_block_hash=None,
+            token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+            block_size=4,
+            token_offset=16,
+        )
+        enc = msgspec.msgpack.Encoder().encode(evt)
+        dec = msgspec.msgpack.Decoder(BlockStored).decode(enc)
+        assert dec.token_offset == 16
+
+    def test_block_stored_token_offset_defaults_none(self):
+        evt = BlockStored(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=[1, 2, 3, 4],
+            block_size=4,
+        )
+        dec = msgspec.msgpack.Decoder(BlockStored).decode(
+            msgspec.msgpack.Encoder().encode(evt)
+        )
+        assert dec.token_offset is None
+
     def test_block_removed_roundtrip(self):
         evt = BlockRemoved(block_hashes=[111], medium=MEDIUM_GPU)
         enc = msgspec.msgpack.Encoder().encode(evt)
@@ -149,6 +175,29 @@ class TestBlockManagerHooks:
         assert len(stored) == 1
         assert stored[0].block_size == 4
         assert stored[0].medium == MEDIUM_GPU
+
+    def test_block_stored_first_run_offset_is_zero(self, seq_factory):
+        bm = _bm_with_events()
+        seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        _admit(bm, seq)
+        stored = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert len(stored) == 1
+        assert stored[0].token_offset == 0
+
+    def test_block_stored_offset_after_cached_prefix(self, seq_factory):
+        # s2 reuses s1's first two blocks (tokens 1-8) and adds a third
+        # block (tokens 9-12). The new run starts at block index 2, so its
+        # token_offset must be 2 * block_size == 8.
+        bm = _bm_with_events()
+        s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        _admit(bm, s1)
+        bm.take_events()
+
+        s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        _admit(bm, s2)
+        stored = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert len(stored) == 1
+        assert stored[0].token_offset == 8
 
     def test_drain_is_destructive(self, seq_factory):
         bm = _bm_with_events()
@@ -238,6 +287,18 @@ class TestBlockManagerHooks:
         assert events[0].medium == MEDIUM_REMOTE
         assert events[0].block_hashes == [42, 43]
 
+    def test_record_remote_store_carries_token_offset(self, seq_factory):
+        bm = _bm_with_events()
+        bm.record_remote_store(
+            block_hashes=[42, 43],
+            token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+            parent_block_hash=None,
+            token_offset=16,
+        )
+        events = bm.take_events()
+        assert len(events) == 1
+        assert events[0].token_offset == 16
+
     def test_record_remote_store_no_op_when_disabled(self, block_manager):
         # block_manager fixture has events disabled
         block_manager.record_remote_store(block_hashes=[1], token_ids=[0])
@@ -265,6 +326,40 @@ class TestPublisher:
         with pytest.raises(ValueError):
             make_publisher(enabled=True, publisher_kind="kafka", endpoint="")
 
+
+class TestReplayEndpointWiring:
+    def test_make_publisher_forwards_replay_endpoint(self):
+        pytest.importorskip("zmq")
+        pub = make_publisher(
+            enabled=True,
+            publisher_kind="zmq",
+            endpoint="inproc://mp-replay-pub",
+            replay_endpoint="inproc://mp-replay-router",
+        )
+        try:
+            assert pub._replay is not None
+            assert pub._replay_buffer is not None
+        finally:
+            pub.shutdown()
+
+    def test_make_publisher_no_replay_by_default(self):
+        pytest.importorskip("zmq")
+        pub = make_publisher(
+            enabled=True, publisher_kind="zmq", endpoint="inproc://mp-noreplay"
+        )
+        try:
+            assert pub._replay is None
+        finally:
+            pub.shutdown()
+
+    def test_env_replay_endpoint_default_and_override(self, monkeypatch):
+        import atom.utils.envs as envs
+
+        monkeypatch.delenv("ATOM_KV_EVENTS_REPLAY_ENDPOINT", raising=False)
+        assert envs.ATOM_KV_EVENTS_REPLAY_ENDPOINT == ""
+        monkeypatch.setenv("ATOM_KV_EVENTS_REPLAY_ENDPOINT", "tcp://127.0.0.1:5558")
+        assert envs.ATOM_KV_EVENTS_REPLAY_ENDPOINT == "tcp://127.0.0.1:5558"
+
     def test_zmq_publisher_roundtrip(self):
         # Skip cleanly when pyzmq isn't installed (zmq is an optional dep of
         # the publisher, not of the engine).
@@ -280,16 +375,123 @@ class TestPublisher:
             sub.setsockopt(zmq.SUBSCRIBE, b"")
             sub.connect(endpoint)
             decoder = msgspec.msgpack.Decoder(EventBatch)
-            payload: bytes | None = None
+            frames: list[bytes] | None = None
             for _ in range(10):
                 pub.publish([BlockRemoved(block_hashes=[7])])
                 if sub.poll(timeout=200):
-                    payload = sub.recv()
+                    frames = sub.recv_multipart()
                     break
-            assert payload is not None, "SUB did not receive any batch"
+            assert frames is not None, "SUB did not receive any batch"
+            # Wire layout is [topic, seq, payload]; topic is empty by default.
+            assert len(frames) == 3
+            topic, seq_bytes, payload = frames
+            assert topic == b""
+            assert int.from_bytes(seq_bytes, "big") == 0  # first batch
             batch = decoder.decode(payload)
             assert len(batch.events) == 1
             assert isinstance(batch.events[0], BlockRemoved)
+        finally:
+            sub.close(linger=0)
+            pub.shutdown()
+
+    def test_zmq_publisher_seq_is_monotonic(self):
+        zmq = pytest.importorskip("zmq")
+        endpoint = "inproc://test-kv-events-seq"
+        pub = ZmqEventPublisher(endpoint=endpoint, buffer_steps=64)
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        try:
+            sub.setsockopt(zmq.SUBSCRIBE, b"")
+            sub.connect(endpoint)
+            seqs: list[int] = []
+            for i in range(5):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            deadline_polls = 50
+            while len(seqs) < 5 and deadline_polls > 0:
+                if sub.poll(timeout=200):
+                    _, seq_bytes, _ = sub.recv_multipart()
+                    seqs.append(int.from_bytes(seq_bytes, "big"))
+                deadline_polls -= 1
+            assert seqs == [0, 1, 2, 3, 4]
+        finally:
+            sub.close(linger=0)
+            pub.shutdown()
+
+    def test_replay_recovers_missed_batches(self):
+        zmq = pytest.importorskip("zmq")
+        pub_ep = "inproc://test-kv-replay-pub"
+        replay_ep = "inproc://test-kv-replay-router"
+        pub = ZmqEventPublisher(
+            endpoint=pub_ep, replay_endpoint=replay_ep, buffer_steps=64
+        )
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        try:
+            sub.setsockopt(zmq.SUBSCRIBE, b"")
+            sub.connect(pub_ep)
+            for i in range(3):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            received = 0
+            polls = 50
+            while received < 3 and polls > 0:
+                if sub.poll(timeout=200):
+                    sub.recv_multipart()
+                    received += 1
+                polls -= 1
+            assert received == 3
+
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.connect(replay_ep)
+            dealer.send(b"\x00" * 8)  # start_seq = 0
+            replayed_seqs: list[int] = []
+            replay_polls = 50
+            while len(replayed_seqs) < 3 and replay_polls > 0:
+                if dealer.poll(timeout=200):
+                    seq_bytes, payload = dealer.recv_multipart()
+                    replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
+                    msgspec.msgpack.Decoder(EventBatch).decode(payload)
+                replay_polls -= 1
+            dealer.close(linger=0)
+            assert replayed_seqs == [0, 1, 2]
+        finally:
+            sub.close(linger=0)
+            pub.shutdown()
+
+    def test_replay_only_returns_from_start_seq(self):
+        zmq = pytest.importorskip("zmq")
+        pub_ep = "inproc://test-kv-replay-pub2"
+        replay_ep = "inproc://test-kv-replay-router2"
+        pub = ZmqEventPublisher(
+            endpoint=pub_ep, replay_endpoint=replay_ep, buffer_steps=64
+        )
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        try:
+            sub.setsockopt(zmq.SUBSCRIBE, b"")
+            sub.connect(pub_ep)
+            for i in range(4):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            received = 0
+            polls = 50
+            while received < 4 and polls > 0:
+                if sub.poll(timeout=200):
+                    sub.recv_multipart()
+                    received += 1
+                polls -= 1
+            assert received == 4
+
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.connect(replay_ep)
+            dealer.send((2).to_bytes(8, "big"))  # start_seq = 2
+            replayed_seqs: list[int] = []
+            replay_polls = 50
+            while len(replayed_seqs) < 2 and replay_polls > 0:
+                if dealer.poll(timeout=200):
+                    seq_bytes, _ = dealer.recv_multipart()
+                    replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
+                replay_polls -= 1
+            dealer.close(linger=0)
+            assert replayed_seqs == [2, 3]
         finally:
             sub.close(linger=0)
             pub.shutdown()
