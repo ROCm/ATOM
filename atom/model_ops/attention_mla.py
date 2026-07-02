@@ -1315,8 +1315,11 @@ def _convert_req_index_to_global_index_kernel(
     kv_end = tl.load(kv_indptr + batch_id + 1)
     out_kv_start = tl.load(page_kv_indptr + batch_id)
     kv_len = kv_end - kv_start
-    qo_start = tl.load(qo_indptr + batch_id, cache_modifier=".cv")
-    qo_end = tl.load(qo_indptr + batch_id + 1, cache_modifier=".cv")
+    # Force buffer_load (vector path, bypasses K$/scalar-cache) instead of s_load.
+    # s_load uses K$ which H2D DMA does not invalidate on gfx950, causing stale reads
+    # in CUDAGraph replay. tl.arange makes the address a tensor → buffer_load → L2 path.
+    qo_start = tl.sum(tl.load(qo_indptr + batch_id     + tl.arange(0, 1)))
+    qo_end   = tl.sum(tl.load(qo_indptr + batch_id + 1 + tl.arange(0, 1)))
 
     for token_id in range(qo_start, qo_end):
         # Load token indices for this tile
