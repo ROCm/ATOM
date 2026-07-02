@@ -21,7 +21,6 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from aiter import ActivationType
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_gather,
@@ -226,8 +225,9 @@ class MLPBlock(torch.nn.Module):
         )
         # Detect MXFP4 MoE GEMM padding requirement from the quant method.
         # When hidden_size is not aligned to 256, MXFP4 weights are padded
-        # and the kernel expects padded input. We handle padding here instead
-        # of in the layernorm, so the layernorm can use fused AllReduce.
+        # and the kernel expects padded input. The padded activation now comes
+        # from post_attention_layernorm so we can verify kernel-side padding
+        # without an extra model-level F.pad here.
         if hasattr(self.experts.quant_method, "hidden_pad"):
             self.moe_hidden_pad = self.experts.quant_method.hidden_pad
         else:
@@ -243,17 +243,17 @@ class MLPBlock(torch.nn.Module):
 
         g = self.router(x[..., : self.hidden_size])
 
-        # Pad input for MXFP4 MoE GEMM alignment if needed
-        if self.moe_hidden_pad > 0 and self.tp_size > 1:
-            x = F.pad(x, (0, self.moe_hidden_pad))
-
         x = self.experts(hidden_states=x, router_logits=g)
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             x = tensor_model_parallel_all_reduce(x)
 
-        # Remove padding from output
-        if self.moe_hidden_pad > 0:
+        # Keep the padded tail for the next fused AR+RMSNorm when fusion is
+        # enabled so the downstream kernel can consume the contiguous 3072-wide
+        # MoE output directly and slice internally.
+        if self.moe_hidden_pad > 0 and (
+            self.tp_size <= 1 or not ENABLE_ALLREDUCE_RMSNORM_FUSION
+        ):
             x = x[:, : self.hidden_size]
 
         if self.is_sequence_parallel:
@@ -294,13 +294,13 @@ class TransformerBlock(torch.nn.Module):
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and layer_num > 0,
         )
         # Fuse o_proj AllReduce into post_attention_layernorm.
-        # Padding for MXFP4 MoE GEMM alignment is now handled inside MLPBlock,
-        # so this layernorm no longer needs x_pad_to_multiple.
+        # Keep MXFP4 MoE alignment padding in the RMSNorm kernel path so model
+        # code does not add a separate F.pad before the MoE block.
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=1e-5,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.tp_size > 1,
-            x_pad_to_multiple=0 if self.tp_size > 1 else 256,
+            x_pad_to_multiple=256,
         )
 
     def forward(

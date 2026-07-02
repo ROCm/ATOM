@@ -319,10 +319,19 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
         x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self.x_pad_to_multiple > 0:
+        if self.fused_allreduce and self.tp_size > 1:
             assert (
-                not self.fused_allreduce
-            ), "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
+                residual is not None
+            ), "fused_allreduce_rmsnorm requires residual input!"
+            x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
+                x,
+                residual,
+                self.weight,
+                self.eps,
+                x_pad_to_multiple=self.x_pad_to_multiple,
+            )
+            return x, residual
+        if self.x_pad_to_multiple > 0:
             if residual is None:
                 x = fused_rmsnorm_pad_(x, self.weight, self.eps, self.x_pad_to_multiple)
                 return x
@@ -331,18 +340,6 @@ class RMSNorm(nn.Module):
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
                 return x, residual
-        if self.fused_allreduce and self.tp_size > 1:
-            assert (
-                residual is not None
-            ), "fused_allreduce_rmsnorm requires residual input!"
-            # tensor_model_parallel_fused_allreduce_rmsnorm does not support non-contiguous input
-            x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
-                x.contiguous(),
-                residual,
-                self.weight,
-                self.eps,
-            )
-            return x, residual
         else:
             if x_scale is not None and self.use_fused_quant:
                 import aiter as rocm_aiter
