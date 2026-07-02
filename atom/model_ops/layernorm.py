@@ -1085,12 +1085,13 @@ class LayerNorm(nn.Module):
         self,
         dim: int,
         eps: float = 1e-6,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = atom_parameter(torch.ones(dim))
-        self.bias = atom_parameter(torch.zeros(dim))
+        self.weight = atom_parameter(torch.ones(dim, dtype=dtype))
+        self.bias = atom_parameter(torch.zeros(dim, dtype=dtype))
 
     def forward(
         self,
