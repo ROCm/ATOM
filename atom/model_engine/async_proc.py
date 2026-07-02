@@ -187,6 +187,7 @@ class AsyncIOProc:
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
+            logger.info(f"{self.label}: dequeue() waiting...")
             func_name, args = self.get_func()
             need_barrier = func_name in self._BARRIER_FUNCS
             for runner in self.runners:

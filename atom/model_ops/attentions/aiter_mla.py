@@ -1047,17 +1047,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 vars_used.append(("sparse_kv_indptr", bs + 1))
                 metadata_deps.add("sparse_kv_indptr")
 
-        prep_stream = self.prep_stream
         vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
         vars_remaining = [(el, num) for el, num in vars_used if el not in metadata_deps]
         max_seqlen_k = context_lens.max()
 
+        # The side prep_stream overlaps the metadata H2D copies + kv_indices
+        # generation with the main stream. Under intra-GPU disagg the decode runs
+        # on a CU-masked stream, and the prep_stream's wait_stream barriers
+        # serialize against it, adding per-step decode latency. So in disagg mode
+        # do the copies synchronously on the current stream; otherwise keep the
+        # async overlap.
+        disagg = self.model_runner.config.enable_disagg
         ctx = {}
         ctx["kv_indptr"] = var["kv_indptr"].copy_to_gpu(bs + 1)
-        # prep_stream does remaining copies + kv_indices
-        current_stream = torch.cuda.current_stream()
-        prep_stream.wait_stream(current_stream)
-        with torch.cuda.stream(prep_stream):
+        if disagg:
             ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
             ctx.update(ctx_rest)
             ctx["kv_indices"] = var["kv_indices"].gpu
@@ -1068,9 +1071,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.block_ratio,
                 max_seqlen_k,
             )
+        else:
+            prep_stream = self.prep_stream
+            current_stream = torch.cuda.current_stream()
+            prep_stream.wait_stream(current_stream)
+            with torch.cuda.stream(prep_stream):
+                ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
+                ctx.update(ctx_rest)
+                ctx["kv_indices"] = var["kv_indices"].gpu
+                kv_indices_generate_triton(
+                    ctx["block_tables"],
+                    ctx["kv_indices"],
+                    ctx["kv_indptr"],
+                    self.block_ratio,
+                    max_seqlen_k,
+                )
 
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
-        # metadata copies on main_stream
+        # metadata copies on main stream
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
 
@@ -1084,7 +1102,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
             ctx_mla_ps_sparse = None
         ctx.update(ctx_mla_ps)
-        current_stream.wait_stream(prep_stream)
+        if not disagg:
+            current_stream.wait_stream(prep_stream)
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
