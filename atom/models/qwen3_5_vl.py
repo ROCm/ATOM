@@ -15,6 +15,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# gfx1151 (RDNA3.5): torch SDPA falls back to the unfused math backend for the ViT
+# (flash/mem-efficient are disabled). Use a custom Triton flash attention that
+# tiles head_dim into 5x16=80 (vs padding to 128) -> ~24 TFLOPS, ~20x over SDPA.
+# On gfx9/CDNA SDPA already has a fast flash backend, so keep SDPA there.
+try:
+    from atom.model_ops.vit_attention import vit_flash_attn
+    from atom.utils.arch import aiter_hip_kernels_supported
+
+    _USE_TRITON_VIT_ATTN = not aiter_hip_kernels_supported()
+except Exception:  # pragma: no cover - fallback if aiter/arch unavailable
+    vit_flash_attn = None
+    _USE_TRITON_VIT_ATTN = False
+
 
 class Qwen3VisionPatchEmbed(nn.Module):
     def __init__(
@@ -79,6 +92,7 @@ class Qwen3VisionAttention(nn.Module):
         x: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        cu_seqlens=None,
     ) -> torch.Tensor:
         # x: [seq_len, 1, embed_dim] (the VisionBlock adds a batch dim)
         seq_len = x.shape[0]
@@ -93,13 +107,32 @@ class Qwen3VisionAttention(nn.Module):
         q = self._apply_rotary_emb(q, rotary_pos_emb_cos, rotary_pos_emb_sin)
         k = self._apply_rotary_emb(k, rotary_pos_emb_cos, rotary_pos_emb_sin)
 
-        # Reshape for SDPA: [batch, heads, seq_len, head_dim]
-        q = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, seq_len, head_dim]
-        k = k.unsqueeze(0).transpose(1, 2)
-        v = v.unsqueeze(0).transpose(1, 2)
-
-        out = F.scaled_dot_product_attention(q, k, v)
-        out = out.transpose(1, 2).reshape(seq_len, self.embed_dim)
+        if (
+            _USE_TRITON_VIT_ATTN
+            and vit_flash_attn is not None
+            and cu_seqlens is not None
+            and self.head_dim <= 80
+        ):
+            # Custom head-dim-tiled flash attention (per-image varlen). Tiles
+            # head_dim into 5x16=80 instead of padding to 128, so the QK/AV
+            # contraction is 80-deep (1.6x fewer WMMA k-steps). No external pad.
+            b_start_loc, b_seq_len, max_seqlen = cu_seqlens
+            out = vit_flash_attn(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                b_start_loc,
+                b_seq_len,
+                max_seqlen,
+            )
+            out = out.reshape(seq_len, self.embed_dim)
+        else:
+            # Reshape for SDPA: [batch, heads, seq_len, head_dim]
+            qh = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, seq_len, head_dim]
+            kh = k.unsqueeze(0).transpose(1, 2)
+            vh = v.unsqueeze(0).transpose(1, 2)
+            out = F.scaled_dot_product_attention(qh, kh, vh)
+            out = out.transpose(1, 2).reshape(seq_len, self.embed_dim)
         out = self.proj(out)
         return out.view(seq_len, batch, self.embed_dim)
 
@@ -144,11 +177,13 @@ class Qwen3VisionBlock(nn.Module):
         x: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        cu_seqlens=None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            cu_seqlens=cu_seqlens,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -387,11 +422,25 @@ class Qwen3VisionTransformer(nn.Module):
         # Rotary position embeddings
         rotary_cos, rotary_sin = self._compute_rotary_emb(grid_thw_list)
 
+        # Per-image attention segments (cu_seqlens) for the Triton prefill kernel:
+        # each image attends only within its own t*h*w patches.
+        seqlens = [int(t) * int(h) * int(w) for t, h, w in grid_thw_list]
+        b_seq_len = torch.tensor(
+            seqlens, dtype=torch.int32, device=hidden_states.device
+        )
+        b_start_loc = torch.zeros(
+            len(seqlens), dtype=torch.int32, device=hidden_states.device
+        )
+        if len(seqlens) > 1:
+            b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], dim=0).to(torch.int32)
+        cu_seqlens = (b_start_loc, b_seq_len, max(seqlens) if seqlens else 0)
+
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
                 rotary_pos_emb_cos=rotary_cos,
                 rotary_pos_emb_sin=rotary_sin,
+                cu_seqlens=cu_seqlens,
             )
 
         hidden_states = self.merger(hidden_states)
