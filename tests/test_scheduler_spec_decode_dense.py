@@ -11,6 +11,7 @@ the positional index ran off the end:
 
 The fix makes the array dense: one row per decode seq, in batch order.
 """
+
 from types import SimpleNamespace
 
 import numpy as np
