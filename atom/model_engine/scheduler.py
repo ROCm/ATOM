@@ -603,7 +603,10 @@ class Scheduler:
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
                 continue
             n = seq.num_tokens - seq.num_cached_tokens
-            if self.enable_chunked_prefill and 0 < self.long_prefill_token_threshold < n:
+            if (
+                self.enable_chunked_prefill
+                and 0 < self.long_prefill_token_threshold < n
+            ):
                 n = self.long_prefill_token_threshold
             if n > cap:
                 n = cap

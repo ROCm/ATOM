@@ -733,7 +733,7 @@ class TestPrefillBatchGate:
         # First (max_passes - 1) calls hold, then it force-fires and resets.
         assert sched._prefill_batch_ready() is False  # pass 1
         assert sched._prefill_batch_ready() is False  # pass 2
-        assert sched._prefill_batch_ready() is True   # pass 3 -> force
+        assert sched._prefill_batch_ready() is True  # pass 3 -> force
         assert sched._prefill_hold_passes == 0
 
     def test_gate_holds_new_prefill_but_decodes(self, seq_factory):
