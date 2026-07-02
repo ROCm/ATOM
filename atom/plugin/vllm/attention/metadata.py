@@ -426,8 +426,12 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self.parallel_config = config.parallel_config
         self.cache_config = config.cache_config
 
-        self.num_heads_kv = self.model_config.get_num_kv_heads(self.parallel_config)
-        self.head_dim = self.model_config.get_head_size()
+        # For EAGLE3 mha draft with mla target, model_config describes the mla target,
+        # but this metadata builder servers the mha draft's own kv cache group. So derive
+        # the kv geometry from the kv_cache_spec, which in non-EAGLE case agrees with the
+        # model_config.
+        self.num_heads_kv = kv_cache_spec.num_kv_heads
+        self.head_dim = kv_cache_spec.head_size
         self.block_size = kv_cache_spec.block_size
 
         self.aot_sliding_window: tuple[int, int] | None = None
@@ -798,7 +802,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
 class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
     """vLLM-only dense MLA metadata builder."""
 
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
     query_len_support = QueryLenSupport.UNIFORM
 
