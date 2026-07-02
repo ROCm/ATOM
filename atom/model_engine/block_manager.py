@@ -146,7 +146,12 @@ class BlockManager:
         # blocks. See `allocate()` for the budget reasoning.
         if seq.has_per_req_cache and not self.free_per_req_cache_groups:
             return -1
-        if not self.enable_prefix_caching:
+        # Multimodal sequences bypass prefix caching: image-placeholder tokens
+        # all share a single id, so token-id hashing collides across different
+        # images and would reuse the wrong image's KV (vision-embeds vs
+        # placeholder count mismatch -> runner crash). ATOM has no mm-aware
+        # cache hashing yet, so simply don't prefix-cache multimodal seqs.
+        if not self.enable_prefix_caching or seq.multimodal_data is not None:
             if len(self.free_block_ids_set) < seq.num_blocks:
                 return -1
             return 0
@@ -224,7 +229,7 @@ class BlockManager:
         single-shot prefill that's `seq.num_tokens - seq.num_cached_tokens`;
         chunked prefill will pass the per-chunk count.
         """
-        if not self.enable_prefix_caching:
+        if not self.enable_prefix_caching or seq.multimodal_data is not None:
             return
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + num_new_tokens) // self.block_size
