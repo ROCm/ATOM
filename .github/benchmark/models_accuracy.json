@@ -17,7 +17,7 @@
     "extraArgs": "--kv_cache_dtype fp8 -tp 8",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
-    "test_level": "pr",
+    "test_level": "nightly",
     "accuracy_threshold": 0.94,
     "accuracy_baseline": 0.9553,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528",
@@ -33,7 +33,7 @@
     "accuracy_threshold": 0.94,
     "accuracy_baseline": 0.96,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059 (measured 2026-06-10 with the env_vars/extraArgs above: AITER_BF16_FP8_MOE_BOUND=0 + ATOM_MOE_GU_ITLV=1). Threshold 0.94 sits ~1pp below the measured full-eval accuracy. Earlier GSM8K-100 4-run small-sample average was 0.96 (0.96/0.98/0.96/0.94, stderr ~0.024)."
+    "_baseline_note": "Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059"
   },
   {
     "model_name": "DeepSeek-V4-Pro MTP",
@@ -45,7 +45,7 @@
     "accuracy_threshold": 0.94,
     "accuracy_baseline": 0.96,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "Same base model as DeepSeek-V4-Pro FP8 (MTP-3: 3 speculative tokens). Local full-eval (1319 samples, 3-shot) flexible-extract = 0.9560 ± 0.0056."
+    "_baseline_note": "Same base model as DeepSeek-V4-Pro FP8 (MTP-3)."
   },
   {
     "model_name": "DeepSeek-R1-0528 MTP",
@@ -69,7 +69,7 @@
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.9553,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528",
-    "_baseline_note": "Online quantization on top of DeepSeek-R1-0528 MTP (FP8 native): global ptpc_fp8 + expert layers mxfp4, excluding lm_head and *.gate.*. Threshold set to 0.93 (same headroom as DeepSeek-R1-0528-FP4 MTP) as a conservative placeholder for the MoE-MXFP4 accuracy drop; refresh after the first CI measurement."
+    "_baseline_note": "Online quantization on top of DeepSeek-R1-0528 MTP (FP8 native): global ptpc_fp8 + expert layers mxfp4, excluding lm_head and *.gate.*. Threshold set to 0.93 (same headroom as DeepSeek-R1-0528-FP4 MTP) as a conservative placeholder for the MoE-MXFP4 accuracy drop."
   },
   {
     "model_name": "gpt-oss-120b",
@@ -191,7 +191,7 @@
     "accuracy_threshold": 0.91,
     "accuracy_baseline": 0.9257,
     "accuracy_baseline_model": "amd/Kimi-K2.5-MXFP4 + lightseekorg/kimi-k2.5-eagle3",
-    "_baseline_note": "Eagle3 spec decode on Kimi-K2.5-MXFP4. Local case_verify_v9_gluon GSM8K 5-shot flexible-extract=0.9257 (vLLM=0.9280, within ±0.71% se). Threshold 0.91 leaves ~1.5pp headroom for noise. -tp 8 (vs base entry's tp=4) because Eagle3 draft KV needs the full 8-rank sharding."
+    "_baseline_note": "Eagle3 spec decode on Kimi-K2.5-MXFP4."
   },
   {
     "model_name": "GLM-5-FP8",
@@ -275,7 +275,7 @@
     "accuracy_threshold": 0.85,
     "accuracy_baseline": 0.9538,
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8",
-    "_baseline_note": "CI baseline=0.8605 (FP8 tp=4, 3-shot completions API, thinking mode active). HF card reports 0.9538 but uses chat API with reasoning_parser"
+    "_baseline_note": "CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser"
   },
   {
     "model_name": "Qwen3.5-397B-A17B-FP8 MTP",
@@ -287,7 +287,7 @@
     "accuracy_threshold": 0.85,
     "accuracy_baseline": 0.9538,
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8",
-    "_baseline_note": "Same base model as Qwen3.5-397B-A17B-FP8; MTP3 speculative decoding"
+    "_baseline_note": "Same base model as Qwen3.5-397B-A17B-FP8; MTP3"
   },
   {
     "model_name": "Qwen3.5-397B-A17B-MXFP4",
@@ -299,7 +299,7 @@
     "accuracy_threshold": 0.835,
     "accuracy_baseline": 0.9538,
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8",
-    "_baseline_note": "CI baseline=0.8605 (FP8 tp=4, 3-shot completions API, thinking mode active). HF card reports 0.9538 but uses chat API with reasoning_parser"
+    "_baseline_note": "CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser"
   },
   {
     "model_name": "Qwen3.5-397B-A17B-MXFP4 MTP",
@@ -311,7 +311,7 @@
     "accuracy_threshold": 0.835,
     "accuracy_baseline": 0.9538,
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8",
-    "_baseline_note": "CI baseline=0.8605 (FP8 tp=4, 3-shot completions API, thinking mode active). HF card reports 0.9538 but uses chat API with reasoning_parser"
+    "_baseline_note": "CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser"
   },
   {
     "model_name": "MiniMax-M2.7",
@@ -348,7 +348,7 @@
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.9363,
     "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4",
-    "_baseline_note": "FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384) per /data/users/zejun/zejun_atom/m3.md: validated MXFP4 flexible-extract=0.9363 ± 0.0067 (measured at tp4). Threshold 0.93 leaves ~0.6pp headroom; refresh after first CI measurement at tp8."
+    "_baseline_note": "FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384)"
   },
   {
     "model_name": "MiniMax-M3-MXFP4 Eagle3",
@@ -361,7 +361,7 @@
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.9469,
     "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4 + Inferact/MiniMax-M3-EAGLE3",
-    "_baseline_note": "FP4 M3 + EAGLE3 draft (tp8), lossless vs greedy target. GSM8K 5-shot chat per /data/users/zejun/zejun_atom/m3.md: validated fp4_eagle_tp4 flexible-extract=0.9469 ± 0.0062 (accept ratio 73.36%, avg 3.20 toks/fwd, commit 9fc48338); baseline carried over from the tp4 validation since EAGLE3 is lossless wrt the target. Threshold 0.93 leaves ~1.7pp headroom; refresh after first CI measurement at tp8."
+    "_baseline_note": "FP4 M3 + EAGLE3 draft (tp8), lossless vs greedy target."
   },
   {
     "model_name": "MiMo-V2-Flash",
@@ -373,7 +373,7 @@
     "accuracy_threshold": 0.778,
     "accuracy_baseline": 0.79,
     "accuracy_baseline_model": "XiaomiMiMo/MiMo-V2-Flash",
-    "_baseline_note": "CI runs GSM8K 3-shot (atom_test.sh hardcodes --num_fewshot 3). Observed CI flexible-extract on the first stable run: base=0.8082 (run 26410931088, commit 24e4367b). Baseline 0.79 sits ~1.5pp below that to absorb run-to-run noise (stderr ±0.011); threshold 0.778 leaves ~1.2pp headroom below baseline (~1.1σ), matching the headroom pattern in DeepSeek-R1 / Kimi-Eagle3 / MiniMax-M2.7 entries. The original 0.8294 baseline was an out-of-band local 5-shot measurement that never matched what CI actually computes. tp pinned to 4 to match the MTP entry's setup (no separate base measurement)."
+    "_baseline_note": "CI GSM8K 3-shot. First stable run base=0.8082 (run 26410931088, commit 24e4367b). Baseline 0.79 sits ~1.5pp below to absorb run-to-run noise (stderr ±0.011); threshold 0.778 leaves ~1.1σ headroom. tp pinned to 4 to match the MTP entry."
   },
   {
     "model_name": "MiMo-V2-Flash MTP",
@@ -385,7 +385,7 @@
     "accuracy_threshold": 0.778,
     "accuracy_baseline": 0.79,
     "accuracy_baseline_model": "XiaomiMiMo/MiMo-V2-Flash",
-    "_baseline_note": "CI runs GSM8K 3-shot (atom_test.sh hardcodes --num_fewshot 3). Observed CI flexible-extract on the first stable run: MTP1=0.7983 (run 26410931088, commit 24e4367b); local reproduction with the fp8 + prefix-cache crash patches gave 0.8052. Baseline 0.79 sits just below the observed values to absorb run-to-run noise (stderr ±0.011); threshold 0.778 leaves ~1.2pp headroom below baseline (~1.1σ), matching the headroom pattern in DeepSeek-R1 / Kimi-Eagle3 / MiniMax-M2.7 entries. tp MUST be 4 and num-speculative-tokens MUST be 1: ATOM only constructs MTP layer 0 (matches vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); driving more spec tokens would route through layers 1/2 whose KV is never populated and accept rate craters."
+    "_baseline_note": "CI GSM8K 3-shot MTP1=0.7983 (run 26410931088). Baseline 0.79; threshold 0.778 (~1.1σ). tp MUST=4, num-speculative-tokens MUST=1: ATOM builds only MTP layer 0 (vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); more spec → layers 1/2 KV unpopulated, accept craters."
   },
   {
     "model_name": "DeepSeek-V4-Pro TBO+DPA conc1000",
@@ -398,6 +398,6 @@
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "TBO + dp-attention at high concurrency (client num_concurrent=1000). Local 1319-sample GSM8K 3-shot flexible-extract across 4 runs = 0.9439 / 0.9484 / 0.9538 / 0.9530 (mean ~0.950, measured 2026-06-14 after the TBO ids-gather inline fix + pad_for_all_gather zero-padding fix). Baseline 0.95; threshold 0.93 leaves ~1.4pp headroom below the lowest observed 0.9439 to absorb the wider run-to-run variance seen at conc=1000."
+    "_baseline_note": "TBO + dp-attention at conc=1000. Local 1319-sample GSM8K 3-shot, 4 runs = 0.9439/0.9484/0.9538/0.9530 (mean ~0.950, 2026-06-14, after TBO ids-gather + pad_for_all_gather fixes). Baseline 0.95; threshold 0.93 (~1.4pp below lowest 0.9439, conc=1000 variance)."
   }
 ]

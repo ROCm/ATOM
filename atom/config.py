@@ -1036,6 +1036,7 @@ class Config:
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)
@@ -1061,6 +1062,13 @@ class Config:
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
+    # MoE expert-parallel layout policy. When True, MoE EP computes ranks in the
+    # flattened DP x TP device space (and shared-expert fusion is disabled,
+    # because the fused shared expert assumes the per-DP MoE layout). The vLLM
+    # plugin sets this when EP is enabled; native ATOM and other plugins use the
+    # per-DP MoE layout and leave it False. Set by the frontend in
+    # atom/plugin/config.py, not queried via is_vllm() at the call site.
+    moe_ep_flatten_tp_across_dp: bool = False
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)

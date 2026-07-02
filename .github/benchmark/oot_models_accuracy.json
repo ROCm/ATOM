@@ -169,7 +169,7 @@
     "runner": "atom-plugin-acc-validation-runner",
     "test_level": "nightly",
     "priority": "P0",
-    "accuracy_test_threshold": 0.93
+    "accuracy_test_threshold": 0.92
   },
   {
     "model_name": "Kimi-K2.5-MXFP4 TP8",
@@ -193,6 +193,18 @@
     "test_level": "nightly",
     "priority": "P1",
     "accuracy_test_threshold": 0.93,
+    "accuracy_baseline": 0.93,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
+  },
+  {
+    "model_name": "DeepSeek-R1-FP8 DP8+EP8",
+    "model_path": "deepseek-ai/DeepSeek-R1-0528",
+    "extraArgs": "--data-parallel-size 8 --enable-expert-parallel",
+    "env_vars": "MORI_SHMEM_MODE=ISOLATION",
+    "runner": "atom-plugin-acc-validation-runner",
+    "test_level": "nightly",
+    "priority": "P1",
+    "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
   },

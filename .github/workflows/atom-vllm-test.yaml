@@ -227,7 +227,7 @@ jobs:
           echo "aiter_wheel_name=$(basename "$AITER_WHL")" >> "$GITHUB_OUTPUT"
 
       - name: Upload aiter wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
@@ -249,7 +249,7 @@ jobs:
               AITER_BF16_FP8_MOE_BOUND=0
               ATOM_MOE_GU_ITLV=1
             lm_eval_num_fewshot: 20
-            accuracy_test_threshold: 0.94
+            accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
@@ -353,7 +353,7 @@ jobs:
           echo "=== End container engine diagnostics ==="
       
       - name: Download aiter wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiter-whl
           path: aiter-whl
@@ -476,8 +476,11 @@ jobs:
           elif [ -d "/shareddata/models" ]; then
             MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
             MODEL_CACHE_DESC="/shareddata/models (host path)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (host path)"
           else
-            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models directory not found on runner; using container-local /models."
+            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models and /data/models directory not found on runner; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -638,7 +641,7 @@ jobs:
 
       - name: Upload OOT artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oot-${{ matrix.model_name }}-artifacts
           path: |

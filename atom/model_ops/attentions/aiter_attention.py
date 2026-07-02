@@ -755,6 +755,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in range(num_layers):
                     _add_region(runner.kv_scale[0, layer_id])
                     _add_region(runner.kv_scale[1, layer_id])
+            # MiniMax-M3 sparse attention's per-token indexer-key cache
+            # (used for top-k block selection on the consumer).
+            index_cache = getattr(runner, "sparse_attention_index_cache", None)
+            if index_cache is not None:
+                for sparse_idx in range(index_cache.shape[0]):
+                    _add_region(index_cache[sparse_idx])
 
         return KVTransferTensors(
             block_regions=block_regions,
@@ -895,10 +901,49 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         del ubatch_idx
-        from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+        from atom.utils.tbo.ubatch_splitting import (
+            derive_prefill_lens_from_positions,
+            split_attn_metadata,
+        )
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
         self._attach_tbo_token_split_straddle_prefix(ub_attn, ub_slice)
+        if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_prefill_metadata,
+            )
+
+            ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
+            ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
+            ub_cu_seqlens_q = ub_attn.cu_seqlens_q[: ub_num_reqs + 1]
+            var = self.model_runner.forward_vars
+            _, ub_seq_lens_np = derive_prefill_lens_from_positions(
+                var["positions"].np[
+                    ub_slice.token_slice.start : ub_slice.token_slice.stop
+                ],
+                var["cu_seqlens_q"].np,
+                ub_slice,
+            )
+            ub_seq_lens = torch.from_numpy(ub_seq_lens_np).to(
+                self.device, non_blocking=True
+            )
+            ub_max_seq_len = int(ub_seq_lens_np.max()) if ub_num_reqs > 0 else 0
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                ub_attn.block_tables[:ub_num_reqs],
+                ub_seq_lens,
+                ub_num_reqs,
+            )
+            sparse_md = make_sparse_prefill_metadata(
+                cu_seqlens_q=ub_cu_seqlens_q,
+                seq_lens=ub_seq_lens,
+                block_table=sparse_block_tables,
+                slot_mapping=ub_attn.slot_mapping,
+                max_query_len=ub_attn.max_seqlen_q,
+                max_seq_len=ub_max_seq_len,
+                num_prefills=ub_num_reqs,
+                num_prefill_tokens=ub_num_tokens,
+            )
+            ub_attn.sparse_attention_metadata = sparse_md
         return ub_attn
 
     def _attach_tbo_token_split_straddle_prefix(self, ub_attn, ub_slice):
@@ -935,8 +980,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             cached = state.num_cached[rs.start : rs.stop].astype(np.int64)
         else:
             cached = np.zeros(ub_num_reqs, dtype=np.int64)
-        ctx_lens = cached + new_lens
-        ctx_lens[0] += prefix_len
+        cached_prefix_lens = cached.copy()
+        cached_prefix_lens[0] += prefix_len
+        ctx_lens = cached_prefix_lens + new_lens
         total_kv = int(ctx_lens.sum())
 
         max_blocks = max(
@@ -959,9 +1005,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ub_attn.block_tables = torch.from_numpy(bt).to(device, non_blocking=True)
         ub_attn.cu_seqlens_k = torch.from_numpy(cu_k).to(device, non_blocking=True)
         ub_attn.seq_starts = torch.zeros(ub_num_reqs, dtype=torch.int32, device=device)
-        ub_attn.num_cached_tokens = torch.from_numpy(ctx_lens.astype(np.int32)).to(
-            device, non_blocking=True
-        )
+        ub_attn.num_cached_tokens = torch.from_numpy(
+            cached_prefix_lens.astype(np.int32)
+        ).to(device, non_blocking=True)
         ub_attn.max_seqlen_k = int(ctx_lens.max())
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
@@ -1229,6 +1275,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens=var[f"{p}context_lens"].gpu[:padded_bs],
             block_tables=var[f"{p}block_tables"].gpu[:padded_bs],
             max_seqlen_q=max_q_len,
+            max_seqlen_k=self.model_runner.config.max_model_len,
             cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
             kv_indptr=var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
             kv_indices=var[f"{p}kv_indices"].gpu,
@@ -1239,6 +1286,27 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             reduce_final_map=var[f"{p}reduce_final_map"],
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
+        if self._has_sparse_attention:
+            if max_q_len > 1:
+                raise NotImplementedError(
+                    "MiniMax M3 sparse TBO decode with max_q_len > 1 is not "
+                    "implemented."
+                )
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_decode_metadata,
+            )
+
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                attn.block_tables,
+                attn.context_lens,
+                padded_bs,
+            )
+            attn.sparse_attention_metadata = make_sparse_decode_metadata(
+                seq_lens=attn.context_lens,
+                block_table=sparse_block_tables,
+                slot_mapping=attn.slot_mapping,
+                max_seq_len=attn.max_seqlen_k,
+            )
         return attn
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
