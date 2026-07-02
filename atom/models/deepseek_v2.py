@@ -1301,7 +1301,6 @@ def sparse_attn_indexer(
             )
         else:
             triton_convert_req_index_to_global_index(
-                attn_metadata.cu_seqlens_q,
                 attn_metadata.kv_indptr,
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.kv_indices,
