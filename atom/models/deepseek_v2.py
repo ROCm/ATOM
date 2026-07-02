@@ -2053,36 +2053,73 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
-        # Keep input RMSNorm quant fusion narrow: the legacy FP8/FP4 path uses
-        # Triton GEMM, while the non-Triton FP4 path is only enabled for the
-        # pure global MXFP4 DeepSeek v2 checkpoint layout.
+        # Keep input RMSNorm quant fusion narrow: FP8 per-token GEMM accepts
+        # pre-quantized activations on both Triton and non-Triton paths, while
+        # the non-Triton FP4 path is only enabled for the pure global MXFP4
+        # DeepSeek v2 checkpoint layout.
         # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
         #   1. RMS_Quant fusion is only used for input_layernorm
         #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
         #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm if ENABLE_ALLREDUCE_RMSNORM_FUSION is turned on
-        self.quant_dtype = (
+        attn_input_proj_name = (
+            "fused_qkv_a_proj"
+            if getattr(config, "q_lora_rank", None) is not None
+            else "q_proj"
+        )
+        attn_input_layer_name = f"{prefix}.self_attn.{attn_input_proj_name}"
+        attn_input_quant_config = (
             None
             if quant_config is None
-            else quant_config.get_layer_quant_config(prefix).quant_dtype
+            else quant_config.get_layer_quant_config(attn_input_layer_name)
+        )
+
+        def _accepts_quantized_input(layer_quant_config):
+            return (
+                layer_quant_config is not None
+                and layer_quant_config.quant_type != QuantType.No
+                and layer_quant_config.quant_dtype in (dtypes.fp8, dtypes.fp4x2)
+            )
+
+        if (
+            not _accepts_quantized_input(attn_input_quant_config)
+            and quant_config is not None
+            and quant_config.online_quant
+        ):
+            online_attn_input_quant_config = quant_config.get_layer_quant_config(
+                attn_input_layer_name,
+                use_online_quant=True,
+            )
+            if _accepts_quantized_input(online_attn_input_quant_config):
+                attn_input_quant_config = online_attn_input_quant_config
+
+        attn_accepts_quantized_input = _accepts_quantized_input(attn_input_quant_config)
+        self.quant_dtype = (
+            attn_input_quant_config.quant_dtype
+            if attn_accepts_quantized_input
+            else None
         )
         self.input_norm_quant_type = (
-            None
-            if quant_config is None
-            else quant_config.get_layer_quant_config(prefix).quant_type.value
+            attn_input_quant_config.quant_type.value
+            if attn_accepts_quantized_input
+            else None
         )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
             enable_fp8_input_norm_quant = (
-                self.quant_dtype == dtypes.fp8 and use_triton_gemm()
+                attn_accepts_quantized_input and self.quant_dtype == dtypes.fp8
             )
-            enable_fp4_input_norm_quant = self.quant_dtype == dtypes.fp4x2 and (
-                use_triton_gemm()
-                or _enable_non_triton_global_mxfp4_input_norm_quant(
-                    config,
-                    quant_config,
-                    self.quant_dtype,
-                    is_mtp_block,
+            enable_fp4_input_norm_quant = (
+                attn_accepts_quantized_input
+                and self.quant_dtype == dtypes.fp4x2
+                and (
+                    use_triton_gemm()
+                    or _enable_non_triton_global_mxfp4_input_norm_quant(
+                        config,
+                        quant_config,
+                        self.quant_dtype,
+                        is_mtp_block,
+                    )
                 )
             )
             if enable_fp8_input_norm_quant or enable_fp4_input_norm_quant:
