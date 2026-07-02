@@ -152,3 +152,11 @@ def register_model() -> None:
     )
 
     apply_vllm_req_id_passthrough_patch()
+
+    # Keep GDN recurrent-state metadata graph-safe for FULL cudagraph padded
+    # decode replay without modifying vLLM sources.
+    from atom.plugin.vllm.gdn_cudagraph_padding_patch import (
+        apply_vllm_gdn_cudagraph_padding_patch,
+    )
+
+    apply_vllm_gdn_cudagraph_padding_patch()
