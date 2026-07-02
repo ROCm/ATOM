@@ -451,6 +451,14 @@ class Scheduler:
         self.spec_stats: Optional[SpecStats] = (
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
+        # Shared placeholder draft row for decode seqs that have no drafts yet
+        # (e.g. first decode after prefill). Cached once so filling the
+        # positional scheduled_spec_decode_tokens array costs no per-seq
+        # allocation. Values are don't-cares: such a seq accepts no drafts this
+        # step (num_new_token + num_rejected == 1).
+        self._empty_draft_row: Optional[np.ndarray] = (
+            np.zeros(self.mtp_k, dtype=np.int32) if self.mtp_k > 0 else None
+        )
         self.cache_stats: Optional[CacheStats] = (
             CacheStats() if config.enable_prefix_caching else None
         )
@@ -985,16 +993,10 @@ class Scheduler:
                     # consumed positionally by batch order in
                     # TokenIDProcessor.prepare_input_ids, so every decode seq must
                     # contribute a row -- otherwise the array is compacted and the
-                    # positional index runs off the end (IndexError). This seq does
-                    # not accept drafts this step (num_new_token + num_rejected == 1),
-                    # so the draft-slot values are don't-cares; reuse the seq's own
-                    # scheduled decode tokens, which are guaranteed valid token ids.
-                    pad = seq.token_ids[-self.mtp_k :]
-                    if len(pad) < self.mtp_k:
-                        pad = [0] * (self.mtp_k - len(pad)) + list(pad)
-                    scheduled_spec_decode_tokens[seq.id] = np.asarray(
-                        pad, dtype=np.int32
-                    )
+                    # positional index runs off the end (IndexError). Reuse the
+                    # cached placeholder row (no per-seq allocation); the values
+                    # are don't-cares since this seq accepts no drafts this step.
+                    scheduled_spec_decode_tokens[seq.id] = self._empty_draft_row
                 num_seqs_decode += 1
                 num_decode_tokens += num_new_tokens
                 # For PD first-decode: if T0 was injected, may_append is
