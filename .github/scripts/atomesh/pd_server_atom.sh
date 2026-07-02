@@ -11,6 +11,17 @@ MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"
 TOPOLOGY="${TOPOLOGY:-unknown}"
 DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-${TOPOLOGY}}"
+ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
+SINGLE_NODE_PD=0
+PREFILL_SINGLE_NODE_PD=0
+case "${ATOMESH_PD_WORKER_LAYOUT}" in
+  single_node)
+    SINGLE_NODE_PD=1
+    ;;
+  prefill_single_node)
+    PREFILL_SINGLE_NODE_PD=1
+    ;;
+esac
 
 xP="${xP:-1}"
 yD="${yD:-1}"
@@ -62,7 +73,9 @@ WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 mkdir -p "${RUN_DIR}"/{logs,benchmark_results,eval_results}
 
 role_tp="${PREFILL_TP_SIZE}"
-if [[ "${NODE_RANK}" -ge "${xP}" ]]; then
+if [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
+  role_tp="${DECODE_TP_SIZE}"
+elif [[ "${NODE_RANK}" -ge "${xP}" ]]; then
   role_tp="${DECODE_TP_SIZE}"
 fi
 if [[ -z "${HIP_VISIBLE_DEVICES:-}" ]]; then
@@ -94,18 +107,49 @@ IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"
 
 prefill_args=()
 prefill_ips=()
-for idx in $(seq 0 $((xP - 1))); do
-  prefill_ips+=("${IP_ARRAY[$idx]}")
-  prefill_args+=(--prefill "http://${IP_ARRAY[$idx]}:${PREFILL_PORT}")
-done
-
+prefill_ports=()
 decode_args=()
 decode_ips=()
-for idx in $(seq 0 $((yD - 1))); do
-  node_idx=$((xP + idx))
-  decode_ips+=("${IP_ARRAY[$node_idx]}")
-  decode_args+=(--decode "http://${IP_ARRAY[$node_idx]}:${DECODE_PORT}")
-done
+decode_ports=()
+if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
+  if [[ "${xP}" != "1" || "${yD}" != "1" ]]; then
+    echo "ERROR: single_node PD worker layout currently supports only 1 prefill and 1 decode worker" >&2
+    exit 1
+  fi
+  prefill_ips+=("${IP_ARRAY[0]}")
+  prefill_ports+=("${PREFILL_PORT}")
+  prefill_args+=(--prefill "http://${IP_ARRAY[0]}:${PREFILL_PORT}")
+  decode_ips+=("${IP_ARRAY[0]}")
+  decode_ports+=("${DECODE_PORT}")
+  decode_args+=(--decode "http://${IP_ARRAY[0]}:${DECODE_PORT}")
+elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
+  for idx in $(seq 0 $((xP - 1))); do
+    prefill_port=$((PREFILL_PORT + idx))
+    prefill_ips+=("${IP_ARRAY[0]}")
+    prefill_ports+=("${prefill_port}")
+    prefill_args+=(--prefill "http://${IP_ARRAY[0]}:${prefill_port}")
+  done
+
+  for idx in $(seq 0 $((yD - 1))); do
+    node_idx=$((1 + idx))
+    decode_ips+=("${IP_ARRAY[$node_idx]}")
+    decode_ports+=("${DECODE_PORT}")
+    decode_args+=(--decode "http://${IP_ARRAY[$node_idx]}:${DECODE_PORT}")
+  done
+else
+  for idx in $(seq 0 $((xP - 1))); do
+    prefill_ips+=("${IP_ARRAY[$idx]}")
+    prefill_ports+=("${PREFILL_PORT}")
+    prefill_args+=(--prefill "http://${IP_ARRAY[$idx]}:${PREFILL_PORT}")
+  done
+
+  for idx in $(seq 0 $((yD - 1))); do
+    node_idx=$((xP + idx))
+    decode_ips+=("${IP_ARRAY[$node_idx]}")
+    decode_ports+=("${DECODE_PORT}")
+    decode_args+=(--decode "http://${IP_ARRAY[$node_idx]}:${DECODE_PORT}")
+  done
+fi
 
 prefill_parallel=(-tp "${PREFILL_TP_SIZE}")
 if [[ "${PREFILL_ENABLE_DP}" == "true" ]]; then
@@ -202,22 +246,27 @@ write_metadata() {
   "backend": "${BACKEND}",
   "topology": "${TOPOLOGY}",
   "display_topology": "${DISPLAY_TOPOLOGY}",
+  "pd_worker_layout": "${ATOMESH_PD_WORKER_LAYOUT}",
   "prefill_ips": "$(IFS=,; echo "${prefill_ips[*]}")",
-  "decode_ips": "$(IFS=,; echo "${decode_ips[*]}")"
+  "prefill_ports": "$(IFS=,; echo "${prefill_ports[*]}")",
+  "decode_ips": "$(IFS=,; echo "${decode_ips[*]}")",
+  "decode_ports": "$(IFS=,; echo "${decode_ports[*]}")"
 }
 EOF
 }
 
 start_prefill() {
   local log_name="$1"
+  local server_port="${2:-${PREFILL_PORT}}"
+  local handshake_port="${3:-${HANDSHAKE_PORT}}"
   apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
-  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip}"
+  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port}"
   python3 -m atom.entrypoints.openai_server \
     "${server_common[@]}" \
-    --server-port "${PREFILL_PORT}" \
+    --server-port "${server_port}" \
     "${prefill_parallel[@]}" \
     --max-num-seqs "${MAX_NUM_SEQS}" \
-    --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}" \
+    --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}" \
     ${PREFILL_SERVER_ARGS} \
     2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
   server_pid=$!
@@ -231,7 +280,7 @@ start_decode() {
   if [[ "${ISL_LIST}" == "1024" && "${OSL}" == "1024" ]]; then
     decode_max_num_seqs="${max_conc}"
   fi
-  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} cudagraph=${DECODE_CUDAGRAPH:-none}"
+  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} cudagraph=${DECODE_CUDAGRAPH:-none}"
   python3 -m atom.entrypoints.openai_server \
     "${server_common[@]}" \
     --server-port "${DECODE_PORT}" \
@@ -363,7 +412,51 @@ PY
 
 write_metadata
 
-if [[ "${NODE_RANK}" -eq 0 ]]; then
+if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
+  start_prefill "prefill-rank-0"
+  prefill_pid="${server_pid}"
+  start_decode
+  decode_pid="${server_pid}"
+  trap 'kill ${router_pid:-0} ${prefill_pid:-0} ${decode_pid:-0} 2>/dev/null || true' EXIT
+  for ip in "${prefill_ips[@]}"; do
+    wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
+  done
+  for ip in "${decode_ips[@]}"; do
+    wait_http "http://${ip}:${DECODE_PORT}/health" "decode-${ip}" "${WAIT_SERVER_TIMEOUT}" "${decode_pid}"
+  done
+  start_router
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  run_eval
+  run_benchmark
+  kill "${router_pid}" "${prefill_pid}" "${decode_pid}" 2>/dev/null || true
+elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
+  prefill_pids=()
+  for idx in $(seq 0 $((xP - 1))); do
+    gpu_start=$((idx * PREFILL_TP_SIZE))
+    gpu_end=$((gpu_start + PREFILL_TP_SIZE - 1))
+    export HIP_VISIBLE_DEVICES="$(seq -s, "${gpu_start}" "${gpu_end}")"
+    prefill_port="${prefill_ports[$idx]}"
+    handshake_port=$((HANDSHAKE_PORT + idx * PREFILL_TP_SIZE))
+    start_prefill "prefill-rank-0-worker-${idx}" "${prefill_port}" "${handshake_port}"
+    prefill_pids+=("${server_pid}")
+  done
+  trap 'kill ${router_pid:-0} ${prefill_pids[*]:-} 2>/dev/null || true' EXIT
+  for idx in "${!prefill_ips[@]}"; do
+    wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
+      "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
+      "${WAIT_SERVER_TIMEOUT}" "${prefill_pids[$idx]}"
+  done
+  for idx in "${!decode_ips[@]}"; do
+    wait_http "http://${decode_ips[$idx]}:${decode_ports[$idx]}/health" \
+      "decode-${decode_ips[$idx]}:${decode_ports[$idx]}" \
+      "${WAIT_SERVER_TIMEOUT}"
+  done
+  start_router
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  run_eval
+  run_benchmark
+  kill "${router_pid}" "${prefill_pids[@]}" 2>/dev/null || true
+elif [[ "${NODE_RANK}" -eq 0 ]]; then
   start_prefill "prefill-rank-0"
   trap 'kill ${router_pid:-0} ${server_pid:-0} 2>/dev/null || true' EXIT
   for ip in "${prefill_ips[@]}"; do
@@ -377,6 +470,12 @@ if [[ "${NODE_RANK}" -eq 0 ]]; then
   run_eval
   run_benchmark
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
+elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
+  start_decode
+  trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  wait_router_closed
+  kill "${server_pid}" 2>/dev/null || true
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
   start_prefill "prefill-rank-${NODE_RANK}"
   trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
