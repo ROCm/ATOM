@@ -133,6 +133,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
+    # --- EPLB (expert load balancing) ---
+    # Master switch for module-A online load statistics.
+    "ATOM_EPLB_ENABLE": lambda: os.getenv("ATOM_EPLB_ENABLE", "0") == "1",
+    # Number of recent forward passes kept in the expert-load ring buffer.
+    "ATOM_EPLB_LOAD_WINDOW_SIZE": lambda: int(
+        os.getenv("ATOM_EPLB_LOAD_WINDOW_SIZE", "1000")
+    ),
+    # Rebalance trigger cadence in number of forward passes.
+    "ATOM_EPLB_REBALANCE_INTERVAL": lambda: int(
+        os.getenv("ATOM_EPLB_REBALANCE_INTERVAL", "3000")
+    ),
+    # Trigger only when aggregated balancedness is below this threshold.
+    "ATOM_EPLB_REBALANCE_MIN_BALANCEDNESS": lambda: float(
+        os.getenv("ATOM_EPLB_REBALANCE_MIN_BALANCEDNESS", "0.8")
+    ),
+    # Cross-layer aggregation mode for per-layer balancedness.
+    "ATOM_EPLB_REBALANCE_BALANCEDNESS_AGG": lambda: os.getenv(
+        "ATOM_EPLB_REBALANCE_BALANCEDNESS_AGG", "min"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
