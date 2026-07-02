@@ -327,6 +327,7 @@ def fake_(
     layer_name: str,
     use_mla: bool,
     qkv: torch.Tensor,
+    qb_prezero: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     output_shape = list(q.shape)
     # If we fusion rmsnorm and quant, the input dtype is fp8, but actually we use bf16 for output.
@@ -342,7 +343,7 @@ def fake_(
 # Dynamo will not try to inspect any of the internal operations for prefill or decode
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
-@mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
+@mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=["qb_prezero"])
 def unified_attention_with_output_base(
     q: torch.Tensor,
     q_scale: Optional[torch.Tensor],
@@ -352,6 +353,7 @@ def unified_attention_with_output_base(
     layer_name: str,
     use_mla: bool,
     qkv: torch.Tensor,
+    qb_prezero: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
@@ -362,6 +364,7 @@ def unified_attention_with_output_base(
             k_rope=v,
             positions=positions,
             q_scale=q_scale,
+            qb_prezero=qb_prezero,
         )
     else:
         return self.impl.forward(

@@ -237,6 +237,7 @@ class CompilationConfig:
         factors.append(self.local_cache_dir)
         factors.append(self.cudagraph_capture_sizes)
         factors.append(self.cuda_graph_sizes)
+        factors.append(envs.ATOM_ENABLE_SPLITK_PREZERO)
 
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
