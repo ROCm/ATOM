@@ -1016,7 +1016,24 @@ class Scheduler:
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
         if skipped_partial_prefills:
-            self.running.extendleft(reversed(skipped_partial_prefills))
+            # Re-queue skipped partial prefills at the TAIL, not the head.
+            #
+            # A partial (chunked, prompt-not-done) prefill can land in this
+            # decode loop when the cross-DP PrefillDelayer vetoes prefill for a
+            # tick (Phase 1 skipped, so num_prefill==0 and the prefill-only
+            # early-return doesn't fire). Re-inserting it at the head pins it
+            # at running[0]; once it finishes prefill it becomes the batch's
+            # position-0 *deferred* seq, which pushes the fresh decode seqs to
+            # positions 1..N. TokenIDProcessor.prepare_input_ids then takes the
+            # [deferred | new] path and indexes the (compacted)
+            # scheduled_spec_decode_tokens array by those shifted positions —
+            # running off the end (IndexError: index N out of bounds size N).
+            #
+            # Appending at the tail keeps the partial out of position 0 (its
+            # prefill still resumes: Phase 1 scans all of `running`), so new
+            # decode seqs stay contiguous from position 0 and the safe
+            # [new | deferred] slice path is used.
+            self.running.extend(skipped_partial_prefills)
 
         connector_meta_output = None
         if self.kv_connector is not None:
