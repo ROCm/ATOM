@@ -1036,6 +1036,7 @@ class Config:
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)

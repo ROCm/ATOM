@@ -808,7 +808,12 @@ class ModelRunner:
         # When data parallelism is enabled on the same node, different DP ranks
         # need to use different sets of GPUs
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
-        local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+        local_device_rank = (
+            dp_rank_local
+            * config.tensor_parallel_size
+            * config.prefill_context_parallel_size
+            + rank
+        )
         num_gpus = torch.cuda.device_count()
         if local_device_rank >= num_gpus:
             raise ValueError(
@@ -835,6 +840,7 @@ class ModelRunner:
             distributed_init_method=distributed_init_method,
             data_parallel_size=config.parallel_config.data_parallel_size,
             data_parallel_rank=config.parallel_config.data_parallel_rank,
+            prefill_context_model_parallel_size=config.prefill_context_parallel_size,
         )
 
     def _make_buffer(
@@ -1123,6 +1129,10 @@ class ModelRunner:
             warmup_max_tokens = max_num_batched_tokens
         else:
             warmup_max_tokens = max_num_batched_tokens // dp_size
+
+        pcp_size = self.config.prefill_context_parallel_size
+        if pcp_size > 1:
+            warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 

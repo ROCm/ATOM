@@ -6,7 +6,7 @@
 from typing import Optional, Union
 
 import torch
-from aiter import ActivationType
+from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -19,6 +19,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_quant,
 )
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.linear import (
@@ -103,6 +104,15 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
 
 def _rope_theta(config: PretrainedConfig) -> float:
     return getattr(config, "rope_theta", 1000000.0)
+
+
+def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
+    quant_type = getattr(linear, "quant_type", None)
+    quant_type_value = getattr(quant_type, "value", quant_type)
+    return (
+        quant_type_value == QuantType.per_Token.value
+        and getattr(linear, "params_dtype", None) == dtypes.fp8
+    )
 
 
 def _minimax_m3_cos_sin_cache(
@@ -209,8 +219,10 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj(x)
+    def forward(
+        self, x: torch.Tensor, x_scale: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x, x_scale=x_scale)
         x = swiglu_oai_split(
             gate_up,
             alpha=self.swiglu_alpha,
@@ -379,8 +391,9 @@ class MiniMaxM3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
         return self.o_proj(attn_output)
@@ -515,10 +528,11 @@ class MiniMaxM3SparseAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v, _, _ = qkv.split(
             [
                 self.q_size,
@@ -590,9 +604,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ):
+        hidden_states_scale = None
+        fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
+            self.self_attn.qkv_proj
+        )
+        fuse_post_attention_ar_rmsnorm_quant = (
+            not self.is_moe_layer
+            and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
+        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif fuse_input_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.input_layernorm
+                )
+            )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -604,12 +632,24 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # TP-partial / NaN-prone under CUDAGraph.
         aux_hidden_state = residual.clone() if capture_aux else None
 
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states)
+        if fuse_post_attention_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+            hidden_states = ffn(hidden_states)
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
