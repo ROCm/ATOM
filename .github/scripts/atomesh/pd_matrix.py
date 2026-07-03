@@ -48,6 +48,28 @@ def parse_int_list(value: Any, field_name: str) -> list[int]:
         raise ValueError(f"{field_name} must be a list of integers") from exc
 
 
+def parse_model_filter(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    models = {
+        item.strip()
+        for item in value.split(",")
+        if item.strip() and item.strip().lower() != "all"
+    }
+    return models or None
+
+
+def model_path_env_key(model_name: str) -> str:
+    suffix = re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_").upper()
+    return f"ATOMESH_MODEL_PATH_{suffix}"
+
+
+def resolve_model_path(model_name: str, model_cfg: dict[str, Any]) -> str:
+    env_value = os.environ.get(model_path_env_key(model_name), "").strip()
+    model_path = env_value or str(model_cfg["model_path"])
+    return resolve_env_refs(model_path) if "${" in model_path else model_path
+
+
 def resolve_env_refs(value: str) -> str:
     def expand_env(match: re.Match[str]) -> str:
         name = match.group(1)
@@ -230,7 +252,7 @@ def build_cell(
         "model": model_name,
         "backend": backend_name,
         "image": image,
-        "model_path": str(model_cfg["model_path"]),
+        "model_path": resolve_model_path(model_name, model_cfg),
         "precision": str(model_cfg.get("precision", "")),
         "topology": topology,
         "display_topology": display_topology,
@@ -265,6 +287,14 @@ def build_cell(
             "fewshot": int(accuracy_cfg.get("fewshot", 3)),
             "limit": suite_cfg.get("eval_limit", accuracy_cfg.get("limit")),
             "concurrency": accuracy_concurrency,
+            "model_type": str(accuracy_cfg.get("model_type", "local-completions")),
+            "endpoint": str(accuracy_cfg.get("endpoint", "completions")),
+            "batch_size": accuracy_cfg.get("batch_size"),
+            "max_gen_toks": accuracy_cfg.get("max_gen_toks"),
+            "apply_chat_template": bool(accuracy_cfg.get("apply_chat_template", False)),
+            "fewshot_as_multiturn": bool(
+                accuracy_cfg.get("fewshot_as_multiturn", False)
+            ),
         },
     }
 
@@ -273,14 +303,14 @@ def build_cells(
     cfg: dict[str, Any],
     *,
     suite: str,
-    model_filter: str | None,
+    model_filter: set[str] | None,
     override_image: str | None,
     override_benchmark_concurrency: list[int] | None,
     override_eval_concurrency: list[int] | None,
 ) -> list[dict[str, Any]]:
     cells = []
     for model_name, model_cfg in (cfg.get("models") or {}).items():
-        if model_filter and model_name != model_filter:
+        if model_filter and model_name not in model_filter:
             continue
         suites = model_cfg.get("suites", {})
         for suite_cfg in normalize_list(suites.get(suite)):
@@ -313,7 +343,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=".github/benchmark/models_atomesh.yaml")
     parser.add_argument("--suite", default=os.environ.get("SUITE", "smoke"))
-    parser.add_argument("--model", default=os.environ.get("MODEL_NAME") or None)
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("MODEL_NAME") or None,
+        help="Optional model filter: one model name, comma-separated model names, or all",
+    )
     parser.add_argument("--image", default=os.environ.get("ATOMESH_IMAGE") or None)
     parser.add_argument(
         "--benchmark-concurrency",
@@ -337,7 +371,7 @@ def main() -> int:
     cells = build_cells(
         config,
         suite=args.suite,
-        model_filter=args.model,
+        model_filter=parse_model_filter(args.model),
         override_image=args.image,
         override_benchmark_concurrency=benchmark_concurrency or None,
         override_eval_concurrency=eval_concurrency or None,

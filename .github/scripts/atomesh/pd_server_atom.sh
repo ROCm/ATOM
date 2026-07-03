@@ -40,7 +40,15 @@ HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
+DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
+ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
+HF_OVERRIDES="${HF_OVERRIDES:-}"
+SPEC_METHOD="${SPEC_METHOD:-}"
+DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
+NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 PREFILL_EXTRA_SERVER_ARGS="${PREFILL_EXTRA_SERVER_ARGS:-}"
 DECODE_EXTRA_SERVER_ARGS="${DECODE_EXTRA_SERVER_ARGS:-}"
@@ -65,6 +73,12 @@ RUN_EVAL="${RUN_EVAL:-false}"
 EVAL_TASK="${EVAL_TASK:-gsm8k}"
 EVAL_FEWSHOT="${EVAL_FEWSHOT:-3}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
+EVAL_MODEL_TYPE="${EVAL_MODEL_TYPE:-local-completions}"
+EVAL_ENDPOINT="${EVAL_ENDPOINT:-completions}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-}"
+EVAL_MAX_GEN_TOKS="${EVAL_MAX_GEN_TOKS:-}"
+EVAL_APPLY_CHAT_TEMPLATE="${EVAL_APPLY_CHAT_TEMPLATE:-false}"
+EVAL_FEWSHOT_AS_MULTITURN="${EVAL_FEWSHOT_AS_MULTITURN:-false}"
 EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-16}"
 
 WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-2500}"
@@ -181,6 +195,28 @@ server_common=(
   --no-enable_prefix_caching
 )
 
+if [[ -n "${MAX_MODEL_LEN}" ]]; then
+  server_common+=(--max-model-len "${MAX_MODEL_LEN}")
+fi
+if [[ -n "${MAX_NUM_BATCHED_TOKENS}" ]]; then
+  server_common+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
+fi
+if [[ -n "${ONLINE_QUANT_CONFIG}" ]]; then
+  server_common+=(--online_quant_config "${ONLINE_QUANT_CONFIG}")
+fi
+if [[ -n "${HF_OVERRIDES}" ]]; then
+  server_common+=(--hf-overrides "${HF_OVERRIDES}")
+fi
+if [[ -n "${SPEC_METHOD}" ]]; then
+  server_common+=(--method "${SPEC_METHOD}")
+fi
+if [[ -n "${DRAFT_MODEL_PATH}" ]]; then
+  server_common+=(--draft-model "${DRAFT_MODEL_PATH}")
+fi
+if [[ -n "${NUM_SPEC_TOKENS}" ]]; then
+  server_common+=(--num-speculative-tokens "${NUM_SPEC_TOKENS}")
+fi
+
 wait_http() {
   local url="$1"
   local name="$2"
@@ -277,6 +313,9 @@ start_decode() {
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
+  if [[ -n "${DECODE_MAX_NUM_SEQS}" ]]; then
+    decode_max_num_seqs="${DECODE_MAX_NUM_SEQS}"
+  fi
   if [[ "${ISL_LIST}" == "1024" && "${OSL}" == "1024" ]]; then
     decode_max_num_seqs="${max_conc}"
   fi
@@ -360,6 +399,27 @@ run_eval() {
   if [[ -n "${EVAL_LIMIT}" ]]; then
     limit_arg=(--limit "${EVAL_LIMIT}")
   fi
+  local eval_extra_args=()
+  if [[ -n "${EVAL_BATCH_SIZE}" ]]; then
+    eval_extra_args+=(--batch_size "${EVAL_BATCH_SIZE}")
+  fi
+  if [[ "${EVAL_APPLY_CHAT_TEMPLATE}" == "true" || "${EVAL_APPLY_CHAT_TEMPLATE}" == "1" ]]; then
+    eval_extra_args+=(--apply_chat_template)
+  fi
+  if [[ "${EVAL_FEWSHOT_AS_MULTITURN}" == "true" || "${EVAL_FEWSHOT_AS_MULTITURN}" == "1" ]]; then
+    eval_extra_args+=(--fewshot_as_multiturn)
+  fi
+  local eval_model_args_extra=""
+  if [[ -n "${EVAL_MAX_GEN_TOKS}" ]]; then
+    eval_model_args_extra=",max_gen_toks=${EVAL_MAX_GEN_TOKS}"
+  fi
+  local eval_model_args_base
+  if [[ "${EVAL_MODEL_TYPE}" == "local-chat-completions" ]]; then
+    eval_model_args_base="model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
+  else
+    eval_model_args_base="model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
+    eval_model_args_extra="${eval_model_args_extra},tokenized_requests=False,trust_remote_code=True"
+  fi
 
   IFS=',' read -r -a eval_concs <<< "${EVAL_CONCURRENCY}"
   local eval_conc tag result_dir
@@ -374,11 +434,12 @@ run_eval() {
     echo "[eval] gsm8k concurrent=${eval_conc}"
     echo "========================================="
 
-    lm_eval --model local-completions \
-      --model_args "model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/completions,num_concurrent=${eval_conc},max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+    lm_eval --model "${EVAL_MODEL_TYPE}" \
+      --model_args "${eval_model_args_base}${eval_conc},max_retries=3${eval_model_args_extra}" \
       --tasks gsm8k \
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
+      "${eval_extra_args[@]}" \
       --output_path "${result_dir}"
 
     python3 - "${result_dir}" "${eval_conc}" <<'PY'

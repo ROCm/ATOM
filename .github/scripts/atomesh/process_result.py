@@ -458,7 +458,9 @@ def collect_dashboard_entries(
         if not fields:
             continue
         payload = enrich_payload(path, payload, fields)
-        gsm8k_score = gsm8k_scores.get(int(payload.get("max_concurrency", fields["conc"])))
+        gsm8k_score = gsm8k_scores.get(
+            int(payload.get("max_concurrency", fields["conc"]))
+        )
         gsm8k = gsm8k_score.get("value") if gsm8k_score else None
         if gsm8k_score is not None:
             payload["gsm8k"] = gsm8k
