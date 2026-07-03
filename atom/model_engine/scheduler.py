@@ -444,9 +444,9 @@ class Scheduler:
         self.delay_factor = config.scheduler_delay_factor
         self.prefill_batch_token_threshold = self.max_num_batched_tokens
         self._prefill_hold_passes = 0
-        # Max consecutive passes we suppress an under-full prefill before firing
-        # it anyway (starvation bound). Reuses the delayer's pass budget knob.
         self._prefill_hold_max_passes = 30
+        _pc = getattr(config, "parallel_config", None)
+        self._prefill_gate_enabled = getattr(_pc, "data_parallel_size", 1) > 1
 
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
@@ -630,6 +630,9 @@ class Scheduler:
         Otherwise returns False (keep decoding) and advances the hold counter.
         The counter resets whenever prefill is allowed to fire.
         """
+        # Gate only applies under DP (>1); otherwise never hold (legacy path).
+        if not self._prefill_gate_enabled:
+            return True
         # Tail escape: no decode work left — never hold, or we'd deadlock.
         if not self.running:
             self._prefill_hold_passes = 0

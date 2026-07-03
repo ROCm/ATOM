@@ -701,7 +701,8 @@ class TestPrefillBatchGate:
         assert sched._prefill_batch_ready() is True
 
     def test_holds_when_under_full(self, seq_factory):
-        cfg = MockConfig(max_num_batched_tokens=32)  # threshold = 32
+        # gate only active under DP>1
+        cfg = MockConfig(max_num_batched_tokens=32, data_parallel_size=8)
         sched = Scheduler(cfg)
         r = seq_factory([1, 2, 3])
         r.status = SequenceStatus.RUNNING
@@ -711,6 +712,20 @@ class TestPrefillBatchGate:
         sched.waiting.append(seq_factory(list(range(8))))
         assert sched._prefill_batch_ready() is False
         assert sched._prefill_hold_passes == 1
+
+    def test_gate_disabled_without_dp(self, seq_factory):
+        # DP<=1 (default): gate off -> under-full prefill is NOT held.
+        cfg = MockConfig(max_num_batched_tokens=32)  # data_parallel_size=1
+        sched = Scheduler(cfg)
+        assert sched._prefill_gate_enabled is False
+        r = seq_factory([1, 2, 3])
+        r.status = SequenceStatus.RUNNING
+        sched.block_manager.allocate(r, 0)
+        sched.running.append(r)
+        sched.waiting.append(seq_factory(list(range(8))))  # under-full
+        # Gate off -> ready True (legacy behavior), no hold counter advance.
+        assert sched._prefill_batch_ready() is True
+        assert sched._prefill_hold_passes == 0
 
     def test_tail_escape_when_no_decode_left(self, seq_factory):
         cfg = MockConfig(max_num_batched_tokens=32)  # threshold = 32
@@ -722,7 +737,7 @@ class TestPrefillBatchGate:
         assert sched._prefill_batch_ready() is True
 
     def test_hold_pass_budget_forces_fire(self, seq_factory):
-        cfg = MockConfig(max_num_batched_tokens=32)  # threshold = 32
+        cfg = MockConfig(max_num_batched_tokens=32, data_parallel_size=8)
         sched = Scheduler(cfg)
         sched._prefill_hold_max_passes = 3
         r = seq_factory([1, 2, 3])
@@ -742,6 +757,7 @@ class TestPrefillBatchGate:
         cfg = MockConfig(
             max_num_batched_tokens=32,  # threshold = 32
             enable_chunked_prefill=False,
+            data_parallel_size=8,  # gate only active under DP>1
         )
         sched = Scheduler(cfg)
         r = seq_factory([1, 2, 3])
