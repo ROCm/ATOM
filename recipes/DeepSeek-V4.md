@@ -70,76 +70,10 @@ For V4-Flash-Base's HF `quantization_config = {"quant_method": "fp8", "fmt": "e4
 - Three-stream concurrency (main / alt / compress) works identically.
 - TP / EP sharding follows V4-Pro layout — `n_routed_experts=256, top-k=6` matches the standard FusedMoE expert-shard math.
 
-### PD Disaggregation with Mooncake (Prefill/Decode Separation)
+### PD Disaggregation
 
-Run prefill and decode on separate nodes with Mooncake RDMA KV cache transfer,
-routed through atomesh.
-
-#### 1. Start Producer (prefill node)
-
-```bash
-AITER_BF16_FP8_MOE_BOUND=0 \
-ATOM_MOE_GU_ITLV=1 \
-AITER_LOG_LEVEL=WARNING \
-python -m atom.entrypoints.openai_server \
-  --model /data/models/DeepSeek-V4-Pro/ \
-  --kv_cache_dtype fp8 \
-  -tp 8 \
-  --server-port 8010 \
-  --kv-transfer-config '{
-    "kv_role": "kv_producer",
-    "kv_connector": "mooncake",
-    "handshake_port": 6301
-  }' \
-  2>&1 | tee producer.log
-```
-
-#### 2. Start Consumer (decode node)
-
-```bash
-AITER_BF16_FP8_MOE_BOUND=0 \
-ATOM_MOE_GU_ITLV=1 \
-AITER_LOG_LEVEL=WARNING \
-python -m atom.entrypoints.openai_server \
-  --model /data/models/DeepSeek-V4-Pro/ \
-  --kv_cache_dtype fp8 \
-  -tp 8 \
-  --server-port 8020 \
-  --kv-transfer-config '{
-    "kv_role": "kv_consumer",
-    "kv_connector": "mooncake",
-    "handshake_port": 6301
-  }' \
-  2>&1 | tee consumer.log
-```
-
-#### 3. Start Router (atomesh)
-
-```bash
-export PREFILL_IP=<prefill-node-ip>
-export DECODE_IP=<decode-node-ip>
-
-atomesh launch \
-    --host 0.0.0.0 --port 8000 \
-    --pd-disaggregation \
-    --prefill "http://${PREFILL_IP}:8010" \
-    --decode  "http://${DECODE_IP}:8020" \
-    --policy random \
-    --backend atom \
-    --log-level info \
-    --disable-health-check \
-    --disable-circuit-breaker
-```
-
-#### 4. Send Requests (to the Router)
-
-```bash
-curl -s http://<ROUTER_IP>:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"1 2 3 4 5","max_tokens":10,"temperature":0}'
-```
-
-> **Note:** `AITER_BF16_FP8_MOE_BOUND=0` and `ATOM_MOE_GU_ITLV=1` are required for V4-Pro's hash-routed MoE to work correctly in PD mode. See the [PD disaggregation guide](pd_disaggregation_guide.md) for architecture details and MORI-IO backend setup.
+For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without MTP), see
+[recipes/mesh/DeepSeek-V4.md](mesh/DeepSeek-V4.md).
 
 ## Performance baseline
 
