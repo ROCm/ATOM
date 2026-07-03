@@ -192,13 +192,14 @@ def build_cell(
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} must define isl and concurrency"
         )
+    eval_concurrency = (
+        suite_cfg.get("eval_concurrency")
+        or accuracy_cfg.get("eval_concurrency")
+        or concurrency
+    )
     accuracy_concurrency = [
         int(value)
-        for value in normalize_list(
-            accuracy_cfg.get("concurrency")
-            or suite_cfg.get("eval_concurrency")
-            or concurrency
-        )
+        for value in normalize_list(eval_concurrency)
     ]
 
     topology = str(suite_cfg["topology"])

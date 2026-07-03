@@ -420,7 +420,7 @@ def perf_point(
         "slurm_job": string_value(payload.get("slurm_job_id")),
         "chart_group": "atomesh-model-performance",
         "chart_label": f"{hardware.upper()} ({display_backend} {precision.upper()})",
-        "gsm8k": gsm8k,
+        "gsm8k": round_or_none(gsm8k, digits=4),
     }
     return {key: value for key, value in point.items() if value is not None}
 
@@ -504,7 +504,7 @@ def find_eval_scores(root: Path) -> dict[int, dict[str, Any]]:
         )
         score = number(score_raw)
         if score is not None:
-            scores[conc] = {"value": score, "raw": str(score_raw)}
+            scores[conc] = {"value": round(score, 4), "raw": f"{score:.4f}"}
     return scores
 
 
