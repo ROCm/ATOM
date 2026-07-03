@@ -161,7 +161,7 @@ class FusedMoEParallelConfig:
         )
 
         pcp_merge = (
-            parallel_config.parallel_config.moe_pcp_merge
+            envs.ATOM_PCP_MOE_MERGE
             and get_prefill_context_model_parallel_world_size() > 1
         )
         if pcp_merge:

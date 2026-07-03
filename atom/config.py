@@ -749,16 +749,6 @@ class ParallelConfig:
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
-    moe_pcp_merge: bool = False
-    """PCP (Prefill Context Parallel) MoE comm mode. Only meaningful when
-    prefill_context_parallel_size > 1.
-    - False (mode A, default): MoE runs on each rank's 1/W token shard with NO
-      extra comm (per-token independent). Equivalent to SGLang moe_dp_size ==
-      pcp_size.
-    - True (mode B): all-gather hidden 1/W -> full before MoE and slice full ->
-      1/W after, so MoE sees the complete token set (MoE itself is untouched /
-      PCP-agnostic). Equivalent to SGLang moe_dp_size == 1. Costs one extra
-      hidden all-gather per layer; see plan §P3."""
     data_parallel_size_local: int = 1
     """Number of local data parallel groups."""
     data_parallel_rank: int = 0

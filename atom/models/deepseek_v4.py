@@ -2309,9 +2309,7 @@ class MoE(nn.Module):
         # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
         # (PCP mode B, 阶段19) — the latter requires registration regardless of
         # dual-stream, so register whenever either consumer is active.
-        _merge_on = get_pcp_world_size() > 1 and bool(
-            get_current_atom_config().parallel_config.moe_pcp_merge
-        )
+        _merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
         if self._use_dual_stream or _merge_on:
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
@@ -2534,7 +2532,7 @@ class Block(nn.Module):
         # warmup/real so Dynamo specializes it identically -> the op call is
         # baked into code0 and the gate inside the op stays dynamic.
         self._moe_merge_enabled = get_pcp_world_size() > 1 and bool(
-            get_current_atom_config().parallel_config.moe_pcp_merge
+            envs.ATOM_PCP_MOE_MERGE
         )
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -2928,12 +2926,12 @@ def _moe_pcp_merge_active() -> bool:
     after) applies in this forward.
 
     True only when this is a real PCP prefill (`_pcp_active`) AND the
-    `moe_pcp_merge` flag is set. Mode A (default) returns False: MoE runs on the
+    `ATOM_PCP_MOE_MERGE` env is set. Mode A returns False: MoE runs on the
     1/W shard with no extra comm.
     """
     if not _pcp_active():
         return False
-    return bool(get_current_atom_config().parallel_config.moe_pcp_merge)
+    return bool(envs.ATOM_PCP_MOE_MERGE)
 
 
 def _moe_pcp_merge_decode_active() -> bool:
@@ -2943,12 +2941,12 @@ def _moe_pcp_merge_decode_active() -> bool:
     instead does one pcp all_reduce after MoE to sum the pcp-half of the
     intermediate that combine_outputs' tp all_reduce misses.
 
-    True only when pcp>1, moe_pcp_merge set, and this is a real DECODE forward
+    True only when pcp>1, ATOM_PCP_MOE_MERGE set, and this is a real DECODE forward
     (not prefill — that's `_moe_pcp_merge_active` — and not dummy/warmup).
     """
     if get_pcp_world_size() <= 1:
         return False
-    if not bool(get_current_atom_config().parallel_config.moe_pcp_merge):
+    if not bool(envs.ATOM_PCP_MOE_MERGE):
         return False
     fc = get_forward_context()
     return (not fc.context.is_prefill) and (not fc.context.is_dummy_run)

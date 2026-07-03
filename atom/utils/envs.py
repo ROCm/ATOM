@@ -237,6 +237,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
         os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
     ),
+    # --- PCP MoE comm mode ---
+    # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
+    # Only meaningful when prefill_context_parallel_size > 1; 
+    # Default "1": all-gather hidden 1/W -> full before MoE and slice
+    # full -> 1/W after, so MoE sees the complete token set (MoE itself is
+    # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
+    # "0": MoE runs on each rank's 1/W token shard with no extra comm.
+    "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
     # Debug logging for TBO (+ PCP) collectives and ubatch splitting. Default off.
     # When "1", PCP collective sites and TBO ubatch decisions emit WARNING logs
     # (function name, input shape, ubatch id) to trace cross-rank collective order

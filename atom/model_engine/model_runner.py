@@ -2105,7 +2105,7 @@ class ModelRunner:
             # Hash MoE (mode B): local per-group-concat ids. Each ForCausalLM.forward
             # allgathers its ubatch's slice (g_i local, H_i/pcp) across pcp ranks →
             # H_i ids, matching moe_pcp_merge_forward's per-ubatch hidden allgather.
-            if self.config.parallel_config.moe_pcp_merge:
+            if envs.ATOM_PCP_MOE_MERGE:
                 forward_context.context.input_ids = input_ids
 
         if not forward_mode.use_cudagraph:

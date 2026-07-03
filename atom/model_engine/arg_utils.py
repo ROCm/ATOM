@@ -31,7 +31,6 @@ class EngineArgs:
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
-    moe_pcp_merge: bool = False
     data_parallel_size: int = 1
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
@@ -88,16 +87,6 @@ class EngineArgs:
             default=1,
             help="Prefill context parallel size. Independent dimension "
             "(world = tp x pcp); splits the sequence during prefill.",
-        )
-        parser.add_argument(
-            "--moe-pcp-merge",
-            action=argparse.BooleanOptionalAction,
-            default=False,
-            help="PCP MoE comm mode (only when -pcp > 1). Default (False, mode "
-            "A): MoE runs on each rank's 1/W token shard, no extra comm. "
-            "True (mode B): all-gather hidden to full tokens before MoE and "
-            "slice back after, so MoE sees the complete sequence (MoE itself "
-            "untouched). Adds one hidden all-gather per layer.",
         )
         parser.add_argument(
             "--data-parallel-size",
