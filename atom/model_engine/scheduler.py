@@ -255,6 +255,17 @@ class ScheduledBatch:
         ]
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
+        # Per-sequence sampling seed (-1 means unset). Used to isolate
+        # stochastic sampling across generate() calls.
+        self.sampling_seeds = np.asarray(
+            [(-1 if seq.seed is None else int(seq.seed)) for seq in seqs.values()],
+            dtype=np.int64,
+        )
+        # Number of completion tokens already emitted for each sequence.
+        # Drives deterministic per-step RNG when seed is set.
+        self.sampling_steps = np.asarray(
+            [seq.num_completion_tokens for seq in seqs.values()], dtype=np.int32
+        )
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
         # and therefore requires fresh per-row random noise at the sampler
         # rather than the cached shared exponential tensor.

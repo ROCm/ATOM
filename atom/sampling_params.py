@@ -20,6 +20,9 @@ class SamplingParams:
     # outputs diverge when temperature > 0.
     n: int = 1
     logprobs: Optional[Union[bool, int]] = None
+    # Optional per-request seed (vLLM-style): when set, sampling randomness
+    # is reproducible and isolated from prior generate() calls.
+    seed: Optional[int] = None
 
     def __post_init__(self):
         if self.top_k != -1 and self.top_k < 1:
@@ -28,3 +31,5 @@ class SamplingParams:
             raise ValueError("top_p must be in range (0.0, 1.0]")
         if self.n < 1:
             raise ValueError("n must be >= 1")
+        if self.seed is not None and self.seed < 0:
+            raise ValueError("seed must be >= 0 or None")
