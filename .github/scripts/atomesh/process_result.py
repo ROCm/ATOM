@@ -420,7 +420,7 @@ def perf_point(
         "slurm_job": string_value(payload.get("slurm_job_id")),
         "chart_group": "atomesh-model-performance",
         "chart_label": f"{hardware.upper()} ({display_backend} {precision.upper()})",
-        "gsm8k": gsm8k,
+        "gsm8k": round_or_none(gsm8k, digits=4),
     }
     return {key: value for key, value in point.items() if value is not None}
 
@@ -444,7 +444,7 @@ def dashboard_point_entry(point: dict[str, Any], extra: str) -> dict[str, Any] |
 def collect_dashboard_entries(
     paths: list[Path],
     run_url: str | None,
-    gsm8k_scores: dict[int, float],
+    gsm8k_scores: dict[int, dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
@@ -458,9 +458,13 @@ def collect_dashboard_entries(
         if not fields:
             continue
         payload = enrich_payload(path, payload, fields)
-        gsm8k = gsm8k_scores.get(int(payload.get("max_concurrency", fields["conc"])))
-        if gsm8k is not None:
+        gsm8k_score = gsm8k_scores.get(
+            int(payload.get("max_concurrency", fields["conc"]))
+        )
+        gsm8k = gsm8k_score.get("value") if gsm8k_score else None
+        if gsm8k_score is not None:
             payload["gsm8k"] = gsm8k
+            payload["gsm8k_raw"] = gsm8k_score.get("raw")
         extra = extra_text(payload, run_url, payload.get("slurm_job_id"))
         point = perf_point(path, payload, fields, run_url, gsm8k)
         point_entry = dashboard_point_entry(point, extra)
@@ -478,7 +482,7 @@ def eval_concurrency(path: Path) -> int | None:
     return None
 
 
-def find_eval_scores(root: Path) -> dict[int, float]:
+def find_eval_scores(root: Path) -> dict[int, dict[str, Any]]:
     scores = {}
     for path in sorted(root.rglob("results*.json")):
         payload = read_json(path)
@@ -488,13 +492,21 @@ def find_eval_scores(root: Path) -> dict[int, float]:
         if conc is None:
             continue
         result = payload.get("results", {}).get("gsm8k", {})
-        score = number(
-            result.get("exact_match,flexible-extract"),
-            result.get("exact_match,strict-match"),
-            result.get("acc"),
+        score_raw = next(
+            (
+                value
+                for value in (
+                    result.get("exact_match,flexible-extract"),
+                    result.get("exact_match,strict-match"),
+                    result.get("acc"),
+                )
+                if value not in (None, "")
+            ),
+            None,
         )
+        score = number(score_raw)
         if score is not None:
-            scores[conc] = score
+            scores[conc] = {"value": round(score, 4), "raw": f"{score:.4f}"}
     return scores
 
 
@@ -523,10 +535,14 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
-                gsm8k=fmt(row.get("gsm8k")),
+                gsm8k=fmt_raw(row.get("gsm8k_raw", row.get("gsm8k"))),
             )
         )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def fmt_raw(value: Any) -> str:
+    return "--" if value in (None, "") else str(value)
 
 
 def fmt(value: Any) -> str:

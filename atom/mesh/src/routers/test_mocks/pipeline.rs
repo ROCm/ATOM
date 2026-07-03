@@ -7,13 +7,9 @@ use crate::routers::grpc::engine::Dispatcher;
 use crate::routers::grpc::pipeline::Pipeline;
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::test_support::synthetic_single_stream;
-use crate::routers::token_handle::token_chunk::{
-    FinishReason, TokenChunk, Usage, WorkerMeta,
-};
+use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
-use super::{
-    dispatcher::MockDispatcher, planner::MockPdPlanner, workers::mock_grpc_worker,
-};
+use super::{dispatcher::MockDispatcher, planner::MockPdPlanner, workers::mock_grpc_worker};
 
 pub(crate) fn pipeline_with(
     planner: Arc<dyn PdPlanner>,

@@ -1,7 +1,8 @@
-from typing import Optional
 import logging
+from typing import Optional
 
 import torch
+from transformers import AutoConfig, PretrainedConfig
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
 from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
@@ -35,11 +36,84 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "MiniMaxM3SparseForConditionalGeneration": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
 }
+
+
+class MiniMaxM3Config(PretrainedConfig):
+    """Minimal local config shim for MiniMax-M3 VL checkpoints."""
+
+    model_type = "minimax_m3_vl"
+
+    def __init__(
+        self,
+        text_config: dict | PretrainedConfig | None = None,
+        vision_config: dict | None = None,
+        **kwargs,
+    ):
+        if isinstance(text_config, dict):
+            text_config = PretrainedConfig(**text_config)
+
+        self.text_config = text_config
+        self.vision_config = vision_config
+        self.hidden_size = getattr(text_config, "hidden_size", None)
+
+        super().__init__(**kwargs)
 
 
 def _set_plugin_mode() -> None:
     _set_framework_backbone("vllm")
+
+
+def _register_hf_configs() -> None:
+    try:
+        AutoConfig.register(MiniMaxM3Config.model_type, MiniMaxM3Config)
+    except ValueError as exc:
+        if "already used by a Transformers config" not in str(exc):
+            raise
+
+
+def _register_mxfp8_quantization_config() -> None:
+    """Let ATOM-owned MXFP8 checkpoints pass vLLM config validation.
+
+    vLLM uses the same name, "mxfp8", for an online-quant shorthand. MiniMax-M3
+    MXFP8 checkpoints store "quant_method": "mxfp8" in config.json, and ATOM
+    parses/loads those weights itself. Registering this no-op config prevents
+    vLLM from routing the checkpoint config through OnlineQuantizationConfig.
+    """
+    from vllm.model_executor.layers.quantization import register_quantization_config
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+        QuantizeMethodBase,
+    )
+
+    @register_quantization_config("mxfp8")
+    class AtomMxfp8Config(QuantizationConfig):
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+        @classmethod
+        def get_min_capability(cls) -> int:
+            return 80
+
+        @classmethod
+        def get_name(cls):
+            return "mxfp8"
+
+        @classmethod
+        def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+            return [torch.bfloat16, torch.float16]
+
+        @classmethod
+        def get_config_filenames(cls) -> list[str]:
+            return []
+
+        def get_quant_method(
+            self, layer: torch.nn.Module, prefix: str
+        ) -> QuantizeMethodBase | None:
+            return None
 
 
 def register_platform() -> Optional[str]:
@@ -55,6 +129,9 @@ def register_platform() -> Optional[str]:
     # importing SGLang plugin modules — then atom.models.qwen3_5's ``if is_vllm():``
     # branch runs and requires vllm.model_executor.models.qwen3_5, which may be
     # absent. Backbone is set in register_model() for real vLLM runs.
+
+    _register_hf_configs()
+    _register_mxfp8_quantization_config()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
