@@ -19,7 +19,7 @@ two topologies (1P+1D pure TP, 2P+1D DPA), each with optional MTP
 | 1P+1D TP | 2 | TP=8 | TP=8 | -- | 1–256 |
 | 1P+1D TP + MTP | 2 | TP=8, mtp | TP=8, mtp | `--num-speculative-tokens 3` | 1–256 |
 | 2P+1D DPA | 3 | TP=8, DPA+TBO | TP=8, DPA | -- | 512–2048 |
-| 2P+1D DPA + MTP | 3 | TP=8, DPA+TBO, mtp | TP=8, DPA, mtp | `--num-speculative-tokens 1` or `3` | 512–2048 |
+| 2P+1D DPA + MTP | 3 | TP=8, DPA+TBO, mtp | TP=8, DPA, mtp | `--num-speculative-tokens 1` | 512–2048 |
 
 ## Environment Setup
 
@@ -227,9 +227,6 @@ Append these two flags to **both** the prefill and decode server commands:
 --method mtp \
 --num-speculative-tokens 1
 ```
-
-Use `--num-speculative-tokens 3` for higher acceptance ratio at the cost of
-more VRAM (the MTP-3 variant in the benchmark scripts).
 
 The router command stays the same.
 
