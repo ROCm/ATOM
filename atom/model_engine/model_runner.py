@@ -631,11 +631,25 @@ class tokenIDProcessor:
             d = int(lens[i]) - 1
             if d > 0 and drafts is not None:
                 flat[s + 1 : s + 1 + d] = drafts[i, :d]
-        # Graph-bucket tail padding: legal vocab id 0 (attention bails via
-        # batch_id=-1, so the value is never used, but embedding must not OOB).
-        if num_deferred_tokens > total:
-            flat[total:num_deferred_tokens] = 0
-        self.input_ids.copy_to_gpu(num_deferred_tokens)
+        # FLAT graph tail-padding. Under CUDAGraph the captured grid processes
+        # C = effective_bs * q_eff tokens (effective_bs = the graph bs bucket
+        # >= bs), but this ragged step has only Σ = total real tokens (Σ ≤ C).
+        # The graph reads the static input_ids buffer out to C, so [Σ:C] must
+        # hold a LEGAL vocab id (0) — stale ids would OOB the embedding gather.
+        # Compute C the same way ForwardMode will (smallest graph_bs >= bs) ×
+        # q_eff. Eager (no graph) → fill_to == total (no-op beyond the Σ fill).
+        q_eff = int(getattr(batch, "num_spec_query_tokens", 1))
+        fill_to = num_deferred_tokens
+        if not self.runner.enforce_eager:
+            # smallest captured graph_bs >= bs (graph_bs is sorted descending)
+            gbs = next(
+                (g for g in reversed(self.runner.graph_bs) if g >= bs), None
+            )
+            if gbs is not None:
+                fill_to = max(fill_to, int(gbs) * q_eff)
+        if fill_to > total:
+            flat[total:fill_to] = 0
+        self.input_ids.copy_to_gpu(fill_to)
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
@@ -656,6 +670,12 @@ class tokenIDProcessor:
 
 
 class ModelRunner:
+
+    # Per-q-bucket CUDA-graph pool memory floor (bytes) for DSpark RAGGED multi-
+    # bucket capture. Measured ~4-7GB/bucket on MI355 (V4-Pro, bs<=512); reserve
+    # 6GB so KV sizing leaves headroom for every captured bucket's graph pool and
+    # capture doesn't OOM mid-way (see _estimate_cudagraph_overhead).
+    _CG_BUCKET_MEM_FLOOR_BYTES = 6 * (1024**3)
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -1553,7 +1573,15 @@ class ModelRunner:
                 else _envs.ATOM_DSPARK_Q_BUCKETS
             )
             n_buckets = len(resolve_q_buckets(_sizes_spec, full_q))
-            overhead *= n_buckets
+            # Each captured q-bucket adds a full graph-pool set. The 0.2×
+            # activation heuristic UNDER-estimates the real per-bucket pool for
+            # the flat-ragged path (extra indexer rect / logits / topk scratch),
+            # causing OOM mid-capture at high bucket counts (observed: 6 buckets
+            # crash capturing q=5 with only ~8GB free). Reserve the LARGER of the
+            # heuristic and a measured per-bucket floor so KV sizing leaves real
+            # headroom for every bucket's graph pool.
+            per_bucket = max(overhead, self._CG_BUCKET_MEM_FLOOR_BYTES)
+            overhead = per_bucket * n_buckets
         return int(overhead)
 
     def get_num_blocks(self) -> dict[str, int]:
@@ -2339,6 +2367,21 @@ class ModelRunner:
             new_len[i] = li
             if li < int(old_nst[i]):
                 any_shrink = True
+
+        # GRAPH mode: CUDA graphs require a RECTANGULAR layout (every seq the
+        # same length) so the captured fixed-shape kernels replay correctly. So
+        # under graph we promote all seqs to the batch-max length QUANTIZED UP to
+        # a captured graph size (= dynamic q-bucket: the whole batch verifies
+        # q_eff, chosen per step). new_len must equal q_eff exactly so that
+        # num_scheduled_tokens / positions / num_spec_query_tokens all agree
+        # (else prepare_decode's positions[bs*q_eff] != total_tokens[bs*um]).
+        # Lossless (equal-length truncation, like the proven q-bucket path) and
+        # CG-safe. EAGER keeps the true per-seq ragged layout (max saving).
+        from atom.spec_decode.dspark_scheduler import (
+            quantize_to_bucket,
+            resolve_q_buckets,
+        )
+
         if not any_shrink:
             return  # nothing to shrink this step -> Phase-1 layout
 
@@ -2373,30 +2416,23 @@ class ModelRunner:
         #     The real Σtokens (total_new) ≤ bs*q_eff; the tail [total_new :
         #     bs*q_eff] is -1 padding (CTAs bail). This is the "K quantized to a
         #     graph bucket" of paper §5.2, with C = bs*q_eff.
-        from atom.spec_decode.dspark_scheduler import (
-            quantize_to_bucket,
-            resolve_q_buckets,
-        )
-
-        # Independent of ATOM_DSPARK_Q_BUCKETS: ragged uses its own graph-size set.
+        # TRUE FLAT (paper §5.2). Both eager and graph keep the per-seq ragged
+        # new_len; tokens are flat-packed [0:Σ]. num_spec_query_tokens (scalar) is
+        # the GRAPH CAPACITY selector q_eff such that C = bs*q_eff >= Σ, i.e.
+        # q_eff = ceil(Σ/bs) quantized UP to a captured (bs, q_eff) graph. The
+        # graph replays a fixed C=bs*q_eff-token grid; real tokens fill [0:Σ], the
+        # tail [Σ:C] is -1-batch_id padding (kv_indptr len 0 → kernels skip it).
+        # A long tail seq no longer inflates the whole batch (that's the win over
+        # the batch-max q-bucket): C tracks the SUM, not bs*max_len.
         buckets = resolve_q_buckets(envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES, full_q)
-        # The scalar num_spec_query_tokens is read by consumers that expect a
-        # single per-seq length (prepare_decode max_seqlen_q, ForwardMode graph
-        # key). It MUST be an UPPER BOUND on every seq's real len (= max new_len),
-        # NOT ceil(Σ/bs) (an AVERAGE — under-counts the longest seq: e.g. lens
-        # [6,1,1,1] avg=2.25→3 but max=6, so max_seqlen_q=3 truncates the len-6
-        # seq's positions/graph). Under eager this is exactly the batch-max real
-        # length (matches the lossless q-bucket scalar `q`). Under graph it's then
-        # quantized UP to a captured bucket (still an upper bound).
-        max_len = int(new_len.max()) if scheduled_bs > 0 else full_q
         if self.enforce_eager:
-            # Eager: no CUDA graph → no bucket quantization needed. The scalar
-            # must be the exact batch-max real length so max_seqlen_q / positions
-            # match the actual ragged layout (mirrors q-bucket's exact `q`).
-            q_eff = max_len
+            # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
+            # real len (positions/attn bound); layout is pure flat Σ.
+            q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
         else:
-            # Graph: quantize UP to a captured (bs, q_eff) bucket (upper bound).
-            q_eff = quantize_to_bucket(max_len, buckets)
+            # Graph: pick the smallest bucket q_eff with bs*q_eff >= Σ.
+            q_ceil = (total_new + scheduled_bs - 1) // max(scheduled_bs, 1)
+            q_eff = quantize_to_bucket(q_ceil, buckets)
         batch.num_spec_query_tokens = int(q_eff)
         batch.num_spec_query_tokens_per_req = new_len
 
@@ -2416,12 +2452,12 @@ class ModelRunner:
         if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
             logger.info(
                 "DSpark ragged: bs=%d Σ(ell+1)=%d vs full=%d (save %.1f%%) "
-                "len[min=%d,max=%d] | max_len=%d q_eff=%d graph_cap=%d "
+                "len[min=%d,max=%d] | q_eff=%d graph_cap=%d "
                 "(graph_save=%.1f%%) buckets=%s",
                 scheduled_bs, total_new, scheduled_bs * full_q,
                 100.0 * (1 - total_new / (scheduled_bs * full_q)),
                 int(new_len.min()), int(new_len.max()),
-                int(max_len), int(q_eff), scheduled_bs * int(q_eff),
+                int(q_eff), scheduled_bs * int(q_eff),
                 100.0 * (1 - (scheduled_bs * int(q_eff)) / (scheduled_bs * full_q)),
                 buckets,
             )
@@ -3222,6 +3258,14 @@ class ModelRunner:
 
         with pause_gc(), graph_capture() as capture_ctx:
           for max_q_len in q_buckets:
+            if self.rank == 0:
+                _free, _total = torch.cuda.mem_get_info()
+                logger.info(
+                    "DSpark capture bucket max_q_len=%d: free=%.2fGB/%.2fGB "
+                    "reserved=%.2fGB",
+                    max_q_len, _free / 1e9, _total / 1e9,
+                    torch.cuda.memory_reserved() / 1e9,
+                )
             capture_range = (
                 tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
             )
@@ -3457,6 +3501,23 @@ class ModelRunner:
             return
 
         from atom.spec_decode.dspark_scheduler import build_sps_table
+
+        # DSpark RAGGED graph: replay-based SPS calibration is UNSAFE here. Each
+        # `graph.replay()` runs the FULL decode graph — including the SWA/KV-cache
+        # ring writes — with synthetic data at real per-req cache slots [0:bs],
+        # polluting the KV cache that the first real requests then read (garbage
+        # → GPU faults / wrong output). It also leaves the shared forward_vars in
+        # a stale layout. The scheduler only needs a monotone SPS(B) shape, so we
+        # build a synthetic table instead of timing replays (matches the proven
+        # DISABLE_SPS_CALIB path that runs lossless at GSM8K 0.95). Timed
+        # calibration for the ragged graph is a follow-up (needs a scratch KV
+        # pool + buffer save/restore around the replays).
+        if envs.ATOM_DSPARK_RAGGED:
+            logger.info(
+                "DSpark SPS calibration skipped under RAGGED graph "
+                "(replay would pollute KV cache); using synthetic stub."
+            )
+            return
 
         token_points: list[int] = []
         sps_points: list[float] = []

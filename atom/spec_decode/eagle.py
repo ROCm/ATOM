@@ -894,6 +894,17 @@ class EagleProposer:
 
         token_indices = cu_seqlens_q[1:] - last_token_offset
 
+        # Defensive clamp to the valid flat-token range [0, total_tokens-1].
+        # Under DSpark flat-ragged CUDA graph, the drain-phase corner (tiny /
+        # mixed batches) can drive an anchor index just out of range; the anchor
+        # only seeds the DRAFT (a wrong anchor lowers acceptance but never
+        # corrupts the verified/target output — losslessness is preserved), so
+        # clamping is safe and avoids an index_select GPU fault. No-op on the
+        # normal path where indices are already in range.
+        total_tokens = int(cu_seqlens_q[-1])
+        if total_tokens > 0:
+            token_indices = token_indices.clamp_(0, total_tokens - 1)
+
         return token_indices
 
     def record_dspark_ell(self, req_ids: Sequence) -> None:

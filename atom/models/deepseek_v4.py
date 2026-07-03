@@ -1648,6 +1648,12 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         """RAGGED decode indexer via pad-to-rectangle + gather (paper §5.2).
 
+        EAGER-ONLY: this per-seq ragged path runs only under --enforce-eager. The
+        CUDAGraph path uses a rectangular (uniform q_eff) decode layout (see
+        `_dspark_apply_ragged`'s graph branch), so under graph the indexer takes
+        the plain `_score_topk_decode` and never reaches here. True per-seq flat
+        under graph is a follow-up.
+
         The decode indexer kernel is rectangular-only (see `_score_topk_decode`).
         We scatter the ragged Q/weights into a [bs, full_q] rectangle at each
         token's original in-span slot j, run the kernel at next_n=full_q, then
@@ -1660,52 +1666,66 @@ class Indexer(nn.Module):
         total_tokens = q_fp8.size(0)
         bs = int(ragged_lens.shape[0])
         H, D = self.n_heads, self.head_dim
+        R = bs * full_q  # padded rectangle rows (fixed per (bs, full_q) graph)
 
-        # Per ragged token t: which seq (batch_id) and which in-span slot (j).
-        # batch_id = repeat(arange(bs), len_i); j = t - cu[batch_id].
+        # CUDAGraph-SAFE pad-to-rectangle. All working tensors are PREALLOCATED
+        # (fixed shape/address) and reused across replays; only their CONTENTS
+        # change per step. The scatter/gather index `dst` is likewise built into
+        # a preallocated buffer, so a captured graph records "scatter using the
+        # dst buffer" and replays correctly after prepare_decode refreshes dst.
+        #
+        # Layout (RIGHT-ALIGN, see below): token t of seq i (its j-th, 0<=j<len_i)
+        # goes to rectangle row  i*full_q + (full_q - len_i) + j. The decode
+        # indexer kernel's causal bound `col <= ctx - next_n + pid_next_n`
+        # assumes the LAST of next_n(=full_q) slots aligns to the KV end, so a
+        # len_i seq must occupy the TAIL slots [full_q-len_i .. full_q-1]; then
+        # token j sees `ctx - len_i + j`, identical to the rectangular path.
+        # Build the scatter/gather index `dst` WITHOUT any data-dependent-shape op
+        # (repeat_interleave is banned under CG). batch_id_per_token is already a
+        # graph-external buffer (per-token seq id, padded tail = -1); clamp -1→0
+        # so padding rows map to a valid slot (their scattered q is zeroed and
+        # never gathered back into a real token). All working tensors below use
+        # torch.empty/zeros — under CUDAGraph these allocate from the graph's
+        # private pool with stable replay addresses (same as the rectangular
+        # `_score_topk_decode`), so they are CG-safe AND non-resident (no per-
+        # layer permanent buffers — that caused 28×3GB OOM).
+        attn_md = get_forward_context().attn_metadata
+        bid_raw = attn_md.batch_id_per_token[:total_tokens].to(torch.int64)
+        bid = torch.clamp(bid_raw, min=0)  # [total_tokens]
         lens_i64 = ragged_lens.to(torch.int64)
         cu = torch.zeros(bs + 1, dtype=torch.int64, device=device)
         torch.cumsum(lens_i64, dim=0, out=cu[1:])
-        batch_id = torch.repeat_interleave(
-            torch.arange(bs, device=device, dtype=torch.int64),
-            lens_i64,
-        )  # [total_tokens]
-        j_in_seq = torch.arange(total_tokens, device=device, dtype=torch.int64) - cu[
-            batch_id
-        ]  # [total_tokens] in-span slot, 0..len_i-1
-        # RIGHT-ALIGN into the [bs, full_q] rectangle. The decode indexer kernel's
-        # causal bound is `col <= context_length - next_n + pid_next_n`, i.e. it
-        # assumes the LAST of the next_n(=full_q) query slots aligns to the KV
-        # end (pid_next_n=full_q-1 sees all of context_length). A verified draft
-        # seq of len_i tokens must therefore occupy the TAIL slots
-        # [full_q-len_i .. full_q-1]: then the last real token (slot full_q-1)
-        # sees the full context and token j sees `ctx - len_i + j`, identical to
-        # the regular q-bucket path (next_n=q, causal `ctx - q + j`). Left-
-        # aligning (slot j) would under-expose every real token by (full_q-len_i)
-        # KV cells → wrong CSA top-k → broken losslessness (the 0.57 bug).
-        pad_i = full_q - lens_i64  # [bs] leading pad per seq
-        dst = batch_id * full_q + pad_i[batch_id] + j_in_seq  # [total_tokens]
+        tok_arange = torch.arange(total_tokens, device=device, dtype=torch.int64)
+        j_in_seq = tok_arange - cu[bid]  # in-span slot 0..len_i-1 (real tokens)
+        pad_i = full_q - lens_i64  # [bs] leading pad per seq (right-align)
+        dst = bid * full_q + pad_i[bid] + j_in_seq  # [total_tokens]
+        # CG tail-padding tokens (original batch_id == -1, at flat positions
+        # [Σ:C]) got bid clamped to 0 → bogus dst. Redirect ALL of them to a
+        # dedicated DUMP row at index R (one past the real rect), so they never
+        # overwrite a real token's q. All ops keep FIXED shape (= total_tokens =
+        # C) → CG-safe (no data-dependent boolean masking). The rect is [R+1];
+        # only rows [0:R] feed the kernel (view to [bs, full_q]); row R is scratch.
+        is_pad = bid_raw < 0
+        dst = torch.where(is_pad, torch.full_like(dst, R), dst)  # pad → row R
+        dst = torch.clamp(dst, 0, R)  # defensive: never OOB the [R+1] rect
 
-        # Scatter ragged Q / weights into the zero-padded rectangle.
-        q_rect = torch.zeros(bs * full_q, H, D, dtype=q_fp8.dtype, device=device)
-        w_rect = torch.zeros(
-            bs * full_q, weights.size(1), dtype=weights.dtype, device=device
-        )
+        # Zero the [R+1] rectangle (last row = pad dump), scatter all tokens.
+        q_rect = torch.zeros(R + 1, H, D, dtype=q_fp8.dtype, device=device)
+        w_rect = torch.zeros(R + 1, weights.size(1), dtype=weights.dtype, device=device)
         q_rect[dst] = q_fp8
         w_rect[dst] = weights
-        q_4d = q_rect.view(bs, full_q, H, D)
+        q_4d = q_rect[:R].view(bs, full_q, H, D)
 
         kv_cache_4d = self.kv_cache.unsqueeze(-2)
+        # kernel operates on the real [R] rect (bs*full_q rows); the dump row R is
+        # only a scatter sink, excluded from the kernel + topk.
         logits = torch.empty(
-            bs * full_q,
-            self._max_model_len_idx,
-            dtype=torch.float32,
-            device=device,
+            R, self._max_model_len_idx, dtype=torch.float32, device=device
         )
         deepgemm_fp8_paged_mqa_logits(
             q_4d,
             kv_cache_4d,
-            w_rect,
+            w_rect[:R],
             logits,
             n_committed_per_seq_gpu,
             block_tables,
@@ -1713,21 +1733,25 @@ class Indexer(nn.Module):
             KVBlockSize=self.kv_cache.size(1),
             Preshuffle=True,
         )
-        topk_rect = torch.empty(
-            bs * full_q, self.index_topk, dtype=torch.int32, device=device
+        # topk_rect has R+1 rows: [0:R] real, row R is the pad dump so that
+        # gather with dst∈{..,R} stays in-bounds. Fill row R with -1 sentinels
+        # (csa_translate_pack skips topk<0), the rest by the kernel.
+        topk_rect = torch.full(
+            (R + 1, self.index_topk), -1, dtype=torch.int32, device=device
         )
         top_k_per_row_decode(
             logits,
             full_q,
             n_committed_per_seq_gpu,
-            topk_rect,
-            bs * full_q,
+            topk_rect[:R],
+            R,
             logits.stride(0),
             logits.stride(1),
             k=topk,
         )
-        # Gather each seq's first len_i rows back to the ragged layout.
-        return topk_rect[dst]  # [total_tokens, index_topk] int32, raw seq-local
+        # Gather each seq's real rows back to the ragged [total_tokens] layout.
+        # Pad tokens (dst==R) read the -1 sentinel row → harmless downstream.
+        return topk_rect[dst]  # [total_tokens, index_topk] int32, seq-local
 
 
 # ---------------------------------------------------------------------------

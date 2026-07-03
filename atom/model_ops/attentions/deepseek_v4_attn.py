@@ -1371,6 +1371,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ) + np.repeat(context_lens_np - full_q, max_seqlen_q)
         sum_scheduled_tokens = batch.total_tokens_num_decode
 
+        # DSpark FLAT graph tail-padding. Under CUDAGraph the captured grid is
+        # C = bs*max_seqlen_q tokens, but a ragged step has only Σ = total_tokens_
+        # num_decode real tokens (Σ ≤ C). The graph replays a fixed C-token grid,
+        # so the per-token buffers MUST be valid out to C — positions[Σ:C] left
+        # stale would feed garbage into rope/embedding/index kernels (GPU fault).
+        # Pad positions[Σ:C] = 0 (a valid position; these tokens are masked out
+        # by batch_id_per_token == -1 and kv_indptr len 0, so their attention
+        # output is discarded). C is derived from the graph bs passed in (bs) ×
+        # max_seqlen_q. Eager (bs == scheduled_bs, Σ == C) is a no-op.
+        graph_cap_tokens = int(bs) * int(max_seqlen_q)
+        if graph_cap_tokens > sum_scheduled_tokens:
+            _pad_positions = np.zeros(graph_cap_tokens, dtype=positions_np.dtype)
+            _pad_positions[:sum_scheduled_tokens] = positions_np
+            positions_np = _pad_positions
+            sum_scheduled_tokens_padded = graph_cap_tokens
+        else:
+            sum_scheduled_tokens_padded = sum_scheduled_tokens
+
         if max_seqlen_q < full_q:
             from atom.utils import envs as _envs
 
@@ -1385,7 +1403,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     int(positions_np.min()), int(positions_np.max()),
                 )
 
-        var["positions"].np[:sum_scheduled_tokens] = positions_np
+        var["positions"].np[:sum_scheduled_tokens_padded] = positions_np
 
         var["context_lens"].np[:scheduled_bs] = context_lens_np
 
@@ -1407,7 +1425,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         current_stream = torch.cuda.current_stream()
         prep_stream.wait_stream(current_stream)
         with torch.cuda.stream(prep_stream):
-            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens_padded)
             cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(bs + 1)
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
             block_tables_gpu = var["block_tables"].copy_to_gpu(scheduled_bs)
@@ -1457,6 +1475,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # decode indexer so it can pad Q back to [bs, full_q] (the decode indexer
         # kernel is rectangular-only). `_score_topk_decode` reads these; None on
         # the regular rectangular path (kernel runs directly).
+        # EAGER-only (under graph, per_req is unset → rectangular indexer). The
+        # ragged pad-to-rectangle uses full_q = the real span (mtp_k+1) so the
+        # right-align causal bound matches the span-head-anchored positions.
         if ragged_lens is not None:
             attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
                 extend_lens_np, device=positions.device
@@ -2879,6 +2900,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_mapping = state_slot_gpu
         attn_metadata.state_slot_mapping_cpu = state_slot_np
         attn_metadata.swa_block_tables = swa_bt_gpu
+
+        # DSpark TRUE-FLAT graph: replay takes the ragged indexer path
+        # (_score_topk_decode_ragged), so capture MUST take the same branch AND
+        # the same rect shape, else graph replay mismatches. The indexer rect is
+        # [bs, full_q] with full_q = REAL span (mtp_k+1) — consistent with replay
+        # (prepare_decode sets dspark_full_q=full_q) and wide enough to hold any
+        # per-seq len_i. Capture's synthetic layout: total_tokens = bs*max_q_len
+        # (this graph's token grid); give each seq max_q_len real tokens (dst
+        # right-aligned into the full_q-wide rect). Replay refreshes dst for the
+        # real ragged lens + tail padding.
+        from atom.utils import envs as _envs
+        drafter = getattr(self.model_runner, "drafter", None)
+        if (
+            _envs.ATOM_DSPARK_RAGGED
+            and drafter is not None
+            and getattr(drafter, "dspark_confidence_schedule", False)
+        ):
+            full_q_real = drafter.mtp_k + 1
+            attn_metadata.dspark_ragged_lens_gpu = torch.full(
+                (bs,), max_q_len, dtype=torch.int32, device=positions.device
+            )
+            attn_metadata.dspark_full_q = int(full_q_real)
 
         # Build compress_plans + per-fwd meta + indexer meta via the same
         # helpers used at runtime — guarantees addresses match.
