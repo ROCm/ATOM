@@ -96,19 +96,34 @@ jobs:
       - name: Detect container engine
         run: |
           set -euo pipefail
-          # Prefer podman when usable + --group-add keep-groups; otherwise docker + --group-add video.
-          if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
-            echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
-            echo "CONTAINER_GROUP_ADD=--group-add keep-groups" >> "$GITHUB_ENV"
-            echo "Container engine: podman (--group-add keep-groups)"
-          elif docker info > /dev/null 2>&1; then
-            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
-            echo "CONTAINER_GROUP_ADD=--group-add video" >> "$GITHUB_ENV"
-            echo "Container engine: docker (--group-add video)"
-          else
-            echo "ERROR: Neither a working podman nor docker is available on this runner."
-            exit 1
+          storage_root="/tmp/atom-container-storage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ strategy.job-index }}"
+          podman_wrapper="/tmp/atom-podman-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ strategy.job-index }}"
+
+          # Prefer Podman with per-job storage so image layers are unpacked under
+          # the job container's /tmp instead of the host Docker/containerd data-root.
+          if command -v podman > /dev/null 2>&1; then
+            mkdir -p "${storage_root}/root" "${storage_root}/runroot" "${storage_root}/tmp"
+            cat > "${podman_wrapper}" <<EOF
+          #!/usr/bin/env bash
+          exec podman --root "${storage_root}/root" --runroot "${storage_root}/runroot" --tmpdir "${storage_root}/tmp" "\$@"
+          EOF
+            chmod +x "${podman_wrapper}"
+
+            if "${podman_wrapper}" info > /dev/null 2>&1; then
+              echo "CONTAINER_ENGINE=${podman_wrapper}" >> "$GITHUB_ENV"
+              echo "CONTAINER_ENGINE_KIND=podman" >> "$GITHUB_ENV"
+              echo "CONTAINER_STORAGE_ROOT=${storage_root}" >> "$GITHUB_ENV"
+              echo "CONTAINER_GROUP_ADD=--group-add keep-groups" >> "$GITHUB_ENV"
+              echo "Container engine: podman (--group-add keep-groups)"
+              echo "Podman storage root: ${storage_root}/root"
+              exit 0
+            fi
+
+            echo "WARNING: job-local podman storage is not usable on this runner."
           fi
+
+          echo "ERROR: Job-local podman storage is required so image layers do not use the host Docker/containerd data-root."
+          exit 1
 
       - name: Clean up containers and workspace
         run: |
@@ -226,7 +241,7 @@ jobs:
             sleep $((attempt * 10))
           done
 
-          if [[ "${pull_ok}" != "true" && "${CONTAINER_ENGINE}" == "podman" ]]; then
+          if [[ "${pull_ok}" != "true" && "${CONTAINER_ENGINE_KIND:-}" == "podman" ]]; then
             echo "Plain podman pull failed; retrying with docker transport."
             if $CONTAINER_ENGINE pull "docker://${IMG}"; then
               pull_ok=true
@@ -300,7 +315,7 @@ jobs:
           # Podman + crun: avoid "create keyring ... Disk quota exceeded" (kernel user-keyring
           # quota on shared runners). Docker ignores CONTAINERS_CONF_OVERRIDE; Podman reads it.
           ATOM_SGLANG_PODMAN_CONF=""
-          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+          if [[ "${CONTAINER_ENGINE_KIND:-}" == "podman" ]]; then
             ATOM_SGLANG_PODMAN_CONF="$(mktemp "${TMPDIR:-/tmp}/atom-sglang-containers-conf.XXXXXX")"
             printf '%s\n' '[containers]' 'keyring=false' > "${ATOM_SGLANG_PODMAN_CONF}"
             _atom_sglang_prev_exit_body="$(trap -p EXIT | sed -nE "s/^trap -- '(.*)' EXIT$/\1/p" || true)"
@@ -314,7 +329,7 @@ jobs:
           fi
 
           container_engine_run() {
-            if [[ "${CONTAINER_ENGINE}" != "podman" ]]; then
+            if [[ "${CONTAINER_ENGINE_KIND:-}" != "podman" ]]; then
               "${CONTAINER_ENGINE}" "$@"
               return
             fi
@@ -710,7 +725,13 @@ jobs:
           $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
           if [[ "${SGLANG_IMAGE_SOURCE}" == "rebuild" ]]; then
             $CONTAINER_ENGINE rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
+          elif [[ -n "${CONTAINER_STORAGE_ROOT:-}" ]]; then
+            echo "Prebuilt SGLang image was stored in job-local container storage."
           else
             echo "Keeping prebuilt SGLang image cached on runner: ${SGLANG_IMAGE_TAG}"
+          fi
+          if [[ -n "${CONTAINER_STORAGE_ROOT:-}" ]]; then
+            echo "Removing job-local container storage: ${CONTAINER_STORAGE_ROOT}"
+            rm -rf "${CONTAINER_STORAGE_ROOT}" || true
           fi
 
