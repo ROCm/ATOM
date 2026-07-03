@@ -4,12 +4,17 @@ set -euo pipefail
 # Start the atomesh Docker container with RDMA NIC auto-detection.
 #
 # Optional env (with defaults):
-#   CONTAINER=atom_sglang_mesh
-#   DOCKER_IMAGE=rocm/atom-dev:mesh-sglang-latest
+#   CONTAINER=atom_mesh
+#   DOCKER_IMAGE=rocm/atom-dev:latest
 #   MORI_NIC_TYPE=<auto>           # override NIC detection (bnxt|ionic|mlx5)
+#
+# Available images:
+#   rocm/atom-dev:latest          # ATOM native backend (default)
+#   rocm/atom-dev:vllm-latest     # vLLM backend
+#   rocm/atom-dev:sglang-latest   # SGLang backend
 
-CONTAINER="${CONTAINER:-atom_sglang_mesh}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
+CONTAINER="${CONTAINER:-atom_mesh}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:latest}"
 
 # ======================== RDMA NIC helpers ========================
 

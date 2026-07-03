@@ -36,7 +36,7 @@ DOCKER_IMAGE=rocm/atom-dev:latest bash atom/mesh/scripts/docker_start.sh
 Then enter the container:
 
 ```bash
-docker exec -it atom_sglang_mesh bash
+docker exec -it atom_mesh bash
 ```
 
 All remaining commands are run **inside the container**.

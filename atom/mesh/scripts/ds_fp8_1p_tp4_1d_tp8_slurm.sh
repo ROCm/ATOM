@@ -28,8 +28,8 @@ set -euo pipefail
 
 # ======================== configuration ========================
 MODEL_PATH="${MODEL_PATH:-/mnt/models/deepseek-ai/DeepSeek-R1}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
-CONTAINER="${CONTAINER:-atom_sglang_mesh_${SLURM_JOB_ID}}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:latest}"
+CONTAINER="${CONTAINER:-atom_mesh_${SLURM_JOB_ID}}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 DECODE_TP="${DECODE_TP:-8}"

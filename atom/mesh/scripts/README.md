@@ -10,7 +10,7 @@ End-to-end guide for building, deploying, and benchmarking the Atomesh prefill-d
 
 ## 1. Start Docker Container
 
-Pre-built images are available at `rocm/atom-dev:mesh-sglang-latest`. Run on **each node** (prefill and decode):
+Pre-built images are available at `rocm/atom-dev:latest`. Run on **each node** (prefill and decode):
 
 ```bash
 bash docker_start.sh
@@ -19,7 +19,7 @@ bash docker_start.sh
 Then enter the container:
 
 ```bash
-docker exec -it atom_sglang_mesh bash
+docker exec -it atom_mesh bash
 ```
 
 All remaining scripts are run **inside the container**.
@@ -176,7 +176,7 @@ sbatch --export=ALL,RUN_GSM8K=0 atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_PATH` | `/mnt/models/deepseek-ai/DeepSeek-R1` | Model path |
-| `DOCKER_IMAGE` | `rocm/atom-dev:mesh-sglang-latest` | Container image |
+| `DOCKER_IMAGE` | `rocm/atom-dev:latest` | Container image |
 | `PREFILL_TP` / `DECODE_TP` | `4` / `8` | Tensor parallel sizes |
 | `LOAD_DUMMY` | `<empty>` | Load real weights by default. Set `LOAD_DUMMY=1` to skip weight loading for fast smoke-test |
 | `ISL_LIST` | `8192` | Input sequence lengths (comma-separated) |

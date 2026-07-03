@@ -271,7 +271,7 @@ Start the container on the node with the RDMA-aware docker script:
 
 ```bash
 DOCKER_IMAGE=rocm/atom-dev:latest bash atom/mesh/scripts/docker_start.sh
-docker exec -it atom_sglang_mesh bash
+docker exec -it atom_mesh bash
 ```
 
 All commands below run **inside the container**.
@@ -459,7 +459,7 @@ Start a container on **each of the 3 nodes** using the RDMA-aware docker script:
 
 ```bash
 DOCKER_IMAGE=rocm/atom-dev:latest bash atom/mesh/scripts/docker_start.sh
-docker exec -it atom_sglang_mesh bash
+docker exec -it atom_mesh bash
 ```
 
 ### Start Prefill Server (Node 0 — prefill-1)
