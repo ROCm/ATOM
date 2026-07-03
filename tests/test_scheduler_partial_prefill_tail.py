@@ -53,7 +53,7 @@ class TestSkippedPartialPrefillGoesToTail:
     def test_skipped_partial_requeued_at_tail_not_head(self, seq_factory):
         sched = self._make_sched(mtp_k=3)
 
-        s_decode = seq_factory([1, 2, 3, 4])   # will finish prefill -> decode-ready
+        s_decode = seq_factory([1, 2, 3, 4])  # will finish prefill -> decode-ready
         s_partial = seq_factory([5, 6, 7, 8])  # stays mid-prefill (partial)
         sched.add(s_decode)
         sched.add(s_partial)
@@ -79,9 +79,9 @@ class TestSkippedPartialPrefillGoesToTail:
         ids = [s.id for s in sched.running]
         assert s_partial.id in ids, "partial must remain in running"
         # The fix: skipped partial is re-queued at the TAIL, never position 0.
-        assert ids[-1] == s_partial.id, (
-            f"expected partial {s_partial.id} at running tail, got order {ids}"
-        )
-        assert ids[0] != s_partial.id, (
-            f"partial {s_partial.id} must NOT be pinned at running head (order {ids})"
-        )
+        assert (
+            ids[-1] == s_partial.id
+        ), f"expected partial {s_partial.id} at running tail, got order {ids}"
+        assert (
+            ids[0] != s_partial.id
+        ), f"partial {s_partial.id} must NOT be pinned at running head (order {ids})"
