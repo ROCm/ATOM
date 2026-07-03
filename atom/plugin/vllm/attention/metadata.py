@@ -399,6 +399,190 @@ class AiterMlaSparseMetadataForVllm:
     reduce_partial_map: torch.Tensor | None = None
 
 
+@dataclass
+class MinimaxM3SparsePrefillMetadata:
+    qo_indptr: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    seq_lens: torch.Tensor
+    context_lens: torch.Tensor
+    block_table: torch.Tensor
+    max_query_len: int
+    max_seq_len: int
+
+
+@dataclass
+class MinimaxM3SparseDecodeMetadata:
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    max_query_len: int = 1
+
+
+@dataclass
+class MinimaxM3SparseMetadata:
+    seq_lens: torch.Tensor
+    max_seq_len: int
+    slot_mapping: torch.Tensor
+    num_actual_tokens: int
+    num_decodes: int
+    num_decode_tokens: int
+    num_prefills: int
+    num_prefill_tokens: int
+    block_table: torch.Tensor
+    max_query_len: int
+    prefill: MinimaxM3SparsePrefillMetadata | None = None
+    decode: MinimaxM3SparseDecodeMetadata | None = None
+
+
+class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
+    # MiniMax-M3 sparse attention owns dynamic index/topk/cache state that must
+    # be refreshed outside full cudagraph capture.
+    _cudagraph_support = AttentionCGSupport.NEVER
+    reorder_batch_threshold = 1
+
+    def __init__(
+        self,
+        kv_cache_spec=None,
+        layer_names=None,
+        config=None,
+        device=None,
+        model_runner=None,
+    ):
+        del model_runner
+        super().__init__(kv_cache_spec, layer_names, config, device)
+        logger.info("init MinimaxM3SparseAttentionMetadataBuilder")
+        from vllm.config import VllmConfig
+
+        assert isinstance(config, VllmConfig)
+        self.vllm_config = config
+        self.model_config = config.model_config
+        self.cache_config = config.cache_config
+        self.scheduler_config = config.scheduler_config
+        self.block_size = kv_cache_spec.block_size
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    def build(
+        self,
+        common_prefix_len: int = 0,
+        common_attn_metadata=None,
+        fast_build: bool = False,
+    ):
+        del fast_build
+        if common_prefix_len > 0:
+            raise ValueError("ATOM does not support cascade attention yet")
+        assert common_attn_metadata is not None
+
+        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
+        from vllm.v1.attention.backends.utils import (
+            split_decodes_prefills_and_extends,
+        )
+
+        (
+            num_decodes,
+            num_extends,
+            num_prefills,
+            num_decode_tokens,
+            _num_extend_tokens,
+            _num_prefill_tokens,
+        ) = split_decodes_prefills_and_extends(
+            common_attn_metadata=common_attn_metadata,
+            decode_threshold=getattr(self, "reorder_batch_threshold", 1) or 1,
+        )
+        num_tokens = common_attn_metadata.num_actual_tokens
+        num_prefills_total = num_extends + num_prefills
+        num_prefill_tokens = num_tokens - num_decode_tokens
+        seq_lens = common_attn_metadata.seq_lens
+        block_table = common_attn_metadata.block_table_tensor
+
+        prefill_metadata: MinimaxM3SparsePrefillMetadata | None = None
+        if num_prefills_total > 0:
+            # MiniMax-M3 sparse attention uses the prefill kernel for any mixed
+            # decode+prefill batch, because it builds per-token causal sparse
+            # block tables. Only pure decode batches use the decode kernel.
+            # The vLLM scheduler orders request rows as decode, extend, prefill.
+            # The prefill metadata below must therefore start after decode rows
+            # and must shift query_start_loc back to this phase's local token
+            # slice; otherwise sparse prefill reads decode requests as prefixes.
+            prefill_start = num_decodes
+            prefill_stop = prefill_start + num_prefills_total
+            prefill_token_start = num_decode_tokens
+            prefill_seq_lens = seq_lens[prefill_start:prefill_stop]
+            prefill_query_start = common_attn_metadata.query_start_loc[
+                prefill_start : prefill_stop + 1
+            ].to(torch.int32)
+            prefill_query_start = prefill_query_start - prefill_token_start
+            context_lens = common_attn_metadata.compute_num_computed_tokens()[
+                prefill_start:prefill_stop
+            ]
+            seq_lens_cpu = getattr(
+                common_attn_metadata, "seq_lens_cpu_upper_bound", None
+            )
+            if seq_lens_cpu is None:
+                seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                seq_lens_cpu = seq_lens.cpu()
+            prefill_max_seq_len = int(
+                seq_lens_cpu[prefill_start:prefill_stop].max().item()
+            )
+            query_lens_cpu = (
+                common_attn_metadata.query_start_loc_cpu[1:]
+                - common_attn_metadata.query_start_loc_cpu[:-1]
+            )
+            prefill_max_query_len = max(
+                1, int(query_lens_cpu[prefill_start:prefill_stop].max().item())
+            )
+            if self.block_size != SPARSE_BLOCK_SIZE:
+                raise ValueError(
+                    f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
+                )
+            qo_indptr = torch.arange(
+                num_prefill_tokens + 1, dtype=torch.int32, device=seq_lens.device
+            )
+            prefill_metadata = MinimaxM3SparsePrefillMetadata(
+                qo_indptr=qo_indptr,
+                cu_seqlens_q=prefill_query_start,
+                seq_lens=prefill_seq_lens,
+                context_lens=context_lens,
+                block_table=block_table[prefill_start:prefill_stop],
+                max_query_len=prefill_max_query_len,
+                max_seq_len=prefill_max_seq_len,
+            )
+
+        decode_metadata: MinimaxM3SparseDecodeMetadata | None = None
+        if num_decodes > 0:
+            query_lens_cpu = (
+                common_attn_metadata.query_start_loc_cpu[1:]
+                - common_attn_metadata.query_start_loc_cpu[:-1]
+            )
+            decode_max_query_len = max(
+                1, int(query_lens_cpu[:num_decodes].max().item())
+            )
+            decode_metadata = MinimaxM3SparseDecodeMetadata(
+                seq_lens=seq_lens[:num_decodes],
+                block_table=block_table[:num_decodes],
+                max_query_len=decode_max_query_len,
+            )
+
+        return MinimaxM3SparseMetadata(
+            seq_lens=seq_lens,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            num_actual_tokens=num_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills_total,
+            num_prefill_tokens=num_prefill_tokens,
+            block_table=block_table,
+            max_query_len=common_attn_metadata.max_query_len,
+            prefill=prefill_metadata,
+            decode=decode_metadata,
+        )
+
+    def build_for_cudagraph_capture(self, common_attn_metadata=None):
+        return self.build(
+            common_prefix_len=0, common_attn_metadata=common_attn_metadata
+        )
+
+
 # vLLM metadata builders
 class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
     """vLLM-only MHA metadata builder."""
