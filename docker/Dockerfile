@@ -476,4 +476,22 @@ assert 'rocm' in torch.__version__, torch.__version__; \
 assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
 print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
 
+# ========== SemiAnalysis aiperf agentic benchmark tool ==========
+# Install the SemiAnalysis fork pinned to the commit that supports the SA
+# agentic datasets (semianalysis_cc_traces_weka_062126*).
+ARG INSTALL_SA_AIPERF=1
+ARG SA_AIPERF_COMMIT="97ae7e898e8cce4070f779f2e0dc04f1d9bb5feb"
+RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
+        rm -rf /opt/aiperf && \
+        git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
+        cd /opt/aiperf && \
+        git checkout "${SA_AIPERF_COMMIT}" && \
+        "${VENV_PYTHON}" -m pip install -e . && \
+        "${VENV_PYTHON}" -m pip show aiperf || true && \
+        command -v aiperf && aiperf --help >/dev/null; \
+    else \
+        echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
+
 CMD ["/bin/bash"]
