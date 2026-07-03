@@ -5,7 +5,7 @@
       "source_path": "deepseek-ai/DeepSeek-R1-0528",
       "path": "deepseek-ai/DeepSeek-R1-0528",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -23,7 +23,7 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -40,7 +40,7 @@
       "choice_label": "DeepSeek-V4-Pro",
       "source_path": "deepseek-ai/DeepSeek-V4-Pro",
       "path": "deepseek-ai/DeepSeek-V4-Pro",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -62,7 +62,7 @@
       "choice_label": "gpt-oss-120b",
       "source_path": "openai/gpt-oss-120b",
       "path": "openai/gpt-oss-120b",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "C",
       "variants": [
         {
@@ -108,7 +108,7 @@
       "source_path": "zai-org/GLM-5.1-FP8",
       "path": "zai-org/GLM-5.1-FP8",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "C",
       "variants": [
         {
@@ -129,7 +129,7 @@
       "source_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
       "path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -154,7 +154,7 @@
       "choice_label": "Kimi-K2.5-MXFP4",
       "source_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
       "path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -191,7 +191,7 @@
       "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "A",
       "variants": [
         {
@@ -223,7 +223,7 @@
       "source_path": "Qwen/Qwen3.5-397B-A17B",
       "path": "Qwen/Qwen3.5-397B-A17B",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "A",
       "variants": [
         {
@@ -243,7 +243,7 @@
       "choice_label": "Qwen3-Next-80B-A3B-Instruct-FP8",
       "source_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
       "path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "A",
       "variants": [
         {
@@ -315,7 +315,7 @@
       "choice_label": "DeepSeek-V3.2 FP8",
       "source_path": "deepseek-ai/DeepSeek-V3.2",
       "path": "deepseek-ai/DeepSeek-V3.2",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -351,7 +351,7 @@
       "choice_label": "DeepSeek-V3.2 FP8 PTPC",
       "source_path": "amd/DeepSeek-V3.2-mtp-ptpc",
       "path": "amd/DeepSeek-V3.2-mtp-ptpc",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -369,7 +369,7 @@
       "choice_label": "GLM-4.7-FP8",
       "source_path": "zai-org/GLM-4.7-FP8",
       "path": "zai-org/GLM-4.7-FP8",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -396,7 +396,7 @@
       "choice_label": "GLM-4.7-FP8 MTP",
       "source_path": "zai-org/GLM-4.7-FP8",
       "path": "zai-org/GLM-4.7-FP8",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
@@ -423,7 +423,7 @@
       "choice_label": "MiniMax-M2.5",
       "source_path": "MiniMaxAI/MiniMax-M2.5",
       "path": "MiniMaxAI/MiniMax-M2.5",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "debug_benchmark_0618",
       "nightly_group": "B",
       "variants": [
         {
