@@ -132,6 +132,14 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     (kernel derives per-token valid_k inline from this + positions +
     index_topk; no separate per-token tensor needed)."""
 
+    # DSpark RAGGED (paper §5.2): per-request ragged verify lengths [bs] int32
+    # (len_i = ell_i+1). None => regular rectangular decode. Set by
+    # prepare_decode's ragged branch; consumed by `_score_topk_decode` to pad Q
+    # back to a [bs, full_q] rectangle for the (rectangular-only) decode indexer
+    # kernel, then gather results back to the ragged layout.
+    dspark_ragged_lens_gpu: Optional[torch.Tensor] = None
+    dspark_full_q: int = 0
+
     # ----- Per-fwd hoisted (built in `_attach_v4_per_fwd_meta`) -----
     batch_id_per_token: Optional[torch.Tensor] = None
     """[padded_T] int32 GPU — the SINGLE per-token mapping
@@ -1314,7 +1322,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         scheduled_bs = batch.total_seqs_num_decode
         context_lens_np = np.asarray(batch.context_lens, dtype=np.int32)
-        max_seqlen_q = batch.num_spec_step + 1
+        # Per-seq decode forward length: single source of truth on the batch
+        # (= num_spec_step+1 for plain MTP, or the DSpark q-bucket when shrunk).
+        # positions/attn use this so the (bs, q) graph is selected. See
+        # ScheduledBatch.num_spec_query_tokens.
+        max_seqlen_q = getattr(batch, "num_spec_query_tokens", batch.num_spec_step + 1)
         # MTP: roll back ctx by `num_rejected` so this fwd's positions overwrite
         # last fwd's rejected-draft slots (matches aiter_mla.py:701 /
         # aiter_attention.py:542). `batch.context_lens` = `seq.num_tokens`
@@ -1330,10 +1342,48 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
                 context_lens_np = context_lens_np - num_rejected.astype(np.int32)
-        positions_np = np.tile(
-            np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
-        ) + np.repeat(context_lens_np - max_seqlen_q, max_seqlen_q)
+        # DSpark plan Y q-shrink: the q tokens we actually forward are the FIRST
+        # q of the full (mtp_k+1)-wide draft span, so they must be anchored to
+        # the span's HEAD, not `context_lens - q` (the span's TAIL minus q).
+        # Anchoring to the head puts them at [ctx-full_q .. ctx-full_q+q-1] (all
+        # <= ctx-1, never OOB); the dropped tail slots [.. ctx-1] stay reserved
+        # and are re-drafted next step -> lossless. When q == full_q (Phase 1)
+        # the two anchors coincide, so this is a no-op for the unshrunk path.
+        full_q = batch.num_spec_step + 1
+        ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
+        if ragged_lens is not None:
+            # RAGGED (paper §5.2 avoid-padding): each seq forwards len_i tokens
+            # (no batch-level pad). Build positions via per-seq cumsum + in-seg
+            # arange instead of the rectangular np.tile. Anchor each seg to the
+            # full span HEAD (ctx-full_q), same losslessness argument as q-shrink:
+            # token j of seq i -> position (ctx_i - full_q) + j, j in [0,len_i).
+            lens = np.asarray(ragged_lens, dtype=np.int32)[:scheduled_bs]
+            cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
+            np.cumsum(lens, out=cu[1:])
+            batch_ids = np.repeat(np.arange(scheduled_bs, dtype=np.int32), lens)
+            j_in_seq = np.arange(int(cu[-1]), dtype=np.int32) - cu[batch_ids].astype(
+                np.int32
+            )
+            positions_np = (context_lens_np - full_q)[batch_ids] + j_in_seq
+        else:
+            positions_np = np.tile(
+                np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
+            ) + np.repeat(context_lens_np - full_q, max_seqlen_q)
         sum_scheduled_tokens = batch.total_tokens_num_decode
+
+        if max_seqlen_q < full_q:
+            from atom.utils import envs as _envs
+
+            if _envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+                import logging
+
+                logging.getLogger("atom").info(
+                    "DSpark prepare_decode q-shrink: bs=%d q=%d full_q=%d "
+                    "ctx[min=%d,max=%d] pos[min=%d,max=%d] (anchor=head)",
+                    scheduled_bs, max_seqlen_q, full_q,
+                    int(context_lens_np.min()), int(context_lens_np.max()),
+                    int(positions_np.min()), int(positions_np.max()),
+                )
 
         var["positions"].np[:sum_scheduled_tokens] = positions_np
 
@@ -1368,7 +1418,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             state_slot_gpu = ss_buf.copy_to_gpu(scheduled_bs)
 
         # ---- CPU numpy work, overlapped with prep_stream H2D ----
-        extend_lens_np = np.full(scheduled_bs, max_seqlen_q, dtype=np.int32)
+        # RAGGED: per-seq extend lengths (else uniform max_seqlen_q). compress
+        # plans + per-fwd meta are all marker-driven (repeat/cumsum over this),
+        # so a ragged array flows through unchanged.
+        if ragged_lens is not None:
+            extend_lens_np = np.asarray(ragged_lens, dtype=np.int32)[:scheduled_bs]
+        else:
+            extend_lens_np = np.full(scheduled_bs, max_seqlen_q, dtype=np.int32)
         compress_plans = self._build_compress_plans(
             extend_lens_np,
             context_lens_np,
@@ -1397,6 +1453,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_mapping_cpu = state_slot_np
         attn_metadata.compress_plans = compress_plans
         attn_metadata.swa_block_tables = swa_bt_gpu
+        # DSpark RAGGED: hand the per-seq verify lengths + full span width to the
+        # decode indexer so it can pad Q back to [bs, full_q] (the decode indexer
+        # kernel is rectangular-only). `_score_topk_decode` reads these; None on
+        # the regular rectangular path (kernel runs directly).
+        if ragged_lens is not None:
+            attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
+                extend_lens_np, device=positions.device
+            )
+            attn_metadata.dspark_full_q = int(full_q)
 
         padded_bs = int(bs)
         self._attach_v4_per_fwd_meta(
@@ -2721,7 +2786,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return gpu
 
     def build_for_cudagraph_capture(
-        self, bs: int
+        self, bs: int, max_q_len: Optional[int] = None
     ) -> tuple[AttentionMetaData_DSV4, Context]:
         """Build attn_metadata for CUDAGraph capture using a synthetic decode batch.
 
@@ -2753,7 +2818,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Honor MTP at capture time: V4-Pro `mtp_k=1` → 2 tokens/req. The
         # outer `model_runner.capture_cudagraph` populates cu_seqlens_q with
         # the same layout, so capture and replay see identical shapes.
-        max_q_len = 1 + self.max_spec_steps
+        # DSpark Phase 2 (graph multi-bucket): max_q_len is parametrized so the
+        # capture loop can build one graph per query-length bucket
+        # (decode_query_len in 1..mtp_k+1). Default = full mtp_k+1 (unchanged).
+        if max_q_len is None:
+            max_q_len = 1 + self.max_spec_steps
         total_tokens = bs * max_q_len
         win = self.window_size
 

@@ -912,82 +912,6 @@ class EagleProposer:
         n = min(len(req_ids), ell_np.shape[0])
         self._dspark_ell_by_req = {req_ids[i]: int(ell_np[i]) for i in range(n)}
 
-    def _dspark_uniform_verify_len(self, req_ids: Sequence) -> int:
-        """Batch-level uniform verify length L for this step (paper §5.2 top-K).
-
-        Re-maps the previous step's per-req ell onto the current batch by req_id,
-        then takes L = max over the batch (round up to a single uniform length so
-        the verify block stays a regular matrix — simplest, and the shape Level B
-        graph buckets will need anyway). Requests with no prior ell (just-started)
-        fall back to mtp_k, so a fresh request never gets under-verified.
-
-        Returns L in 1..mtp_k. L == mtp_k means "no truncation this step".
-        """
-        by_req = getattr(self, "_dspark_ell_by_req", None)
-        if not by_req:
-            return self.mtp_k
-        L = 0
-        for rid in req_ids:
-            # Missing req (new this step) -> mtp_k so it is fully verified.
-            L = max(L, by_req.get(rid, self.mtp_k))
-        return int(min(max(L, 1), self.mtp_k))
-
-    def _dspark_per_request_ell(self, req_ids: Sequence) -> np.ndarray:
-        """Per-request verify length [bs] re-mapped onto the current batch.
-
-        This is the production policy (paper Algorithm 1 per-request, not the
-        batch-uniform L of §13 which only captured 15% of the win). For each
-        request in THIS step's batch order, look up the ell its own previous
-        step produced (keyed by req_id, so continuous-batching reorders are
-        handled). A request with no prior ell (new this step) gets mtp_k so it
-        is never under-verified. Values clamped to 1..mtp_k.
-        """
-        n = len(req_ids)
-        out = np.full(n, self.mtp_k, dtype=np.int32)
-        by_req = getattr(self, "_dspark_ell_by_req", None)
-        if not by_req:
-            return out
-        for i, rid in enumerate(req_ids):
-            v = by_req.get(rid)
-            if v is not None:
-                out[i] = min(max(int(v), 1), self.mtp_k)
-        return out
-
-    def _dspark_verify_lengths(self, scheduled_bs: int) -> np.ndarray:
-        """Per-request verify length for this step's verification.
-
-        NOT WIRED YET (Level B). calc_spec_decode_metadata intentionally uses a
-        static mtp_k instead of calling this, because shrinking num_draft_tokens
-        alone (without also shrinking model_runner tokens_per_seq + all the
-        bonus/target index math) desynchronizes the flat-batch indices and
-        breaks losslessness (GSM8K 98% -> 52%). This helper keeps the correct
-        ell + alignment-guard logic ready for the full Level B wiring (which must
-        change tokens_per_seq, KV reservation, and CUDA graph buckets together).
-
-        Returns the scheduler-chosen ell_r when available and consistent with
-        the current batch; otherwise the static mtp_k. Eager-only: variable
-        query length is incompatible with the fixed-shape decode CUDA graph.
-
-        Alignment guard: ell is produced by the previous step's propose() ordered
-        by that step's batch. If the batch size changed (continuous batching
-        added/removed requests) we cannot safely reuse it, so fall back to mtp_k.
-        Both paths are lossless; the fallback only forgoes truncation that step.
-        """
-        static = np.full(scheduled_bs, self.mtp_k, dtype=np.int32)
-        if not getattr(self, "dspark_confidence_schedule", False):
-            return static
-        if not self.config.enforce_eager:
-            # Variable-length verify needs eager (fixed decode graph otherwise).
-            return static
-        ell = getattr(self, "_dspark_last_ell", None)
-        if ell is None or ell.numel() != scheduled_bs:
-            return static
-        # ell in 0..mtp_k; clamp to >=1 (verifying 0 draft tokens degenerates the
-        # index math; 1 keeps at least the first speculative position).
-        ell_np = ell.detach().to("cpu").numpy().astype(np.int32)
-        np.clip(ell_np, 1, self.mtp_k, out=ell_np)
-        return ell_np
-
     def calc_spec_decode_metadata(
         self,
         num_sampled_tokens: np.ndarray,
@@ -996,22 +920,14 @@ class EagleProposer:
     ) -> SpecDecodeMetadata:
         scheduled_bs = len(num_sampled_tokens)
 
-        # Verify length is STATIC mtp_k here. The DSpark scheduler still computes
-        # ell_r in propose() and stashes it on self._dspark_last_ell, but this
-        # metadata MUST stay at mtp_k:
-        #   target forward always produces mtp_k+1 logits per request
-        #   (model_runner tokens_per_seq = num_spec_tokens+1 is fixed by the
-        #   input build + decode CUDA graph shape). num_sampled / cu_num_sampled /
-        #   bonus_logits_indices are all derived from that mtp_k+1 layout. If we
-        #   shrink num_draft_tokens to ell here WITHOUT also shrinking
-        #   tokens_per_seq, the draft/target/bonus indices desynchronize across
-        #   the flat batch (one request's bonus lands on another's logits) ->
-        #   wrong outputs (observed: GSM8K 98% -> 52%).
-        # Real variable-length verification (Level B) requires changing
-        # tokens_per_seq + every downstream index together (paper §5.2: top-K
-        # batch-capacity K + two-steps-prior causal barrier). Until then we keep
-        # mtp_k (lossless, parity Phase 1) and only collect ell for Level B.
-        num_draft_tokens = np.full(scheduled_bs, self.mtp_k, dtype=np.int32)
+        # num_draft = num_sampled - 1 per request. num_sampled_tokens is the
+        # per-seq token count for THIS forward (anchor + drafts). In Phase 1 that
+        # is mtp_k+1 (full). With DSpark plan Y the q-bucket already shrank it to
+        # q (uniform), so deriving num_draft from num_sampled keeps draft / target
+        # / bonus indices consistent with the actual forward layout — no separate
+        # mtp_k constant that could desync (the A-bug: 98%->52%).
+        num_draft_tokens = (np.asarray(num_sampled_tokens, dtype=np.int32) - 1)
+        np.clip(num_draft_tokens, 0, self.mtp_k, out=num_draft_tokens)
         sum_drafted_tokens = int(num_draft_tokens.sum())
 
         # Compute the bonus logits indices.

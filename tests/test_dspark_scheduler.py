@@ -323,11 +323,14 @@ import torch as _torch
 
 
 class _StubProposer:
-    """Mirrors EagleProposer.record_dspark_ell / _dspark_uniform_verify_len.
+    """Mirrors EagleProposer.record_dspark_ell + the q-bucket max-ell logic.
 
-    Importing EagleProposer pulls the heavy atom.config chain (stubbed in this
-    sandbox), so the two methods are mirrored verbatim. Keep in lockstep with
-    eagle.py if those change (name-matches-function rule).
+    record_dspark_ell is live production code (req_id remapping of ell across
+    continuous-batching reorders). max_mapped_ell mirrors the per-step
+    "max ell over the batch" that _dspark_apply_q_bucket computes inline before
+    quantizing to a graph bucket. Importing EagleProposer pulls the heavy
+    atom.config chain (stubbed here), so both are mirrored verbatim — keep in
+    lockstep with eagle.py / model_runner.py.
     """
 
     def __init__(self, mtp_k, ell):
@@ -344,7 +347,12 @@ class _StubProposer:
         n = min(len(req_ids), ell_np.shape[0])
         self._dspark_ell_by_req = {req_ids[i]: int(ell_np[i]) for i in range(n)}
 
-    def _dspark_uniform_verify_len(self, req_ids):
+    def max_mapped_ell(self, req_ids):
+        """max over the batch of mapped ell (clamped 1..mtp_k); missing -> mtp_k.
+
+        This is the value _dspark_apply_q_bucket feeds into quantize_to_bucket
+        (as max_ell+1). Mirrors that inline computation for testing.
+        """
         by_req = getattr(self, "_dspark_ell_by_req", None)
         if not by_req:
             return self.mtp_k
@@ -358,10 +366,10 @@ def test_ell_remap_by_req_id_reordered_batch():
     # Step N batch order [A,B,C] with ell [2,5,1]; step N+1 reorders to [C,A,B].
     p = _StubProposer(mtp_k=5, ell=[2, 5, 1])
     p.record_dspark_ell(["A", "B", "C"])
-    # Uniform L = max over current batch's mapped ell.
-    assert p._dspark_uniform_verify_len(["C", "A", "B"]) == 5  # max(1,2,5)
+    # max mapped ell over current batch (drives the q-bucket choice).
+    assert p.max_mapped_ell(["C", "A", "B"]) == 5  # max(1,2,5)
     # A subset batch [C, A] → max(1,2) = 2.
-    assert p._dspark_uniform_verify_len(["C", "A"]) == 2
+    assert p.max_mapped_ell(["C", "A"]) == 2
 
 
 def test_ell_remap_new_request_falls_back_to_mtpk():
@@ -369,19 +377,110 @@ def test_ell_remap_new_request_falls_back_to_mtpk():
     # never under-verified.
     p = _StubProposer(mtp_k=5, ell=[1, 1])
     p.record_dspark_ell(["A", "B"])
-    # "Z" is new this step -> contributes mtp_k=5 -> L=5.
-    assert p._dspark_uniform_verify_len(["A", "Z"]) == 5
+    # "Z" is new this step -> contributes mtp_k=5 -> max=5.
+    assert p.max_mapped_ell(["A", "Z"]) == 5
 
 
 def test_ell_remap_no_history_returns_mtpk():
     # First step ever (no ell recorded) -> no truncation.
     p = _StubProposer(mtp_k=5, ell=None)
     p.record_dspark_ell(["A", "B"])  # ell is None -> empty map
-    assert p._dspark_uniform_verify_len(["A", "B"]) == 5
+    assert p.max_mapped_ell(["A", "B"]) == 5
 
 
 def test_ell_remap_clamps_to_valid_range():
     p = _StubProposer(mtp_k=5, ell=[0, 0])  # scheduler said verify 0
     p.record_dspark_ell(["A", "B"])
     # Clamped to >=1 (verifying 0 degenerates index math).
-    assert p._dspark_uniform_verify_len(["A", "B"]) == 1
+    assert p.max_mapped_ell(["A", "B"]) == 1
+
+
+# ---- CUDA-graph query-length buckets (plan Y, §17) ----
+
+def test_resolve_q_buckets_parses_and_clamps():
+    from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+    # mtp_k=5 -> max_q=6
+    assert resolve_q_buckets("1,3,6", 6) == [1, 3, 6]
+    # out-of-range dropped, max_q always present
+    assert resolve_q_buckets("1,3,99", 6) == [1, 3, 6]
+    # empty -> just the full bucket
+    assert resolve_q_buckets("", 6) == [6]
+    # dups + unsorted normalized; max_q auto-added
+    assert resolve_q_buckets("3,1,3", 6) == [1, 3, 6]
+    # junk tolerated
+    assert resolve_q_buckets("1, x, 4", 6) == [1, 4, 6]
+
+
+def test_quantize_to_bucket_rounds_up():
+    from atom.spec_decode.dspark_scheduler import quantize_to_bucket
+    b = [1, 3, 6]
+    assert quantize_to_bucket(1, b) == 1
+    assert quantize_to_bucket(2, b) == 3   # round up
+    assert quantize_to_bucket(3, b) == 3
+    assert quantize_to_bucket(4, b) == 6   # round up
+    assert quantize_to_bucket(6, b) == 6
+    assert quantize_to_bucket(7, b) == 6   # cap at max
+
+
+def test_ragged_positions_construction():
+    """DSpark §5.2 ragged: per-req positions via cumsum+arange (the 10-req example).
+
+    Verifies prepare_decode's ragged branch builds correct per-seg positions
+    (anchored to the full-span head, never OOB) with no batch-level padding.
+    """
+    import numpy as np
+
+    scheduled_bs = 10
+    full_q = 6
+    # 5 reqs ell=2 (len 3), 4 reqs ell=1 (len 2), 1 req ell=3 (len 4)
+    lens = np.array([3, 3, 3, 3, 3, 2, 2, 2, 2, 4], dtype=np.int32)
+    context_lens = np.array(
+        [100, 200, 150, 300, 250, 400, 180, 220, 310, 500], dtype=np.int32
+    )
+
+    cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
+    np.cumsum(lens, out=cu[1:])
+    batch_ids = np.repeat(np.arange(scheduled_bs, dtype=np.int32), lens)
+    j_in_seq = np.arange(int(cu[-1]), dtype=np.int32) - cu[batch_ids].astype(np.int32)
+    positions = (context_lens - full_q)[batch_ids] + j_in_seq
+
+    # total = Σ(ell_i+1), no padding
+    assert int(cu[-1]) == 27
+    # each seg = [ctx_i-full_q .. ctx_i-full_q+len_i-1], anchor <= ctx-1
+    for i in range(scheduled_bs):
+        seg = positions[int(cu[i]) : int(cu[i + 1])]
+        expect = np.arange(lens[i]) + (context_lens[i] - full_q)
+        assert np.array_equal(seg, expect)
+        assert seg[0] <= context_lens[i] - 1  # no OOB
+    # vs full (10*6=60): ragged saves 55%
+    assert abs((1 - 27 / 60) - 0.55) < 1e-9
+
+
+def test_ragged_graph_bucket_plan_b():
+    """DSpark §5.2 plan B: ragged replays (bs, q_eff) graph, C=bs*q_eff CTAs.
+
+    q_eff = quantize_up(ceil(Σ(ell+1)/bs)); capacity bs*q_eff >= real Σ; the
+    tail to capacity is -1 padding (CTAs bail). Verifies the graph-capacity /
+    ForwardMode-recovery / pad-tail invariants for the 10-req example.
+    """
+    import numpy as np
+    from atom.spec_decode.dspark_scheduler import quantize_to_bucket, resolve_q_buckets
+
+    bs, full_q = 10, 6
+    buckets = resolve_q_buckets("1,3,6", full_q)
+    new_len = np.array([3, 3, 3, 3, 3, 2, 2, 2, 2, 4], dtype=np.int32)
+    total_new = int(new_len.sum())  # 27
+
+    q_ceil = (total_new + bs - 1) // bs  # ceil(27/10) = 3
+    q_eff = quantize_to_bucket(q_ceil, buckets)  # 3
+    cap = bs * q_eff  # 30
+
+    assert q_eff == 3 and cap == 30
+    assert cap >= total_new  # capacity must cover real ragged tokens
+    assert cap // q_eff == bs  # ForwardMode recovers bs from graph-capacity tokens
+    assert cap < bs * full_q  # saves CTAs vs full-length (30 < 60)
+
+    # pad tail batch_id = -1 (CTAs bail)
+    batch_id = np.full(cap, -1, dtype=np.int32)
+    batch_id[:total_new] = np.repeat(np.arange(bs), new_len)
+    assert (batch_id[total_new:] == -1).all()

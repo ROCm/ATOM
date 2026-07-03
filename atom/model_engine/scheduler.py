@@ -343,6 +343,23 @@ class ScheduledBatch:
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
 
+        # num_spec_query_tokens: SINGLE SOURCE OF TRUTH for this step's per-seq
+        # decode query length (= anchor + verified drafts). Sibling of
+        # num_spec_step. Default = num_spec_step + 1 (full MTP block). DSpark
+        # plan Y's `_dspark_apply_q_bucket` overwrites this with
+        # the chosen q-bucket when it shrinks the batch. EVERY consumer that
+        # needs "how many tokens per decode seq this step" (input_ids build,
+        # positions, ForwardMode bs recovery, draft anchor offset, ...) MUST
+        # read this field instead of re-deriving num_scheduled_tokens.max() or
+        # hardcoding mtp_k+1 — that scattered re-derivation was the source of a
+        # whole family of q-shrink desync bugs. For plain MTP (no shrink) the
+        # value stays num_spec_step + 1, so all consumers are unchanged.
+        self.num_spec_query_tokens = num_spec_step + 1
+        # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
+        # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when
+        # set, consumers must use it (per-seq) instead of the scalar above.
+        self.num_spec_query_tokens_per_req = None
+
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
         for seq in seqs.values():
@@ -1525,9 +1542,6 @@ class Scheduler:
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
-                # logger.info(
-                #     f"{seq.id=}, {num_new_token=} {num_rejected=} {self.mtp_k} {token_ids=} {seq.token_ids[-8:]=}"
-                # )
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob

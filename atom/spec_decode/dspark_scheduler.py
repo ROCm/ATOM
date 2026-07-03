@@ -253,10 +253,19 @@ def schedule_prefix_lengths_tensor(
     if early_stop:
         # First m with Theta(m+1) <= Theta(m): m* = that m (the local peak). The
         # reference breaks at the first non-increase, keeping the prior best.
+        # When there is no drop, m* = N (admit everything).
+        #
+        # NOTE: build the "N" fallback as a device tensor via arithmetic on an
+        # existing device tensor (theta), NOT `torch.tensor(N, device=device)`.
+        # The latter materializes a host scalar -> device under the active
+        # DeviceContext __torch_function__ guard, which on ROCm hangs the
+        # worker (observed: all 8 ranks frozen at this line, GPU 100%). Keeping
+        # everything on-device avoids the host->device scalar sync entirely.
         nonincrease = theta[1:] <= theta[:-1]  # [N] ; index k -> step m=k -> k+1
         has_drop = nonincrease.any()
         first_drop = nonincrease.int().argmax()  # 0 if none (guarded below)
-        m_star = torch.where(has_drop, first_drop, torch.tensor(N, device=device))
+        n_fallback = torch.full_like(first_drop, N)  # device tensor, no host sync
+        m_star = torch.where(has_drop, first_drop, n_fallback)
     else:
         m_star = theta.argmax()  # first global max
 
@@ -266,3 +275,43 @@ def schedule_prefix_lengths_tensor(
     ell = torch.zeros(R, dtype=torch.long, device=device)
     ell.scatter_add_(0, sorted_req, admitted.long())
     return ell
+
+
+def resolve_q_buckets(spec: str, max_q: int) -> list[int]:
+    """Parse the DSpark CUDA-graph query-length buckets (plan Y, §17.1).
+
+    Args:
+        spec: comma-separated decode_query_len values (e.g. "1,3,6"). Empty ->
+            single full bucket [max_q] (Phase-1 capture behavior).
+        max_q: full verify length = mtp_k + 1 (the largest valid bucket).
+
+    Returns:
+        Sorted ascending unique buckets, each clamped to 1..max_q, always
+        including max_q (the safe fallback bucket for un-quantizable steps).
+    """
+    out = set()
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            v = int(tok)
+        except ValueError:
+            continue
+        if 1 <= v <= max_q:
+            out.add(v)
+    out.add(max_q)  # always keep the full bucket as fallback
+    return sorted(out)
+
+
+def quantize_to_bucket(q: int, buckets: list[int]) -> int:
+    """Round a desired query length UP to the nearest available bucket.
+
+    Rounding UP (never down) guarantees the chosen graph verifies at least the
+    requested number of tokens -> a request is never under-verified. If q exceeds
+    all buckets, returns the largest (== max_q).
+    """
+    for b in buckets:
+        if b >= q:
+            return b
+    return buckets[-1]

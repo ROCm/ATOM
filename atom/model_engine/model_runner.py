@@ -379,7 +379,13 @@ class tokenIDProcessor:
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
             if self.use_spec:
-                token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
+                if getattr(batch, "num_spec_query_tokens_per_req", None) is not None:
+                    # RAGGED: scheduled_tokens is already the flat [anchor, drafts...]
+                    # layout per seq (scheduler populated drafts from seq.token_ids),
+                    # so no rectangular reshape/overwrite is needed.
+                    pass
+                else:
+                    token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
 
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
@@ -400,9 +406,29 @@ class tokenIDProcessor:
         num_deferred_seqs = len(deferred_curr_indices)
         num_new_seqs = len(new_curr_indices)
 
-        # Calculate token counts: in MTP mode, each seq has multiple tokens
-        if self.use_spec:
-            tokens_per_seq = self.num_spec_tokens + 1
+        # Calculate token counts: in MTP mode, each seq has multiple tokens.
+        # num_spec_query_tokens is the single source of truth (= mtp_k+1 for
+        # plain MTP, or the DSpark q-bucket when shrunk this step). See
+        # ScheduledBatch.num_spec_query_tokens.
+        _per_req = getattr(batch, "num_spec_query_tokens_per_req", None)
+        # RAGGED all-same: token counts MUST come from the true per-req lengths,
+        # not `num_seqs * scalar`. The scalar `num_spec_query_tokens` is q_eff
+        # (a graph bucket, can be 6 while the real ragged len is 3), so
+        # `num_seqs * q_eff` over-counts and corrupts the padding boundary in
+        # _ragged_fill_deferred_all_same. Only the all-same deferred layout is
+        # ragged-handled; the non-all-same (prefill-boundary) layout keeps the
+        # rectangular scalar path (new seqs get full length under ragged, so it
+        # stays consistent there — and that path's gathered_tokens assembly
+        # assumes the rectangular count).
+        if self.use_spec and _per_req is not None and is_all_same:
+            _pr = np.asarray(_per_req)
+            tokens_per_seq = int(batch.num_spec_query_tokens)
+            num_deferred_tokens = int(_pr[deferred_curr_indices].sum())
+            num_new_tokens = (
+                int(_pr[new_curr_indices].sum()) if len(new_curr_indices) else 0
+            )
+        elif self.use_spec:
+            tokens_per_seq = batch.num_spec_query_tokens
             num_deferred_tokens = num_deferred_seqs * tokens_per_seq
             num_new_tokens = num_new_seqs * tokens_per_seq
         else:
@@ -422,6 +448,20 @@ class tokenIDProcessor:
                 deferred_prev_indices
             ]
 
+        # RAGGED (DSpark §5.2): per-req lengths differ, so the rectangular
+        # reshape/cat below doesn't apply. Build input_ids by scattering each
+        # seq's [anchor, drafts...] into its cu-offset segment. Only the
+        # all-same deferred layout (steady-state decode) is ragged-handled; the
+        # prefill-boundary layouts fall back (ragged shrink is suppressed there
+        # by _dspark_apply_ragged seeing full lengths on new seqs).
+        ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
+        if ragged_lens is not None and is_all_same and self.use_spec:
+            self._ragged_fill_deferred_all_same(
+                batch, ragged_lens, num_deferred_tokens
+            )
+            input_ids = self.input_ids.gpu[:total_tokens]
+            return input_ids
+
         if is_all_same:
             # All requests are the same, only deferred tokens
             if self.use_spec:
@@ -430,10 +470,22 @@ class tokenIDProcessor:
                     self.draft_token_ids is not None
                     and self.pre_num_decode_token_per_seq > 1
                 ):
+                    # DSpark plan Y: self.draft_token_ids carries full mtp_k
+                    # columns from the previous step, but this step's q-bucket
+                    # wants only tokens_per_seq (= q) per seq. Truncate the draft
+                    # columns to q-1 so combined length == num_deferred_tokens
+                    # (= num_deferred_seqs * q). Mirrors the same truncation in
+                    # the non-all-same deferred path below (gathered_draft[:,
+                    # :n_draft]); without it combined is full-length (e.g. 66)
+                    # while the target is q-length (e.g. 33) -> expand mismatch.
+                    draft_cols = self.draft_token_ids
+                    n_draft = tokens_per_seq - 1
+                    if n_draft < draft_cols.shape[1]:
+                        draft_cols = draft_cols[:, :n_draft]
                     combined = torch.cat(
                         [
                             self.prev_token_ids.unsqueeze(1),  # (num_seqs, 1)
-                            self.draft_token_ids,  # (num_seqs, mtp_n_grams-1)
+                            draft_cols,  # (num_seqs, q-1)
                         ],
                         dim=1,
                     ).reshape(
@@ -478,10 +530,13 @@ class tokenIDProcessor:
                     ):
                         # draft_token_ids is 2D (num_seqs, mtp_n_grams-1), use direct indexing
                         gathered_draft = self.draft_token_ids[deferred_indices_gpu]
+                        n_draft = tokens_per_seq - 1
+                        if n_draft < gathered_draft.shape[1]:
+                            gathered_draft = gathered_draft[:, :n_draft]
                         gathered_tokens = torch.cat(
                             [
                                 gathered_prev.unsqueeze(1),  # (num_deferred_seqs, 1)
-                                gathered_draft,  # (num_deferred_seqs, mtp_n_grams-1)
+                                gathered_draft,  # (num_deferred_seqs, q-1)
                             ],
                             dim=1,
                         ).reshape(
@@ -535,6 +590,52 @@ class tokenIDProcessor:
                     self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
         input_ids = self.input_ids.gpu[:total_tokens]
         return input_ids
+
+    def _ragged_fill_deferred_all_same(self, batch, ragged_lens, num_deferred_tokens):
+        """Fill input_ids for the all-same deferred decode step under RAGGED.
+
+        Layout per seq i (length ragged_lens[i] = ell_i+1):
+          [ anchor_i (= prev_token_ids[i]),  draft_i[0 .. ell_i-1] ]
+        anchor from self.prev_token_ids [bs]; drafts from self.draft_token_ids
+        [bs, mtp_k] (full columns, sliced to ell_i-1). Scatter into the flat
+        input_ids buffer at per-seq cu offsets. Done on CPU then one H2D — the
+        token counts are tiny (Σ ell_i+1 ≤ bs*(mtp_k+1)).
+
+        Graph plan B: the real ragged tokens are DENSELY packed in [0:total];
+        the tail [total:num_deferred_tokens] is CUDA-graph-bucket padding
+        (num_deferred_tokens = bs*q_eff ≥ total, where q_eff quantizes UP to a
+        captured graph size). The graph replays the full bs*q_eff buffer, so the
+        padding slots must hold a LEGAL vocab id (0, not -1) or the embedding
+        gather goes OOB — their attention output is discarded via batch_id=-1.
+        Eager (num_deferred_tokens == total) skips the pad entirely.
+        """
+        lens = np.asarray(ragged_lens, dtype=np.int64)
+        bs = lens.shape[0]
+        cu = np.zeros(bs + 1, dtype=np.int64)
+        np.cumsum(lens, out=cu[1:])
+        total = int(cu[-1])
+        assert total <= num_deferred_tokens, (
+            f"ragged total {total} > num_deferred_tokens {num_deferred_tokens} "
+            f"(graph bucket capacity); ragged must fit within bs*q_eff"
+        )
+        anchors = self.prev_token_ids.detach().to("cpu").numpy()  # [bs]
+        drafts = (
+            self.draft_token_ids.detach().to("cpu").numpy()
+            if self.draft_token_ids is not None
+            else None
+        )  # [bs, mtp_k]
+        flat = self.input_ids.np
+        for i in range(bs):
+            s = int(cu[i])
+            flat[s] = anchors[i]
+            d = int(lens[i]) - 1
+            if d > 0 and drafts is not None:
+                flat[s + 1 : s + 1 + d] = drafts[i, :d]
+        # Graph-bucket tail padding: legal vocab id 0 (attention bails via
+        # batch_id=-1, so the value is never used, but embedding must not OOB).
+        if num_deferred_tokens > total:
+            flat[total:num_deferred_tokens] = 0
+        self.input_ids.copy_to_gpu(num_deferred_tokens)
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
@@ -1429,7 +1530,31 @@ class ModelRunner:
             return overhead
         # CUDA graph pool overhead is roughly 20% of single-pass activation
         # memory due to pooling across multiple captured batch sizes.
-        return int(activation_bytes * 0.2)
+        overhead = activation_bytes * 0.2
+        # DSpark plan Y captures one full graph set PER q-bucket (the
+        # `for max_q_len in q_buckets` loop in capture_model), so the graph
+        # pool grows ~linearly with the number of buckets. Without scaling the
+        # estimate here, KV-pool sizing over-allocates by (n_buckets-1)x the
+        # graph overhead -> OOM (Available Free mem: 0 MB) once a large
+        # concurrent decode batch fills the pool. Scale by the bucket count.
+        if hasattr(self, "drafter") and getattr(
+            self.drafter, "dspark_confidence_schedule", False
+        ):
+            from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+            from atom.utils import envs as _envs
+
+            full_q = self.drafter.mtp_k + 1
+            # Must match the var used by the capture loop so the estimate counts
+            # the graphs actually captured (ragged and q-bucket use different
+            # independent size sets).
+            _sizes_spec = (
+                _envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES
+                if _envs.ATOM_DSPARK_RAGGED
+                else _envs.ATOM_DSPARK_Q_BUCKETS
+            )
+            n_buckets = len(resolve_q_buckets(_sizes_spec, full_q))
+            overhead *= n_buckets
+        return int(overhead)
 
     def get_num_blocks(self) -> dict[str, int]:
         torch.set_default_device(self.device)
@@ -2011,7 +2136,299 @@ class ModelRunner:
             sync.ub_max_tokens_across_dp,
         )
 
+    def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> None:
+        """Shrink this decode step's per-seq verify length to one CUDA-graph
+        query bucket q (DSpark plan Y, §17.4 Y1: whole batch one bucket).
+
+        q = quantize_up(max_i(ell_i) + 1) over the batch's decode seqs, where
+        ell_i comes from the worker drafter's own {req_id: ell} map populated by
+        the previous step's propose() (record_dspark_ell, same process). The
+        target then forwards only q tokens/req (anchor + q-1 drafts) instead of
+        mtp_k+1, and replay picks the (bs, q) graph. The dropped draft suffix is
+        re-drafted next step -> lossless.
+
+        Mutates the worker's batch copy (pickled, not shared with scheduler):
+        num_scheduled_tokens, total_tokens_num{,_decode}, and truncates each
+        request's scheduled_spec_decode_tokens to q-1. KV stays reserved at
+        mtp_k+1 (scheduler untouched) — only the forward shrinks.
+        Returns early (no-op) unless DSpark confidence scheduling is on and this
+        is a pure-decode batch.
+        """
+        # Idempotency guard: prepare_model calls this before prepare_input_ids,
+        # and prepare_inputs (also reachable standalone for dummy/warmup) calls
+        # it again — only the first application must shrink the batch.
+        if getattr(batch, "_dspark_q_applied", False):
+            return
+        if not (
+            hasattr(self, "drafter")
+            and getattr(self.drafter, "dspark_confidence_schedule", False)
+        ):
+            return
+        if batch.total_tokens_num_prefill > 0:
+            return  # mixed/prefill step: keep full length
+        batch._dspark_q_applied = True
+        scheduled_bs = batch.total_seqs_num_decode
+        if scheduled_bs <= 0:
+            return
+        full_q = self.drafter.mtp_k + 1
+
+        # {req_id: ell} from the PREVIOUS step's propose() (record_dspark_ell,
+        # same process). The worker batch copy has req_ids but NOT the
+        # scheduler-side `seqs` dict, so look ell up by req_id. A request with no
+        # prior ell (new this step) -> full length (never under-verify).
+        by_req = getattr(self.drafter, "_dspark_ell_by_req", None) or {}
+        if not by_req:
+            return
+
+        # ==== RAGGED path (paper §5.2 avoid-padding) — FULLY INDEPENDENT =====
+        # This branch is hoisted ABOVE the q-bucket early-return so it never
+        # depends on ATOM_DSPARK_Q_BUCKETS. Each decode seq forwards its own
+        # ell_r+1 tokens (no batch-level pad to a single q). num_scheduled_tokens
+        # becomes a true ragged array; all V4 attn metadata/kernels are already
+        # per-token + marker-driven, so this is the only construction change.
+        # Graph replay picks a (bs, q_eff) graph captured from the independent
+        # ATOM_DSPARK_RAGGED_GRAPH_SIZES set. Anchor lower bound (q>=num_bonus+1)
+        # is applied PER REQUEST so each seg can hold its own anchor.
+        if envs.ATOM_DSPARK_RAGGED:
+            self._dspark_apply_ragged(batch, scheduled_bs, full_q, by_req)
+            return
+        # ====================================================================
+
+        # ---- Q-BUCKET path (older batch-uniform padding scheme) ------------
+        from atom.spec_decode.dspark_scheduler import (
+            quantize_to_bucket,
+            resolve_q_buckets,
+        )
+
+        buckets = resolve_q_buckets(envs.ATOM_DSPARK_Q_BUCKETS, full_q)
+        if buckets == [full_q]:
+            return  # no smaller buckets configured -> Phase-1 behavior
+
+        max_ell = 0
+        for rid in batch.req_ids[:scheduled_bs]:
+            ell = by_req.get(rid)
+            max_ell = full_q - 1 if ell is None else max(max_ell, int(ell))
+            if max_ell >= full_q - 1:
+                break
+
+        # CORRECTNESS LOWER BOUND on q (separate from the ell-driven target):
+        # `ell` is the scheduler's PREDICTION of how many drafts will be
+        # accepted, but the anchor (last verified target token) sits at the
+        # PREVIOUS step's ACTUAL accept count `num_bonus` within each q-length
+        # segment. If q-1 < num_bonus for any request, that request's anchor
+        # falls outside its (shrunk) segment -> the draft propose path's
+        # scatter/index_select goes OOB (observed: scatter_gather TensorAssign
+        # fault at bs=128 where a request was predicted ell small but actually
+        # accepted more). So q MUST also cover the largest realized num_bonus:
+        #   q >= max_num_bonus + 1
+        # This only enlarges q on the rare steps where reality beat the
+        # prediction; it never under-verifies and is a no-op when num_bonus is
+        # unavailable (first decode step / non-spec).
+        max_num_bonus = 0
+        num_bonus_arr = getattr(batch, "num_bonus", None)
+        if num_bonus_arr is not None:
+            nb = np.asarray(num_bonus_arr)[:scheduled_bs]
+            if nb.size > 0:
+                max_num_bonus = int(nb.max())
+        need = max(max_ell + 1, max_num_bonus + 1)
+        q = quantize_to_bucket(need, buckets)
+        if q >= full_q:
+            return  # no shrink possible this step
+
+        # Rebuild scheduled_tokens (flat [seq0 tokens | seq1 tokens | ...]) to the
+        # new q-per-seq layout BEFORE rewriting the counts (need the old per-seq
+        # lengths to slice). Pure-decode step (we returned early on prefill), so
+        # the array is entirely decode segments. Keep the first q of each seq's
+        # segment: token[0] is the anchor; the rest are placeholders overwritten
+        # by token_ids[:, 1:] = scheduled_spec_decode_tokens downstream.
+        old_nst = np.asarray(batch.num_scheduled_tokens, dtype=np.int32)
+        sched = np.asarray(batch.scheduled_tokens)
+        old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
+        np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
+        new_sched = np.empty(scheduled_bs * q, dtype=sched.dtype)
+        for i in range(scheduled_bs):
+            start = int(old_cu[i])
+            new_sched[i * q : (i + 1) * q] = sched[start : start + q]
+        batch.scheduled_tokens = new_sched
+
+        # Rewrite decode token counts to q (anchor + q-1 drafts) per seq.
+        nst = old_nst.copy()
+        prefill_tok = int(batch.total_tokens_num_prefill)
+        nst[:scheduled_bs] = q
+        batch.num_scheduled_tokens = nst
+        batch.total_tokens_num_decode = int(nst[:scheduled_bs].sum())
+        batch.total_tokens_num = prefill_tok + batch.total_tokens_num_decode
+        # Publish the chosen q as the single source of truth (see ScheduledBatch
+        # .num_spec_query_tokens). All downstream length consumers read this.
+        batch.num_spec_query_tokens = q
+        # Truncate each request's draft block to q-1 (regular matrix: all seqs q-1).
+        spec = batch.scheduled_spec_decode_tokens
+        if spec is not None and getattr(spec, "size", 0) > 0:
+            batch.scheduled_spec_decode_tokens = np.ascontiguousarray(spec[:, : q - 1])
+        if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+            logger.info(
+                "DSpark q-bucket: bs=%d q=%d (max_ell=%d, full=%d) "
+                "-> forward %d tok/req vs %d",
+                scheduled_bs, q, max_ell, full_q, q, full_q,
+            )
+
+    def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
+        """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
+
+        Sets num_scheduled_tokens[i] = ell_i + 1 PER REQUEST (no batch-level pad
+        to a single q). Each seq keeps the first ell_i+1 of its full mtp_k+1
+        draft span (anchor + ell_i drafts); the dropped suffix is re-drafted next
+        step -> lossless. Downstream V4 attn metadata is all marker-driven
+        (cu_seqlens / batch_id_per_token / kv_indptr via repeat+cumsum over
+        num_scheduled_tokens), so a ragged num_scheduled_tokens flows through
+        unchanged. KV stays reserved at mtp_k+1 (scheduler untouched).
+
+        Per-request anchor lower bound: each seg must hold its own anchor, which
+        sits at the previous step's realized num_bonus within the seg. So
+        len_i = max(ell_i, num_bonus_i) + 1, clamped to [1, full_q].
+        """
+        old_nst = np.asarray(batch.num_scheduled_tokens, dtype=np.int32)
+
+        # BOUNDARY GUARD: only shrink on steady-state steps where the current
+        # decode batch order EXACTLY matches the previous step (is_all_same). On
+        # prefill→decode boundary / batch-reorder steps (is_all_same == False),
+        # prepare_input_ids takes the rectangular non-all-same path, which does
+        # NOT understand ragged per-seq lengths — feeding it a ragged layout
+        # scatters each seq's anchor/draft to the wrong slot, producing whole-
+        # batch token duplication (observed: 37 DUP-SEAM in one step right after
+        # a prefill admit → GSM8K 0.95→0.9). On those steps keep full length
+        # (Phase-1 rectangular), lossless; the next steady step resumes ragged.
+        tp = getattr(self, "tokenID_processor", None)
+        prev_b = getattr(tp, "prev_batch", None) if tp is not None else None
+        cur_req = list(batch.req_ids[:scheduled_bs])
+        prev_req = list(prev_b.req_ids) if prev_b is not None else None
+        # is_all_same premise: previous batch is exactly this decode set, same
+        # order (no new/prefill seqs, no reorder). Any deviation → boundary step.
+        if prev_req is None or prev_req != cur_req:
+            return  # boundary / reorder step: skip ragged, stay rectangular
+
+        num_bonus_arr = getattr(batch, "num_bonus", None)
+        nb = (
+            np.asarray(num_bonus_arr)[:scheduled_bs]
+            if num_bonus_arr is not None
+            else None
+        )
+
+        # ANCHOR LOWER BOUND — CORRECTNESS CRITICAL.
+        # Each seq's anchor (last verified target token) sits at in-span offset
+        # num_bonus_i. If len_i <= num_bonus_i the anchor falls OUTSIDE the
+        # (shrunk) segment → wrong KV/attention → broken losslessness. At this
+        # point (prepare_model, before prepare_input_ids) batch.num_bonus is not
+        # yet remapped to the current req_id order, so per-seq nb[i] is not
+        # reliable; use the batch-wide MAX as a uniform lower bound (order-
+        # invariant, matches the lossless q-bucket path).
+        max_nb = int(nb.max()) if nb is not None and nb.size > 0 else 0
+
+        # Per-request forward length = max(ell_i, max_num_bonus) + 1, in [1, full_q].
+        new_len = np.empty(scheduled_bs, dtype=np.int32)
+        any_shrink = False
+        for i, rid in enumerate(batch.req_ids[:scheduled_bs]):
+            ell = by_req.get(rid)
+            ell_i = full_q - 1 if ell is None else int(ell)
+            ell_i = max(ell_i, max_nb)
+            li = ell_i + 1
+            if li < 1:
+                li = 1
+            elif li > full_q:
+                li = full_q
+            new_len[i] = li
+            if li < int(old_nst[i]):
+                any_shrink = True
+        if not any_shrink:
+            return  # nothing to shrink this step -> Phase-1 layout
+
+        # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
+        # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
+        # placeholders already populated by the scheduler from seq.token_ids).
+        sched = np.asarray(batch.scheduled_tokens)
+        old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
+        np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
+        new_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
+        np.cumsum(new_len, out=new_cu[1:])
+        total_new = int(new_cu[-1])
+        new_sched = np.empty(total_new, dtype=sched.dtype)
+        for i in range(scheduled_bs):
+            s_old = int(old_cu[i])
+            s_new = int(new_cu[i])
+            new_sched[s_new : s_new + new_len[i]] = sched[s_old : s_old + new_len[i]]
+        batch.scheduled_tokens = new_sched
+
+        nst = old_nst.copy()
+        nst[:scheduled_bs] = new_len
+        batch.num_scheduled_tokens = nst
+        prefill_tok = int(batch.total_tokens_num_prefill)
+        batch.total_tokens_num_decode = total_new
+        batch.total_tokens_num = prefill_tok + total_new
+        # Single source of truth (ragged):
+        #   * num_spec_query_tokens_per_req : the true ragged per-seq lengths.
+        #   * num_spec_query_tokens (scalar): the GRAPH BUCKET this step replays
+        #     (plan B). The captured graph for (bs, q) has capacity bs*q tokens;
+        #     ragged needs a bucket q_eff with bs*q_eff >= total_new, i.e.
+        #     q_eff = ceil(total_new / bs), quantized UP to an available bucket.
+        #     The real Σtokens (total_new) ≤ bs*q_eff; the tail [total_new :
+        #     bs*q_eff] is -1 padding (CTAs bail). This is the "K quantized to a
+        #     graph bucket" of paper §5.2, with C = bs*q_eff.
+        from atom.spec_decode.dspark_scheduler import (
+            quantize_to_bucket,
+            resolve_q_buckets,
+        )
+
+        # Independent of ATOM_DSPARK_Q_BUCKETS: ragged uses its own graph-size set.
+        buckets = resolve_q_buckets(envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES, full_q)
+        # The scalar num_spec_query_tokens is read by consumers that expect a
+        # single per-seq length (prepare_decode max_seqlen_q, ForwardMode graph
+        # key). It MUST be an UPPER BOUND on every seq's real len (= max new_len),
+        # NOT ceil(Σ/bs) (an AVERAGE — under-counts the longest seq: e.g. lens
+        # [6,1,1,1] avg=2.25→3 but max=6, so max_seqlen_q=3 truncates the len-6
+        # seq's positions/graph). Under eager this is exactly the batch-max real
+        # length (matches the lossless q-bucket scalar `q`). Under graph it's then
+        # quantized UP to a captured bucket (still an upper bound).
+        max_len = int(new_len.max()) if scheduled_bs > 0 else full_q
+        if self.enforce_eager:
+            # Eager: no CUDA graph → no bucket quantization needed. The scalar
+            # must be the exact batch-max real length so max_seqlen_q / positions
+            # match the actual ragged layout (mirrors q-bucket's exact `q`).
+            q_eff = max_len
+        else:
+            # Graph: quantize UP to a captured (bs, q_eff) bucket (upper bound).
+            q_eff = quantize_to_bucket(max_len, buckets)
+        batch.num_spec_query_tokens = int(q_eff)
+        batch.num_spec_query_tokens_per_req = new_len
+
+        # NOTE: an earlier revision built a flat `scheduled_spec_decode_tokens_flat`
+        # here by indexing `scheduled_spec_decode_tokens[i]` per decode seq. That
+        # was (a) DEAD — nothing downstream ever read the flat/cu fields — and
+        # (b) BUGGY: `scheduled_spec_decode_tokens` only contains rows for seqs
+        # that actually have drafts (scheduler builds it from
+        # `dict(values())` over seqs where `spec_token_ids.size > 0`), so its row
+        # count is <= scheduled_bs and its row order does NOT align 1:1 with the
+        # decode batch. Indexing it by decode-seq position both over-ran (255 vs
+        # 256) and mis-mapped rows. The ragged input_ids are assembled downstream
+        # from `self.prev_token_ids` (anchor) + `self.draft_token_ids` (the
+        # worker's draft output) in `_ragged_fill_deferred_all_same`, which never
+        # consults `scheduled_spec_decode_tokens`. So this block is removed.
+
+        if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+            logger.info(
+                "DSpark ragged: bs=%d Σ(ell+1)=%d vs full=%d (save %.1f%%) "
+                "len[min=%d,max=%d] | max_len=%d q_eff=%d graph_cap=%d "
+                "(graph_save=%.1f%%) buckets=%s",
+                scheduled_bs, total_new, scheduled_bs * full_q,
+                100.0 * (1 - total_new / (scheduled_bs * full_q)),
+                int(new_len.min()), int(new_len.max()),
+                int(max_len), int(q_eff), scheduled_bs * int(q_eff),
+                100.0 * (1 - (scheduled_bs * int(q_eff)) / (scheduled_bs * full_q)),
+                buckets,
+            )
+
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
+        # NOTE: DSpark q-bucket shrink happens in prepare_model BEFORE
+        # prepare_input_ids, so the batch is already reduced when we get here.
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
@@ -2026,15 +2443,40 @@ class ModelRunner:
         ) = self._preprocess(batch, num_scheduled_tokens=num_scheduled_tokens)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
 
+        # mtp_step = per-seq decode token count, used by ForwardMode.decide to
+        # recover batch size as num_input_tokens // mtp_step. This is exactly
+        # the batch's single-source-of-truth decode length (= mtp_k+1, or the
+        # DSpark q-bucket when shrunk); num_input_tokens = scheduled_bs *
+        # num_spec_query_tokens, so the division recovers bs correctly. Prefill
+        # has no drafter / uses 1.
+        decide_num_input_tokens = num_input_tokens
+        if (
+            not is_prefill
+            and getattr(batch, "num_spec_query_tokens_per_req", None) is not None
+        ):
+            # RAGGED (plan B graph): the real Σtokens (num_input_tokens) is
+            # irregular, but we replay the (bs, q_eff) graph whose capacity is
+            # bs*q_eff (q_eff = num_spec_query_tokens, the quantized bucket).
+            # Feed ForwardMode the GRAPH-CAPACITY token count so it recovers
+            # padded_scheduled_bs = bs*q_eff // q_eff = bs and picks the matching
+            # (bs, q_eff) graph. The real ragged tokens sit in [0:Σ]; the tail
+            # to bs*q_eff is -1 padding (CTAs bail).
+            q_eff = int(batch.num_spec_query_tokens)
+            mtp_step = q_eff
+            decide_num_input_tokens = batch.total_seqs_num_decode * q_eff
+        elif not is_prefill and hasattr(self, "drafter"):
+            mtp_step = batch.num_spec_query_tokens
+        else:
+            mtp_step = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
         forward_mode = ForwardMode.decide(
             is_prefill=is_prefill,
             total_seqs_num=batch.total_seqs_num,
             scheduled_bs_decode=batch.total_seqs_num_decode,
-            num_input_tokens=num_input_tokens,
+            num_input_tokens=decide_num_input_tokens,
             dp_uniform_decode=dp_uniform_decode,
             enforce_eager=self.enforce_eager,
             graph_bs=self.graph_bs,
-            mtp_step=(self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1,
+            mtp_step=mtp_step,
         )
 
         if not is_prefill:
@@ -2152,6 +2594,14 @@ class ModelRunner:
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
     def prepare_model(self, batch: ScheduledBatch):
+        # DSpark plan Y: shrink the batch to the chosen q-bucket FIRST, before
+        # anything reads it. prepare_input_ids (builds input_ids) and
+        # prepare_inputs (builds cu_seqlens / attn metadata) must both see the
+        # reduced per-seq token count, or input_ids stays full-length while the
+        # metadata is q -> "batch_id_per_token len < T" desync. (This call used
+        # to live inside prepare_inputs, which runs AFTER prepare_input_ids —
+        # too late, so the shrink never reached input_ids.)
+        self._dspark_apply_q_bucket(batch)
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
@@ -2525,7 +2975,77 @@ class ModelRunner:
         forward_context = get_forward_context()
 
         positions = forward_context.context.positions
+        # Anchor (last verified target token) flat index = segment_start +
+        # num_bonus. prepare_inputs counts back from each segment's END
+        # (cu_seqlens_q[1:]), so offset = full_q - num_bonus = 1 + num_reject.
         last_token_offset = 1 + num_reject_tokens
+
+        # DSpark plan Y q-shrink: this step's cu_seqlens_q segments are length q
+        # (= batch.num_spec_query_tokens, < full_q = mtp_k+1), but
+        # `num_reject_tokens` is measured against the full mtp_k block (kept
+        # full-length on purpose — the scheduler uses it for KV rollback). So
+        # the END-relative offset over-counts by (full_q - q): it would index
+        # into the previous segment / go negative -> index_select OOB in the
+        # draft backbone. Subtract the shrink so the anchor lands at
+        # (segment_start + num_bonus), identical to Phase 1. No-op when not
+        # shrunk (q == full_q) or on prefill/mixed steps.
+        ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
+        if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
+            # RAGGED: each seg has its own length len_i; the anchor sits at
+            # segment offset num_bonus_i (= mtp_k - num_reject_i). prepare_inputs
+            # computes cu_seqlens_q[1:] (ragged seg ends) - offset, so the
+            # per-req offset to land on the anchor is len_i - num_bonus_i.
+            sbs = batch.total_seqs_num_decode
+            lens_t = torch.as_tensor(
+                np.asarray(ragged_lens)[:sbs],
+                device=num_reject_tokens.device,
+                dtype=num_reject_tokens.dtype,
+            )
+            num_bonus = self.drafter.mtp_k - num_reject_tokens[:sbs]
+            last_token_offset = lens_t - num_bonus
+            if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+                # Anchor index = cu_seqlens_q[1:] - offset. It must land inside
+                # each seq's own [seg_start, seg_end) segment, i.e.
+                # 1 <= offset <= len_i. offset = len_i - num_bonus, so the guard
+                # is 0 <= num_bonus <= len_i - 1. A violation here is the exact
+                # cause of the scatter/index_select OOB (async GPU coredump).
+                off_cpu = last_token_offset.detach().to("cpu")
+                len_cpu = lens_t.detach().to("cpu")
+                nb_cpu = num_bonus.detach().to("cpu")
+                bad = (off_cpu < 1) | (off_cpu > len_cpu)
+                logger.info(
+                    "DSpark draft anchor ragged: bs=%d len[min=%d,max=%d] "
+                    "offset[min=%d,max=%d] num_bonus[min=%d,max=%d] bad=%d",
+                    sbs, int(len_cpu.min()), int(len_cpu.max()),
+                    int(off_cpu.min()), int(off_cpu.max()),
+                    int(nb_cpu.min()), int(nb_cpu.max()), int(bad.sum()),
+                )
+                if bad.any():
+                    idx = int(bad.nonzero()[0])
+                    logger.error(
+                        "DSpark anchor OOB: seq=%d len=%d num_bonus=%d offset=%d "
+                        "num_reject=%d mtp_k=%d",
+                        idx, int(len_cpu[idx]), int(nb_cpu[idx]),
+                        int(off_cpu[idx]),
+                        int(num_reject_tokens[:sbs].detach().to("cpu")[idx]),
+                        self.drafter.mtp_k,
+                    )
+        elif (
+            hasattr(self, "drafter")
+            and getattr(self.drafter, "dspark_confidence_schedule", False)
+            and batch.total_tokens_num_prefill == 0
+        ):
+            full_q = self.drafter.mtp_k + 1
+            q_actual = batch.num_spec_query_tokens
+            if 1 <= q_actual < full_q:
+                last_token_offset = last_token_offset - (full_q - q_actual)
+                if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+                    logger.info(
+                        "DSpark draft anchor q-shrink: bs=%d q=%d full_q=%d "
+                        "offset-=%d",
+                        batch.total_seqs_num_decode, q_actual, full_q,
+                        full_q - q_actual,
+                    )
 
         assert isinstance(self.drafter, EagleProposer)
 
@@ -2676,11 +3196,35 @@ class ModelRunner:
                 gc.collect()
 
         _rsv_before_capture = torch.cuda.memory_reserved()
+        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        # DSpark Phase 2 (plan Y): capture one graph per (bs, query-length bucket)
+        # so a decode step can replay a SMALLER max_q_len when the scheduler chose
+        # a shorter verify length. Each bucket is rectangular -> reuses the
+        # existing capture body + prepare_decode unchanged (no V4-attn variable
+        # query). Buckets default to [full_q_len] (Phase-1 single-graph behavior).
+        q_buckets = [full_q_len]
+        if hasattr(self, "drafter") and getattr(
+            self.drafter, "dspark_confidence_schedule", False
+        ):
+            from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+
+            # RAGGED path uses its own independent graph-size set; the older
+            # q-bucket path uses ATOM_DSPARK_Q_BUCKETS. Pick the right source so
+            # the smaller graphs that each path replays actually get captured.
+            if envs.ATOM_DSPARK_RAGGED:
+                q_buckets = resolve_q_buckets(
+                    envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES, full_q_len
+                )
+                logger.info("DSpark RAGGED CUDA-graph query sizes: %s", q_buckets)
+            else:
+                q_buckets = resolve_q_buckets(envs.ATOM_DSPARK_Q_BUCKETS, full_q_len)
+                logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
+
         with pause_gc(), graph_capture() as capture_ctx:
+          for max_q_len in q_buckets:
             capture_range = (
                 tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
             )
-            max_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
             for bs in capture_range:
                 if self.rank == 0:
                     capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")
@@ -2720,7 +3264,9 @@ class ModelRunner:
                     np.arange(num_tokens, dtype=np.int64) % max_q_len
                 )
                 attn_metadata, context = (
-                    self.attn_metadata_builder.build_for_cudagraph_capture(bs=bs)
+                    self.attn_metadata_builder.build_for_cudagraph_capture(
+                        bs=bs, max_q_len=max_q_len
+                    )
                 )
                 if self.use_mrope:
                     mrope_positions = self._mrope_positions_view(num_tokens)
