@@ -52,7 +52,8 @@ class _StubKVCacheTensor:
 class _StubParallelConfig:
     """Placeholder for ParallelConfig."""
 
-    pass
+    def __init__(self, data_parallel_size: int = 1):
+        self.data_parallel_size = data_parallel_size
 
 
 _atom_config.Config = _StubConfig
@@ -146,6 +147,12 @@ class MockConfig:
             stop_token_ids=[],
             scheduler_delay_factor=0.0,
             speculative_config=None,
+            # DP size gates the dense-batch prefill hold (see Scheduler). Default
+            # 1 (gate off) so unrelated tests keep legacy behavior; gate tests
+            # pass data_parallel_size>1.
+            parallel_config=_StubParallelConfig(
+                data_parallel_size=overrides.pop("data_parallel_size", 1)
+            ),
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
             hf_config=_MockHFConfig(),
