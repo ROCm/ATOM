@@ -155,7 +155,7 @@ jobs:
           if [ -z "$HF_CACHE_ROOT" ]; then
             HF_CACHE_ROOT="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/huggingface"
           fi
-          HF_CACHE_MOUNT="-v ${HF_CACHE_ROOT}:/root/.cache/huggingface"
+          HF_CACHE_MOUNT="-v ${HF_CACHE_ROOT}:/hf-cache"
           mkdir -p "$HF_CACHE_ROOT"
           echo "Using HuggingFace cache root: ${HF_CACHE_ROOT}"
           df -h "$HF_CACHE_ROOT" || true
@@ -266,10 +266,10 @@ jobs:
             --ulimit stack=67108864 \
             --env-file "$SGLANG_ENV_FILE" \
             -e HF_TOKEN="${HF_TOKEN:-}" \
-            -e HF_HOME="/root/.cache/huggingface" \
-            -e HF_HUB_CACHE="/root/.cache/huggingface/hub" \
-            -e HF_DATASETS_CACHE="/root/.cache/huggingface/datasets" \
-            -e TRANSFORMERS_CACHE="/root/.cache/huggingface/transformers" \
+            -e HF_HOME="/hf-cache" \
+            -e HF_HUB_CACHE="/hf-cache/hub" \
+            -e HF_DATASETS_CACHE="/hf-cache/datasets" \
+            -e TRANSFORMERS_CACHE="/hf-cache/transformers" \
             --name "$CONTAINER_NAME" \
             "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
         env:
