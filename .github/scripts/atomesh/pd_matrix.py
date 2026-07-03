@@ -174,14 +174,17 @@ def build_cell(
 
     prefill_cfg = deep_merge(
         backend_cfg.get("service", {}).get("prefill", {}),
+        model_cfg.get("service", {}).get("prefill", {}),
         suite_cfg.get("prefill", {}),
     )
     decode_cfg = deep_merge(
         backend_cfg.get("service", {}).get("decode", {}),
+        model_cfg.get("service", {}).get("decode", {}),
         suite_cfg.get("decode", {}),
     )
     router_cfg = deep_merge(
         backend_cfg.get("service", {}).get("router", {}),
+        model_cfg.get("service", {}).get("router", {}),
         suite_cfg.get("router", {}),
     )
     pd_worker_layout = str(suite_cfg.get("pd_worker_layout", "multi_node"))

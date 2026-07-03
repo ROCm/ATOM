@@ -175,15 +175,23 @@ if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
   decode_parallel+=("--enable-dp-attention")
 fi
 
-cudagraph_args=()
-case "${DECODE_CUDAGRAPH:-}" in
-  ""|none|None|NONE|false|False|FALSE|off|Off|OFF|disabled|Disabled|DISABLED)
-    cudagraph_args=()
-    ;;
-  *)
-    cudagraph_args=(--cudagraph-capture-sizes "${DECODE_CUDAGRAPH}")
-    ;;
-esac
+build_cudagraph_args() {
+  local value="$1"
+  local -n out="$2"
+  case "${value:-}" in
+    ""|none|None|NONE|false|False|FALSE|off|Off|OFF|disabled|Disabled|DISABLED)
+      out=()
+      ;;
+    *)
+      out=(--cudagraph-capture-sizes "${value}")
+      ;;
+  esac
+}
+
+prefill_cudagraph_args=()
+decode_cudagraph_args=()
+build_cudagraph_args "${PREFILL_CUDAGRAPH:-}" prefill_cudagraph_args
+build_cudagraph_args "${DECODE_CUDAGRAPH:-}" decode_cudagraph_args
 
 server_common=(
   --model "${MODEL_PATH}"
@@ -296,13 +304,14 @@ start_prefill() {
   local server_port="${2:-${PREFILL_PORT}}"
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
-  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port}"
+  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
   python3 -m atom.entrypoints.openai_server \
     "${server_common[@]}" \
     --server-port "${server_port}" \
     "${prefill_parallel[@]}" \
     --max-num-seqs "${MAX_NUM_SEQS}" \
     --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}" \
+    "${prefill_cudagraph_args[@]}" \
     ${PREFILL_SERVER_ARGS} \
     2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
   server_pid=$!
@@ -326,7 +335,7 @@ start_decode() {
     "${decode_parallel[@]}" \
     --max-num-seqs "${decode_max_num_seqs}" \
     --kv-transfer-config "{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}" \
-    "${cudagraph_args[@]}" \
+    "${decode_cudagraph_args[@]}" \
     ${DECODE_SERVER_ARGS} \
     2>&1 | tee "${RUN_DIR}/logs/decode-rank-${NODE_RANK}.log" &
   server_pid=$!

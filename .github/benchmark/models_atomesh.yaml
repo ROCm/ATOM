@@ -149,7 +149,7 @@ models:
           runner:
             time_limit: "04:00:00"
           run_eval: true
-          eval_concurrency: [64]
+          eval_concurrency: [64, 256]
 
         - name: kimi-k25-2p1d-tp4
           topology: 2p1d
@@ -169,7 +169,7 @@ models:
           runner:
             time_limit: "06:00:00"
           run_eval: true
-          eval_concurrency: [128]
+          eval_concurrency: [128, 768]
 
     accuracy:
       task: gsm8k
@@ -198,6 +198,10 @@ models:
         online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}'
         hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
         extra_args: ""
+    service:
+      decode:
+        cudagraph: &minimax_decode_cudagraph_256 >-
+          [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
     suites:
       nightly:
         - name: minimax-m3-fp4-1p1d-tp4
@@ -341,6 +345,9 @@ models:
         online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}'
         hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
         extra_args: ""
+    service:
+      decode:
+        cudagraph: *minimax_decode_cudagraph_256
     suites:
       nightly:
         - name: minimax-m3-fp8-1p1d-tp4

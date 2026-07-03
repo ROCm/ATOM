@@ -116,6 +116,7 @@ exports = {
     "DECODE_TP": decode.get("tp", 8),
     "PREFILL_ENABLE_DP": str(prefill.get("enable_dp_attention", False)).lower(),
     "DECODE_ENABLE_DP": str(decode.get("enable_dp_attention", False)).lower(),
+    "PREFILL_CUDAGRAPH": prefill.get("cudagraph", ""),
     "DECODE_CUDAGRAPH": decode.get("cudagraph", ""),
     "PREFILL_PORT": prefill.get("port", 8010),
     "DECODE_PORT": decode.get("port", 8020),
