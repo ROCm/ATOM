@@ -75,6 +75,16 @@ on:
         required: false
         default: mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
         type: string
+      benchmark_concurrency:
+        description: 'Optional benchmark concurrency override, e.g. 1,2,4 (no quotes)'
+        required: false
+        default: ''
+        type: string
+      eval_concurrency:
+        description: 'Optional lm_eval concurrency override, e.g. 64 or 32,64 (no quotes)'
+        required: false
+        default: ''
+        type: string
       run_model_benchmark:
         description: 'Run model Slurm benchmark for workflow_dispatch'
         required: false
@@ -118,12 +128,16 @@ jobs:
           SUITE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
           MODEL_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.model != 'all' && inputs.model || '' }}
           ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+          ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
+          ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
         run: |
           set -euo pipefail
           python3 .github/scripts/atomesh/pd_matrix.py \
             --suite "$SUITE" \
             ${MODEL_NAME:+--model "$MODEL_NAME"} \
             ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+            ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
+            ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
             --output atomesh-matrix.json \
             --github-output
           cat atomesh-matrix.json

@@ -35,6 +35,19 @@ def normalize_list(value: Any) -> list[Any]:
     return [value]
 
 
+def parse_int_list(value: Any, field_name: str) -> list[int]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        raw_values = [item for item in re.split(r"[,\s]+", value.strip()) if item]
+    else:
+        raw_values = normalize_list(value)
+    try:
+        return [int(item) for item in raw_values]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a list of integers") from exc
+
+
 def resolve_env_refs(value: str) -> str:
     def expand_env(match: re.Match[str]) -> str:
         name = match.group(1)
@@ -122,6 +135,8 @@ def build_cell(
     suite_name: str,
     suite_cfg: dict[str, Any],
     override_image: str | None,
+    override_benchmark_concurrency: list[int] | None,
+    override_eval_concurrency: list[int] | None,
 ) -> dict[str, Any]:
     defaults = cfg.get("defaults", {})
     backend_name = str(model_cfg.get("backend", "atom"))
@@ -186,21 +201,21 @@ def build_cell(
         model_cfg.get("accuracy", {}), suite_cfg.get("accuracy", {})
     )
 
-    concurrency = [int(value) for value in normalize_list(suite_cfg.get("concurrency"))]
+    concurrency = override_benchmark_concurrency or parse_int_list(
+        suite_cfg.get("concurrency"), "concurrency"
+    )
     isl = [int(value) for value in normalize_list(suite_cfg.get("isl"))]
     if not concurrency or not isl:
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} must define isl and concurrency"
         )
     eval_concurrency = (
-        suite_cfg.get("eval_concurrency")
+        override_eval_concurrency
+        or suite_cfg.get("eval_concurrency")
         or accuracy_cfg.get("eval_concurrency")
         or concurrency
     )
-    accuracy_concurrency = [
-        int(value)
-        for value in normalize_list(eval_concurrency)
-    ]
+    accuracy_concurrency = parse_int_list(eval_concurrency, "eval_concurrency")
 
     topology = str(suite_cfg["topology"])
     display_topology = format_display_topology(
@@ -260,6 +275,8 @@ def build_cells(
     suite: str,
     model_filter: str | None,
     override_image: str | None,
+    override_benchmark_concurrency: list[int] | None,
+    override_eval_concurrency: list[int] | None,
 ) -> list[dict[str, Any]]:
     cells = []
     for model_name, model_cfg in (cfg.get("models") or {}).items():
@@ -275,6 +292,8 @@ def build_cells(
                     suite_name=suite,
                     suite_cfg=suite_cfg,
                     override_image=override_image,
+                    override_benchmark_concurrency=override_benchmark_concurrency,
+                    override_eval_concurrency=override_eval_concurrency,
                 )
             )
     return cells
@@ -296,23 +315,39 @@ def main() -> int:
     parser.add_argument("--suite", default=os.environ.get("SUITE", "smoke"))
     parser.add_argument("--model", default=os.environ.get("MODEL_NAME") or None)
     parser.add_argument("--image", default=os.environ.get("ATOMESH_IMAGE") or None)
+    parser.add_argument(
+        "--benchmark-concurrency",
+        default=os.environ.get("ATOMESH_BENCHMARK_CONCURRENCY") or None,
+        help="Optional comma-separated benchmark concurrency override",
+    )
+    parser.add_argument(
+        "--eval-concurrency",
+        default=os.environ.get("ATOMESH_EVAL_CONCURRENCY") or None,
+        help="Optional comma-separated lm_eval concurrency override",
+    )
     parser.add_argument("--output", help="Optional output JSON path")
     parser.add_argument("--github-output", action="store_true")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))
+    benchmark_concurrency = parse_int_list(
+        args.benchmark_concurrency, "benchmark_concurrency"
+    )
+    eval_concurrency = parse_int_list(args.eval_concurrency, "eval_concurrency")
     cells = build_cells(
         config,
         suite=args.suite,
         model_filter=args.model,
         override_image=args.image,
+        override_benchmark_concurrency=benchmark_concurrency or None,
+        override_eval_concurrency=eval_concurrency or None,
     )
     print(f"Generated {len(cells)} ATOMesh benchmark cell(s) for suite={args.suite}")
     for cell in cells:
         print(
             f"  {cell['id']}: {cell['model']} {cell['display_topology']} "
             f"nodes={','.join(cell['nodes'])} isl={cell['isl']} osl={cell['osl']} "
-            f"conc={cell['concurrency']}"
+            f"conc={cell['concurrency']} eval_conc={cell['accuracy']['concurrency']}"
         )
 
     if args.output:
