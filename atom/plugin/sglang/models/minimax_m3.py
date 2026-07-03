@@ -44,8 +44,9 @@ def _sparse_forward_for_sglang(
     self: MiniMaxM3SparseAttention,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    qkv = self.qkv_proj(hidden_states)
+    qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
     if isinstance(qkv, tuple):
         qkv = qkv[0]
 
