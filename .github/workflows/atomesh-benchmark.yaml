@@ -17,8 +17,10 @@ on:
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
-    # Nightly at 00:01 Beijing time (16:01 UTC)
-    - cron: '1 16 * * *'
+    # Start weekend nightly runs at 21:00 Beijing time (13:00 UTC).
+    # Runs are expected to occupy the Sat 21:00-Sun 09:00 and Sun 21:00-Mon 09:00 windows.
+    - cron: '0 13 * * 6'
+    - cron: '0 13 * * 0'
   workflow_dispatch:
     inputs:
       suite:
