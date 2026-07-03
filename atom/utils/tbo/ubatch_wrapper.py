@@ -5,7 +5,7 @@ import logging
 import threading
 import traceback
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,8 @@ from .ubatching import make_tbo_contexts
 
 logger = logging.getLogger("atom")
 
+UBatchModelOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
+
 
 @dataclass
 class TBOGraphData:
@@ -29,7 +31,7 @@ class TBOGraphData:
 
     graph: torch.cuda.CUDAGraph
     tbo_ctxs: list  # keep torch.Event objects alive for replay
-    output: Any = None  # output tensor reference from capture
+    output: Optional[UBatchModelOutput] = None  # output reference from capture
 
 
 class UBatchWrapper(nn.Module):
@@ -55,7 +57,9 @@ class UBatchWrapper(nn.Module):
         if self.comm_stream is None:
             self.comm_stream = torch.cuda.Stream()
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> UBatchModelOutput:
         ctx = get_forward_context()
         if ctx.ubatch_slices is None:
             return self.model(input_ids, positions)
@@ -66,7 +70,7 @@ class UBatchWrapper(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-    ) -> torch.Tensor:
+    ) -> UBatchModelOutput:
         """Launch threads that each call self.model() inside a TBOContext."""
         self._ensure_comm_stream()
         original_ctx = ctx
@@ -131,7 +135,7 @@ class UBatchWrapper(nn.Module):
             ready_barrier=self.ready_barrier,
         )
 
-        results: list[tuple[int, torch.Tensor]] = []
+        results: list[tuple[int, UBatchModelOutput]] = []
         errors: list[Optional[Exception]] = [None] * N
 
         device = input_ids.device
@@ -148,7 +152,7 @@ class UBatchWrapper(nn.Module):
                 ub_input_ids, ub_positions = ub_inputs[idx]
                 with tbo_ctxs[idx]:
                     model_output = self.model(ub_input_ids, ub_positions)
-                results.append((idx, model_output))
+                results.append((idx, self._validate_ubatch_output(model_output)))
             except Exception as e:
                 # `logger.exception` captures the full traceback to the atom
                 # logger (which goes to stderr + log file); previously the
@@ -186,7 +190,7 @@ class UBatchWrapper(nn.Module):
                 raise e
 
         sorted_results = [value for _, value in sorted(results)]
-        return torch.cat(sorted_results, dim=0)
+        return self._concat_ubatch_outputs(sorted_results)
 
     def capture_tbo_graph(
         self,
@@ -195,7 +199,7 @@ class UBatchWrapper(nn.Module):
         graph_pool,
         capture_stream: torch.cuda.Stream,
         output_buffer: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+    ) -> tuple[torch.cuda.CUDAGraph, UBatchModelOutput]:
         """Capture a CUDAGraph for TBO ubatch execution.
 
         Threads are started and cuBLAS is initialized BEFORE graph capture
@@ -246,7 +250,7 @@ class UBatchWrapper(nn.Module):
             ready_barrier=self.ready_barrier,
         )
 
-        results: list[tuple[int, torch.Tensor]] = []
+        results: list[tuple[int, UBatchModelOutput]] = []
         errors: list[Optional[Exception]] = [None] * N
         device = input_ids.device
 
@@ -264,7 +268,7 @@ class UBatchWrapper(nn.Module):
                 ub_input_ids, ub_positions = ub_inputs[idx]
                 with tbo_ctxs[idx]:
                     model_output = self.model(ub_input_ids, ub_positions)
-                results.append((idx, model_output))
+                results.append((idx, self._validate_ubatch_output(model_output)))
             except Exception as e:
                 traceback.print_exc()
                 errors[idx] = e
@@ -292,10 +296,10 @@ class UBatchWrapper(nn.Module):
                     t.join()
                 # Concatenate results (this op is captured too)
                 sorted_results = [v for _, v in sorted(results)]
-                output = torch.cat(sorted_results, dim=0)
+                output = self._concat_ubatch_outputs(sorted_results)
                 # Copy into caller's buffer so replay writes to the right place
                 if output_buffer is not None:
-                    output_buffer.copy_(output)
+                    output_buffer.copy_(self._primary_output(output))
         finally:
             _forward_context_local.ctx = saved_ctx
 
@@ -313,6 +317,56 @@ class UBatchWrapper(nn.Module):
         logger.info(f"[TBO] Captured CUDAGraph for {graph_key}")
 
         return graph, output
+
+    @staticmethod
+    def _concat_ubatch_outputs(
+        outputs: list[UBatchModelOutput],
+    ) -> UBatchModelOutput:
+        """Concatenate Tensor or Eagle3 aux outputs from per-ubatch forwards."""
+        first = outputs[0]
+        if isinstance(first, torch.Tensor):
+            if not all(isinstance(output, torch.Tensor) for output in outputs):
+                raise TypeError("TBO ubatch outputs must have matching structures")
+            return torch.cat(outputs, dim=0)
+
+        if not all(isinstance(output, tuple) for output in outputs):
+            raise TypeError("TBO ubatch outputs must have matching structures")
+
+        hidden_states = torch.cat([output[0] for output in outputs], dim=0)
+        num_aux = len(first[1])
+        if not all(len(output[1]) == num_aux for output in outputs):
+            raise ValueError("TBO ubatch aux output counts must match")
+        aux_hidden_states = [
+            torch.cat([output[1][idx] for output in outputs], dim=0)
+            for idx in range(num_aux)
+        ]
+        return hidden_states, aux_hidden_states
+
+    @staticmethod
+    def _primary_output(output: UBatchModelOutput) -> torch.Tensor:
+        """Return the tensor backed by ModelRunner's preallocated output buffer."""
+        if isinstance(output, tuple):
+            return output[0]
+        return output
+
+    @staticmethod
+    def _validate_ubatch_output(output: object) -> UBatchModelOutput:
+        """Accept only the TBO output contracts: Tensor or Eagle3 aux tuple."""
+        if isinstance(output, torch.Tensor):
+            return output
+        if (
+            isinstance(output, tuple)
+            and len(output) == 2
+            and isinstance(output[0], torch.Tensor)
+            and isinstance(output[1], list)
+            and all(isinstance(aux, torch.Tensor) for aux in output[1])
+        ):
+            return output
+        raise TypeError(
+            "TBO ubatch output must be a Tensor or "
+            "(Tensor, list[Tensor]), got "
+            f"{type(output).__name__}"
+        )
 
     @staticmethod
     def _get_dp_size() -> int:

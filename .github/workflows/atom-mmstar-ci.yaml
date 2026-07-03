@@ -165,39 +165,19 @@ jobs:
           echo "Downloading aiter wheel: ${wheel_name}"
           curl -fsSL "${resolved_wheel_url}" -o "aiter-whl/${wheel_name}"
 
+      # Shared container boilerplate. MODEL_CACHE_MOUNT here is exactly the
+      # `-v /models:/models` that setup-gpu-container mounts automatically, so
+      # it isn't passed through; pull-policy:always reproduces the prior
+      # explicit `docker pull`.
       - name: Start validation container
-        run: |
-          if [ -f "/etc/podinfo/gha-render-devices" ]; then
-            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-          else
-            DEVICE_FLAG="--device /dev/dri"
-          fi
-
-          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
-          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
-
-          cat > /tmp/mmstar_env_file.txt << 'EOF'
-          ${{ matrix.env_vars }}
-          EOF
-
-          docker pull "${ATOM_BASE_IMAGE}"
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
-            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-            $MODEL_MOUNT \
-            -w /workspace \
-            --ipc=host --group-add video \
-            --shm-size=16G \
-            --privileged \
-            --cap-add=SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            --env-file /tmp/mmstar_env_file.txt \
-            -e HF_TOKEN="${HF_TOKEN:-}" \
-            --name "$CONTAINER_NAME" \
-            "${ATOM_BASE_IMAGE}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
+        uses: ./.github/actions/setup-gpu-container
+        with:
+          container-name: ${{ env.CONTAINER_NAME }}
+          base-image: ${{ env.ATOM_BASE_IMAGE }}
+          env-vars: ${{ matrix.env_vars }}
+          hf-token: ${{ env.HF_TOKEN }}
+          pull-policy: "always"
+          disable-mmap: "false"  # mmstar never set ATOM_DISABLE_MMAP; keep parity
 
       - name: Install aiter wheel
         run: |
