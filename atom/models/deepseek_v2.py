@@ -1667,11 +1667,7 @@ class Indexer(nn.Module):
             k_pe, _ = torch.split(
                 k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
-            # rotary_emb runs aiter's in-place rope kernel, which honors the
-            # (strided) views returned by torch.split and writes the rotated
-            # values straight back into q/k's own storage. So q/k already carry
-            # the rope here; no re-concat is needed.
-            rotary_emb(positions, q_pe, k_pe)
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
 
             q = q.view(-1, self.head_dim)
             q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
