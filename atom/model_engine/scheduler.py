@@ -18,7 +18,6 @@ This module provides:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections import deque
 from typing import Optional
@@ -30,6 +29,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -339,8 +339,13 @@ class ScheduledBatch:
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
 
-        # Profiler annotation string (set by Scheduler when profiling is active)
-        self.profile_annotation: str | None = None
+        # Roofline FLOP aggregates (set by Scheduler.compute_roofline_aggregates
+        # when profiling is active and ATOM_ENABLE_ROOFLINE_ANNOTATION is set).
+        # None on the normal path; consumed by ModelRunner.run_model to extend
+        # the prefill[]/decode[] trace labels.
+        self.roofline_sqsq: int | None = None  # sum N_Q^2
+        self.roofline_sqsk: int | None = None  # sum N_Q*N_KV
+        self.roofline_sk: int | None = None  # sum N_KV
 
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
@@ -1668,100 +1673,58 @@ class Scheduler:
             self.running.remove(seq)
         return finished_seqs
 
-    def build_profile_annotation(
+    def compute_roofline_aggregates(
         self,
         scheduled_batch: ScheduledBatch,
         seqs: dict[int, Sequence],
-    ):
-        """Return a context manager that annotates the profiler trace with
-        iteration details and roofline-analysis aggregates.
+    ) -> None:
+        """Attach roofline FLOP aggregates to *scheduled_batch* in place.
 
-        The annotation encodes aggregate statistics needed for roofline
-        analysis of paged attention **without** per-request details:
+        Only the quadratic terms genuinely needed for a roofline FLOP estimate
+        are computed here. The request counts and total query tokens are
+        already emitted by the ``prefill[]``/``decode[]`` labels in
+        :meth:`ModelRunner.run_model`, so this avoids duplicating them.
 
-        For context (prefill) requests (prefix ``c_``):
-            R_C           — number of context requests
-            sum N_Q       — total query tokens          (sq)
-            sum N_KV      — total KV tokens             (sk)
-            sum N_Q^2     — sum of sq^2 per request     (sqsq)
-            sum N_Q*N_KV  — sum of sq*sk per request    (sqsk)
+        The following batch-level sums are stored on the batch and appended to
+        those labels by the runner:
 
-        For generation (decode) requests (prefix ``g_``):
-            R_G           — number of generation requests
-            sum N_Q       — total query tokens          (sq)
-            sum N_KV      — total KV tokens             (sk)
-            sum N_Q^2     — sum of sq^2 per request     (sqsq)
-            sum N_Q*N_KV  — sum of sq*sk per request    (sqsk)
+            sqsq  — sum of N_Q^2      (per request)
+            sqsk  — sum of N_Q*N_KV   (per request)
+            sk    — sum of N_KV       (per request)
 
-        bs = total scheduled tokens across both phases.
+        where ``N_Q`` is the number of query tokens scheduled for a request and
+        ``N_KV`` is its KV length (cached + new tokens for prefill, full
+        sequence length for decode). Aggregating over every request in the
+        batch gives the total for that single forward, which is exactly the
+        quantity a per-iteration roofline point needs.
+
+        This is a no-op (leaves the fields ``None``) unless profiling is active
+        and ``ATOM_ENABLE_ROOFLINE_ANNOTATION`` is set.
         """
-        if not self.profile_active or not os.environ.get("ATOM_ENABLE_ROOFLINE_ANNOTATION", "0") == "1":
+        if not self.profile_active or not envs.ATOM_ENABLE_ROOFLINE_ANNOTATION:
             return
 
-        # Context (prefill) phase aggregates
-        p_nq = 0     # sum N_Q
-        p_nkv = 0    # sum N_KV
-        p_sqsq = 0   # sum N_Q^2
-        p_sqsk = 0   # sum N_Q*N_KV
-
-        # Generation (decode) phase aggregates
-        g_nq = 0
-        g_nkv = 0
-        g_sqsq = 0
-        g_sqsk = 0
-
-        num_ctx_requests = 0
-        num_gen_requests = 0
-        bs = 0
-
-        for seq, num_tokens in zip(seqs.values(), scheduled_batch.num_scheduled_tokens):
+        sqsq = 0  # sum N_Q^2
+        sqsk = 0  # sum N_Q*N_KV
+        sk = 0  # sum N_KV
+        for seq, num_tokens in zip(
+            seqs.values(), scheduled_batch.num_scheduled_tokens
+        ):
             if seq.type == SequenceType.DECODE:
                 nq = 1
                 nkv = seq.num_tokens  # full sequence length
-                num_gen_requests += 1
-                g_nq += nq
-                g_nkv += nkv
-                g_sqsq += nq * nq
-                g_sqsk += nq * nkv
             else:
                 # PREFILL: num_tokens scheduled is the query length,
-                # KV length = cached + new tokens
+                # KV length = cached + new tokens.
                 nq = num_tokens
                 nkv = seq.num_cached_tokens + num_tokens
-                num_ctx_requests += 1
-                p_nq += nq
-                p_nkv += nkv
-                p_sqsq += nq * nq
-                p_sqsk += nq * nkv
-            bs += nq
+            sqsq += nq * nq
+            sqsk += nq * nkv
+            sk += nkv
 
-        scheduled_batch.profile_annotation = "".join(
-            [
-                "execute_",
-                str(bs),
-                "_context_",
-                str(num_ctx_requests),
-                "(sq",
-                str(p_nq),
-                "sk",
-                str(p_nkv),
-                "sqsq",
-                str(p_sqsq),
-                "sqsk",
-                str(p_sqsk),
-                ")_generation_",
-                str(num_gen_requests),
-                "(sq",
-                str(g_nq),
-                "sk",
-                str(g_nkv),
-                "sqsq",
-                str(g_sqsq),
-                "sqsk",
-                str(g_sqsk),
-                ")",
-            ]
-        )
+        scheduled_batch.roofline_sqsq = sqsq
+        scheduled_batch.roofline_sqsk = sqsk
+        scheduled_batch.roofline_sk = sk
 
     def _is_offload_connector(self) -> bool:
         """True when the active KV connector is the CPU/NVMe offload backend.

@@ -1940,6 +1940,26 @@ class ModelRunner:
             needs_independent_noise,
         )
 
+    @staticmethod
+    def _roofline_label_suffix(batch: Optional[ScheduledBatch]) -> str:
+        """Roofline FLOP aggregates for the trace label, or ``""``.
+
+        These fields are only populated by
+        :meth:`Scheduler.compute_roofline_aggregates` when profiling is active
+        and ``ATOM_ENABLE_ROOFLINE_ANNOTATION`` is set, so on the normal
+        (unprofiled) path this returns an empty string without any extra work.
+        Appending here keeps the annotation on the ``prefill[]``/``decode[]``
+        ``record_function`` (a GPU-recognized layer) instead of nesting an
+        extra span above ``run_model``.
+        """
+        if batch is None or batch.roofline_sqsq is None:
+            return ""
+        return (
+            f" sqsq={batch.roofline_sqsq}"
+            f" sqsk={batch.roofline_sqsk}"
+            f" sk={batch.roofline_sk}"
+        )
+
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -1981,6 +2001,7 @@ class ModelRunner:
                 else:
                     ctx_str = f"{ctx[:3].tolist()}...+{len(ctx)-3}"
                 label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
+            label += self._roofline_label_suffix(batch)
             label += "]"
             with record_function(label):
                 # Handle multimodal prefill: compute vision embeddings and merge
@@ -2030,6 +2051,7 @@ class ModelRunner:
                 label += f" d={batch.total_seqs_num_decode}"
                 if batch.num_spec_step > 0:
                     label += f" spec={batch.num_spec_step}"
+            label += self._roofline_label_suffix(batch)
             label += "]"
             with record_function(label):
                 graph_bs = context.graph_bs
@@ -2181,16 +2203,6 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        annotation = batch.profile_annotation
-        if annotation and (
-            self.profiler is not None
-            and os.environ.get("ATOM_ENABLE_ROOFLINE_ANNOTATION", "0") == "1"
-        ):
-            ctx = torch.profiler.record_function(annotation)
-            ctx.__enter__()
-        else:
-            ctx = None
-
         (
             input_ids,
             temperatures,
@@ -2211,9 +2223,6 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
-
-        if ctx is not None:
-            ctx.__exit__(None, None, None)
 
         return fwd_output
 
@@ -2280,26 +2289,52 @@ class ModelRunner:
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     def start_capture_profiler(self):
-        if self.profiler_dir is not None and self.mark_trace and self.rank == 0:
+        """Set up the per-bs CUDA graph capture profiler (profiles in place).
+
+        Profiles the capture phase as graphs are captured and writes one trace
+        per batch size, per rank (``bs_<bs>_rank<rank>.json.gz``). Enabled on
+        every rank when a torch profiler dir is set and mark-trace is on.
+        """
+        self._capture_profile_enabled = (
+            self.profiler_dir is not None and self.mark_trace
+        )
+        if self._capture_profile_enabled:
             self._profile_bs_idx = 0
-            self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
+            self.capture_traces_dir = os.path.join(
+                self.profiler_dir, "capture_traces"
+            )
             os.makedirs(self.capture_traces_dir, exist_ok=True)
             logger.info(f"{self.label}: Starting CUDA graph capture profiler...")
 
             def on_trace_ready(prof):
+                # Invariant: exactly two prof.step() calls happen per captured
+                # batch size (schedule wait=1 + active=1, repeat=0), so
+                # on_trace_ready fires once per bs, in self.graph_bs order.
+                assert self._profile_bs_idx < len(self.graph_bs), (
+                    f"capture profiler fired {self._profile_bs_idx + 1} times "
+                    f"but only {len(self.graph_bs)} batch sizes were captured; "
+                    "check the prof.step() cadence in capture_cudagraph."
+                )
                 bs = self.graph_bs[self._profile_bs_idx]
-                trace_file = os.path.join(self.capture_traces_dir, f"bs_{bs}_rank{self.rank}.json.gz")
+                trace_file = os.path.join(
+                    self.capture_traces_dir, f"bs_{bs}_rank{self.rank}.json.gz"
+                )
                 prof.export_chrome_trace(trace_file)
                 logger.info(f"Saved trace for bs={bs} to {trace_file}")
                 self._profile_bs_idx += 1
 
             self.capture_profiler = torch_profiler.profile(
-                activities=[torch_profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
-                schedule=torch_profiler.schedule(wait=1, warmup=0, active=1, repeat=0),
+                activities=[
+                    torch_profiler.ProfilerActivity.CUDA,
+                    torch_profiler.ProfilerActivity.CPU,
+                ],
+                schedule=torch_profiler.schedule(
+                    wait=1, warmup=0, active=1, repeat=0
+                ),
                 record_shapes=True,
                 with_stack=True,
                 profile_memory=False,
-                on_trace_ready=on_trace_ready
+                on_trace_ready=on_trace_ready,
             )
         else:
             self.capture_profiler = nullcontext()

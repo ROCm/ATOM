@@ -96,6 +96,7 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 |----------|------|---------|-------------|
 | **ATOM_TORCH_PROFILER_DIR** | str | — | When set, enables PyTorch profiler and writes traces to this directory. Create subdirectories per rank (e.g., `rank_0`, `dp0_tp0`). |
 | **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. |
+| **ATOM_ENABLE_ROOFLINE_ANNOTATION** | bool | 0 (false) | When profiling is active, appends roofline FLOP aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
 
 ### Debug Dump (`atom.utils.debug_helper`)

@@ -770,3 +770,73 @@ class TestPrefillBatchGate:
         assert batch is not None
         assert batch.total_seqs_num_prefill == 0
         assert batch.total_seqs_num_decode == 1
+
+
+# ── roofline annotation aggregates ──────────────────────────────────────────
+
+
+class TestComputeRooflineAggregates:
+    """Unit tests for Scheduler.compute_roofline_aggregates (pure Python).
+
+    The method only touches ``self.profile_active`` and the env var, so a
+    lightweight SimpleNamespace stands in for both the scheduler and the
+    sequences — no GPU or full Scheduler construction required.
+    """
+
+    @staticmethod
+    def _make_batch(num_scheduled_tokens):
+        return SimpleNamespace(
+            num_scheduled_tokens=num_scheduled_tokens,
+            roofline_sqsq=None,
+            roofline_sqsk=None,
+            roofline_sk=None,
+        )
+
+    @staticmethod
+    def _make_seqs():
+        # Two prefill requests + one decode request.
+        #   prefill A: N_Q=4, cached=2 -> N_KV=6  -> sqsq 16, sqsk 24, sk 6
+        #   prefill B: N_Q=3, cached=0 -> N_KV=3  -> sqsq  9, sqsk  9, sk 3
+        #   decode  C: N_Q=1,          -> N_KV=10 -> sqsq  1, sqsk 10, sk 10
+        return {
+            0: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=6, num_cached_tokens=2
+            ),
+            1: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=3, num_cached_tokens=0
+            ),
+            2: SimpleNamespace(
+                type=SequenceType.DECODE, num_tokens=10, num_cached_tokens=9
+            ),
+        }
+
+    def test_aggregates_when_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_ROOFLINE_ANNOTATION", "1")
+        fake_self = SimpleNamespace(profile_active=True)
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_roofline_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.roofline_sqsq == 16 + 9 + 1
+        assert batch.roofline_sqsk == 24 + 9 + 10
+        assert batch.roofline_sk == 6 + 3 + 10
+
+    def test_noop_when_env_disabled(self, monkeypatch):
+        monkeypatch.delenv("ATOM_ENABLE_ROOFLINE_ANNOTATION", raising=False)
+        fake_self = SimpleNamespace(profile_active=True)
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_roofline_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.roofline_sqsq is None
+        assert batch.roofline_sqsk is None
+        assert batch.roofline_sk is None
+
+    def test_noop_when_profiling_inactive(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_ROOFLINE_ANNOTATION", "1")
+        fake_self = SimpleNamespace(profile_active=False)
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_roofline_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.roofline_sqsq is None
