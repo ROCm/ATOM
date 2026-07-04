@@ -3093,6 +3093,125 @@ class FusedMoE(torch.nn.Module):
                 narrow_weight = loaded_weight
             target_param[: narrow_weight.shape[0]].copy_(narrow_weight)
 
+    def _copy_expert_shard(
+        self,
+        param: torch.nn.Parameter,
+        expert_data: torch.Tensor,
+        shard_id: str,
+        shard_dim: int,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+    ) -> bool:
+        """Copy one expert's shard into ``expert_data``. Shared by
+        ``weight_loader`` (GPU dest) and ``stage_expert_weight`` (CPU staging
+        dest) so the two paths can't drift. Returns False for cases the batched
+        path can't handle (per-Tensor scale, ``weight_shape``); caller falls back.
+        """
+        # scales / zero-points / offset (group + per-channel)
+        if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
+            quant_method = self.layer_quant_config.quant_type
+            if quant_method == QuantType.per_Token:
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
+                return True
+            if quant_method in (QuantType.per_1x128, QuantType.per_1x32):
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    load_full=getattr(param, "load_full_w2", False),
+                )
+                return True
+            return False
+
+        # model weights; `weight_shape` shares the substring but isn't batchable
+        if "weight" in weight_name and "weight_shape" not in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=self.tp_rank,
+            )
+            return True
+
+        return False
+
+    def stage_expert_weight(
+        self,
+        param: torch.nn.Parameter,
+        staging: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        local_expert_id: int,
+        shard_id: str,
+        weight_name: str,
+    ) -> bool:
+        # Cases not handled by the batched path — caller falls back.
+        if (
+            "input_scale" in weight_name
+            or "g_idx" in weight_name
+            or "weight_shape" in weight_name
+            or weight_name == ""
+        ):
+            return False
+        if shard_id not in ("w1", "w2", "w3"):
+            return False
+
+        # compressed-tensors packed-weight flip (matches weight_loader)
+        if self.quant_method.__class__.__name__ in (
+            "CompressedTensorsWNA16MarlinMoEMethod",
+            "CompressedTensorsWNA16MoEMethod",
+        ):
+            loaded_weight = loaded_weight.t().contiguous()
+
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        is_transposed = getattr(param, "is_transposed", False)
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+        if is_transposed:
+            shard_dim = int(not shard_dim)
+
+        if len(loaded_weight.shape) == 3:
+            return False
+
+        expert_data = staging[local_expert_id]
+
+        if (
+            staging.dtype == torch.uint8
+            and param.data.dtype == dtypes.fp4x2
+            and loaded_weight.dtype == dtypes.fp4x2
+        ):
+            loaded_weight = loaded_weight.view(torch.uint8)
+
+        return self._copy_expert_shard(
+            param=param,
+            expert_data=expert_data,
+            shard_id=shard_id,
+            shard_dim=shard_dim,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+        )
+
+    def expected_batched_arrivals(self, param: torch.nn.Parameter) -> Optional[int]:
+        w13_params = [
+            getattr(self, n, None)
+            for n in ("w13_weight", "w13_weight_scale", "w13_bias")
+        ]
+        w2_params = [
+            getattr(self, n, None) for n in ("w2_weight", "w2_weight_scale", "w2_bias")
+        ]
+        if any(param is p for p in w13_params if p is not None):
+            return self.local_num_experts * 2
+        if any(param is p for p in w2_params if p is not None):
+            return self.local_num_experts
+        return None
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -3172,35 +3291,22 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        # Case weight scales, zero_points and offset
+        # Group/per-channel scales and model weights share one copy path with
+        # the batched loader (_copy_expert_shard).
+        # TODO @dsikka: once hardened, refactor to use vLLM Parameters.
+        if self._copy_expert_shard(
+            param=param,
+            expert_data=expert_data,
+            shard_id=shard_id,
+            shard_dim=shard_dim,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+        ):
+            return
+
+        # Case per-Tensor weight scale
         if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
-            # load the weight scales and zp based on the quantization scheme
-            # supported weight scales/zp can be found in
-            # FusedMoeWeightScaleSupported
-            # TODO @dsikka: once hardened, refactor to use vLLM Parameters
-            # specific to each case
-            quant_method = self.layer_quant_config.quant_type
-            if quant_method == QuantType.per_Token:
-                self._load_per_channel_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                )
-            elif quant_method in [
-                QuantType.per_1x128,
-                QuantType.per_1x32,
-            ]:
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                    load_full=getattr(param, "load_full_w2", False),
-                )
-            elif quant_method == QuantType.per_Tensor:
+            if self.layer_quant_config.quant_type == QuantType.per_Tensor:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
@@ -3214,17 +3320,6 @@ class FusedMoE(torch.nn.Module):
             # only required by compressed-tensors
             self._load_single_value(
                 param=param, loaded_weight=loaded_weight, expert_id=expert_id
-            )
-            return
-
-        # Case model weights
-        if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=self.tp_rank,
             )
             return
 
