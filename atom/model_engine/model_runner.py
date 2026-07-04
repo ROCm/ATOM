@@ -671,11 +671,12 @@ class tokenIDProcessor:
 
 class ModelRunner:
 
-    # Per-q-bucket CUDA-graph pool memory floor (bytes) for DSpark RAGGED multi-
-    # bucket capture. Measured ~4-7GB/bucket on MI355 (V4-Pro, bs<=512); reserve
-    # 6GB so KV sizing leaves headroom for every captured bucket's graph pool and
-    # capture doesn't OOM mid-way (see _estimate_cudagraph_overhead).
-    _CG_BUCKET_MEM_FLOOR_BYTES = 6 * (1024**3)
+    # DSpark RAGGED per-bucket CUDA-graph pool cost model (see
+    # _estimate_cudagraph_overhead): per_bucket(q) = act * (1 + SLOPE * q),
+    # summed over captured buckets, times a safety margin. Both constants are
+    # dimensionless (q carries the mtp scale), so no per-mtp_k tuning.
+    _CG_BUCKET_SAFETY_MULT = 1.5
+    _CG_Q_SLOPE = 0.19  # fit from MI355 capture deltas (q=1:1.0x, q=5:1.95x act)
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -1551,12 +1552,14 @@ class ModelRunner:
         # CUDA graph pool overhead is roughly 20% of single-pass activation
         # memory due to pooling across multiple captured batch sizes.
         overhead = activation_bytes * 0.2
-        # DSpark plan Y captures one full graph set PER q-bucket (the
-        # `for max_q_len in q_buckets` loop in capture_model), so the graph
-        # pool grows ~linearly with the number of buckets. Without scaling the
-        # estimate here, KV-pool sizing over-allocates by (n_buckets-1)x the
-        # graph overhead -> OOM (Available Free mem: 0 MB) once a large
-        # concurrent decode batch fills the pool. Scale by the bucket count.
+        # DSpark RAGGED captures one graph set per q-bucket, so the pool grows
+        # with the bucket set, not a single graph. Per-bucket cost is AFFINE in
+        # q: a large q-independent base (the pool freezes the whole decode
+        # forward, ~1x activation even at q=1) plus a q-scaled part (wider verify
+        # block -> more attn/MoE scratch). A pure token-count ratio under-counts
+        # the base by ~25x and OOMs mid-capture; the old fixed floor needed
+        # per-mtp_k hand-tuning. Estimate analytically:
+        #   overhead = safety * act * Σ_q (1 + SLOPE * q)
         if hasattr(self, "drafter") and getattr(
             self.drafter, "dspark_confidence_schedule", False
         ):
@@ -1564,24 +1567,26 @@ class ModelRunner:
             from atom.utils import envs as _envs
 
             full_q = self.drafter.mtp_k + 1
-            # Must match the var used by the capture loop so the estimate counts
-            # the graphs actually captured (ragged and q-bucket use different
-            # independent size sets).
+            # Match the capture loop's bucket source so we count the graphs
+            # actually captured (ragged and q-bucket use independent size sets).
             _sizes_spec = (
                 _envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES
                 if _envs.ATOM_DSPARK_RAGGED
                 else _envs.ATOM_DSPARK_Q_BUCKETS
             )
-            n_buckets = len(resolve_q_buckets(_sizes_spec, full_q))
-            # Each captured q-bucket adds a full graph-pool set. The 0.2×
-            # activation heuristic UNDER-estimates the real per-bucket pool for
-            # the flat-ragged path (extra indexer rect / logits / topk scratch),
-            # causing OOM mid-capture at high bucket counts (observed: 6 buckets
-            # crash capturing q=5 with only ~8GB free). Reserve the LARGER of the
-            # heuristic and a measured per-bucket floor so KV sizing leaves real
-            # headroom for every bucket's graph pool.
-            per_bucket = max(overhead, self._CG_BUCKET_MEM_FLOOR_BYTES)
-            overhead = per_bucket * n_buckets
+            buckets = resolve_q_buckets(_sizes_spec, full_q)
+            sum_q = sum(buckets)
+            n_buckets = len(buckets)
+            overhead = self._CG_BUCKET_SAFETY_MULT * activation_bytes * (
+                n_buckets + self._CG_Q_SLOPE * sum_q
+            )
+            logger.info(
+                "DSpark cudagraph mem estimate: buckets=%s n=%d Σq=%d "
+                "act=%.2fGB slope=%.2f -> overhead=%.2fGB (x%.2f safety)",
+                buckets, n_buckets, sum_q, activation_bytes / (1 << 30),
+                self._CG_Q_SLOPE, overhead / (1 << 30),
+                self._CG_BUCKET_SAFETY_MULT,
+            )
         return int(overhead)
 
     def get_num_blocks(self) -> dict[str, int]:

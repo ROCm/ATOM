@@ -708,7 +708,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         keeps the [B, T] block flattened to [B*T] for the mHC + MoE ops.
         """
         B = positions.shape[0]
-        T = self.block_size
+        T = x.shape[1]
         # ----- Attention sub-layer with mHC mixing -----
         if hc_state is None:
             residual = x.reshape(B * T, self.hc_mult, x.shape[-1])
@@ -863,15 +863,20 @@ class DeepseekV4DSpark(nn.Module):
         main_hidden: torch.Tensor,  # [B, dim*len(target_layers)] concat target hidden
         positions: torch.Tensor,    # [B]  anchor position per request
         cache_indices: torch.Tensor,  # [B] rows into the rolling KV cache
+        num_draft: "int | None" = None,  # draft width (defaults to block_size)
     ):
         """One DSpark draft block: parallel backbone + sequential Markov head.
 
+        ``num_draft`` selects the draft width; when the verify horizon
+        (num_speculative_tokens) exceeds ``dspark_block_size`` the caller passes
+        the larger width and the block is drafted at that width in one pass.
+
         Returns:
-            draft_token_ids: [B, block_size]
-            confidence: [B, block_size]
+            draft_token_ids: [B, num_draft]
+            confidence: [B, num_draft]
         """
         return self.model.forward_spec(
-            input_ids, main_hidden, positions, cache_indices
+            input_ids, main_hidden, positions, cache_indices, num_draft=num_draft
         )
 
 
@@ -935,9 +940,15 @@ class _DSparkInner(nn.Module):
                 main_x, positions, cache_indices, cu_seqlens_q, write_per_batch
             )
 
-    def forward_spec(self, input_ids, main_hidden, positions, cache_indices):
+    def forward_spec(
+        self, input_ids, main_hidden, positions, cache_indices, num_draft=None
+    ):
         B = input_ids.shape[0]
-        T = self.block_size
+        # Draft width defaults to the training block size but may be widened up to
+        # the rolling window when num_speculative_tokens > block_size (the weights
+        # are draft-width-agnostic; positions past the block size are RoPE-
+        # extrapolated). Cap at window_size so the [window ++ draft] KV stays sane.
+        T = int(num_draft) if num_draft is not None else self.block_size
         stage0 = self.mtp[0]
         # Inject target context: project concat target hidden -> dim, norm.
         main_x = stage0.main_proj(main_hidden)

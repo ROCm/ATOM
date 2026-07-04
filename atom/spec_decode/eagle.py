@@ -529,8 +529,16 @@ class EagleProposer:
         self.model.precompute_context_kv(
             main_hidden, anchor_positions, cache_indices
         )
+        # Draft width = the verify horizon mtp_k (num_speculative_tokens). This
+        # may exceed dspark_block_size (the training default); DSpark weights are
+        # draft-width-agnostic so the wider block is drafted in one pass, with
+        # positions past block_size RoPE-extrapolated. Capped at the rolling
+        # window so [window ++ draft] KV stays bounded.
+        window = int(self.model.model.mtp[0].window_size)
+        num_draft = min(self.mtp_k, window)
         draft_token_ids, confidence = self.model.forward_spec(
-            anchor_ids, main_hidden, anchor_positions, cache_indices
+            anchor_ids, main_hidden, anchor_positions, cache_indices,
+            num_draft=num_draft,
         )
         draft_token_ids = draft_token_ids[:, : self.mtp_k]
         # Phase 2: confidence-scheduled verification. The hardware-aware prefix

@@ -1261,19 +1261,19 @@ class Config:
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
             # DSpark is a parallel block drafter: the whole block is produced in
-            # one backbone pass, so the verify length may equal dspark_block_size
-            # (5 for V4-Pro-DSpark), above the serial-MTP cap of 4.
+            # one backbone pass. dspark_block_size (5 for V4-Pro-DSpark) is only
+            # the TRAINING default draft width, NOT a hard ceiling: the DSpark
+            # weights are draft-width-agnostic (no parameter shape depends on it),
+            # so a wider verify horizon is drafted in the same single pass, with
+            # positions past block_size RoPE-extrapolated. The real ceiling is the
+            # rolling target-KV window (sliding_window=128), beyond which the
+            # [window ++ draft] block attention no longer fits its context.
             is_dspark = getattr(
                 self.speculative_config, "use_dspark", lambda: False
             )()
+            draft_cfg = self.speculative_config.draft_model_hf_config
             max_spec = (
-                int(
-                    getattr(
-                        self.speculative_config.draft_model_hf_config,
-                        "dspark_block_size",
-                        4,
-                    )
-                )
+                int(getattr(draft_cfg, "sliding_window", 128))
                 if is_dspark
                 else 4
             )
