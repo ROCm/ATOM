@@ -34,6 +34,8 @@ from atom.utils import mark_spliting_op
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
+_MINIMAX_M3_TOPK_CACHE_STATE: dict = {}
+
 
 def minimax_m3_sparse_attention_fake(
     qkv: torch.Tensor,
@@ -167,7 +169,6 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             use_mla,
             quant_config,
             index_rotary_emb,
-            sparse_layer_ordinal,
             impl_cls,
             kwargs,
         )
@@ -221,8 +222,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
         self.skip_index_topk = skip_index_topk
-        self._cached_topk: tuple | None = None
-        self._cached_topk_key: tuple | None = None
+        self.sparse_layer_ordinal = sparse_layer_ordinal
 
         if self.head_dim != 128:
             raise ValueError("MiniMax-M3 sparse attention requires head_dim == 128.")
@@ -443,15 +443,28 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.local_blocks,
         )
 
+    @staticmethod
+    def _topk_cache_state():
+        return _MINIMAX_M3_TOPK_CACHE_STATE
+
     def _load_cached_topk(self, key: tuple):
-        if self.skip_index_topk and self._cached_topk_key == key:
-            return self._cached_topk
+        if not self.skip_index_topk:
+            return None
+        phase = key[0]
+        entry = self._topk_cache_state().get(phase)
+        if entry is not None and entry.get("key") == key:
+            return entry["value"]
+        raise RuntimeError("MiniMax-M3 topk cache miss on a skip-index layer")
         return None
 
     def _store_cached_topk(self, key: tuple, topk_idx) -> None:
-        if self.skip_index_topk:
-            self._cached_topk_key = key
-            self._cached_topk = topk_idx
+        phase = key[0]
+        self._topk_cache_state()[phase] = {
+            "key": key,
+            "value": topk_idx,
+            "layer_num": self.layer_num,
+            "sparse_layer_ordinal": self.sparse_layer_ordinal,
+        }
 
     def _decode_topk(
         self,
@@ -506,7 +519,11 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         index_prefill_md = (
             index_metadata.prefill if index_metadata is not None else prefill_md
         )
-        return minimax_m3_index_topk(
+        key = self._topk_cache_key("prefill", index_q[start:stop], index_prefill_md)
+        cached = self._load_cached_topk(key)
+        if cached is not None:
+            return cached
+        topk_idx = minimax_m3_index_topk(
             index_q[start:stop].view(-1, self.num_idx_heads, self.index_head_dim),
             self.index_cache_layer.kv_cache,
             index_prefill_md.block_table,
@@ -522,6 +539,8 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.scale,
             emit_sparse_block_table=True,
         )
+        self._store_cached_topk(key, topk_idx)
+        return topk_idx
 
     def _run_decode_sparse_attention(
         self,
