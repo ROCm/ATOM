@@ -984,6 +984,13 @@ class MLAAttention(nn.Module):
         )
 
 
+_DBG_PROBE = None   # int32[2+32*64] sticky: [0]hits [1]oob [2+slot*64..]=live[16]+after_copy[16]+pre_replay[16]
+_PRE_SNAP = None    # int32[16] persistent: model_runner D2D fills before each replay
+_SNAP_AFTER_COPY = None  # int32[16] persistent: aiter_mla D2D fills right after copy_to_gpu@1075
+_SRC_BAD_AT_COPY = [0]    # PURE-HOST sticky counter: copy source cpu[1] != 1 at copy site
+_LAST_SRC_AT_COPY = None  # PURE-HOST last snapshot of copy source cpu[:16] (for logging)
+
+
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     qo_indptr,  # int32 [num_requests]
@@ -999,6 +1006,11 @@ def _convert_req_index_to_global_index_kernel(
     # strides (in elements)
     ti_stride0,
     ti_stride1,
+    # Run15 probe
+    debug_buf,
+    pre_snap,
+    after_copy,
+    TOKEN_INDICES_ROWS: tl.constexpr,
 ):
     # program_id(0) -> batch_id (row)
     # program_id(1) -> tile index along columns
@@ -1016,7 +1028,26 @@ def _convert_req_index_to_global_index_kernel(
     qo_start = tl.load(qo_indptr + batch_id)
     qo_end = tl.load(qo_indptr + batch_id + 1)
 
-    for token_id in range(qo_start, qo_end):
+    if tile_id == 0:
+        span = qo_end - qo_start
+        bad = (span > 1) | (qo_start > TOKEN_INDICES_ROWS) | (qo_end > TOKEN_INDICES_ROWS)
+        bad_tid_oob = qo_end > TOKEN_INDICES_ROWS
+        if bad:
+            o = tl.atomic_add(debug_buf + 0, 1)
+            slot = o % 32
+            base = 2 + slot * 64
+            idx = tl.arange(0, 16)
+            live = tl.load(qo_indptr + idx)
+            ac = tl.load(after_copy + idx)
+            snap = tl.load(pre_snap + idx)
+            tl.store(debug_buf + base + idx, live)
+            tl.store(debug_buf + base + 16 + idx, ac)
+            tl.store(debug_buf + base + 32 + idx, snap)
+        if bad_tid_oob:
+            tl.atomic_add(debug_buf + 1, 1)
+
+    qo_end_clamped = tl.minimum(qo_end, TOKEN_INDICES_ROWS)
+    for token_id in range(qo_start, qo_end_clamped):
         # Load token indices for this tile
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr)  # int32
@@ -1025,7 +1056,7 @@ def _convert_req_index_to_global_index_kernel(
         valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
         out_val = tl.load(
             kv_indices + kv_start + tok,
-            mask=valid_mask,
+            mask=valid_mask & (tok >= 0),
             other=0,
         )
 
@@ -1102,8 +1133,33 @@ def triton_convert_req_index_to_global_index(
         # strides
         ti_stride0,
         ti_stride1,
+        _get_dbg_probe(qo_indptr_c.device),
+        _get_pre_snap(qo_indptr_c.device),
+        _get_after_copy(qo_indptr_c.device),
+        token_indices_c.shape[0],
     )
     return new_kv_indices
+
+
+def _get_dbg_probe(device):
+    global _DBG_PROBE
+    if _DBG_PROBE is None:
+        _DBG_PROBE = torch.zeros(2 + 32 * 64, dtype=torch.int32, device=device)
+    return _DBG_PROBE
+
+
+def _get_pre_snap(device):
+    global _PRE_SNAP
+    if _PRE_SNAP is None:
+        _PRE_SNAP = torch.zeros(16, dtype=torch.int32, device=device)
+    return _PRE_SNAP
+
+
+def _get_after_copy(device):
+    global _SNAP_AFTER_COPY
+    if _SNAP_AFTER_COPY is None:
+        _SNAP_AFTER_COPY = torch.zeros(16, dtype=torch.int32, device=device)
+    return _SNAP_AFTER_COPY
 
 
 @triton.jit

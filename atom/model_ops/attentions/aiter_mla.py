@@ -1038,6 +1038,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # metadata copies on main_stream
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
+        # Run15: (a) D2D-snap the async-copy TARGET; (b) PURE-HOST read the copy SOURCE (.cpu)
+        try:
+            import atom.model_ops.attention_mla as _am15
+            if _am15._SNAP_AFTER_COPY is not None and "cu_seqlens_q" in var:
+                _am15._SNAP_AFTER_COPY.copy_(var["cu_seqlens_q"].gpu[:16])
+            if "cu_seqlens_q" in var:
+                _src = var["cu_seqlens_q"].cpu[:16].tolist()
+                _am15._LAST_SRC_AT_COPY = _src
+                if len(_src) > 1 and int(_src[1]) != 1:
+                    _am15._SRC_BAD_AT_COPY[0] += 1
+        except Exception:
+            pass
 
         if is_sparse_mtp:
             sum_tokens = bs * max_seqlen_q
