@@ -685,14 +685,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 ) % 4 == 0, f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
                 block_fp32_stride = (k1 * aligned_dim) // 4
                 scale_fp32_offset = (k1 * head_dim) // 4
-                module.cache_scale = (
-                    idx_kv.view(torch.float32)
-                    .view(-1)
-                    .as_strided(
-                        size=(nb, k1),
-                        stride=(block_fp32_stride, 1),
-                        storage_offset=scale_fp32_offset,
-                    )
+                # `as_strided(storage_offset=...)` is ABSOLUTE in the underlying
+                # storage, NOT relative to `idx_kv`. Since idx_kv =
+                # v4_csa_idx_kv[pos] carries its own storage_offset (pos *
+                # block_span), it MUST be added here — otherwise every CSA
+                # layer's `cache_scale` aliases pos 0's scale region, so only
+                # the first CSA layer's indexer reads valid scale and all other
+                # layers read zeros (FP8 indexer logits collapse at long
+                # context). The FP4 path is unaffected: it binds a real per-pos
+                # tensor (v4_csa_idx_kv_scale[pos]).
+                idx_kv_f32 = idx_kv.view(torch.float32)
+                module.cache_scale = idx_kv_f32.view(-1).as_strided(
+                    size=(nb, k1),
+                    stride=(block_fp32_stride, 1),
+                    storage_offset=idx_kv_f32.storage_offset() + scale_fp32_offset,
                 )
             elif ratio == 4:
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
