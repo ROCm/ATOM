@@ -169,6 +169,13 @@ class MLAModules:
     kv_b_proj: torch.nn.Module
     o_proj: torch.nn.Module
     indexer: Optional[torch.nn.Module]
+    # Model-level sparse flag. A v3.2 / GLM-5.2 model runs sparse MLA on ALL its
+    # layers. GLM-5.2 IndexShare "shared" layers carry no indexer module yet must
+    # still run sparse attention (reusing the prior "full" layer's top-k), so
+    # sparsity must be derived from the model, not from whether this layer owns
+    # an indexer. Defaults keep non-sparse models unchanged.
+    is_sparse: bool = False
+    topk_tokens: Optional[int] = None
 
 
 def dynamic_per_batched_tensor_quant(
@@ -231,10 +238,20 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
-        self.is_sparse_mla = mla_modules.indexer is not None
+        # Derive sparsity from the model-level flag, not from whether THIS layer
+        # owns an indexer: GLM-5.2 IndexShare "shared" layers have indexer=None
+        # but must still run sparse MLA, reusing the prior "full" layer's top-k.
+        # (`mla_modules.is_sparse` defaults False, so non-sparse models and the
+        # `indexer is not None` fallback keep their previous behavior.)
+        self.is_sparse_mla = mla_modules.is_sparse or (mla_modules.indexer is not None)
         self.topk_tokens = (
-            mla_modules.indexer.topk_tokens if mla_modules.indexer is not None else None
+            mla_modules.indexer.topk_tokens
+            if mla_modules.indexer is not None
+            else mla_modules.topk_tokens
         )
+        # Shared layers have no indexer buffer at construction; the metadata
+        # builder rebinds it to the shared `_sparse_kv_indices_gpu` at runtime,
+        # so the layer reads the prior full layer's selected indices.
         self.sparse_kv_indices_buffer = (
             mla_modules.indexer.sparse_kv_indices_buffer
             if mla_modules.indexer is not None
@@ -874,6 +891,24 @@ class MLAAttention(nn.Module):
                     sm_scale=self.scale,
                     q_scale=self._q_scale,
                     kv_scale=self._k_scale,
+                    work_meta_data=getattr(
+                        attn_metadata, "sparse_prefill_work_meta_data", None
+                    ),
+                    work_indptr=getattr(
+                        attn_metadata, "sparse_prefill_work_indptr", None
+                    ),
+                    work_info_set=getattr(
+                        attn_metadata, "sparse_prefill_work_info_set", None
+                    ),
+                    reduce_indptr=getattr(
+                        attn_metadata, "sparse_prefill_reduce_indptr", None
+                    ),
+                    reduce_final_map=getattr(
+                        attn_metadata, "sparse_prefill_reduce_final_map", None
+                    ),
+                    reduce_partial_map=getattr(
+                        attn_metadata, "sparse_prefill_reduce_partial_map", None
+                    ),
                 )
             else:
                 mla_prefill_fwd(

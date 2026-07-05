@@ -13,9 +13,13 @@
 
 ## 📢 News
 
+- **[2026/06]** ATOM now supports **MiniMax-M3** inference on the native OpenAI-compatible server path, including MXFP4/MXFP8 checkpoints, FP8 KV cache, and EAGLE3 speculative decoding. See [MiniMax-M3 recipe](recipes/MiniMax-M3.md).
 - **[2026/06] Featured ROCm Blog:** [DP Attention and TBO for DeepSeek-V4 on MI355X](https://rocm.blogs.amd.com/software-tools-optimization/atom-optimiztion/README.html) highlights how ATOM optimizes DeepSeek-V4 inference on AMD Instinct MI355X GPUs with DP Attention using all-gather/reduce-scatter and Two-Batch Overlap, achieving strongly competitive DeepSeek-V4 inference performance.
+- **[2026/06] Featured ROCm Blog:** [ATOMesh: Unlocking AMD Hardware for Scalable LLM Serving](https://rocm.blogs.amd.com/software-tools-optimization/atomesh-inference/README.html) explains how ATOMesh orchestrates distributed inference on AMD GPUs with ATOM, AITER, MORI, and RCCL.
+- **[2026/06] Featured ROCm Blog:** [ATOM: Unlocking Extreme AMD Instinct Inference with Software-Hardware Co-Optimization](https://rocm.blogs.amd.com/software-tools-optimization/atom-inference-engine/README.html) covers ATOM architecture, feature scope, model coverage, and benchmark dashboard usage.
 - **[2026/06]** Experimental **Navi 4 (RDNA4 / gfx1201)** support — AMD Radeon RX 9070 / RX 9070 XT and Radeon AI PRO R9700. See the [Qwen3-8B-FP8](recipes/Qwen3-8B-FP8.md) and [Ministral-3-8B](recipes/Ministral-3-8B.md) recipes.
 - **[2026/06]** ATOM now supports **GLM-5.2** (`glm_moe_dsa`) in FP8, including the new **IndexShare** DSA schedule (shared layers reuse the preceding full layer's indexer). See [GLM-5.2 recipe](recipes/GLM-5.md#glm-52-indexshare).
+- **[2026/05] Featured ROCm Blog:** [vLLM-ATOM: Unlocking Native AMD Performance in the vLLM Ecosystem](https://rocm.blogs.amd.com/software-tools-optimization/vllm-atom/README.html) shows how ATOM integrates with vLLM as an AMD-optimized plugin path.
 - **[2026/05]** ATOM now supports **Qwen3.5 multimodal image+text inference** on the native engine and OpenAI-compatible chat API. See [Qwen3.5 multimodal recipe](recipes/Qwen3.5_multimodel.md).
 - **[2026/05]** ATOM now supports **online quantization** — re-quantize unquantized or FP8-block source checkpoints to PTPC-FP8 / MXFP4 mixed precision at load time via `--online_quant_config`, no offline re-packing required. See [online quantization guide](docs/online_quantization_guide.md).
 - **[2026/05]** [Dissecting DeepSeek V4 Compressor](https://rocm.github.io/ATOM/dissecting_dsv4_compressor) — interactive animation visualizing how the CSA/HCA compressor state cache works (overlap mechanism, prefill vs decode, bulk compression vs sequential accumulation).

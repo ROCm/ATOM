@@ -50,6 +50,21 @@ jobs:
             exit 1
           fi
 
+      - name: Free container engine disk space
+        run: |
+          set -euo pipefail
+          echo "=== Disk before cleanup ==="
+          df -h || true
+          $CONTAINER_ENGINE system df || true
+
+          $CONTAINER_ENGINE container prune -f || true
+          $CONTAINER_ENGINE image prune -af || true
+          $CONTAINER_ENGINE builder prune -af || true
+
+          echo "=== Disk after cleanup ==="
+          df -h || true
+          $CONTAINER_ENGINE system df || true
+
       - name: Docker Login
         run: |
           REG="${SGLANG_IMAGE_TAG%%/*}"
@@ -97,40 +112,61 @@ jobs:
           echo "Pulling SGLANG image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
           $CONTAINER_ENGINE pull "${IMG}"
 
-      - name: Prepare model cache mount
+      - name: Prepare model and HuggingFace cache mounts
         run: |
+          set -euo pipefail
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_ROOT=""
           MODEL_CACHE_DESC=""
           MODEL_MOUNT_PATH="/models"
+          HF_CACHE_ROOT=""
 
           if [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_ROOT="/shared/data/WRH/models"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
-            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/mnt/raid0/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
-            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/data/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/data/pretrained_model"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
-            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           elif [ -d "/data/models" ]; then
             MODEL_CACHE_ROOT="/data/models"
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
-            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
-            MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
             echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model nor /shared/data/WRH/models nor /data/models exists on runner; using container-local ${MODEL_CACHE_ROOT}."
           fi
+
+          if [ -d "$MODEL_CACHE_ROOT" ]; then
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
+            HF_CACHE_ROOT="${MODEL_CACHE_ROOT}/.cache/huggingface"
+          else
+            MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
+          fi
+
+          if [ -z "$HF_CACHE_ROOT" ]; then
+            for candidate in /mnt/raid0/huggingface /data/huggingface /shared/data/WRH/huggingface; do
+              parent="$(dirname "$candidate")"
+              if [ -d "$parent" ] && [ -w "$parent" ]; then
+                HF_CACHE_ROOT="$candidate"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$HF_CACHE_ROOT" ]; then
+            HF_CACHE_ROOT="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/huggingface"
+          fi
+          HF_CACHE_MOUNT="-v ${HF_CACHE_ROOT}:/hf-cache"
+          mkdir -p "$HF_CACHE_ROOT"
+          echo "Using HuggingFace cache root: ${HF_CACHE_ROOT}"
+          df -h "$HF_CACHE_ROOT" || true
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
           echo "MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
           echo "MODEL_MOUNT_PATH=${MODEL_MOUNT_PATH}" >> "$GITHUB_ENV"
+          echo "HF_CACHE_ROOT=${HF_CACHE_ROOT}" >> "$GITHUB_ENV"
+          echo "HF_CACHE_MOUNT=${HF_CACHE_MOUNT}" >> "$GITHUB_ENV"
 
       - name: Clean up GPU and Python processes
         run: |
@@ -210,6 +246,7 @@ jobs:
 
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "Using HuggingFace cache root: ${HF_CACHE_ROOT}"
 
           SGLANG_ENV_FILE="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/sglang_env_file.txt"
           cat > "$SGLANG_ENV_FILE" << 'EOF'
@@ -219,6 +256,7 @@ jobs:
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
+            $HF_CACHE_MOUNT \
             -w /workspace \
             --ipc=host $GROUP_ADD_FLAG \
             --privileged \
@@ -228,6 +266,10 @@ jobs:
             --ulimit stack=67108864 \
             --env-file "$SGLANG_ENV_FILE" \
             -e HF_TOKEN="${HF_TOKEN:-}" \
+            -e HF_HOME="/hf-cache" \
+            -e HF_HUB_CACHE="/hf-cache/hub" \
+            -e HF_DATASETS_CACHE="/hf-cache/datasets" \
+            -e TRANSFORMERS_CACHE="/hf-cache/transformers" \
             --name "$CONTAINER_NAME" \
             "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
         env:
