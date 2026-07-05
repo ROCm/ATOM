@@ -1027,6 +1027,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton_decode:
+            # Interleave w13 gate/up columns in-place BEFORE shuffle so
+            # both prefill (FlydSL, GateMode.INTERLEAVE) and decode (gluon,
+            # _swiglu) share one copy.  [gate|up] → [g0,u0,g1,u1,...]
+            w13_raw = layer.w13_weight.data
+            w13_dtype = w13_raw.dtype
+            if w13_dtype != torch.uint8:
+                w13_raw = w13_raw.view(torch.uint8)
+            E_13, N_13, K_13 = w13_raw.shape
+            N_half = N_13 // 2
+            layer.w13_weight.data = (
+                w13_raw.view(E_13, 2, N_half, K_13)
+                .permute(0, 2, 1, 3)
+                .reshape(E_13, N_13, K_13)
+                .contiguous()
+                .view(w13_dtype)
+            )
+            # Interleave w13 scales along N to match weight interleave.
+            # Scale shape is (E, N, K_scale).
+            w13_sc = layer.w13_weight_scale.data
+            E_s, N_s, K_s = w13_sc.shape
+            N_s_half = N_s // 2
+            layer.w13_weight_scale.data = (
+                w13_sc.view(E_s, 2, N_s_half, K_s)
+                .permute(0, 2, 1, 3)
+                .reshape(E_s, N_s, K_s)
+                .contiguous()
+            )
             orig_w13_weight_scale = layer.w13_weight_scale.data.clone()
             orig_w2_weight_scale = layer.w2_weight_scale.data.clone()
 
@@ -1323,7 +1350,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         moe_extra_args = {
             "gate_mode": (
                 GateMode.INTERLEAVE.value
-                if self.is_guinterleave
+                if (self.is_guinterleave or self.use_triton_decode)
                 else GateMode.SEPARATED.value
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),

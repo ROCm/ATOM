@@ -414,16 +414,14 @@ def triton_kernel_fused_experts_a8w4_silu(
 ) -> torch.Tensor:
     """Decode-only A8W4 MoE for SiLU models (DSv4).
 
-    Pipeline: MXFP8 quant -> GEMM1(a8w4) -> SiLU -> MXFP8 quant -> GEMM2(a8w4).
-    Weights must be in preshuffled layout (shuffle_weight_gfx1250).
+    Pipeline: MXFP8 quant -> GEMM1(a8w4, fused swiglu + mxfp8 out) -> GEMM2(a8w4).
+    Weights must be in preshuffled layout with w13 gate/up interleaved.
     Scales must be GFX1250-swizzled.
     """
     assert hidden_states.ndim == 2
     assert hidden_states.dtype == torch.bfloat16
 
     M, K = hidden_states.shape
-    N = w1.shape[-1] * 16
-    half_N = N // 2
 
     gammas = routing_data.gate_scal if routing_data else None
 
@@ -431,7 +429,7 @@ def triton_kernel_fused_experts_a8w4_silu(
         hidden_states, torch.float8_e4m3fn, axis=-1
     )
 
-    raw_intermediate = moe_gemm_a8w4(
+    interm_fp8, interm_scale = moe_gemm_a8w4(
         x_fp8,
         w1,
         x_scale,
@@ -443,26 +441,12 @@ def triton_kernel_fused_experts_a8w4_silu(
         gather_indx=gather_indx,
         gammas=gammas if apply_router_weight_on_input else None,
         swizzle_mx_scale=w13_swizzle_layout,
-        apply_swiglu=False,
+        apply_swiglu=True,
+        alpha=1.0,
+        limit=swiglu_limit,
+        swiglu_add_residual=False,
         preshuffled=True,
-    )
-
-    raw_2d = raw_intermediate.view(M * topk, N)
-    intermediate = torch.empty(
-        (M * topk, half_N),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    fused_clamp_act_mul(
-        raw_2d,
-        out=intermediate,
-        swiglu_limit=swiglu_limit,
-        activation="silu",
-        dtype_quant=None,
-    )
-
-    interm_fp8, interm_scale = downcast_to_mxfp(
-        intermediate, torch.float8_e4m3fn, axis=-1
+        out_mx_quant=True,
     )
 
     output_tensor = moe_gemm_a8w4(
