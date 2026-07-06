@@ -248,7 +248,11 @@ scancel_slurm_job() {
   SCANCEL_SENT=1
   echo "=== cancelling Slurm job ${JOB_ID}: ${reason} ===" >&2
   if command -v scancel >/dev/null 2>&1; then
-    scancel "${JOB_ID}" || true
+    if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+      scancel --controller "${SPUR_CONTROLLER_ADDR}" "${JOB_ID}" || true
+    else
+      scancel "${JOB_ID}" || true
+    fi
   else
     echo "WARNING: scancel not found; unable to cancel Slurm job ${JOB_ID}" >&2
   fi
