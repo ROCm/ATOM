@@ -1941,6 +1941,26 @@ class DeepseekV2MLAAttention(nn.Module):
             if layer_quant_dtype in (dtypes.fp8, dtypes.fp4x2):
                 self.fuse_qknorm_quant = True
 
+        # split-K prezero widths, read by the pre-split compile pass. qkv_a + q_b
+        # ride the input_layernorm AR donor (base); o_proj adds an overflowing
+        # tail gated independently (greedy). Only bf16 (a16w16) GEMMs qualify.
+        if self.q_lora_rank is not None:
+            n_qb = (
+                self.q_b_proj.weight.shape[0]
+                if self.q_b_proj.quant_type.value == QuantType.No.value
+                else 0
+            )
+            n_oproj = (
+                self.o_proj.weight.shape[0]
+                if self.o_proj.quant_type.value == QuantType.No.value
+                else 0
+            )
+            self.q_b_proj.prezero_n_qkva = self.fused_qkv_a_proj.weight.shape[0]
+            self.q_b_proj.prezero_n_qb = n_qb
+            self.q_b_proj.prezero_n_oproj = n_oproj
+            self.q_b_proj.prezero_n_base = self.q_b_proj.prezero_n_qkva + n_qb
+            self.q_b_proj.prezero_n_total = self.q_b_proj.prezero_n_base + n_oproj
+
     def forward(
         self,
         positions: torch.Tensor,

@@ -645,6 +645,30 @@ class VllmBackend:
         self.graph = graph
         # self.configure_post_pass()
 
+        # aiter pre-split prezero hook (env-gated by ATOM_ENABLE_PREZERO). Runs
+        # on the FULL graph before splitting, where the opaque attention node
+        # (with its qb_prezero/oproj_prezero slots) is still visible -- lets the
+        # pass wire the attn-internal q_b/o_proj prezero automatically. Widths
+        # (n_total/n_base) are static module attrs not present in the graph.
+        import os as _os
+        if _os.getenv("ATOM_ENABLE_PREZERO"):
+            try:
+                from atom.models.deepseek_v2_prezero import deepseek_v2_prezero_pass
+
+                _nt_map, _nb_map = {}, {}
+                for _ln, _mod in self.compilation_config.static_forward_context.items():
+                    for _sub in _mod.modules():
+                        _nt = getattr(_sub, "prezero_n_total", None)
+                        if _nt:
+                            _nt_map[_ln] = int(_nt)
+                            _nb_map[_ln] = int(getattr(_sub, "prezero_n_base", _nt))
+                            break
+                deepseek_v2_prezero_pass(graph, _nt_map, _nb_map)
+                graph.recompile() if hasattr(graph, "recompile") else None
+            except Exception as _e:
+                import traceback as _tb
+                print(f"[prezero] {_e}\n{_tb.format_exc()}", flush=True)
+
         self.split_gm, self.piecewise_graphs = split_graph(
             graph, self.compilation_config.splitting_ops
         )

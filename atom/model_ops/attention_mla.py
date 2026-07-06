@@ -31,6 +31,9 @@ except ImportError:
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.tuned_gemm import tgemm
+
+from atom.model_ops.prezero import prezero_active
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
 )
@@ -350,7 +353,7 @@ class MLAAttention(nn.Module):
             )
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
-    def _v_up_proj_and_o_proj(self, x):
+    def _v_up_proj_and_o_proj(self, x, oproj_prezero=None):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
@@ -382,14 +385,22 @@ class MLAAttention(nn.Module):
             )
             # Convert from (B, N, V) to (B, N * V)
             x = x.reshape(-1, self.num_heads * self.v_head_dim)
+        if oproj_prezero is not None:
+            active = prezero_active(self.q_proj.prezero_n_total)
+            tgemm.mm(x, self.o_proj.weight, None, zero_init=not active, out=oproj_prezero)
+            return oproj_prezero
         return self.o_proj(x)
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
-    def _q_proj_and_k_up_proj(self, x, x_scale=None):
-        q_nope, q_pe = (
-            self.q_proj(x, x_scale)
-            .view(-1, self.num_heads, self.qk_head_dim)
-            .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+    def _q_proj_and_k_up_proj(self, x, x_scale=None, qb_prezero=None):
+        if qb_prezero is not None:
+            active = prezero_active(self.q_proj.prezero_n_base)
+            tgemm.mm(x, self.q_proj.weight, None, zero_init=not active, out=qb_prezero)
+            q_proj_out = qb_prezero
+        else:
+            q_proj_out = self.q_proj(x, x_scale)
+        q_nope, q_pe = q_proj_out.view(-1, self.num_heads, self.qk_head_dim).split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
         # Convert from (B, N, P) to (N, B, P)
@@ -956,6 +967,7 @@ class MLAAttention(nn.Module):
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        oproj_prezero: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
@@ -1116,7 +1128,7 @@ class MLAAttention(nn.Module):
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :].contiguous()
 
-        return self._v_up_proj_and_o_proj(o)
+        return self._v_up_proj_and_o_proj(o, oproj_prezero=oproj_prezero)
 
     def forward_impl(
         self,
@@ -1125,6 +1137,8 @@ class MLAAttention(nn.Module):
         k_rope: torch.Tensor,
         positions: torch.Tensor = None,
         q_scale: Optional[torch.Tensor] = None,
+        qb_prezero: Optional[torch.Tensor] = None,
+        oproj_prezero: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
@@ -1206,7 +1220,9 @@ class MLAAttention(nn.Module):
                     prefill_q, k_nope, k_rope, kv_cache, attn_metadata
                 )
         else:
-            q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
+            q_nope, q_rope = self._q_proj_and_k_up_proj(
+                q, x_scale=q_scale, qb_prezero=qb_prezero
+            )
 
             if self.use_seg_mla:
                 # Seg path: allocate q_out with a padded last dim so each head row
@@ -1296,7 +1312,9 @@ class MLAAttention(nn.Module):
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
             else:
-                output = self._forward_decode(q_out, kv_cache, attn_metadata)
+                output = self._forward_decode(
+                    q_out, kv_cache, attn_metadata, oproj_prezero=oproj_prezero
+                )
 
         return output
 
@@ -1310,6 +1328,8 @@ class MLAAttention(nn.Module):
         positions: torch.Tensor = None,
         q_scale: Optional[torch.Tensor] = None,
         output: torch.Tensor = None,
+        qb_prezero: Optional[torch.Tensor] = None,
+        oproj_prezero: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         return self.forward_impl(
@@ -1318,6 +1338,8 @@ class MLAAttention(nn.Module):
             k_rope=k_rope,
             positions=positions,
             q_scale=q_scale,
+            qb_prezero=qb_prezero,
+            oproj_prezero=oproj_prezero,
         )
 
 
