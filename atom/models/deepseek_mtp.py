@@ -186,6 +186,24 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         logits = mtp_layer.shared_head.head(mtp_layer.shared_head(hidden_states))
         return logits
 
+    def compute_draft_token(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token via distributed argmax over the TP-sharded vocab —
+        avoids all-gathering the full [N, vocab] logits every draft step.
+
+        Mirrors compute_logits() (same norm + shared head), but reduces each
+        rank's logit shard to (max_val, global_idx) and all-gathers only [N, 2]
+        instead of the O(vocab) logits. Token-identical to
+        compute_logits(...).argmax(-1).
+        """
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        normed = mtp_layer.shared_head(hidden_states)
+        return mtp_layer.shared_head.head.compute_argmax_token(normed)
+
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module):
@@ -274,6 +292,20 @@ class DeepSeekMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def compute_draft_token(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
+
+        EagleProposer picks this over compute_logits().argmax(-1) when present
+        (``_draft_argmax_fused``), so the draft never all-gathers the full
+        [N, vocab] logits — it all-gathers only the packed [N, 2] per-rank
+        reductions. See DeepSeekMultiTokenPredictor.compute_draft_token.
+        """
+        return self.model.compute_draft_token(hidden_states, spec_step_idx)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
