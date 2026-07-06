@@ -8,6 +8,7 @@ from typing import List, Optional, Type
 
 import numpy as np
 import torch
+import triton
 from atom.utils import envs
 from aiter import (
     decode_update_mla_metadata_v1,
@@ -20,6 +21,7 @@ from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
+    mtp_prepare_decode_mla_kernel,
 )
 from atom.utils.forward_context import AttentionMetaData, Context
 
@@ -99,6 +101,11 @@ class AiterMLABackend(AttentionBackend):
 
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
+    # EagleProposer folds the per-draft-step position/context bump into
+    # prepare_mtp_decode's fused kernel when this is set (matches the MHA
+    # backend). The fused kernel handles both sparse and dense MLA.
+    fuse_mtp_decode_position_update = True
+
     def __init__(self, model_runner):
         if envs.ATOM_MLA_PAGE_SIZE > 1:
             self.block_size = envs.ATOM_MLA_PAGE_SIZE
@@ -111,6 +118,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 f"got --block-size {model_runner.block_size}"
             )
         CommonAttentionBuilder.__init__(self, model_runner)
+        # Single-program block for the fused MTP-decode metadata kernel. Sized
+        # to the max batch (runtime bs <= max_bs) so one tl.cumsum spans the
+        # whole batch in a single launch.
+        self._mtp_fuse_block = triton.next_power_of_2(self.max_bs + 1)
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
@@ -589,21 +600,53 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         positions: torch.Tensor,  # [total_tokens] int32
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
+        *,
+        update_context_lens: bool = False,
+        positions_out: torch.Tensor | None = None,
+        last_token_indices: torch.Tensor | None = None,
     ):
+        """Per-draft-step MLA metadata update, fused into a single kernel.
+
+        One ``_mtp_prepare_decode_mla_kernel`` launch performs, in place:
+          - ``kv_indptr += cu_seqlens_q`` (needed by kv_indices + slot_mapping),
+          - (sparse) per-seq ``min(kv_count, index_topk)`` cumsum ->
+            ``sparse_kv_indptr``,
+          - (fused position update) ``positions += 1`` when ``positions_out`` is
+            given, and ``context_lens += 1`` when ``update_context_lens`` is set.
+
+        ``fuse_mtp_decode_position_update`` makes EagleProposer route the
+        per-step position/context bumps through here instead of launching them
+        as separate kernels. ``last_token_indices`` is accepted for signature
+        parity with the MHA backend but unused (MLA's ``positions`` is already
+        one entry per sequence at this point).
+        """
+        del last_token_indices  # MLA positions are already per-seq (1 per token)
         var = self.model_runner.forward_vars
         kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+        cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
         if self.is_sparse:
-            # Update dense kv_indptr (needed for kv_indices generation and slot_mapping)
-            kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
-            # Recompute sparse_kv_indptr: per-seq sparse count = min(dense_kv_count, index_topk)
             sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
-            kv_counts = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
-            sparse_counts = torch.clamp(kv_counts, max=self.index_topk)
-            sparse_kv_indptr[0] = 0
-            sparse_kv_indptr[1 : bs + 1] = torch.cumsum(sparse_counts, dim=0)
         else:
             assert self.block_size == 1
-            kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
+            sparse_kv_indptr = None
+
+        update_positions = positions_out is not None
+        context_lens = var["context_lens"].gpu[:bs] if update_context_lens else None
+
+        mtp_prepare_decode_mla_kernel[(1,)](
+            kv_indptr,
+            cu_seqlens_q,
+            sparse_kv_indptr if self.is_sparse else kv_indptr,
+            positions_out if update_positions else kv_indptr,
+            context_lens if update_context_lens else kv_indptr,
+            bs,
+            self.index_topk if self.is_sparse else 0,
+            positions_out.stride(0) if update_positions else 1,
+            IS_SPARSE=self.is_sparse,
+            UPDATE_POSITIONS=update_positions,
+            UPDATE_CONTEXT_LENS=update_context_lens,
+            BLOCK=self._mtp_fuse_block,
+        )
 
         kv_indices_generate_triton(
             var["block_tables"].gpu[:bs],
