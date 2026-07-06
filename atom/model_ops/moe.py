@@ -3199,16 +3199,18 @@ class FusedMoE(torch.nn.Module):
         )
 
     def expected_batched_arrivals(self, param: torch.nn.Parameter) -> Optional[int]:
-        w13_params = [
-            getattr(self, n, None)
-            for n in ("w13_weight", "w13_weight_scale", "w13_bias")
-        ]
-        w2_params = [
-            getattr(self, n, None) for n in ("w2_weight", "w2_weight_scale", "w2_bias")
-        ]
-        if any(param is p for p in w13_params if p is not None):
+        w13_batchable = [getattr(self, "w13_weight", None)]
+        w2_batchable = [getattr(self, "w2_weight", None)]
+        if self.layer_quant_config.quant_type in (
+            QuantType.per_Token,
+            QuantType.per_1x128,
+            QuantType.per_1x32,
+        ):
+            w13_batchable.append(getattr(self, "w13_weight_scale", None))
+            w2_batchable.append(getattr(self, "w2_weight_scale", None))
+        if any(param is p for p in w13_batchable if p is not None):
             return self.local_num_experts * 2
-        if any(param is p for p in w2_params if p is not None):
+        if any(param is p for p in w2_batchable if p is not None):
             return self.local_num_experts
         return None
 
