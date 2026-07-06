@@ -70,7 +70,7 @@ class LLMEngine:
                 "them (use -tp N -pcp M without DP-attention, or -dp N "
                 "--enable-dp-attention without -pcp)."
             )
-        # PCP + TBO prefill: supported via coordinated splitting (P1).
+        # PCP + TBO prefill: supported via coordinated splitting.
         # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
         # per-request ubatch split are unverified).
         if config.prefill_context_parallel_size > 1 and config.enable_tbo:

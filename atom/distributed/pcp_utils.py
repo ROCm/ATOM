@@ -13,7 +13,6 @@ Ported from SGLang's DSA round-robin CP path
 `layers/utils/cp_utils.py:cp_all_gather_rerange_output`).
 """
 
-import itertools
 import logging
 from typing import NamedTuple, Optional
 
@@ -21,7 +20,7 @@ import torch
 
 
 class PcpBalGroup(NamedTuple):
-    """One request group for PCP+TBO balanced prefill (PCP_TBO.md §12).
+    """One request group for PCP+TBO balanced prefill.
 
     A prefill batch is split into request groups at request boundaries (never
     inside a sequence); each group is processed as an independent non-TBO PCP
@@ -43,41 +42,6 @@ from aiter.dist.parallel_state import (
 )
 
 logger = logging.getLogger("atom")
-
-# Monotonic counter so debug lines can be matched against RCCL WorkNCCL SeqNum
-# when locating a PCP+TBO collective hang. GIL-protected; shared across the 2
-# TBO ubatch threads (the issue order across threads is exactly what we trace).
-_pcp_comm_seq = itertools.count()
-
-
-def _tbo_debug_collective(fn: str, input_: torch.Tensor) -> None:
-    """Emit a WARNING-level trace for one PCP collective when ATOM_TBO_DEBUG=1.
-
-    Logs (in issue order) the call site, input shape/numel, the current TBO
-    ubatch id, and the PCP rank — so the last line before an RCCL allgather
-    timeout pinpoints which collective (attention KV/compressor/indexer vs MoE
-    hidden) deadlocked, and on which ubatch.
-    """
-    from atom.utils import envs
-
-    if not envs.ATOM_TBO_DEBUG:
-        return
-    try:
-        from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
-
-        ub = tbo_current_ubatch_id() if tbo_active() else -1
-    except Exception:
-        ub = -1
-    seq = next(_pcp_comm_seq)
-    logger.warning(
-        "[TBO_DEBUG] seq=%d %s in_shape=%s numel=%d ubatch=%d pcp_rank=%d",
-        seq,
-        fn,
-        tuple(input_.shape),
-        input_.numel(),
-        ub,
-        get_prefill_context_model_parallel_rank(),
-    )
 
 
 def get_pcp_world_size() -> int:
@@ -104,10 +68,6 @@ def pcp_pad_len(
     padded length (>= total_tokens); callers pad per-token tensors to this
     length with dummy tokens (KV length 0) before splitting.
 
-    When TBO is active with N ubatches, pass num_ubatches=N so each per-rank
-    shard (total // pcp_size) is also divisible by N — guaranteeing every
-    ubatch is a pcp_size multiple and the token-midpoint split lands on an
-    exact pcp_size boundary.
     """
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
@@ -159,7 +119,6 @@ def pcp_allgather_rerange(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
-    _tbo_debug_collective("pcp_allgather_rerange", input_)
     group = get_pcp_group()
     # aiter all_gather(dim=0) returns rank-major concat: [pcp*L, *rest].
     gathered = group.all_gather(input_.contiguous(), dim=0)
@@ -175,15 +134,7 @@ def pcp_allgather_rerange(
     return out
 
 
-# ==== MoE-path PCP collectives (scheme B, rank-major gather + reduce_scatter) ====
-# Used by the MoE merge path (moe_pcp_merge_forward custom op). Because that op
-# is opaque to Dynamo (the collectives run eagerly inside it, NOT in the compiled
-# graph), we use the NATURAL collectives — no all-reduce emulation needed. The
-# earlier all-reduce-only scheme was a workaround for "collectives miscompiled
-# inside the @support_torch_compile graph"; with the opaque-op fix (方向C) the
-# gather/scatter no longer live in the traced graph, so plain all_gather /
-# reduce_scatter are correct and cheaper (all_gather moves W× fewer bytes).
-#
+# ==== MoE-path PCP collectives (rank-major gather + reduce_scatter) ====
 # Rank-major all_gather + reduce_scatter are a mutually-inverse pair:
 #   - gather (1/W -> full): all_gather(dim=0) concats rank-major, so rank r's
 #     1/W stripe lands at rows [r*L:(r+1)*L]. MoE is per-token so the rank-major
@@ -202,7 +153,6 @@ def pcp_allgather_rankmajor(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
-    _tbo_debug_collective("pcp_allgather_rankmajor", input_)
     return get_pcp_group().all_gather(input_.contiguous(), dim=0)
 
 
@@ -215,7 +165,6 @@ def pcp_reduce_scatter(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
-    _tbo_debug_collective("pcp_reduce_scatter", input_)
     return get_pcp_group().reduce_scatter(input_.contiguous(), dim=0)
 
 
@@ -229,7 +178,6 @@ def pcp_all_reduce(input_: torch.Tensor, pcp_size: Optional[int] = None) -> torc
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
-    _tbo_debug_collective("pcp_all_reduce", input_)
     return get_pcp_group().all_reduce(input_)
 
 

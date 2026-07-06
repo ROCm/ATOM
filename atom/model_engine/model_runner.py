@@ -1741,7 +1741,7 @@ class ModelRunner:
                 self.config, batch, is_prefill, num_scheduled_tokens
             )
 
-        # PCP+TBO prefill — b2 + balanced (PCP_TBO.md §12): split requests into
+        # PCP+TBO prefill — b2 + balanced: split requests into
         # two GROUPS at a request boundary (never split a sequence's tokens), so
         # each ubatch = "non-TBO PCP on a request subset". This root-fixes the
         # token-split R1/R2 structural conflicts (compressor cross-token

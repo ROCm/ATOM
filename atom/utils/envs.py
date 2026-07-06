@@ -245,11 +245,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
     # "0": MoE runs on each rank's 1/W token shard with no extra comm.
     "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
-    # Debug logging for TBO (+ PCP) collectives and ubatch splitting. Default off.
-    # When "1", PCP collective sites and TBO ubatch decisions emit WARNING logs
-    # (function name, input shape, ubatch id) to trace cross-rank collective order
-    # — used to locate RCCL allgather hangs under PCP+TBO.
-    "ATOM_TBO_DEBUG": lambda: os.getenv("ATOM_TBO_DEBUG", "0") == "1",
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.
