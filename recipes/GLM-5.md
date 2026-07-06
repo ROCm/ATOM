@@ -132,3 +132,58 @@ Reference numbers on 8×MI355X (TP8, FP8 weights, bf16 KV cache), using the benc
 | 8192 | 1024 | 1   | 73   | 669   | 409 | 13.2 |
 | 8192 | 1024 | 16  | 645  | 5818  | 418 | 23.3 |
 | 8192 | 1024 | 64  | 1210 | 10853 | 483 | 51.3 |
+
+## GLM-5.2 FP8 and MXFP4 Server Recipes
+
+Use the following docker image for these recipes:
+
+```bash
+docker pull docker.io/rocm/atom-dev:nightly_202606301541
+```
+
+Inside the container, install ATOM from the `zejun/opt_GLM5.2_0701` branch. AITER can remain unchanged.
+
+```bash
+cd PATH_TO_ATOM
+git checkout zejun/opt_GLM5.2_0701
+pip install -e .
+```
+
+### GLM-5.2 FP8 Server
+
+```bash
+#!/bin/bash
+
+model_path=/shared/data/amd_int/models/GLM-5.2-FP8
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+TP=4
+
+rm -rf /root/.cache/atom/*
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8000 \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  --online_quant_config '{"layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}}' \
+  -tp $TP 2>&1 | tee server.log &
+```
+
+### GLM-5.2 MXFP4 Server
+
+```bash
+#!/bin/bash
+
+model_path=/shared/data/amd_int/models/GLM-5.2-MXFP4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+TP=4
+
+rm -rf /root/.cache/atom/*
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8000 \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  -tp $TP 2>&1 | tee server.log &
+```
