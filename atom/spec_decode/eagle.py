@@ -324,11 +324,21 @@ class EagleProposer:
             self.model.share_with_target(target_base, loaded)
             return
 
-        # Share embed_tokens with the target model
+        # Share embed_tokens with the target model. Match on the *logical* vocab
+        # (num_embeddings) and hidden dim rather than the stored weight shape, so a
+        # replicated target embed ([vocab, hidden], ATOM_REPLICATE_VOCAB_EMBED) is
+        # still shared onto a TP-sharded draft embed ([vocab/tp, hidden]) — the
+        # draft then reuses the target's replicated table (no post-embed
+        # all-reduce). When both are sharded this is identical to the old check.
+        draft_embed = self.model.model.embed_tokens
+        target_embed = target_base.model.embed_tokens
+        draft_vocab = getattr(draft_embed, "num_embeddings", None)
+        target_vocab = getattr(target_embed, "num_embeddings", None)
         if (
             get_pp_group().world_size == 1
-            and self.model.model.embed_tokens.weight.shape
-            == target_base.model.embed_tokens.weight.shape
+            and draft_vocab is not None
+            and draft_vocab == target_vocab
+            and draft_embed.weight.shape[1] == target_embed.weight.shape[1]
         ):
             logger.info(
                 "Assuming the EAGLE head shares the same vocab embedding"
