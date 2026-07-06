@@ -196,13 +196,20 @@ def load_model(
    ```
    Each packed parameter has a `weight_loader` attribute that knows how to shard and place the weight into the correct slice.
 
-4. **Expert parameter loading:** If the model has a `get_expert_mapping()` method, expert weights are loaded using `FusedMoE.make_expert_params_mapping()`, which generates (param_name, weight_name, expert_id, shard_id) tuples. This handles per-expert sharding across TP ranks.
+4. **Expert parameter loading:** If the model has a `get_expert_mapping()` method, expert weights are loaded using `FusedMoE.make_expert_params_mapping()`, which generates (param_name, weight_name, expert_id, shard_id) tuples. This handles per-expert sharding across TP ranks. Each expert shard is then placed either through the per-expert `FusedMoE.weight_loader` or, when the parallel loader is enabled, the batched staging path (see [Batched Expert Staging](#batched-expert-staging)).
 
 5. **TP sharding:** Parallel linear layers (`ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`) have custom `weight_loader` methods that automatically select the correct shard for the current TP rank during loading. The default fallback `default_weight_loader` handles simple cases where weights need to be sliced by TP rank.
 
-6. **Concurrent loading:** All weight loading calls are submitted to a `ThreadPoolExecutor` for parallel execution.
+6. **Concurrent loading:** Controlled by `ATOM_LOADER_NUM_THREADS` (default `16`). A value `>1` runs loads on a `ThreadPoolExecutor` of that many workers and routes MoE expert weights through the batched staging path (see [Batched Expert Staging](#batched-expert-staging)); `1` loads sequentially and sends every expert through the per-expert `weight_loader` path.
 
 7. **Post-processing:** After all weights are loaded, `process_weights_after_loading()` is called on each module (e.g., for weight pre-shuffling, scale computation), and `quant_method.process_weights_after_loading()` is invoked for quantized modules. For `FusedMoEMethodBase`, `init_prepare_finalize()` is also called.
+
+### Batched Expert Staging
+
+On large MoE checkpoints each expert's weight arrives as a separate tensor, so the per-expert `weight_loader` issues one small H2D copy per (expert, shard). When the parallel loader is enabled (`ATOM_LOADER_NUM_THREADS > 1`), these are collapsed into one large copy per fused parameter:
+
+- Once a buffer has received all `expected_batched_arrivals` shards, it is flushed to the GPU parameter with a single H2D copy.
+- If a staged group never reaches its expected count (some expert slots left unstaged), loading raises a `RuntimeError` rather than flushing a partially-zeroed parameter; set `ATOM_LOADER_NUM_THREADS=1` to fall back to the per-expert loader.
 
 ### Layers Beyond `num_hidden_layers`
 
