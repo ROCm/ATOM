@@ -381,7 +381,6 @@ class tokenIDProcessor:
             if self.use_spec:
                 if getattr(batch, "num_spec_query_tokens_per_req", None) is not None:
                     # RAGGED: scheduled_tokens is already the flat [anchor, drafts...]
-                    # layout per seq (scheduler populated drafts from seq.token_ids),
                     # so no rectangular reshape/overwrite is needed.
                     pass
                 else:
@@ -411,15 +410,6 @@ class tokenIDProcessor:
         # plain MTP, or the DSpark q-bucket when shrunk this step). See
         # ScheduledBatch.num_spec_query_tokens.
         _per_req = getattr(batch, "num_spec_query_tokens_per_req", None)
-        # RAGGED all-same: token counts MUST come from the true per-req lengths,
-        # not `num_seqs * scalar`. The scalar `num_spec_query_tokens` is q_eff
-        # (a graph bucket, can be 6 while the real ragged len is 3), so
-        # `num_seqs * q_eff` over-counts and corrupts the padding boundary in
-        # _ragged_fill_deferred_all_same. Only the all-same deferred layout is
-        # ragged-handled; the non-all-same (prefill-boundary) layout keeps the
-        # rectangular scalar path (new seqs get full length under ragged, so it
-        # stays consistent there — and that path's gathered_tokens assembly
-        # assumes the rectangular count).
         if self.use_spec and _per_req is not None and is_all_same:
             _pr = np.asarray(_per_req)
             tokens_per_seq = int(batch.num_spec_query_tokens)
@@ -448,12 +438,8 @@ class tokenIDProcessor:
                 deferred_prev_indices
             ]
 
-        # RAGGED (DSpark §5.2): per-req lengths differ, so the rectangular
-        # reshape/cat below doesn't apply. Build input_ids by scattering each
-        # seq's [anchor, drafts...] into its cu-offset segment. Only the
-        # all-same deferred layout (steady-state decode) is ragged-handled; the
-        # prefill-boundary layouts fall back (ragged shrink is suppressed there
-        # by _dspark_apply_ragged seeing full lengths on new seqs).
+        # DSpark dynamic: per-req lengths differ, build input_ids by scattering each
+        # seq's [anchor, drafts...] into its cu-offset segment.
         ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
         if ragged_lens is not None and is_all_same and self.use_spec:
             self._ragged_fill_deferred_all_same(
@@ -470,14 +456,9 @@ class tokenIDProcessor:
                     self.draft_token_ids is not None
                     and self.pre_num_decode_token_per_seq > 1
                 ):
-                    # DSpark plan Y: self.draft_token_ids carries full mtp_k
+                    # DSpark: self.draft_token_ids carries full mtp_k
                     # columns from the previous step, but this step's q-bucket
-                    # wants only tokens_per_seq (= q) per seq. Truncate the draft
-                    # columns to q-1 so combined length == num_deferred_tokens
-                    # (= num_deferred_seqs * q). Mirrors the same truncation in
-                    # the non-all-same deferred path below (gathered_draft[:,
-                    # :n_draft]); without it combined is full-length (e.g. 66)
-                    # while the target is q-length (e.g. 33) -> expand mismatch.
+                    # wants only tokens_per_seq (= q) per seq.
                     draft_cols = self.draft_token_ids
                     n_draft = tokens_per_seq - 1
                     if n_draft < draft_cols.shape[1]:
@@ -600,14 +581,6 @@ class tokenIDProcessor:
         [bs, mtp_k] (full columns, sliced to ell_i-1). Scatter into the flat
         input_ids buffer at per-seq cu offsets. Done on CPU then one H2D — the
         token counts are tiny (Σ ell_i+1 ≤ bs*(mtp_k+1)).
-
-        Graph plan B: the real ragged tokens are DENSELY packed in [0:total];
-        the tail [total:num_deferred_tokens] is CUDA-graph-bucket padding
-        (num_deferred_tokens = bs*q_eff ≥ total, where q_eff quantizes UP to a
-        captured graph size). The graph replays the full bs*q_eff buffer, so the
-        padding slots must hold a LEGAL vocab id (0, not -1) or the embedding
-        gather goes OOB — their attention output is discarded via batch_id=-1.
-        Eager (num_deferred_tokens == total) skips the pad entirely.
         """
         lens = np.asarray(ragged_lens, dtype=np.int64)
         bs = lens.shape[0]
@@ -671,13 +644,6 @@ class tokenIDProcessor:
 
 class ModelRunner:
 
-    # DSpark RAGGED per-bucket CUDA-graph pool cost model (see
-    # _estimate_cudagraph_overhead): per_bucket(q) = act * (1 + SLOPE * q),
-    # summed over captured buckets, times a safety margin. Both constants are
-    # dimensionless (q carries the mtp scale), so no per-mtp_k tuning.
-    _CG_BUCKET_SAFETY_MULT = 1.5
-    _CG_Q_SLOPE = 0.19  # fit from MI355 capture deltas (q=1:1.0x, q=5:1.95x act)
-
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.mark_trace = getattr(config, "mark_trace", False)
@@ -689,8 +655,15 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
+        self._cg_probe = os.environ.get("ATOM_CG_PROBE", "") == "1"
         self.world_size = config.tensor_parallel_size
         self.rank = rank
+        # Distinct per-process id for diagnostics: under DP-attn self.rank is the
+        # TP rank (0 for every DP worker), so it cannot tell the 8 processes
+        # apart. data_parallel_rank does.
+        self._diag_rank = getattr(
+            config.parallel_config, "data_parallel_rank", 0
+        )
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
@@ -1163,12 +1136,6 @@ class ModelRunner:
         [N, hc, dim] -> [N, dim]), and concatenates the selected layers into
         [N, len(target_layers)*dim].
 
-        ATOM's V4 decoder ``Block`` returns an ``HCState`` whose ``residual`` is
-        the PRE-layer residual; the layer's actual output residual is synthesized
-        by the NEXT layer's ``fuse_hc`` via ``hc_post(x_prev, residual, post,
-        comb)``. We reproduce that here inside the hook using the same block's
-        ``hc_post`` so the captured tensor matches the post-layer residual.
-
         The captured per-layer [N, dim] tensors are stashed on the runner and
         read out in run_model as ``self._aux_hidden_states`` (list, target order).
         """
@@ -1189,12 +1156,6 @@ class ModelRunner:
         max_tokens = self.config.max_num_batched_tokens
 
         self._dspark_target_layer_ids = target_layer_ids
-        # Preallocated fixed-address buffers, one per target layer, written
-        # in-place by the hooks. A Python dict write (cache[lid] = ...) is NOT
-        # cudagraph-safe: it is a host-side side effect that the compiler's
-        # buffer-mutation guard rejects (it never re-runs on graph replay, so the
-        # captured tensors would silently go stale). In-place ``copy_`` into a
-        # static buffer captures into the graph and replays correctly.
         self._dspark_aux_buffers = [
             torch.zeros(
                 max_tokens, hidden_size, device=self.device, dtype=self.config.torch_dtype
@@ -1550,16 +1511,14 @@ class ModelRunner:
             )
             return overhead
         # CUDA graph pool overhead is roughly 20% of single-pass activation
-        # memory due to pooling across multiple captured batch sizes.
+        # memory due to pooling across captured batch sizes. Measured on MI355
+        # V4-Pro TP8 (CG-PROBE): a single q-bucket graph set across all bs adds
+        # only ~1.4GB reserved, well under 0.2*act.
         overhead = activation_bytes * 0.2
-        # DSpark RAGGED captures one graph set per q-bucket, so the pool grows
-        # with the bucket set, not a single graph. Per-bucket cost is AFFINE in
-        # q: a large q-independent base (the pool freezes the whole decode
-        # forward, ~1x activation even at q=1) plus a q-scaled part (wider verify
-        # block -> more attn/MoE scratch). A pure token-count ratio under-counts
-        # the base by ~25x and OOMs mid-capture; the old fixed floor needed
-        # per-mtp_k hand-tuning. Estimate analytically:
-        #   overhead = safety * act * Σ_q (1 + SLOPE * q)
+        # DSpark RAGGED captures one graph set PER q-bucket, so scale by the
+        # number of captured buckets (the pool grows ~linearly with bucket
+        # count, each bucket ~one graph set). This stays a safe upper bound:
+        # measured per-bucket pool (~1.4GB) << 0.2*act.
         if hasattr(self, "drafter") and getattr(
             self.drafter, "dspark_confidence_schedule", False
         ):
@@ -1575,17 +1534,13 @@ class ModelRunner:
                 else _envs.ATOM_DSPARK_Q_BUCKETS
             )
             buckets = resolve_q_buckets(_sizes_spec, full_q)
-            sum_q = sum(buckets)
             n_buckets = len(buckets)
-            overhead = self._CG_BUCKET_SAFETY_MULT * activation_bytes * (
-                n_buckets + self._CG_Q_SLOPE * sum_q
-            )
+            overhead = activation_bytes * 0.2 * n_buckets
             logger.info(
-                "DSpark cudagraph mem estimate: buckets=%s n=%d Σq=%d "
-                "act=%.2fGB slope=%.2f -> overhead=%.2fGB (x%.2f safety)",
-                buckets, n_buckets, sum_q, activation_bytes / (1 << 30),
-                self._CG_Q_SLOPE, overhead / (1 << 30),
-                self._CG_BUCKET_SAFETY_MULT,
+                "DSpark cudagraph mem estimate: buckets=%s n=%d act=%.2fGB "
+                "-> overhead=%.2fGB",
+                buckets, n_buckets, activation_bytes / (1 << 30),
+                overhead / (1 << 30),
             )
         return int(overhead)
 
@@ -2170,22 +2125,16 @@ class ModelRunner:
         )
 
     def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> None:
-        """Shrink this decode step's per-seq verify length to one CUDA-graph
-        query bucket q (DSpark plan Y, §17.4 Y1: whole batch one bucket).
+        """Shrink this decode step's verify length to one CUDA-graph bucket q.
 
-        q = quantize_up(max_i(ell_i) + 1) over the batch's decode seqs, where
-        ell_i comes from the worker drafter's own {req_id: ell} map populated by
-        the previous step's propose() (record_dspark_ell, same process). The
-        target then forwards only q tokens/req (anchor + q-1 drafts) instead of
-        mtp_k+1, and replay picks the (bs, q) graph. The dropped draft suffix is
-        re-drafted next step -> lossless.
+        q = quantize_up(max ell_i + 1) over the batch (ell_i = last step's
+        per-req schedule). All seqs then forward q tokens (anchor + q-1 drafts)
+        instead of mtp_k+1, and replay picks the (bs, q) graph; the dropped
+        draft suffix is re-drafted next step -> lossless.
 
-        Mutates the worker's batch copy (pickled, not shared with scheduler):
-        num_scheduled_tokens, total_tokens_num{,_decode}, and truncates each
-        request's scheduled_spec_decode_tokens to q-1. KV stays reserved at
-        mtp_k+1 (scheduler untouched) — only the forward shrinks.
-        Returns early (no-op) unless DSpark confidence scheduling is on and this
-        is a pure-decode batch.
+        Mutates only the worker's batch copy (counts + scheduled_spec_decode_
+        tokens truncated to q-1); KV stays reserved at mtp_k+1. No-op unless
+        DSpark confidence scheduling is on and this is a pure-decode batch.
         """
         # Idempotency guard: prepare_model calls this before prepare_input_ids,
         # and prepare_inputs (also reachable standalone for dummy/warmup) calls
@@ -2244,19 +2193,11 @@ class ModelRunner:
             if max_ell >= full_q - 1:
                 break
 
-        # CORRECTNESS LOWER BOUND on q (separate from the ell-driven target):
-        # `ell` is the scheduler's PREDICTION of how many drafts will be
-        # accepted, but the anchor (last verified target token) sits at the
-        # PREVIOUS step's ACTUAL accept count `num_bonus` within each q-length
-        # segment. If q-1 < num_bonus for any request, that request's anchor
-        # falls outside its (shrunk) segment -> the draft propose path's
-        # scatter/index_select goes OOB (observed: scatter_gather TensorAssign
-        # fault at bs=128 where a request was predicted ell small but actually
-        # accepted more). So q MUST also cover the largest realized num_bonus:
-        #   q >= max_num_bonus + 1
-        # This only enlarges q on the rare steps where reality beat the
-        # prediction; it never under-verifies and is a no-op when num_bonus is
-        # unavailable (first decode step / non-spec).
+        # Lower bound q >= max_num_bonus + 1: ell is only the PREDICTED accept
+        # count, but the anchor sits at the PREVIOUS step's ACTUAL num_bonus. If
+        # q-1 < num_bonus the anchor falls outside the shrunk segment and the
+        # draft propose scatter/index_select goes OOB. No-op when num_bonus is
+        # unavailable (first decode step).
         max_num_bonus = 0
         num_bonus_arr = getattr(batch, "num_bonus", None)
         if num_bonus_arr is not None:
@@ -2308,29 +2249,14 @@ class ModelRunner:
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
 
-        Sets num_scheduled_tokens[i] = ell_i + 1 PER REQUEST (no batch-level pad
-        to a single q). Each seq keeps the first ell_i+1 of its full mtp_k+1
-        draft span (anchor + ell_i drafts); the dropped suffix is re-drafted next
-        step -> lossless. Downstream V4 attn metadata is all marker-driven
-        (cu_seqlens / batch_id_per_token / kv_indptr via repeat+cumsum over
-        num_scheduled_tokens), so a ragged num_scheduled_tokens flows through
-        unchanged. KV stays reserved at mtp_k+1 (scheduler untouched).
-
-        Per-request anchor lower bound: each seg must hold its own anchor, which
-        sits at the previous step's realized num_bonus within the seg. So
-        len_i = max(ell_i, num_bonus_i) + 1, clamped to [1, full_q].
+        Sets num_scheduled_tokens[i] = len_i PER REQUEST (no batch-level pad to a
+        single q), where len_i = max(ell_i, max_num_bonus) + 1, clamped to
+        [1, full_q]. Downstream V4 attn is marker-driven (cu_seqlens etc.) so a
+        ragged num_scheduled_tokens flows through unchanged; dropped draft suffix
+        is re-drafted next step -> lossless. KV stays reserved at mtp_k+1.
         """
         old_nst = np.asarray(batch.num_scheduled_tokens, dtype=np.int32)
 
-        # BOUNDARY GUARD: only shrink on steady-state steps where the current
-        # decode batch order EXACTLY matches the previous step (is_all_same). On
-        # prefill→decode boundary / batch-reorder steps (is_all_same == False),
-        # prepare_input_ids takes the rectangular non-all-same path, which does
-        # NOT understand ragged per-seq lengths — feeding it a ragged layout
-        # scatters each seq's anchor/draft to the wrong slot, producing whole-
-        # batch token duplication (observed: 37 DUP-SEAM in one step right after
-        # a prefill admit → GSM8K 0.95→0.9). On those steps keep full length
-        # (Phase-1 rectangular), lossless; the next steady step resumes ragged.
         tp = getattr(self, "tokenID_processor", None)
         prev_b = getattr(tp, "prev_batch", None) if tp is not None else None
         cur_req = list(batch.req_ids[:scheduled_bs])
@@ -2346,15 +2272,6 @@ class ModelRunner:
             if num_bonus_arr is not None
             else None
         )
-
-        # ANCHOR LOWER BOUND — CORRECTNESS CRITICAL.
-        # Each seq's anchor (last verified target token) sits at in-span offset
-        # num_bonus_i. If len_i <= num_bonus_i the anchor falls OUTSIDE the
-        # (shrunk) segment → wrong KV/attention → broken losslessness. At this
-        # point (prepare_model, before prepare_input_ids) batch.num_bonus is not
-        # yet remapped to the current req_id order, so per-seq nb[i] is not
-        # reliable; use the batch-wide MAX as a uniform lower bound (order-
-        # invariant, matches the lossless q-bucket path).
         max_nb = int(nb.max()) if nb is not None and nb.size > 0 else 0
 
         # Per-request forward length = max(ell_i, max_num_bonus) + 1, in [1, full_q].
@@ -2373,15 +2290,6 @@ class ModelRunner:
             if li < int(old_nst[i]):
                 any_shrink = True
 
-        # GRAPH mode: CUDA graphs require a RECTANGULAR layout (every seq the
-        # same length) so the captured fixed-shape kernels replay correctly. So
-        # under graph we promote all seqs to the batch-max length QUANTIZED UP to
-        # a captured graph size (= dynamic q-bucket: the whole batch verifies
-        # q_eff, chosen per step). new_len must equal q_eff exactly so that
-        # num_scheduled_tokens / positions / num_spec_query_tokens all agree
-        # (else prepare_decode's positions[bs*q_eff] != total_tokens[bs*um]).
-        # Lossless (equal-length truncation, like the proven q-bucket path) and
-        # CG-safe. EAGER keeps the true per-seq ragged layout (max saving).
         from atom.spec_decode.dspark_scheduler import (
             quantize_to_bucket,
             resolve_q_buckets,
@@ -2412,23 +2320,14 @@ class ModelRunner:
         prefill_tok = int(batch.total_tokens_num_prefill)
         batch.total_tokens_num_decode = total_new
         batch.total_tokens_num = prefill_tok + total_new
-        # Single source of truth (ragged):
+        # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
+        # [0:Σ] with the per-seq ragged new_len.
         #   * num_spec_query_tokens_per_req : the true ragged per-seq lengths.
-        #   * num_spec_query_tokens (scalar): the GRAPH BUCKET this step replays
-        #     (plan B). The captured graph for (bs, q) has capacity bs*q tokens;
-        #     ragged needs a bucket q_eff with bs*q_eff >= total_new, i.e.
-        #     q_eff = ceil(total_new / bs), quantized UP to an available bucket.
-        #     The real Σtokens (total_new) ≤ bs*q_eff; the tail [total_new :
-        #     bs*q_eff] is -1 padding (CTAs bail). This is the "K quantized to a
-        #     graph bucket" of paper §5.2, with C = bs*q_eff.
-        # TRUE FLAT (paper §5.2). Both eager and graph keep the per-seq ragged
-        # new_len; tokens are flat-packed [0:Σ]. num_spec_query_tokens (scalar) is
-        # the GRAPH CAPACITY selector q_eff such that C = bs*q_eff >= Σ, i.e.
-        # q_eff = ceil(Σ/bs) quantized UP to a captured (bs, q_eff) graph. The
-        # graph replays a fixed C=bs*q_eff-token grid; real tokens fill [0:Σ], the
-        # tail [Σ:C] is -1-batch_id padding (kv_indptr len 0 → kernels skip it).
-        # A long tail seq no longer inflates the whole batch (that's the win over
-        # the batch-max q-bucket): C tracks the SUM, not bs*max_len.
+        #   * num_spec_query_tokens (scalar) : graph CAPACITY selector q_eff, so
+        #     C = bs*q_eff >= Σ (q_eff = ceil(Σ/bs) quantized up to a captured
+        #     bucket). Graph replays a fixed C grid; tail [Σ:C] is -1-batch_id
+        #     padding (kernels skip it). C tracks the SUM, not bs*max_len, so a
+        #     long tail seq no longer inflates the whole batch (win over q-bucket).
         buckets = resolve_q_buckets(envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES, full_q)
         if self.enforce_eager:
             # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
@@ -2441,18 +2340,10 @@ class ModelRunner:
         batch.num_spec_query_tokens = int(q_eff)
         batch.num_spec_query_tokens_per_req = new_len
 
-        # NOTE: an earlier revision built a flat `scheduled_spec_decode_tokens_flat`
-        # here by indexing `scheduled_spec_decode_tokens[i]` per decode seq. That
-        # was (a) DEAD — nothing downstream ever read the flat/cu fields — and
-        # (b) BUGGY: `scheduled_spec_decode_tokens` only contains rows for seqs
-        # that actually have drafts (scheduler builds it from
-        # `dict(values())` over seqs where `spec_token_ids.size > 0`), so its row
-        # count is <= scheduled_bs and its row order does NOT align 1:1 with the
-        # decode batch. Indexing it by decode-seq position both over-ran (255 vs
-        # 256) and mis-mapped rows. The ragged input_ids are assembled downstream
-        # from `self.prev_token_ids` (anchor) + `self.draft_token_ids` (the
-        # worker's draft output) in `_ragged_fill_deferred_all_same`, which never
-        # consults `scheduled_spec_decode_tokens`. So this block is removed.
+        # (No flat scheduled_spec_decode_tokens is built here: the ragged
+        # input_ids are assembled downstream in _ragged_fill_deferred_all_same
+        # from prev_token_ids (anchor) + draft_token_ids, which never consults
+        # scheduled_spec_decode_tokens.)
 
         if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
             logger.info(
@@ -3277,6 +3168,10 @@ class ModelRunner:
             for bs in capture_range:
                 if self.rank == 0:
                     capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")
+                if os.environ.get("ATOM_CG_TRACE", "") == "1":
+                    logger.info(
+                        "CG-TRACE rank=%d ENTER q=%d bs=%d", self._diag_rank, max_q_len, bs
+                    )
                 graph = torch.cuda.CUDAGraph()
 
                 cu_seqlens_q = np.arange(
@@ -3323,7 +3218,18 @@ class ModelRunner:
                         positions[:num_tokens].unsqueeze(0).expand(3, -1)
                     )
                     context.positions = mrope_positions
+                _trace = os.environ.get("ATOM_CG_TRACE", "") == "1"
+                if _trace:
+                    logger.info(
+                        "CG-TRACE rank=%d PRE-dp_padding q=%d bs=%d num_tokens=%d",
+                        self._diag_rank, max_q_len, bs, num_tokens,
+                    )
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
+                if _trace:
+                    logger.info(
+                        "CG-TRACE rank=%d POST-dp_padding q=%d bs=%d num_pad=%d",
+                        self._diag_rank, max_q_len, bs, num_pad,
+                    )
                 num_tokens += num_pad
                 # Create ubatch slices for TBO capture (need > 2 requests)
                 ubatch_slices = None
@@ -3423,6 +3329,18 @@ class ModelRunner:
                 if graph_aux is not None:
                     self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
                 torch.cuda.synchronize()
+                if os.environ.get("ATOM_CG_TRACE", "") == "1":
+                    logger.info(
+                        "CG-TRACE rank=%d DONE q=%d bs=%d", self._diag_rank, max_q_len, bs
+                    )
+                if self.rank == 0 and getattr(self, "_cg_probe", False):
+                    logger.info(
+                        "CG-PROBE bs=%d q=%d num_tokens=%d reserved=%.3fGB "
+                        "alloc=%.3fGB",
+                        bs, max_q_len, bs * max_q_len,
+                        torch.cuda.memory_reserved() / (1 << 30),
+                        torch.cuda.memory_allocated() / (1 << 30),
+                    )
         self.graph_bs.sort(reverse=False)
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)

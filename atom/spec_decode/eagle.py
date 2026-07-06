@@ -439,11 +439,19 @@ class EagleProposer:
         parallel_config = self.config.parallel_config
         if parallel_config.data_parallel_size <= 1:
             return
-        forward_context.context.dp_uniform_decode = False
-        forward_context.dp_metadata = DPMetadata.make(
-            parallel_config,
-            num_local_tokens,
-        )
+        # DSpark RAGGED + DP fix: force the draft MoE onto the UNIFORM equal-split
+        # all_gather instead of the variable-length path. The var-length
+        # reduce_scatterv gives each rank an output row count == its own
+        # bs*num_draft, which differs across ranks in a mixed step; RCCL then
+        # launches a different kernel grid per rank and the cross-rank barrier
+        # deadlocks (rocgdb: ncclDevKernel waitPeer spin, grid 2048 vs 4096).
+        # dp_uniform_decode=True routes MoE through pad_for_all_gather, which
+        # (see moe.py) pads every rank to dp_metadata.max_tokens_across_dp — the
+        # DP-max computed by the all_reduce inside DPMetadata.make below — so all
+        # ranks share one grid. This mirrors the main-forward pure-decode path.
+        dp_metadata = DPMetadata.make(parallel_config, num_local_tokens)
+        forward_context.context.dp_uniform_decode = True
+        forward_context.dp_metadata = dp_metadata
 
     def _propose_dspark(
         self,
@@ -487,14 +495,6 @@ class EagleProposer:
             target_positions, 0, last_token_indices
         )
         main_hidden = torch.index_select(main_hidden_all, 0, last_token_indices)
-        # Rolling-KV cache rows MUST be the persistent per-request state slot,
-        # NOT a fresh arange(bs). The DSpark window is a ring buffer that
-        # accumulates target KV across decode steps; under continuous batching a
-        # request's position in the batch drifts between steps, so arange(bs)
-        # would scatter each request's history across different rows (reading
-        # back stale/foreign KV -> first-token rejection spikes, acceptance
-        # collapse). state_slot_mapping is the same stable per-seq slot the V4
-        # target uses for its own SWA cache, so DSpark's window stays aligned.
         state_slot = getattr(attn_metadata, "state_slot_mapping", None)
         if state_slot is not None:
             cache_indices = state_slot[:bs].to(torch.long)
@@ -536,13 +536,14 @@ class EagleProposer:
         # window so [window ++ draft] KV stays bounded.
         window = int(self.model.model.mtp[0].window_size)
         num_draft = min(self.mtp_k, window)
+        self._refresh_dp_metadata(forward_context, bs * num_draft)
         draft_token_ids, confidence = self.model.forward_spec(
             anchor_ids, main_hidden, anchor_positions, cache_indices,
             num_draft=num_draft,
         )
         draft_token_ids = draft_token_ids[:, : self.mtp_k]
         # Phase 2: confidence-scheduled verification. The hardware-aware prefix
-        # scheduler (paper Algorithm 1) consumes the confidence head to pick a
+        # scheduler consumes the confidence head to pick a
         # per-request verify length ell_r. We compute ell here and stash it; the
         # actual variable-length verification (Level B) is applied downstream by
         # truncating each request's scheduled spec tokens to ell_r, which frees

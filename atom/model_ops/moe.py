@@ -257,7 +257,7 @@ def all_gather_with_padding(
     # (NCCL), whose WorkNCCL end-event recorded inside CUDAGraph capture is
     # later queried by the watchdog thread -> hipErrorCapturedEvent crash.
     gathered_hidden_states = get_dp_group().all_gather(
-        padded_x, use_custom=use_cag, dim=0
+        padded_x, use_custom=False, dim=0
     )
     return gathered_hidden_states, original_batch_size
 
