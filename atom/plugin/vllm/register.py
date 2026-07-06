@@ -28,6 +28,7 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "GlmMoeDsaForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "DeepSeekV4MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLMVllm",
     "Qwen3NextMTP": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -49,6 +50,12 @@ class MiniMaxM3Config(PretrainedConfig):
     """Minimal local config shim for MiniMax-M3 VL checkpoints."""
 
     model_type = "minimax_m3_vl"
+    text_config_override_attrs = {
+        "use_index_cache",
+        "index_topk_freq",
+        "index_topk_pattern",
+        "index_skip_topk_offset",
+    }
 
     def __init__(
         self,
@@ -64,6 +71,14 @@ class MiniMaxM3Config(PretrainedConfig):
         self.hidden_size = getattr(text_config, "hidden_size", None)
 
         super().__init__(**kwargs)
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name not in self.text_config_override_attrs:
+            return
+        text_config = self.__dict__.get("text_config")
+        if text_config is not None and text_config is not self:
+            setattr(text_config, name, value)
 
 
 def _set_plugin_mode() -> None:

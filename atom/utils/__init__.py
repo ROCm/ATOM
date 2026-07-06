@@ -171,6 +171,29 @@ def get_mp_context() -> Union[ForkContext, SpawnContext]:
     return multiprocessing.get_context("spawn")
 
 
+def set_process_title(
+    name: str, suffix: str = "", prefix: Optional[str] = None
+) -> None:
+    """Set the current process title (comm/cmdline) for ps/top/rocm-smi.
+
+    rocm-smi --showpids reads the process ``comm`` field, which defaults to the
+    interpreter name (``python``). Setting a title makes GPU-holding worker
+    processes distinguishable by rank. Soft dependency: no-op if setproctitle
+    is not installed.
+    """
+    try:
+        import setproctitle
+    except ImportError:
+        return
+    from atom.utils import envs
+
+    if prefix is None:
+        prefix = envs.ATOM_PROCESS_NAME_PREFIX
+    if suffix:
+        name = f"{name}_{suffix}"
+    setproctitle.setproctitle(f"{prefix}::{name}")
+
+
 def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
     # First join any already-exited processes (instant, no wait).
     for proc in procs:

@@ -442,6 +442,11 @@ class Scheduler:
         # Latency of the last prompt step
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
+        self.prefill_batch_token_threshold = self.max_num_batched_tokens
+        self._prefill_hold_passes = 0
+        self._prefill_hold_max_passes = 30
+        _pc = getattr(config, "parallel_config", None)
+        self._prefill_gate_enabled = getattr(_pc, "data_parallel_size", 1) > 1
 
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
@@ -580,6 +585,65 @@ class Scheduler:
                 continue
             if self.block_manager.can_allocate(seq) < 0:
                 return False  # KV-pressured: definitely cannot prefill
+            return True
+        return False
+
+    def _waiting_prefill_tokens(self) -> int:
+        """Sum of admissible new-prefill tokens sitting in the waiting queue,
+        capped at max_num_batched_tokens (we only care whether a *dense* batch
+        can be filled). Skips unschedulable / remote-KV-waiting entries and
+        clamps each seq to the chunked-prefill / budget limit, mirroring the
+        Phase-2 admission math so the count reflects what would actually pack
+        into one prefill step."""
+        total = 0
+        cap = self.max_num_batched_tokens
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            n = seq.num_tokens - seq.num_cached_tokens
+            if (
+                self.enable_chunked_prefill
+                and 0 < self.long_prefill_token_threshold < n
+            ):
+                n = self.long_prefill_token_threshold
+            if n > cap:
+                n = cap
+            total += n
+            if total >= cap:
+                return cap
+        return total
+
+    def _prefill_batch_ready(self) -> bool:
+        """Gate for firing a NEW prefill step (dense-batch requirement).
+
+        The threshold is max_num_batched_tokens (a full prefill batch).
+
+        Returns True (allow prefill) when:
+          - the waiting queue can fill a dense batch (>= threshold tokens), or
+          - there is nothing left to decode (running empty) — tail escape so a
+            partial final batch still goes out, or
+          - we've suppressed prefill for too many consecutive passes
+            (_prefill_hold_max_passes) — starvation bound.
+
+        Otherwise returns False (keep decoding) and advances the hold counter.
+        The counter resets whenever prefill is allowed to fire.
+        """
+        # Gate only applies under DP (>1); otherwise never hold (legacy path).
+        if not self._prefill_gate_enabled:
+            return True
+        # Tail escape: no decode work left — never hold, or we'd deadlock.
+        if not self.running:
+            self._prefill_hold_passes = 0
+            return True
+        if self._waiting_prefill_tokens() >= self.prefill_batch_token_threshold:
+            self._prefill_hold_passes = 0
+            return True
+        # Under-full: hold prefill (keep decoding) up to the pass budget.
+        self._prefill_hold_passes += 1
+        if self._prefill_hold_passes >= self._prefill_hold_max_passes:
+            self._prefill_hold_passes = 0
             return True
         return False
 
@@ -746,13 +810,22 @@ class Scheduler:
         # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
+            # A rank counts as "prefillable" for cross-DP alignment only if it
+            # can admit a prefill AND has a full batch's worth of waiting tokens.
+            # This makes all ranks align on firing dense prefills together
+            # instead of straggling partials.
+            _local_prefillable = self._can_admit_head_prefill() and (
+                self._waiting_prefill_tokens() >= self.prefill_batch_token_threshold
+            )
             _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
-                local_prefillable=self._can_admit_head_prefill(),
+                local_prefillable=_local_prefillable,
                 token_usage=self._kv_usage(),
             )
 
         if not self.running and not self.waiting:
             return None
+
+        _new_prefill_allowed = _delayer_allows_prefill and self._prefill_batch_ready()
 
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `_delayer_allows_prefill` so cross-DP alignment still
@@ -782,7 +855,7 @@ class Scheduler:
 
         # ---- Phase 2: new requests from waiting ----
         while (
-            _delayer_allows_prefill
+            _new_prefill_allowed
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
@@ -1016,7 +1089,24 @@ class Scheduler:
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
         if skipped_partial_prefills:
-            self.running.extendleft(reversed(skipped_partial_prefills))
+            # Re-queue skipped partial prefills at the TAIL, not the head.
+            #
+            # A partial (chunked, prompt-not-done) prefill can land in this
+            # decode loop when the cross-DP PrefillDelayer vetoes prefill for a
+            # tick (Phase 1 skipped, so num_prefill==0 and the prefill-only
+            # early-return doesn't fire). Re-inserting it at the head pins it
+            # at running[0]; once it finishes prefill it becomes the batch's
+            # position-0 *deferred* seq, which pushes the fresh decode seqs to
+            # positions 1..N. TokenIDProcessor.prepare_input_ids then takes the
+            # [deferred | new] path and indexes the (compacted)
+            # scheduled_spec_decode_tokens array by those shifted positions —
+            # running off the end (IndexError: index N out of bounds size N).
+            #
+            # Appending at the tail keeps the partial out of position 0 (its
+            # prefill still resumes: Phase 1 scans all of `running`), so new
+            # decode seqs stay contiguous from position 0 and the safe
+            # [new | deferred] slice path is used.
+            self.running.extend(skipped_partial_prefills)
 
         connector_meta_output = None
         if self.kv_connector is not None:

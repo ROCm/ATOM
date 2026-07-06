@@ -80,7 +80,7 @@ def test_build_args_golden():
 
 def test_load_variants_shape():
     variants = catalog.load_variants(CATALOG)
-    assert len(variants) == 21
+    assert len(variants) == 22
     required = {
         "display",
         "path",
