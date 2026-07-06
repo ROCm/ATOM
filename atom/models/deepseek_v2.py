@@ -2067,57 +2067,40 @@ class DeepseekV2DecoderLayer(nn.Module):
             if getattr(config, "q_lora_rank", None) is not None
             else "q_proj"
         )
-        attn_input_layer_name = f"{prefix}.self_attn.{attn_input_proj_name}"
-        attn_input_quant_config = (
-            None
-            if quant_config is None
-            else quant_config.get_layer_quant_config(attn_input_layer_name)
-        )
-
-        def _accepts_quantized_input(layer_quant_config):
-            return (
-                layer_quant_config is not None
-                and layer_quant_config.quant_type != QuantType.No
-                and layer_quant_config.quant_dtype in (dtypes.fp8, dtypes.fp4x2)
+        self.quant_dtype = None
+        self.input_norm_quant_type = None
+        if quant_config is not None:
+            attn_input_layer_name = f"{prefix}.self_attn.{attn_input_proj_name}"
+            attn_input_quant_config = quant_config.get_layer_quant_config(
+                attn_input_layer_name
             )
+            if quant_config.online_quant and (
+                attn_input_quant_config.quant_type == QuantType.No
+                or attn_input_quant_config.quant_dtype not in (dtypes.fp8, dtypes.fp4x2)
+            ):
+                attn_input_quant_config = quant_config.get_layer_quant_config(
+                    attn_input_layer_name,
+                    use_online_quant=True,
+                )
 
-        if (
-            not _accepts_quantized_input(attn_input_quant_config)
-            and quant_config is not None
-            and quant_config.online_quant
-        ):
-            online_attn_input_quant_config = quant_config.get_layer_quant_config(
-                attn_input_layer_name,
-                use_online_quant=True,
-            )
-            if _accepts_quantized_input(online_attn_input_quant_config):
-                attn_input_quant_config = online_attn_input_quant_config
-
-        attn_accepts_quantized_input = _accepts_quantized_input(attn_input_quant_config)
-        self.quant_dtype = (
-            attn_input_quant_config.quant_dtype
-            if attn_accepts_quantized_input
-            else None
-        )
-        self.input_norm_quant_type = (
-            attn_input_quant_config.quant_type.value
-            if attn_accepts_quantized_input
-            else None
-        )
+            if (
+                attn_input_quant_config.quant_type != QuantType.No
+                and attn_input_quant_config.quant_dtype in (dtypes.fp8, dtypes.fp4x2)
+            ):
+                self.quant_dtype = attn_input_quant_config.quant_dtype
+                self.input_norm_quant_type = attn_input_quant_config.quant_type.value
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
             enable_fp8_input_norm_quant = (
-                attn_accepts_quantized_input
-                and self.quant_dtype == dtypes.fp8
+                self.quant_dtype == dtypes.fp8
                 and (
                     use_triton_gemm()
                     or self.input_norm_quant_type == QuantType.per_Token.value
                 )
             )
             enable_fp4_input_norm_quant = (
-                attn_accepts_quantized_input
-                and self.quant_dtype == dtypes.fp4x2
+                self.quant_dtype == dtypes.fp4x2
                 and (
                     use_triton_gemm()
                     or _enable_non_triton_global_mxfp4_input_norm_quant(
