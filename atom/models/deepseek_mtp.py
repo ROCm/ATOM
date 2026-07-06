@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -15,7 +19,11 @@ from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
-from .deepseek_v2 import DeepseekV2DecoderLayer, _can_fuse_indexer_wk_weights_proj
+from .deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    _can_fuse_indexer_wk_weights_proj,
+    use_replicated_vocab_embed,
+)
 from .utils import ckpt_has_tensor_suffix, maybe_prefix
 
 
@@ -136,10 +144,18 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 )
             }
         )
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+        if use_replicated_vocab_embed(config):
+            # GLM-5.2 MTP: full table per rank, no post-embedding all-reduce.
+            # (Shared with the target's replicated embed by EagleProposer at load.)
+            self.embed_tokens = ReplicatedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
 
     def forward(
         self,

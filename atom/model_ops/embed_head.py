@@ -103,6 +103,24 @@ def masked_embedding(
     return _masked_embedding_launcher(x, weight, vocab_start_idx, vocab_end_idx)
 
 
+def _replicated_embedding_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.empty(
+        x.numel(),
+        weight.shape[1],
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_replicated_embedding_fake)
+def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # Keep the lookup opaque to torch.compile: inductor otherwise fuses the
+    # embedding gather into the surrounding graph, which corrupts the MTP draft
+    # rollout (acceptance collapses ~69%->45%) — the same reason
+    # VocabParallelEmbedding routes through the masked_embedding custom op.
+    return F.embedding(x, weight)
+
+
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -184,7 +202,7 @@ class ReplicatedEmbedding(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
-        return F.embedding(x, self.weight)
+        return replicated_embedding(x, self.weight)
 
 
 class ParallelLMHead(VocabParallelEmbedding):

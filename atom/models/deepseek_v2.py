@@ -60,7 +60,11 @@ from atom.model_ops.attention_mla import (
     triton_gather_kv_indices_sparse,
 )
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -91,6 +95,7 @@ from atom.utils.custom_register import direct_register_custom_op
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.plugin import is_plugin_mode
 from atom.plugin.vllm.attention.layer_sparse_mla import (
     IndexerDecoratorForPluginMode,
     DeepseekV32IndexerCacheDecoratorForPluginMode,
@@ -2426,6 +2431,33 @@ class DeepseekV2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def use_replicated_vocab_embed(config: PretrainedConfig) -> bool:
+    """Whether to hold the full vocab embedding on every TP rank (local lookup,
+    no post-embedding all-reduce) instead of a ``VocabParallelEmbedding`` shard.
+
+    Enabled by default (gated by ``ATOM_REPLICATE_VOCAB_EMBED``) for GLM-5.2
+    (``glm_moe_dsa``) — both the main model and its MTP draft — whose embedding is
+    independent of the still TP-sharded ``lm_head`` (``tie_word_embeddings=False``),
+    so the lookup is bit-identical to the sharded masked-embedding + all-reduce
+    path. Skipped in plugin mode (vLLM/SGLang/RTP own the embedding lifecycle) and
+    whenever the embedding is tied to the sharded head.
+
+    The GLM-5.2 main model keeps ``model_type == "glm_moe_dsa"``; its MTP draft
+    config has ``model_type`` rewritten to ``"deepseek_mtp"`` (see
+    ``SpeculativeConfig.hf_config_override``) but still carries the GLM-only
+    ``index_share_for_mtp_iteration`` flag, so we detect either.
+    """
+    if not envs.ATOM_REPLICATE_VOCAB_EMBED:
+        return False
+    if is_plugin_mode():
+        return False
+    if getattr(config, "tie_word_embeddings", False):
+        return False
+    return getattr(config, "model_type", None) == "glm_moe_dsa" or bool(
+        getattr(config, "index_share_for_mtp_iteration", False)
+    )
+
+
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
     def __init__(
@@ -2446,10 +2478,17 @@ class DeepseekV2Model(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
 
         if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-            )
+            if use_replicated_vocab_embed(config):
+                # GLM-5.2: full table per rank, no post-embedding all-reduce.
+                self.embed_tokens = ReplicatedEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                )
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 
