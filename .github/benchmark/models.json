@@ -42,7 +42,7 @@
       "config": {
         "tp": 8,
         "kv_cache_dtype": "fp8",
-        "extra_args": "--hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'"
+        "extra_args": "--no-enable_prefix_caching"
       },
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },
