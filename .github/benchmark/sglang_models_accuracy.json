@@ -14,6 +14,34 @@
     "_baseline_note": "SGLang-ATOM DeepSeek V4-Pro TP8 measured GSM8K 5-shot flexible-extract = 0.9530 ± 0.0058 with num_concurrent=8."
   },
   {
+    "model_name": "DeepSeek-V4-Pro MTP1 TP8",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 --speculative-algorithm EAGLE --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=true\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128\nATOM_USE_TRITON_MOE=0\nATOM_SGLANG_V4_DISABLE_PRO_DRAFT_TRITON_MOE=1\nATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1",
+    "runner": "atom-plugin-acc-validation-runner",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 8,
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "DeepSeek V4-Pro MTP1 follows the V4-Pro TP8 GSM8K 5-shot threshold while enabling EAGLE speculative decoding."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro MTP3 TP8",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=true\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128\nATOM_USE_TRITON_MOE=0\nATOM_SGLANG_V4_DISABLE_PRO_DRAFT_TRITON_MOE=1\nATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1",
+    "runner": "atom-plugin-acc-validation-runner",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 8,
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.9507,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "DeepSeek V4-Pro MTP3 full GSM8K validation measured flexible-extract = 0.9507 ± 0.0060 with EAGLE speculative decoding."
+  },
+  {
     "model_name": "DeepSeek-V4-Pro Prefix Cache TP8",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
     "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --enable-cache-report --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4",
