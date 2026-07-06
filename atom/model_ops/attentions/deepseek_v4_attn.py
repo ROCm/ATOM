@@ -1780,7 +1780,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata: AttentionMetaData,
         ubatch_idx: int,
     ) -> AttentionMetaData_DSV4:
-        """PCP+TBO balanced (§12): build one request group's metadata as an
+        """PCP+TBO balanced: build one request group's metadata as an
         independent non-TBO PCP mini-batch.
 
         `attn_metadata` is the FULL, UN-reindexed metadata (global). We slice it

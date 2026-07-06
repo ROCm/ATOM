@@ -2309,8 +2309,8 @@ class MoE(nn.Module):
         # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
         # — the latter requires registration regardless of
         # dual-stream, so register whenever either consumer is active.
-        _merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
-        if self._use_dual_stream or _merge_on:
+        _pcp_merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
+        if self._use_dual_stream or _pcp_merge_on:
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
@@ -2888,8 +2888,8 @@ def _pcp_active() -> bool:
 
 
 def _moe_pcp_merge_active() -> bool:
-    """Whether PCP MoE mode B (all-gather hidden -> full before MoE, slice back
-    after) applies in this forward.
+    """Whether PCP applies `attn with PCP -> all-gather hidden -> full before MoE,
+     slice back` after in this forward.
 
     True only when this is a real PCP prefill (`_pcp_active`) AND the
     `ATOM_PCP_MOE_MERGE` env is set. Mode A returns False: MoE runs on the
@@ -3144,9 +3144,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         # The MoE merge collectives gate themselves separately inside the opaque
         # moe_pcp_merge_forward custom op (called from Block.forward).
         moe_merge = _moe_pcp_merge_active()
-        # PCP with ATOM_PCP_MOE_MERGE=1 (default) is incompatible with DP-attention id-gathering for now: both
-        # rewrite ctx.context.input_ids with different (full-PCP vs DP-gathered)
-        # token sets, and stacking them is unverified. Disallow until needed.
+        # PCP with ATOM_PCP_MOE_MERGE=1 (default) is incompatible with DP-attention
+        # id-gathering for now: both rewrite ctx.context.input_ids with different
+        # (full-PCP vs DP-gathered) token sets, and stacking them is unverified.
+        # Disallow until needed.
         assert not (moe_merge and self._need_ids_gather), (
             "PCP with ATOM_PCP_MOE_MERGE=1 (default) is not supported "
             "together with DP-attention input-id gathering yet."
