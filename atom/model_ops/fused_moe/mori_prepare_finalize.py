@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import os
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -95,6 +96,26 @@ def init_mori_op(
         f"{num_experts_per_token=}"
     )
     return mori_op
+
+
+def _use_flydsl() -> bool:
+    """ATOM_USE_FLYDSL=1 enables FlyDSL-based MoE paths (dispatch/combine or the
+    fused MegaMoE experts)."""
+    return os.environ.get("ATOM_USE_FLYDSL", "0").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
+def _use_flydsl_fused() -> bool:
+    """ATOM_USE_FLYDSL_FUSED=1 replaces the whole EP experts step (dispatch +
+    gemm1 + quant + gemm2 + combine) with the new-PR MegaMoE fused op.
+    Requires ATOM_USE_FLYDSL=1."""
+    return _use_flydsl() and os.environ.get(
+        "ATOM_USE_FLYDSL_FUSED", "0"
+    ).strip().lower() in {"1", "true", "on", "yes"}
 
 
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):

@@ -552,6 +552,26 @@ class tokenIDProcessor:
         return ret
 
 
+def _mega_dummy_token_ids(n):
+    """Dummy token ids for warmup / cudagraph-capture / DP-sync batches.
+
+    FlyDSL MegaMoE fused (ATOM_USE_FLYDSL_FUSED=1): all-zero dummy tokens make the
+    gate route every token to the SAME expert set, overflowing the mega
+    dispatch/combine buffers (single-expert recv >> max_recv) -> HIP illegal
+    memory access at warmup/capture. Use varied ids so routing is balanced; real
+    token ids still flow at graph replay, so cudagraph correctness is unaffected.
+    Non-fused paths keep the original all-zero dummy (bit-identical behaviour).
+    """
+    if os.environ.get("ATOM_USE_FLYDSL_FUSED", "0").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    ):
+        return [(i % 8192) for i in range(n)]
+    return [0] * n
+
+
 class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
@@ -1043,7 +1063,7 @@ class ModelRunner:
         mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
-        seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
+        seq = Sequence(_mega_dummy_token_ids(num_tokens_original), block_size=self.block_size, id=-1)
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
@@ -1080,7 +1100,7 @@ class ModelRunner:
 
         seqs = {}
         for t in tokens_per_seq:
-            seq = Sequence([0] * t, block_size=self.block_size)
+            seq = Sequence(_mega_dummy_token_ids(t), block_size=self.block_size)
             seqs[seq.id] = seq
 
         dummy_batch = ScheduledBatch(
@@ -1140,7 +1160,7 @@ class ModelRunner:
             seq_len = max_model_len
 
         seqs = [
-            Sequence([0] * seq_len, block_size=self.block_size) for _ in range(num_seqs)
+            Sequence(_mega_dummy_token_ids(seq_len), block_size=self.block_size) for _ in range(num_seqs)
         ]
         seqs = {seq.id: seq for seq in seqs}
 

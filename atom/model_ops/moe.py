@@ -1012,6 +1012,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_swizzle_layout = w2_swizzle_layout
             return
 
+        # FlyDSL MegaMoE fused (ATOM_USE_FLYDSL_FUSED=1): build MegaMoE-layout
+        # weights from the RAW mxfp4 w13/w2 BEFORE atom's own shuffle overwrites them.
+        from atom.model_ops.fused_moe.mori_prepare_finalize import _use_flydsl_fused
+
+        if _use_flydsl_fused():
+            from atom.model_ops.fused_moe.flydsl_mega_experts import (
+                build_mega_weights,
+            )
+
+            build_mega_weights(layer)
+            print("[MEGA] built MegaMoE-layout weights for fused EP", flush=True)
+            # 坑2: under fused EP, apply() early-returns run_mega_moe (uses _mega_*),
+            # so the raw aiter-layout w13/w2 are a DEAD fallback. Releasing them (and
+            # skipping the redundant shuffle) avoids storing MoE weights twice, which
+            # otherwise crushes the KV cache ~35x (see PERF_REPORT §6.6).
+            import torch as _torch
+
+            layer.w13_weight.data = _torch.empty(
+                0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
+            )
+            layer.w2_weight.data = _torch.empty(
+                0, dtype=layer.w2_weight.dtype, device=layer.w2_weight.device
+            )
+            return
+
         # shuffle weight
         layer.w13_weight.data = shuffle_weight(
             layer.w13_weight,
@@ -1247,6 +1272,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias2=layer.w2_bias,
                 **moe_extra_args,
             )
+        # FlyDSL MegaMoE fused EP: replace the whole experts step (dispatch +
+        # gemm1 + quant + gemm2 + combine) with MegaMoE.forward.
+        from atom.model_ops.fused_moe.mori_prepare_finalize import _use_flydsl_fused
+
+        if _use_flydsl_fused() and getattr(layer, "_mega_w1", None) is not None:
+            from atom.model_ops.fused_moe.flydsl_mega_experts import run_mega_moe
+
+            return run_mega_moe(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                model_dim=self.hidden_size,
+                inter_dim=self.intermediate_size,
+                experts=global_num_experts,
+                topk=top_k,
+                quant="a8w4",
+            )
+
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
