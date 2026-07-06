@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import List, Optional, Type
@@ -25,6 +26,24 @@ from atom.utils.forward_context import AttentionMetaData, Context
 from .backends import AttentionBackend, CommonAttentionBuilder
 
 logger = logging.getLogger("atom")
+
+# `max_split_per_batch` is only needed (and only exists in newer aiter builds)
+# for the segmented page_size>1 MLA path. Detect support once so the default
+# page_size=1 path never passes an unsupported kwarg.
+try:
+    _MLA_META_SUPPORTS_MAX_SPLIT = (
+        "max_split_per_batch" in inspect.signature(get_mla_metadata_info_v1).parameters
+    )
+except (TypeError, ValueError):
+    _MLA_META_SUPPORTS_MAX_SPLIT = False
+
+
+def _mla_seg_meta_kwargs() -> dict:
+    """Extra kwargs for ``get_mla_metadata_info_v1`` on the seg (page_size>1)
+    path. Empty on the original page_size=1 path so behavior is unchanged."""
+    if envs.ATOM_MLA_PAGE_SIZE > 1 and _MLA_META_SUPPORTS_MAX_SPLIT:
+        return {"max_split_per_batch": 16}
+    return {}
 
 
 @dataclass
@@ -81,7 +100,10 @@ class AiterMLABackend(AttentionBackend):
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
-        self.block_size = 1
+        if envs.ATOM_MLA_PAGE_SIZE > 1:
+            self.block_size = envs.ATOM_MLA_PAGE_SIZE
+        else:
+            self.block_size = 1
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             assert model_runner.block_size == 64, (
                 f"ATOM_USE_TRITON_MLA=1 and ATOM_USE_TRITON_MLA_SHUFFLE_KV=1 expects --block-size 64 "
@@ -114,6 +136,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.dtype_kv,
             is_sparse=self.is_sparse,
             fast_mode=True,
+            **_mla_seg_meta_kwargs(),
         )
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
@@ -175,6 +198,40 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            (
+                (spp_wmd_size, spp_wmd_type),
+                (spp_wi_size, spp_wi_type),
+                (spp_wis_size, spp_wis_type),
+                (spp_ri_size, spp_ri_type),
+                (spp_rfm_size, spp_rfm_type),
+                (spp_rpm_size, spp_rpm_type),
+            ) = get_mla_metadata_info_v1(
+                self.max_num_batched_tokens,
+                1,  # sparse prefill treats each query token as q_len=1
+                self.padded_num_attention_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=True,
+                fast_mode=True,
+            )
+            mla_metadata["sparse_prefill_work_meta_data"] = torch.empty(
+                spp_wmd_size, dtype=spp_wmd_type, device=self.device
+            )
+            mla_metadata["sparse_prefill_work_indptr"] = torch.empty(
+                spp_wi_size, dtype=spp_wi_type, device=self.device
+            )
+            mla_metadata["sparse_prefill_work_info_set"] = torch.empty(
+                spp_wis_size, dtype=spp_wis_type, device=self.device
+            )
+            mla_metadata["sparse_prefill_reduce_indptr"] = torch.empty(
+                spp_ri_size, dtype=spp_ri_type, device=self.device
+            )
+            mla_metadata["sparse_prefill_reduce_final_map"] = torch.empty(
+                spp_rfm_size, dtype=spp_rfm_type, device=self.device
+            )
+            mla_metadata["sparse_prefill_reduce_partial_map"] = torch.empty(
+                spp_rpm_size, dtype=spp_rpm_type, device=self.device
+            )
 
         if self.is_sparse and max_seqlen_qo > 1:
             # Allocate a second set of persistent work buffers for sparse MTP
@@ -195,6 +252,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dtype_kv,
                 is_sparse=True,
                 fast_mode=True,
+                **_mla_seg_meta_kwargs(),
             )
             mla_metadata["sparse_mtp_work_meta_data"] = torch.empty(
                 smt_wmd_size, dtype=smt_wmd_type, device=self.device
@@ -720,14 +778,25 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.prepare_block_tables(batch)
                 attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
             counts = var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
+            local_offsets = np.concatenate(
+                [np.arange(s, dtype=np.int32) for s in counts]
+            )
             if attn_metadata.has_cached:
-                # Full context (cached + new): use cu_seqlens_k for indexer
+                # Full context (cached + new): each query token can see the cached
+                # prefix plus previous query tokens in this chunk, not future chunk
+                # tokens.
+                seq_starts = var["cu_seqlens_k"].np[:bs]
+                seq_lens = var["cu_seqlens_k"].np[1 : bs + 1] - seq_starts
+                cached_lens = seq_lens - counts
+                repeated_seq_starts = np.repeat(seq_starts, counts)
+                repeated_cached_lens = np.repeat(cached_lens, counts)
                 var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
-                    var["cu_seqlens_k"].np[:bs], counts
+                    seq_starts, counts
                 )
-                var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = np.repeat(
-                    var["cu_seqlens_k"].np[1 : bs + 1], counts
+                var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
+                    repeated_seq_starts + repeated_cached_lens + local_offsets + 1
                 )
+                sparse_counts = repeated_cached_lens + local_offsets + 1
             else:
                 var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
                     np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
@@ -735,6 +804,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
                     var["cu_seqlens_q"].np[:bs], counts
                 )
+                sparse_counts = local_offsets + 1
             attn_metadata.cu_seqlen_ks = var["cu_seqlen_ks"].copy_to_gpu(
                 sum_scheduled_tokens
             )
@@ -756,15 +826,50 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             var["sparse_kv_indptr"].np[0] = 0
             var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
-                np.minimum(
-                    np.concatenate([np.arange(1, s + 1) for s in counts]),
-                    self.index_topk,
-                ),
+                np.minimum(sparse_counts, self.index_topk),
                 dtype=np.int32,
             )
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
                 sum_scheduled_tokens + 1
             )
+            get_mla_metadata_v1(
+                attn_metadata.sparse_cu_seqlens_q,
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.kv_last_page_lens,
+                self.padded_num_attention_heads,
+                1,  # nhead_kv
+                True,
+                var["sparse_prefill_work_meta_data"],
+                var["sparse_prefill_work_info_set"],
+                var["sparse_prefill_work_indptr"],
+                var["sparse_prefill_reduce_indptr"],
+                var["sparse_prefill_reduce_final_map"],
+                var["sparse_prefill_reduce_partial_map"],
+                page_size=self.block_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
+                kv_granularity=max(self.block_size, 16),
+                max_seqlen_qo=1,
+                uni_seqlen_qo=1,
+                fast_mode=1,
+                max_split_per_batch=16,
+            )
+            attn_metadata.sparse_prefill_work_meta_data = var[
+                "sparse_prefill_work_meta_data"
+            ]
+            attn_metadata.sparse_prefill_work_info_set = var[
+                "sparse_prefill_work_info_set"
+            ]
+            attn_metadata.sparse_prefill_work_indptr = var["sparse_prefill_work_indptr"]
+            attn_metadata.sparse_prefill_reduce_indptr = var[
+                "sparse_prefill_reduce_indptr"
+            ]
+            attn_metadata.sparse_prefill_reduce_final_map = var[
+                "sparse_prefill_reduce_final_map"
+            ]
+            attn_metadata.sparse_prefill_reduce_partial_map = var[
+                "sparse_prefill_reduce_partial_map"
+            ]
 
         if hasattr(self.model_runner, "drafter") or attn_metadata.has_cached:
             # Populate kv_last_page_lens for full sequence (needed for MLA prefill with
@@ -1248,6 +1353,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
+        # Self-consistent minimal KV metadata for capture: give every sequence
+        # exactly 1 page (kv_indptr = [0,1,...,bs]) pointing at block 0, with a
+        # 1-token last page. The split-KV stage1 asm kernel computes per batch
+        # full_pages = page_count - (tail_len != 0). With model_runner's default
+        # zeroed kv_indptr (page_count == 0) but kv_last_page_lens == 1, that
+        # subtraction underflows (0 - 1 -> 0xFFFFFFFF), inflating the kv loop
+        # count to ~2^32 so the kernel never exits and cudagraph capture hangs
+        # (only hit when num_kv_splits > 1; passes==1 takes the bf16 fast path).
+        # Replay overwrites these buffers with real values, so this only affects
+        # capture-time loop termination, not inference correctness.
+        if self.block_size > 1:
+            kv_indptr_buf = var["kv_indptr"]
+            kv_indptr_buf.np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+            kv_indptr_buf.copy_to_gpu(bs + 1)
+            var["kv_indices"].gpu[:bs].zero_()
+            var["kv_last_page_lens"].gpu[:bs].fill_(1)
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         sum_tokens = bs * max_q_len

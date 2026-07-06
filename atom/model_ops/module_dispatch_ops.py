@@ -51,7 +51,10 @@ def maybe_dual_stream_forward(
     ]
     threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
     num_tokens = hidden_states.shape[0]
-    if self._use_dual_stream and 0 < num_tokens <= threshold:
+    # Under TBO the two micro-batches already overlap on separate threads
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if self._use_dual_stream and 0 < num_tokens <= threshold and not tbo_active():
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)
 

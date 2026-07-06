@@ -32,7 +32,6 @@ import torch.nn.functional as F
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
-    get_hip_quant,
     rope_rotate_activation,
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
@@ -47,13 +46,21 @@ from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.jit.utils.chip_info import get_gfx
 from atom.config import (
     Config,
     LayerQuantConfig,
     QuantizationConfig,
     QuantType,
     get_current_atom_config,
+)
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+    pcp_round_robin_split,
 )
 from atom.model_loader.loader import WeightsMapper
 
@@ -874,6 +881,11 @@ class Compressor(nn.Module):
         )
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
 
+        # Fixed CUDAGraph-stable scratch for `wkv_gate(x)` output on the captured
+        # decode path, in TBO, two concurrent ubatch threads never share the
+        # same scratch.
+        self._combined_cg_buf: dict = {}
+
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: Optional[torch.Tensor] = None
         self.rotary_emb: Optional[_V4RoPE] = None
@@ -980,6 +992,37 @@ class Compressor(nn.Module):
         # stride must be 1).
         coff_d = (1 + overlap) * d
         combined = self.wkv_gate(x)
+        # ===== PCP (full-KV) =====
+        # `x` here is this rank's 1/W round-robin shard (model.forward entry split).
+        # The wkv_gate projection above is per-token (parallelizable), but the
+        # downstream fused_compress_attn compresses `ratio` CONSECUTIVE tokens
+        # into one entry — which round-robin split breaks. So all-gather the
+        # projected `combined` back to full sequence order before compression,
+        # mirroring SGLang's compute_kv_score (all-gather kv_score after the
+        # projection, before the cross-token compress). The plan /
+        # state_slot_mapping passed to fused_compress_attn are full-sequence
+        # (never split in the builder), so they match the gathered `combined`.
+        if _pcp_active():
+            combined = pcp_allgather_rerange(combined, get_pcp_world_size())
+        # TBO decode: copy `combined` into a fixed-address buffer so CUDAGraph
+        # capture/replay see a stable pointer (allocator may re-place it).
+        from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
+
+        _fc = get_forward_context()
+        if getattr(_fc, "in_hipgraph", False) and tbo_active():
+            ub = tbo_current_ubatch_id()
+            n_tok = combined.shape[0]
+            buf = self._combined_cg_buf.get(ub)
+            if buf is None or buf.shape[0] < n_tok or buf.shape[1] != combined.shape[1]:
+                buf = torch.empty(
+                    combined.shape[0],
+                    combined.shape[1],
+                    dtype=combined.dtype,
+                    device=combined.device,
+                )
+                self._combined_cg_buf[ub] = buf
+            buf[:n_tok].copy_(combined)
+            combined = buf[:n_tok]
         kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
@@ -1085,7 +1128,10 @@ class Indexer(nn.Module):
         )
         self.softmax_scale = self.head_dim**-0.5
         # Init-time hoists out of `forward_batched`'s hot path.
-        self._fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        # FP8 Q quant is fused into `rope_rotate_activation` (per_1x128 over
+        # head_dim); `group_size` is the per-1xN block. head_dim is the index
+        # head dim (128), so there is exactly one scale per (token, head).
+        self._q_quant_group = self.head_dim
         self._weights_scale = self.softmax_scale * self.n_heads**-0.5
         # `deepgemm_fp8_paged_mqa_logits` decode-path output column count:
         # one indexer slot per `compress_ratio` source tokens.
@@ -1157,16 +1203,28 @@ class Indexer(nn.Module):
         q = self.wq_b(qr_full, x_scale=qr_full_scale).view(
             total_tokens, self.n_heads, self.head_dim
         )
-        # self.rotary_emb(positions, q[..., -rd:])
-        # q = rotate_activation(q)
-        rope_rotate_activation(
-            q, q, self.rotary_emb.cos_cache, self.rotary_emb.sin_cache, positions, rd
+        # RoPE + Hadamard-rotate + FP8 quant fused in one kernel. Q is online
+        # (recomputed each fwd, no cache); the bf16 rotated Q is never read back,
+        # so it is quantized in place of being materialized. `out_scale` carries
+        # the per-(token, head) fp8 block scale (head_dim == group => one/row).
+        # `_weights_scale` precomputed in __init__.
+        # self.rotary_emb(positions, q[..., -rd:]); q = rotate_activation(q)
+        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        q_scale = torch.empty(
+            (total_tokens * self.n_heads, self.head_dim // self._q_quant_group),
+            dtype=dtypes.fp32,
+            device=q.device,
         )
-
-        # FP8 quant Q (still online — Q is recomputed each fwd, no cache).
-        # `_fp8_quant_func` / `_weights_scale` precomputed in __init__.
-        q_2d = q.view(-1, self.head_dim)
-        q_fp8, q_scale = self._fp8_quant_func(q_2d, quant_dtype=dtypes.fp8)
+        rope_rotate_activation(
+            q_fp8,
+            q,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            positions,
+            rd,
+            out_scale=q_scale,
+            group_size=self._q_quant_group,
+        )
         q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
         q_scale = q_scale.view(total_tokens, self.n_heads, 1)
 
@@ -1322,10 +1380,12 @@ class Indexer(nn.Module):
         """
         total_tokens = q_fp8.size(0)
         n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
-        bs = block_tables.size(0)
-        # V4-Pro has no MTP, so next_n = total_tokens // bs = 1. The reshape
-        # also handles future multi-token decode (MTP) without code change.
-        next_n = total_tokens // bs
+        # NOTE: derive the query batch size from the ACTUAL number of query
+        # tokens, NOT from block_tables.size(0). Under TBO the per-ubatch
+        # block_tables / n_committed are padded to a DP-unified bucket and will
+        # get errors if we try to use the padded rows.
+        next_n = max(1, int(get_forward_context().attn_metadata.max_seqlen_q))
+        bs = total_tokens // next_n
         # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
         # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
         q_4d = q_fp8.view(
@@ -1632,7 +1692,11 @@ class DeepseekV4Attention(nn.Module):
         Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
         fc = get_forward_context()
         current_stream = fc.main_stream
-        use_async_compress = self._use_async_compress and fc.in_hipgraph
+        from atom.utils.tbo.ubatching import tbo_active
+
+        use_async_compress = (
+            self._use_async_compress and fc.in_hipgraph and not tbo_active()
+        )
         has_compressor = self.compressor is not None
         has_indexer = self.indexer is not None and not self.skip_topk
         if use_async_compress:
@@ -1754,6 +1818,16 @@ class DeepseekV4Attention(nn.Module):
         # from 4 (1.12×) to 32k (1.04×); used for both decode and prefill.
         # Optional FP8 quant outputs left off — downstream sparse_attn /
         # swa_write are still bf16.
+        # Decode folds the SWA cache-write into qk_norm_rope_maybe_quant: the
+        # post-norm/rope KV row is written into swa_kv[slot, pos%cache, :]
+        # (slot = state_slot_mapping[batch_id_per_token[t]]). The flydsl path
+        # fuses it into the kernel launch; the Triton fallback emits a separate
+        # swa_write internally — either way the bridge owns the SWA write, so
+        # no backend dispatch is needed here. Prefill writes its in-chunk SWA
+        # tail after sparse_attn, so it passes swa_kv=None and never fuses.
+        # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
+        # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
+        # covers exactly the tokens the old standalone swa_write did.
         q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
@@ -1767,19 +1841,15 @@ class DeepseekV4Attention(nn.Module):
             self.eps,
             quant_q=False,
             quant_k=False,
+            swa_kv=self.swa_kv if is_decode else None,
+            state_slot_mapping=state_slot_mapping if is_decode else None,
+            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
+            swa_cache_size=cache_size if is_decode else None,
+            swa_write_per_batch=(
+                min(attn_md.max_seqlen_q, cache_size) if is_decode else None
+            ),
         )
-        if is_decode:
-            # SWA write per-token in decode (prefill writes after sparse_attn
-            # below so the in-chunk SWA tail is captured post-attention).
-            swa_write(
-                kv,
-                positions,
-                attn_md.cu_seqlens_q,
-                state_slot_mapping,
-                self.swa_kv,
-                cache_size,
-                min(attn_md.max_seqlen_q, cache_size),
-            )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
@@ -1835,6 +1905,37 @@ class DeepseekV4Attention(nn.Module):
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
             # buffer with SWA history + compress section), extend from per-fwd
             # `kv` tensor (in-chunk SWA tail; extend buffer is layer-invariant).
+            #
+            # ===== PCP (full-KV) =====
+            # Under PCP the model.forward entry round-robin-split x/positions to 1/W,
+            # so `q_sa` and `kv` here are this rank's 1/W shard. The per-query
+            # metadata (kv_indptr/indices_*, indexer_meta) was already reduced
+            # to this rank's owned queries in the builder (_apply_pcp_reindex),
+            # so `q_sa` + those indices are aligned and used as-is. The only
+            # runtime fixups here are on the actual K/V data:
+            #   - swa_write must write the FULL sequence SWA ring (every PCP
+            #     rank keeps full KV), and
+            #   - sparse_attn's extend source must be the FULL `kv` so each 1/W
+            #     query can attend the whole in-chunk SWA window.
+            # So all-gather `kv` back to full order; positions/cu_seqlens_q/
+            # state_slot_mapping for the SWA write stay full (cu_seqlens_q /
+            # state_slot_mapping are per-seq, never split; positions_full comes
+            # from the forward context which holds the pre-split copy).
+            pcp_on = _pcp_active()
+            if pcp_on:
+                pcp_ws = get_pcp_world_size()
+                kv_full = pcp_allgather_rerange(kv, pcp_ws)
+                # positions must match kv_full's full-sequence coords for the
+                # swa_write ring addressing (`positions[src] % cache_size`).
+                # `positions` here is this rank's 1/W shard (split in
+                # ForCausalLM.forward); all-gather it back to full order with
+                # the same rerange used for kv (NOT fc.context.positions, which
+                # the builder reindexed to 1/W).
+                positions_full = pcp_allgather_rerange(positions, pcp_ws)
+            else:
+                kv_full = kv
+                positions_full = positions
+
             if ratio == 0:
                 kv_indices_prefix = attn_md.kv_indices_prefix_swa
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_swa
@@ -1851,7 +1952,7 @@ class DeepseekV4Attention(nn.Module):
                 self.unified_kv,
                 kv_indices_prefix,
                 kv_indptr_prefix,
-                kv,
+                kv_full,
                 attn_md.kv_indices_extend,
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
@@ -1860,9 +1961,11 @@ class DeepseekV4Attention(nn.Module):
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see
             # prior-chunk's ring contents (current swa_write would overwrite
             # ring slots `pos % cache_size` for positions in this chunk's tail).
+            # PCP: write the FULL sequence SWA ring from the gathered kv_full +
+            # full positions/cu_seqlens_q (full-KV scheme — every rank holds it).
             swa_write(
-                kv,
-                positions,
+                kv_full,
+                positions_full,
                 attn_md.cu_seqlens_q,
                 state_slot_mapping,
                 self.swa_kv,
@@ -1876,7 +1979,18 @@ class DeepseekV4Attention(nn.Module):
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        if num_tokens <= 32 or get_gfx() == "gfx1250":
+            y = torch.empty(
+                num_tokens,
+                self.n_local_groups,
+                self.o_lora_rank,
+                dtype=o.dtype,
+                device=o.device,
+            ).transpose(0, 1)
+            y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
+            o = y.transpose(0, 1)
+        else:
+            o = torch.einsum("sgd,grd->sgr", o, wo_a)
         x = self.wo_b(o.flatten(1))
         return x
 
@@ -2633,6 +2747,19 @@ class ParallelHead(ParallelLMHead):
         return self.get_logits(norm(x))  # [bs, vocab]
 
 
+def _pcp_active() -> bool:
+    """Whether to apply PCP round-robin-split in this forward.
+
+    True only when pcp_size > 1 AND this is a real prefill forward (not decode,
+    not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
+    warmup dummy run has no valid KV cache so it must skip the split path.
+    """
+    if get_pcp_world_size() <= 1:
+        return False
+    fc = get_forward_context()
+    return fc.context.is_prefill and not fc.context.is_dummy_run
+
+
 @support_torch_compile
 class DeepseekV4Model(nn.Module):
     """Full model: embed -> expand to hc_mult copies -> N blocks -> hc_head -> logits.
@@ -2709,6 +2836,12 @@ class DeepseekV4Model(nn.Module):
         MTP draft consume it without re-expanding from a dim-reduced state.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
+        # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
+        # split to this rank's 1/W shard (done in DeepseekV4ForCausalLM.forward,
+        # OUTSIDE the torch.compile boundary — keeping comms / dynamic padding
+        # out of the compiled graph). So everything here runs on the 1/W shard;
+        # the K/V all-gather inside attention reconstructs full KV per layer,
+        # and the final all-gather + un-pad happens back in the caller.
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
@@ -2834,6 +2967,30 @@ class DeepseekV4ForCausalLM(nn.Module):
         # `model.forward` — production runner, warmup, benchmarks — gets
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
+
+        # ===== PCP: round-robin-split the prefill sequence OUTSIDE torch.compile =====
+        # PCP splits the prefill query sequence across the PCP group (full-KV
+        # scheme). This must happen here in ForCausalLM.forward (NOT in the
+        # @support_torch_compile-wrapped DeepseekV4Model.forward) so the
+        # cross-rank all-gather + data-dependent padding stay out of the
+        # compiled graph (Dynamo mishandles comms / dynamic shapes -> shape
+        # desync). Mirrors SGLang, which does cp_round_robin on input_ids in
+        # the un-compiled ForCausalLM.forward. We pad tokens to a multiple of
+        # pcp_size (dummy tokens, zero-length KV in the builder metadata), then
+        # round-robin-split input_ids/positions to this rank's 1/W shard. The model
+        # runs entirely on 1/W; the final hidden is all-gathered + un-padded
+        # after self.model(...) returns.
+        use_pcp = _pcp_active()
+        if use_pcp:
+            pcp_size = get_pcp_world_size()
+            n_global = input_ids.shape[0]
+            pad = pcp_pad_len(n_global, pcp_size) - n_global
+            if pad > 0:
+                input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
+                positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
+            input_ids = pcp_round_robin_split(input_ids, pcp_size)
+            positions = pcp_round_robin_split(positions, pcp_size)
+
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
             # gate sees DP-gathered gating_output, so gather ids to match. Run
@@ -2849,7 +3006,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         else:
             ctx.context.input_ids = input_ids
-        return self.model(input_ids, positions)
+        h = self.model(input_ids, positions)
+
+        # ----- PCP: all-gather shards, restore original order, drop pad -----
+        if use_pcp:
+            h = pcp_allgather_rerange(h, pcp_size)
+            if pad > 0:
+                h = h[:n_global]
+        return h
 
     def compute_logits(
         self,

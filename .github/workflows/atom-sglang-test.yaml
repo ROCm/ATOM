@@ -226,7 +226,7 @@ jobs:
           echo "aiter_wheel_name=$(basename "$AITER_WHL")" >> "$GITHUB_OUTPUT"
 
       - name: Upload aiter wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
@@ -252,7 +252,7 @@ jobs:
               SGLANG_ENABLE_TORCH_COMPILE=1
               TORCHINDUCTOR_COMPILE_THREADS=128
             accuracy_test_threshold: 0.91
-            runner: linux-atom-mi35x-4
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - model_name: "DeepSeek-R1-FP4 TP4"
             model_path: "amd/DeepSeek-R1-0528-MXFP4-v2"
             extra_args: "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache"
@@ -265,7 +265,7 @@ jobs:
               SGLANG_ENABLE_TORCH_COMPILE=1
               TORCHINDUCTOR_COMPILE_THREADS=128
             accuracy_test_threshold: 0.91
-            runner: linux-atom-mi35x-4
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - model_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
             extra_args: "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
@@ -274,52 +274,24 @@ jobs:
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
             accuracy_test_threshold: 0.76
-            runner: linux-atom-mi35x-4
-          - model_name: "MI308 Qwen3.5-397B-A17B-FP8 TP4"
-            model_path: "Qwen/Qwen3.5-397B-A17B-FP8"
-            extra_args: "--tensor-parallel-size 4 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+          - model_name: "DeepSeek-V4-Pro TP8"
+            model_path: "deepseek-ai/DeepSeek-V4-Pro"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4"
             env_vars: |
               SGLANG_DEFAULT_SERVER_ARGS=
+              AITER_BF16_FP8_MOE_BOUND=0
+              ATOM_MOE_GU_ITLV=1
+              SGLANG_DEFAULT_THINKING=1
+              SGLANG_DSV4_REASONING_EFFORT=max
+              SGLANG_USE_AITER=1
+              SGLANG_DSV4_FP4_EXPERTS=true
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.83
-            runner: atom-mi308-8gpu-plugins-benchmark
-          - model_name: "MI308 Qwen3.5-397B-A17B-FP8 TP8"
-            model_path: "Qwen/Qwen3.5-397B-A17B-FP8"
-            extra_args: "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.83
-            runner: atom-mi308-8gpu-plugins-benchmark
-          - model_name: "MI308 Qwen3.5-35B-A3B-FP8 TP1"
-            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
-            extra_args: "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.76
-            runner: atom-mi308-8gpu-plugins-benchmark
-          - model_name: "MI308 Qwen3-32B-FP8 TP1"
-            model_path: "Qwen/Qwen3-32B-FP8"
-            extra_args: "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.8
-            runner: atom-mi308-8gpu-plugins-benchmark
-          - model_name: "MI308 Qwen3-32B-FP8 TP8"
-            model_path: "Qwen/Qwen3-32B-FP8"
-            extra_args: "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.8
-            runner: atom-mi308-8gpu-plugins-benchmark
+              TORCHINDUCTOR_COMPILE_THREADS=128
+            lm_eval_num_fewshot: 5
+            lm_eval_num_concurrent: 8
+            accuracy_test_threshold: 0.94
+            runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -327,54 +299,24 @@ jobs:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
-      - name: Ensure Python 3.10+ (install portable 3.10 if needed)
-        if: matrix.runner == 'atom-mi308-8gpu-plugins-benchmark'
-        id: ensure_python
-        shell: bash
+      - name: Configure Docker client config path
         run: |
-          if command -v python3 >/dev/null 2>&1 && python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"; then
-            echo "Using $(command -v python3): $(python3 --version)"
-            echo "need_install=false" >> "$GITHUB_OUTPUT"
-          else
-            if command -v python3 >/dev/null 2>&1; then
-              echo "python3 is below 3.10: $(python3 --version 2>&1)"
-            else
-              echo "python3 not found on PATH; will install portable CPython 3.10"
-            fi
-            echo "need_install=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # setup-python has no build for Alibaba Cloud Linux / unknown OS on many self-hosted runners.
-      # Portable glibc CPython from python-build-standalone (3.10.13 @ tag 20231002; satisfies >=3.10).
-      - name: Install portable CPython 3.10 (self-hosted)
-        if: matrix.runner == 'atom-mi308-8gpu-plugins-benchmark' && steps.ensure_python.outputs.need_install == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG='20231002'
-          PYVER='3.10.13'
-          case "$(uname -m)" in
-            x86_64) triple='x86_64-unknown-linux-gnu' ;;
-            aarch64) triple='aarch64-unknown-linux-gnu' ;;
-            *) echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
+          # Self-hosted runners often have a small or full $HOME; buildx defaults to ~/.docker/buildx
+          # and fails with "no space left on device" on .lock. Point DOCKER_CONFIG + BUILDKIT_TMPDIR
+          # at the job workspace (typically a larger volume than /home).
+          case "${{ matrix.runner }}" in
+            atom-mi308-8gpu-plugins-benchmark|atom-mi355-8gpu.predownload)
+              echo "DOCKER_CONFIG=${GITHUB_WORKSPACE}/.atom-docker-client" >> "$GITHUB_ENV"
+              echo "BUILDKIT_TMPDIR=${GITHUB_WORKSPACE}/.buildkit-tmp" >> "$GITHUB_ENV"
+              echo "Set DOCKER_CONFIG and BUILDKIT_TMPDIR under workspace."
+              ;;
+            *)
+              echo "Runner ${{ matrix.runner }}: leave DOCKER_CONFIG unset (default ~/.docker)."
+              ;;
           esac
-          tarball="cpython-${PYVER}+${TAG}-${triple}-install_only.tar.gz"
-          base="${RUNNER_TOOL_CACHE:-${HOME}/.cache/atom-ci}/portable-python/${PYVER}-${TAG}-${triple}"
-          pybin="${base}/python/bin"
-          if [ ! -x "${pybin}/python3" ]; then
-            echo "Downloading ${tarball}..."
-            rm -rf "${base}"
-            mkdir -p "${base}"
-            curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/${TAG}/${tarball}" -o "/tmp/${tarball}"
-            tar -xzf "/tmp/${tarball}" -C "${base}"
-            rm -f "/tmp/${tarball}"
-          fi
-          echo "${pybin}" >> "$GITHUB_PATH"
-          command -v python3
-          python3 --version
-
+      
       - name: Clean up containers and workspace
-        if: contains(fromJSON('["atom-mi355-8gpu.predownload","atom-mi308-8gpu-plugins-benchmark"]'), matrix.runner)
+        if: contains(fromJSON('["atom-mi355-8gpu.predownload"]'), matrix.runner)
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -386,6 +328,15 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+
+      - name: Ensure Docker client config directory
+        if: contains(fromJSON('["atom-mi308-8gpu-plugins-benchmark","atom-mi355-8gpu.predownload"]'), matrix.runner)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+          mkdir -p "${BUILDKIT_TMPDIR}"
+          chmod 700 "${BUILDKIT_TMPDIR}"
 
       - name: Resolve SGLang version metadata
         run: python3 .github/scripts/resolve_sglang_metadata.py
@@ -399,7 +350,7 @@ jobs:
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Download aiter wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiter-whl
           path: aiter-whl
@@ -513,8 +464,20 @@ jobs:
           if [ -d "/models" ]; then
             MODEL_CACHE_MOUNT="-v /models:/models"
             MODEL_CACHE_DESC="/models (host mount)"
+          elif [ -d "/it-share/models" ]; then
+            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
+            MODEL_CACHE_DESC="/it-share/models (host path)"
+          elif [ -d "/mnt/dcgpuval/models" ]; then
+            MODEL_CACHE_MOUNT="-v /mnt/dcgpuval/models:/models"
+            MODEL_CACHE_DESC="/mnt/dcgpuval/models (host path)"
+          elif [ -d "/shareddata/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
+            MODEL_CACHE_DESC="/shareddata/models (host path)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (host path)"
           else
-            echo "Warning: /models directory not found on runner; using container-local /models."
+            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models and /data/models directory not found on runner; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -536,7 +499,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host --network=host --group-add video \
             --shm-size=16G \
             --privileged \
             --cap-add=SYS_PTRACE \
@@ -605,6 +568,8 @@ jobs:
           MAX_WAIT_RETRIES: "120"
           STREAM_SGLANG_LOGS: "1"
           LM_EVAL_TASK: "gsm8k"
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot || '3' }}
+          LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent || '65' }}
         run: |
           docker exec \
             -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
@@ -614,6 +579,8 @@ jobs:
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
+            -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
               bash .github/scripts/atom_sglang_test.sh accuracy
@@ -630,7 +597,15 @@ jobs:
           fi
 
           echo "RESULT_FILE: $result_file"
-          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
+          flexible_extract_value=$(python3 - "$result_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              data = json.load(f)
+          print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
+          PY
+          )
           echo "Flexible extract value: $flexible_extract_value"
           echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
 
@@ -658,7 +633,7 @@ jobs:
 
       - name: Upload SGLANG artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sglang-${{ matrix.model_name }}-artifacts
           path: |

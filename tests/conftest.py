@@ -4,6 +4,7 @@
 
 import importlib
 import importlib.util
+import importlib.machinery
 import sys
 import os
 import types
@@ -51,13 +52,24 @@ class _StubKVCacheTensor:
 class _StubParallelConfig:
     """Placeholder for ParallelConfig."""
 
-    pass
+    def __init__(self, data_parallel_size: int = 1):
+        self.data_parallel_size = data_parallel_size
 
 
 _atom_config.Config = _StubConfig
 _atom_config.KVCacheTensor = _StubKVCacheTensor
 _atom_config.ParallelConfig = _StubParallelConfig
 sys.modules["atom.config"] = _atom_config
+
+# ── 3b. Stub forward_context; Scheduler only needs get_kvconnector in tests ──
+
+_forward_context = types.ModuleType("atom.utils.forward_context")
+_forward_context.__package__ = "atom.utils"
+_forward_context.__spec__ = importlib.machinery.ModuleSpec(
+    "atom.utils.forward_context", loader=None
+)
+_forward_context.get_kvconnector = lambda *args, **kwargs: None
+sys.modules["atom.utils.forward_context"] = _forward_context
 
 # ── 4. Stub zmq / zmq.asyncio if not installed ────────────────────────────
 
@@ -104,6 +116,15 @@ from atom.model_engine.scheduler import Scheduler  # noqa: E402
 # ── 7. MockConfig ──────────────────────────────────────────────────────────
 
 
+class _MockHFConfig:
+    """Minimal hf_config stub. Default is non-V4 so Scheduler's V4 SWA-warmup
+    detection stays inert; pass architectures=[...] to exercise the V4 path."""
+
+    def __init__(self, architectures=None, sliding_window=128):
+        self.architectures = architectures or ["LlamaForCausalLM"]
+        self.sliding_window = sliding_window
+
+
 class MockConfig:
     """Lightweight stand-in for atom.config.Config.
 
@@ -116,15 +137,25 @@ class MockConfig:
             kv_cache_block_size=4,
             num_kvcache_blocks=10,
             enable_prefix_caching=False,
+            enable_chunked_prefill=True,
             max_num_seqs=4,
             max_num_batched_tokens=64,
+            long_prefill_token_threshold=0,
             max_model_len=64,
             bos_token_id=1,
             eos_token_id=2,
             stop_token_ids=[],
             scheduler_delay_factor=0.0,
             speculative_config=None,
-            enable_chunked_prefill=False,
+            # DP size gates the dense-batch prefill hold (see Scheduler). Default
+            # 1 (gate off) so unrelated tests keep legacy behavior; gate tests
+            # pass data_parallel_size>1.
+            parallel_config=_StubParallelConfig(
+                data_parallel_size=overrides.pop("data_parallel_size", 1)
+            ),
+            # Scheduler.__init__ reads config.hf_config.architectures for V4
+            # SWA-warmup detection; a non-V4 stub keeps that path inert.
+            hf_config=_MockHFConfig(),
         )
         defaults.update(overrides)
         for k, v in defaults.items():

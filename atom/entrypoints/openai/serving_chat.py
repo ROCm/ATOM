@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
@@ -18,12 +18,6 @@ from .reasoning import ReasoningFilter, separate_reasoning
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger("atom")
-
-
-def _prompt_token_count(prompt_or_tokens: Union[str, List[int]], tokenizer) -> int:
-    if isinstance(prompt_or_tokens, str):
-        return len(tokenizer.encode(prompt_or_tokens))
-    return len(prompt_or_tokens)
 
 
 def create_chat_chunk(
@@ -61,11 +55,11 @@ def create_chat_chunk(
 async def stream_chat_response(
     request_id: str,
     model: str,
-    prompt: Union[str, List[int]],
     stream_queue: asyncio.Queue,
     seq_id: int,
-    tokenizer,
+    num_prompt_tokens: int,
     cleanup_fn,
+    tools=None,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -73,11 +67,16 @@ async def stream_chat_response(
     - reasoning_content deltas during thinking phase
     - content deltas for the answer
     - tool_calls deltas when model invokes tools
+
+    ``num_prompt_tokens`` is the engine-computed prompt length (``Sequence.
+    num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
+    event loop at stream start.
     """
-    num_tokens_input = _prompt_token_count(prompt, tokenizer)
+    num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
+    num_cached_tokens = 0
     reasoning_filter = ReasoningFilter()
-    tool_parser = ToolCallStreamParser()
+    tool_parser = ToolCallStreamParser(tools=tools)
     has_tool_calls = False
 
     # Send initial role chunk
@@ -89,6 +88,9 @@ async def stream_chat_response(
         chunk_data = await stream_queue.get()
         new_text = chunk_data["text"]
         num_tokens_output += len(chunk_data.get("token_ids", []))
+        _ct = chunk_data.get("num_cached_tokens", 0)
+        if _ct:
+            num_cached_tokens = _ct
 
         if "kv_transfer_params" in chunk_data:
             kv_transfer_params_value = chunk_data["kv_transfer_params"]
@@ -151,8 +153,8 @@ async def stream_chat_response(
         "prompt_tokens": num_tokens_input,
         "completion_tokens": num_tokens_output,
         "total_tokens": num_tokens_input + num_tokens_output,
+        "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
     }
-    yield create_chat_chunk(request_id, model, finish_reason=finish_reason)
     usage_chunk = {
         "id": request_id,
         "object": CHAT_COMPLETION_CHUNK_OBJECT,
@@ -162,14 +164,21 @@ async def stream_chat_response(
     }
     if kv_transfer_params_value is not None:
         usage_chunk["kv_transfer_params"] = kv_transfer_params_value
-    yield f"data: {json.dumps(usage_chunk)}\n\n"
-    yield STREAM_DONE_MESSAGE
+    # Coalesce finish + usage + [DONE] into one send: at a wave boundary many
+    # requests finalize at once, so collapsing 3 socket writes/req to 1 cuts
+    # the syscalls that saturate the API event loop.
+    yield (
+        create_chat_chunk(request_id, model, finish_reason=finish_reason)
+        + f"data: {json.dumps(usage_chunk)}\n\n"
+        + STREAM_DONE_MESSAGE
+    )
 
 
 def _build_chat_choice(
     raw_text: str,
     finish_reason: Optional[str],
     index: int = 0,
+    tools=None,
 ) -> Dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
@@ -178,7 +187,7 @@ def _build_chat_choice(
     without duplicating the logic.
     """
     reasoning_content, content_with_tools = separate_reasoning(raw_text)
-    content, tool_calls = parse_tool_calls(content_with_tools)
+    content, tool_calls = parse_tool_calls(content_with_tools, tools)
 
     message: Dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning_content is not None:
@@ -199,18 +208,26 @@ def build_chat_response(
     model: str,
     raw_text: str,
     final_output: Dict[str, Any],
+    tools=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
-        choices=[_build_chat_choice(raw_text, final_output["finish_reason"], index=0)],
+        choices=[
+            _build_chat_choice(
+                raw_text, final_output["finish_reason"], index=0, tools=tools
+            )
+        ],
         usage={
             "prompt_tokens": final_output["num_tokens_input"],
             "completion_tokens": final_output["num_tokens_output"],
             "total_tokens": final_output["num_tokens_input"]
             + final_output["num_tokens_output"],
+            "prompt_tokens_details": {
+                "cached_tokens": final_output.get("num_cached_tokens", 0)
+            },
             "ttft_s": round(final_output.get("ttft", 0.0), 4),
             "tpot_s": round(final_output.get("tpot", 0.0), 4),
             "latency_s": round(final_output.get("latency", 0.0), 4),
@@ -229,6 +246,7 @@ def build_chat_response_multi(
     request_id: str,
     model: str,
     final_outputs: List[Dict[str, Any]],
+    tools=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -240,7 +258,7 @@ def build_chat_response_multi(
     """
     assert final_outputs, "build_chat_response_multi requires at least one output"
     choices = [
-        _build_chat_choice(out["text"], out["finish_reason"], index=i)
+        _build_chat_choice(out["text"], out["finish_reason"], index=i, tools=tools)
         for i, out in enumerate(final_outputs)
     ]
     prompt_tokens = final_outputs[0]["num_tokens_input"]
@@ -254,6 +272,9 @@ def build_chat_response_multi(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": final_outputs[0].get("num_cached_tokens", 0)
+            },
             "ttft_s": round(
                 max((out.get("ttft", 0.0) for out in final_outputs), default=0.0), 4
             ),
@@ -271,11 +292,11 @@ def build_chat_response_multi(
 async def stream_chat_response_fanout(
     request_id: str,
     model: str,
-    prompt: Union[str, List[int]],
     shared_queue: asyncio.Queue,
     seq_ids: List[int],
-    tokenizer,
+    num_prompt_tokens: int,
     cleanup_fn,
+    tools=None,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
     into a single SSE stream, tagging every chunk with ``choices[0].index``.
@@ -283,15 +304,20 @@ async def stream_chat_response_fanout(
     The shared queue receives ``(sibling_index, chunk_data)`` tuples from
     the engine callbacks registered in :func:`setup_streaming_request_fanout`.
     Reasoning + tool-call state is kept independently per sibling.
+
+    ``num_prompt_tokens`` is the engine-computed prompt length shared by all
+    siblings (they tokenize the same prompt once); reusing it avoids
+    re-tokenizing on the event loop at stream start.
     """
     n = len(seq_ids)
-    num_tokens_input = _prompt_token_count(prompt, tokenizer)
+    num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     reasoning_filters = [ReasoningFilter() for _ in range(n)]
-    tool_parsers = [ToolCallStreamParser() for _ in range(n)]
+    tool_parsers = [ToolCallStreamParser(tools=tools) for _ in range(n)]
     has_tool_calls = [False] * n
     finished = [False] * n
     kv_transfer_params_value = None
+    num_cached_tokens = 0
 
     for i in range(n):
         yield create_chat_chunk(request_id, model, delta={"role": "assistant"}, index=i)
@@ -303,6 +329,9 @@ async def stream_chat_response_fanout(
             continue
         new_text = chunk_data["text"]
         num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
+        _ct = chunk_data.get("num_cached_tokens", 0)
+        if _ct:
+            num_cached_tokens = _ct
 
         if "kv_transfer_params" in chunk_data:
             kv_transfer_params_value = chunk_data["kv_transfer_params"]
@@ -369,15 +398,12 @@ async def stream_chat_response_fanout(
     for sid in seq_ids:
         cleanup_fn(request_id, sid)
 
-    for i in range(n):
-        finish_reason = "tool_calls" if has_tool_calls[i] else "stop"
-        yield create_chat_chunk(request_id, model, finish_reason=finish_reason, index=i)
-
     usage = {
         "prompt_tokens": num_tokens_input,
         "completion_tokens": sum(num_tokens_output),
         "total_tokens": num_tokens_input + sum(num_tokens_output),
         "num_choices": n,
+        "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
     }
     usage_chunk = {
         "id": request_id,
@@ -388,5 +414,17 @@ async def stream_chat_response_fanout(
     }
     if kv_transfer_params_value is not None:
         usage_chunk["kv_transfer_params"] = kv_transfer_params_value
-    yield f"data: {json.dumps(usage_chunk)}\n\n"
-    yield STREAM_DONE_MESSAGE
+    # Coalesce the per-sibling finish chunks + usage + [DONE] into one send.
+    yield (
+        "".join(
+            create_chat_chunk(
+                request_id,
+                model,
+                finish_reason="tool_calls" if has_tool_calls[i] else "stop",
+                index=i,
+            )
+            for i in range(n)
+        )
+        + f"data: {json.dumps(usage_chunk)}\n\n"
+        + STREAM_DONE_MESSAGE
+    )

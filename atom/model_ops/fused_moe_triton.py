@@ -122,7 +122,7 @@ def triton_kernel_moe_forward(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    activation: str = "silu",
+    activation: ActivationType = ActivationType.Silu,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
     a13_scale: torch.Tensor | None = None,
@@ -131,6 +131,7 @@ def triton_kernel_moe_forward(
     w2_swizzle_layout: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 7.0,
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
@@ -160,6 +161,7 @@ def triton_kernel_moe_forward(
         w2_swizzle_layout=w2_swizzle_layout,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
+        swiglu_limit=swiglu_limit,
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=global_num_experts,
         expert_map=expert_map,
@@ -177,7 +179,7 @@ def triton_kernel_fused_experts(
     gather_indx,  # GatherIndx -> tensor
     scatter_indx,  # ScatterIndx -> tensor
     topk: int,
-    activation: str = "silu",
+    activation: ActivationType = ActivationType.Silu,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
     w13_swizzle_layout: torch.Tensor | None = None,
@@ -231,10 +233,6 @@ def triton_kernel_fused_experts(
         if act_quant == MoEActivationQuant.FP8:
             assert a13_scale is not None
             assert a2_scale is not None
-
-            # vllm-like processing
-            a13_scale = a13_scale.max().to(torch.float32)
-            a2_scale = a2_scale.max().to(torch.float32)
 
             quant_dtype = torch.float8_e4m3fn
             if get_arch() == "gfx942":
@@ -307,6 +305,12 @@ def triton_kernel_fused_experts(
         # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation.
         # The activation precision selects the routed GEMM: MXFP4 activations
         # (a4w4) when act_quant is FP4, otherwise bf16 activations (a16w4).
+        if act_quant == MoEActivationQuant.FP8:
+            raise NotImplementedError(
+                "SiLU activation with FP8 act_quant is not implemented in the "
+                "triton MoE kernel. Only the SwiGLU branch supports FP8 "
+                "activations (moe_gemm_a8w4)."
+            )
         if act_quant == MoEActivationQuant.FP4:
             hidden_states_fp4, hidden_states_mx_scale = mxfp4_quant(hidden_states)
             raw_intermediate = moe_gemm_a4w4(

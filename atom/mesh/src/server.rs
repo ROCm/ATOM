@@ -1,4 +1,6 @@
 use std::{
+    io,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -401,6 +403,12 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
+#[derive(Clone, Debug)]
+pub struct ServerTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -413,6 +421,7 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    pub tls: Option<ServerTlsConfig>,
     pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
 }
 
@@ -744,7 +753,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ]
     });
 
-    let app = build_app(app_state.clone(), config.max_payload_size, request_id_headers);
+    let app = build_app(
+        app_state.clone(),
+        config.max_payload_size,
+        request_id_headers,
+    );
 
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
     let bind_addr = format!("{}:{}", config.host, config.port);
@@ -764,11 +777,76 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         app_state_clone.router.shutdown().await;
     });
 
-    axum_server::bind(addr)
-        .handle(handle)
-        .serve(app.into_make_service())
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    if let Some(tls) = config.tls.as_ref() {
+        let cert_metadata = tokio::fs::metadata(&tls.cert_path).await.map_err(|e| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TLS certificate file is not accessible at '{}': {}",
+                    tls.cert_path.display(),
+                    e
+                ),
+            )) as Box<dyn std::error::Error>
+        })?;
+        if !cert_metadata.is_file() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TLS certificate path is not a file: '{}'",
+                    tls.cert_path.display()
+                ),
+            )));
+        }
+
+        let key_metadata = tokio::fs::metadata(&tls.key_path).await.map_err(|e| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TLS private key file is not accessible at '{}': {}",
+                    tls.key_path.display(),
+                    e
+                ),
+            )) as Box<dyn std::error::Error>
+        })?;
+        if !key_metadata.is_file() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TLS private key path is not a file: '{}'",
+                    tls.key_path.display()
+                ),
+            )));
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                .await
+                .map_err(|e| {
+                    Box::new(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "failed to load TLS certificate '{}' and key '{}': {}",
+                            tls.cert_path.display(),
+                            tls.key_path.display(),
+                            e
+                        ),
+                    )) as Box<dyn std::error::Error>
+                })?;
+        info!("TLS enabled");
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    } else {
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    }
 
     // HA handler shutdown is handled by the signal in mesh_run! macro
     // No need to manually shutdown here

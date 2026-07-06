@@ -27,7 +27,7 @@ pub use crate::core::token_bucket::TokenBucket;
 use crate::{
     observability::{
         inflight_tracker::InFlightRequestTracker,
-        metrics::{method_to_static_str, metrics_labels, MeshMetrics, normalize_path_for_metrics},
+        metrics::{method_to_static_str, metrics_labels, normalize_path_for_metrics, MeshMetrics},
     },
     routers::comm::error::extract_error_code_from_response,
     server::AppState,
@@ -470,12 +470,16 @@ pub async fn concurrency_limit_middleware(
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
-                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            MeshMetrics::record_http_rate_limit(
+                                metrics_labels::RATE_LIMIT_REJECTED,
+                            );
                             status.into_response()
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
-                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            MeshMetrics::record_http_rate_limit(
+                                metrics_labels::RATE_LIMIT_REJECTED,
+                            );
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
                     }
