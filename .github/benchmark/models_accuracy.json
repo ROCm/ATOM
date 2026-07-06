@@ -218,6 +218,30 @@
     "_baseline_note": "ATOM native FP8 gsm8k 3-shot flexible-extract=0.9447 (5-shot=0.9416); --gpu-memory-utilization 0.8 needed since the DSA index cache OOMs at default 0.9. Threshold 0.92 leaves ~2.5pp headroom."
   },
   {
+    "model_name": "GLM-5.2-MXFP4",
+    "model_path": "amd/GLM-5.2-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --default-chat-template-kwargs '{\"enable_thinking\":false}' --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": 0.9447,
+    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
+    "_baseline_note": "Initial GLM-5.2-MXFP4 online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 CI baseline is calibrated."
+  },
+  {
+    "model_name": "GLM-5.2-MXFP4 MTP",
+    "model_path": "amd/GLM-5.2-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --default-chat-template-kwargs '{\"enable_thinking\":false}' --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}' --method mtp --num-speculative-tokens 3",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": 0.9447,
+    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
+    "_baseline_note": "Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated."
+  },
+  {
     "model_name": "GLM-5.1-FP8",
     "model_path": "zai-org/GLM-5.1-FP8",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
