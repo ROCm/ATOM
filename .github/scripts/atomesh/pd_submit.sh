@@ -19,6 +19,7 @@ DRY_RUN=0
 JOB_ID=""
 SLURM_JOB_ACTIVE=0
 SCANCEL_SENT=0
+declare -A SPUR_SHARED_LOG_LINES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -327,19 +328,47 @@ stream_slurm_logs_once() {
   ERR_LINE="$(stream_file_lines "${SLURM_JOB_ERROR}" "[slurm.err] " "${ERR_LINE}")"
 }
 
+stream_spur_shared_logs_once() {
+  local job_id="$1"
+  local run_dir="${LOG_ROOT}/slurm_job-${job_id}"
+  local log_file rel_path current_line
+
+  [[ -d "${run_dir}" ]] || return 0
+
+  shopt -s nullglob
+  for log_file in "${run_dir}"/rank-*/container.log "${run_dir}"/logs/*.log; do
+    rel_path="${log_file#"${run_dir}/"}"
+    current_line="${SPUR_SHARED_LOG_LINES[${log_file}]:-0}"
+    SPUR_SHARED_LOG_LINES["${log_file}"]="$(stream_file_lines "${log_file}" "[spur:${rel_path}] " "${current_line}")"
+  done
+  shopt -u nullglob
+}
+
 monitor_slurm_job() {
   local job_id="$1"
+  local squeue_cmd=(squeue)
   OUT_LINE=0
   ERR_LINE=0
+  SPUR_SHARED_LOG_LINES=()
+
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    squeue_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
 
   echo "=== monitoring Slurm job ${job_id} ==="
-  while squeue -h -j "${job_id}" >/dev/null 2>&1 && [[ -n "$(squeue -h -j "${job_id}" 2>/dev/null)" ]]; do
-    squeue -h -j "${job_id}" -o "[slurm] job=%i state=%T elapsed=%M nodes=%D reason=%R" || true
+  while "${squeue_cmd[@]}" -h -j "${job_id}" >/dev/null 2>&1 && [[ -n "$("${squeue_cmd[@]}" -h -j "${job_id}" 2>/dev/null)" ]]; do
+    "${squeue_cmd[@]}" -h -j "${job_id}" -o "[slurm] job=%i state=%T elapsed=%M nodes=%D reason=%R" || true
     stream_slurm_logs_once
+    if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+      stream_spur_shared_logs_once "${job_id}"
+    fi
     sleep "${SLURM_LOG_POLL_INTERVAL}"
   done
 
   stream_slurm_logs_once
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    stream_spur_shared_logs_once "${job_id}"
+  fi
 }
 
 read_slurm_exit_code() {
