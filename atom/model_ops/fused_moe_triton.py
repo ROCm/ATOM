@@ -29,7 +29,6 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE or envs.ATOM_USE_TRITON
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
-        swizzle_scales as swizzle_scales_a8w4,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
@@ -37,8 +36,8 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE or envs.ATOM_USE_TRITON
     from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
         moe_gemm_a4w4,
         mxfp4_quant,
-        swizzle_scales as swizzle_scales_cdna4,
     )
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
     from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
@@ -51,11 +50,14 @@ def _swizzle_scales_for_kernel(scale, act_quant: MoEActivationQuant):
     FP8 (a8w4): arch-agnostic swizzle (CDNA4 on gfx950, GFX1250 on gfx1250).
     BF16/FP4 (a16w4/a4w4): CDNA4 swizzle on gfx942/gfx950, no swizzle elsewhere.
     """
+    arch = get_arch()
     if act_quant == MoEActivationQuant.FP8:
-        return swizzle_scales_a8w4(scale)
-    # TODO: move arch dispatch into aiter's a4w4/a16w4 swizzle_scales (like a8w4)
-    if get_arch() in ("gfx942", "gfx950"):
-        return swizzle_scales_cdna4(scale), "CDNA4_SCALE"
+        layout = "GFX1250_SCALE" if arch == "gfx1250" else (
+            "CDNA4_SCALE" if arch == "gfx950" else None
+        )
+        return shuffle_scale_moe(scale), layout
+    if arch in ("gfx942", "gfx950"):
+        return shuffle_scale_moe(scale), "CDNA4_SCALE"
     return scale, None
 
 

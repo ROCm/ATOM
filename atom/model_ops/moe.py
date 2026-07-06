@@ -1093,9 +1093,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
         if self.use_triton_decode:
-            from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
-                swizzle_scales as swizzle_scales_a8w4,
-            )
+            from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
             w13_u8 = layer.w13_weight.data
             if w13_u8.dtype != torch.uint8:
@@ -1116,12 +1114,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_scale_for_a8w4 = orig_w13_weight_scale.transpose(-2, -1)
             w2_scale_for_a8w4 = orig_w2_weight_scale.transpose(-2, -1)
 
-            layer.w13_weight_scale_a8w4, layer.w13_swizzle_layout_a8w4 = (
-                swizzle_scales_a8w4(w13_scale_for_a8w4)
-            )
-            layer.w2_weight_scale_a8w4, layer.w2_swizzle_layout_a8w4 = (
-                swizzle_scales_a8w4(w2_scale_for_a8w4)
-            )
+            layer.w13_weight_scale_a8w4 = shuffle_scale_moe(w13_scale_for_a8w4)
+            layer.w13_swizzle_layout_a8w4 = "GFX1250_SCALE"
+            layer.w2_weight_scale_a8w4 = shuffle_scale_moe(w2_scale_for_a8w4)
+            layer.w2_swizzle_layout_a8w4 = "GFX1250_SCALE"
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
