@@ -480,7 +480,7 @@ print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)
 # Install the SemiAnalysis fork pinned to the commit that supports the SA
 # agentic datasets (semianalysis_cc_traces_weka_062126*).
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_COMMIT="97ae7e898e8cce4070f779f2e0dc04f1d9bb5feb"
+ARG SA_AIPERF_COMMIT="0d2aa0572ac685943d38c580675c4a61023581d3"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
         rm -rf /opt/aiperf && \
