@@ -136,7 +136,10 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     cli_args_dict.set_item("decode", cli_args.decode)?;
     cli_args_dict.set_item("prefill_policy", cli_args.prefill_policy)?;
     cli_args_dict.set_item("decode_policy", cli_args.decode_policy)?;
-    cli_args_dict.set_item("worker_startup_timeout_secs", cli_args.worker_startup_timeout_secs)?;
+    cli_args_dict.set_item(
+        "worker_startup_timeout_secs",
+        cli_args.worker_startup_timeout_secs,
+    )?;
     cli_args_dict.set_item(
         "worker_startup_check_interval",
         cli_args.worker_startup_check_interval,
@@ -165,19 +168,37 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
         cli_args.rate_limit_tokens_per_second,
     )?;
     cli_args_dict.set_item("retry_max_retries", cli_args.retry_max_retries)?;
-    cli_args_dict.set_item("retry_initial_backoff_ms", cli_args.retry_initial_backoff_ms)?;
+    cli_args_dict.set_item(
+        "retry_initial_backoff_ms",
+        cli_args.retry_initial_backoff_ms,
+    )?;
     cli_args_dict.set_item("retry_max_backoff_ms", cli_args.retry_max_backoff_ms)?;
-    cli_args_dict.set_item("retry_backoff_multiplier", cli_args.retry_backoff_multiplier)?;
+    cli_args_dict.set_item(
+        "retry_backoff_multiplier",
+        cli_args.retry_backoff_multiplier,
+    )?;
     cli_args_dict.set_item("retry_jitter_factor", cli_args.retry_jitter_factor)?;
     cli_args_dict.set_item("disable_retries", cli_args.disable_retries)?;
     cli_args_dict.set_item("cb_failure_threshold", cli_args.cb_failure_threshold)?;
     cli_args_dict.set_item("cb_success_threshold", cli_args.cb_success_threshold)?;
-    cli_args_dict.set_item("cb_timeout_duration_secs", cli_args.cb_timeout_duration_secs)?;
+    cli_args_dict.set_item(
+        "cb_timeout_duration_secs",
+        cli_args.cb_timeout_duration_secs,
+    )?;
     cli_args_dict.set_item("cb_window_duration_secs", cli_args.cb_window_duration_secs)?;
     cli_args_dict.set_item("disable_circuit_breaker", cli_args.disable_circuit_breaker)?;
-    cli_args_dict.set_item("health_failure_threshold", cli_args.health_failure_threshold)?;
-    cli_args_dict.set_item("health_success_threshold", cli_args.health_success_threshold)?;
-    cli_args_dict.set_item("health_check_timeout_secs", cli_args.health_check_timeout_secs)?;
+    cli_args_dict.set_item(
+        "health_failure_threshold",
+        cli_args.health_failure_threshold,
+    )?;
+    cli_args_dict.set_item(
+        "health_success_threshold",
+        cli_args.health_success_threshold,
+    )?;
+    cli_args_dict.set_item(
+        "health_check_timeout_secs",
+        cli_args.health_check_timeout_secs,
+    )?;
     cli_args_dict.set_item(
         "health_check_interval_secs",
         cli_args.health_check_interval_secs,
@@ -187,12 +208,18 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     cli_args_dict.set_item("model_path", cli_args.model_path)?;
     cli_args_dict.set_item("tokenizer_path", cli_args.tokenizer_path)?;
     cli_args_dict.set_item("chat_template", cli_args.chat_template)?;
-    cli_args_dict.set_item("tokenizer_cache_enable_l0", cli_args.tokenizer_cache_enable_l0)?;
+    cli_args_dict.set_item(
+        "tokenizer_cache_enable_l0",
+        cli_args.tokenizer_cache_enable_l0,
+    )?;
     cli_args_dict.set_item(
         "tokenizer_cache_l0_max_entries",
         cli_args.tokenizer_cache_l0_max_entries,
     )?;
-    cli_args_dict.set_item("tokenizer_cache_enable_l1", cli_args.tokenizer_cache_enable_l1)?;
+    cli_args_dict.set_item(
+        "tokenizer_cache_enable_l1",
+        cli_args.tokenizer_cache_enable_l1,
+    )?;
     cli_args_dict.set_item(
         "tokenizer_cache_l1_max_memory",
         cli_args.tokenizer_cache_l1_max_memory,

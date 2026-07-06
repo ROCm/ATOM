@@ -67,13 +67,9 @@ mod b_handlers_dispatch {
         let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req(false);
         r.model = "no-such-model".to_string();
-        let resp = handlers::route_responses(
-            &ctx,
-            Arc::new(r),
-            None,
-            Some("no-such-model".to_string()),
-        )
-        .await;
+        let resp =
+            handlers::route_responses(&ctx, Arc::new(r), None, Some("no-such-model".to_string()))
+                .await;
         assert!(
             !resp.status().is_success(),
             "unknown model must fail, got {}",
@@ -118,7 +114,10 @@ mod c_non_streaming {
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("\"id\""), "envelope must include id: {s}");
-        assert!(s.contains("\"object\""), "envelope must include object: {s}");
+        assert!(
+            s.contains("\"object\""),
+            "envelope must include object: {s}"
+        );
     }
 
     #[tokio::test]
@@ -413,11 +412,16 @@ mod g_conversation {
     use serde_json::json;
 
     use crate::protocols::responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest};
-    use crate::routers::openai::responses::conversation::load_conversation_history;
     use crate::routers::openai::responses::context::ResponsesContext;
+    use crate::routers::openai::responses::conversation::load_conversation_history;
     use crate::routers::test_mocks;
 
-    async fn store_prev(ctx: &ResponsesContext, id: &str, input: serde_json::Value, output: serde_json::Value) {
+    async fn store_prev(
+        ctx: &ResponsesContext,
+        id: &str,
+        input: serde_json::Value,
+        output: serde_json::Value,
+    ) {
         let mut s = StoredResponse::new(None);
         s.id = ResponseId::from(id);
         s.input = input;
@@ -528,9 +532,11 @@ mod g_conversation {
         req.input = ResponseInput::Items(vec![ResponseInputOutputItem::Message {
             id: "msg_1".to_string(),
             role: "user".to_string(),
-            content: vec![crate::protocols::responses::ResponseContentPart::InputText {
-                text: "now".to_string(),
-            }],
+            content: vec![
+                crate::protocols::responses::ResponseContentPart::InputText {
+                    text: "now".to_string(),
+                },
+            ],
             status: Some("completed".to_string()),
         }]);
         let modified = load_conversation_history(&ctx, &req).await.unwrap();
@@ -670,9 +676,11 @@ mod g_conversation {
         req.input = ResponseInput::Items(vec![ResponseInputOutputItem::Message {
             id: "msg_now".to_string(),
             role: "user".to_string(),
-            content: vec![crate::protocols::responses::ResponseContentPart::InputText {
-                text: "now".to_string(),
-            }],
+            content: vec![
+                crate::protocols::responses::ResponseContentPart::InputText {
+                    text: "now".to_string(),
+                },
+            ],
             status: Some("completed".to_string()),
         }]);
         let modified = load_conversation_history(&ctx, &req).await.unwrap();
@@ -782,9 +790,7 @@ mod h2_conversions_branches {
         ResponseReasoningContent::ReasoningText, ResponseStatus, ResponseTool, ResponseToolType,
         ResponsesRequest, StringOrContentParts, TextConfig, TextFormat,
     };
-    use crate::routers::openai::responses::conversions::{
-        chat_to_responses, responses_to_chat,
-    };
+    use crate::routers::openai::responses::conversions::{chat_to_responses, responses_to_chat};
 
     fn req_with_input(input: ResponseInput) -> ResponsesRequest {
         let mut r = ResponsesRequest::default();
@@ -904,11 +910,14 @@ mod h2_conversions_branches {
             ResponseInputOutputItem::Reasoning {
                 id: "r_1".to_string(),
                 summary: vec![],
-                content: vec![ReasoningText {
-                    text: "think a".to_string(),
-                }, ReasoningText {
-                    text: "think b".to_string(),
-                }],
+                content: vec![
+                    ReasoningText {
+                        text: "think a".to_string(),
+                    },
+                    ReasoningText {
+                        text: "think b".to_string(),
+                    },
+                ],
                 status: None,
             },
         ]));
@@ -992,7 +1001,10 @@ mod h2_conversions_branches {
         assert!(chat.stream_options.is_some());
     }
 
-    fn chat_with_message(msg: ChatCompletionMessage, finish: Option<&str>) -> ChatCompletionResponse {
+    fn chat_with_message(
+        msg: ChatCompletionMessage,
+        finish: Option<&str>,
+    ) -> ChatCompletionResponse {
         ChatCompletionResponse::builder("chatcmpl-1", "m")
             .add_choice(ChatChoice {
                 index: 0,
@@ -1147,7 +1159,9 @@ mod j_stream_event_emitter {
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use crate::protocols::chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice};
+    use crate::protocols::chat::{
+        ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
+    };
     use crate::protocols::common::{FunctionCallDelta, ToolCallDelta};
     use crate::routers::openai::responses::streaming::{
         OutputItemType, ResponseStreamEventEmitter,
@@ -1295,7 +1309,8 @@ mod j_stream_event_emitter {
     fn test_process_chunk_content_emits_added_and_delta() {
         let mut e = emitter();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        e.process_chunk(&chunk_with(Some("hi"), None, None), &tx).unwrap();
+        e.process_chunk(&chunk_with(Some("hi"), None, None), &tx)
+            .unwrap();
         let s = collect_lines(&mut rx);
         assert!(s.contains("response.output_item.added"));
         assert!(s.contains("response.content_part.added"));
@@ -1306,7 +1321,8 @@ mod j_stream_event_emitter {
     fn test_process_chunk_empty_content_is_skipped() {
         let mut e = emitter();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        e.process_chunk(&chunk_with(Some(""), None, None), &tx).unwrap();
+        e.process_chunk(&chunk_with(Some(""), None, None), &tx)
+            .unwrap();
         let s = collect_lines(&mut rx);
         assert!(s.is_empty());
     }
@@ -1324,7 +1340,8 @@ mod j_stream_event_emitter {
                 arguments: Some("{\"a\":1}".to_string()),
             }),
         }];
-        e.process_chunk(&chunk_with(None, Some(deltas), None), &tx).unwrap();
+        e.process_chunk(&chunk_with(None, Some(deltas), None), &tx)
+            .unwrap();
         let s = collect_lines(&mut rx);
         assert!(s.contains("response.output_item.added"));
         assert!(s.contains("response.function_call_arguments.delta"));
@@ -1343,8 +1360,10 @@ mod j_stream_event_emitter {
                 arguments: Some("{}".to_string()),
             }),
         }];
-        e.process_chunk(&chunk_with(None, Some(deltas), None), &tx).unwrap();
-        e.process_chunk(&chunk_with(None, None, Some("tool_calls")), &tx).unwrap();
+        e.process_chunk(&chunk_with(None, Some(deltas), None), &tx)
+            .unwrap();
+        e.process_chunk(&chunk_with(None, None, Some("tool_calls")), &tx)
+            .unwrap();
         let s = collect_lines(&mut rx);
         assert!(s.contains("response.function_call_arguments.done"));
         assert!(s.contains("response.output_item.done"));
@@ -1354,8 +1373,10 @@ mod j_stream_event_emitter {
     fn test_process_chunk_finish_stop_emits_text_done() {
         let mut e = emitter();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        e.process_chunk(&chunk_with(Some("yo"), None, None), &tx).unwrap();
-        e.process_chunk(&chunk_with(None, None, Some("stop")), &tx).unwrap();
+        e.process_chunk(&chunk_with(Some("yo"), None, None), &tx)
+            .unwrap();
+        e.process_chunk(&chunk_with(None, None, Some("stop")), &tx)
+            .unwrap();
         let s = collect_lines(&mut rx);
         assert!(s.contains("response.output_text.done"));
         assert!(s.contains("response.content_part.done"));
@@ -1366,8 +1387,10 @@ mod j_stream_event_emitter {
     fn test_process_chunk_finish_length_emits_text_done() {
         let mut e = emitter();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        e.process_chunk(&chunk_with(Some("yo"), None, None), &tx).unwrap();
-        e.process_chunk(&chunk_with(None, None, Some("length")), &tx).unwrap();
+        e.process_chunk(&chunk_with(Some("yo"), None, None), &tx)
+            .unwrap();
+        e.process_chunk(&chunk_with(None, None, Some("length")), &tx)
+            .unwrap();
         let s = collect_lines(&mut rx);
         assert!(s.contains("response.output_text.done"));
     }
@@ -1386,7 +1409,12 @@ mod j_stream_event_emitter {
     fn test_build_sse_response_has_event_stream_content_type() {
         let (_tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
         let resp = crate::routers::openai::responses::streaming::build_sse_response(rx);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/event-stream"));
     }
 }
@@ -1451,7 +1479,9 @@ mod j2_stream_event_emitter_branches {
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use crate::protocols::chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice};
+    use crate::protocols::chat::{
+        ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
+    };
     use crate::protocols::common::{FunctionCallDelta, ToolCallDelta};
     use crate::routers::openai::responses::streaming::{
         OutputItemType, ResponseStreamEventEmitter,
@@ -1744,7 +1774,12 @@ mod j2_stream_event_emitter_branches {
     fn test_build_sse_response_headers() {
         let (_tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
         let resp = crate::routers::openai::responses::streaming::build_sse_response(rx);
-        let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap();
+        let cc = resp
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(cc, "no-cache");
         let conn = resp.headers().get("connection").unwrap().to_str().unwrap();
         assert_eq!(conn, "keep-alive");
@@ -1777,9 +1812,13 @@ mod k2_streaming_accumulator {
     #[tokio::test]
     async fn test_streaming_output_text_delta_contains_content() {
         let ctx = test_mocks::responses_context_with_chat_path("m");
-        let resp =
-            handlers::route_responses(&ctx, Arc::new(req_with_store(None)), None, Some("m".to_string()))
-                .await;
+        let resp = handlers::route_responses(
+            &ctx,
+            Arc::new(req_with_store(None)),
+            None,
+            Some("m".to_string()),
+        )
+        .await;
         let s = body_of(resp).await;
         assert!(s.contains("response.created"));
         assert!(s.contains("response.completed"));

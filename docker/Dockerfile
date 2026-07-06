@@ -444,4 +444,36 @@ RUN echo "========== Install atomesh binary ==========" && \
     cp target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
 
+# ========== LMCache (HIP c_ops) for KV offload ==========
+# ATOM's KV offload uses the LMCache connector, which needs LMCache's c_ops
+# built for ROCm. NEVER `pip install lmcache` — it pulls CUDA torch and breaks
+# the ROCm stack. Build from source pinned to a release tag, against the image's
+# torch. KEY: the install must be EDITABLE (`pip install -e .`); at this tag a
+# non-editable `pip install .` silently SKIPS the c_ops extension and falls back
+# to the slow python backend. Verified end-to-end (tp8 offload store via c_ops)
+# on gfx950. NOTE: tp>1 offload also needs aiter's eager-NCCL-init fix
+# (device_id= to init_process_group); that belongs in aiter (tracked separately),
+# not here — the CI build_aiter stage picks it up once merged.
+ARG LMCACHE_TAG=v0.4.5
+# PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
+# hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
+# ${GPU_ARCH} here — ARG does not cross FROM so it would be empty in this stage.
+RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+    git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
+    cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
+    "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
+    CXX=hipcc BUILD_WITH_HIP=1 \
+      "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
+    "${VENV_PYTHON}" -m pip install --no-deps \
+        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 && \
+    "${VENV_PYTHON}" -c "import torch, lmcache, lmcache.c_ops; \
+from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
+from lmcache.v1.memory_management import MemoryFormat; \
+from lmcache.v1.lookup_client.factory import LookupClientFactory; \
+from lmcache.v1.config import LMCacheEngineConfig; \
+from lmcache.v1.metadata import LMCacheMetadata; \
+assert 'rocm' in torch.__version__, torch.__version__; \
+assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
+print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
+
 CMD ["/bin/bash"]
