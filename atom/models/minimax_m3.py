@@ -6,8 +6,7 @@
 from typing import Optional, Union
 
 import torch
-import aiter
-from aiter import ActivationType
+from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -19,8 +18,8 @@ from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
-    fused_qk_norm,
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_quant,
 )
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.linear import (
@@ -62,6 +61,40 @@ def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
     return {i for i, enabled in enumerate(freq) if enabled != 0}
 
 
+def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]:
+    return {
+        layer_id: ordinal
+        for ordinal, layer_id in enumerate(sorted(_sparse_attention_layer_ids(config)))
+    }
+
+
+def _should_skip_minimax_m3_index_topk(
+    config: PretrainedConfig, layer_id: int
+) -> tuple[bool, int]:
+    sparse_ordinals = _sparse_attention_layer_ordinals(config)
+    sparse_ordinal = sparse_ordinals.get(layer_id, -1)
+    if sparse_ordinal < 0:
+        return False, sparse_ordinal
+    if not getattr(config, "use_index_cache", False):
+        return False, sparse_ordinal
+
+    index_topk_freq = int(getattr(config, "index_topk_freq", 1) or 1)
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        if 0 <= sparse_ordinal < len(index_topk_pattern):
+            return index_topk_pattern[sparse_ordinal] == "S", sparse_ordinal
+        return False, sparse_ordinal
+
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    if index_topk_freq == 1:
+        return False, sparse_ordinal
+
+    # MiniMax-M3 schedules sharing by sparse-layer ordinal, not absolute layer id.
+    offset = int(getattr(config, "index_skip_topk_offset", 0))
+    return max(sparse_ordinal - offset, 0) % index_topk_freq != 0, sparse_ordinal
+
+
 def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     moe_layer_freq = getattr(config, "moe_layer_freq", None)
     if moe_layer_freq is None:
@@ -71,6 +104,15 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
 
 def _rope_theta(config: PretrainedConfig) -> float:
     return getattr(config, "rope_theta", 1000000.0)
+
+
+def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
+    quant_type = getattr(linear, "quant_type", None)
+    quant_type_value = getattr(quant_type, "value", quant_type)
+    return (
+        quant_type_value == QuantType.per_Token.value
+        and getattr(linear, "params_dtype", None) == dtypes.fp8
+    )
 
 
 def _minimax_m3_cos_sin_cache(
@@ -177,8 +219,10 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj(x)
+    def forward(
+        self, x: torch.Tensor, x_scale: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x, x_scale=x_scale)
         x = swiglu_oai_split(
             gate_up,
             alpha=self.swiglu_alpha,
@@ -347,8 +391,9 @@ class MiniMaxM3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
         return self.o_proj(attn_output)
@@ -402,6 +447,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
         self.init_blocks = sparse_cfg.get("sparse_init_block", 0)
         self.local_blocks = sparse_cfg.get("sparse_local_block", 0)
+        self.skip_index_topk, self.sparse_layer_ordinal = (
+            _should_skip_minimax_m3_index_topk(config, layer_id)
+        )
         score_type = sparse_cfg.get("sparse_score_type", "max")
         if score_type != "max":
             raise ValueError(
@@ -472,18 +520,19 @@ class MiniMaxM3SparseAttention(nn.Module):
             topk=self.topk_blocks,
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
+            skip_index_topk=self.skip_index_topk,
+            sparse_layer_ordinal=self.sparse_layer_ordinal,
         )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Packed qkv = [q | k | v | index_q | index_k]. The sparse impl's
-        # rope_cache consumes the packed tensor directly (passed via qkv=); the
-        # split q/k/v slices satisfy forward_impl's view contract (they are
-        # rebuilt from qkv inside rope_cache).
-        qkv = self.qkv_proj(hidden_states)
+        # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
+        # the indexer norm/rope/top-k path, but still compute the packed GEMM.
+        qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v, _, _ = qkv.split(
             [
                 self.q_size,
@@ -550,21 +599,59 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        capture_aux: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
+        hidden_states_scale = None
+        fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
+            self.self_attn.qkv_proj
+        )
+        fuse_post_attention_ar_rmsnorm_quant = (
+            not self.is_moe_layer
+            and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
+        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif fuse_input_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.input_layernorm
+                )
+            )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
 
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
+        # Eagle3 aux hidden state = the all-reduced residual stream entering this
+        # layer (post input-norm). Captured here, not as `hidden_states + residual`
+        # in the model loop, because M3's fused all-reduce RMSNorm leaves that sum
+        # TP-partial / NaN-prone under CUDAGraph.
+        aux_hidden_state = residual.clone() if capture_aux else None
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states)
+        if fuse_post_attention_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+            hidden_states = ffn(hidden_states)
+        if aux_hidden_state is not None:
+            return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
 
@@ -609,6 +696,10 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # Eagle3 aux hidden-state capture layer ids. Empty unless an Eagle3 drafter
+        # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -622,7 +713,7 @@ class MiniMaxM3Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             hidden_states = (
                 inputs_embeds
@@ -635,10 +726,17 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        aux_hidden_states: list[torch.Tensor] = []
         for idx in range(self.start_layer, self.end_layer):
-            hidden_states, residual = self.layers[idx](
-                positions, hidden_states, residual
-            )
+            if idx in self.aux_hidden_state_layers:
+                hidden_states, residual, aux_hidden_state = self.layers[idx](
+                    positions, hidden_states, residual, capture_aux=True
+                )
+                aux_hidden_states.append(aux_hidden_state)
+            else:
+                hidden_states, residual = self.layers[idx](
+                    positions, hidden_states, residual
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -648,6 +746,8 @@ class MiniMaxM3Model(nn.Module):
         hidden_states, _ = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.norm
         )
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -705,6 +805,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default Eagle3 aux hidden-state layer ids: early / middle / late of
+        the target model (early=2, mid=n//2, late=n-3), matching vLLM's default.
+        """
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def forward(
         self,
@@ -770,6 +880,12 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
     def forward(
         self,

@@ -7,6 +7,8 @@ from typing import Type
 import aiter
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer, envs
@@ -15,10 +17,7 @@ from atom.utils.block_convert import (
     kv_indices_generate_triton,
 )
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
-from atom.utils.forward_context import (
-    AttentionMetaData,
-    Context,
-)
+from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
@@ -43,6 +42,54 @@ def _is_indexed_sparse_attention(module) -> bool:
     return bool(getattr(impl, "is_indexed_sparse_attention", False))
 
 
+@triton.jit
+def _mtp_prepare_decode_metadata_kernel(
+    context_lens_ptr,
+    block_tables_ptr,
+    slot_mapping_ptr,
+    positions_in_ptr,
+    positions_out_ptr,
+    last_token_indices_ptr,
+    bs,
+    skip_update: tl.constexpr,
+    update_context_lens: tl.constexpr,
+    update_positions: tl.constexpr,
+    select_positions: tl.constexpr,
+    block_size: tl.constexpr,
+    block_table_stride: tl.constexpr,
+    position_stride: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    if not skip_update:
+        seq = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = seq < bs
+
+        ctx = tl.load(context_lens_ptr + seq, mask=mask, other=1).to(tl.int64)
+        if update_context_lens:
+            ctx += 1
+            tl.store(context_lens_ptr + seq, ctx, mask=mask)
+
+        if update_positions:
+            pos_idx = seq
+            if select_positions:
+                pos_idx = tl.load(last_token_indices_ptr + seq, mask=mask, other=0)
+            pos = tl.load(positions_in_ptr + pos_idx, mask=mask, other=0)
+            tl.store(positions_out_ptr + seq * position_stride, pos + 1, mask=mask)
+
+        last_pos = tl.maximum(ctx - 1, 0)
+        block_col = last_pos // block_size
+        within_block = last_pos - block_col * block_size
+
+        phys_block = tl.load(
+            block_tables_ptr + seq * block_table_stride + block_col,
+            mask=mask,
+            other=0,
+        ).to(tl.int64)
+        tl.store(
+            slot_mapping_ptr + seq, phys_block * block_size + within_block, mask=mask
+        )
+
+
 class AiterBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -59,6 +106,9 @@ class AiterBackend(AttentionBackend):
 
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
+    # EagleProposer fuses the per-draft-step position bump into
+    # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
+    fuse_mtp_decode_position_update = True
 
     def __init__(
         self,
@@ -499,6 +549,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
             )
             tensors["_sparse_attention_cache_next"] = 0
+            if getattr(text_config, "use_index_cache", False) or getattr(
+                hf_config, "use_index_cache", False
+            ):
+                tensors["_sparse_attention_topk_cache_state"] = {}
         return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -530,6 +584,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             runner._sparse_attention_cache_next += 1
             module.impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
             module.impl.max_model_len = runner.config.max_model_len
+            module.impl.index_topk_cache_state = getattr(
+                runner, "_sparse_attention_topk_cache_state", None
+            )
             # NOTE: no return — fall through to the standard MHA binding below.
 
         if not (
@@ -698,12 +755,85 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in range(num_layers):
                     _add_region(runner.kv_scale[0, layer_id])
                     _add_region(runner.kv_scale[1, layer_id])
+            # MiniMax-M3 sparse attention's per-token indexer-key cache
+            # (used for top-k block selection on the consumer).
+            index_cache = getattr(runner, "sparse_attention_index_cache", None)
+            if index_cache is not None:
+                for sparse_idx in range(index_cache.shape[0]):
+                    _add_region(index_cache[sparse_idx])
 
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.num_physical_kvcache_blocks,
         )
+
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor = None,
+        *,
+        update_context_lens: bool = False,
+        positions_out: torch.Tensor | None = None,
+        last_token_indices: torch.Tensor | None = None,
+    ):
+        """Per-draft-step metadata for a block-paged MHA Eagle3 draft.
+
+        Called by EagleProposer.propose at mid-step iters. The draft's decode
+        kernels (``paged_attention_{asm,triton}``) read ``block_tables`` +
+        ``context_lens``. Eagle can pre-bump ``context_lens`` before this call,
+        or ask this fused kernel to update it in place. The block_size==1024
+        persistent path is the only one consuming ``kv_indptr``/``kv_indices``;
+        MiniMax-M3 runs at ``--block-size 128`` so the kernel never reads them -
+        no rebuild.
+
+        The one value we must (re)compute is the write slot for the new draft
+        token in the draft's own block-paged KV cache:
+
+            slot = block_tables[seq, (ctx-1)//B] * B + (ctx-1) % B,   B = block_size
+
+        Returned under ``slot_mapping`` so EagleProposer skips its token-granular
+        (MLA physical block_size==1) flat-kv slot derivation, which would yield
+        a bare block id for ``B > 1``.
+
+        ``only_update`` / ``num_reject_tokens`` are MLA/V4-specific knobs and are
+        unused here: there are no persistent worker buffers to roll over for
+        ``block_size != 1024``.
+        """
+        var = self.model_runner.forward_vars
+        slot_mapping = var["slot_mapping"].gpu[:bs]
+        block_tables = var["block_tables"].gpu
+        context_lens = var["context_lens"].gpu
+        update_positions = positions_out is not None
+        select_positions = update_positions and last_token_indices is not None
+        if positions_out is None:
+            positions_out = positions
+        if last_token_indices is None:
+            last_token_indices = slot_mapping
+        # Dummy runs skip the draft attention, so keep this launch as a no-op:
+        # their synthetic context_lens can point past block_tables.
+        _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(bs, 128)),)](
+            context_lens,
+            block_tables,
+            slot_mapping,
+            positions,
+            positions_out,
+            last_token_indices,
+            bs,
+            bs == 0 or get_forward_context().context.is_dummy_run,
+            update_context_lens,
+            update_positions,
+            select_positions,
+            self.model_runner.block_size,
+            block_tables.stride(0),
+            positions_out.stride(0) if update_positions else 1,
+            BLOCK=128,
+        )
+        return {"slot_mapping": slot_mapping}
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
@@ -771,10 +901,49 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         del ubatch_idx
-        from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+        from atom.utils.tbo.ubatch_splitting import (
+            derive_prefill_lens_from_positions,
+            split_attn_metadata,
+        )
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
         self._attach_tbo_token_split_straddle_prefix(ub_attn, ub_slice)
+        if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_prefill_metadata,
+            )
+
+            ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
+            ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
+            ub_cu_seqlens_q = ub_attn.cu_seqlens_q[: ub_num_reqs + 1]
+            var = self.model_runner.forward_vars
+            _, ub_seq_lens_np = derive_prefill_lens_from_positions(
+                var["positions"].np[
+                    ub_slice.token_slice.start : ub_slice.token_slice.stop
+                ],
+                var["cu_seqlens_q"].np,
+                ub_slice,
+            )
+            ub_seq_lens = torch.from_numpy(ub_seq_lens_np).to(
+                self.device, non_blocking=True
+            )
+            ub_max_seq_len = int(ub_seq_lens_np.max()) if ub_num_reqs > 0 else 0
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                ub_attn.block_tables[:ub_num_reqs],
+                ub_seq_lens,
+                ub_num_reqs,
+            )
+            sparse_md = make_sparse_prefill_metadata(
+                cu_seqlens_q=ub_cu_seqlens_q,
+                seq_lens=ub_seq_lens,
+                block_table=sparse_block_tables,
+                slot_mapping=ub_attn.slot_mapping,
+                max_query_len=ub_attn.max_seqlen_q,
+                max_seq_len=ub_max_seq_len,
+                num_prefills=ub_num_reqs,
+                num_prefill_tokens=ub_num_tokens,
+            )
+            ub_attn.sparse_attention_metadata = sparse_md
         return ub_attn
 
     def _attach_tbo_token_split_straddle_prefix(self, ub_attn, ub_slice):
@@ -811,8 +980,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             cached = state.num_cached[rs.start : rs.stop].astype(np.int64)
         else:
             cached = np.zeros(ub_num_reqs, dtype=np.int64)
-        ctx_lens = cached + new_lens
-        ctx_lens[0] += prefix_len
+        cached_prefix_lens = cached.copy()
+        cached_prefix_lens[0] += prefix_len
+        ctx_lens = cached_prefix_lens + new_lens
         total_kv = int(ctx_lens.sum())
 
         max_blocks = max(
@@ -835,9 +1005,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ub_attn.block_tables = torch.from_numpy(bt).to(device, non_blocking=True)
         ub_attn.cu_seqlens_k = torch.from_numpy(cu_k).to(device, non_blocking=True)
         ub_attn.seq_starts = torch.zeros(ub_num_reqs, dtype=torch.int32, device=device)
-        ub_attn.num_cached_tokens = torch.from_numpy(ctx_lens.astype(np.int32)).to(
-            device, non_blocking=True
-        )
+        ub_attn.num_cached_tokens = torch.from_numpy(
+            cached_prefix_lens.astype(np.int32)
+        ).to(device, non_blocking=True)
         ub_attn.max_seqlen_k = int(ctx_lens.max())
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
@@ -1105,6 +1275,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens=var[f"{p}context_lens"].gpu[:padded_bs],
             block_tables=var[f"{p}block_tables"].gpu[:padded_bs],
             max_seqlen_q=max_q_len,
+            max_seqlen_k=self.model_runner.config.max_model_len,
             cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
             kv_indptr=var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
             kv_indices=var[f"{p}kv_indices"].gpu,
@@ -1115,6 +1286,27 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             reduce_final_map=var[f"{p}reduce_final_map"],
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
+        if self._has_sparse_attention:
+            if max_q_len > 1:
+                raise NotImplementedError(
+                    "MiniMax M3 sparse TBO decode with max_q_len > 1 is not "
+                    "implemented."
+                )
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_decode_metadata,
+            )
+
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                attn.block_tables,
+                attn.context_lens,
+                padded_bs,
+            )
+            attn.sparse_attention_metadata = make_sparse_decode_metadata(
+                seq_lens=attn.context_lens,
+                block_table=sparse_block_tables,
+                slot_mapping=attn.slot_mapping,
+                max_seq_len=attn.max_seqlen_k,
+            )
         return attn
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:

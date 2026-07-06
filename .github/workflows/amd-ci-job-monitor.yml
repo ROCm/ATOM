@@ -145,7 +145,7 @@ jobs:
             --snapshot-out actions-snapshot.json
 
       - name: Upload snapshot
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: actions-job-snapshot
           path: actions-snapshot.json
@@ -172,7 +172,7 @@ jobs:
         run: pip install requests tabulate
 
       - name: Download actions snapshot
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: actions-job-snapshot
           path: .
@@ -204,7 +204,7 @@ jobs:
         run: pip install requests tabulate
 
       - name: Download actions snapshot
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: actions-job-snapshot
           path: .
@@ -221,7 +221,7 @@ jobs:
           cat runner-fleet-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload runner fleet report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: runner-fleet-report
           path: runner-fleet-report.md

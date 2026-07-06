@@ -19,7 +19,7 @@ from typing import Any, Callable
 # ---------------------------------------------------------------------------
 
 EngineId = str
-ReqId = str
+ReqId = str | int
 TransferId = int
 
 # ---------------------------------------------------------------------------
@@ -59,22 +59,33 @@ class KVConnectorOutput:
     Attributes:
         finished_sending: Request IDs whose KV send completed on this worker.
         finished_recving: Request IDs whose KV receive completed on this worker.
+        failed_recving: Request IDs whose KV receive failed on this worker.
+        finished_saving: Request IDs whose local fire-and-forget save completed.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
 
-    finished_sending: set[str] = field(default_factory=set)
-    finished_recving: set[str] = field(default_factory=set)
+    finished_sending: set[ReqId] = field(default_factory=set)
+    finished_recving: set[ReqId] = field(default_factory=set)
+    failed_recving: set[ReqId] = field(default_factory=set)
+    finished_saving: set[ReqId] = field(default_factory=set)
     expected_finished_count: int = 0
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
-        return not self.finished_sending and not self.finished_recving
+        return (
+            not self.finished_sending
+            and not self.finished_recving
+            and not self.failed_recving
+            and not self.finished_saving
+        )
 
     def __repr__(self) -> str:
         return (
             f"KVConnectorOutput(sending={self.finished_sending}, "
-            f"recving={self.finished_recving})"
+            f"recving={self.finished_recving}, "
+            f"failed_recving={self.failed_recving}, "
+            f"finished_saving={self.finished_saving})"
         )
 
 

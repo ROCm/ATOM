@@ -80,7 +80,7 @@ def test_build_args_golden():
 
 def test_load_variants_shape():
     variants = catalog.load_variants(CATALOG)
-    assert len(variants) == 18
+    assert len(variants) == 21
     required = {
         "display",
         "path",
@@ -150,22 +150,23 @@ def test_param_lists_override_and_conc_band():
     cells = catalog.build_cells(
         CATALOG, param_lists="1024,1024,512,0.7", model_filter={"deepseek-v4-pro"}
     )
-    assert sorted(c["suffix"] for c in cells) == ["-dpa", "-dpa-mtp3"]
+    assert sorted(c["suffix"] for c in cells) == ["-dpa", "-dpa-mtp3", "-dpa-tbo"]
     rfs = {c["result_filename"] for c in cells}
     assert "deepseek-v4-pro-dpa-1024-1024-512-0.7" in rfs
     assert "deepseek-v4-pro-dpa-mtp3-1024-1024-512-0.7" in rfs
+    assert "deepseek-v4-pro-dpa-tbo-1024-1024-512-0.7" in rfs
 
 
 def test_model_filter():
-    cells = catalog.build_cells(CATALOG, model_filter={"glm-5-fp8"})
-    assert {c["prefix"] for c in cells} == {"glm-5-fp8"}
+    cells = catalog.build_cells(CATALOG, model_filter={"glm-5-2-fp8"})
+    assert {c["prefix"] for c in cells} == {"glm-5-2-fp8"}
 
 
 def test_validate_dispatch_inputs_in_sync_and_drift():
     prefixes = {m["prefix"] for m in catalog._load_catalog(CATALOG)["models"]}
     assert catalog.validate_dispatch_inputs(CATALOG, prefixes) == []
     # missing a checkbox
-    assert catalog.validate_dispatch_inputs(CATALOG, prefixes - {"glm-5-fp8"})
+    assert catalog.validate_dispatch_inputs(CATALOG, prefixes - {"glm-5-2-fp8"})
     # extra checkbox
     assert catalog.validate_dispatch_inputs(CATALOG, prefixes | {"ghost"})
 
@@ -180,3 +181,55 @@ def test_workflow_dispatch_inputs_match_catalog():
     model_toggles = dispatch_inputs - RESERVED_INPUTS
     prefixes = {m["prefix"] for m in catalog._load_catalog(CATALOG)["models"]}
     assert model_toggles == prefixes
+
+
+def test_scenario_tag():
+    assert catalog.scenario_tag(1024, 1024) == "1k1k"
+    assert catalog.scenario_tag(8192, 1024) == "8k1k"
+    # Non-1024-multiple lengths fall back to an unambiguous tag.
+    assert catalog.scenario_tag(1000, 1024) == "1000_1024"
+
+
+def test_build_cell_configs_partitions_cells():
+    """Configs are a lossless regrouping of build_cells: every cell appears in
+    exactly one config (keyed by variant × scenario), expanded over concurrency."""
+    import json
+
+    cells = catalog.build_cells(CATALOG)
+    configs = catalog.build_cell_configs(CATALOG)
+
+    # Reconstruct the flat (variant, scenario, conc) set from configs.
+    from_configs = set()
+    for cfg in configs:
+        conc_list = json.loads(cfg["concurrency"])
+        assert conc_list == sorted(conc_list), "concurrency must be sorted"
+        for conc in conc_list:
+            from_configs.add(
+                (cfg["prefix"], cfg["suffix"], cfg["isl"], cfg["osl"], conc)
+            )
+    from_cells = {
+        (c["prefix"], c["suffix"], c["isl"], c["osl"], c["conc"]) for c in cells
+    }
+    assert from_configs == from_cells
+    # Total cells preserved (no dup / drop).
+    assert sum(len(json.loads(c["concurrency"])) for c in configs) == len(cells)
+
+
+def test_build_cell_configs_matrix_under_github_limit():
+    """Both fan-out levels must stay under GitHub's 256-jobs-per-matrix cap."""
+    import json
+
+    configs = catalog.build_cell_configs(CATALOG)
+    assert len(configs) <= 256, "first-level (config) matrix exceeds 256"
+    for cfg in configs:
+        assert len(json.loads(cfg["concurrency"])) <= 256, "conc matrix exceeds 256"
+
+
+def test_build_cell_configs_one_config_per_server_key():
+    """Each config is a unique (variant, scenario) server-launch key."""
+    configs = catalog.build_cell_configs(CATALOG)
+    keys = [
+        (c["model_path"], c["server_args"], c["env_vars"], c["isl"], c["osl"])
+        for c in configs
+    ]
+    assert len(keys) == len(set(keys))
