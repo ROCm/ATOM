@@ -2358,6 +2358,47 @@ class ModelRunner:
                 buckets,
             )
 
+    def _dspark_sync_graph_shape_dp(self, batch: ScheduledBatch) -> None:
+        """DP-attention: force the decode graph shape (bs, q) to be IDENTICAL on
+        every DP rank.
+
+        Under DSpark dynamic scheduling each rank picks its verify length q
+        (``num_spec_query_tokens``) and decode batch size from its OWN local
+        batch, so they diverge across ranks (observed q=2 vs 5, bs=1 vs 8). The
+        decode CUDA graph replays a captured (bs, q) shape whose MoE all_gather
+        pads every rank to ``graph_bs * max_seqlen_q`` (moe.pad_for_all_gather,
+        max_seqlen_q == num_spec_query_tokens). Divergent (bs, q) -> mismatched
+        collective row counts -> RCCL cross-rank deadlock (all ranks then spin,
+        py-spy shows every rank stuck at the next H2D sync).
+
+        Fix: all-reduce MAX of (q, decode-bs) over the DP group and adopt the
+        DP-max for both. Raising q/bs only ENLARGES the graph capacity
+        (real tokens stay flat-packed in [0:Σ]; the extra slots are padding the
+        kernels skip), so it is always lossless. The per-request ragged
+        ``num_scheduled_tokens`` is left untouched -> attention stays ragged.
+        The DP-max bs is stashed as ``_dspark_dp_bs`` for ForwardMode.decide
+        (prepare_inputs), which must recover the SAME padded_scheduled_bs on
+        every rank instead of the local one.
+
+        Called on every rank each step (real forward AND dummy_execution both go
+        through prepare_model) so the collective itself never deadlocks. No-op
+        for single-DP or non-spec runs.
+        """
+        if self.config.parallel_config.data_parallel_size <= 1:
+            return
+        if not hasattr(self, "drafter"):
+            return
+        import torch.distributed as dist
+
+        local_q = int(getattr(batch, "num_spec_query_tokens", 1))
+        local_bs = int(getattr(batch, "total_seqs_num_decode", 0))
+        shape_t = torch.tensor([local_q, local_bs], device="cpu", dtype=torch.int64)
+        dist.all_reduce(
+            shape_t, op=dist.ReduceOp.MAX, group=get_dp_group().cpu_group
+        )
+        batch.num_spec_query_tokens = int(shape_t[0].item())
+        batch._dspark_dp_bs = int(shape_t[1].item())
+
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         # NOTE: DSpark q-bucket shrink happens in prepare_model BEFORE
         # prepare_input_ids, so the batch is already reduced when we get here.
@@ -2382,11 +2423,24 @@ class ModelRunner:
         # num_spec_query_tokens, so the division recovers bs correctly. Prefill
         # has no drafter / uses 1.
         decide_num_input_tokens = num_input_tokens
-        if (
+        dp_bs = getattr(batch, "_dspark_dp_bs", None)
+        if not is_prefill and dp_bs is not None:
+            # DP-attention (see _dspark_sync_graph_shape_dp): the graph shape
+            # (bs, q) is DP-max-synced there. Recover the SAME padded_scheduled_bs
+            # = dp_bs on every rank via decide_num_input_tokens = dp_bs * q, so
+            # all ranks pick the identical (effective_bs, q) graph and the
+            # captured MoE all_gather (pad = graph_bs * max_seqlen_q) matches
+            # across ranks. Using the LOCAL bs*q (or the ragged Σ) here is what
+            # diverges and RCCL-deadlocks. Covers both the ragged and q-bucket
+            # dynamic paths (both set num_spec_query_tokens).
+            q_eff = int(batch.num_spec_query_tokens)
+            mtp_step = q_eff
+            decide_num_input_tokens = int(dp_bs) * q_eff
+        elif (
             not is_prefill
             and getattr(batch, "num_spec_query_tokens_per_req", None) is not None
         ):
-            # RAGGED (plan B graph): the real Σtokens (num_input_tokens) is
+            # RAGGED (single-DP): the real Σtokens (num_input_tokens) is
             # irregular, but we replay the (bs, q_eff) graph whose capacity is
             # bs*q_eff (q_eff = num_spec_query_tokens, the quantized bucket).
             # Feed ForwardMode the GRAPH-CAPACITY token count so it recovers
@@ -2534,6 +2588,7 @@ class ModelRunner:
         # to live inside prepare_inputs, which runs AFTER prepare_input_ids —
         # too late, so the shrink never reached input_ids.)
         self._dspark_apply_q_bucket(batch)
+        self._dspark_sync_graph_shape_dp(batch)
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 

@@ -439,19 +439,11 @@ class EagleProposer:
         parallel_config = self.config.parallel_config
         if parallel_config.data_parallel_size <= 1:
             return
-        # DSpark RAGGED + DP fix: force the draft MoE onto the UNIFORM equal-split
-        # all_gather instead of the variable-length path. The var-length
-        # reduce_scatterv gives each rank an output row count == its own
-        # bs*num_draft, which differs across ranks in a mixed step; RCCL then
-        # launches a different kernel grid per rank and the cross-rank barrier
-        # deadlocks (rocgdb: ncclDevKernel waitPeer spin, grid 2048 vs 4096).
-        # dp_uniform_decode=True routes MoE through pad_for_all_gather, which
-        # (see moe.py) pads every rank to dp_metadata.max_tokens_across_dp — the
-        # DP-max computed by the all_reduce inside DPMetadata.make below — so all
-        # ranks share one grid. This mirrors the main-forward pure-decode path.
-        dp_metadata = DPMetadata.make(parallel_config, num_local_tokens)
-        forward_context.context.dp_uniform_decode = True
-        forward_context.dp_metadata = dp_metadata
+        forward_context.context.dp_uniform_decode = False
+        forward_context.dp_metadata = DPMetadata.make(
+            parallel_config,
+            num_local_tokens,
+        )
 
     def _propose_dspark(
         self,
