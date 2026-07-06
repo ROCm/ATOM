@@ -296,10 +296,11 @@
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
     "runner": "atom-mi308-8gpu-plugins-benchmark",
     "test_level": "nightly",
+    "lm_eval_extra_model_args": "max_gen_toks=1024",
     "accuracy_threshold": 0.8,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "Qwen/Qwen3-32B-FP8",
-    "_baseline_note": "Threshold placeholder until MI308 gsm8k baseline is measured in CI."
+    "_baseline_note": "Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output."
   },
   {
     "model_name": "MI308 Qwen3-32B-FP8 TP8",
@@ -308,9 +309,10 @@
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
     "runner": "atom-mi308-8gpu-plugins-benchmark",
     "test_level": "nightly",
+    "lm_eval_extra_model_args": "max_gen_toks=1024",
     "accuracy_threshold": 0.8,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "Qwen/Qwen3-32B-FP8",
-    "_baseline_note": "Threshold placeholder until MI308 gsm8k baseline is measured in CI."
+    "_baseline_note": "Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output."
   }
 ]
