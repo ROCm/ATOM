@@ -22,6 +22,8 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_scale_gemm_e8m0
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_ops.utils import (
@@ -219,7 +221,7 @@ def gemm_a4w4_quant(
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
             weight_scale.view(torch.uint8).view(
-                weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
+                weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1 # NOTE: this may only work for gfx950
             ),
             y=y,
         )
@@ -750,11 +752,13 @@ class LinearBase(nn.Module):
                 # weight; only the AITER bpreshuffle fallback needs the shuffle.
                 and not (use_triton_gemm() and gemm_a8w8_triton is not None)
             ) or (
+                # gemma4w4 weight shuffled here (-> shuffle_weights below)
                 self.quant_type == QuantType.per_1x32
                 and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
             )
             # per_1x128 only needs shuffle when using the preshuffle GEMM path
             if not need_shuffle and self.quant_type == QuantType.per_1x128:
+                # gemma8w8 blockscale weight shuffled here (-> shuffle_weights below)
                 need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
                 # Modules whose fused forward calls a *preshuffle* blockscale GEMM
                 # directly (e.g. DeepSeek fused qkv_a_proj) need the 16x16-shuffled
@@ -767,10 +771,51 @@ class LinearBase(nn.Module):
                     need_shuffle = True
             if need_shuffle:
                 if self.weight.dim() == 2:
-                    shuffle_weights(self.weight)
+                    if (
+                        arch_info.get_arch() == "gfx1250"
+                        and use_triton_gemm()
+                        and self.params_dtype == dtypes.fp4x2
+                        and not use_fp4_non_shuffle_triton_gemm()
+                    ):
+                        # gemma4w4 on gfx1250: WMMA preshuffle layout
+                        from aiter.ops.triton.utils.shuffle import (
+                            _shuffle_weight_gfx1250,
+                        )
+
+                        self.weight.data = _shuffle_weight_gfx1250(self.weight.data)
+                    elif (
+                        arch_info.get_arch() == "gfx1250"
+                        and use_triton_gemm()
+                        and self.quant_type == QuantType.per_1x128
+                    ):
+                        # gemma8w8 blockscale on gfx1250: WMMA preshuffle layout
+                        from aiter.ops.shuffle import preshuffle_fp8_weights_gfx1250
+
+                        self.weight.data = preshuffle_fp8_weights_gfx1250(
+                            self.weight.data
+                        )
+                    else:
+                        shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
-        if self.quant_type == QuantType.per_1x32 and (
+        _fp4_triton_preshuffle = (
+            self.quant_type == QuantType.per_1x32
+            and self.params_dtype == dtypes.fp4x2
+            and use_triton_gemm()
+            and not use_fp4_non_shuffle_triton_gemm()
+            and gemm_afp4wfp4_preshuffle is not None
+        )
+        if _fp4_triton_preshuffle:
+            # Shuffle the weight scale into the gemm_afp4wfp4_preshuffle kernel layout
+            # at load. shuffle_scale_gemm_e8m0 is built on shuffle_scale_gemm's gfx950
+            # tile (preshuffle_factor=32, scale_kwidth=8) but returns the UN-collapsed
+            # (M_pad, N_pad) shape -- byte-identical to the original fp4_utils.e8m0_shuffle
+            # that the forward (gemm_a4w4_quant, ~line 223) still re-collapses via
+            # `.view(shape[0] // 32, -1)`. (Raw shuffle_scale_gemm returns the already
+            # collapsed (M_pad//32, N*32), which the forward would divide by 32 again
+            # -> wrong-strided scale -> OOB read in the preshuffle kernel -> GPU fault.)
+            self.weight_scale.data = shuffle_scale_gemm_e8m0(self.weight_scale.data)
+        elif self.quant_type == QuantType.per_1x32 and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
@@ -822,16 +867,7 @@ class LinearBase(nn.Module):
                         scale_b=self.weight_scale,
                     )
             elif self.quant_type.value == QuantType.per_Token.value:
-                if self.params_dtype == dtypes.i8:
-                    y = gemm_a8w8(
-                        x,
-                        self.weight,
-                        x_scale,
-                        self.weight_scale,
-                        self.bias,
-                        dtype=otype,
-                    )
-                elif use_triton_gemm() and gemm_a8w8_triton is not None:
+                if use_triton_gemm() and gemm_a8w8_triton is not None:
                     # Triton a8w8 per-token-per-channel GEMM (unshuffled weight).
                     y = gemm_a8w8_per_token_impl(
                         x,
@@ -839,6 +875,15 @@ class LinearBase(nn.Module):
                         x_scale,
                         self.weight_scale,
                         bias=self.bias,
+                        dtype=otype,
+                    )
+                elif self.params_dtype == dtypes.i8:
+                    y = gemm_a8w8(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        self.bias,
                         dtype=otype,
                     )
                 else:

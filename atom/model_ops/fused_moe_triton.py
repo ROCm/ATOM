@@ -29,7 +29,6 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
-        swizzle_scales as swizzle_scales_a8w4,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
@@ -37,7 +36,13 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
         moe_gemm_a4w4,
         mxfp4_quant,
-        swizzle_scales as swizzle_scales_cdna4,
+    )
+    # aiter #3900 unified the per-module swizzle_scales into utils/shuffle.py's
+    # arch-aware shuffle_scale_moe (a8w4/a8w8/a16w4/a4w4 family). Alias to keep
+    # the a8w4 / cdna4 call sites below unchanged.
+    from aiter.ops.triton.utils.shuffle import (
+        shuffle_scale_moe as swizzle_scales_a8w4,
+        shuffle_scale_moe as swizzle_scales_cdna4,
     )
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 

@@ -733,12 +733,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
 
-    # NOTE: this fused path always calls aiter's *preshuffle* blockscale GEMMs,
-    # which require a 16x16-shuffled weight. fused_qkv_a_proj is flagged with
-    # needs_preshuffled_weight=True so the loader shuffles it once even under the
-    # non-preshuffle path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) -- see
-    # LinearBase.process_weights_after_loading.
-
     if hidden_states_quant_scale is None:
         if M <= 32:
             qkv_lora = gemm_a16w8_blockscale_preshuffle(
@@ -1735,8 +1729,28 @@ class DeepseekV2MLAAttention(nn.Module):
                     quant_config = None
                     base_quant_config = None
             else:
-                source_quant_dtype = torch.bfloat16
-                base_quant_config = None
+                # Mirror the non-triton path above: quark pre-quantized MXFP4
+                # checkpoints (weight_format=real_quantized) store the attention
+                # projections as packed FP4 + e8m0 on disk, so load them directly
+                # (source_quant_dtype=None, keep quant_config via base_quant_config).
+                # The bf16 branch is the online-quant path (load a BF16 checkpoint,
+                # quantize to FP4 at load); using it for a static MXFP4 checkpoint
+                # allocates a bf16 weight param the packed FP4 tensor cannot load
+                # into -> uninitialized garbage -> NaN logits.
+                q_a_proj_quant_config = quant_config.get_layer_quant_config(
+                    f"{prefix}.{q_a_proj_name}"
+                )
+                is_quark_static_mxfp4 = (
+                    q_a_proj_quant_config.quant_method == "quark"
+                    and layer_quant_type == QuantType.per_1x32
+                )
+                if is_quark_static_mxfp4:
+                    source_quant_dtype = None
+                    base_quant_config = quant_config
+                else:
+                    source_quant_dtype = torch.bfloat16
+                    base_quant_config = None
+
         else:
             source_quant_dtype = None
             # Check exclude patterns (e.g. W4A8 checkpoints exclude attention)
@@ -1760,11 +1774,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype=source_quant_dtype,
                 prefix=f"{prefix}.fused_qkv_a_proj",
             )
-            # The fused qkv_a_proj forward calls *preshuffle* blockscale GEMMs, so
-            # its weight must be 16x16-shuffled even when the global non-preshuffle
-            # path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) is selected. The loader
-            # honors this flag in LinearBase.process_weights_after_loading.
-            self.fused_qkv_a_proj.needs_preshuffled_weight = True
+            
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
