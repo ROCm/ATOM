@@ -212,39 +212,31 @@ class QuarkOnlineParser(QuantConfigParser):
         and ``online_exclude_layers_list``.
 
         Supported format strings:
-        - ``"ptpc_fp8"``  — per-tensor-per-channel FP8
-        - ``"mxfp4"``     — microscaling FP4 (block size 32)
+        - ``"ptpc_fp8"``        — per-tensor-per-channel FP8
+        - ``"per_block_fp8"``   — per-block FP8 (128x128; alias of per_block128_fp8)
+        - ``"per_block128_fp8"``— per-block FP8, 128x128 block
+        - ``"mxfp4"``           — microscaling FP4 (block size 32)
         """
         if not isinstance(online_quant_config, dict):
             raise TypeError("online_quant_config must be a dict parsed from JSON.")
 
-        scheme_map = {
-            "ptpc": QuantType.per_Token,
-            "per_block": QuantType.per_1x128,
+        # Explicit table of supported online quant formats -> (QuantType, dtype_str).
+        # per_block / per_block128 are aliases (128 is the default block size).
+        FORMAT_MAP = {
+            "ptpc_fp8": (QuantType.per_Token, "fp8"),
+            "per_block_fp8": (QuantType.per_1x128, "fp8"),
+            "per_block128_fp8": (QuantType.per_1x128, "fp8"),
+            "mxfp4": (QuantType.per_1x32, "fp4"),
         }
 
         def _parse_online_quant_format(quant_format_str: str) -> LayerQuantConfig:
             quant_format_str = quant_format_str.strip().lower()
-            quant_type = None
-            dtype_str = None
-
-            if quant_format_str.startswith("mx"):
-                quant_type = QuantType.per_1x32
-                dtype_str = quant_format_str[2:]
-            else:
-                matched_scheme = None
-                for scheme in sorted(scheme_map, key=len, reverse=True):
-                    if quant_format_str.startswith(scheme + "_"):
-                        matched_scheme = scheme
-                        break
-                if matched_scheme is not None:
-                    quant_type = scheme_map[matched_scheme]
-                    dtype_str = quant_format_str[len(matched_scheme) + 1 :]
-                else:
-                    raise ValueError(
-                        f"Unsupported online quant format: '{quant_format_str}'. "
-                        f"Expected '<scheme>_<dtype>' (e.g. ptpc_fp8) or 'mx<dtype>' (e.g. mxfp4)."
-                    )
+            if quant_format_str not in FORMAT_MAP:
+                raise ValueError(
+                    f"Unsupported online quant format: '{quant_format_str}'. "
+                    f"Expected one of: {sorted(FORMAT_MAP)}."
+                )
+            quant_type, dtype_str = FORMAT_MAP[quant_format_str]
 
             dtype_str = dtype_str.split("_")[0]
             if dtype_str.endswith("4"):
