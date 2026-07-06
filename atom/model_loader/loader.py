@@ -471,22 +471,33 @@ def load_model(
     def _stage_task(param, full_param_name, shard_id, global_expert_id, loaded_weight):
         pid = id(param)
         with staging_lock:
-            if pid in fallback_pids:
+            opted_out = pid in fallback_pids
+            entry = None if opted_out else staging_map.get(pid)
+        if opted_out:
+            _fallback(param, full_param_name, shard_id, global_expert_id, loaded_weight)
+            return
+
+        if entry is None:
+            moe = _lookup_moe_module(full_param_name)
+            new_entry = {
+                "staging": _make_staging(param),
+                "arrived": 0,
+                "expected": moe.expected_batched_arrivals(param),
+                "moe": moe,
+                "param": param,
+                "lock": threading.Lock(),
+            }
+            with staging_lock:
+                opted_out = pid in fallback_pids
+                if not opted_out:
+                    entry = staging_map.get(pid)
+                    if entry is None:
+                        entry = staging_map[pid] = new_entry
+            if opted_out:
                 _fallback(
                     param, full_param_name, shard_id, global_expert_id, loaded_weight
                 )
                 return
-            entry = staging_map.get(pid)
-            if entry is None:
-                moe = _lookup_moe_module(full_param_name)
-                entry = staging_map[pid] = {
-                    "staging": _make_staging(param),
-                    "arrived": 0,
-                    "expected": moe.expected_batched_arrivals(param),
-                    "moe": moe,
-                    "param": param,
-                    "lock": threading.Lock(),
-                }
 
         moe = entry["moe"]
         local_eid = moe._map_global_expert_id_to_local_expert_id(global_expert_id)
@@ -517,9 +528,9 @@ def load_model(
                 if staging_map.get(pid) is entry:
                     del staging_map[pid]
 
-    use_threadpool = envs.ATOM_LOADER_USE_THREADPOOL
-    if use_threadpool:
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+    num_threads = envs.ATOM_LOADER_NUM_THREADS
+    if num_threads > 1:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
     else:
         executor = None
     futures = []
@@ -713,7 +724,7 @@ def load_model(
                             # an unquantized drafter MTP block); skip silently.
                             matched = True
                             break
-                        if _param_is_batchable(param, name):
+                        if executor is not None and _param_is_batchable(param, name):
                             _submit(
                                 _stage_task,
                                 param,
@@ -792,17 +803,13 @@ def load_model(
             pending = list(staging_map.values())
             staging_map.clear()
         if pending:
-            logger.warning(
-                "Batched-load safety flush: %d group(s) under-filled, flushing "
-                "partial data (missing experts left as zeros): %s",
-                len(pending),
-                [
-                    (tuple(e["param"].shape), e["arrived"], e["expected"])
-                    for e in pending
-                ],
+            detail = [
+                (tuple(e["param"].shape), e["arrived"], e["expected"]) for e in pending
+            ]
+            raise RuntimeError(
+                f"Batched loader: {len(pending)} MoE param group(s) under-filled "
+                f"Set ATOM_LOADER_NUM_THREADS=1 to use the per-expert loader."
             )
-            for entry in pending:
-                _do_flush(entry["param"], entry["staging"])
     finally:
         if executor is not None:
             executor.shutdown(wait=True)

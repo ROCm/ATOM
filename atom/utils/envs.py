@@ -101,11 +101,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
-    # Use a thread pool for weight loading instead of main-process sequential I/O.
-    # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
-    "ATOM_LOADER_USE_THREADPOOL": lambda: (
-        os.getenv("ATOM_LOADER_USE_THREADPOOL", "1") == "1"
-    ),
+    # Worker threads for weight loading. >1 (default 16) enables the batched
+    # parallel loader (per-fused-param CPU staging flushed with one H2D copy)
+    # with that many threads; set to 1 to fall back to the original sequential
+    # per-expert path.
+    "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
