@@ -305,6 +305,30 @@ set_slurm_job_log_paths() {
   echo "slurm_error=${SLURM_JOB_ERROR}"
 }
 
+write_slurm_cancel_helper() {
+  local job_id="$1"
+  local helper="${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-cancel.sh"
+
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    cat > "${helper}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v scancel >/dev/null 2>&1; then
+  scancel --controller "${SPUR_CONTROLLER_ADDR}" "${job_id}" || true
+fi
+EOF
+  else
+    cat > "${helper}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v scancel >/dev/null 2>&1; then
+  scancel "${job_id}" || true
+fi
+EOF
+  fi
+  chmod +x "${helper}"
+}
+
 stream_file_lines() {
   local file="$1"
   local prefix="$2"
@@ -472,6 +496,7 @@ fi
 
 JOB_ID="$(parse_sbatch_job_id "${SBATCH_OUTPUT}")"
 echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
+write_slurm_cancel_helper "${JOB_ID}"
 
 SLURM_JOB_ACTIVE=1
 set_slurm_job_log_paths "${JOB_ID}"

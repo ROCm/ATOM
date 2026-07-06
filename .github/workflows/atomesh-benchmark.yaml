@@ -254,6 +254,18 @@ jobs:
             RESULT_DIR="${ORIGINAL_WORKSPACE}/${RESULT_DIR}"
           fi
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+          SLURM_CANCEL_HELPER="${RESULT_DIR}/${{ matrix.id }}.slurm-cancel.sh"
+          cancel_slurm_from_wrapper() {
+            local rc=$?
+            if [[ "${rc}" -ne 0 && -x "${SLURM_CANCEL_HELPER}" ]]; then
+              echo "=== cancelling Slurm job from workflow wrapper rc=${rc} ==="
+              bash "${SLURM_CANCEL_HELPER}" || true
+            fi
+            exit "${rc}"
+          }
+          trap cancel_slurm_from_wrapper EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           bash .github/scripts/atomesh/pd_submit.sh \
             --cell-json "$CELL_JSON" \
             --result-dir "$RESULT_DIR"
