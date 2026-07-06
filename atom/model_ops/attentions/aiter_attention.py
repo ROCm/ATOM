@@ -540,12 +540,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             sparse_layers = sum(
                 1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
             )
+            index_cache_dtype = (
+                dtypes.d_dtypes[config.kv_cache_dtype]
+                if str(config.kv_cache_dtype).startswith("fp8")
+                else config.torch_dtype
+            )
             tensors["sparse_attention_index_cache"] = torch.zeros(
                 sparse_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
                 sparse_cfg["sparse_index_dim"],
-                dtype=config.torch_dtype,
+                dtype=index_cache_dtype,
                 device="cuda",
             )
             tensors["_sparse_attention_cache_next"] = 0
