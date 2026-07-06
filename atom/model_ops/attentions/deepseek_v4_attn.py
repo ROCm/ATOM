@@ -441,17 +441,32 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return self.num_layers * self.block_size * self.head_dim * elem_bf16
 
     def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
-        """M2 brick-3b: size the windowed SWA pool. Must cover, concurrently:
-        one full single-shot prefill (ceil(max_model_len/bs)), a prefill step's
-        worth of fresh SWA (ceil(max_num_batched_tokens/bs)), and every decode
-        seq's retained window (max_num_seqs * (ceil(window/bs)+1)), plus slack.
-        Far smaller than the compressed pool (which retains ALL reusable prefix
-        history); window-freeing keeps live SWA at ~this bound."""
+        """Size the windowed SWA pool (vLLM-aligned; chunked-prefill freeing).
+
+        With chunk-boundary SWA window-freeing + incremental allocation
+        (BlockManager.ensure_swa_blocks_for_tokens / free_swa_after_prefill_chunk,
+        Scheduler prefill hooks), a single prefill no longer holds the whole
+        prompt's SWA — only its trailing window plus the current step's fresh
+        chunk (bounded by max_num_batched_tokens). So:
+
+          one_prefill = ceil(min(window-1 + max_num_batched_tokens,
+                                 max_model_len) / bs) + 1   # vLLM boundary +1
+
+        Every active seq (prefilling OR decoding) retains ~one window, covered by
+        `max_num_seqs * per_decode` (per_decode = ceil(window/bs)+1). Keep BOTH
+        terms: `one_prefill` = the current step's fresh chunk; the per-seq term =
+        each seq's retained window. Do NOT drop the per-seq term thinking
+        one_prefill subsumes it — that under-provisions under concurrent prefill
+        and hits "No free SWA blocks". Far smaller than the old
+        ceil(max_model_len/bs) (e.g. 1024 → ~66 blocks at 131072/8192/128/128).
+        """
         bs = self.block_size
         per_decode = (self.window_size + bs - 1) // bs + 1
-        one_prefill = (max_model_len + bs - 1) // bs
-        prefill_step = (self.max_num_batched_tokens + bs - 1) // bs
-        return one_prefill + prefill_step + max_num_seqs * per_decode + 64
+        num_tokens = min(
+            max(0, self.window_size - 1) + self.max_num_batched_tokens, max_model_len
+        )
+        one_prefill = (num_tokens + bs - 1) // bs + 1
+        return one_prefill + max_num_seqs * per_decode + 64
 
     def slots_per_req(self) -> int:
         # State cache is one slot per req regardless of MTP. The MTP draft

@@ -97,6 +97,10 @@ class BlockManager:
         num_swa_blocks: int = getattr(config, "num_swa_blocks", 0)
         self.swa_enabled: bool = num_swa_blocks > 0
         self.swa_window: int = getattr(config, "swa_window_size", 0)
+        # M2 chunked-prefill: SWA is allocated incrementally (windowed), not
+        # full-length, so admission gates on the per-request windowed peak
+        # rather than the whole prompt. Mirrors vLLM max_admission_blocks.
+        self.max_num_batched_tokens: int = getattr(config, "max_num_batched_tokens", 0)
         self.swa_blocks: list[Block] = [Block(i) for i in range(num_swa_blocks)]
         self.swa_hash_to_block_id: dict[int, int] = dict()
         self.swa_free_block_ids: deque[int] = deque(range(num_swa_blocks))
@@ -128,7 +132,21 @@ class BlockManager:
         self.swa_free_block_ids.append(block_id)
         self.swa_free_block_ids_set.add(block_id)
 
-    def _free_swa_out_of_window(self, seq: Sequence):
+    def _swa_prefill_blocks(self, seq: Sequence) -> int:
+        """Peak concurrent SWA blocks one request holds during (chunked)
+        prefill: its trailing window plus the largest single chunk (bounded by
+        the batch token budget), capped by the prompt's block count. Used as the
+        SWA admission gate instead of the full `seq.num_blocks`, since SWA is now
+        filled incrementally and window-freed per chunk. Mirrors vLLM's
+        max_admission_blocks_per_request."""
+        if not self.swa_enabled:
+            return 0
+        bs = self.block_size
+        span = max(0, self.swa_window - 1) + max(self.max_num_batched_tokens, bs)
+        cap = (span + bs - 1) // bs + 1
+        return min(cap, seq.num_blocks)
+
+    def _free_swa_out_of_window(self, seq: Sequence, seq_len: int | None = None):
         """M2 brick-2: release SWA blocks that have fallen fully behind the
         sliding window — they're never read again by this request, and freeing
         them bounds live SWA memory to ~window per request.
@@ -140,10 +158,19 @@ class BlockManager:
         eviction, same as the compressed pool), so a cross-request hit can still
         reuse a freed-but-not-overwritten SWA block. The trailing window (plus
         up to one boundary block) is retained for prefix reuse.
+
+        ``seq_len`` is the number of tokens whose KV has been COMPUTED so far.
+        Decode passes None → ``len(seq)`` (whole sequence). Chunked prefill MUST
+        pass ``seq.num_cached_tokens`` (post-increment): using ``len(seq)`` (the
+        full prompt length) mid-prefill would free SWA for tokens later chunks
+        have not written yet. Freeing only sets ``-1``; it never shortens the
+        table (see ensure_swa_blocks_for_tokens / hash_blocks / PD transfer,
+        which all index swa_block_table by absolute logical block).
         """
         if not self.swa_enabled or self.swa_window <= 0:
             return
-        seq_len = len(seq)
+        if seq_len is None:
+            seq_len = len(seq)
         free_before = max(0, (seq_len - self.swa_window) // self.block_size)
         free_before = min(free_before, len(seq.swa_block_table))
         for i in range(free_before):
@@ -155,6 +182,63 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_swa_block(swa_id)
             seq.swa_block_table[i] = -1  # sentinel: out of window
+
+    def free_swa_after_prefill_chunk(self, seq: Sequence):
+        """Chunk-boundary SWA window-freeing, called from scheduler.postprocess
+        AFTER ``seq.num_cached_tokens += chunk``. Uses the computed-so-far length
+        so out-of-window SWA blocks are reclaimed during prefill (not only at the
+        first decode step), bounding peak SWA to ~window per request."""
+        if not self.swa_enabled:
+            return
+        self._free_swa_out_of_window(seq, seq.num_cached_tokens)
+
+    def ensure_swa_blocks_for_tokens(
+        self, seq: Sequence, num_cached_tokens: int, num_new_tokens: int
+    ):
+        """Fill the SWA pool blocks for the logical blocks this step's tokens
+        touch. `allocate()` left uncached SWA slots as ``-1`` placeholders (table
+        length == block_table length); here we replace the ``-1`` in the current
+        chunk's logical range with real physical blocks, BEFORE the forward
+        writes SWA. In-place fill (never append/shorten) keeps swa_block_table
+        positionally aligned with block_table — required by the index kernels
+        (absolute logical indexing), may_append (lockstep), and PD transfer."""
+        if not self.swa_enabled or num_new_tokens <= 0:
+            return
+        bs = self.block_size
+        start_blk = num_cached_tokens // bs
+        end_blk = (num_cached_tokens + num_new_tokens - 1) // bs
+        table = seq.swa_block_table
+        for i in range(start_blk, end_blk + 1):
+            if i >= len(table):
+                # allocate() sizes the table to seq.num_blocks; a chunk should
+                # never index past it. Guard against desync loudly.
+                raise AssertionError(
+                    f"ensure_swa: logical block {i} >= swa_block_table len "
+                    f"{len(table)} (seq {seq.id}); table not full-length?"
+                )
+            if table[i] < 0:  # -1 placeholder → materialize a real SWA block
+                swa_id = self._pop_free_swa_block()
+                self._allocate_swa_block(swa_id)
+                table[i] = swa_id
+
+    def materialize_swa_window(self, seq: Sequence, seq_len: int):
+        """PD consumer path: the decode instance receives KV via RDMA and never
+        runs a prefill forward, so `ensure_swa_blocks_for_tokens` is never called
+        and its first `may_append` is skipped. Materialize exactly the trailing-
+        window SWA blocks — the same logical positions the producer keeps live
+        after `_free_swa_out_of_window` (both use `free_before = (seq_len -
+        window)//bs`) — so the producer's RDMA write has real dst slots at
+        matching logical indices. Blocks before the window stay `-1`, mirroring
+        the producer's freed prefix (the consumer never reads them)."""
+        if not self.swa_enabled or self.swa_window <= 0:
+            return
+        bs = self.block_size
+        free_before = max(0, (seq_len - self.swa_window) // bs)
+        for i in range(free_before, len(seq.swa_block_table)):
+            if seq.swa_block_table[i] < 0:
+                swa_id = self._pop_free_swa_block()
+                self._allocate_swa_block(swa_id)
+                seq.swa_block_table[i] = swa_id
 
     def _allocate_swa_for_cached(self, h: int, token_ids: list[int], seq: Sequence):
         """Claim the cached SWA block for hash `h` (caller guarantees it exists,
@@ -231,10 +315,13 @@ class BlockManager:
         if not self.enable_prefix_caching:
             if len(self.free_block_ids_set) < seq.num_blocks:
                 return -1
-            # M2: SWA pool allocates in parallel (1:1 with compressed in M2
-            # brick-1; brick-2 window-freeing reduces this). Require space.
-            if self.swa_enabled and len(self.swa_free_block_ids_set) < seq.num_blocks:
-                return -1
+            # M2 chunked-prefill: SWA is filled incrementally + window-freed, so
+            # admission only needs the per-request windowed peak, not the whole
+            # prompt (which no longer fits the small SWA pool for long prompts).
+            if self.swa_enabled:
+                swa_need = self._swa_prefill_blocks(seq)
+                if len(self.swa_free_block_ids_set) < swa_need:
+                    return -1
             return 0
         h = -1
         num_cached_blocks = 0
@@ -260,10 +347,12 @@ class BlockManager:
                 num_new_blocks -= 1
         if len(self.free_block_ids_set) < num_new_blocks:
             return -1
-        # M2 brick-1: SWA pool is parallel (a cached compressed block has its
-        # SWA cached too; allocate() mirrors the reuse), so SWA new-block demand
-        # equals the compressed one. Require the SWA pool can cover it.
-        if self.swa_enabled and len(self.swa_free_block_ids_set) < num_new_blocks:
+        # M2 chunked-prefill: SWA new-block demand is bounded by the windowed
+        # peak (filled incrementally + window-freed), not the full new-block
+        # count. Require the SWA pool can cover that peak.
+        if self.swa_enabled and len(self.swa_free_block_ids_set) < min(
+            num_new_blocks, self._swa_prefill_blocks(seq)
+        ):
             return -1
         return num_cached_blocks
 
@@ -302,9 +391,13 @@ class BlockManager:
             self._allocate_block(block_id)
             seq.block_table.append(block_id)
             if self.swa_enabled:
-                swa_id = self._pop_free_swa_block()
-                self._allocate_swa_block(swa_id)
-                seq.swa_block_table.append(swa_id)
+                # M2 chunked-prefill: do NOT pop a physical SWA block for the
+                # whole prompt up front. Append a -1 placeholder to keep
+                # swa_block_table the same length as block_table (positional
+                # alignment); ensure_swa_blocks_for_tokens fills the current
+                # chunk's window slots with real phys before each forward, and
+                # free_swa_after_prefill_chunk releases them once out of window.
+                seq.swa_block_table.append(-1)
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
         # Per-request cache: claim one slot index from the pre-allocated
@@ -347,11 +440,17 @@ class BlockManager:
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
             # M2: publish the parallel SWA block under the same content hash so
-            # cross-request hits can reuse its sliding-window KV.
+            # cross-request hits can reuse its sliding-window KV. Skip -1 slots
+            # (window-freed or not-yet-materialized): a block finalized this step
+            # is in-window and was filled by ensure_swa, so this normally holds a
+            # real phys; the >= 0 guard prevents a silent swa_blocks[-1] alias if
+            # a block fell out of window in the same step.
             if self.swa_enabled and i < len(seq.swa_block_table):
-                swa_block = self.swa_blocks[seq.swa_block_table[i]]
-                swa_block.update(h, token_ids)
-                self.swa_hash_to_block_id[h] = swa_block.block_id
+                swa_id = seq.swa_block_table[i]
+                if swa_id >= 0:
+                    swa_block = self.swa_blocks[swa_id]
+                    swa_block.update(h, token_ids)
+                    self.swa_hash_to_block_id[h] = swa_block.block_id
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
