@@ -112,7 +112,7 @@
       "path": "amd/GLM-5.2-MXFP4",
       "prefix": "glm-5-2-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
       "config": {
         "tp": 4,
         "kv_cache_dtype": "fp8",
