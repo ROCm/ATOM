@@ -1408,16 +1408,49 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         # Check block alignment for block quantization
         if self.block_quant:
             tp_size = get_tp_group().world_size
+            # Auto-degrade block_n to 64 when the per-partition intermediate
+            # size is not divisible by 128 (e.g. intermediate_size=1536 at
+            # TP=8 → 192 per partition, which 128 does not divide).
+            if (
+                self.quant_type == QuantType.per_1x128
+                and intermediate_size_per_partition % self.block_n != 0
+                and intermediate_size_per_partition % 64 == 0
+            ):
+                logger.warning(
+                    "Block quantisation block_n=%d does not divide "
+                    "intermediate_size_per_partition=%d (world_size=%d). "
+                    "Automatically degrading block_n from %d to 64.",
+                    self.block_n,
+                    intermediate_size_per_partition,
+                    tp_size,
+                    self.block_n,
+                )
+                self.block_n = 64
             if intermediate_size_per_partition % self.block_n != 0:
                 raise ValueError(
                     f"intermediate_size_per_partition={intermediate_size_per_partition} "
                     f"must be divisible by block_n={self.block_n}"
                 )
             if tp_size > 1 and intermediate_size_per_partition % self.block_k != 0:
-                raise ValueError(
-                    f"intermediate_size_per_partition={intermediate_size_per_partition} "
-                    f"must be divisible by block_k={self.block_k}"
-                )
+                if (
+                    self.quant_type == QuantType.per_1x128
+                    and intermediate_size_per_partition % 64 == 0
+                ):
+                    logger.warning(
+                        "Block quantisation block_k=%d does not divide "
+                        "intermediate_size_per_partition=%d (world_size=%d). "
+                        "Automatically degrading block_k from %d to 64.",
+                        self.block_k,
+                        intermediate_size_per_partition,
+                        tp_size,
+                        self.block_k,
+                    )
+                    self.block_k = 64
+                else:
+                    raise ValueError(
+                        f"intermediate_size_per_partition={intermediate_size_per_partition} "
+                        f"must be divisible by block_k={self.block_k}"
+                    )
 
         # WEIGHTS
         w13_weight = atom_parameter(
@@ -1769,6 +1802,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
+        # Block sizes for block quantization
+        if self.block_quant:
+            if self.quant_type == QuantType.per_1x128:
+                self.block_n = 128
+                self.block_k = 128
+            elif self.quant_type == QuantType.per_1x32:
+                self.block_n = 1
+                self.block_k = 32
         self.channel_quant = self.quant_type == QuantType.per_Token
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             self.quant_dtype == torch.float8_e4m3fnuz
@@ -1787,35 +1828,62 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         intermediate_size_for_weight = intermediate_size_per_partition
 
         if self.block_quant:
-            if self.quant_type == QuantType.per_1x128:
-                block_n = 128
-                block_k = 128
-            elif self.quant_type == QuantType.per_1x32:
-                block_n = 1
-                block_k = 32
             tp_size = get_tp_group().world_size
+            # Auto-degrade block_n to 64 when the per-partition intermediate
+            # size is not divisible by 128 (e.g. intermediate_size=1536 at
+            # TP=8 → 192 per partition, which 128 does not divide).
+            if (
+                self.quant_type == QuantType.per_1x128
+                and intermediate_size_per_partition % self.block_n != 0
+                and intermediate_size_per_partition % 64 == 0
+            ):
+                logger.warning(
+                    "Block quantisation block_n=%d does not divide "
+                    "intermediate_size_per_partition=%d (world_size=%d). "
+                    "Automatically degrading block_n from %d to 64.",
+                    self.block_n,
+                    intermediate_size_per_partition,
+                    tp_size,
+                    self.block_n,
+                )
+                self.block_n = 64
             # NOTE: To ensure proper alignment of the block-wise quantization
             # scales, the output_size of the weights for both the gate and up
             # layers must be divisible by block_n.
             # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
+            if intermediate_size_per_partition % self.block_n != 0:
                 raise ValueError(
                     f"The output_size of gate's and up's weight = "
                     f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
+                    f"weight quantization block_n = {self.block_n}."
                 )
-            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
+            if tp_size > 1 and intermediate_size_per_partition % self.block_k != 0:
                 # Required by row parallel
-                raise ValueError(
-                    f"The input_size of down's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_k = {block_k}."
-                )
+                if (
+                    self.quant_type == QuantType.per_1x128
+                    and intermediate_size_per_partition % 64 == 0
+                ):
+                    logger.warning(
+                        "Block quantisation block_k=%d does not divide "
+                        "intermediate_size_per_partition=%d (world_size=%d). "
+                        "Automatically degrading block_k from %d to 64.",
+                        self.block_k,
+                        intermediate_size_per_partition,
+                        tp_size,
+                        self.block_k,
+                    )
+                    self.block_k = 64
+                else:
+                    raise ValueError(
+                        f"The input_size of down's weight = "
+                        f"{intermediate_size_per_partition} is not divisible by "
+                        f"weight quantization block_k = {self.block_k}."
+                    )
             if self.quant_type == QuantType.per_1x32:
                 # aiter's GU-interleaved MXFP8 scale shuffle packs 8 scale
                 # columns, i.e. 256 weight columns for 1x32 scales. TP8 on
                 # MiniMax-M3 has local intermediate=384, so pad to 512.
-                scale_pack_k = block_k * 8
+                scale_pack_k = self.block_k * 8
                 intermediate_size_for_weight = (
                     (intermediate_size_per_partition + scale_pack_k - 1)
                     // scale_pack_k
@@ -1868,13 +1936,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif self.block_quant:
             scale_shape_w13 = (
                 num_experts,
-                2 * ((intermediate_size_for_weight + block_n - 1) // block_n),
-                (hidden_size + block_k - 1) // block_k,
+                2 * ((intermediate_size_for_weight + self.block_n - 1) // self.block_n),
+                (hidden_size + self.block_k - 1) // self.block_k,
             )
             scale_shape_w2 = (
                 num_experts,
-                (hidden_size + block_n - 1) // block_n,
-                (intermediate_size_for_weight + block_k - 1) // block_k,
+                (hidden_size + self.block_n - 1) // self.block_n,
+                (intermediate_size_for_weight + self.block_k - 1) // self.block_k,
             )
             # MXFP8 checkpoints store 1x32 scales as e8m0 bytes. Keep the
             # existing float32 initialization for the original 1x128 path.
@@ -2073,12 +2141,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # V4-Flash-Base on gfx942 hits this: routed experts are FP8 e4m3
             # per_1x128 + UE8M0 block-scale.
             if self.block_quant:
-                if self.quant_type == QuantType.per_1x128:
-                    block_shape = [128, 128]
-                elif self.quant_type == QuantType.per_1x32:
-                    block_shape = [1, 32]
-                else:
-                    block_shape = None
+                block_shape = [self.block_n, self.block_k]
             else:
                 block_shape = None
             return fp8_w8a8_moe_quant_config(
