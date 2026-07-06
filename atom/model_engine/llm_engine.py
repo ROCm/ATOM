@@ -74,11 +74,33 @@ class LLMEngine:
         # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
         # per-request ubatch split are unverified).
         if config.prefill_context_parallel_size > 1 and config.enable_tbo:
-            if config.enable_tbo_decode:
+            # TBO overlaps compute with the attn<->MoE PCP collectives, which
+            # only exist in MoE merge mode (ATOM_PCP_MOE_MERGE=1). With
+            # ATOM_PCP_MOE_MERGE=0, MoE runs on each rank's 1/W token shard
+            # with NO extra comm between attn and MoE, so TBO has nothing
+            # to overlap and only adds ubatch-splitting overhead. Force it off.
+            if not envs.ATOM_PCP_MOE_MERGE:
+                logger.warning(
+                    "Disabling TBO because ATOM_PCP_MOE_MERGE=0: in this "
+                    "situation it runs MoE on each rank's 1/W token shard with "
+                    "no extra attn<->MoE communication, so TBO has nothing to "
+                    "overlap and only adds overhead."
+                )
+                config.enable_tbo = False
+                config.enable_tbo_decode = False
+            elif config.enable_tbo_decode:
                 raise ValueError(
                     "prefill_context_parallel_size > 1 (-pcp) combined with "
                     "--enable-tbo all (decode TBO) is not supported yet. "
                     "Use --enable-tbo (prefill only) with -pcp."
+                )
+            # Under PCP, TBO prefill uses request-boundary balanced grouping
+            # (never token-midpoint split), so ATOM_TBO_PREFILL_TOKEN_SPLIT is
+            # ignored.
+            if config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
+                logger.warning(
+                    "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
+                    "prefill uses request-boundary balanced grouping."
                 )
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(

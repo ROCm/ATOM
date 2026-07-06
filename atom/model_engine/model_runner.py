@@ -1741,13 +1741,10 @@ class ModelRunner:
                 self.config, batch, is_prefill, num_scheduled_tokens
             )
 
-        # PCP+TBO prefill — b2 + balanced: split requests into
-        # two GROUPS at a request boundary (never split a sequence's tokens), so
-        # each ubatch = "non-TBO PCP on a request subset". This root-fixes the
-        # token-split R1/R2 structural conflicts (compressor cross-token
-        # compression / SWA ring), because every sequence stays whole within one
-        # group. Requires num_reqs >= 2 (balanced needs two non-empty groups);
-        # bs=1 falls back to non-TBO.
+        # PCP+TBO prefill: split requests into two GROUPS at a request boundary
+        # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
+        # request subset". Requires num_reqs >= 2 (balanced needs two non-empty
+        # groups); bs=1 falls back to non-TBO.
         pcp_size = self.config.prefill_context_parallel_size
         # True for eligible PCP+TBO balanced prefill; read by build_ubatch /
         # run_model / prepare_prefill to route the per-group path.
@@ -1895,12 +1892,12 @@ class ModelRunner:
             and getattr(self, "_pcp_tbo_balanced_active", False)
         )
         if _pcp_tbo_balanced:
-            # b2 + balanced (PCP_TBO.md §12): split REQUESTS into two groups at a
-            # request boundary near the token midpoint. Each group is an
-            # independent "non-TBO PCP mini-batch": padded to a pcp multiple and
-            # round-robin striped as a whole, so every sequence stays intact in
-            # one group (root-fixes token-split R1/R2). forward_vars stay GLOBAL
-            # here; build_ubatch_prefill_metadata slices the FULL (un-reindexed)
+            # split REQUESTS into two groups at a request boundary near the
+            # token midpoint. Each group is an independent "non-TBO PCP
+            # mini-batch": padded to a pcp multiple and round-robin striped
+            # as a whole, so every sequence stays intact in one group
+            # (root-fixes token-split R1/R2). forward_vars stay GLOBAL here;
+            # build_ubatch_prefill_metadata slices the FULL (un-reindexed)
             # metadata per group and calls _apply_pcp_reindex on it.
             num_prefill_reqs = batch.total_seqs_num_prefill
             per_req = np.asarray(
@@ -2070,11 +2067,11 @@ class ModelRunner:
         # internally short-circuits for prefill / cudagraph.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
-        # PCP+TBO prefill — b2 + balanced (PCP_TBO.md §12): PER-GROUP stripe here,
-        # before UBatchWrapper. Each request group is padded to a pcp multiple and
-        # round-robin striped as a WHOLE (so sequences stay intact per group), then
-        # the two groups' 1/pcp shards are concatenated. token_slice (built in
-        # prepare_inputs) indexes into this [g0_local | g1_local] concat.
+        # PCP+TBO prefill: PER-GROUP stripe here, before UBatchWrapper. Each
+        # request group is padded to a pcp multiple and round-robin striped as a
+        # WHOLE (so sequences stay intact per group), then the two groups' 1/pcp
+        # shards are concatenated. token_slice (built in prepare_inputs) indexes
+        # into this [g0_local | g1_local] concat.
         _pcp_size = self.config.prefill_context_parallel_size
         _pcp_bal_groups = getattr(self, "_pcp_bal_groups", None)
         _pcp_tbo_balanced = (
@@ -2102,7 +2099,7 @@ class ModelRunner:
             # context.positions = local per-group concat so _make_ubatch_context
             # slices each ubatch's forward positions correctly.
             forward_context.context.positions = positions
-            # Hash MoE (mode B): local per-group-concat ids. Each ForCausalLM.forward
+            # Hash MoE: local per-group-concat ids. Each ForCausalLM.forward
             # allgathers its ubatch's slice (g_i local, H_i/pcp) across pcp ranks →
             # H_i ids, matching moe_pcp_merge_forward's per-ubatch hidden allgather.
             if envs.ATOM_PCP_MOE_MERGE:

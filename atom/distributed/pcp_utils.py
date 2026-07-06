@@ -59,19 +59,21 @@ def pcp_is_enabled() -> bool:
 def pcp_pad_len(
     total_tokens: int,
     pcp_size: Optional[int] = None,
-    num_ubatches: int = 1,
+    multiple: int = 1,
 ) -> int:
-    """Padded token count so the global sequence is divisible by pcp_size * num_ubatches.
+    """Padded token count so the global sequence is divisible by pcp_size * multiple.
 
     Round-robin split requires the global token count to be divisible by pcp_size
-    (see SGLang `can_dsa_cp_split` assert / HIP `apply_cp_reindex`). Returns the
-    padded length (>= total_tokens); callers pad per-token tensors to this
-    length with dummy tokens (KV length 0) before splitting.
+    (see SGLang `can_dsa_cp_split` assert / HIP `apply_cp_reindex`). `multiple` is
+    an extra factor applied on top of pcp_size when the sequence must additionally
+    be evenly divisible by some multiplier. Returns the padded length
+    (>= total_tokens); callers pad per-token tensors to this length with dummy
+    tokens (KV length 0) before splitting.
 
     """
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
-    divisor = pcp_size * max(num_ubatches, 1)
+    divisor = pcp_size * max(multiple, 1)
     if divisor <= 1:
         return total_tokens
     rem = total_tokens % divisor
