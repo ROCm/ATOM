@@ -170,16 +170,16 @@
     "_baseline_note": "HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909"
   },
   {
-    "model_name": "Kimi-K2.5-MXFP4",
-    "model_path": "amd/Kimi-K2.5-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code",
-    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
+    "model_name": "Kimi-K2.7-Code-MXFP4",
+    "model_path": "amd/Kimi-K2.7-Code-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code --gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"\", \"layer_quant_config\": {\"model.layers.*.self_attn.fused_qkv_a_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.q_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.kv_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.o_proj\": \"ptpc_fp8\"}}'",
+    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.9409,
-    "accuracy_baseline_model": "moonshotai/Kimi-K2.5",
-    "_baseline_note": "HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409"
+    "accuracy_baseline_model": "moonshotai/Kimi-K2.7-Code",
+    "_baseline_note": "Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold inherited from Kimi-K2.5-MXFP4 until CI baseline is refreshed."
   },
   {
     "model_name": "Kimi-K2.5-MXFP4 Eagle3",

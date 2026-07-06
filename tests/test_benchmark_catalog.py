@@ -68,9 +68,17 @@ def test_build_args_golden():
         f"--kv_cache_dtype fp8 -tp 8 {HF} --method mtp --num-speculative-tokens 3 "
         "--enable-dp-attention"
     )
-    m, v = by_display["Kimi-K2.5-MXFP4"]
+    m, v = by_display["Kimi-K2.7-Code-MXFP4"]
     assert catalog.build_args(m["config"], v) == (
-        "--kv_cache_dtype fp8 -tp 4 --trust-remote-code"
+        "--kv_cache_dtype fp8 -tp 4 --trust-remote-code "
+        "--gpu-memory-utilization 0.9 --max-model-len 32768 "
+        "--max-num-batched-tokens 32768 --no-enable_prefix_caching "
+        "--online_quant_config "
+        '\'{"global_quant_config": "", "layer_quant_config": '
+        '{"model.layers.*.self_attn.fused_qkv_a_proj": "ptpc_fp8", '
+        '"model.layers.*.self_attn.q_b_proj": "ptpc_fp8", '
+        '"model.layers.*.self_attn.kv_b_proj": "ptpc_fp8", '
+        '"model.layers.*.self_attn.o_proj": "ptpc_fp8"}}\''
     )
     m, v = by_display["gpt-oss-120b"]
     assert catalog.build_args(m["config"], v) == (

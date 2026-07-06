@@ -34,8 +34,8 @@ on:
         description: "Benchmark gpt-oss-120b"
         type: boolean
         default: true
-      kimi-k25-mxfp4:
-        description: "Benchmark Kimi-K2.5-MXFP4"
+      kimi-k27-code-mxfp4:
+        description: "Benchmark Kimi-K2.7-Code-MXFP4"
         type: boolean
         default: true
       m3-mxfp8:
