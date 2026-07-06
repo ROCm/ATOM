@@ -51,7 +51,7 @@ rm -rf /root/.cache/atom/* 2>/dev/null || true
 DPA prefill instances additionally set:
 
 ```bash
-export ATOM_CPU_AFFINITY=1
+export ATOM_NUMA_BIND=1
 export GPU_MAX_HW_QUEUES=5
 ```
 
@@ -150,7 +150,7 @@ Node 2 (decode)     ──┘
 
 ```bash
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export ATOM_CPU_AFFINITY=1
+export ATOM_NUMA_BIND=1
 export GPU_MAX_HW_QUEUES=5
 
 python3 -m atom.entrypoints.openai_server \
