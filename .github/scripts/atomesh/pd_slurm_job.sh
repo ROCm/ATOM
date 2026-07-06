@@ -43,6 +43,8 @@ allow = (
     "MAX_NUM_BATCHED_TOKENS",
     "ONLINE_QUANT_CONFIG",
     "HF_OVERRIDES",
+    # Preserve FlyDSL cache overrides for non-root Spur containers.
+    "FLYDSL_",
     "SPEC_",
     "DRAFT_MODEL_PATH",
     "NUM_SPEC_TOKENS",
@@ -130,6 +132,9 @@ EOF
     -e TORCHINDUCTOR_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/torchinductor"
     -e AITER_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/aiter"
     -e AITER_JIT_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/aiter/jit"
+    # FlyDSL otherwise tries to create caches under /app/aiter-test, which is
+    # read-only for the Slurm uid required by Spur's Docker template.
+    -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
     -e NCCL_NET_PLUGIN=none
     -e NCCL_SOCKET_IFNAME=eth1
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
