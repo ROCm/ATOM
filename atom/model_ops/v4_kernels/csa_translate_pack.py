@@ -46,6 +46,11 @@ import torch
 import triton
 import triton.language as tl
 
+# Target workgroup count for BLOCK_K tuning (see csa_translate_pack): grow the
+# per-program tile until the grid would drop below this many workgroups, then
+# stop, so large-T launches use fat tiles without starving GPU occupancy.
+_CSA_TARGET_WG = 512
+
 
 @triton.jit
 def _csa_translate_pack_kernel(
@@ -230,7 +235,16 @@ def csa_translate_pack(
         else positions
     )
 
-    BLOCK_K = min(64, triton.next_power_of_2(index_topk))
+    # BLOCK_K tuning: each program packs BLOCK_K slots of one token's row.
+    # Fat tiles amortize per-program launch/scheduling overhead (fewer, wider
+    # workgroups), but the grid still needs enough workgroups
+    # (T * cdiv(index_topk, BLOCK_K)) to fill the GPU. So grow the tile only
+    # while the workgroup count stays >= _CSA_TARGET_WG: large-T decode gets
+    # fat tiles (measured up to 3.2x over a fixed BLOCK_K=64 on gfx1250),
+    # small-T stays fine-grained for occupancy. Tile floor is 64 slots.
+    max_tiles = triton.cdiv(index_topk, 64)
+    n_tiles = min(max_tiles, max(1, -(-_CSA_TARGET_WG // T)))  # ceil(target/T)
+    BLOCK_K = min(1024, triton.next_power_of_2(triton.cdiv(index_topk, n_tiles)))
     grid = (T, triton.cdiv(index_topk, BLOCK_K))
     _csa_translate_pack_kernel[grid](
         topk_local,
