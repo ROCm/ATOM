@@ -11,7 +11,7 @@ from atom.model_ops.embed_head import (
     ReplicatedEmbedding,
     VocabParallelEmbedding,
 )
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.layernorm import RMSNorm, fused_dual_rmsnorm_cat
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import IntermediateTensors
@@ -95,13 +95,17 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        masked_inputs_embeds = inputs_embeds
-        inputs_embeds = self.enorm(masked_inputs_embeds)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
-
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        # Fused enorm(inputs_embeds) ++ hnorm(previous_hidden_states) in a single
+        # Triton launch (folds the two RMSNorms + the torch.cat; enorm and hnorm
+        # share eps=rms_norm_eps). bf16-identical to the separate path.
+        eh_input = fused_dual_rmsnorm_cat(
+            inputs_embeds,
+            self.enorm.weight,
+            previous_hidden_states,
+            self.hnorm.weight,
+            self.enorm.eps,
         )
+        hidden_states = self.eh_proj(eh_input)
 
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
