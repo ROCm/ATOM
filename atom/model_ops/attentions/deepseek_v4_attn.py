@@ -403,14 +403,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._ubatch_decode_meta: Optional[list] = None
 
     @property
-    def swa_paged(self) -> bool:
-        """M2 paged-SWA live switch (lazy: config.num_swa_blocks is set by
-        ModelRunner.get_num_blocks AFTER this builder is constructed). When >0
-        the SWA pool is a separate windowed/prefix-cached pool addressed by
-        swa_block_tables; else M1 behaviour (SWA shares compressed phys)."""
-        return getattr(self.model_runner.config, "num_swa_blocks", 0) > 0
-
-    @property
     def prep_stream(self):
         return self.model_runner.async_execute_stream
 
@@ -431,10 +423,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         csa_main = self._numel(self.csa_main_state_shape) * 2 * elem_state
         csa_idx = self._numel(self.csa_idx_state_shape) * 2 * elem_state
         hca_main = self._numel(self.hca_main_state_shape) * 2 * elem_state
-        # M1 paged-SWA: the sliding-window KV is no longer a per-request ring;
-        # it moved into the paged pool (content-addressed by block_tables, see
-        # `compute_block_bytes`). Per-request cache now holds ONLY the
-        # compressor tail state (kv_state/score_state), which stays per-request.
+        # paged-SWA: the sliding-window KV is no longer a per-request ring; it
+        # moved into the separate window-freed SWA pool (content-addressed by
+        # swa_block_tables). Per-request cache now holds ONLY the compressor
+        # tail state (kv_state/score_state), which stays per-request.
         return (
             len(self.csa_layers) * (csa_main + csa_idx)
             + len(self.hca_layers) * hca_main
@@ -485,11 +477,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         csa_main_per_block = self.k1_csa * self.head_dim * elem_bf16
         csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
         hca_main_per_block = self.k2_hca * self.head_dim * elem_bf16
-        # M1 paged-SWA: the sliding-window KV is now content-addressed by
-        # block_tables in the paged pool, one full-resolution (ratio-1) entry
-        # per original token in EVERY layer. So each block also carries
-        # `block_size * head_dim` BF16 of SWA per layer. (M2 will window-free
-        # out-of-window SWA blocks to reclaim this; M1 pages all of them.)
+        # paged-SWA: the sliding-window KV is content-addressed, one full-
+        # resolution (ratio-1) entry per original token in EVERY layer, so each
+        # block carries `block_size * head_dim` BF16 of SWA per layer. This term
+        # is charged here but the budget (model_runner.get_num_blocks) strips it
+        # back out into the separate window-freed num_swa_blocks pool (M2).
         swa_per_block = self.block_size * self.head_dim * elem_bf16
         return (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
@@ -559,13 +551,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         num_blocks = self.model_runner.num_physical_kvcache_blocks
         n_csa = len(self.csa_layers)
         n_hca = len(self.hca_layers)
-        # M1 paged-SWA: SWA region is now content-addressed by block_tables
-        # (one full-resolution entry per original token per physical block),
-        # exactly like the compressed region. Size = num_blocks * block_size
-        # (was the per-request ring `num_slots * win_with_spec`).
-        swa_pages = (
-            self.model_runner.num_swa_blocks if self.swa_paged else num_blocks
-        ) * self.block_size
+        # M2 paged-SWA: SWA lives in its own num_swa_blocks pool, content-
+        # addressed by swa_block_tables. Size = num_swa_blocks * block_size.
+        swa_pages = self.model_runner.num_swa_blocks * self.block_size
         head_dim = self.head_dim
         dtype = self._swa_dtype
 
@@ -663,19 +651,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         runner = self.model_runner
         num_blocks = self.model_runner.num_physical_kvcache_blocks
-        # M1 paged-SWA: SWA region is content-addressed (num_blocks*block_size
-        # rows), not a per-request ring.
-        swa_pages = (
-            self.model_runner.num_swa_blocks if self.swa_paged else num_blocks
-        ) * self.block_size
+        # M2 paged-SWA: SWA region is the separate num_swa_blocks pool,
+        # content-addressed by swa_block_tables.
+        swa_pages = self.model_runner.num_swa_blocks * self.block_size
 
         if isinstance(module, _V4Attention):
             # Bind both:
             #   - `attn.unified_kv`: the full per-layer pool (paged_decode reads).
-            #   - `attn.swa_kv`: the flat [num_blocks*block_size, head_dim] paged
-            #     SWA region. Indexed by `block_tables[bid, pos//block_size] *
-            #     block_size + pos%block_size` (same physical block as the
-            #     compressed cache → prefix-cache hits reuse SWA, issue #1417).
+            #   - `attn.swa_kv`: the flat [num_swa_blocks*block_size, head_dim]
+            #     separate SWA pool. Indexed by `swa_block_tables[bid,
+            #     pos//block_size] * block_size + pos%block_size`; prefix-cache
+            #     hits reuse SWA via content-addressed swa_block_tables (#1417).
             unified = runner.v4_unified_kv[module.layer_id]
             module.unified_kv = unified
             module.swa_kv = unified[:swa_pages]
@@ -787,20 +773,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         num_slots = runner.max_per_req_cache_slots
-        # A3 paged-SWA: under PD, swa_paged is forced OFF (M1 fallback), so the
-        # SWA region is num_physical_kvcache_blocks * block_size rows, content-
-        # addressed by the SAME compressed block_table → transferred below as a
-        # paged block_region (not a per-request ring slot). (M2 separate-pool PD
-        # transfer, keyed by seq.swa_block_table, needs connector support — TODO.)
-        swa_pages = (
-            self.model_runner.num_swa_blocks
-            if self.swa_paged
-            else runner.num_physical_kvcache_blocks
-        ) * self.block_size
+        # M2 paged-SWA: SWA lives in a SEPARATE num_swa_blocks pool at the head
+        # of unified_kv ([0, swa_pages)); the compress tail follows. The SWA
+        # region is emitted below as swa_block_regions (keyed by
+        # seq.swa_block_table, only the live window is transferred).
+        swa_pages = self.model_runner.num_swa_blocks * self.block_size
         elem_bf16 = 2
         elem_fp32 = 4
 
         block_regions: list[KVTransferRegion] = []
+        swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
         # Block regions: compress tail per layer
@@ -829,15 +811,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 KVTransferRegion(t.data_ptr(), t.numel() * t.element_size(), bpb)
             )
 
-        # A3 paged-SWA: SWA region [0, swa_pages) is content-addressed by the
-        # compressed block_table (M1 fallback under PD), so transfer it as a
-        # PAGED block_region (one block = block_size SWA rows), NOT a per-request
-        # ring slot. block b's SWA lives at uv[0] + b*block_size*head_dim*elem,
-        # and the connector already transfers block_regions by seq.block_table.
+        # M2 paged-SWA: SWA region [0, swa_pages) is the SEPARATE window-freed
+        # pool, content-addressed by seq.swa_block_table (NOT the compressed
+        # block_table). Emit it as swa_block_regions so the connector keys it by
+        # swa_block_table — window-freeing leaves only the live tail (the last
+        # ~128-token block) as non-(-1) entries, so only that gets transferred.
+        # block b's SWA lives at uv[0] + b*block_size*head_dim*elem.
         swa_block_bytes = self.block_size * self.head_dim * elem_bf16
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
-            block_regions.append(
+            swa_block_regions.append(
                 KVTransferRegion(
                     uv.data_ptr(),
                     swa_pages * self.head_dim * elem_bf16,
@@ -872,6 +855,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         return KVTransferTensors(
             block_regions=block_regions,
+            swa_block_regions=swa_block_regions,
             slot_regions=slot_regions,
             num_blocks=runner.num_physical_kvcache_blocks,
             num_slots=num_slots,
@@ -1116,11 +1100,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # building two extra unused indptr buffers.
         swa_indices_buf = var["v4_kv_indices_swa"].gpu
         write_v4_paged_decode_indices(
-            block_tables=(
-                attn_metadata.swa_block_tables[:bs]
-                if self.swa_paged and attn_metadata.swa_block_tables is not None
-                else attn_metadata.block_tables[:bs]
-            ),
+            block_tables=attn_metadata.swa_block_tables[:bs],
             batch_id_per_token=batch_id_per_token,
             positions=positions,
             swa_indptr=swa_indptr,
@@ -1213,15 +1193,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
             block_tables_gpu = var["block_tables"].copy_to_gpu(scheduled_bs)
             # M2 paged-SWA: decode also needs the SWA block table on attn_metadata
-            # (model-forward swa_write + decode index kernel). Without it the
-            # forward falls back to the COMPRESSED block_tables → swa_region OOB
-            # when a compressed phys exceeds num_swa_blocks (crashes under
-            # concurrency; sequential only escapes by small phys ids).
-            swa_bt_gpu = (
-                var["swa_block_tables"].copy_to_gpu(scheduled_bs)
-                if self.swa_paged
-                else None
-            )
+            # (model-forward swa_write + decode index kernel), keyed into the
+            # separate num_swa_blocks pool.
+            swa_bt_gpu = var["swa_block_tables"].copy_to_gpu(scheduled_bs)
             state_slot_gpu = ss_buf.copy_to_gpu(scheduled_bs)
 
         # ---- CPU numpy work, overlapped with prep_stream H2D ----
@@ -1476,7 +1450,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.block_tables = self._populate_block_tables(
                 batch, scheduled_bs
             )
-        if self.swa_paged and attn_metadata.swa_block_tables is None:
+        if attn_metadata.swa_block_tables is None:
             attn_metadata.swa_block_tables = self._populate_swa_block_tables(
                 batch, scheduled_bs
             )
@@ -2006,13 +1980,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         win = self.window_size  # per-token max SWA prefix slots
-        # M1 paged-SWA: SWA region is num_blocks*block_size rows; this boundary
-        # offsets the HCA compress section in unified_kv.
-        swa_pages = (
-            self.model_runner.num_swa_blocks
-            if self.swa_paged
-            else self.model_runner.num_physical_kvcache_blocks
-        ) * self.block_size
+        # M2 paged-SWA: SWA region = num_swa_blocks*block_size rows (separate
+        # pool); this boundary offsets the HCA compress section in unified_kv.
+        swa_pages = self.model_runner.num_swa_blocks * self.block_size
 
         T = total_tokens
 
@@ -2138,11 +2108,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"].gpu
         csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"].gpu
         write_v4_paged_decode_indices(
-            block_tables=(
-                var["swa_block_tables"].gpu[:scheduled_bs]
-                if self.swa_paged
-                else var[f"{buf_prefix_ubatch}block_tables"].gpu[:scheduled_bs]
-            ),
+            block_tables=var["swa_block_tables"].gpu[:scheduled_bs],
             batch_id_per_token=batch_id_per_token_gpu,
             positions=var[f"{buf_prefix_ubatch}positions"].gpu,
             swa_indptr=swa_indptr_gpu,
@@ -2247,13 +2213,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         num_slots = getattr(self.model_runner, "max_per_req_cache_slots", 0)
         if num_slots == 0:
             return
-        # M1 paged-SWA: SWA region = num_blocks*block_size (content-addressed),
+        # M2 paged-SWA: SWA region = num_swa_blocks*block_size (separate pool),
         # boundary into the HCA compress section of unified_kv.
-        swa_pages = (
-            self.model_runner.num_swa_blocks
-            if self.swa_paged
-            else self.model_runner.num_physical_kvcache_blocks
-        ) * self.block_size
+        swa_pages = self.model_runner.num_swa_blocks * self.block_size
         var = self.model_runner.forward_vars
 
         # ----- CPU numpy: per-token counts + indptrs -----
@@ -2343,13 +2305,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_q_per_seq_gpu = var["cu_seqlens_q"].gpu[:scheduled_bs]
         if block_tables_gpu is None:
             block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
-        # M2: SWA-prefix offsets index the SWA pool via swa_block_tables; HCA
-        # still uses the compressed block_tables. M1 fallback (swa_paged off):
-        # SWA shares the compressed phys, so pass block_tables for both.
-        if self.swa_paged and attn_metadata.swa_block_tables is not None:
-            swa_block_tables_gpu = attn_metadata.swa_block_tables[:scheduled_bs]
-        else:
-            swa_block_tables_gpu = block_tables_gpu
+        # M2: SWA-prefix offsets index the separate SWA pool via
+        # swa_block_tables; HCA still uses the compressed block_tables.
+        swa_block_tables_gpu = attn_metadata.swa_block_tables[:scheduled_bs]
         state_slot_per_seq_gpu = attn_metadata.state_slot_mapping[:scheduled_bs]
         # batch_id_per_token is int32 in storage (accepted by PyTorch
         # advanced-indexing and the fused flydsl SWA scatter); the kernel uses
@@ -2605,12 +2563,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # M2 paged-SWA: capture the SWA block table too (placeholder block 0),
         # pointing at the persistent var["swa_block_tables"] buffer that
         # replay-time prepare_decode refills — so the captured graph's SWA
-        # reads/writes hit stable addresses. Without this the captured decode
-        # swa_write falls back to the compressed block_tables → OOB at replay.
-        swa_bt_gpu = None
-        if self.swa_paged:
-            var["swa_block_tables"].np[:bs] = block_tables_np
-            swa_bt_gpu = var["swa_block_tables"].copy_to_gpu(bs)
+        # reads/writes hit stable addresses into the separate SWA pool.
+        var["swa_block_tables"].np[:bs] = block_tables_np
+        swa_bt_gpu = var["swa_block_tables"].copy_to_gpu(bs)
         state_slot_gpu = self._stage("v4_meta_state_slot_groups", state_slot_np)
 
         # Synthetic decode batch: start_pos = win > 0 and uniform

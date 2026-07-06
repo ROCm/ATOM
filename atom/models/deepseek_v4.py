@@ -1789,13 +1789,9 @@ class DeepseekV4Attention(nn.Module):
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
         block_tables_gpu = attn_md.block_tables
-        # M2 paged-SWA: swa_write targets the SWA pool via swa_block_tables when
-        # live; M1 fallback reuses the compressed block_tables (shared phys).
-        swa_block_tables_gpu = (
-            attn_md.swa_block_tables
-            if getattr(attn_md, "swa_block_tables", None) is not None
-            else block_tables_gpu
-        )
+        # M2 paged-SWA: swa_write targets the separate SWA pool via
+        # swa_block_tables (always populated for V4).
+        swa_block_tables_gpu = attn_md.swa_block_tables
         state_slot_mapping = attn_md.state_slot_mapping
         plan_for_layer = compress_plans[ratio] if ratio else None
 

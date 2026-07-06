@@ -1392,29 +1392,15 @@ class ModelRunner:
         # maps model_type deepseek_v4 → v3).
         _arches = getattr(hf_config, "architectures", None) or []
         # M2 paged-SWA: separate windowed/prefix-cached SWA pool — the RIGHT fix
-        # for #1417. The M1 page-everything fallback fixes the bug too but bloats
-        # block_bytes ~8x, cutting num_kvcache_blocks from ~113k (main) to ~14k;
-        # M2 restores capacity AND fixes the bug (num_kvcache_blocks ~108k, SWA in
-        # a bounded window-freed pool ~1248 blocks). VALIDATED: eager repro 0/3 +
-        # gsm8k 0.952 @1319/nc64 + perf parity; non-eager CUDAGraph capture
-        # succeeds (swa_block_tables wired into build_for_cudagraph_capture).
-        # Default ON for V4; ATOM_M2_PAGED_SWA=0 forces the M1 fallback.
-        _M2_PAGED_SWA = os.environ.get("ATOM_M2_PAGED_SWA", "1") == "1"
-        # A3: PD/disaggregation transfers block_regions by seq.block_table and
-        # per-request slots by per_req_cache_group. M2's SWA lives in a SEPARATE
-        # pool addressed by seq.swa_block_table — the connector can't transfer
-        # that second block-table yet. So under PD, force the M1 fallback (SWA
-        # shares the compressed phys) where SWA transfers as a paged block_region
-        # keyed by the compressed block_table (get_kv_transfer_tensors emits it).
-        # M2-under-PD (separate-pool transfer) needs connector-side support.
-        _pd_active = bool(getattr(config, "kv_transfer_config", None))
-        if _pd_active and _M2_PAGED_SWA:
-            logger.info(
-                "M2 paged-SWA: PD/disaggregation active → using M1 fallback "
-                "(SWA shares compressed phys; M2 separate-pool transfer TODO)."
-            )
-            _M2_PAGED_SWA = False
-        _is_v4 = _M2_PAGED_SWA and any("DeepseekV4" in str(a) for a in _arches)
+        # for #1417. The SWA bytes that `compute_block_bytes` charges per
+        # compressed block move into a `num_swa_blocks`-sized pool (window-freed,
+        # ~1248 blocks), and the freed budget grows num_kvcache_blocks (~108k).
+        # VALIDATED: eager repro 0/3 + gsm8k 0.952 @1319/nc64 + perf parity;
+        # non-eager CUDAGraph capture succeeds (swa_block_tables wired into
+        # build_for_cudagraph_capture). Under PD/disaggregation the SWA pool is
+        # transferred per-request by seq.swa_block_table (only the live window,
+        # i.e. the last ~128-token block); see get_kv_transfer_tensors.
+        _is_v4 = any("DeepseekV4" in str(a) for a in _arches)
         if _is_v4:
             b = self.attn_metadata_builder
             swa_block_bytes = b.swa_pool_block_bytes()
@@ -1521,7 +1507,7 @@ class ModelRunner:
             # config.num_swa_blocks isn't visible to the engine process that
             # builds BlockManager. Propagate via block_info (mirrors the
             # per_req_cache fields) so BlockManager.swa_enabled matches the
-            # attn builder's swa_paged.
+            # attn builder's SWA pool.
             "num_swa_blocks": int(getattr(config, "num_swa_blocks", 0)),
             "swa_window_size": int(getattr(config, "swa_window_size", 0)),
         }
@@ -1696,7 +1682,7 @@ class ModelRunner:
         actual_kv_bytes = post_alloc - pre_alloc
         # M2 brick-3b: SWA moved to its own num_swa_blocks pool, so the
         # compressed pool is sized on (block_bytes - swa_block_bytes); add the
-        # SWA pool separately. (swa_paged off → num_swa_blocks=0, reduces to the
+        # SWA pool separately. (non-V4 → num_swa_blocks=0, reduces to the
         # original formula.)
         _nswa = getattr(self, "num_swa_blocks", 0)
         _swa_bb = (
