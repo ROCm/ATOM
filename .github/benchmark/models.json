@@ -131,15 +131,6 @@
       ]
     },
     {
-      "display": "GLM-5.1-MXFP4",
-      "path": "amd/GLM-5.1-MXFP4",
-      "prefix": "glm-5.1-fp4",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 4, "kv_cache_dtype": "fp8" },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
-    },
-    {
       "display": "gpt-oss-120b",
       "path": "openai/gpt-oss-120b",
       "prefix": "gpt-oss-120b",
