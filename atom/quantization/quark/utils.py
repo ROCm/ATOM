@@ -164,6 +164,8 @@ def quant_weight_online(
 
     - MXFP4 (``dtypes.fp4x2``): use the aiter HIP kernel with ``Even`` round
       mode (:func:`quant_mxfp4_online_even`), matching the offline Quark kernel.
+    - MXFP8 (``per_1x32`` + ``dtypes.fp8``): fp8 weights with a per-32 block
+      scale. See the e8m0 note below for why ``scale_type`` must be forced.
     - FP8 (incl. ptpc_fp8 per-token / per-channel): use the aiter quant
       function resolved from ``get_hip_quant(online_quant_type)``.
 
@@ -178,4 +180,17 @@ def quant_weight_online(
     if online_quant_dtype == dtypes.fp4x2:
         return quant_mxfp4_online_even(weight)
     quant_func = get_hip_quant(online_quant_type)
+    if online_quant_type == QuantType.per_1x32 and online_quant_dtype == dtypes.fp8:
+        # MXFP8: aiter's per_1x32 fp8 quantizer defaults scale_type=fp32 for
+        # backward compat, but that fp32 scale is NOT what we want here —
+        # Fp8MoEMethod.create_weights allocates an e8m0 (uint8) scale buffer for
+        # per_1x32, and the MXFP8 GEMM / flydsl MoE kernels only consume the
+        # e8m0 byte scale. Force scale_type=fp8_e8m0 so the produced scale
+        # matches the buffer and the kernel; DO NOT drop this argument or the
+        # scale silently reverts to fp32 and loading/inference breaks.
+        return quant_func(
+            weight,
+            quant_dtype=online_quant_dtype,
+            scale_type=dtypes.fp8_e8m0,
+        )
     return quant_func(weight, quant_dtype=online_quant_dtype)
