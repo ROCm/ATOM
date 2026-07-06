@@ -87,7 +87,9 @@ def _sparse_attn_v4_paged_prefill_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    t = tl.program_id(0)
+    # int64 to avoid 32-bit overflow in per-token address offsets
+    # (t * q_stride_t / t * out_stride_t).
+    t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)

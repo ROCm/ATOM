@@ -63,10 +63,10 @@ def _swa_write_kernel(
     cu_seqlens_q_ptr,  # [bs+1] int — per-seq cumulative seqlens
     state_slot_per_seq_ptr,  # [bs] int — state_slot_mapping_gpu_i32
     swa_kv_ptr,  # [num_slots, cache_size, head_dim]
-    swa_kv_slot_stride,  # = cache_size * head_dim
-    swa_kv_pos_stride,  # = head_dim
-    head_dim,
-    cache_size,
+    swa_kv_slot_stride: tl.constexpr,  # = cache_size * head_dim
+    swa_kv_pos_stride: tl.constexpr,  # = head_dim
+    head_dim: tl.constexpr,
+    cache_size: tl.constexpr,
     WRITE_PER_BATCH: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -237,19 +237,19 @@ def swa_write_reference(
 @triton.jit
 def _update_compressor_states_kernel(
     kv_ptr,  # [N, dim] (strided allowed)
-    kv_row_stride,
+    kv_row_stride: tl.constexpr,
     score_ptr,  # [N, dim] (strided allowed)
-    score_row_stride,
+    score_row_stride: tl.constexpr,
     ape_ptr,  # [RATIO, dim]
     write_plan_ptr,  # [num_write, 4] int32 (ragged_id, batch_id, position, _)
     state_slot_mapping_ptr,  # [bs] int32 — per-seq state cache slot
     kv_state_ptr,
-    kv_state_slot_stride,
-    kv_state_pos_stride,
+    kv_state_slot_stride: tl.constexpr,
+    kv_state_pos_stride: tl.constexpr,
     score_state_ptr,
-    score_state_slot_stride,
-    score_state_pos_stride,
-    dim,
+    score_state_slot_stride: tl.constexpr,
+    score_state_pos_stride: tl.constexpr,
+    dim: tl.constexpr,
     STATE_SIZE: tl.constexpr,  # ring buffer modulo = kv_state.shape[1] (≥ K_pool;
     #   V4-Pro spec decode: K_pool + max_spec_steps to keep R's rejected writes
     #   out of R+1's read window; non-spec or pre-spec models: exactly K_pool)
@@ -418,6 +418,11 @@ def update_compressor_states_reference(
     slot_map_cpu = state_slot_mapping.detach().cpu()
     for i in range(plan_cpu.shape[0]):
         ragged_id, batch_id, position, _ = plan_cpu[i].tolist()
+        # Skip sentinel rows (position = -1) exactly like the kernel. Without
+        # this, Python's negative modulo (`-1 % state_size == state_size-1`)
+        # would silently write a garbage row into the ring.
+        if position < 0:
+            continue
         slot = int(slot_map_cpu[batch_id].item())
         dst = position % state_size
         kv_state[slot, dst] = kv[ragged_id]

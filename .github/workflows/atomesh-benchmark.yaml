@@ -31,10 +31,50 @@ on:
         options:
           - smoke
           - nightly
-      model:
-        description: 'Model name from models_atomesh.yaml; empty means all models'
+      run_all_models:
+        description: 'Run all models from models_atomesh.yaml'
         required: false
-        default: ''
+        default: true
+        type: boolean
+      run_deepseek_v4_pro:
+        description: 'Run DeepSeek-V4-Pro'
+        required: false
+        default: false
+        type: boolean
+      run_kimi_k25_mxfp4:
+        description: 'Run Kimi-K2.5-MXFP4'
+        required: false
+        default: false
+        type: boolean
+      run_minimax_m3_mxfp4:
+        description: 'Run MiniMax-M3-MXFP4'
+        required: false
+        default: false
+        type: boolean
+      run_minimax_m3_mxfp8:
+        description: 'Run MiniMax-M3-MXFP8'
+        required: false
+        default: false
+        type: boolean
+      deepseek_v4_pro_model_path:
+        description: 'Model path for DeepSeek-V4-Pro'
+        required: false
+        default: /mnt/models/DeepSeek-V4-Pro/
+        type: string
+      kimi_k25_mxfp4_model_path:
+        description: 'Model path for Kimi-K2.5-MXFP4'
+        required: false
+        default: /mnt/models/Kimi-K2.5-MXFP4/
+        type: string
+      minimax_m3_mxfp4_model_path:
+        description: 'Model path for MiniMax-M3-MXFP4'
+        required: false
+        default: /mnt/models/MiniMax-M3-MXFP4
+        type: string
+      minimax_m3_mxfp8_model_path:
+        description: 'Model path for MiniMax-M3-MXFP8'
+        required: false
+        default: /mnt/models/MiniMax-M3-MXFP8
         type: string
       atomesh_image:
         description: 'Override ATOM docker image'
@@ -70,6 +110,16 @@ on:
         description: 'Comma-separated ATOMesh 2P1D nodes'
         required: false
         default: mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
+        type: string
+      benchmark_concurrency:
+        description: 'Optional benchmark concurrency override, e.g. 1,2,4 (no quotes)'
+        required: false
+        default: ''
+        type: string
+      eval_concurrency:
+        description: 'Optional lm_eval concurrency override, e.g. 64 or 32,64 (no quotes)'
+        required: false
+        default: ''
         type: string
       run_model_benchmark:
         description: 'Run model Slurm benchmark for workflow_dispatch'
@@ -112,14 +162,40 @@ jobs:
         id: matrix
         env:
           SUITE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
-          MODEL_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.model || '' }}
+          RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
+          RUN_DEEPSEEK_V4_PRO: ${{ github.event_name == 'workflow_dispatch' && inputs.run_deepseek_v4_pro || false }}
+          RUN_KIMI_K25_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.run_kimi_k25_mxfp4 || false }}
+          RUN_MINIMAX_M3_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.run_minimax_m3_mxfp4 || false }}
+          RUN_MINIMAX_M3_MXFP8: ${{ github.event_name == 'workflow_dispatch' && inputs.run_minimax_m3_mxfp8 || false }}
+          ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO: ${{ github.event_name == 'workflow_dispatch' && inputs.deepseek_v4_pro_model_path || '' }}
+          ATOMESH_MODEL_PATH_KIMI_K2_5_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.kimi_k25_mxfp4_model_path || '' }}
+          ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.minimax_m3_mxfp4_model_path || '' }}
+          ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8: ${{ github.event_name == 'workflow_dispatch' && inputs.minimax_m3_mxfp8_model_path || '' }}
           ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+          ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
+          ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
         run: |
           set -euo pipefail
+          MODEL_NAME=""
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${RUN_ALL_MODELS}" != "true" ]]; then
+            selected_models=()
+            [[ "${RUN_DEEPSEEK_V4_PRO}" == "true" ]] && selected_models+=("DeepSeek-V4-Pro")
+            [[ "${RUN_KIMI_K25_MXFP4}" == "true" ]] && selected_models+=("Kimi-K2.5-MXFP4")
+            [[ "${RUN_MINIMAX_M3_MXFP4}" == "true" ]] && selected_models+=("MiniMax-M3-MXFP4")
+            [[ "${RUN_MINIMAX_M3_MXFP8}" == "true" ]] && selected_models+=("MiniMax-M3-MXFP8")
+            if [[ "${#selected_models[@]}" -eq 0 ]]; then
+              echo "::error::Select run_all_models or at least one model checkbox."
+              exit 1
+            fi
+            MODEL_NAME="$(IFS=,; echo "${selected_models[*]}")"
+          fi
+
           python3 .github/scripts/atomesh/pd_matrix.py \
             --suite "$SUITE" \
             ${MODEL_NAME:+--model "$MODEL_NAME"} \
             ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+            ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
+            ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
             --output atomesh-matrix.json \
             --github-output
           cat atomesh-matrix.json
