@@ -187,3 +187,23 @@ python -m atom.entrypoints.openai_server \
   --no-enable_prefix_caching \
   -tp $TP 2>&1 | tee server.log &
 ```
+
+### GLM-5.2 MXFP4 MTP Server
+```bash
+#!/bin/bash
+
+model_path=/shared/data/amd_int/models/GLM-5.2-MXFP4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+TP=4
+
+rm -rf /root/.cache/atom/*
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8004 \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  --num-speculative-tokens 3 \
+  --method mtp \
+  -tp $TP 2>&1 | tee server_mtp.log
+```
