@@ -567,6 +567,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         """
         model = self.model
         chain = self._inner_model_chain(model)
+        inner = chain[1] if len(chain) > 1 else None
         is_draft = self.is_spec_draft_model
         put = setattr if is_draft else object.__setattr__
 
@@ -576,12 +577,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     return node
             return None
 
-        # ATOM DeepSeek-V4 names these shared modules `embed` / `head`, while
-        # vLLM's generic MTP proposer expects `embedding` / `lm_head`.
-        if not hasattr(model, "embedding") and hasattr(inner, "embed"):
-            model.embedding = inner.embed
-        if not hasattr(model, "lm_head") and hasattr(inner, "head"):
-            model.lm_head = inner.head
+        # ATOM DeepSeek-V4 names these shared modules `embed` / `head` on its
+        # immediate backbone child, while vLLM's generic MTP proposer expects
+        # `embedding` / `lm_head` on the outer model.
+        if inner is not None:
+            if not hasattr(model, "embedding") and hasattr(inner, "embed"):
+                put(model, "embedding", inner.embed)
+            if not hasattr(model, "lm_head") and hasattr(inner, "head"):
+                put(model, "lm_head", inner.head)
 
         # (1) Mirror backbone attrs onto the outer model, and the head onto self.
         for attr in (*self._WEIGHT_SHARED_ATTRS, "layers"):
@@ -600,7 +603,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         #     subclass only once, and only when there is an inner level to sync.
         if not is_draft:
             return
-        inner = chain[1] if len(chain) > 1 else None
         if inner is None:
             return
         if getattr(model, "_atom_vllm_shared_attr_sync_patched", False):
