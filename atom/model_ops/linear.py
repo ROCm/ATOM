@@ -201,10 +201,14 @@ def gemm_a4w4_quant(
             device=x.device,
         )
         if x_scale is None:
-            x, x_scale = quant_mxfp4_act_preshuffle(x, params_dtype, m)
+            # quant with no shuffle, then shuffle
+            x, x_scale = quant_mxfp4_act_preshuffle(
+                x, params_dtype, m, MXFP4_QUANT_BLOCK_SIZE
+            )
         else:
+            # collapse in arch-aware layout
             x_scale = collapse_mxfp4_gemm_scale(
-                x_scale.view(torch.float8_e8m0fnu), rows_valid=m
+                x_scale.view(torch.float8_e8m0fnu), MXFP4_QUANT_BLOCK_SIZE, rows_valid=m
             )
             x = x.view(torch.float4_e2m1fn_x2)
 
@@ -212,7 +216,7 @@ def gemm_a4w4_quant(
             x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
-            collapse_mxfp4_gemm_scale(weight_scale),
+            collapse_mxfp4_gemm_scale(weight_scale, MXFP4_QUANT_BLOCK_SIZE),
             y=y,
         )
     # Default AITER path: quantize/shuffle into the layout expected by gemm_a4w4
