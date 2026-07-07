@@ -1124,9 +1124,10 @@ def _fp8_mqa_topk_prefill_chunked(
     cu_seqlen_ke: torch.Tensor,
     topk_tokens: int,
     chunk_tokens: int,
-) -> torch.Tensor:
+    out: torch.Tensor,
+) -> None:
     """Compute the sparse-indexer prefill top-k without materializing the full
-    ``[prefill_tokens, total_kv]`` logits buffer.
+    ``[prefill_tokens, total_kv]`` logits buffer, writing indices into ``out``.
 
     The indexer is block-diagonal per request (query row ``i`` is only valid
     within ``[cu_seqlen_ks[i], cu_seqlen_ke[i])``), yet ``fp8_mqa_logits``
@@ -1138,6 +1139,10 @@ def _fp8_mqa_topk_prefill_chunked(
     ``[rows, chunk_tokens]``. Selection stays exact: each ``logit(i, j)`` is an
     independent ``q_i·k_j`` dot, so chunking KV and merging by value yields the
     same global top-k.
+
+    ``out`` (shape ``[num_rows, topk_tokens]``, int32) is used directly as the
+    running index accumulator, so the final result lands there in place — no
+    extra allocation or copy back in the caller.
     """
     num_rows = q_fp8.shape[0]
     total_kv = k_fp8.shape[0]
@@ -1145,9 +1150,9 @@ def _fp8_mqa_topk_prefill_chunked(
     best_values = torch.full(
         (num_rows, topk_tokens), -float("inf"), dtype=torch.float32, device=device
     )
-    best_indices = torch.full(
-        (num_rows, topk_tokens), -1, dtype=torch.int32, device=device
-    )
+    # Use the caller's output buffer as the running index accumulator.
+    best_indices = out
+    best_indices.fill_(-1)
 
     for chunk_start in range(0, total_kv, chunk_tokens):
         chunk_end = min(chunk_start + chunk_tokens, total_kv)
@@ -1196,12 +1201,12 @@ def _fp8_mqa_topk_prefill_chunked(
             chunk_indices < 0, chunk_indices, chunk_indices + chunk_start
         )
 
+        # merged_indices is a fresh cat (separate storage from best_indices), so
+        # gathering back into best_indices=out is alias-safe.
         merged_values = torch.cat((best_values, chunk_values), dim=1)
         merged_indices = torch.cat((best_indices, chunk_indices), dim=1)
         best_values, merge_positions = torch.topk(merged_values, k=topk_tokens, dim=1)
-        best_indices = torch.gather(merged_indices, 1, merge_positions)
-
-    return best_indices
+        torch.gather(merged_indices, 1, merge_positions, out=best_indices)
 
 
 def sparse_attn_indexer(
@@ -1333,17 +1338,16 @@ def sparse_attn_indexer(
         # exceeds the budget; short contexts keep the single-shot fast path.
         chunk_tokens = SPARSE_INDEXER_CHUNK_TOKENS
         if chunk_tokens > 0 and total_kv > chunk_tokens:
-            topk_indices_prefill.copy_(
-                _fp8_mqa_topk_prefill_chunked(
-                    q_fp8=q_prefill,
-                    k_fp8=k_fp8,
-                    k_scale=k_scale,
-                    weights=weights_prefill,
-                    cu_seqlen_ks=cu_seqlen_ks,
-                    cu_seqlen_ke=cu_seqlen_ke,
-                    topk_tokens=topk_tokens,
-                    chunk_tokens=chunk_tokens,
-                )
+            _fp8_mqa_topk_prefill_chunked(
+                q_fp8=q_prefill,
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                weights=weights_prefill,
+                cu_seqlen_ks=cu_seqlen_ks,
+                cu_seqlen_ke=cu_seqlen_ke,
+                topk_tokens=topk_tokens,
+                chunk_tokens=chunk_tokens,
+                out=topk_indices_prefill,
             )
         else:
             logits = fp8_mqa_logits(
