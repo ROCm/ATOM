@@ -1907,6 +1907,9 @@ class DeepseekV4Attention(nn.Module):
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
+                # Reuse q_sa as the attention output buffer; q_sa is not needed
+                # after this call and this avoids an extra empty_like allocation.
+                out=q_sa,
             )  # [S, H, head_dim]
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see
             # prior-chunk's ring contents (current swa_write would overwrite
