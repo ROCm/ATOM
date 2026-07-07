@@ -1252,7 +1252,11 @@ def sparse_attn_indexer(
         # budget is disabled (0) or a single chunk fits, the loop runs exactly
         # once and matches the original single-shot behavior.
         budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if budget_bytes > 0 and total_kv > 0 and budget_bytes // (total_kv * 4) < num_rows:
+        if (
+            budget_bytes > 0
+            and total_kv > 0
+            and budget_bytes // (total_kv * 4) < num_rows
+        ):
             # 4 bytes per fp32 logit; total_kv * 4 is one query row's footprint.
             # Round the budget-derived row count DOWN to keep the buffer within
             # budget: a multiple of 128 (aligned to the kernel's row tiling) in
