@@ -194,8 +194,6 @@ Reference numbers on 8×MI355X (TP8, FP8 weights, bf16 KV cache), using the benc
 | 8192 | 1024 | 1   | 73   | 669   | 409 | 13.2 |
 | 8192 | 1024 | 16  | 645  | 5818  | 418 | 23.3 |
 | 8192 | 1024 | 64  | 1210 | 10853 | 483 | 51.3 |
-<<<<<<< HEAD
-=======
 
 ## GLM-5.2 FP8 and MXFP4 Server Recipes
 
@@ -269,6 +267,6 @@ python -m atom.entrypoints.openai_server \
   --no-enable_prefix_caching \
   --num-speculative-tokens 3 \
   --method mtp \
+  --online_quant_config '{"layer_quant_config": {"*layers.78*": "ptpc_fp8"}, "exclude_layer": ["*.gate", "*shared_head*", "*embed*"]}' \
   -tp $TP 2>&1 | tee server_mtp.log
 ```
->>>>>>> 7986b0aa (add mtp recipe)
