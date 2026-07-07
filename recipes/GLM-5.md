@@ -156,6 +156,7 @@ pip install -e .
 
 model_path=/shared/data/amd_int/models/GLM-5.2-FP8
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=4
 
 rm -rf /root/.cache/atom/*
@@ -176,6 +177,7 @@ python -m atom.entrypoints.openai_server \
 
 model_path=/shared/data/amd_int/models/GLM-5.2-MXFP4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=4
 
 rm -rf /root/.cache/atom/*
@@ -195,6 +197,7 @@ python -m atom.entrypoints.openai_server \
 
 model_path=/shared/data/amd_int/models/GLM-5.2-MXFP4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=4
 
 rm -rf /root/.cache/atom/*
