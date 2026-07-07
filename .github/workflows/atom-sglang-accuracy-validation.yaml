@@ -9,121 +9,36 @@ on:
     # from") as the ATOM branch selector, so users do not need to type branch
     # names.
     inputs:
-      run_dsv4_prefix_cache_tp8:
-        description: "DeepSeek-V4-Pro Prefix Cache TP8"
+      model_mi355:
+        description: "Manual MI355 accuracy model selection"
         required: false
-        type: boolean
-        default: false
-      run_dsv32_fp8_tp4:
-        description: "DeepSeek-V3.2-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_dsv32_fp8_tp4_dp4_ep4:
-        description: "DeepSeek-V3.2-FP8 TP4 DP4 EP4"
-        required: false
-        type: boolean
-        default: false
-      run_dsv32_fp8_tp8:
-        description: "DeepSeek-V3.2-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsv32_fp8_tp8_dp8_ep8:
-        description: "DeepSeek-V3.2-FP8 TP8 DP8 EP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp8_tp4_online_quant:
-        description: "DeepSeek-R1-FP8 TP4 Online Quant"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k26_mxfp4_tp4:
-        description: "Kimi-K2.6-MXFP4 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k26_mxfp4_tp8:
-        description: "Kimi-K2.6-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_minimax_m3_mxfp4_tp4:
-        description: "MiniMax-M3-MXFP4 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_35b_a3b_fp8_tp2:
-        description: "Qwen3.5-35B-A3B-FP8 TP2"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_35b_a3b_tp2:
-        description: "Qwen3.5-35B-A3B TP2"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_a17b_fp8_tp4:
-        description: "Qwen3.5-397B-A17B-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_a17b_fp8_tp8:
-        description: "Qwen3.5-397B-A17B-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp8_tp4:
-        description: "DeepSeek-R1-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp8_tp8:
-        description: "DeepSeek-R1-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp4:
-        description: "DeepSeek-R1-FP4 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp4_dp4_ep4:
-        description: "DeepSeek-R1-FP4 TP4 DP4 EP4"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp8_dp8_ep8:
-        description: "DeepSeek-R1-FP4 TP8 DP8 EP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp8:
-        description: "DeepSeek-R1-FP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp8_mtp3:
-        description: "DeepSeek-R1-FP4 TP8 MTP3"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp8_mtp1:
-        description: "DeepSeek-R1-FP4 TP8 MTP1"
-        required: false
-        type: boolean
-        default: false
-      run_glm51_fp8_tp8:
-        description: "GLM-5.1-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_mi355_all:
-        description: "Run all MI355 accuracy cases"
-        required: false
-        type: boolean
-        default: false
+        type: choice
+        default: none
+        options:
+          - none
+          - all
+          - DeepSeek-V4-Pro Prefix Cache TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP4 DP4 EP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 TP8 DP8 EP8
+          - DeepSeek-R1-FP8 TP4 Online Quant
+          - Kimi-K2.6-MXFP4 TP4
+          - Kimi-K2.6-MXFP4 TP8
+          - MiniMax-M3-MXFP4 TP4
+          - Qwen3.5-35B-A3B-FP8 TP2
+          - Qwen3.5-35B-A3B TP2
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - DeepSeek-R1-FP8 TP4
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP4 TP4
+          - DeepSeek-R1-FP4 TP4 DP4 EP4
+          - DeepSeek-R1-FP4 TP8 DP8 EP8
+          - DeepSeek-R1-FP4 TP8
+          - DeepSeek-R1-FP4 TP8 MTP3
+          - DeepSeek-R1-FP4 TP8 MTP1
+          - GLM-5.1-FP8 TP8
       model_mi308:
         description: "Manual MI308 accuracy model selection"
         required: false
@@ -192,43 +107,21 @@ jobs:
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-          RUN_DSV4_PREFIX_CACHE_TP8: ${{ inputs.run_dsv4_prefix_cache_tp8 }}
-          RUN_DSR1_FP8_TP4: ${{ inputs.run_dsr1_fp8_tp4 }}
-          RUN_DSV32_FP8_TP4: ${{ inputs.run_dsv32_fp8_tp4 }}
-          RUN_DSV32_FP8_TP4_DP4_EP4: ${{ inputs.run_dsv32_fp8_tp4_dp4_ep4 }}
-          RUN_DSV32_FP8_TP8_DP8_EP8: ${{ inputs.run_dsv32_fp8_tp8_dp8_ep8 }}
-          RUN_DSR1_FP8_TP4_ONLINE_QUANT: ${{ inputs.run_dsr1_fp8_tp4_online_quant }}
-          RUN_KIMI_K26_MXFP4_TP4: ${{ inputs.run_kimi_k26_mxfp4_tp4 }}
-          RUN_KIMI_K26_MXFP4_TP8: ${{ inputs.run_kimi_k26_mxfp4_tp8 }}
-          RUN_MINIMAX_M3_MXFP4_TP4: ${{ inputs.run_minimax_m3_mxfp4_tp4 }}
-          RUN_QWEN35_35B_A3B_FP8_TP2: ${{ inputs.run_qwen35_35b_a3b_fp8_tp2 }}
-          RUN_QWEN35_35B_A3B_TP2: ${{ inputs.run_qwen35_35b_a3b_tp2 }}
-          RUN_QWEN35_397B_A17B_FP8_TP4: ${{ inputs.run_qwen35_397b_a17b_fp8_tp4 }}
-          RUN_QWEN35_397B_A17B_FP8_TP8: ${{ inputs.run_qwen35_397b_a17b_fp8_tp8 }}
-          RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
-          RUN_DSR1_FP4_TP4: ${{ inputs.run_dsr1_fp4_tp4 }}
-          RUN_DSR1_FP4_TP4_DP4_EP4: ${{ inputs.run_dsr1_fp4_tp4_dp4_ep4 }}
-          RUN_DSR1_FP4_TP8_DP8_EP8: ${{ inputs.run_dsr1_fp4_tp8_dp8_ep8 }}
-          RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
-          RUN_DSR1_FP4_TP8_MTP3: ${{ inputs.run_dsr1_fp4_tp8_mtp3 }}
-          RUN_DSR1_FP4_TP8_MTP1: ${{ inputs.run_dsr1_fp4_tp8_mtp1 }}
-          RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
-          RUN_GLM51_FP8_TP8: ${{ inputs.run_glm51_fp8_tp8 }}
-          RUN_MI355_ALL: ${{ inputs.run_mi355_all }}
+          MODEL_MI355: ${{ inputs.model_mi355 || 'none' }}
           MODEL_MI308: ${{ inputs.model_mi308 || 'none' }}
           REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
         run: |
           set -euo pipefail
 
           # Keep this Python model list as the single source of truth for SGLANG
-          # full-validation coverage and manual checkbox filtering.
+          # full-validation coverage and manual dropdown filtering.
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
           import sys
 
           event = os.environ["GITHUB_EVENT_NAME"]
-          run_mi355_all = os.environ.get("RUN_MI355_ALL", "").lower() == "true"
+          model_mi355 = os.environ.get("MODEL_MI355", "none")
           model_mi308 = os.environ.get("MODEL_MI308", "none")
           models = [
               {
@@ -540,7 +433,11 @@ jobs:
                       or model["model_name"] == model_mi308
                   )
               else:
-                  enabled = event != "workflow_dispatch" or run_mi355_all or os.environ.get(toggle, "").lower() == "true"
+                  enabled = (
+                      event != "workflow_dispatch"
+                      or model_mi355 == "all"
+                      or model["model_name"] == model_mi355
+                  )
               if enabled:
                   selected.append({k: v for k, v in model.items() if k != "toggle_env"})
 
