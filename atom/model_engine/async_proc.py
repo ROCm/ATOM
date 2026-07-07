@@ -32,6 +32,7 @@ from atom.utils import (
     init_exit_handler,
     make_zmq_socket,
     resolve_obj_by_qualname,
+    set_process_title,
     shutdown_all_processes,
 )
 from atom.utils.numa_utils import numa_bind_to_node
@@ -86,6 +87,16 @@ class AsyncIOProc:
         except Exception as e:
             logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
+        # Set process title so this GPU worker is distinguishable by rank in
+        # ps/top/rocm-smi (otherwise all workers show as "python").
+        try:
+            cfg = args[0]
+            if cfg.parallel_config.data_parallel_size > 1:
+                set_process_title(f"DP{cfg.parallel_config.data_parallel_rank}TP{rank}")
+            else:
+                set_process_title(f"TP{rank}")
+        except Exception:
+            set_process_title(f"TP{rank}")
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads: list[threading.Thread] = []
