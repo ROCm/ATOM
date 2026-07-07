@@ -81,6 +81,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -1938,13 +1939,23 @@ class DeepseekV2MLAAttention(nn.Module):
         # qkv_a_proj + reduce + RMSNorm + quant fusion remains gated by
         # use_triton_gemm() in forward(), because that path depends on Triton GEMM.
         self.prefix = prefix
-        self.quant_dtype = layer_quant_dtype
-        self.qknorm_quant_type = layer_quant_type_value
+        # Online-aware scheme for the fused q/kv norm+quant feeding q_b_proj:
+        # use the online target (applied after __init__), else the static config.
+        # layer_quant_dtype/type stay static for the fp4x2 weight-loading branch.
+        eff_dtype, eff_type = layer_quant_dtype, layer_quant_type
+        if quant_config is not None and quant_config.online_quant:
+            online_cfg = quant_config.get_layer_quant_config(
+                f"{prefix}.{q_a_proj_name}", use_online_quant=True
+            )
+            if not should_skip_online_quant(eff_type, eff_dtype, online_cfg):
+                eff_dtype, eff_type = online_cfg.quant_dtype, online_cfg.quant_type
+        self.quant_dtype = eff_dtype
+        self.qknorm_quant_type = None if eff_type is None else eff_type.value
         self.fuse_qknorm_quant = False
         # always fuse qknorm
         self.fuse_qknorm = ENABLE_DS_QKNORM_FUSION
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if layer_quant_dtype in (dtypes.fp8, dtypes.fp4x2):
+            if eff_dtype in (dtypes.fp8, dtypes.fp4x2):
                 self.fuse_qknorm_quant = True
 
     def forward(
@@ -2159,14 +2170,30 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
         # Fuse activation quant into AR+RMSNorm when fused_qkv_a_proj is
-        # per-1x128/per-token FP8, so the kernel emits the (fp8, scale) that GEMM
-        # consumes directly. Independent of the non-AR fuse_input_norm_quant path
-        # (mutually exclusive: that path forces fuse_ar_input_norm off).
+        # per-1x128/per-token FP8, so the GEMM consumes the (fp8, scale) directly.
+        # Use the online-quant target (get_layer_quant_config(..., online)), not
+        # the static params_dtype: online quant flips the qkv proj to fp8 only in
+        # process_weights_after_loading, which runs after this __init__.
         qkv_proj = getattr(self.self_attn, "fused_qkv_a_proj", None)
+        eff_quant_type = None if qkv_proj is None else qkv_proj.quant_type
+        eff_quant_dtype = None if qkv_proj is None else qkv_proj.params_dtype
+        if (
+            qkv_proj is not None
+            and quant_config is not None
+            and quant_config.online_quant
+        ):
+            online_cfg = quant_config.get_layer_quant_config(
+                qkv_proj.prefix, use_online_quant=True
+            )
+            if not should_skip_online_quant(
+                eff_quant_type, eff_quant_dtype, online_cfg
+            ):
+                eff_quant_type = online_cfg.quant_type
+                eff_quant_dtype = online_cfg.quant_dtype
         input_norm_fused_quant = (
             qkv_proj is not None
-            and qkv_proj.params_dtype == dtypes.fp8
-            and qkv_proj.quant_type.value
+            and eff_quant_dtype == dtypes.fp8
+            and eff_quant_type.value
             in (QuantType.per_1x128.value, QuantType.per_Token.value)
         )
         fused_allreduce = (
