@@ -121,6 +121,9 @@ class ChatCompletionRequest(BaseModel):
     n: Optional[int] = 1
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: Optional[Dict[str, Any]] = None
+    # DP-attention rank injected by a cache-aware router (Atomesh dp-aware
+    # mode). None => engine round-robins across DP ranks.
+    data_parallel_rank: Optional[int] = None
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""
@@ -158,6 +161,9 @@ class CompletionRequest(BaseModel):
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: Optional[Dict[str, Any]] = None
     n: Optional[int] = 1
+    # DP-attention rank injected by a cache-aware router (Atomesh dp-aware
+    # mode). None => engine round-robins across DP ranks.
+    data_parallel_rank: Optional[int] = None
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""

@@ -57,6 +57,7 @@ class EngineRequest:
     effective_n: int
     future: concurrent.futures.Future[list[dict[str, Any]]]
     kv_transfer_params: dict[str, Any] | None = None
+    data_parallel_rank: int | None = None
 
 
 @dataclasses.dataclass
@@ -67,6 +68,7 @@ class EngineStreamRequest:
     effective_n: int
     stream_queue: queue.Queue[dict[str, Any]]
     kv_transfer_params: dict[str, Any] | None = None
+    data_parallel_rank: int | None = None
 
 
 class AtomEngineService:
@@ -95,6 +97,7 @@ class AtomEngineService:
         request_id: str,
         effective_n: int,
         kv_transfer_params: dict[str, Any] | None = None,
+        data_parallel_rank: int | None = None,
     ) -> list[dict[str, Any]]:
         if self._closed.is_set():
             raise RuntimeError("ATOM standalone engine service is closed")
@@ -113,6 +116,7 @@ class AtomEngineService:
                 effective_n=effective_n,
                 future=future,
                 kv_transfer_params=kv_transfer_params,
+                data_parallel_rank=data_parallel_rank,
             )
         )
         try:
@@ -184,6 +188,7 @@ class AtomEngineService:
         request_id: str,
         effective_n: int,
         kv_transfer_params: dict[str, Any] | None = None,
+        data_parallel_rank: int | None = None,
     ) -> queue.Queue[dict[str, Any]]:
         if self._closed.is_set():
             raise RuntimeError("ATOM standalone engine service is closed")
@@ -197,6 +202,7 @@ class AtomEngineService:
                 effective_n=effective_n,
                 stream_queue=stream_queue,
                 kv_transfer_params=kv_transfer_params,
+                data_parallel_rank=data_parallel_rank,
             )
         )
         return stream_queue
@@ -224,6 +230,7 @@ class AtomEngineService:
             request.sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=request.kv_transfer_params,
+            data_parallel_rank=request.data_parallel_rank,
         )
 
     def _preprocess_fanout_stream_request(
@@ -250,6 +257,7 @@ class AtomEngineService:
             ],
             kv_transfer_params=request.kv_transfer_params,
             parent_request_id=request.request_id,
+            data_parallel_rank=request.data_parallel_rank,
         )
 
     def _preprocess_single_request(self, request: EngineRequest) -> Any:
@@ -267,6 +275,7 @@ class AtomEngineService:
             request.sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=request.kv_transfer_params,
+            data_parallel_rank=request.data_parallel_rank,
         )
         state.set_num_tokens_input(seq.num_prompt_tokens)
         return seq
@@ -293,6 +302,7 @@ class AtomEngineService:
             ],
             kv_transfer_params=request.kv_transfer_params,
             parent_request_id=request.request_id,
+            data_parallel_rank=request.data_parallel_rank,
         )
         if seqs:
             state.set_num_tokens_input(seqs[0].num_prompt_tokens)
@@ -914,10 +924,15 @@ class AtomStandaloneService:
                 request_data.get("temperature", DEFAULT_TEMPERATURE),
             )
             sampling_params = self._build_sampling_params(request_data, effective_n)
+            data_parallel_rank = self._get_data_parallel_rank(request_data)
             request_id = f"chatcmpl-{uuid.uuid4().hex}"
             if effective_n > 1:
                 outputs = self.engine_service.generate(
-                    prompt, sampling_params, request_id, effective_n
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    effective_n,
+                    data_parallel_rank=data_parallel_rank,
                 )
                 if not outputs:
                     raise RuntimeError("No output generated")
@@ -926,7 +941,11 @@ class AtomStandaloneService:
                 )
             else:
                 outputs = self.engine_service.generate(
-                    prompt, sampling_params, request_id, effective_n
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    effective_n,
+                    data_parallel_rank=data_parallel_rank,
                 )
                 if not outputs:
                     raise RuntimeError("No output generated")
@@ -967,6 +986,7 @@ class AtomStandaloneService:
                 request_id,
                 effective_n,
                 kv_transfer_params=request_data.get("kv_transfer_params"),
+                data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -1007,6 +1027,7 @@ class AtomStandaloneService:
                 request_id,
                 effective_n,
                 kv_transfer_params=request_data.get("kv_transfer_params"),
+                data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             stream_state = CompletionStreamState(
                 request_id=request_id,
@@ -1089,6 +1110,7 @@ class AtomStandaloneService:
                 sampling_params,
                 request_id,
                 effective_n,
+                data_parallel_rank=self._get_data_parallel_rank(request_data),
             )
             stream_state = ChatCompletionStreamState(
                 request_id=request_id,
@@ -1158,6 +1180,22 @@ class AtomStandaloneService:
         ):
             normalized["max_tokens"] = normalized["max_completion_tokens"]
         return normalized
+
+    @staticmethod
+    def _get_data_parallel_rank(request_data: dict[str, Any]) -> int | None:
+        """Extract the DP-attention rank injected by a cache-aware router.
+
+        Atomesh's dp-aware router adds a top-level ``data_parallel_rank`` field
+        to the request body. Returns None when absent so the engine falls back
+        to round-robin. Range is validated downstream in add_request.
+        """
+        raw = request_data.get("data_parallel_rank")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"data_parallel_rank must be an integer, got {raw!r}")
 
     def _validate_model_name(self, request_model: str | None) -> None:
         if (

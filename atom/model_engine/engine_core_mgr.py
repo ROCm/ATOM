@@ -397,12 +397,25 @@ class CoreManager:
                 copy=False,
             )
         else:
-            # DP ranks, round-robin with counter for load balancing for atom server
+            # DP ranks. A seq with an explicit target_dp_rank (set by an
+            # external cache-aware router) is dispatched to that rank so it
+            # lands on the DP rank holding its prefix cache. Seqs without a
+            # target fall back to round-robin load balancing.
             dp_seqs = [[] for _ in range(self.local_engine_count)]
             for seq in seqs:
-                dp_rank = self._rr_counter % self.local_engine_count
+                target = seq.target_dp_rank
+                if target is not None and 0 <= target < self.local_engine_count:
+                    dp_rank = target
+                else:
+                    if target is not None:
+                        logger.warning(
+                            f"{self.label}: seq {seq.id} target_dp_rank {target} "
+                            f"out of range [0, {self.local_engine_count}); "
+                            f"falling back to round-robin"
+                        )
+                    dp_rank = self._rr_counter % self.local_engine_count
+                    self._rr_counter += 1
                 dp_seqs[dp_rank].append(seq)
-                self._rr_counter += 1
 
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if rank_seqs:

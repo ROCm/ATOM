@@ -51,6 +51,7 @@ class Sequence:
         multimodal_data: Optional[dict] = None,
         mrope_positions: Optional[np.ndarray] = None,
         mrope_position_delta: int = 0,
+        target_dp_rank: Optional[int] = None,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -133,6 +134,11 @@ class Sequence:
         # to safe values for single-sample requests.
         self.parent_request_id = parent_request_id
         self.sibling_index = sibling_index
+        # Explicit DP-attention rank requested by an external cache-aware
+        # router (Atomesh injects `data_parallel_rank` into the request body).
+        # None means the engine picks a rank via round-robin. See
+        # EngineCoreManager.add_request.
+        self.target_dp_rank = target_dp_rank
 
     def __len__(self):
         return self._num_tokens
