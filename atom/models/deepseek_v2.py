@@ -1861,7 +1861,9 @@ class DeepseekV2MLAAttention(nn.Module):
                 max_position=max_position_embeddings,
                 base=rope_theta,
                 rope_scaling=rope_scaling,
-                is_neox_style=True,
+                is_neox_style=_is_neox_rope_style(
+                    config, "indexer_rope_interleave", True
+                ),
             )
             if _indexer_weights_shared(config, prefix):
                 # GLM-5.2 IndexShare: reuses prior "full" layer's indexer; the
