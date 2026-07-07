@@ -131,7 +131,7 @@ python -m atom.benchmarks.benchmark_serving \
 ```
 
 Reference MXFP4 results from the validated run on 4xMI355 GPUs:
-
+      
 | CONC | Requests | Duration (s) | Mean TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | P99 TPOT (ms) | Output tok/s | Total tok/s |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 4 | 40 | 73.27 | 260.77 | 791.33 | 7.50 | 8.33 | 502.35 | 4515.86 |
