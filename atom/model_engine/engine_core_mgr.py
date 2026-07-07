@@ -12,6 +12,7 @@ from typing import List
 
 import zmq
 import zmq.asyncio
+
 from atom.config import Config
 from atom.model_engine.engine_core import EngineCore, EngineCoreRequestType
 from atom.model_engine.sequence import Sequence

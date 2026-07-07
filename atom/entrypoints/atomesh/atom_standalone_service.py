@@ -24,14 +24,14 @@ from atom.entrypoints.openai.chat_encoders import (
     load_custom_message_encoder,
 )
 from atom.entrypoints.openai.protocol import (
+    CHAT_COMPLETION_CHUNK_OBJECT,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
-    CHAT_COMPLETION_CHUNK_OBJECT,
-    CompletionRequest,
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
+    CompletionRequest,
 )
 from atom.entrypoints.openai.reasoning import ReasoningFilter
 from atom.entrypoints.openai.serving_chat import (
@@ -1183,11 +1183,10 @@ class AtomStandaloneService:
 
     @staticmethod
     def _get_data_parallel_rank(request_data: dict[str, Any]) -> int | None:
-        """Extract the DP-attention rank injected by a cache-aware router.
+        """Extract the DP-attention rank, if available.
 
-        Atomesh's dp-aware router adds a top-level ``data_parallel_rank`` field
-        to the request body. Returns None when absent so the engine falls back
-        to round-robin. Range is validated downstream in add_request.
+        Routers can inject a ``data_parallel_rank`` field into the request body to
+        indicate which DP rank to route to. Falls back to round-robin if not available.
         """
         raw = request_data.get("data_parallel_rank")
         if raw is None:

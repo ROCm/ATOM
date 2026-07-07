@@ -7,6 +7,7 @@ from itertools import count
 from typing import Any, Callable, Optional
 
 import numpy as np
+
 from atom.sampling_params import SamplingParams
 
 
@@ -134,10 +135,7 @@ class Sequence:
         # to safe values for single-sample requests.
         self.parent_request_id = parent_request_id
         self.sibling_index = sibling_index
-        # Explicit DP-attention rank requested by an external cache-aware
-        # router (Atomesh injects `data_parallel_rank` into the request body).
-        # None means the engine picks a rank via round-robin. See
-        # EngineCoreManager.add_request.
+        # Explicitly requested DP rank, e.g. for cache aware DP routing
         self.target_dp_rank = target_dp_rank
 
     def __len__(self):
