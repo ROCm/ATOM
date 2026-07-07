@@ -443,6 +443,7 @@ if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
 #SBATCH --job-name=${ATOMESH_CELL_ID}
 #SBATCH --nodes=${NUM_NODES}
 #SBATCH --ntasks-per-node=1
+#SBATCH --exclusive
 #SBATCH --time=${SLURM_TIME_LIMIT}
 #SBATCH --chdir=/tmp
 EOF
