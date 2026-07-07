@@ -198,30 +198,51 @@ def gemm_a4w4_quant(
             dtype=otype,
             device=x.device,
         )
+        # Scale preshuffle factor per arch: 32 on gfx950, 16 on gfx1250 (WMMA
+        # tiles both M and N in 16-lane groups). Applies to BOTH the activation
+        # (M-axis) and weight (N-axis) e8m0 scales.
+        _arch = arch_info.get_arch()
+        _scale_pf = 16 if _arch == "gfx1250" else MXFP4_QUANT_BLOCK_SIZE
+
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
-            x, x_scale = quant_func(
-                x,
-                quant_dtype=params_dtype,
-                shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
-            )
+            if _arch == "gfx1250" and m >= MXFP4_QUANT_BLOCK_SIZE:
+                # get_hip_quant's built-in scale shuffle is gfx950-pinned
+                # (per_1x32_mx_quant_hip pads to (256, 8) -> the 32/8 tile,
+                # no arch branch). On gfx1250 quantize WITHOUT that shuffle and
+                # apply the arch-aware e8m0 tile (16/4) in-line, mirroring the
+                # weight-scale path so the activation scale matches the gfx1250
+                # GEMM instead of arriving in the gfx950 layout.
+                x, x_scale = quant_func(
+                    x, quant_dtype=params_dtype, shuffle=False
+                )
+                x_scale = shuffle_scale_gemm_e8m0(x_scale.view(torch.uint8), arch=_arch)
+            else:
+                x, x_scale = quant_func(
+                    x,
+                    quant_dtype=params_dtype,
+                    shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
+                )
         else:
             x_scale = x_scale.view(torch.float8_e8m0fnu)
             x = x.view(torch.float4_e2m1fn_x2)
 
         if m >= MXFP4_QUANT_BLOCK_SIZE:
             x_scale = x_scale.view(torch.uint8).view(
-                x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
+                x_scale.shape[0] // _scale_pf, -1
             )
         else:
             x_scale = x_scale[:m, ...].view(torch.uint8)
 
+        # Re-collapse the un-collapsed (rows_pad, kgroups_pad) weight scale
+        # produced by shuffle_scale_gemm_e8m0 into the kernel layout, by the same
+        # arch preshuffle factor used for the activation scale above.
         y = gemm_afp4wfp4_preshuffle(
             x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
             weight_scale.view(torch.uint8).view(
-                weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1 # NOTE: this may only work for gfx950
+                weight_scale.shape[0] // _scale_pf, -1
             ),
             y=y,
         )
@@ -771,54 +792,30 @@ class LinearBase(nn.Module):
                     need_shuffle = True
             if need_shuffle:
                 if self.weight.dim() == 2:
-                    if (
-                        arch_info.get_arch() == "gfx1250"
-                        and use_triton_gemm()
-                        and self.params_dtype == dtypes.fp4x2
-                        and not use_fp4_non_shuffle_triton_gemm()
-                    ):
-                        # gemma4w4 on gfx1250: WMMA preshuffle layout
+                    if use_triton_gemm():
+                        # gfx1250 WMMA preshuffle layout for both gemma4w4 (FP4) and
+                        # gemma8w8 blockscale, via the arch-aware triton shuffle_weight
+                        # (dispatches to _shuffle_weight_gfx1250 on gfx1250).
                         from aiter.ops.triton.utils.shuffle import (
-                            _shuffle_weight_gfx1250,
+                            shuffle_weight as _triton_shuffle_weight,
                         )
 
-                        self.weight.data = _shuffle_weight_gfx1250(self.weight.data)
-                    elif (
-                        arch_info.get_arch() == "gfx1250"
-                        and use_triton_gemm()
-                        and self.quant_type == QuantType.per_1x128
-                    ):
-                        # gemma8w8 blockscale on gfx1250: WMMA preshuffle layout
-                        from aiter.ops.shuffle import preshuffle_fp8_weights_gfx1250
-
-                        self.weight.data = preshuffle_fp8_weights_gfx1250(
-                            self.weight.data
-                        )
+                        self.weight.data = _triton_shuffle_weight(self.weight.data)
+                        self.weight.is_shuffled = True
                     else:
                         shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
-        # shuffle weight scale once so no reshuffling for every gemm
-        _fp4_triton_preshuffle = (
-            self.quant_type == QuantType.per_1x32
-            and self.params_dtype == dtypes.fp4x2
-            and use_triton_gemm()
-            and not use_fp4_non_shuffle_triton_gemm()
-            and gemm_afp4wfp4_preshuffle is not None
-        )
-        if _fp4_triton_preshuffle:
-            # Shuffle the weight scale into the gemm_afp4wfp4_preshuffle kernel layout
-            # at load. shuffle_scale_gemm_e8m0 is built on shuffle_scale_gemm's gfx950
-            # tile (preshuffle_factor=32, scale_kwidth=8) but returns the UN-collapsed
-            # (M_pad, N_pad) shape -- byte-identical to the original fp4_utils.e8m0_shuffle
-            # that the forward (gemm_a4w4_quant, ~line 223) still re-collapses via
-            # `.view(shape[0] // 32, -1)`. (Raw shuffle_scale_gemm returns the already
-            # collapsed (M_pad//32, N*32), which the forward would divide by 32 again
-            # -> wrong-strided scale -> OOB read in the preshuffle kernel -> GPU fault.)
-            self.weight_scale.data = shuffle_scale_gemm_e8m0(self.weight_scale.data)
-        elif self.quant_type == QuantType.per_1x32 and (
+        # Shuffle the weight scale once at load. One call covers every per_1x32 case
+        # that needs a shuffled scale: the FP4 triton-preshuffle path (config C) and
+        # the non-triton / non-fp4x2 fallbacks. The only per_1x32 case skipped is FP4 +
+        # non-shuffle triton (config D), which passes raw scales. shuffle_scale_gemm_e8m0
+        # is arch-aware (gfx950 32/8 tile == fp4_utils.e8m0_shuffle byte-for-byte, proven;
+        # gfx1250 16/4 tile) and returns the UN-collapsed (M_pad, N_pad) view that the
+        # forward (gemm_a4w4_quant) re-collapses by the arch preshuffle_factor.
+        if self.quant_type == QuantType.per_1x32 and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
-            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+            self.weight_scale.data = shuffle_scale_gemm_e8m0(self.weight_scale.data)
 
     @mark_trace
     def forward(
