@@ -26,6 +26,8 @@ on:
         options:
           - "none (do not run SGLang-OOB models)"
           - "deepseek-v4-pro-tp8 (1024x1024/8192x1024: [4,8,16,32,64,128,256])"
+          - "deepseek-v4-pro-mtp1-tp8 (1024x1024/8192x1024: [4,8,16,32,64,128,256])"
+          - "deepseek-v4-pro-mtp3-tp8 (1024x1024/8192x1024: [4,8,16,32,64,128,256])"
           - "deepseek-v4-pro-prefix-cache-tp8 (1024x1024/8192x1024: [4,8,16,32,64,128,256])"
           - "deepseek-r1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
@@ -50,14 +52,14 @@ on:
           - "qwen3-32b-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-v3-2-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "glm-5-1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
-          - "all-deepseek (17 DeepSeek configs)"
+          - "all-deepseek (19 DeepSeek configs)"
           - "all-deepseek-non-mtp (13 DeepSeek non-MTP configs)"
-          - "all-deepseek-mtp (4 DeepSeek MTP configs x 10 default params)"
+          - "all-deepseek-mtp (6 DeepSeek MTP configs x 10 default params)"
           - "all-deepseek-v3-2 (4 DeepSeek-V3.2 FP8 OOB configs x 10 default params)"
           - "all-deepseek-v3-2_glm_qwen (DeepSeek-V3.2 + GLM + Qwen OOB configs x 10 default params)"
           - "all-qwen (7 Qwen configs x 10 default params)"
           - "all-glm (1 GLM config x 10 default params)"
-          - "all-oob (25 SGLang-OOB configs x 10 default params)"
+          - "all-oob (27 SGLang-OOB configs x 10 default params)"
         default: "none (do not run SGLang-OOB models)"
       mesh_config_preset:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
@@ -708,7 +710,12 @@ jobs:
                   return prefix.startswith("glm")
               return prefix == preset
 
-          OOB_P0_PREFIX_ORDER = ["glm-5-1-fp8-tp8"]
+          OOB_P0_PREFIX_ORDER = [
+              "deepseek-v4-pro-tp8",
+              "deepseek-v4-pro-mtp1-tp8",
+              "deepseek-v4-pro-mtp3-tp8",
+              "glm-5-1-fp8-tp8",
+          ]
           OOB_P1_PREFIX_ORDER = [
               "deepseek-v3-2-fp8-tp4",
               "deepseek-v3-2-fp8-tp4-dp4-ep4",

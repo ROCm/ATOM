@@ -17,7 +17,12 @@ from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import envs, init_exit_handler, make_zmq_socket
+from atom.utils import (
+    envs,
+    init_exit_handler,
+    make_zmq_socket,
+    set_process_title,
+)
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -196,8 +201,12 @@ class EngineCore:
         engine: EngineCore = None
         try:
             if config.parallel_config.data_parallel_size > 1:
+                set_process_title(
+                    f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
+                )
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
+                set_process_title("EngineCore")
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:

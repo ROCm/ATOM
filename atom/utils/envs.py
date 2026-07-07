@@ -28,6 +28,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
+    "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
