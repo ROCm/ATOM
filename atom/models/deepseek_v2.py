@@ -176,11 +176,19 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
 
 
 def _is_neox_rope_style(
-    config: PretrainedConfig, interleave_attr: str, default_interleave: bool
+    config: PretrainedConfig, interleave_attr: str, *, default_is_neox: bool
 ) -> bool:
-    interleave = getattr(config, interleave_attr, default_interleave)
+    """Resolve ``is_neox_style`` from a model's ``*_interleave`` rope config flag.
+
+    neox and interleaved (GPT-J) are the two mutually-exclusive rope layouts, so
+    an interleave flag of True means ``is_neox_style=False``. A missing or null
+    flag falls back to ``default_is_neox`` — the layout of DeepSeek checkpoints
+    that predate the flag, which differs per rope instance (see call sites):
+    DeepSeek's main MLA rope is interleaved, but its V3.2 indexer rope is neox.
+    """
+    interleave = getattr(config, interleave_attr, None)
     if interleave is None:
-        interleave = default_interleave
+        return default_is_neox
     return not bool(interleave)
 
 
@@ -1884,7 +1892,11 @@ class DeepseekV2MLAAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=_is_neox_rope_style(config, "rope_interleave", True),
+            # DeepSeek's main MLA rope is interleaved (is_neox_style=False) when
+            # unspecified; GLM-5.x sets rope_interleave=true, i.e. also interleaved.
+            is_neox_style=_is_neox_rope_style(
+                config, "rope_interleave", default_is_neox=False
+            ),
         )
         if rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
@@ -1903,7 +1915,12 @@ class DeepseekV2MLAAttention(nn.Module):
                 max_position=max_position_embeddings,
                 base=rope_theta,
                 rope_scaling=rope_scaling,
-                is_neox_style=True,
+                # DeepSeek-V3.2's indexer rope is neox (is_neox_style=True) when
+                # unspecified; GLM-5.x sets indexer_rope_interleave=true to override
+                # it to interleaved.
+                is_neox_style=_is_neox_rope_style(
+                    config, "indexer_rope_interleave", default_is_neox=True
+                ),
             )
             if _indexer_weights_shared(config, prefix):
                 # GLM-5.2 IndexShare: reuses prior "full" layer's indexer; the
