@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783419259643,
+  "lastUpdate": 1783446365327,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -662,6 +662,46 @@ window.BENCHMARK_DATA = {
             "value": 0.7513,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28856306012 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607061543 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7483 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Wang, Yiting",
+            "username": "yitingw1",
+            "email": "yitiwang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ddb38b04ee8dbd9557fc3887b6d86041fc7d192d",
+          "message": "[Fix] fix GLM5.2 n-shot100 accuracy (#1502)\n\n* [Fix] fix GLM5.2 n-shot100 accuracy\n\n* [Fix] preserve DeepSeek V3.2 neox indexer rope; clean up helper semantics\n\nThe prior fix routed the indexer rope through _is_neox_rope_style with a\ndefault of True. For configs that omit indexer_rope_interleave (DeepSeek\nV3.2), that resolved to is_neox_style=False, silently flipping V3.2's\nindexer from neox (its validated layout) to interleaved. GLM-5.x declares\nthe flag so it was unaffected, but V3.2 would regress at prompts longer\nthan index_topk (the only case that exercises the sparse indexer top-k).\n\nAlso make _is_neox_rope_style read directly:\n  - the default is now expressed in the same vocabulary as the return value\n    and the call site's assignment target: default_interleave -> default_is_neox\n    (keyword-only), so no reader has to mentally invert.\n  - the missing/null flag now early-returns default_is_neox, leaving the lone\n    `not bool(interleave)` to do exactly one thing: convert a present interleave\n    flag to is_neox_style. No `not` tangled with the default fallback.\n  - per-rope fallbacks (main=interleaved so default_is_neox=False; V3.2 indexer\n    =neox so default_is_neox=True) are passed inline with a comment on each.\n\nNet behavior: V3.2 indexer stays neox; GLM indexer stays interleaved.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: zejunchen-zejun <zejun.chen@amd.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-07-07T13:54:27Z",
+          "url": "https://github.com/ROCm/ATOM/commit/ddb38b04ee8dbd9557fc3887b6d86041fc7d192d"
+        },
+        "date": 1783446348656,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28883623174 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202607071606 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7506,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28883623174 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607071606 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7475 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8802,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28883623174 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202607071606 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3442 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
