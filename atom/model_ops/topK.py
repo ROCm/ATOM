@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from functools import lru_cache
 from typing import Optional
 
@@ -87,6 +88,81 @@ def is_rocm_aiter_fuse_routed_scaling_factor():
 
 
 aiter_topK_meta_data = None
+_TRUTHY_ENV = ("1", "true", "True", "yes", "on")
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "") in _TRUTHY_ENV
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+
+def _topk_use_herd(token: int, expert: int, topk: int) -> bool:
+    if not (_env_truthy("AITER_FLYDSL_USE_HERD") or _env_truthy("AITER_TRITON_USE_HERD")):
+        return False
+    if topk + 1 > expert:
+        return False
+    min_m = _env_int(
+        "AITER_FLYDSL_HERD_MIN_M", _env_int("AITER_TRITON_HERD_MIN_M", 16)
+    )
+    max_m = _env_int(
+        "AITER_FLYDSL_HERD_MAX_M", _env_int("AITER_TRITON_HERD_MAX_M", 128)
+    )
+    return min_m <= token <= max_m
+
+
+def _topk_herd(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """HERD flat topk: top-(k+1), drop least batch-popular, keep k."""
+    token, expert = gating_output.shape
+    kp1 = topk + 1
+    cand_val, cand_idx = torch.topk(gating_output.float(), kp1, dim=1)
+
+    # Match Triton HERD's tie-break order: sort candidates by expert id before
+    # choosing the dropped column.
+    cand_idx, order = torch.sort(cand_idx, dim=1)
+    cand_val = torch.gather(cand_val, 1, order)
+
+    pop = torch.zeros(expert, dtype=torch.int64, device=gating_output.device)
+    pop.scatter_add_(
+        0,
+        cand_idx.reshape(-1),
+        torch.ones(token * kp1, dtype=torch.int64, device=gating_output.device),
+    )
+    cand_pop = pop[cand_idx]
+
+    is_min_pop = cand_pop == cand_pop.min(dim=1, keepdim=True).values
+    inf = float("inf")
+    val_for_min_pop = torch.where(
+        is_min_pop, cand_val, torch.full_like(cand_val, inf)
+    )
+    is_min_val = is_min_pop & (
+        val_for_min_pop == val_for_min_pop.min(dim=1, keepdim=True).values
+    )
+    cols = torch.arange(kp1, device=gating_output.device).expand(token, kp1)
+    drop_col = torch.where(is_min_val, cols, torch.full_like(cols, 1 << 30)).argmin(
+        dim=1
+    )
+
+    keep = torch.ones(token, kp1, dtype=torch.bool, device=gating_output.device)
+    keep.scatter_(1, drop_col.unsqueeze(1), False)
+    kept_val = cand_val[keep].reshape(token, topk)
+    kept_idx = cand_idx[keep].reshape(token, topk)
+    kept_weight = torch.softmax(kept_val, dim=1) if renormalize else kept_val
+
+    topk_weights[:, :topk].copy_(kept_weight.to(topk_weights.dtype))
+    topk_ids[:, :topk].copy_(kept_idx.to(topk_ids.dtype))
+    return topk_weights, topk_ids
 
 
 @lru_cache(maxsize=1)
@@ -162,9 +238,20 @@ def rocm_aiter_topk_softmax_impl(
         topk_ids, _ = torch.split(
             total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
         )
+        routed_topk_weights, _ = torch.split(
+            topk_weights, [topk, topk_weights.shape[1] - topk], dim=1
+        )
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+        routed_topk_weights = topk_weights
+
+    if _topk_use_herd(token, gating_output.shape[1], topk):
+        _topk_herd(gating_output, topk, renormalize, routed_topk_weights, topk_ids)
+        if num_fused_shared_experts > 0:
+            return total_topk_weights, total_topk_ids
+        return topk_weights, topk_ids
+
     token_expert_indicies = torch.empty(
         gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
     )
