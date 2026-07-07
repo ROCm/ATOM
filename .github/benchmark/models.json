@@ -42,7 +42,7 @@
       "config": {
         "tp": 8,
         "kv_cache_dtype": "fp8",
-        "extra_args": "--hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'"
+        "extra_args": "--no-enable_prefix_caching"
       },
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },
@@ -108,13 +108,27 @@
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {
-      "display": "GLM-5.1-MXFP4",
-      "path": "amd/GLM-5.1-MXFP4",
-      "prefix": "glm-5.1-fp4",
+      "display": "GLM-5.2-MXFP4",
+      "path": "amd/GLM-5.2-MXFP4",
+      "prefix": "glm-5-2-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 4, "kv_cache_dtype": "fp8" },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "extra_args": "--online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}'"
+      },
+      "variants": [
+        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "MTP3",
+          "suffix": "-mtp3",
+          "extra_args": "--method mtp --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
     },
     {
       "display": "gpt-oss-120b",

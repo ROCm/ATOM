@@ -49,6 +49,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_minimax_m3_mxfp4_tp4:
+        description: "MiniMax-M3-MXFP4 TP4"
+        required: false
+        type: boolean
+        default: false
       run_qwen35_35b_a3b_fp8_tp2:
         description: "Qwen3.5-35B-A3B-FP8 TP2"
         required: false
@@ -195,6 +200,7 @@ jobs:
           RUN_DSR1_FP8_TP4_ONLINE_QUANT: ${{ inputs.run_dsr1_fp8_tp4_online_quant }}
           RUN_KIMI_K26_MXFP4_TP4: ${{ inputs.run_kimi_k26_mxfp4_tp4 }}
           RUN_KIMI_K26_MXFP4_TP8: ${{ inputs.run_kimi_k26_mxfp4_tp8 }}
+          RUN_MINIMAX_M3_MXFP4_TP4: ${{ inputs.run_minimax_m3_mxfp4_tp4 }}
           RUN_QWEN35_35B_A3B_FP8_TP2: ${{ inputs.run_qwen35_35b_a3b_fp8_tp2 }}
           RUN_QWEN35_35B_A3B_TP2: ${{ inputs.run_qwen35_35b_a3b_tp2 }}
           RUN_QWEN35_397B_A17B_FP8_TP4: ${{ inputs.run_qwen35_397b_a17b_fp8_tp4 }}
@@ -328,6 +334,15 @@ jobs:
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache",
                   "accuracy_test_threshold": 0.91,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_MINIMAX_M3_MXFP4_TP4",
+                  "model_name": "MiniMax-M3-MXFP4 TP4",
+                  "model_path": "amd/MiniMax-M3-MXFP4",
+                  "extra_args": "--tensor-parallel-size 4 --attention-backend triton --page-size 128 --mem-fraction-static 0.75 --max-running-requests 128 --disable-radix-cache --disable-cuda-graph",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {

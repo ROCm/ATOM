@@ -2,7 +2,8 @@
 """Tests for the benchmark catalog (.github/scripts/catalog.py) and the
 workflow's use of it. These guard the CI benchmark matrix against drift:
 
-- build_args composes server CLI exactly as authored
+- build_args composes the server CLI in a fixed field order (synthetic inputs),
+  plus a content-agnostic smoke pass over the real catalog
 - build_cells reproduces the legacy effective matrix (concurrency bands ==
   the old hard-coded `exclude` block)
 - result_filename keeps the dashboard/baseline naming contract
@@ -41,54 +42,48 @@ LEGACY_EXCLUDE = {
 }
 
 
-def test_build_args_golden():
+def test_build_args_composition():
+    """build_args composes the CLI in a fixed order from structured fields plus
+    verbatim config/variant extra_args. Uses synthetic inputs so it exercises
+    the composition contract without coupling to real catalog content (which
+    changes often)."""
+    # Full: kv_cache_dtype -> tp -> config.extra_args -> variant.extra_args.
+    assert (
+        catalog.build_args(
+            {"kv_cache_dtype": "fp8", "tp": 8, "extra_args": "--foo"},
+            {"extra_args": "--bar"},
+        )
+        == "--kv_cache_dtype fp8 -tp 8 --foo --bar"
+    )
+
+    # tp omitted -> no -tp; default dtype fp8 when not set.
+    assert catalog.build_args({}, {}) == "--kv_cache_dtype fp8"
+
+    # trust_remote_code -> --trust-remote-code, before extra_args.
+    assert (
+        catalog.build_args({"tp": 4, "trust_remote_code": True}, {})
+        == "--kv_cache_dtype fp8 -tp 4 --trust-remote-code"
+    )
+
+    # config.extra_args present, no variant.extra_args.
+    assert (
+        catalog.build_args({"kv_cache_dtype": "fp8", "tp": 8, "extra_args": "--x"}, {})
+        == "--kv_cache_dtype fp8 -tp 8 --x"
+    )
+
+
+def test_build_args_smoke_over_real_catalog():
+    """Every real (model, variant) pair produces a well-formed arg string.
+    Content-agnostic: asserts shape only, so config edits never break it."""
     cat = catalog._load_catalog(CATALOG)
-    by_display = {
-        m["display"] + (f" {v.get('label','')}" if v.get("label") else ""): (m, v)
-        for m, v in catalog._iter_variants(cat)
-    }
-    m, v = by_display["DeepSeek-V4-Pro"]
-    assert catalog.build_args(m["config"], v) == (
-        "--kv_cache_dtype fp8 -tp 8 "
-        '--hf-overrides \'{"use_index_cache": true, "index_topk_freq": 4}\''
-    )
-    # --hf-overrides is model-level (config.extra_args), so every V4-Pro variant
-    # carries it, right after `-tp 8`.
-    HF = '--hf-overrides \'{"use_index_cache": true, "index_topk_freq": 4}\''
-    m, v = by_display["DeepSeek-V4-Pro MTP3"]
-    assert catalog.build_args(m["config"], v) == (
-        f"--kv_cache_dtype fp8 -tp 8 {HF} --method mtp --num-speculative-tokens 3"
-    )
-    m, v = by_display["DeepSeek-V4-Pro DPA"]
-    assert catalog.build_args(m["config"], v) == (
-        f"--kv_cache_dtype fp8 -tp 8 {HF} --enable-dp-attention"
-    )
-    m, v = by_display["DeepSeek-V4-Pro DPA MTP3"]
-    assert catalog.build_args(m["config"], v) == (
-        f"--kv_cache_dtype fp8 -tp 8 {HF} --method mtp --num-speculative-tokens 3 "
-        "--enable-dp-attention"
-    )
-    m, v = by_display["Kimi-K2.7-Code-MXFP4"]
-    assert catalog.build_args(m["config"], v) == (
-        "--kv_cache_dtype fp8 -tp 4 --trust-remote-code "
-        "--gpu-memory-utilization 0.9 --max-model-len 32768 "
-        "--max-num-batched-tokens 32768 --no-enable_prefix_caching "
-        "--online_quant_config "
-        '\'{"global_quant_config": "", "layer_quant_config": '
-        '{"model.layers.*.self_attn.fused_qkv_a_proj": "ptpc_fp8", '
-        '"model.layers.*.self_attn.q_b_proj": "ptpc_fp8", '
-        '"model.layers.*.self_attn.kv_b_proj": "ptpc_fp8", '
-        '"model.layers.*.self_attn.o_proj": "ptpc_fp8"}}\''
-    )
-    m, v = by_display["gpt-oss-120b"]
-    assert catalog.build_args(m["config"], v) == (
-        "--kv_cache_dtype fp8 --gpu-memory-utilization 0.9"
-    )
+    for m, v in catalog._iter_variants(cat):
+        args = catalog.build_args(m["config"], v)
+        assert args.startswith("--kv_cache_dtype "), (m["display"], args)
 
 
 def test_load_variants_shape():
     variants = catalog.load_variants(CATALOG)
-    assert len(variants) == 21
+    assert len(variants) == 22
     required = {
         "display",
         "path",

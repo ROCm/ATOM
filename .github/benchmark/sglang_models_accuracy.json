@@ -104,6 +104,18 @@
     "_baseline_note": "TP8 coverage for the Kimi-K2.6-MXFP4 SGLang accuracy validation target for gsm8k."
   },
   {
+    "model_name": "MiniMax-M3-MXFP4 TP4",
+    "model_path": "amd/MiniMax-M3-MXFP4",
+    "extraArgs": "--tensor-parallel-size 4 --attention-backend triton --page-size 128 --mem-fraction-static 0.75 --max-running-requests 128 --disable-radix-cache --disable-cuda-graph",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models",
+    "runner": "atom-mi355-8gpu-conductor-sgl-runner",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4",
+    "_baseline_note": "SGLang-ATOM MiniMax-M3-MXFP4 TP4 measured on GSM8K benchmark."
+  },
+  {
     "model_name": "Qwen3.5-35B-A3B-FP8 TP2",
     "model_path": "Qwen/Qwen3.5-35B-A3B-FP8",
     "extraArgs": "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
