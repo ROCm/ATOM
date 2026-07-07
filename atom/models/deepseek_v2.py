@@ -127,7 +127,7 @@ ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_F
 ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
     envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
 )
-SPARSE_INDEXER_CHUNK_TOKENS = envs.ATOM_SPARSE_INDEXER_CHUNK_TOKENS
+SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 _FP8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -1115,100 +1115,6 @@ class DeepseekV32IndexerCache(nn.Module):
         self.dtype = dtype
 
 
-def _fp8_mqa_topk_prefill_chunked(
-    q_fp8: torch.Tensor,
-    k_fp8: torch.Tensor,
-    k_scale: torch.Tensor,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-    topk_tokens: int,
-    chunk_tokens: int,
-    out: torch.Tensor,
-) -> None:
-    """Compute the sparse-indexer prefill top-k without materializing the full
-    ``[prefill_tokens, total_kv]`` logits buffer, writing indices into ``out``.
-
-    The indexer is block-diagonal per request (query row ``i`` is only valid
-    within ``[cu_seqlen_ks[i], cu_seqlen_ke[i])``), yet ``fp8_mqa_logits``
-    allocates a dense ``[rows, total_kv]`` fp32 matrix. ``total_kv`` is the sum
-    of all co-scheduled prefill contexts and is NOT bounded by
-    ``max_num_batched_tokens``, so a concurrency burst of long-context requests
-    can drive a single allocation to tens of GiB (GLM-5.2 OOM #1376). Chunking
-    along KV and merging per-row top-k across chunks caps the peak to
-    ``[rows, chunk_tokens]``. Selection stays exact: each ``logit(i, j)`` is an
-    independent ``q_i·k_j`` dot, so chunking KV and merging by value yields the
-    same global top-k.
-
-    ``out`` (shape ``[num_rows, topk_tokens]``, int32) is used directly as the
-    running index accumulator, so the final result lands there in place — no
-    extra allocation or copy back in the caller.
-    """
-    num_rows = q_fp8.shape[0]
-    total_kv = k_fp8.shape[0]
-    device = q_fp8.device
-    best_values = torch.full(
-        (num_rows, topk_tokens), -float("inf"), dtype=torch.float32, device=device
-    )
-    # Use the caller's output buffer as the running index accumulator.
-    best_indices = out
-    best_indices.fill_(-1)
-
-    for chunk_start in range(0, total_kv, chunk_tokens):
-        chunk_end = min(chunk_start + chunk_tokens, total_kv)
-        chunk_len = chunk_end - chunk_start
-        # Rebase each row's [start, end) window into this chunk's local column
-        # space; rows whose window misses the chunk collapse to an empty range.
-        local_starts = (cu_seqlen_ks - chunk_start).clamp_(0, chunk_len).to(torch.int32)
-        local_ends = (cu_seqlen_ke - chunk_start).clamp_(0, chunk_len).to(torch.int32)
-
-        logits = fp8_mqa_logits(
-            Q=q_fp8,
-            KV=k_fp8[chunk_start:chunk_end],
-            kv_scales=k_scale[chunk_start:chunk_end],
-            weights=weights,
-            cu_starts=local_starts,
-            cu_ends=local_ends,
-        )
-
-        chunk_indices = torch.full(
-            (num_rows, topk_tokens), -1, dtype=torch.int32, device=device
-        )
-        chunk_values = torch.full(
-            (num_rows, topk_tokens), -float("inf"), dtype=torch.float32, device=device
-        )
-        # The kernel emits -1 index sentinels and 0-valued padding for rows
-        # shorter than topk_tokens. Read values straight from the kernel's
-        # output buffer (no re-gather from logits) and mask the padding back to
-        # -inf via the index sentinel so it never wins the cross-chunk merge.
-        top_k_per_row_prefill(
-            logits=logits,
-            rowStarts=local_starts,
-            rowEnds=local_ends,
-            indices=chunk_indices,
-            values=chunk_values,
-            numRows=num_rows,
-            stride0=logits.stride(0),
-            stride1=logits.stride(1),
-        )
-        chunk_values = torch.where(
-            chunk_indices < 0,
-            torch.full_like(chunk_values, -float("inf")),
-            chunk_values,
-        )
-        # Local chunk column -> global concatenated-KV offset; -1 stays -1.
-        chunk_indices = torch.where(
-            chunk_indices < 0, chunk_indices, chunk_indices + chunk_start
-        )
-
-        # merged_indices is a fresh cat (separate storage from best_indices), so
-        # gathering back into best_indices=out is alias-safe.
-        merged_values = torch.cat((best_values, chunk_values), dim=1)
-        merged_indices = torch.cat((best_indices, chunk_indices), dim=1)
-        best_values, merge_positions = torch.topk(merged_values, k=topk_tokens, dim=1)
-        torch.gather(merged_indices, 1, merge_positions, out=best_indices)
-
-
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -1334,37 +1240,54 @@ def sparse_attn_indexer(
         # The dense logits buffer is [num_rows, total_kv] fp32. total_kv is the
         # sum of all co-scheduled prefill contexts and is unbounded by
         # max_num_batched_tokens, so a burst of long-context requests can push a
-        # single allocation to tens of GiB (#1376). Chunk along KV once total_kv
-        # exceeds the budget; short contexts keep the single-shot fast path.
-        chunk_tokens = SPARSE_INDEXER_CHUNK_TOKENS
-        if chunk_tokens > 0 and total_kv > chunk_tokens:
-            _fp8_mqa_topk_prefill_chunked(
-                q_fp8=q_prefill,
-                k_fp8=k_fp8,
-                k_scale=k_scale,
-                weights=weights_prefill,
-                cu_seqlen_ks=cu_seqlen_ks,
-                cu_seqlen_ke=cu_seqlen_ke,
-                topk_tokens=topk_tokens,
-                chunk_tokens=chunk_tokens,
-                out=topk_indices_prefill,
-            )
+        # single allocation to tens of GiB (#1376). Under chunked prefill
+        # num_rows is already capped by max_num_batched_tokens, so the OOM is
+        # driven by total_kv (the column dim). Chunk along the Q (query-row)
+        # dimension with q_chunk sized so the buffer [q_chunk, total_kv] fp32
+        # stays within the memory budget — q_chunk shrinks as total_kv grows.
+        # Each chunk still scores the FULL KV, so every row's top-k is computed
+        # completely in one shot: the result is exact with no cross-chunk merge,
+        # the kernel's column indices are already global (no remapping), and each
+        # chunk writes straight into its output row slice (no copy). When the
+        # budget is disabled (0) or a single chunk fits, the loop runs exactly
+        # once and matches the original single-shot behavior.
+        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
+        if budget_bytes > 0 and total_kv > 0 and budget_bytes // (total_kv * 4) < num_rows:
+            # 4 bytes per fp32 logit; total_kv * 4 is one query row's footprint.
+            # Round the budget-derived row count DOWN to keep the buffer within
+            # budget: a multiple of 128 (aligned to the kernel's row tiling) in
+            # the normal regime, avoiding the coarse power-of-2 doubling. When
+            # the budget affords < 128 rows (extreme total_kv), fall back to a
+            # power-of-2 floor so it degrades to 64/32/.../1 instead of
+            # collapsing straight to 1.
+            budget_rows = budget_bytes // (total_kv * 4)
+            if budget_rows >= 128:
+                chunk_tokens = (budget_rows // 128) * 128
+            else:
+                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
         else:
+            # Budget disabled, or a single chunk already fits all rows.
+            chunk_tokens = num_rows
+        for chunk_start in range(0, num_rows, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+            # Per-row window bounds slice 1:1 with this chunk's rows.
+            row_starts = cu_seqlen_ks[chunk_start:chunk_end]
+            row_ends = cu_seqlen_ke[chunk_start:chunk_end]
             logits = fp8_mqa_logits(
-                Q=q_prefill,
+                Q=q_prefill[chunk_start:chunk_end],
                 KV=k_fp8,
                 kv_scales=k_scale,
-                weights=weights_prefill,
-                cu_starts=cu_seqlen_ks,
-                cu_ends=cu_seqlen_ke,
+                weights=weights_prefill[chunk_start:chunk_end],
+                cu_starts=row_starts,
+                cu_ends=row_ends,
             )
             top_k_per_row_prefill(
                 logits=logits,
-                rowStarts=cu_seqlen_ks,
-                rowEnds=cu_seqlen_ke,
-                indices=topk_indices_prefill,
+                rowStarts=row_starts,
+                rowEnds=row_ends,
+                indices=topk_indices_prefill[chunk_start:chunk_end],
                 values=None,
-                numRows=num_rows,
+                numRows=chunk_end - chunk_start,
                 stride0=logits.stride(0),
                 stride1=logits.stride(1),
             )
