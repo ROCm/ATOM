@@ -1953,8 +1953,16 @@ class DeepseekV2MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states_scale = None
+        # When input_layernorm fused AR+RMSNorm+quant, hidden_states is a tuple.
+        # A 3-tuple (fp8, scale, bf16) additionally carries the unquantized bf16
+        # normed activation for the v32 indexer (see RMSNorm.fused_quant_emit_bf16);
+        # a 2-tuple (fp8, scale) is the plain fused-quant output.
+        indexer_hidden = None
         if isinstance(hidden_states, tuple):
-            hidden_states, hidden_states_scale = hidden_states
+            if len(hidden_states) == 3:
+                hidden_states, hidden_states_scale, indexer_hidden = hidden_states
+            else:
+                hidden_states, hidden_states_scale = hidden_states
 
         if self.q_lora_rank is not None:
             if self.fuse_qknorm_quant and use_triton_gemm():
@@ -2031,8 +2039,11 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None and not self.skip_topk:
+            # The indexer's wk/weights_proj GEMMs run in BF16. When input_layernorm
+            # fused the quant it emits a bf16 mirror (indexer_hidden); otherwise
+            # hidden_states is already the bf16 normed activation.
             self.indexer(
-                hidden_states,
+                indexer_hidden if indexer_hidden is not None else hidden_states,
                 hidden_states_or_q_c,
                 hidden_states_or_q_c_scale,
                 positions,
@@ -2147,12 +2158,41 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
             )
+        # Fuse activation quant into AR+RMSNorm when fused_qkv_a_proj is
+        # per-1x128/per-token FP8, so the kernel emits the (fp8, scale) that GEMM
+        # consumes directly. Independent of the non-AR fuse_input_norm_quant path
+        # (mutually exclusive: that path forces fuse_ar_input_norm off).
+        qkv_proj = getattr(self.self_attn, "fused_qkv_a_proj", None)
+        input_norm_fused_quant = (
+            qkv_proj is not None
+            and qkv_proj.params_dtype == dtypes.fp8
+            and qkv_proj.quant_type.value
+            in (QuantType.per_1x128.value, QuantType.per_Token.value)
+        )
+        fused_allreduce = (
+            self.fuse_ar_input_norm and self.layer_idx > 0 and not is_mtp_block
+        )
+        # GLM-5.2 (v32) DSA: the indexer's wk/weights_proj GEMMs run in BF16 and
+        # consume the same normed activation, so the fused kernel must also emit
+        # the pre-quant bf16 mirror alongside the fp8 for fused_qkv_a_proj.
+        emit_bf16_for_indexer = (
+            getattr(self.self_attn, "is_v32", False)
+            and getattr(self.self_attn, "indexer", None) is not None
+        )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=self.fuse_ar_input_norm
-            and self.layer_idx > 0
-            and not is_mtp_block,
+            fused_allreduce=fused_allreduce,
+            fused_quant=fused_allreduce and input_norm_fused_quant,
+            fused_quant_emit_bf16=(
+                fused_allreduce and input_norm_fused_quant and emit_bf16_for_indexer
+            ),
+            quant_config=quant_config,
+            prefix=(
+                f"{prefix}.self_attn.fused_qkv_a_proj"
+                if qkv_proj is not None
+                else f"{prefix}.self_attn.q_a_proj"
+            ),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
