@@ -89,7 +89,7 @@ class BlockManager:
             range(num_per_req_cache_groups)
         )
 
-        # M2 paged-SWA: optional second block pool for the sliding-window KV,
+        # paged-SWA: optional second block pool for the sliding-window KV,
         # with an independent free-list/hash so out-of-window SWA blocks can be
         # freed while the compressed blocks persist. `swa_enabled=False` →
         # every SWA branch below short-circuits and the compressed path is
@@ -97,7 +97,7 @@ class BlockManager:
         num_swa_blocks: int = getattr(config, "num_swa_blocks", 0)
         self.swa_enabled: bool = num_swa_blocks > 0
         self.swa_window: int = getattr(config, "swa_window_size", 0)
-        # M2 chunked-prefill: SWA is allocated incrementally (windowed), not
+        # chunked-prefill: SWA is allocated incrementally (windowed), not
         # full-length, so admission gates on the per-request windowed peak
         # rather than the whole prompt. Mirrors vLLM max_admission_blocks.
         self.max_num_batched_tokens: int = getattr(config, "max_num_batched_tokens", 0)
@@ -193,7 +193,7 @@ class BlockManager:
         return num_contig  # short prompt / partial front run (window spans [0,L))
 
     def _free_swa_out_of_window(self, seq: Sequence, seq_len: int | None = None):
-        """M2 brick-2: release SWA blocks that have fallen fully behind the
+        """paged-SWA: release SWA blocks that have fallen fully behind the
         sliding window — they're never read again by this request, and freeing
         them bounds live SWA memory to ~window per request.
 
@@ -361,7 +361,7 @@ class BlockManager:
         if not self.enable_prefix_caching:
             if len(self.free_block_ids_set) < seq.num_blocks:
                 return -1
-            # M2 chunked-prefill: SWA is filled incrementally + window-freed, so
+            # chunked-prefill: SWA is filled incrementally + window-freed, so
             # admission only needs the per-request windowed peak, not the whole
             # prompt (which no longer fits the small SWA pool for long prompts).
             if self.swa_enabled:
@@ -399,7 +399,7 @@ class BlockManager:
                 num_new_blocks -= 1
         if len(self.free_block_ids_set) < num_new_blocks:
             return -1
-        # M2 chunked-prefill: SWA new-block demand is bounded by the windowed
+        # chunked-prefill: SWA new-block demand is bounded by the windowed
         # peak (filled incrementally + window-freed), not the full new-block
         # count. Require the SWA pool can cover that peak.
         if self.swa_enabled and len(self.swa_free_block_ids_set) < min(
@@ -453,7 +453,7 @@ class BlockManager:
             self._allocate_block(block_id)
             seq.block_table.append(block_id)
             if self.swa_enabled:
-                # M2 chunked-prefill: do NOT pop a physical SWA block for the
+                # chunked-prefill: do NOT pop a physical SWA block for the
                 # whole prompt up front. Append a -1 placeholder to keep
                 # swa_block_table the same length as block_table (positional
                 # alignment); ensure_swa_blocks_for_tokens fills the current
@@ -501,7 +501,7 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
-            # M2: publish the parallel SWA block under the same content hash so
+            # paged-SWA: publish the parallel SWA block under the same content hash so
             # cross-request hits can reuse its sliding-window KV. Skip -1 slots
             # (window-freed or not-yet-materialized): a block finalized this step
             # is in-window and was filled by ensure_swa, so this normally holds a
@@ -535,7 +535,7 @@ class BlockManager:
         if self.swa_enabled:
             for swa_id in reversed(seq.swa_block_table):
                 if swa_id < 0:
-                    continue  # window-freed slot (brick-2)
+                    continue  # window-freed slot (window-freed)
                 block = self.swa_blocks[swa_id]
                 block.ref_count -= 1
                 if block.ref_count == 0:
@@ -582,7 +582,7 @@ class BlockManager:
                     swa_id = self._pop_free_swa_block()
                     self._allocate_swa_block(swa_id)
                     seq.swa_block_table.append(swa_id)
-        # M2 brick-2: reclaim SWA blocks that just fell out of the window.
+        # paged-SWA: reclaim SWA blocks that just fell out of the window.
         if self.swa_enabled:
             self._free_swa_out_of_window(seq)
 

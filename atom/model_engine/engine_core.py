@@ -116,7 +116,7 @@ class EngineCore:
             config.num_per_req_cache_groups = block_info.get(
                 "num_per_req_cache_groups", 0
             )
-            # M2 paged-SWA: propagate SWA pool sizing from the runner subprocess
+            # paged-SWA: propagate SWA pool sizing from the runner subprocess
             # so BlockManager (built in Scheduler below) sees the same value as
             # the runner's attn builder (else swa_enabled=False vs the SWA pool).
             config.num_swa_blocks = block_info.get("num_swa_blocks", 0)

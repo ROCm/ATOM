@@ -228,7 +228,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_block_ids": seq.block_table.copy(),
-            # M2 paged-SWA: the consumer's SWA-pool block ids (separate pool);
+            # paged-SWA: the consumer's SWA-pool block ids (separate pool);
             # the producer keys the SWA region transfer by these. Empty for
             # non-V4 backends.
             "remote_swa_block_ids": list(getattr(seq, "swa_block_table", []) or []),
@@ -364,7 +364,7 @@ class MooncakeConnector(KVConnectorBase):
         self._v4_block_regions: list[tuple[int, int]] = (
             []
         )  # (base_addr, bytes_per_block)
-        # M2 paged-SWA: SWA pool regions, keyed by seq.swa_block_table (separate
+        # paged-SWA: SWA pool regions, keyed by seq.swa_block_table (separate
         # from the compressed block_table above).
         self._v4_swa_block_regions: list[tuple[int, int]] = (
             []
@@ -539,7 +539,7 @@ class MooncakeConnector(KVConnectorBase):
 
         # Populate block/slot region lists for transfer offset computation
         self._v4_block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
-        # M2 paged-SWA: SWA pool regions, transferred by seq.swa_block_table.
+        # paged-SWA: SWA pool regions, transferred by seq.swa_block_table.
         self._v4_swa_block_regions = [
             (r.base_addr, r.unit_bytes) for r in tt.swa_block_regions
         ]
@@ -742,7 +742,7 @@ class MooncakeConnector(KVConnectorBase):
                         "consumer_v4_block_bpb": [
                             bpb for _, bpb in self._v4_block_regions
                         ],
-                        # M2 paged-SWA: separate SWA pool, keyed by swa_block_table
+                        # paged-SWA: separate SWA pool, keyed by swa_block_table
                         "dst_swa_block_ids": meta.local_swa_block_ids,
                         "consumer_v4_swa_block_base_addrs": [
                             b for b, _ in self._v4_swa_block_regions
@@ -1057,7 +1057,7 @@ class MooncakeConnector(KVConnectorBase):
         consumer_slot_bps = request_data["consumer_v4_slot_bps"]
         dst_slot = request_data["dst_slot_index"]
         src_slot = prefill_data["slot_index"]
-        # M2 paged-SWA: separate SWA pool, keyed by swa_block_table.
+        # paged-SWA: separate SWA pool, keyed by swa_block_table.
         consumer_swa_block_addrs = request_data.get(
             "consumer_v4_swa_block_base_addrs", []
         )
@@ -1077,7 +1077,7 @@ class MooncakeConnector(KVConnectorBase):
                 block_dst.append(dst_base + db * consumer_block_bpb[region_idx])
                 block_sizes.append(bpb)
 
-        # M2 paged-SWA: transfer the SWA pool by swa_block_table. Window-freed
+        # paged-SWA: transfer the SWA pool by swa_block_table. Window-freed
         # entries carry -1 on either side → skipped, so only the live window
         # (the last ~128-token block per request) crosses the wire.
         for region_idx, (src_base, bpb) in enumerate(self._v4_swa_block_regions):

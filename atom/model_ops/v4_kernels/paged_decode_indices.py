@@ -48,7 +48,7 @@ def _v4_paged_decode_indices_kernel(
     swa_indices_ptr,  # [swa_total] int32, output
     csa_indices_ptr,  # [csa_total] int32, output (writes SWA-prefix segment only)
     hca_indices_ptr,  # [hca_total] int32, output (writes SWA-prefix segment only)
-    block_size,  # M1 paged-SWA: tokens per block (= V4 block_size, 128)
+    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
     win: tl.constexpr,  # window_size — max SWA prefix slots
     BLOCK_N: tl.constexpr,  # next_pow2(win)
 ):
@@ -91,7 +91,7 @@ def _v4_paged_decode_indices_kernel(
     i = tl.arange(0, BLOCK_N)
     mask = i < n
     abs_pos = pos - n + 1 + i  # ∈ [0, pos] for valid i
-    # M1 paged-SWA: content-address each window position via block_tables
+    # paged-SWA: content-address each window position via block_tables
     # (same physical block as the compressed cache → prefix-cache hits read
     # the original request's SWA, not a stale ring). issue #1417.
     blk = abs_pos // block_size
@@ -125,7 +125,7 @@ def write_v4_paged_decode_indices(
     + `index_copy_` chain. All inputs are persistent forward_vars buffers —
     no allocator churn.
 
-    M1 paged-SWA: SWA offsets are content-addressed via `block_tables`
+    paged-SWA: SWA offsets are content-addressed via `block_tables`
     (`block_tables[bid, abs_pos//block_size]*block_size + abs_pos%block_size`),
     same physical block as the compressed cache — so prefix-cache hits read the
     original request's SWA, not a stale per-request ring (issue #1417).
@@ -205,7 +205,7 @@ def write_v4_paged_decode_indices_reference(
     block_size: int,
 ) -> None:
     """Pure-PyTorch reference equivalent of `write_v4_paged_decode_indices`
-    (M1 paged-SWA). For unit tests and bisect verification. Mirrors the kernel:
+    (paged-SWA). For unit tests and bisect verification. Mirrors the kernel:
     per-token ragged-packed write, content-addressed via block_tables.
     """
     if T == 0:

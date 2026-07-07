@@ -265,7 +265,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         for i, block_table in enumerate(batch.block_tables):
             block_tables[i] = 0
             block_tables[i, : len(block_table)] = block_table
-        # M2 paged-SWA: fill the parallel SWA block table in lockstep (decode
+        # paged-SWA: fill the parallel SWA block table in lockstep (decode
         # path). -1 sentinels (window-freed) are copied verbatim but never
         # indexed by the SWA kernels.
         swa_buf = var.get("swa_block_tables")

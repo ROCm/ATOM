@@ -1773,7 +1773,7 @@ class DeepseekV4Attention(nn.Module):
         if os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return torch.zeros_like(x)
         num_tokens = x.size(0)
-        # M1 paged-SWA: swa_kv is now the flat [num_blocks*block_size, head_dim]
+        # paged-SWA: swa_kv is now the flat [num_blocks*block_size, head_dim]
         # content-addressed region; block_size (not a ring cache_size) is the
         # paging stride.
         swa_block_size = self.swa_block_size
@@ -1789,7 +1789,7 @@ class DeepseekV4Attention(nn.Module):
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
         block_tables_gpu = attn_md.block_tables
-        # M2 paged-SWA: swa_write targets the separate SWA pool via
+        # paged-SWA: swa_write targets the separate SWA pool via
         # swa_block_tables (always populated for V4).
         swa_block_tables_gpu = attn_md.swa_block_tables
         state_slot_mapping = attn_md.state_slot_mapping
@@ -1834,7 +1834,7 @@ class DeepseekV4Attention(nn.Module):
         # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
         # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
         # covers exactly the tokens the old standalone swa_write did.
-        # M1 paged-SWA: do NOT fuse the SWA write into qk_norm_rope_maybe_quant.
+        # paged-SWA: do NOT fuse the SWA write into qk_norm_rope_maybe_quant.
         # The fused (flydsl, aiter) path scatters into a per-request ring
         # (swa_kv[slot, pos%cache]); paged content-addressing needs the
         # block_tables-based swa_write below instead. Pass swa_kv=None so neither
@@ -1978,7 +1978,7 @@ class DeepseekV4Attention(nn.Module):
             )  # [S, H, head_dim]
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
             # prior chunk's contents (not this chunk's just-computed tail).
-            # M1 paged-SWA: content-addressed via block_tables; write EVERY token
+            # paged-SWA: content-addressed via block_tables; write EVERY token
             # of the chunk (write_per_batch = max_seqlen_q) so each token's SWA
             # is stored at its own block slot for cross-request prefix reuse.
             swa_write(

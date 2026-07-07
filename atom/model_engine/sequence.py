@@ -81,7 +81,7 @@ class Sequence:
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
         self.block_table = []
-        # M2 paged-SWA: separate physical block table for the sliding-window
+        # paged-SWA: separate physical block table for the sliding-window
         # KV pool (independent lifetime from the compressed block_table so
         # out-of-window SWA blocks can be freed while compressed blocks persist).
         # Empty / unused for non-SWA models.

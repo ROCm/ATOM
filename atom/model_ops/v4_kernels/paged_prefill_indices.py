@@ -60,7 +60,7 @@ def _v4_paged_prefill_indices_kernel(
     n_committed_hca_per_seq_ptr,  # [bs] int — per-seq HCA compress entry count
     block_tables_ptr,  # [bs, MAX_BLOCKS] int — compressed pool block ids (HCA)
     bt_stride_bs,  # row stride of block_tables
-    swa_block_tables_ptr,  # [bs, MAX_BLOCKS] int — M2 SWA pool block ids
+    swa_block_tables_ptr,  # [bs, MAX_BLOCKS] int — SWA pool block ids
     swa_bt_stride_bs,  # row stride of swa_block_tables
     # Indptrs (already cumsum'd by caller, all length [T+1]).
     extend_indptr_ptr,
@@ -74,7 +74,7 @@ def _v4_paged_prefill_indices_kernel(
     prefix_hca_indices_ptr,
     # Constants.
     win: tl.constexpr,
-    block_size,  # M1 paged-SWA: tokens per block (= V4 block_size, 128)
+    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
     swa_pages,  # num_blocks * block_size — boundary into HCA compress section
     HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
@@ -125,7 +125,7 @@ def _v4_paged_prefill_indices_kernel(
     tl.store(extend_indices_ptr + ext_base + i, ext_start_row + i, mask=ext_mask)
 
     # ---- SWA prefix paged offsets: written to all three prefix buffers ----
-    # M1 paged-SWA: content-address each prior-chunk window position via
+    # paged-SWA: content-address each prior-chunk window position via
     # block_tables (same physical block as the compressed cache) so a
     # cross-request prefix-cache hit reads the original request's SWA instead of
     # a stale per-request ring (issue #1417):
@@ -374,7 +374,7 @@ def write_v4_paged_prefill_indices_reference(
                 device=device,
                 dtype=prefix_swa_indices.dtype,
             )
-            # M1 paged-SWA: content-address via block_tables (issue #1417).
+            # paged-SWA: content-address via block_tables (issue #1417).
             blk = (global_pos // block_size).long()
             phys = swa_block_tables_cpu[bid, blk.cpu()].to(
                 device=device, dtype=prefix_swa_indices.dtype

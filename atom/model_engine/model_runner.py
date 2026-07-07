@@ -1384,14 +1384,14 @@ class ModelRunner:
         )
         self.max_per_req_cache_slots = max_per_req_cache_slots
 
-        # M2 paged-SWA (brick-3b): DeepSeek-V4 gets a SEPARATE windowed/prefix-
+        # paged-SWA: DeepSeek-V4 gets a SEPARATE windowed/prefix-
         # cached SWA pool. The SWA bytes that `compute_block_bytes` charges per
         # compressed block move into a `num_swa_blocks`-sized pool (window-freed,
         # so far smaller than the compressed pool), and the freed budget grows
         # `num_kvcache_blocks`. V4 detected via architectures (config registry
         # maps model_type deepseek_v4 → v3).
         _arches = getattr(hf_config, "architectures", None) or []
-        # M2 paged-SWA: separate windowed/prefix-cached SWA pool — the RIGHT fix
+        # paged-SWA: separate windowed/prefix-cached SWA pool — the RIGHT fix
         # for #1417. The SWA bytes that `compute_block_bytes` charges per
         # compressed block move into a `num_swa_blocks`-sized pool (window-freed,
         # ~1248 blocks), and the freed budget grows num_kvcache_blocks (~108k).
@@ -1420,7 +1420,7 @@ class ModelRunner:
             )
             self.num_swa_blocks = int(num_swa_blocks)
             logger.info(
-                f"M2 paged-SWA pool: num_swa_blocks={num_swa_blocks}, "
+                f"paged-SWA pool: num_swa_blocks={num_swa_blocks}, "
                 f"swa_block_bytes={swa_block_bytes}, "
                 f"swa_reserved={swa_reserved / (1 << 30):.2f}GB, "
                 f"compressed_block_bytes={compressed_block_bytes}, "
@@ -1503,7 +1503,7 @@ class ModelRunner:
             "num_per_req_cache_groups": (
                 config.max_num_seqs if per_req_cache_bytes > 0 else 0
             ),
-            # M2 paged-SWA: get_num_blocks runs in the RUNNER subprocess, so its
+            # paged-SWA: get_num_blocks runs in the RUNNER subprocess, so its
             # config.num_swa_blocks isn't visible to the engine process that
             # builds BlockManager. Propagate via block_info (mirrors the
             # per_req_cache fields) so BlockManager.swa_enabled matches the
@@ -1680,7 +1680,7 @@ class ModelRunner:
         # backend with non-zero `compute_per_req_cache_bytes()` (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
-        # M2 brick-3b: SWA moved to its own num_swa_blocks pool, so the
+        # paged-SWA: SWA moved to its own num_swa_blocks pool, so the
         # compressed pool is sized on (block_bytes - swa_block_bytes); add the
         # SWA pool separately. (non-V4 → num_swa_blocks=0, reduces to the
         # original formula.)

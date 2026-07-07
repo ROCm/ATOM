@@ -70,7 +70,7 @@ def _swa_write_kernel(
     WRITE_PER_BATCH: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """M1 paged-SWA write. 2D grid `(bs, WRITE_PER_BATCH)`. Program `(b, r)`
+    """paged-SWA write. 2D grid `(bs, WRITE_PER_BATCH)`. Program `(b, r)`
     writes the `r`-th of the last-N tokens of seq `b`, where
     `N = min(tok_n_b, WRITE_PER_BATCH)` and
     `tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`. Threads with `r >= N` bail.
@@ -125,7 +125,7 @@ def swa_write(
     block_size: int,
     write_per_batch: int,
 ) -> None:
-    """M1 paged-SWA in-place write. For the last
+    """paged-SWA in-place write. For the last
     `min(tok_n_b, write_per_batch)` tokens of every seq `b ∈ [0, bs)` this fwd
     (`tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`, `bs = block_tables.shape[0]`),
     write `kv[r]` to the content-addressed SWA region:
@@ -194,7 +194,7 @@ def swa_write_reference(
     block_size: int,
     write_per_batch: int,
 ) -> None:
-    """Pure-PyTorch reference equivalent of `swa_write` (M1 paged). For tests.
+    """Pure-PyTorch reference equivalent of `swa_write` (paged). For tests.
 
     Mirrors the kernel: for each seq `b ∈ [0, bs)`
     (`bs = block_tables.shape[0]`), take the last

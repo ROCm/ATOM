@@ -318,7 +318,7 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
-        # M2 paged-SWA: parallel SWA block table (independent physical pool;
+        # paged-SWA: parallel SWA block table (independent physical pool;
         # -1 sentinels for window-freed blocks). Same filter as block_tables.
         self.swa_block_tables = [
             seq.swa_block_table for seq in seqs.values() if seq.block_table
@@ -941,7 +941,7 @@ class Scheduler:
             )
 
             if needs_remote_load:
-                # M2 PD: the consumer runs no prefill forward (so ensure_swa is
+                # PD: the consumer runs no prefill forward (so ensure_swa is
                 # never called) and its first may_append is skipped. Materialize
                 # the trailing-window SWA blocks now — matching the producer's
                 # post-free swa_block_table positions — so the RDMA transfer has
@@ -972,7 +972,7 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
-            # M2 chunked-prefill: materialize the SWA pool blocks this chunk's
+            # chunked-prefill: materialize the SWA pool blocks this chunk's
             # tokens touch BEFORE the forward writes SWA. allocate() left uncached
             # SWA slots as -1 placeholders; fill the current chunk's logical
             # range in-place (out-of-window blocks are freed in postprocess after
@@ -1343,7 +1343,7 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
-                # M2 chunked-prefill: reclaim SWA blocks that just fell out of
+                # chunked-prefill: reclaim SWA blocks that just fell out of
                 # the window, using the computed-so-far length
                 # (num_cached_tokens). Bounds peak SWA to ~window during prefill
                 # instead of waiting for the first decode step's may_append.
