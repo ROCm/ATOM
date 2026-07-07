@@ -4,13 +4,13 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::{
     config::{
-        BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig, MetricsConfig,
-        PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+        BackendType, CircuitBreakerConfig, ConfigError, ConfigResult, HealthCheckConfig,
+        MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
     routers::atom_standalone::AtomStandaloneRuntime,
-    server::ServerConfig,
+    server::{ServerConfig, ServerTlsConfig},
 };
 
 pub fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
@@ -451,6 +451,15 @@ pub struct CliArgs {
     /// API key for worker connections
     #[arg(long, help_heading = "Control Plane Authentication")]
     pub api_key: Option<String>,
+
+    // ==================== TLS ====================
+    /// PEM certificate chain path for serving HTTPS
+    #[arg(long, requires = "tls_key_path", help_heading = "TLS")]
+    pub tls_cert_path: Option<std::path::PathBuf>,
+
+    /// PEM private key path for serving HTTPS
+    #[arg(long, requires = "tls_cert_path", help_heading = "TLS")]
+    pub tls_key_path: Option<std::path::PathBuf>,
 }
 
 impl CliArgs {
@@ -506,10 +515,24 @@ impl CliArgs {
         }
     }
 
+    fn validate_tls_args(&self) -> ConfigResult<()> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(_), Some(_)) | (None, None) => Ok(()),
+            (Some(_), None) => Err(ConfigError::MissingRequired {
+                field: "tls_key_path".to_string(),
+            }),
+            (None, Some(_)) => Err(ConfigError::MissingRequired {
+                field: "tls_cert_path".to_string(),
+            }),
+        }
+    }
+
     pub fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        self.validate_tls_args()?;
+
         // Determine routing mode based on PD disaggregation flag
         let mode = if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
@@ -644,6 +667,14 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+            tls: self
+                .tls_cert_path
+                .as_ref()
+                .zip(self.tls_key_path.as_ref())
+                .map(|(cert_path, key_path)| ServerTlsConfig {
+                    cert_path: cert_path.clone(),
+                    key_path: key_path.clone(),
+                }),
             atom_standalone_runtime,
         }
     }
@@ -712,6 +743,8 @@ impl Default for CliArgs {
             tool_call_parser: None,
             backend: Backend::Sglang,
             api_key: None,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }

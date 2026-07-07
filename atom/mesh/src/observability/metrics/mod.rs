@@ -16,9 +16,9 @@ pub use config::PrometheusConfig;
 pub use recorder::{MeshMetrics, StreamingMetricsParams};
 pub use routes::MetricsRouteFactory;
 pub use schema::{
-    METRIC_INVENTORY, MetricKind, MetricSpec, MetricStatus, bool_to_static_str,
-    labels as metrics_labels, method_to_static_str, normalize_path_for_metrics, status_code_to_cow,
-    status_code_to_static_str,
+    bool_to_static_str, labels as metrics_labels, method_to_static_str, normalize_path_for_metrics,
+    status_code_to_cow, status_code_to_static_str, MetricKind, MetricSpec, MetricStatus,
+    METRIC_INVENTORY,
 };
 
 pub(crate) use mesh_metrics::start_prometheus;

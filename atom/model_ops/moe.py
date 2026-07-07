@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -52,7 +51,11 @@ from atom.model_ops.utils import (
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
-from atom.quantization.quark.utils import weight_dequant_fp8, weight_dequant_mxfp8
+from atom.quantization.quark.utils import (
+    quant_weight_online,
+    weight_dequant_fp8,
+    weight_dequant_mxfp8,
+)
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
@@ -126,12 +129,18 @@ class FusedMoEParallelConfig:
         # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
 
+        # When EP shards across the flattened DP * TP space (vLLM plugin under
+        # EP), the ep rank must be computed in that flattened group space.
+        flatten_tp_across_dp_for_moe = (
+            enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
+        )
+
         use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
 
-        if enable_dp_attention:
+        if flatten_tp_across_dp_for_moe:
             tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
         else:
             tp_size = tp_size_
@@ -431,14 +440,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=16384,
+                max_num_tokens_per_dp_rank=moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
             )
-            from atom.config import get_current_atom_config
             from atom.utils.tbo.ubatching import tbo_enabled
 
             handle = all2all_manager.get_handle(all_to_all_args)
@@ -455,7 +463,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 world_size=all2all_manager.world_size,
                 hidden_dim=moe.hidden_dim,
                 scale_dim=scale_dim,
-                max_num_inp_token_per_rank=16384,
+                # Match max_num_tokens_per_dp_rank / max_tokens_per_rank (= moe.max_num_tokens);
+                # leaving this hardcoded 16384 truncates the TBO mori buffer at mbt>16384.
+                max_num_inp_token_per_rank=moe.max_num_tokens,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
@@ -2620,7 +2630,6 @@ class FusedMoE(torch.nn.Module):
         ):
             return
 
-        quant_func = get_hip_quant(online_quant_type)
         assert source_quant_type in (
             QuantType.No,
             QuantType.per_1x128,
@@ -2639,6 +2648,15 @@ class FusedMoE(torch.nn.Module):
             if source_quant_type == QuantType.per_1x32:
                 return weight_dequant_mxfp8(w.contiguous(), sc.contiguous())
             return weight_dequant_fp8(w.contiguous(), sc.contiguous())
+
+        # Online weight quant dispatch (MXFP4 vs FP8), shared with the Linear
+        # path via a single helper under quark so both stay in sync.
+        def _quant_weight(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return quant_weight_online(
+                w,
+                online_quant_type=online_quant_type,
+                online_quant_dtype=online_quant_dtype,
+            )
 
         # Determine whether each weight needs all_gather to match offline quantization.
         # w13 (column parallel): (E, (2*intermediate/tp, hidden)) — TP dim 0
@@ -2707,8 +2725,8 @@ class FusedMoE(torch.nn.Module):
                 w1_bf16 = w13_local[:w1_size]
                 w3_bf16 = w13_local[w1_size:]
 
-            w1_q, w1_s = quant_func(w1_bf16, quant_dtype=online_quant_dtype)
-            w3_q, w3_s = quant_func(w3_bf16, quant_dtype=online_quant_dtype)
+            w1_q, w1_s = _quant_weight(w1_bf16)
+            w3_q, w3_s = _quant_weight(w3_bf16)
             del w1_bf16, w3_bf16
 
             w13_expert = self.w13_weight.data[expert_id]
@@ -2744,10 +2762,10 @@ class FusedMoE(torch.nn.Module):
                 )
             if need_gather_w2:
                 w2_full = tp_group.all_gather(w2_local, dim=1)
-                w2_q, w2_s = quant_func(w2_full, quant_dtype=online_quant_dtype)
+                w2_q, w2_s = _quant_weight(w2_full)
                 del w2_full
             else:
-                w2_q, w2_s = quant_func(w2_local, quant_dtype=online_quant_dtype)
+                w2_q, w2_s = _quant_weight(w2_local)
 
             self._load_model_weight_or_group_weight_scale(
                 shard_dim=1,
@@ -2912,7 +2930,7 @@ class FusedMoE(torch.nn.Module):
                 load_size = loaded_weight.shape[shard_dim]
                 if load_size != expert_data.shape[shard_dim]:
                     expert_data = expert_data.narrow(shard_dim, 0, load_size)
-                expert_data.copy_(loaded_weight)
+                self._copy_quant_storage(expert_data, loaded_weight)
             elif shard_id in ("w1", "w3"):
                 self._load_w13(
                     shard_id=shard_id,
@@ -2924,7 +2942,7 @@ class FusedMoE(torch.nn.Module):
                 )
             return
         if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            self._copy_quant_storage(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -2938,6 +2956,19 @@ class FusedMoE(torch.nn.Module):
     def _copy_quant_storage(dst: torch.Tensor, src: torch.Tensor) -> None:
         """Copy quantized tensors without numeric conversion of byte formats."""
         if dst.dtype == dtypes.fp4x2:
+            dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            return
+        fp8_storage_dtypes = (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e8m0fnu,
+            dtypes.fp8,
+            dtypes.fp8_e8m0,
+        )
+        if dst.dtype in fp8_storage_dtypes and src.dtype in fp8_storage_dtypes:
+            # Offline FP8 checkpoints encode raw FP8 bytes. Avoid dtype-to-dtype
+            # numeric conversion when destination storage uses a different FP8
+            # variant; later scale fixups expect the original bytes.
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
             return
         if dst.dtype == dtypes.fp8_e8m0 and src.dtype == torch.uint8:
