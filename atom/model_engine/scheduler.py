@@ -946,7 +946,7 @@ class Scheduler:
                 # the trailing-window SWA blocks now — matching the producer's
                 # post-free swa_block_table positions — so the RDMA transfer has
                 # real dst slots to write the sliding-window KV into.
-                self.block_manager.materialize_swa_window(seq, seq.num_prompt_tokens)
+                self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
@@ -980,7 +980,7 @@ class Scheduler:
             # are index-aligned; all seqs here are PREFILL.
             if self.block_manager.swa_enabled:
                 for seq, chunk in zip(scheduled_seqs.values(), num_scheduled_tokens):
-                    self.block_manager.ensure_swa_blocks_for_tokens(
+                    self.block_manager.swa.ensure_for_tokens(
                         seq, seq.num_cached_tokens, chunk
                     )
             num_cached_tokens_list = [
@@ -1347,7 +1347,7 @@ class Scheduler:
                 # the window, using the computed-so-far length
                 # (num_cached_tokens). Bounds peak SWA to ~window during prefill
                 # instead of waiting for the first decode step's may_append.
-                self.block_manager.free_swa_after_prefill_chunk(seq)
+                self.block_manager.swa.free_after_prefill_chunk(seq)
                 # Prefill is partial until the whole PROMPT's KV is computed.
                 # Compare against num_prompt_tokens, not num_tokens: once a
                 # completion token is appended (this step's sampled token, or an

@@ -444,8 +444,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Size the windowed SWA pool (vLLM-aligned; chunked-prefill freeing).
 
         With chunk-boundary SWA window-freeing + incremental allocation
-        (BlockManager.ensure_swa_blocks_for_tokens / free_swa_after_prefill_chunk,
-        Scheduler prefill hooks), a single prefill no longer holds the whole
+        (SlidingWindowPool.ensure_for_tokens / free_after_prefill_chunk, driven by
+        the Scheduler prefill hooks), a single prefill no longer holds the whole
         prompt's SWA — only its trailing window plus the current step's fresh
         chunk (bounded by max_num_batched_tokens). So:
 
