@@ -18,6 +18,10 @@ RESULT_RE = re.compile(
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
 EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
+EVAL_TOPOLOGY_RE = re.compile(
+    r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?)(?:$|[_-])",
+    re.IGNORECASE,
+)
 
 
 def number(*values: Any) -> float | None:
@@ -56,6 +60,8 @@ def slurm_job_env(path: Path) -> dict[str, str]:
     for parent in path.parents:
         env_path = parent / "docker.env"
         if env_path.is_file():
+            return read_env_file(env_path)
+        for env_path in sorted(parent.glob("docker-rank-*.env")):
             return read_env_file(env_path)
     return {}
 
@@ -203,6 +209,12 @@ def extra_text(
 def perf_point_extra(base_extra: str, point: dict[str, Any]) -> str:
     encoded = quote(json.dumps(point, separators=(",", ":"), sort_keys=True), safe="")
     return " | ".join(part for part in (base_extra, f"perf_point={encoded}") if part)
+
+
+def topology_key(value: Any) -> str:
+    text = string_value(value).lower().replace("-", "_")
+    match = EVAL_TOPOLOGY_RE.search(text)
+    return match.group("topology").replace("-", "_") if match else text
 
 
 def derive_fields(path: Path, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -444,7 +456,7 @@ def dashboard_point_entry(point: dict[str, Any], extra: str) -> dict[str, Any] |
 def collect_dashboard_entries(
     paths: list[Path],
     run_url: str | None,
-    gsm8k_scores: dict[int, dict[str, Any]],
+    gsm8k_scores: dict[tuple[str, int], dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
@@ -458,9 +470,10 @@ def collect_dashboard_entries(
         if not fields:
             continue
         payload = enrich_payload(path, payload, fields)
-        gsm8k_score = gsm8k_scores.get(
-            int(payload.get("max_concurrency", fields["conc"]))
-        )
+        conc = int(payload.get("max_concurrency", fields["conc"]))
+        gsm8k_score = gsm8k_scores.get((topology_key(fields["topology"]), conc))
+        if gsm8k_score is None:
+            gsm8k_score = gsm8k_scores.get(("", conc))
         gsm8k = gsm8k_score.get("value") if gsm8k_score else None
         if gsm8k_score is not None:
             payload["gsm8k"] = gsm8k
@@ -482,7 +495,15 @@ def eval_concurrency(path: Path) -> int | None:
     return None
 
 
-def find_eval_scores(root: Path) -> dict[int, dict[str, Any]]:
+def eval_topology(path: Path) -> str:
+    for part in reversed(path.parts):
+        match = EVAL_TOPOLOGY_RE.search(part)
+        if match:
+            return match.group("topology").replace("-", "_").lower()
+    return ""
+
+
+def find_eval_scores(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
     scores = {}
     for path in sorted(root.rglob("results*.json")):
         payload = read_json(path)
@@ -506,7 +527,10 @@ def find_eval_scores(root: Path) -> dict[int, dict[str, Any]]:
         )
         score = number(score_raw)
         if score is not None:
-            scores[conc] = {"value": round(score, 4), "raw": f"{score:.4f}"}
+            scores[(eval_topology(path), conc)] = {
+                "value": round(score, 4),
+                "raw": f"{score:.4f}",
+            }
     return scores
 
 
