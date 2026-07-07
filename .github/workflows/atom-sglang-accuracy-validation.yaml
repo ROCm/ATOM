@@ -340,7 +340,7 @@ jobs:
                   "toggle_env": "RUN_MINIMAX_M3_MXFP4_TP4",
                   "model_name": "MiniMax-M3-MXFP4 TP4",
                   "model_path": "amd/MiniMax-M3-MXFP4",
-                  "extra_args": "--tensor-parallel-size 4 --attention-backend triton --page-size 128 --mem-fraction-static 0.75 --max-running-requests 128 --disable-radix-cache --disable-cuda-graph",
+                  "extra_args": "--tensor-parallel-size 4 --attention-backend aiter --page-size 128 --mem-fraction-static 0.8 --max-running-requests 128 --disable-radix-cache",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models",
                   "runner": "atom-plugin-acc-validation-runner",
