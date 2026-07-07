@@ -36,6 +36,7 @@ class EngineArgs:
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: str = "auto"
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
@@ -120,6 +121,16 @@ class EngineArgs:
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'.",
+        )
+        parser.add_argument(
+            "--index-cache-dtype",
+            choices=["auto", "fp8"],
+            type=str,
+            default="auto",
+            help=(
+                "MiniMax-M3 index cache type. 'auto' uses the model dtype; "
+                "'fp8' stores the index cache in FP8 independently of KV cache dtype."
+            ),
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."

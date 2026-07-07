@@ -1047,6 +1047,7 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: str = "auto"
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     port: int = 8006
@@ -1267,6 +1268,7 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(self.index_cache_dtype)
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (

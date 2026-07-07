@@ -958,6 +958,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         local_blocks: int = 0,
         skip_index_topk: bool = False,
         sparse_layer_ordinal: int = -1,
+        index_cache_dtype: str = "auto",
         **kwargs,
     ):
         super().__init__(
@@ -995,6 +996,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.local_blocks = local_blocks
         self.skip_index_topk = skip_index_topk
         self.sparse_layer_ordinal = sparse_layer_ordinal
+        self.index_cache_dtype = index_cache_dtype
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: Optional[torch.Tensor] = None
@@ -1164,6 +1166,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             index_q,
             slot_mapping,
             kv_cache_dtype=kv_cache_dtype,
+            index_cache_dtype=self.index_cache_dtype,
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
             asm_layout=True,

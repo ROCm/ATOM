@@ -42,6 +42,20 @@ def _is_indexed_sparse_attention(module) -> bool:
     return bool(getattr(impl, "is_indexed_sparse_attention", False))
 
 
+def _resolve_minimax_m3_index_cache_dtype(config) -> torch.dtype:
+    from aiter import dtypes
+
+    index_cache_dtype = getattr(config, "index_cache_dtype", "auto")
+    if index_cache_dtype == "auto":
+        return config.torch_dtype
+    if index_cache_dtype == "fp8":
+        return dtypes.d_dtypes["fp8"]
+    raise ValueError(
+        "MiniMax-M3 index_cache_dtype must be 'auto' or 'fp8', "
+        f"got {index_cache_dtype!r}"
+    )
+
+
 @triton.jit
 def _mtp_prepare_decode_metadata_kernel(
     context_lens_ptr,
@@ -480,11 +494,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
             )
             index_dim = sparse_cfg["sparse_index_dim"]
+            index_cache_dtype = _resolve_minimax_m3_index_cache_dtype(config)
             block_bytes += (
                 sparse_layers
                 * runner.physical_block_size
                 * index_dim
-                * torch.empty((), dtype=config.torch_dtype).element_size()
+                * torch.empty((), dtype=index_cache_dtype).element_size()
             )
         return block_bytes
 
@@ -540,11 +555,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             sparse_layers = sum(
                 1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
             )
-            index_cache_dtype = (
-                dtypes.d_dtypes[config.kv_cache_dtype]
-                if str(config.kv_cache_dtype).startswith("fp8")
-                else config.torch_dtype
-            )
+            index_cache_dtype = _resolve_minimax_m3_index_cache_dtype(config)
             tensors["sparse_attention_index_cache"] = torch.zeros(
                 sparse_layers,
                 runner.num_physical_kvcache_blocks,
