@@ -1743,14 +1743,15 @@ class ModelRunner:
 
         # PCP+TBO prefill: split requests into two GROUPS at a request boundary
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
-        # request subset". Requires num_reqs >= 2 (balanced needs two non-empty
-        # groups); bs=1 falls back to non-TBO.
+        # request subset". Requires num_reqs >= 2 (request-boundary split needs
+        # two non-empty groups); bs=1 falls back to non-TBO.
         pcp_size = self.config.prefill_context_parallel_size
-        # True for eligible PCP+TBO balanced prefill; read by build_ubatch /
-        # run_model / prepare_prefill to route the per-group path.
+        # True for eligible PCP+TBO request-boundary split prefill; read by
+        # build_ubatch / run_model / prepare_prefill to route the per-group path.
         self._pcp_tbo_balanced_active = False
-        # Per-group descriptors; reset each step, set in prepare_inputs balanced
-        # branch. Guards run_model/build_ubatch against stale values.
+        # Per-group descriptors; reset each step, set in prepare_inputs
+        # request-boundary-split branch. Guards run_model/build_ubatch against
+        # stale values.
         self._pcp_bal_groups = None
         if tbo_on and is_prefill and pcp_size > 1 and not batch.is_dummy_run:
             num_prefill_reqs = batch.total_seqs_num_prefill
@@ -2026,7 +2027,7 @@ class ModelRunner:
         groups: "list[PcpBalGroup]",
         pcp_size: int,
     ) -> torch.Tensor:
-        """Restore PCP+TBO balanced output (PCP_TBO.md §12).
+        """Restore PCP+TBO request-boundary-split output.
 
         UBatchWrapper concatenated the two groups' 1/pcp output shards
         [g0_local | g1_local]. Each group was striped independently, so restore
@@ -2154,7 +2155,7 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
-                # PCP+TBO prefill (balanced): UBatchWrapper concatenated the two
+                # PCP+TBO prefill (request-boundary split): UBatchWrapper concatenated the two
                 # groups' 1/pcp output shards [g0_local | g1_local]. Restore each
                 # group independently: pcp_allgather_rerange its shard back to the
                 # group's global order, crop off the per-group pad, then concat to

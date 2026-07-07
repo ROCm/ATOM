@@ -1475,7 +1475,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # model.forward entry round-robin-splits hidden/positions to 1/W, so the
         # per-query (per-token) metadata must be reduced to the SAME owned-query
         # set. Per-seq / KV-write fields stay full (every rank keeps full KV).
-        # PCP+TBO balanced: DEFER reindex to per-group in
+        # PCP+TBO request-boundary split: DEFER reindex to per-group in
         # build_ubatch_prefill_metadata (each request group reindexed
         # independently on its own pcp pad). Keep the FULL un-reindexed metadata
         # here so build_ubatch can slice it per group.
@@ -1527,7 +1527,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         device = attn_metadata.batch_id_per_token.device
         # Pad to a multiple of pcp_size; dummy (pad) queries get zero-length KV.
         # This runs on the non-TBO PCP path (full-batch reindex) and, under
-        # PCP+TBO balanced, per request GROUP (each group reindexed independently
+        # PCP+TBO request-boundary split, per request GROUP (each group reindexed independently
         # on its own pcp pad). Either way the divisor is pcp_size.
         padded_total = pcp_pad_len(total_tokens, pcp_size)
         n_pad = padded_total - total_tokens
@@ -1622,16 +1622,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Split prefill AttentionMetaData for V4 TBO micro-batches.
 
         Two paths:
-        - PCP+TBO balanced: dispatches to
+        - PCP+TBO request-boundary split: dispatches to
           `_build_ubatch_prefill_metadata_balanced(attn_metadata, ubatch_idx)`,
           which derives the group from `model_runner._pcp_bal_groups[ubatch_idx]`
           and **ignores `ub_slice` / `padded_bs`** (the group's request/token
           ranges come from the PcpBalGroup, not the ub_slice).
-        - Non-balanced TBO (token-split, §11): uses `ub_slice` / `padded_bs`.
+        - Token-split TBO (default, §11): uses `ub_slice` / `padded_bs`.
         """
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
-        # PCP+TBO balanced: each ubatch = one request group processed as an
+        # PCP+TBO request-boundary split: each ubatch = one request group processed as an
         # independent non-TBO PCP mini-batch. Slice the FULL (un-reindexed)
         # metadata to the group + call _apply_pcp_reindex on it (reuse the proven
         # reindex). Bypasses the token-split rebuild path entirely.
@@ -1780,7 +1780,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata: AttentionMetaData,
         ubatch_idx: int,
     ) -> AttentionMetaData_DSV4:
-        """PCP+TBO balanced: build one request group's metadata as an
+        """PCP+TBO request-boundary split: build one request group's metadata as an
         independent non-TBO PCP mini-batch.
 
         `attn_metadata` is the FULL, UN-reindexed metadata (global). We slice it
@@ -1867,7 +1867,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ---- compress_plans: group's GLOBAL per-request (compressor all-gathers
         # the group to full order). Built from global cu / context_lens slices. ----
         if self._unique_compress_ratios_overlap:
-            gcu = var["cu_seqlens_q"].np  # GLOBAL (not overwritten for balanced)
+            gcu = var["cu_seqlens_q"].np  # GLOBAL (not overwritten for request-boundary split)
             ext = (gcu[rs0 + 1 : rs1 + 1] - gcu[rs0:rs1]).astype(np.int32)
             ctx = np.asarray(var["context_lens"].np[rs0:rs1], dtype=np.int32)
             plan_bufs = self._get_ubatch_compress_plan_buffers(ubatch_idx)
@@ -1882,8 +1882,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub.compress_plans = {}
 
         # ---- reindex the group to 1/pcp (proven path) ----
-        # positions: group's GLOBAL positions (forward_vars stay global for
-        # balanced). _apply_pcp_reindex pads group_total to pcp + strides —
+        # positions: group's GLOBAL positions (forward_vars stay global for the
+        # request-boundary split). _apply_pcp_reindex pads group_total to pcp + strides —
         # matching run_model's per-group pcp_round_robin_split.
         group_positions = var["positions"].gpu[gts:gte]
         self._apply_pcp_reindex(ub, group_positions, group_bs, group_total)
@@ -1896,7 +1896,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # Clone GPU tensors that are slices/views into shared CpuGpuBuffers, so a
         # later ubatch (or fwd) reusing the same buffer can't overwrite this
-        # ubatch's data (mirrors the non-balanced path's clones).
+        # ubatch's data (mirrors the token-split path's clones).
         # n_committed_csa_per_seq is a view of src's shared buffer (the [rs0:rs1]
         # .contiguous() slice above stays a view when already contiguous).
         if ub.n_committed_csa_per_seq is not None:

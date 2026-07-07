@@ -20,7 +20,7 @@ import torch
 
 
 class PcpBalGroup(NamedTuple):
-    """One request group for PCP+TBO balanced prefill.
+    """One request group for PCP+TBO request-boundary split prefill.
 
     A prefill batch is split into request groups at request boundaries (never
     inside a sequence); each group is processed as an independent non-TBO PCP

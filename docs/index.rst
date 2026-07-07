@@ -25,6 +25,7 @@ ATOM Documentation
    model_ops_guide
    scheduling_kv_cache_guide
    distributed_guide
+   context_parallel_guide
    compilation_cudagraph_guide
    serving_benchmarking_guide
 
