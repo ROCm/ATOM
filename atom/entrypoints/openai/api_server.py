@@ -1555,6 +1555,24 @@ async def kv_transfer_info():
     }
 
 
+@app.get("/server_info")
+async def server_info():
+    """Server metadata for the Atomesh router.
+
+    The router's dp-aware discovery reads ``dp_size`` here to expand the
+    per-DP-rank worker set and enable cache-aware routing to the rank that
+    holds a request's prefix.
+    """
+    global engine, model_name
+    cfg = engine.config
+    return {
+        "model_id": model_name,
+        "served_model_name": model_name,
+        "tp_size": cfg.tensor_parallel_size,
+        "dp_size": cfg.parallel_config.data_parallel_size,
+    }
+
+
 @app.post("/start_profile")
 async def start_profile():
     """Start profiling the engine."""
