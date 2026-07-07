@@ -1,0 +1,338 @@
+name: Atomesh Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'atom/mesh/**'
+      - '.github/benchmark/models_atomesh.yaml'
+      - '.github/scripts/atomesh/**'
+      - '.github/workflows/atomesh-benchmark.yaml'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'atom/mesh/**'
+      - '.github/benchmark/models_atomesh.yaml'
+      - '.github/scripts/atomesh/**'
+      - '.github/workflows/atomesh-benchmark.yaml'
+  schedule:
+    # Start weekend nightly runs at 21:00 Beijing time (13:00 UTC).
+    # Runs are expected to occupy the Sat 21:00-Sun 09:00 and Sun 21:00-Mon 09:00 windows.
+    - cron: '0 13 * * 6'
+    - cron: '0 13 * * 0'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Benchmark suite'
+        required: false
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - nightly
+      run_all_models:
+        description: 'Run all models from models_atomesh.yaml'
+        required: false
+        default: true
+        type: boolean
+      run_deepseek_v4_pro:
+        description: 'Run DeepSeek-V4-Pro'
+        required: false
+        default: false
+        type: boolean
+      run_kimi_k25_mxfp4:
+        description: 'Run Kimi-K2.5-MXFP4'
+        required: false
+        default: false
+        type: boolean
+      run_minimax_m3_mxfp4:
+        description: 'Run MiniMax-M3-MXFP4'
+        required: false
+        default: false
+        type: boolean
+      run_minimax_m3_mxfp8:
+        description: 'Run MiniMax-M3-MXFP8'
+        required: false
+        default: false
+        type: boolean
+      deepseek_v4_pro_model_path:
+        description: 'Model path for DeepSeek-V4-Pro'
+        required: false
+        default: /mnt/models/DeepSeek-V4-Pro/
+        type: string
+      kimi_k25_mxfp4_model_path:
+        description: 'Model path for Kimi-K2.5-MXFP4'
+        required: false
+        default: /mnt/models/Kimi-K2.5-MXFP4/
+        type: string
+      minimax_m3_mxfp4_model_path:
+        description: 'Model path for MiniMax-M3-MXFP4'
+        required: false
+        default: /mnt/models/MiniMax-M3-MXFP4
+        type: string
+      minimax_m3_mxfp8_model_path:
+        description: 'Model path for MiniMax-M3-MXFP8'
+        required: false
+        default: /mnt/models/MiniMax-M3-MXFP8
+        type: string
+      atomesh_image:
+        description: 'Override ATOM docker image'
+        required: false
+        default: rocm/atom-dev:latest
+        type: string
+      atomesh_slurm_account:
+        description: 'Slurm account'
+        required: false
+        default: amd-frameworks
+        type: string
+      atomesh_slurm_partition:
+        description: 'Slurm partition'
+        required: false
+        default: amd-frameworks
+        type: string
+      atomesh_slurm_submit_runner:
+        description: 'GitHub runner label used to submit Slurm jobs'
+        required: false
+        default: atomesh-cicd
+        type: string
+      atomesh_log_root:
+        description: 'Root directory for ATOMesh Slurm logs'
+        required: false
+        default: /it-share/ATOMESH_LOG/
+        type: string
+      atomesh_1p1d_nodes:
+        description: 'Comma-separated ATOMesh 1P1D nodes'
+        required: false
+        default: mia1-p02-g42,mia1-p02-g44
+        type: string
+      atomesh_2p1d_nodes:
+        description: 'Comma-separated ATOMesh 2P1D nodes'
+        required: false
+        default: mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
+        type: string
+      benchmark_concurrency:
+        description: 'Optional benchmark concurrency override, e.g. 1,2,4 (no quotes)'
+        required: false
+        default: ''
+        type: string
+      eval_concurrency:
+        description: 'Optional lm_eval concurrency override, e.g. 64 or 32,64 (no quotes)'
+        required: false
+        default: ''
+        type: string
+      run_model_benchmark:
+        description: 'Run model Slurm benchmark for workflow_dispatch'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account || 'amd-frameworks' }}
+  ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition || 'amd-frameworks' }}
+  ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || 'atomesh-cicd' }}
+  ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root || '/it-share/ATOMESH_LOG/' }}
+  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes || 'mia1-p02-g42,mia1-p02-g44' }}
+  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47' }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  load-config:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: Load ATOMesh benchmark config
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.matrix.outputs.matrix_json }}
+      has_matrix: ${{ steps.matrix.outputs.has_matrix }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Install YAML parser
+        run: python3 -m pip install pyyaml
+
+      - name: Build benchmark matrix
+        id: matrix
+        env:
+          SUITE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
+          RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
+          RUN_DEEPSEEK_V4_PRO: ${{ github.event_name == 'workflow_dispatch' && inputs.run_deepseek_v4_pro || false }}
+          RUN_KIMI_K25_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.run_kimi_k25_mxfp4 || false }}
+          RUN_MINIMAX_M3_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.run_minimax_m3_mxfp4 || false }}
+          RUN_MINIMAX_M3_MXFP8: ${{ github.event_name == 'workflow_dispatch' && inputs.run_minimax_m3_mxfp8 || false }}
+          ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO: ${{ github.event_name == 'workflow_dispatch' && inputs.deepseek_v4_pro_model_path || '' }}
+          ATOMESH_MODEL_PATH_KIMI_K2_5_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.kimi_k25_mxfp4_model_path || '' }}
+          ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.minimax_m3_mxfp4_model_path || '' }}
+          ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8: ${{ github.event_name == 'workflow_dispatch' && inputs.minimax_m3_mxfp8_model_path || '' }}
+          ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+          ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
+          ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
+        run: |
+          set -euo pipefail
+          MODEL_NAME=""
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${RUN_ALL_MODELS}" != "true" ]]; then
+            selected_models=()
+            [[ "${RUN_DEEPSEEK_V4_PRO}" == "true" ]] && selected_models+=("DeepSeek-V4-Pro")
+            [[ "${RUN_KIMI_K25_MXFP4}" == "true" ]] && selected_models+=("Kimi-K2.5-MXFP4")
+            [[ "${RUN_MINIMAX_M3_MXFP4}" == "true" ]] && selected_models+=("MiniMax-M3-MXFP4")
+            [[ "${RUN_MINIMAX_M3_MXFP8}" == "true" ]] && selected_models+=("MiniMax-M3-MXFP8")
+            if [[ "${#selected_models[@]}" -eq 0 ]]; then
+              echo "::error::Select run_all_models or at least one model checkbox."
+              exit 1
+            fi
+            MODEL_NAME="$(IFS=,; echo "${selected_models[*]}")"
+          fi
+
+          python3 .github/scripts/atomesh/pd_matrix.py \
+            --suite "$SUITE" \
+            ${MODEL_NAME:+--model "$MODEL_NAME"} \
+            ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+            ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
+            ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
+            --output atomesh-matrix.json \
+            --github-output
+          cat atomesh-matrix.json
+
+      - name: Validate ATOMesh P/D matrix
+        if: ${{ steps.matrix.outputs.has_matrix == 'true' }}
+        env:
+          RESULT_DIR: atomesh-dry-run-results
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          matrix = json.loads(Path("atomesh-matrix.json").read_text(encoding="utf-8"))
+          for cell in matrix.get("include", []):
+              print(f"Validating {cell['id']}", flush=True)
+              subprocess.run(
+                  [
+                      "bash",
+                      ".github/scripts/atomesh/pd_submit.sh",
+                      "--cell-json",
+                      json.dumps(cell, separators=(",", ":")),
+                      "--result-dir",
+                      os.environ["RESULT_DIR"],
+                      "--dry-run",
+                  ],
+                  check=True,
+              )
+          PY
+
+      - name: Upload expanded matrix
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-benchmark-matrix
+          path: atomesh-matrix.json
+
+  run-model-benchmark:
+    name: ${{ matrix.id }}
+    needs: [load-config]
+    if: >-
+      needs.load-config.outputs.has_matrix == 'true'
+      && (
+        github.event_name == 'schedule'
+        || github.event_name == 'push'
+        || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
+      )
+    runs-on: ${{ matrix.runner.slurm_submit_runner }}
+    timeout-minutes: 420
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Run Slurm benchmark cell
+        env:
+          CELL_JSON: ${{ toJson(matrix) }}
+          RESULT_DIR: atomesh-results
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+          bash .github/scripts/atomesh/pd_submit.sh \
+            --cell-json "$CELL_JSON" \
+            --result-dir "$RESULT_DIR"
+
+      - name: Summarize ${{ matrix.id }} benchmark result
+        if: always()
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p atomesh-results
+          SUMMARY_PATH="atomesh-results/${MATRIX_ID}-summary.md"
+          BENCHMARK_ACTION_INPUT="atomesh-results/${MATRIX_ID}-benchmark-action.json"
+
+          python3 .github/scripts/atomesh/process_result.py \
+            "atomesh-results/${MATRIX_ID}" \
+            --output "${BENCHMARK_ACTION_INPUT}" \
+            --summary "${SUMMARY_PATH}" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          {
+            echo "## ${MATRIX_ID}"
+            echo
+            if [ -f "atomesh-results/${MATRIX_ID}.slurm-job-id" ]; then
+              echo "Slurm job: $(cat "atomesh-results/${MATRIX_ID}.slurm-job-id")"
+              echo
+            fi
+            cat "${SUMMARY_PATH}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cat "${SUMMARY_PATH}"
+
+      - name: Upload model benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-model-benchmark-${{ matrix.id }}
+          path: |
+            atomesh-results/
+          if-no-files-found: ignore
+
+  summarize-results:
+    name: Summarize ATOMesh benchmark results
+    needs: [run-model-benchmark]
+    if: ${{ !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download model benchmark artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: atomesh-model-benchmark-*
+          merge-multiple: true
+          path: atomesh-results
+
+      - name: Build benchmark summary
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/atomesh/process_result.py \
+            atomesh-results \
+            --output atomesh-benchmark-action.json \
+            --summary atomesh-benchmark-summary.md \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cat atomesh-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark summary
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-benchmark-summary
+          path: |
+            atomesh-benchmark-action.json
+            atomesh-benchmark-summary.md

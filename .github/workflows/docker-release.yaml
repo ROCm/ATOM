@@ -109,8 +109,10 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Login to Docker Hub
-        run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Echo environment variables
         run: |

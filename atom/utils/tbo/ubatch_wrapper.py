@@ -5,7 +5,7 @@ import logging
 import threading
 import traceback
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,8 @@ from .ubatching import make_tbo_contexts
 
 logger = logging.getLogger("atom")
 
+UBatchModelOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
+
 
 @dataclass
 class TBOGraphData:
@@ -29,7 +31,7 @@ class TBOGraphData:
 
     graph: torch.cuda.CUDAGraph
     tbo_ctxs: list  # keep torch.Event objects alive for replay
-    output: Any = None  # output tensor reference from capture
+    output: Optional[UBatchModelOutput] = None  # output reference from capture
 
 
 class UBatchWrapper(nn.Module):
@@ -51,11 +53,49 @@ class UBatchWrapper(nn.Module):
         # TBO CUDAGraph storage: keyed by (graph_bs, max_q_len)
         self.tbo_graphs: dict[tuple, TBOGraphData] = {}
 
+        # Persistent ubatch worker pool. Previously every forward spawned + joined
+        # 2 threads.
+        self._num_workers = 2
+        self._workers: list[threading.Thread] = []
+        self._worker_jobs: list[Optional[callable]] = [None] * self._num_workers
+        self._worker_job_ready = [threading.Event() for _ in range(self._num_workers)]
+        self._worker_job_done = [threading.Event() for _ in range(self._num_workers)]
+        self._workers_device: Optional[torch.device] = None
+
+    def _worker_loop(self, idx: int):
+        # Bind this long-lived thread to the device ONCE — the HIP per-thread
+        # context (and its getprops storm) is paid here, not every forward.
+        if self._workers_device is not None:
+            torch.cuda.set_device(self._workers_device)
+        while True:
+            self._worker_job_ready[idx].wait()
+            self._worker_job_ready[idx].clear()
+            job = self._worker_jobs[idx]
+            self._worker_jobs[idx] = None
+            try:
+                if job is not None:
+                    job()
+            finally:
+                self._worker_job_done[idx].set()
+
+    def _ensure_workers(self, device: torch.device):
+        if self._workers:
+            return
+        self._workers_device = device
+        for i in range(self._num_workers):
+            t = threading.Thread(
+                target=self._worker_loop, args=(i,), daemon=True, name=f"tbo-ub-{i}"
+            )
+            self._workers.append(t)
+            t.start()
+
     def _ensure_comm_stream(self):
         if self.comm_stream is None:
             self.comm_stream = torch.cuda.Stream()
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> UBatchModelOutput:
         ctx = get_forward_context()
         if ctx.ubatch_slices is None:
             return self.model(input_ids, positions)
@@ -66,7 +106,7 @@ class UBatchWrapper(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-    ) -> torch.Tensor:
+    ) -> UBatchModelOutput:
         """Launch threads that each call self.model() inside a TBOContext."""
         self._ensure_comm_stream()
         original_ctx = ctx
@@ -131,51 +171,51 @@ class UBatchWrapper(nn.Module):
             ready_barrier=self.ready_barrier,
         )
 
-        results: list[tuple[int, torch.Tensor]] = []
+        results: list[tuple[int, UBatchModelOutput]] = []
         errors: list[Optional[Exception]] = [None] * N
 
         device = input_ids.device
+        assert (
+            N <= self._num_workers
+        ), f"TBO needs {N} ubatch workers but pool has {self._num_workers}"
+        self._ensure_workers(device)
 
-        @torch.inference_mode()
-        def _ubatch_thread(idx):
-            try:
-                # Ensure the child thread has a HIP/CUDA context on the
-                # correct device — without this, the first HIP API call
-                # (e.g. RCCL collective, kernel launch) may block or fail
-                # because the runtime lazily initialises per-thread state.
-                torch.cuda.set_device(device)
+        def _make_job(idx):
+            @torch.inference_mode()
+            def _job():
+                try:
+                    ub_input_ids, ub_positions = ub_inputs[idx]
+                    with tbo_ctxs[idx]:
+                        model_output = self.model(ub_input_ids, ub_positions)
+                    results.append((idx, self._validate_ubatch_output(model_output)))
+                except Exception as e:
+                    # logger.exception captures the full traceback. The partner
+                    # thread is unblocked via TBOContext.partner.done (set in
+                    # __exit__) so the main thread's done-wait returns promptly
+                    # and re-raises errors[idx].
+                    logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
+                    errors[idx] = e
 
-                ub_input_ids, ub_positions = ub_inputs[idx]
-                with tbo_ctxs[idx]:
-                    model_output = self.model(ub_input_ids, ub_positions)
-                results.append((idx, model_output))
-            except Exception as e:
-                # `logger.exception` captures the full traceback to the atom
-                # logger (which goes to stderr + log file); previously the
-                # bare `traceback.print_exc()` could be drowned by other
-                # stderr output across 8 worker procs. The partner thread
-                # is now unblocked via TBOContext.partner.done (set in
-                # __exit__) so the main thread's `t.join()` will return
-                # promptly and re-raise this `errors[idx]`.
-                logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
-                errors[idx] = e
+            return _job
 
-        # Clear thread-local forward context so threads don't inherit it
+        # Clear thread-local forward context so worker threads don't inherit it
         saved_ctx = getattr(_forward_context_local, "ctx", None)
         _forward_context_local.ctx = None
 
         try:
-            threads = []
+            # Hand each ubatch job to its persistent worker and wake it.
             for i in range(N):
-                t = threading.Thread(target=_ubatch_thread, args=(i,))
-                threads.append(t)
-                t.start()
+                self._worker_job_done[i].clear()
+                self._worker_jobs[i] = _make_job(i)
+                self._worker_job_ready[i].set()
 
+            # Same handshake as before: all reach the barrier, then wake thread 0.
             self.ready_barrier.wait()
             tbo_ctxs[0].cpu_wait_event.set()
 
-            for t in threads:
-                t.join()
+            # Wait for this step's jobs to finish (replaces Thread.join()).
+            for i in range(N):
+                self._worker_job_done[i].wait()
         finally:
             # Restore original forward context
             _forward_context_local.ctx = saved_ctx
@@ -186,7 +226,7 @@ class UBatchWrapper(nn.Module):
                 raise e
 
         sorted_results = [value for _, value in sorted(results)]
-        return torch.cat(sorted_results, dim=0)
+        return self._concat_ubatch_outputs(sorted_results)
 
     def capture_tbo_graph(
         self,
@@ -195,7 +235,7 @@ class UBatchWrapper(nn.Module):
         graph_pool,
         capture_stream: torch.cuda.Stream,
         output_buffer: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+    ) -> tuple[torch.cuda.CUDAGraph, UBatchModelOutput]:
         """Capture a CUDAGraph for TBO ubatch execution.
 
         Threads are started and cuBLAS is initialized BEFORE graph capture
@@ -246,7 +286,7 @@ class UBatchWrapper(nn.Module):
             ready_barrier=self.ready_barrier,
         )
 
-        results: list[tuple[int, torch.Tensor]] = []
+        results: list[tuple[int, UBatchModelOutput]] = []
         errors: list[Optional[Exception]] = [None] * N
         device = input_ids.device
 
@@ -264,7 +304,7 @@ class UBatchWrapper(nn.Module):
                 ub_input_ids, ub_positions = ub_inputs[idx]
                 with tbo_ctxs[idx]:
                     model_output = self.model(ub_input_ids, ub_positions)
-                results.append((idx, model_output))
+                results.append((idx, self._validate_ubatch_output(model_output)))
             except Exception as e:
                 traceback.print_exc()
                 errors[idx] = e
@@ -292,10 +332,10 @@ class UBatchWrapper(nn.Module):
                     t.join()
                 # Concatenate results (this op is captured too)
                 sorted_results = [v for _, v in sorted(results)]
-                output = torch.cat(sorted_results, dim=0)
+                output = self._concat_ubatch_outputs(sorted_results)
                 # Copy into caller's buffer so replay writes to the right place
                 if output_buffer is not None:
-                    output_buffer.copy_(output)
+                    output_buffer.copy_(self._primary_output(output))
         finally:
             _forward_context_local.ctx = saved_ctx
 
@@ -313,6 +353,56 @@ class UBatchWrapper(nn.Module):
         logger.info(f"[TBO] Captured CUDAGraph for {graph_key}")
 
         return graph, output
+
+    @staticmethod
+    def _concat_ubatch_outputs(
+        outputs: list[UBatchModelOutput],
+    ) -> UBatchModelOutput:
+        """Concatenate Tensor or Eagle3 aux outputs from per-ubatch forwards."""
+        first = outputs[0]
+        if isinstance(first, torch.Tensor):
+            if not all(isinstance(output, torch.Tensor) for output in outputs):
+                raise TypeError("TBO ubatch outputs must have matching structures")
+            return torch.cat(outputs, dim=0)
+
+        if not all(isinstance(output, tuple) for output in outputs):
+            raise TypeError("TBO ubatch outputs must have matching structures")
+
+        hidden_states = torch.cat([output[0] for output in outputs], dim=0)
+        num_aux = len(first[1])
+        if not all(len(output[1]) == num_aux for output in outputs):
+            raise ValueError("TBO ubatch aux output counts must match")
+        aux_hidden_states = [
+            torch.cat([output[1][idx] for output in outputs], dim=0)
+            for idx in range(num_aux)
+        ]
+        return hidden_states, aux_hidden_states
+
+    @staticmethod
+    def _primary_output(output: UBatchModelOutput) -> torch.Tensor:
+        """Return the tensor backed by ModelRunner's preallocated output buffer."""
+        if isinstance(output, tuple):
+            return output[0]
+        return output
+
+    @staticmethod
+    def _validate_ubatch_output(output: object) -> UBatchModelOutput:
+        """Accept only the TBO output contracts: Tensor or Eagle3 aux tuple."""
+        if isinstance(output, torch.Tensor):
+            return output
+        if (
+            isinstance(output, tuple)
+            and len(output) == 2
+            and isinstance(output[0], torch.Tensor)
+            and isinstance(output[1], list)
+            and all(isinstance(aux, torch.Tensor) for aux in output[1])
+        ):
+            return output
+        raise TypeError(
+            "TBO ubatch output must be a Tensor or "
+            "(Tensor, list[Tensor]), got "
+            f"{type(output).__name__}"
+        )
 
     @staticmethod
     def _get_dp_size() -> int:
@@ -452,6 +542,7 @@ class UBatchWrapper(nn.Module):
             batch_size=ub_num_reqs,
             graph_bs=graph_bs,
             is_draft=ctx.context.is_draft,
+            dp_uniform_decode=ctx.context.dp_uniform_decode,
         )
 
         return ForwardContext(

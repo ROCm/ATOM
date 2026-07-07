@@ -17,7 +17,15 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME = "model.layers.0.atom_deepseek_v4_proxy"
+ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX = "atom_deepseek_v4_draft_proxy"
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+
+
+def deepseek_v4_draft_proxy_layer_name(hf_config) -> str:
+    return (
+        f"model.layers.{int(getattr(hf_config, 'num_hidden_layers'))}."
+        f"{ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX}"
+    )
 
 
 def _aligned_index_dim(index_head_dim: int) -> int:
@@ -45,11 +53,23 @@ def _classical_block_bytes(hf_config) -> int:
     return csa_layers * (csa_main + csa_index) + hca_layers * hca_main
 
 
+def _v4_spec_steps(vllm_config) -> int:
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return 0
+    n = getattr(spec, "num_speculative_tokens", None)
+    return int(n) if n else 0
+
+
+def _v4_win_with_spec(vllm_config, window_size: int) -> int:
+    return int(window_size) + _v4_spec_steps(vllm_config)
+
+
 def _proxy_page_bytes(vllm_config) -> int:
     hf = vllm_config.model_config.hf_config
     ratios, _dense, _csa, _hca = _layer_counts(hf)
     head_dim = int(getattr(hf, "head_dim", 512))
-    win = int(getattr(hf, "sliding_window", 128))
+    win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
     max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
     max_model_len = int(vllm_config.model_config.max_model_len)
     min_blocks = max(
@@ -173,23 +193,49 @@ def slice_deepseek_v4_proxy_cache_views(
 
 
 class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
-    # Decode (query_len == 1) is the only shape we capture in a full CUDA/HIP
-    # graph: it has a fixed per-step kernel grid and the per-fwd index/indptr/
-    # slot/compress-plan tensors are staged into persistent fixed-address
-    # buffers here in build() (outside the captured region) so replay re-reads
-    # the same addresses. Prefill/mixed batches stay eager (FULL_DECODE_ONLY).
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # Decode is full-graph safe for uniform query batches, including speculative
+    # decode where each request contributes 1 + num_speculative_tokens queries.
+    # The per-fwd index/indptr/slot/compress-plan tensors are staged into
+    # persistent fixed-address buffers here in build() (outside the captured
+    # region), so replay re-reads the same addresses. Prefill/mixed batches stay
+    # on the piecewise/eager path.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.vllm_config = vllm_config
         self.device = device
-        # Pure decodes (query_len == 1) get pulled to the front of the batch so
-        # vLLM can classify a uniform-decode batch and dispatch the captured
-        # decode graph. The plugin reads the (reordered) CommonAttentionMetadata
-        # transparently; the per-request state slot is keyed on the first block
-        # id, so it is invariant to reordering.
-        self.reorder_batch_threshold = 1
+        # Decodes get pulled to the front of the batch so vLLM can classify a
+        # uniform-decode batch and dispatch the captured decode graph. The plugin
+        # reads the (reordered) CommonAttentionMetadata transparently; the
+        # per-request state slot is keyed on the req id, so it is invariant to
+        # reordering.
+        #
+        # With speculative decoding (MTP) each request's verify step carries
+        # ``1 + num_speculative_tokens`` query rows, so the decode threshold must
+        # be raised accordingly -- otherwise the verify batch is misclassified as
+        # prefill/mixed and the captured uniform-decode graph is fed mismatched
+        # metadata (garbage outputs, and an illegal access once the V4 compressor
+        # side-stream is captured). Use vLLM's own spec-as-decode computation
+        # (``1 + num_speculative_tokens``, doubled for parallel drafting) so this
+        # tracks the upstream contract for spec-decode-capable backends.
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # Number of MTP draft tokens per step (0 when spec decode is off). The
+        # spec-verify batch carries ``1 + num_spec_tokens`` uniform query rows;
+        # the metadata builder must classify that as DECODE (not PREFILL) so it
+        # stages into the persistent fixed-address decode buffers the captured
+        # FULL graph replays against. Kept consistent with the reorder threshold.
+        self._num_spec_tokens = _v4_spec_steps(vllm_config)
+        # CUDA/HIP-graph capture token-bucket sizes. vLLM pads the decode model
+        # forward (``positions``/hidden states) up to one of these even under
+        # PIECEWISE, where it leaves the attention-metadata token count
+        # unpadded. The decode metadata token-pad is rounded up to the same
+        # bucket so the ``batch_id == -1`` sentinel tail covers the padded rows
+        # the fused decode ``qk_norm_rope`` iterates over.
+        cc = getattr(vllm_config, "compilation_config", None)
+        self._cg_token_sizes = sorted(
+            {int(s) for s in (getattr(cc, "cudagraph_capture_sizes", None) or [])}
+        )
 
     def build(
         self, common_prefix_len: int, common_attn_metadata, fast_build: bool = False
@@ -229,7 +275,8 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
         if common_attn_metadata is None:
             return common_attn_metadata
         sfc = self.vllm_config.compilation_config.static_forward_context
-        proxy = sfc.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+        proxy_layer_name = self.layer_names[0]
+        proxy = sfc.get(proxy_layer_name)
         model = getattr(proxy, "_atom_v4_model", None) if proxy is not None else None
         meta_params = getattr(model, "_atom_v4_meta_params", None)
         if model is None or meta_params is None:
@@ -241,13 +288,33 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
             None if capturing else getattr(model, "_atom_v4_slot_allocator", None)
         )
         decode_bufs = getattr(model, "_atom_v4_decode_bufs", None)
+        # Batch-ordered req_ids exposed by the ATOM vLLM patch for this step;
+        # used as the host-resident state-slot key (no block-table D2H). None
+        # when the patch isn't applied (standalone/tests) -> build falls back.
+        req_ids = None
+        if not capturing:
+            try:
+                from atom.plugin.vllm.req_id_passthrough_patch import (
+                    get_current_req_ids,
+                )
+
+                req_ids = get_current_req_ids()
+            except Exception:
+                req_ids = None
         md = build_atom_v4_attention_metadata(
             common_attn_metadata,
             meta_params=meta_params,
             slot_allocator=slot_allocator,
             decode_bufs=decode_bufs,
             capturing=capturing,
+            req_ids=req_ids,
+            num_spec_tokens=self._num_spec_tokens,
+            cudagraph_token_sizes=self._cg_token_sizes,
         )
+        # Native ATOM enables V4 compressor side-stream launches only while the
+        # forward is being captured into a HIP/CUDA graph. vLLM builds this metadata
+        # on the capture path, so carry the signal into ATOM's forward context.
+        md.in_hipgraph = bool(capturing)
         # Selective per-slot reset OUTSIDE the captured region. For decode this
         # is empty (no fresh slots are bound mid-generation); it fires for the
         # prefill chunk that first allocates a request's slot, which is eager.
@@ -327,15 +394,18 @@ class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
         )
 
 
-def register_deepseek_v4_proxy_layer(vllm_config) -> AtomDeepseekV4ProxyAttention:
+def register_deepseek_v4_proxy_layer(
+    vllm_config,
+    layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+) -> AtomDeepseekV4ProxyAttention:
     sfc = vllm_config.compilation_config.static_forward_context
-    existing = sfc.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+    existing = sfc.get(layer_name)
     if isinstance(existing, AtomDeepseekV4ProxyAttention):
         return existing
     if existing is not None:
-        raise ValueError(f"Duplicate layer name: {ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME}")
-    proxy = AtomDeepseekV4ProxyAttention()
-    sfc[ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME] = proxy
+        raise ValueError(f"Duplicate layer name: {layer_name}")
+    proxy = AtomDeepseekV4ProxyAttention(prefix=layer_name)
+    sfc[layer_name] = proxy
     return proxy
 
 
@@ -382,11 +452,59 @@ def _v4_max_spec_steps(vllm_config) -> int:
     Sets the decode CG bucket: the per-fwd token count for a uniform decode
     batch of ``bs`` requests is ``bs * (1 + max_spec_steps)``.
     """
-    spec = getattr(vllm_config, "speculative_config", None)
-    if spec is None:
-        return 0
-    n = getattr(spec, "num_speculative_tokens", None)
-    return int(n) if n else 0
+    return _v4_spec_steps(vllm_config)
+
+
+def _deepseek_v4_blocks(model):
+    inner = getattr(model, "model", None)
+    layers = getattr(inner, "layers", None)
+    if layers is not None:
+        return layers
+    mtp = getattr(inner, "mtp", None)
+    if mtp is not None:
+        return mtp
+    return []
+
+
+def _compressed_layer_cache_index(ratios, layer_id: int, ratio: int) -> int:
+    return sum(1 for r in ratios[:layer_id] if int(r) == int(ratio))
+
+
+def _v4_padded_token_count(common_attn_metadata, total: int) -> int:
+    num_actual = int(getattr(common_attn_metadata, "num_actual_tokens", total) or total)
+    slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
+    slot_tokens = (
+        int(slot_mapping.numel()) if isinstance(slot_mapping, torch.Tensor) else 0
+    )
+    return max(total, num_actual, slot_tokens)
+
+
+def _v4_round_to_cudagraph_bucket(n: int, sizes) -> int:
+    """Round ``n`` up to the smallest CUDA/HIP-graph capture size >= ``n``.
+
+    vLLM only pads the *attention metadata* token count to a capture-size
+    bucket when the decode dispatches the FULL graph (``pad_attn`` is
+    ``cudagraph_mode == FULL``). Under PIECEWISE, the metadata is left at the
+    real (unpadded) token count, yet the model forward still receives
+    ``positions``/hidden states padded to a piecewise capture-size bucket
+    (fixed shapes are required to replay the captured piecewise regions). The
+    fused decode ``qk_norm_rope`` reads ``T = positions.shape[0]`` (the padded
+    forward width) and asserts ``len(batch_id_per_token) >= T``; if the V4
+    decode metadata is sized to the unpadded count the padded tail tokens read
+    ``batch_id_per_token`` out of bounds (illegal access / launch failure under
+    load). Rounding the decode token-pad count up to the same bucket vLLM pads
+    the forward to keeps the ``batch_id == -1`` sentinel tail long enough to
+    cover those padded rows. Batches larger than the max capture size run eager
+    (no padding), so ``n`` passes through unchanged.
+    """
+    if not sizes:
+        return n
+    if n > sizes[-1]:
+        return n
+    for s in sizes:
+        if s >= n:
+            return s
+    return n
 
 
 class _V4DecodeMetaBuffers:
@@ -447,7 +565,15 @@ class _V4DecodeMetaBuffers:
         self.idx_hca = i32(T * max(1, win + hca))
         # Native compress-plan buffers (one pair per compress ratio present).
         # Decode worst case: each seq contributes ceil((1 + spec) / ratio)
-        # compression boundaries; the write plan touches up to K_pool tokens.
+        # compression boundaries. The write plan is a subset of the per-fwd
+        # ragged tokens (a token is written iff its position falls in the per-seq
+        # "last K_pool" window), so for decode it has at most `total` rows
+        # (<= T == max_decode_tokens). Sizing the write buffer to T instead of
+        # the prefill-style S*K_pool worst case keeps the per-step sentinel fill,
+        # the H2D copy, AND the write-kernel grid (== write_plan.shape[0]) bounded
+        # to the decode token count -- the prior S*K_pool sizing filled/copied an
+        # almost-entirely-sentinel buffer every decode step (up to 128x for the
+        # HCA ratio). CUDAGraph-safe: shape[0]==T is fixed across capture/replay.
         from atom.model_ops.v4_kernels.compress_plan import (  # noqa: F401
             make_compress_plans as _mcp,
         )
@@ -457,12 +583,11 @@ class _V4DecodeMetaBuffers:
         spec_plus_one = max(1, T // S)
         for ratio, is_overlap in ratios_overlap:
             ratio = int(ratio)
-            K_pool = (2 if is_overlap else 1) * ratio
             per_seq = (spec_plus_one + ratio - 1) // ratio
             cap = max(1, S * per_seq)
             self.plan_buffers[ratio] = {
                 "compress": i32(cap, 4),
-                "write": i32(max(1, S * K_pool), 4),
+                "write": i32(max(1, T), 4),
             }
             self.decode_compress_cap[ratio] = cap
 
@@ -478,9 +603,13 @@ class _V4DecodeMetaBuffers:
         return buf.copy_to_gpu(n)
 
 
-def bind_deepseek_v4_proxy_cache_views(model, vllm_config) -> bool:
+def bind_deepseek_v4_proxy_cache_views(
+    model,
+    vllm_config,
+    layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+) -> bool:
     sfc = vllm_config.compilation_config.static_forward_context
-    proxy = sfc.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+    proxy = sfc.get(layer_name)
     if proxy is None or not isinstance(proxy, AtomDeepseekV4ProxyAttention):
         return False
     if not isinstance(proxy.kv_cache, torch.Tensor) or proxy.kv_cache.numel() == 0:
@@ -497,30 +626,32 @@ def bind_deepseek_v4_proxy_cache_views(model, vllm_config) -> bool:
     # must use it for `swa_pages`, not the per-forward request count.
     if not hasattr(model, "_atom_v4_slot_allocator"):
         model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
+    window_size = int(model.args.window_size)
+    win_with_spec = _v4_win_with_spec(vllm_config, window_size)
     model._atom_v4_meta_params = SimpleNamespace(
         num_slots=num_slots,
-        window_size=int(model.args.window_size),
-        # Plugin SWA ring is sized by window_size (no MTP spec steps folded in,
-        # matching the slicing above), so the ring stride cs == window_size.
-        cs=int(model.args.window_size),
+        window_size=window_size,
+        # Match native V4 MTP: the SWA ring stride includes in-flight draft
+        # steps so MTP>1 writes do not alias the target decode window.
+        cs=win_with_spec,
         index_topk=int(getattr(model.args, "index_topk", 1024)),
     )
     views = slice_deepseek_v4_proxy_cache_views(
         proxy.kv_cache,
         compress_ratios=ratios,
         num_slots=num_slots,
-        window_size=int(model.args.window_size),
+        window_size=win_with_spec,
         head_dim=int(model.args.head_dim),
         index_head_dim=int(model.args.index_head_dim),
     )
-    csa_i = 0
-    hca_i = 0
-    for layer_id, block in enumerate(model.model.layers):
+    for fallback_layer_id, block in enumerate(_deepseek_v4_blocks(model)):
         attn = block.attn
+        layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
         ratio = int(attn.compress_ratio)
         attn.unified_kv = views["unified"][layer_id]
         attn.swa_kv = views["swa"][layer_id]
         if ratio == 4:
+            csa_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
                 attn.compressor,
                 views["csa_main"][csa_i],
@@ -538,15 +669,14 @@ def bind_deepseek_v4_proxy_cache_views(model, vllm_config) -> bool:
                 int(model.args.index_head_dim),
                 is_indexer=True,
             )
-            csa_i += 1
         elif ratio == 128:
+            hca_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
                 attn.compressor,
                 views["hca_main"][hca_i],
                 num_slots,
                 int(model.args.head_dim),
             )
-            hca_i += 1
     # Persistent decode-metadata buffers for the FULL decode CUDA/HIP graph.
     # Allocated once (sized to the worst-case decode shape) so build() can
     # refresh them in place each step; the captured kernels read stable
@@ -617,17 +747,80 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
                 compressor.score_state[idx] = float("-inf")
 
 
-def _infer_atom_attn_state(common_attn_metadata):
+def _infer_atom_attn_state(common_attn_metadata, num_spec_tokens: int = 0):
+    """Classify the batch as DECODE / PREFILL_PREFIX / PREFILL_NATIVE.
+
+    A speculative-decode verify (MTP) step contributes a *uniform*
+    ``1 + num_speculative_tokens`` query rows per request, so its
+    ``max_query_len`` is ``1 + num_spec_tokens`` (== 2 for the default MTP
+    k=1), NOT 1. vLLM batches exactly these query lengths as a uniform decode
+    (its ``reorder_batch_threshold`` is ``1 + num_speculative_tokens`` for
+    spec-as-decode backends) and dispatches the captured FULL decode graph for
+    them. ATOM must agree: a batch whose longest query fits inside the spec
+    decode block is DECODE, so the build stages the per-fwd metadata into the
+    persistent fixed-address decode buffers that the captured graph replays
+    against. The old ``max_query_len == 1`` test classified the verify batch as
+    PREFILL, which builds fresh per-step tensors at new addresses; the captured
+    decode graph then replays against stale addresses -> garbage outputs under
+    cudagraph (eager is unaffected because nothing is captured). Mirrors native
+    ATOM, where the verify step is ``AttnState.DECODE`` with
+    ``max_seqlen_q == num_spec_step + 1`` (deepseek_v4_attn.py:prepare_decode).
+
+    ``max_query_len`` alone is NOT sufficient, though. vLLM's batch reorder
+    (``reorder_batch_to_split_decodes_and_prefills``) groups by *scheduled token
+    count*, so a request whose current step has ``<= 1 + num_spec`` query tokens
+    but is still PREFILLING -- a fresh <=decode_q-token prompt (``num_computed ==
+    0``) or a chunked-prefill tail whose remaining tokens are ``<= decode_q``
+    (a "short extend") -- can sit in the same batch as real decodes. If the
+    batch has no longer prefill row to push ``max_query_len`` past ``decode_q``,
+    the ``max_q``-only test would misclassify it as DECODE and feed those
+    prefill rows through the fixed-shape paged decode path: ``_score_topk_decode``
+    reshapes ``[bs, next_n]`` assuming ONE uniform decode length (a ragged
+    ``[4,4,4,1]`` breaks the view) and a fresh row (no committed K) needs the
+    prefill index build, not the decode one. So gate DECODE on vLLM's own
+    uniform-decode predicate plus a prefill guard (see ``_is_pure_uniform_decode``),
+    using CPU-resident metadata only (NO H2D/D2H sync). A non-uniform or
+    prefill-containing batch cannot be a FULL-captured decode anyway (capture is
+    gated on ``batch_descriptor.uniform``), so routing it to PREFILL -- where
+    ``_populate_indexer``'s leading-uniform-decode split already peels the decode
+    prefix onto the paged path and folds the rest onto the dense path -- is both
+    correct and capture-safe.
+    """
     from atom.utils.forward_context import AttnState
 
     if common_attn_metadata is None:
         return AttnState.PREFILL_NATIVE
-    if getattr(common_attn_metadata, "max_query_len", 0) == 1:
+    decode_q = 1 + max(0, int(num_spec_tokens))
+    if _is_pure_uniform_decode(common_attn_metadata, decode_q):
         return AttnState.DECODE
     num_computed = getattr(common_attn_metadata, "_num_computed_tokens_cpu", None)
     if num_computed is not None and bool((num_computed > 0).any().item()):
         return AttnState.PREFILL_PREFIX
     return AttnState.PREFILL_NATIVE
+
+
+def _is_pure_uniform_decode(common_attn_metadata, decode_q: int) -> bool:
+    """True iff the batch is the exact uniform decode vLLM captures a graph for.
+
+    Reuses vLLM'sown uniform-decode definition (``GPUModelRunner._is_uniform_decode``):
+    ``max_query_len == decode_q`` and ``num_actual_tokens == decode_q * num_reqs``
+    -- pure scalars already on ``common_attn_metadata`` (padded decode rows are
+    also ``decode_q`` long, so the product identity still holds). That aligns our
+    DECODE state exactly with when vLLM dispatches its captured FULL decode graph.
+    Since the predicate is purely shape-based, it is paired with ``is_prefilling``
+    (a CPU bool ``num_computed < num_prompt``, padded rows zeroed) to reject a
+    fresh ``decode_q``-length prompt / extend that is uniform yet not a real
+    decode (no committed K -> needs the prefill index build, not paged decode).
+    """
+    num_reqs = int(getattr(common_attn_metadata, "num_reqs", 0) or 0)
+    if num_reqs <= 0:
+        return False
+    is_pref = getattr(common_attn_metadata, "is_prefilling", None)
+    if is_pref is not None and bool(is_pref[:num_reqs].any()):
+        return False
+    max_q = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
+    num_tokens = int(getattr(common_attn_metadata, "num_actual_tokens", 0) or 0)
+    return max_q == decode_q and num_tokens == decode_q * num_reqs
 
 
 def _counts_to_indptr(counts: np.ndarray) -> np.ndarray:
@@ -670,81 +863,84 @@ def _make_compress_plans(
 class _V4StateSlotAllocator:
     """Stable per-request state-slot allocator over ``[0, num_slots)``.
 
-    Keyed by each request's first KV block id, which is unique and stable for
-    the request's lifetime because V4 disables prefix caching (no block sharing
-    across requests). This hands back the same state slot for every
-    chunked-prefill step and every decode step of a request, so its SWA ring and
-    compressor state accumulate in one place -- matching native ATOM's
-    per-request cache slots.
+    Keyed by each request's id (``req_id``), the canonical, host-resident
+    request identity from vLLM's ``InputBatch``. This hands back the same state
+    slot for every chunked-prefill step and every decode step of a request, so
+    its SWA ring and compressor state accumulate in one place -- matching native
+    ATOM's per-request cache slots.
+
+    Keying on ``req_id`` (rather than the first KV block id, which lived on the
+    GPU block table) removes the per-step D2H copy + host<->device sync that the
+    block-id key required, and is immune to vLLM recycling a finished request's
+    blocks to a new request within the same step.
 
     A slot is reported as freshly allocated (caller resets it) when it is newly
-    bound to an unseen block id, or when its block id reappears for a brand-new
-    request (``num_computed == 0``) because vLLM recycled the block after the
-    previous owner finished.
+    bound to an unseen ``req_id``, or when a known ``req_id`` reappears with
+    ``num_computed == 0`` -- vLLM recomputes preempted requests from scratch
+    under the same id, so the slot's accumulated state must be cleared on resume.
 
     Slots are reclaimed lazily on exhaustion by evicting the least-recently-seen
-    slot whose block id is absent from the current step (its request finished or
-    was preempted -- vLLM recomputes preempted requests from scratch, so a reset
-    on resume is correct). vLLM caps concurrency at ``num_slots`` (max_num_seqs),
-    so a request that is live this step never has its slot evicted.
+    slot whose ``req_id`` is absent from the current step (its request finished
+    or was preempted). vLLM caps concurrency at ``num_slots`` (max_num_seqs), so
+    a request that is live this step never has its slot evicted.
     """
 
     def __init__(self, num_slots: int):
         self.num_slots = max(1, int(num_slots))
-        self._block_to_slot: dict[int, int] = {}
-        self._slot_to_block: list[int] = [-1] * self.num_slots
+        self._key_to_slot: dict[object, int] = {}
+        self._slot_to_key: list[object] = [None] * self.num_slots
         self._free: list[int] = list(range(self.num_slots - 1, -1, -1))
         self._last_seen: list[int] = [-1] * self.num_slots
         self._step = 0
 
-    def assign(self, first_block_ids, num_computed):
-        """Return ``(slots: np.int32[num_reqs], reset_slots: set[int])``."""
+    def assign(self, req_keys, num_computed):
+        """Return ``(slots: np.int32[num_reqs], reset_slots: set[int])``.
+
+        ``req_keys`` is a per-request sequence of stable, hashable keys (the
+        ``req_id`` strings), aligned with the batch rows.
+        """
         self._step += 1
-        # Pull both arrays to Python lists in one C call. Per-element
-        # ``int(np_arr[i])`` (a numpy-scalar -> Python-int conversion) was the
-        # dominant cost of this per-decode-step loop; ``.tolist()`` amortizes
-        # it. Local-bind the dict/list fields too -- attribute lookups inside
-        # the ``bs``-length loop add up at large batch (profiled #1 build cost).
-        fb = (
-            first_block_ids.tolist()
-            if hasattr(first_block_ids, "tolist")
-            else list(first_block_ids)
-        )
+        # Pull num_computed to a Python list in one C call (per-element
+        # numpy-scalar -> int was the dominant cost of this per-decode-step
+        # loop). req_keys is already a host-side list[str]. Local-bind the
+        # dict/list fields too -- attribute lookups inside the bs-length loop
+        # add up at large batch (profiled #1 build cost).
+        keys = list(req_keys)
         nc = (
             num_computed.tolist()
             if hasattr(num_computed, "tolist")
             else list(num_computed)
         )
-        n = len(fb)
-        active = set(fb)
-        block_to_slot = self._block_to_slot
-        slot_to_block = self._slot_to_block
+        n = len(keys)
+        active = set(keys)
+        key_to_slot = self._key_to_slot
+        slot_to_key = self._slot_to_key
         last_seen = self._last_seen
         step = self._step
         slots = [0] * n
         reset: set[int] = set()
         for i in range(n):
-            b = fb[i]
-            slot = block_to_slot.get(b)
+            k = keys[i]
+            slot = key_to_slot.get(k)
             if slot is None:
                 slot = self._acquire(active)
-                block_to_slot[b] = slot
-                slot_to_block[slot] = b
+                key_to_slot[k] = slot
+                slot_to_key[slot] = k
                 reset.add(slot)
             elif nc[i] == 0:
-                # Recycled block id now owned by a fresh request.
+                # Known request recomputed from scratch (preemption resume).
                 reset.add(slot)
             slots[i] = slot
             last_seen[slot] = step
         return np.asarray(slots, dtype=np.int32), reset
 
-    def _acquire(self, active: set[int]) -> int:
+    def _acquire(self, active: set) -> int:
         if self._free:
             return self._free.pop()
         victim = -1
         victim_seen = None
         for s in range(self.num_slots):
-            if self._slot_to_block[s] in active:
+            if self._slot_to_key[s] in active:
                 continue
             if victim_seen is None or self._last_seen[s] < victim_seen:
                 victim = s
@@ -754,10 +950,10 @@ class _V4StateSlotAllocator:
             # concurrency exceeds num_slots, which vLLM forbids. Fall back to
             # slot 0 rather than crash.
             victim = 0
-        old = self._slot_to_block[victim]
-        if old >= 0:
-            self._block_to_slot.pop(old, None)
-        self._slot_to_block[victim] = -1
+        old = self._slot_to_key[victim]
+        if old is not None:
+            self._key_to_slot.pop(old, None)
+        self._slot_to_key[victim] = None
         return victim
 
 
@@ -768,6 +964,9 @@ def build_atom_v4_attention_metadata(
     slot_allocator=None,
     decode_bufs=None,
     capturing=False,
+    req_ids=None,
+    num_spec_tokens=0,
+    cudagraph_token_sizes=None,
 ):
     """Translate a vLLM ``CommonAttentionMetadata`` into ATOM's V4
     ``AttentionMetaData``.
@@ -781,12 +980,18 @@ def build_atom_v4_attention_metadata(
     (eager-only). ``capturing`` forces ``arange`` state slots so a CUDA-graph
     capture dummy batch (whose block ids are NULL) does not pollute the real
     per-request slot allocator.
+
+    ``req_ids`` (batch-ordered, host-resident) is the slot-allocation key,
+    threaded in by the req_id passthrough patch with no device sync. The decode
+    slot-assignment path requires it: if it is missing/short there (patch not
+    applied or out of sync) the build raises rather than reading the device
+    block table.
     """
     from atom.utils.forward_context import AttentionMetaData
 
     if common_attn_metadata is None:
         return AttentionMetaData()
-    state = _infer_atom_attn_state(common_attn_metadata)
+    state = _infer_atom_attn_state(common_attn_metadata, num_spec_tokens)
     is_decode = state.value == "decode"
     device = common_attn_metadata.seq_lens.device
     num_reqs = int(common_attn_metadata.num_reqs)
@@ -796,12 +1001,25 @@ def build_atom_v4_attention_metadata(
     q_np = q_cpu[: num_reqs + 1].numpy().astype(np.int32)
     lens = np.diff(q_np).astype(np.int32)
     total = int(lens.sum())  # real tokens (CG-padded reqs contribute 0)
-    # NOTE: `seq_lens_cpu` can be a property returning a multi-element tensor;
-    # `a or b` on tensors raises "Boolean value of Tensor ... is ambiguous"
-    # (surfaced at CG-capture warmup where batch size > 1). Test for None.
-    seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+    # Per-seq lengths on the HOST without a device sync. This vLLM build does
+    # not expose an eager `seq_lens_cpu`, so `seq_lens.cpu()` is a blocking D2H
+    # that drains the prior decode step's GPU work -> a large per-step bubble.
+    # Prefer, in order: a future `seq_lens_cpu`; the (deprecated but exact)
+    # `_seq_lens_cpu`; vLLM's CPU-resident `seq_lens_cpu_upper_bound` (exact for
+    # prefill and for every decode row outside async spec-decode, which this
+    # integration does not use). Fall back to the D2H only if none exist.
+    # NOTE: test each for None explicitly -- `a or b` on a multi-element tensor
+    # raises "Boolean value of Tensor ... is ambiguous" (e.g. CG-capture warmup).
+    # IMPORTANT: read the RAW backing attributes, never the `seq_lens_cpu`
+    # property -- that property lazily does `seq_lens.to("cpu")` (a blocking
+    # D2H) whenever `_seq_lens_cpu` is unset, which is exactly the bubble we are
+    # removing. `_seq_lens_cpu` is the exact CPU tensor when present;
+    # `seq_lens_cpu_upper_bound` is a CPU tensor that is always populated and is
+    # exact for prefill and every decode row outside async spec-decode (which
+    # this integration does not use). Only as a last resort do the D2H.
+    seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
     if seq_lens_cpu is None:
-        seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
     if seq_lens_cpu is None:
         seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
     seq_np = seq_lens_cpu[:num_reqs].numpy().astype(np.int32)
@@ -838,25 +1056,51 @@ def build_atom_v4_attention_metadata(
     # Real reqs are contiguous at the front of a (reordered) decode batch; CG
     # padding appends zero-query-len reqs at the tail.
     scheduled_bs = int((lens > 0).sum()) if is_decode else num_reqs
-    # T_pad: the captured per-fwd token count (== num_actual_tokens, which vLLM
-    # sets to the cudagraph bucket size on capture/replay; == total in eager).
-    T_pad = int(getattr(common_attn_metadata, "num_actual_tokens", total) or total)
-    if T_pad < total:
-        T_pad = total
+    # T_pad: the per-fwd token count seen by the model. For draft decode, vLLM
+    # keeps `num_actual_tokens` at the real batch size but passes padded
+    # input/slot tensors; use slot_mapping length so ATOM metadata also carries
+    # a sentinel tail for padded draft slots.
+    T_pad = _v4_padded_token_count(common_attn_metadata, total)
+    # The model forward runs over ``positions`` padded to a CUDA/HIP-graph
+    # capture-size bucket even when vLLM leaves the *attention metadata* token
+    # count unpadded (PIECEWISE decode: ``pad_attn`` is FULL-only). Size the
+    # decode token-pad (and thus the ``batch_id == -1`` sentinel tail) to that
+    # same bucket so the fused decode ``qk_norm_rope`` never reads
+    # ``batch_id_per_token`` past its end for the padded tail rows.
+    if is_decode:
+        T_pad = _v4_round_to_cudagraph_bucket(T_pad, cudagraph_token_sizes)
 
     # ---- per-request state slot ----
-    if capturing or slot_allocator is None or scheduled_bs == 0:
+    # Real per-request state slots are assigned only for genuine (non-capture)
+    # builds that carry a live allocator and real scheduled rows. The slot key
+    # is vLLM's batch-ordered req_ids (the canonical, host-resident request
+    # identity), threaded in by the ATOM req_id passthrough patch with no device
+    # sync (installed at register.apply_vllm_req_id_passthrough_patch).
+    real_slots = not capturing and slot_allocator is not None and scheduled_bs > 0
+    if real_slots and req_ids is None:
+        # Patch contract violated: a real build with a live allocator must
+        # receive batch-ordered req_ids. None means the passthrough patch did
+        # not run (not installed / out of sync) -> fail fast rather than
+        # silently degrading to the old block-id key, which needed a per-step
+        # D2H sync and was not immune to vLLM recycling a finished request's
+        # blocks to a new request within the same step.
+        raise RuntimeError(
+            "ATOM V4 decode slot assignment requires batch-ordered req_ids "
+            f"from the vLLM passthrough patch (scheduled_bs={scheduled_bs}), "
+            "but none were threaded in. Ensure "
+            "apply_vllm_req_id_passthrough_patch() ran at model registration "
+            "and is still active."
+        )
+    if not real_slots or len(req_ids) < scheduled_bs:
+        # Capture / profiling / warmup / empty synthetic batch (patch ran but
+        # there are no -- or too few -- real request ids): throwaway arange
+        # slots. The batch's results are discarded, and its NULL block ids /
+        # absent req ids must not pollute the real per-request slot allocator.
         slot_arr = np.arange(num_reqs, dtype=np.int32)
         reset_slots: set = set()
     else:
-        first_block_ids = (
-            common_attn_metadata.block_table_tensor[:scheduled_bs, 0]
-            .detach()
-            .cpu()
-            .numpy()
-        )
         slot_real, reset_slots = slot_allocator.assign(
-            first_block_ids, chunk_start_np[:scheduled_bs]
+            req_ids[:scheduled_bs], chunk_start_np[:scheduled_bs]
         )
         # Padded reqs get slot 0 (a valid slot); their tokens carry batch_id ==
         # -1 so the per-token decode kernels never read them.
@@ -946,7 +1190,60 @@ def build_atom_v4_attention_metadata(
         _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
     else:
         _populate_prefill(md, common_attn_metadata, batch_np, pos_np, q_np, positions)
-    _populate_indexer(md, common_attn_metadata, batch_np, positions[:total], device)
+    # Decode/prefill split for the indexer. vLLM reorders rows with
+    # query_len <= (1 + num_spec_tokens) — i.e. decode / spec-verify / 1-token
+    # rows — to the FRONT of the batch (reorder_batch_threshold). Grouping by
+    # query length is exactly what the indexer needs: those rows only require
+    # committed K from the paged cache, so they take the fixed-shape paged
+    # `_score_topk_decode` path and are kept out of the dense prefill logits.
+    decode_q = 1 + max(0, int(num_spec_tokens))
+    if is_decode:
+        idx_num_decodes = num_reqs
+        idx_num_decode_tokens = total
+        idx_decode_next_n = int(lens[0]) if num_reqs > 0 else 1
+    else:
+        # The paged `_score_topk_decode` reshapes the decode tokens to
+        # `[num_decode_tokens // decode_next_n, decode_next_n]`, so the paged
+        # decode group must be a contiguous batch prefix that shares ONE query
+        # length (`decode_next_n`). vLLM usually reorders the short decode /
+        # spec-verify rows (query_len <= decode_q) ahead of the longer prefill
+        # rows, but that layout is NOT guaranteed under MTP + chunked prefill:
+        #   * the decode prefix is not uniform -- a steady-state verify row is
+        #     `1 + num_spec_tokens` long, but a request on its first decode step
+        #     (or one whose drafts were all rejected) contributes a shorter row,
+        #     e.g. `[4, 4, ..., 4, 1]`; and
+        #   * a prefill chunk can land AMONG the verify rows, e.g. `[4, 4, 10,
+        #     4]`, so decode-length rows are not always a clean leading prefix.
+        # Rather than assert a layout vLLM does not promise, take the paged
+        # decode group as the leading contiguous run of rows that share the
+        # FIRST row's length (only when that is a decode/verify length,
+        # `<= decode_q`), and end it at the first row that differs -- whether a
+        # short decode straggler or a longer prefill row. Everything from there
+        # flows to the dense prefill path below, which handles arbitrary per-row
+        # query lengths. This is memory-safe: the long-context verify rows are
+        # emitted first, so they stay on the paged path, and only the (few)
+        # rows after the first mismatch reach the dense `total_committed` -- so
+        # its `[total_tokens, total_committed]` logits never explode the way
+        # they would if every running seq were summed in. `lens` is a CPU numpy
+        # array (from `query_start_loc.cpu()`), so this adds no H2D/D2H sync.
+        if num_reqs > 0 and int(lens[0]) <= decode_q:
+            idx_decode_next_n = int(lens[0])
+            mismatch = np.nonzero(lens != idx_decode_next_n)[0]
+            idx_num_decodes = int(mismatch[0]) if mismatch.size else num_reqs
+        else:
+            idx_decode_next_n = 1
+            idx_num_decodes = 0
+        idx_num_decode_tokens = int(q_np[idx_num_decodes]) if idx_num_decodes > 0 else 0
+    _populate_indexer(
+        md,
+        common_attn_metadata,
+        batch_np,
+        positions[:total],
+        device,
+        num_decodes=idx_num_decodes,
+        num_decode_tokens=idx_num_decode_tokens,
+        decode_next_n=idx_decode_next_n,
+    )
     return md
 
 
@@ -979,11 +1276,7 @@ def _populate_decode_persistent(
     buffer base so their data pointers are stable across builds (the captured
     decode-attention kernels read these addresses on replay).
     """
-    from atom.model_ops.v4_kernels.paged_decode_indices import (
-        write_v4_paged_decode_indices,
-    )
-
-    from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_hca_compress_tail
+    from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_indices_fused
 
     win = int(md.swa_window)
     cs = int(md.swa_cs)
@@ -1015,21 +1308,18 @@ def _populate_decode_persistent(
     hca_indptr_gpu = bufs.stage(bufs.indptr_hca, hca_indptr)
     hca_total = int(hca_indptr[total]) if total else 0
 
-    # Build the whole decode index set on-GPU with two Triton kernels writing
-    # directly into the persistent idx buffers:
-    #   1. `write_v4_paged_decode_indices` -- the SWA window prefix shared by
-    #      the SWA / CSA / HCA regions.
-    #   2. `write_v4_decode_hca_compress_tail` -- the HCA compress tail
-    #      (`swa_pages + block_tables[seq, j]`), reading the block table
-    #      straight from GPU.
-    # The two write each token's disjoint prefix / tail, together covering its
-    # full HCA segment `[hca_indptr[t], hca_indptr[t+1])`, so no `-1` pre-fill
-    # is needed. This replaces the prior CPU HCA-tail scatter (a per-step
-    # block-table D2H + numpy repeat/cumsum/fancy-index + H2D). T == real
-    # tokens; the `-1` batch_id pad tail is skipped natively by both kernels.
+    # Build the whole decode index set on-GPU with one fused Triton kernel
+    # writing directly into the persistent idx buffers. Each token's program
+    # writes both its SWA window prefix (slice tail of SWA / CSA / HCA) and its
+    # HCA compress section (slice head of HCA: `swa_pages + block_tables[seq, j]`,
+    # read straight from GPU). The two segments are disjoint and together cover
+    # the full HCA segment `[hca_indptr[t], hca_indptr[t+1])`, so no `-1`
+    # pre-fill is needed. This replaces the prior CPU HCA-tail scatter (a
+    # per-step block-table D2H + numpy repeat/cumsum/fancy-index + H2D). T ==
+    # real tokens; the `-1` batch_id pad tail is skipped natively by the kernel.
     swa_indices_gpu = bufs.idx_swa.gpu
     csa_indices_gpu = bufs.idx_csa.gpu
-    write_v4_paged_decode_indices(
+    write_v4_decode_indices_fused(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
@@ -1039,19 +1329,11 @@ def _populate_decode_persistent(
         swa_indices=swa_indices_gpu,
         csa_indices=csa_indices_gpu,
         hca_indices=bufs.idx_hca.gpu,
+        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+        block_tables=common.block_table_tensor,
         T=total,
         win=win,
         cs=cs,
-    )
-    write_v4_decode_hca_compress_tail(
-        batch_id_per_token=md.batch_id_per_token,
-        positions=positions_gpu,
-        hca_indptr=hca_indptr_gpu,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
-        block_tables=common.block_table_tensor,
-        hca_indices=bufs.idx_hca.gpu,
-        T=total,
-        win=win,
         swa_pages=swa_pages,
     )
     md.kv_indices_swa = swa_indices_gpu[: int(swa_indptr[total])]
@@ -1063,24 +1345,68 @@ def _populate_decode_persistent(
     md.swa_pages = swa_pages
 
 
-def _populate_indexer(md, common, batch_np, positions, device):
-    n_csa = md.n_committed_csa_per_seq_cpu
+def _populate_indexer(
+    md,
+    common,
+    batch_np,
+    positions,
+    device,
+    num_decodes=0,
+    num_decode_tokens=0,
+    decode_next_n=1,
+):
+    # In a MIXED (chunked-prefill + decode) batch vLLM orders the decode rows
+    # first (reorder threshold == 1[+spec]); only the prefill rows feed the
+    # dense `fp8_mqa_logits` indexer. Build the committed cumsum / per-token
+    # start-end offsets over the PREFILL SEQUENCES ONLY (seqs [num_decodes:],
+    # tokens [num_decode_tokens:]) so the long-context decode seqs do NOT get
+    # summed into `total_committed` (the O(total_tokens x total_committed) dense
+    # logits that OOMs at high concurrency). The decode rows are scored by the
+    # fixed-shape paged path (`_score_topk_decode`), which reads only the full
+    # per-seq committed tensor kept below. Pure prefill => num_decodes == 0, so
+    # this reduces to the whole batch (unchanged).
+    n_csa = md.n_committed_csa_per_seq_cpu[num_decodes:]
     cu = np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(n_csa, dtype=np.int32)])
     cu[-1] = max(int(cu[-1]), 1)
     cu_gpu = torch.from_numpy(cu).to(device)
-    bid = md.batch_id_per_token
+    # Per-prefill-token batch id, rebased to 0-based prefill-seq indexing.
+    bid = (md.batch_id_per_token[num_decode_tokens:] - num_decodes).to(
+        md.batch_id_per_token.dtype
+    )
+    n_committed_pref = md.n_committed_csa_per_seq[num_decodes:]
+    pos_pref = positions[num_decode_tokens:]
     base = cu_gpu[bid].to(torch.int32)
-    end = base + torch.minimum(
-        (positions + 1) // 4, md.n_committed_csa_per_seq[bid]
-    ).to(torch.int32)
+    end = base + torch.minimum((pos_pref + 1) // 4, n_committed_pref[bid]).to(
+        torch.int32
+    )
     md.indexer_meta = {
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,
+        # FULL per-seq committed (decode-first order): the decode sub-call
+        # slices [:num_decodes]; the pure-decode path reads it whole.
         "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_token_gpu": bid,
+        "batch_id_per_token_gpu": md.batch_id_per_token,
         "seq_base_per_token_gpu": base,
         "cu_starts_gpu": base,
         "cu_ends_gpu": end,
+        # Decode/prefill split (consumed by `indexer_score_topk` for mixed
+        # batches; harmless for pure prefill where num_decode_tokens == 0).
+        "num_decodes": int(num_decodes),
+        "num_decode_tokens": int(num_decode_tokens),
+        "decode_next_n": int(decode_next_n),
+        # Largest committed compressed-KV length among the DECODE sub-batch
+        # seqs (host int from the CPU committed array -- no D2H sync). The
+        # mixed-batch paged `_score_topk_decode` sizes its per-fwd logits width
+        # to this instead of the model-max `_max_model_len_idx` (= max_seq_len
+        # // compress_ratio). The deepgemm kernel guards every store by
+        # `col < max_model_len_arg` and only writes [0, n_committed) per row,
+        # so a width >= this max is exact, while the model-max width would
+        # allocate a ~GB transient per CSA layer and OOM at high concurrency.
+        "decode_max_committed": (
+            int(md.n_committed_csa_per_seq_cpu[:num_decodes].max())
+            if num_decodes > 0
+            else 0
+        ),
     }
 
 
@@ -1120,6 +1446,28 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         md.skip_prefix_len_csa = empty.clone()
         return
 
+    # ----- Exact per-seq chunk start (sync-free; robust to spec-decode) ------
+    # chunk_start == the global position of each sequence's FIRST token this
+    # forward (== num_computed_tokens by definition). Derive it from the real
+    # per-token ``positions`` rather than ``seq_len - query_len``: in
+    # speculative-decode (MTP) mixed prefill+verify batches
+    # ``seq_lens_cpu_upper_bound`` can OVERESTIMATE seq_len, so
+    # ``seq_len - query_len`` exceeds a verify token's true position. That makes
+    # ``prefix_swa_count = chunk_start - swa_low`` exceed the window ``win``, and
+    # the index kernel (``BLOCK_N = next_pow2(win) == win``) only writes the
+    # first ``win`` slots, leaving the overflow slot UNINITIALIZED -> a garbage
+    # paged offset -> illegal memory access in sparse_attn_v4_paged_prefill.
+    # The first-token position is exact and guarantees token_pos_in_chunk >= 0
+    # for every token, capping prefix_swa_count at ``win``. Both the CPU indptr
+    # sizing below and the Triton scatter kernel read this same array, so they
+    # stay consistent.
+    lens_cs = np.diff(q_np[: num_reqs + 1]).astype(np.int64)
+    first_tok = q_np[:num_reqs].astype(np.int64)
+    chunk_start_seq = md.chunk_start_per_seq_cpu[:num_reqs].astype(np.int32).copy()
+    has_tok = lens_cs > 0
+    chunk_start_seq[has_tok] = pos_np[first_tok[has_tok]].astype(np.int32)
+    md.chunk_start_per_seq_cpu = chunk_start_seq
+
     # ----- Per-token counts (CPU numpy; cumsum gives indptr totals w/o D2H) ---
     chunk_start_pt = md.chunk_start_per_seq_cpu[batch_np]
     token_pos_in_chunk = pos_np - chunk_start_pt
@@ -1130,7 +1478,13 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     csa_valid_k = np.minimum(
         np.minimum((pos_np + 1) // 4, n_csa_pt), index_topk
     ).astype(np.int32)
-    n_hca_pt = md.n_committed_hca_per_seq_cpu[batch_np].astype(np.int32)
+    # Per-token causal cap, mirroring CSA above and the kernel
+    # (write_v4_paged_prefill_indices: n_hca = min((pos+1)//128, committed)).
+    # Without it the indptr reserves `committed` HCA slots but the kernel only
+    # writes min((pos+1)//128, committed), leaving uninitialized tail garbage.
+    n_hca_pt = np.minimum(
+        (pos_np + 1) // 128, md.n_committed_hca_per_seq_cpu[batch_np]
+    ).astype(np.int32)
 
     ext_indptr_np = _counts_to_indptr(extend_count)
     swa_indptr_np = _counts_to_indptr(prefix_swa_count)
@@ -1268,17 +1622,62 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     md.swa_pages = swa_pages
 
 
-def get_deepseek_v4_proxy_metadata_from_vllm_context():
+def get_deepseek_v4_proxy_metadata_from_vllm_context(
+    layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+):
     from vllm.forward_context import get_forward_context, is_forward_context_available
 
     if not is_forward_context_available():
         return None
     meta = get_forward_context().attn_metadata
     if isinstance(meta, dict):
-        return meta.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+        return meta.get(layer_name)
     if isinstance(meta, list) and meta and isinstance(meta[0], dict):
-        return meta[0].get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+        return meta[0].get(layer_name)
     return None
+
+
+def _is_vllm_decode_graph_phase(attn_metadata, atom_config) -> bool:
+    """True when vLLM is inside its CUDA-graph capture window for V4 decode.
+
+    vLLM sets ``cudagraph_capturing_enabled=True`` around both the eager warmup
+    and the actual capture. The flag is global and defaults to True, so narrow
+    it to real V4 decode-shaped forwards before mapping it to ATOM's
+    ``in_hipgraph``.
+    """
+    if getattr(getattr(attn_metadata, "state", None), "value", None) != "decode":
+        return False
+    try:
+        import vllm.compilation.monitor as vllm_monitor
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        vllm_config = getattr(
+            getattr(atom_config, "plugin_config", None), "vllm_config", None
+        )
+        if vllm_config is None:
+            return False
+        if getattr(getattr(vllm_config, "model_config", None), "enforce_eager", False):
+            return False
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        if getattr(compilation_config, "cudagraph_mode", None) == CUDAGraphMode.NONE:
+            return False
+        if not is_forward_context_available():
+            return False
+        vllm_ctx = get_forward_context()
+        batch_descriptor = getattr(vllm_ctx, "batch_descriptor", None)
+        is_uniform_decode_bucket = bool(
+            batch_descriptor is not None and getattr(batch_descriptor, "uniform", False)
+        )
+        is_single_query_decode = int(getattr(attn_metadata, "max_seqlen_q", 0)) == 1
+        if not (is_uniform_decode_bucket or is_single_query_decode):
+            return False
+        return bool(getattr(vllm_monitor, "cudagraph_capturing_enabled", False))
+    except Exception:
+        return False
 
 
 @contextmanager
@@ -1292,6 +1691,7 @@ def atom_deepseek_v4_forward_context(
     state_model=None,
     meta_params=None,
     slot_allocator=None,
+    proxy_layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
 ):
     from atom.utils.forward_context import (
         Context,
@@ -1300,7 +1700,9 @@ def atom_deepseek_v4_forward_context(
     )
 
     if common_attn_metadata is None:
-        common_attn_metadata = get_deepseek_v4_proxy_metadata_from_vllm_context()
+        common_attn_metadata = get_deepseek_v4_proxy_metadata_from_vllm_context(
+            proxy_layer_name
+        )
     # Fast path: the proxy metadata builder already built the ATOM metadata into
     # persistent buffers (outside any captured region) and attached it. This is
     # the only path that is CUDA/HIP-graph safe -- the captured forward merely
@@ -1311,10 +1713,22 @@ def atom_deepseek_v4_forward_context(
         # bound): build inline with fresh tensors. Never captured.
         if common_attn_metadata is not None:
             common_attn_metadata.positions = positions
+        _spec_cfg = getattr(atom_config, "speculative_config", None)
+        _num_spec = (
+            int(getattr(_spec_cfg, "num_speculative_tokens", 0) or 0)
+            if _spec_cfg is not None
+            else 0
+        )
         attn_metadata = build_atom_v4_attention_metadata(
             common_attn_metadata,
             meta_params=meta_params,
             slot_allocator=slot_allocator,
+            decode_bufs=(
+                getattr(state_model, "_atom_v4_decode_bufs", None)
+                if state_model is not None
+                else None
+            ),
+            num_spec_tokens=_num_spec,
         )
         # Selective per-slot reset: clear only the slots the allocator just
         # bound to a fresh request (replaces the old global position-0 reset,
@@ -1323,28 +1737,9 @@ def atom_deepseek_v4_forward_context(
             reset_slots = getattr(attn_metadata, "reset_slots", None)
             if reset_slots:
                 reset_deepseek_v4_state_slots(state_model, reset_slots)
-    import os
-
-    if os.environ.get("ATOM_VLLM_V4_DEBUG") == "1":
-        try:
-            import torch.distributed as dist
-
-            rank = dist.get_rank() if dist.is_initialized() else 0
-        except Exception:
-            rank = 0
-        if rank == 0:
-            ids = None if input_ids is None else input_ids[:8].detach().cpu().tolist()
-            pos = positions[:8].detach().cpu().tolist()
-            seq = (
-                None
-                if common_attn_metadata is None
-                else common_attn_metadata.seq_lens[:8].detach().cpu().tolist()
-            )
-            n_csa = getattr(attn_metadata, "n_committed_csa_per_seq_cpu", None)
-            print(
-                f"[ATOM_VLLM_V4_DEBUG] state={attn_metadata.state} max_q={attn_metadata.max_seqlen_q} ids={ids} pos={pos} seq={seq} n_csa={None if n_csa is None else n_csa[:8].tolist()}",
-                flush=True,
-            )
+    in_hipgraph = bool(getattr(attn_metadata, "in_hipgraph", False)) or (
+        _is_vllm_decode_graph_phase(attn_metadata, atom_config)
+    )
     is_prefill = attn_metadata.state.value.startswith("prefill")
     batch_size = int(
         getattr(common_attn_metadata, "num_reqs", 0)
@@ -1363,6 +1758,7 @@ def atom_deepseek_v4_forward_context(
         atom_config=atom_config,
         context=context,
         num_tokens=int(positions.numel()),
+        in_hipgraph=in_hipgraph,
     )
     try:
         yield
