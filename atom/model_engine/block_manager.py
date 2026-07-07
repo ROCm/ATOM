@@ -313,7 +313,9 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        self.swa.release(seq)  # release SWA blocks + clear swa_block_table (no-op if disabled)
+        self.swa.release(
+            seq
+        )  # release SWA blocks + clear swa_block_table (no-op if disabled)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:

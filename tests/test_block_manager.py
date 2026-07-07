@@ -407,7 +407,9 @@ class TestM2DualSwaPool:
         toks = list(range(1, 13))  # 3 blocks
         s1 = seq_factory(toks)
         bm.allocate(s1, bm.can_allocate(s1))
-        bm.swa.ensure_for_tokens(s1, 0, len(toks))  # fill SWA (scheduler does this pre-forward)
+        bm.swa.ensure_for_tokens(
+            s1, 0, len(toks)
+        )  # fill SWA (scheduler does this pre-forward)
         bm.hash_blocks(s1, len(toks))  # publish hashes (compressed + swa)
         s2 = seq_factory(toks)
         n2 = bm.can_allocate(s2)
