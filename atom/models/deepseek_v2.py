@@ -1774,7 +1774,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype=source_quant_dtype,
                 prefix=f"{prefix}.fused_qkv_a_proj",
             )
-            
+
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
