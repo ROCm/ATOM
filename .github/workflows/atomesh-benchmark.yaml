@@ -117,6 +117,7 @@ env:
   ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != '' && inputs.atomesh_slurm_account || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks') }}
   ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != '' && inputs.atomesh_slurm_partition || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks') }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
+  ATOMESH_DASHBOARD_HARDWARE: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'MI350X' || 'MI355X' }}
   ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root != '' && inputs.atomesh_log_root || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || '/it-share/ATOMESH_LOG/') }}
   ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || '/mnt/models' }}
   ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != '' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'mia1-p02-g42,mia1-p02-g44') }}
@@ -289,6 +290,7 @@ jobs:
             "atomesh-results/${MATRIX_ID}" \
             --output "${BENCHMARK_ACTION_INPUT}" \
             --summary "${SUMMARY_PATH}" \
+            --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           {
@@ -315,8 +317,10 @@ jobs:
   summarize-results:
     name: Summarize ATOMesh benchmark results
     needs: [run-model-benchmark]
-    if: ${{ !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
+    if: ${{ always() && !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
     runs-on: ubuntu-latest
+    outputs:
+      has_results: ${{ steps.summary.outputs.has_results }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -329,16 +333,35 @@ jobs:
           path: atomesh-results
 
       - name: Build benchmark summary
+        id: summary
         run: |
           set -euo pipefail
+          mkdir -p atomesh-results
           python3 .github/scripts/atomesh/process_result.py \
             atomesh-results \
             --output atomesh-benchmark-action.json \
             --summary atomesh-benchmark-summary.md \
+            --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           cat atomesh-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+          ENTRY_COUNT="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("atomesh-benchmark-action.json")
+          entries = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
+          print(len(entries))
+          PY
+          )"
+          echo "entry_count=${ENTRY_COUNT}" >> "$GITHUB_OUTPUT"
+          if [[ "${ENTRY_COUNT}" -gt 0 ]]; then
+            echo "has_results=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+            echo "No successful ATOMesh benchmark result JSONs were produced; dashboard publish will be skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload benchmark summary
+        if: ${{ steps.summary.outputs.has_results == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: atomesh-benchmark-summary
@@ -355,6 +378,7 @@ jobs:
     if: >-
       !cancelled()
       && needs.summarize-results.result == 'success'
+      && needs.summarize-results.outputs.has_results == 'true'
       && (
         github.event_name == 'schedule'
         || github.event_name == 'push'
@@ -384,6 +408,9 @@ jobs:
           Path("/tmp/atomesh_summary.js").write_text(
               "window.ATOMESH_RUN_URL = "
               + json.dumps("https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+              + ";\n"
+              + "window.ATOMESH_HARDWARE = "
+              + json.dumps("${{ env.ATOMESH_DASHBOARD_HARDWARE }}")
               + ";\n"
               + "window.ATOMESH_SUMMARY_MARKDOWN = "
               + json.dumps(summary, ensure_ascii=False)

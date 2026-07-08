@@ -243,7 +243,7 @@ def derive_fields(path: Path, payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def enrich_payload(
-    path: Path, payload: dict[str, Any], fields: dict[str, Any]
+    path: Path, payload: dict[str, Any], fields: dict[str, Any], hardware: str | None
 ) -> dict[str, Any]:
     env = slurm_job_env(path)
     enriched = dict(payload)
@@ -263,6 +263,13 @@ def enrich_payload(
     enriched.setdefault("decode_workers", env.get("DECODE_WORKERS"))
     enriched.setdefault("prefill_tp", env.get("PREFILL_TP"))
     enriched.setdefault("decode_tp", env.get("DECODE_TP"))
+    runner = env.get("SLURM_SUBMIT_RUNNER", "")
+    if hardware:
+        enriched["hardware"] = hardware
+    elif runner == "atomesh-cicd-mi350":
+        enriched["hardware"] = "MI350X"
+    elif runner == "atomesh-cicd":
+        enriched["hardware"] = "MI355X"
 
     if "total_token_throughput" not in enriched:
         enriched["total_token_throughput"] = number(
@@ -330,7 +337,9 @@ def perf_point(
     hardware = string_value(
         payload.get("hardware"), payload.get("gpu_name"), default="mi355x"
     ).lower()
-    if "mi355" in hardware:
+    if "mi350" in hardware:
+        hardware = "mi350x"
+    elif "mi355" in hardware:
         hardware = "mi355x"
     backend = string_value(
         payload.get("backend"), fields.get("backend"), default="atom"
@@ -457,6 +466,7 @@ def collect_dashboard_entries(
     paths: list[Path],
     run_url: str | None,
     gsm8k_scores: dict[tuple[str, int], dict[str, Any]],
+    hardware: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
@@ -469,7 +479,7 @@ def collect_dashboard_entries(
         fields = derive_fields(path, payload)
         if not fields:
             continue
-        payload = enrich_payload(path, payload, fields)
+        payload = enrich_payload(path, payload, fields, hardware)
         conc = int(payload.get("max_concurrency", fields["conc"]))
         gsm8k_score = gsm8k_scores.get((topology_key(fields["topology"]), conc))
         if gsm8k_score is None:
@@ -538,12 +548,13 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | GSM8K |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | GSM8K |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {gsm8k} |".format(
+            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {gsm8k} |".format(
+                hardware=row.get("hardware", "--"),
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
                 isl=row.get("random_input_len", "--"),
@@ -578,12 +589,15 @@ def main() -> None:
     )
     parser.add_argument("--summary", default="benchmark-summary.md")
     parser.add_argument("--run-url", default=None)
+    parser.add_argument("--hardware", default=None)
     args = parser.parse_args()
 
     root = Path(args.result_dir)
     bench_paths = list(root.rglob("pd-*.json"))
     gsm8k_scores = find_eval_scores(root)
-    entries, rows = collect_dashboard_entries(bench_paths, args.run_url, gsm8k_scores)
+    entries, rows = collect_dashboard_entries(
+        bench_paths, args.run_url, gsm8k_scores, args.hardware
+    )
     Path(args.output).write_text(json.dumps(entries, indent=2), encoding="utf-8")
     write_summary(rows, Path(args.summary))
     print(
