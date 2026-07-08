@@ -1702,6 +1702,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub_attn.state_slot_mapping = src.state_slot_mapping[rs]
         if src.state_slot_mapping_cpu is not None:
             ub_attn.state_slot_mapping_cpu = src.state_slot_mapping_cpu[rs]
+        # paged-SWA: slice this ubatch's SWA block-table rows (parallel to the
+        # compressed block_tables / state_slot_mapping). split_attn_metadata is
+        # V4-agnostic and leaves ub_attn.swa_block_tables=None, so set it from the
+        # parent's rows here — otherwise _build_paged_prefill_meta reads None and
+        # crashes. Row i == local req i, matching the ubatch's rebuilt
+        # batch_id_per_token (the prefill counterpart of the decode-ubatch wiring).
+        if src.swa_block_tables is not None:
+            ub_attn.swa_block_tables = src.swa_block_tables[rs]
 
         var = self.model_runner.forward_vars
         positions_np = np.asarray(var["positions"].np[ts.start : ts.stop])
