@@ -1012,7 +1012,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.hidden_size,  # N_2,
                 self.intermediate_size,  # K_2,
                 atom_config.tensor_parallel_size,
-                act_quant=self.act_quant,
             )
             del layer.w13_weight
             del layer.w2_weight
@@ -1095,6 +1094,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_triton_decode:
             from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
+            # FlyDSL (prefill) and Triton/gluon (decode) are two different
+            # layouts. layer.w13_weight / w13_weight_scale stay in the FlyDSL
+            # layout shuffled above; the *_preshuffled / *_a8w4 tensors below
+            # hold the separate Triton gluon a8w4 layout for the decode kernel.
             w13_u8 = layer.w13_weight.data
             if w13_u8.dtype != torch.uint8:
                 w13_u8 = w13_u8.view(torch.uint8)
@@ -1114,10 +1117,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_scale_for_a8w4 = orig_w13_weight_scale.transpose(-2, -1)
             w2_scale_for_a8w4 = orig_w2_weight_scale.transpose(-2, -1)
 
-            layer.w13_weight_scale_a8w4 = shuffle_scale_moe(w13_scale_for_a8w4)
-            layer.w13_swizzle_layout_a8w4 = "GFX1250_SCALE"
-            layer.w2_weight_scale_a8w4 = shuffle_scale_moe(w2_scale_for_a8w4)
-            layer.w2_swizzle_layout_a8w4 = "GFX1250_SCALE"
+            # Arch -> SWIZZLE_MX_SCALE label decision lives in aiter, not here.
+            (
+                layer.w13_weight_scale_a8w4,
+                layer.w13_swizzle_layout_a8w4,
+            ) = shuffle_scale_moe(w13_scale_for_a8w4, return_layout=True)
+            (
+                layer.w2_weight_scale_a8w4,
+                layer.w2_swizzle_layout_a8w4,
+            ) = shuffle_scale_moe(w2_scale_for_a8w4, return_layout=True)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1185,22 +1193,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
             )
-            n_expts_act = routing_data.n_expts_act
-
-            num_tokens, n_expts_tot = router_logits.shape
-            if global_num_experts > 0:
-                n_expts_tot = global_num_experts
-
-            output = torch.empty_like(x)
             return triton_kernel_fused_experts_a8w4_silu(
-                output,
                 x,
                 layer.w13_weight_preshuffled,
                 layer.w2_weight_preshuffled,
                 routing_data,
                 gather_idx,
                 scatter_idx,
-                topk=n_expts_act,
                 w13_scale=layer.w13_weight_scale_a8w4,
                 w2_scale=layer.w2_weight_scale_a8w4,
                 w13_swizzle_layout=layer.w13_swizzle_layout_a8w4,
@@ -1211,8 +1210,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_bias=layer.w2_bias,
                 swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                 apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=n_expts_tot,
-                expert_map=expert_map,
             )
 
         if self.use_triton:
