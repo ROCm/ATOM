@@ -803,9 +803,6 @@ def load_model(
             pending = list(staging_map.values())
             staging_map.clear()
         if pending:
-            detail = [
-                (tuple(e["param"].shape), e["arrived"], e["expected"]) for e in pending
-            ]
             raise RuntimeError(
                 f"Batched loader: {len(pending)} MoE param group(s) under-filled "
                 f"Set ATOM_LOADER_NUM_THREADS=1 to use the per-expert loader."
