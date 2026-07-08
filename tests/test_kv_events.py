@@ -386,7 +386,9 @@ class TestReplayEndpointWiring:
             assert len(frames) == 3
             topic, seq_bytes, payload = frames
             assert topic == b""
-            assert int.from_bytes(seq_bytes, "big") == 0  # first batch
+            # 8-byte big-endian seq frame (don't assume which batch arrived
+            # first — the warm-up loop above may drop early ones on connect).
+            assert len(seq_bytes) == 8
             batch = decoder.decode(payload)
             assert len(batch.events) == 1
             assert isinstance(batch.events[0], BlockRemoved)
@@ -403,21 +405,37 @@ class TestReplayEndpointWiring:
         try:
             sub.setsockopt(zmq.SUBSCRIBE, b"")
             sub.connect(endpoint)
-            seqs: list[int] = []
+            # Warm up past the ZMQ "slow joiner": publish until the SUB actually
+            # receives one (subscription now live), then drain extras.
+            warmed = False
+            for _ in range(20):
+                pub.publish([BlockRemoved(block_hashes=[0])])
+                if sub.poll(timeout=200):
+                    sub.recv_multipart()
+                    warmed = True
+                    break
+            assert warmed, "SUB never received a warm-up batch"
+            while sub.poll(timeout=100):
+                sub.recv_multipart()
+            # The next batches must arrive with strictly consecutive seqs.
             for i in range(5):
                 pub.publish([BlockRemoved(block_hashes=[i])])
-            deadline_polls = 50
-            while len(seqs) < 5 and deadline_polls > 0:
+            seqs: list[int] = []
+            polls = 50
+            while len(seqs) < 5 and polls > 0:
                 if sub.poll(timeout=200):
                     _, seq_bytes, _ = sub.recv_multipart()
                     seqs.append(int.from_bytes(seq_bytes, "big"))
-                deadline_polls -= 1
-            assert seqs == [0, 1, 2, 3, 4]
+                polls -= 1
+            assert len(seqs) == 5, seqs
+            assert all(seqs[i + 1] == seqs[i] + 1 for i in range(4)), seqs
         finally:
             sub.close(linger=0)
             pub.shutdown()
 
     def test_replay_recovers_missed_batches(self):
+        # No SUB here: the replay buffer is populated by the sender regardless
+        # of delivery, so we wait on stats["sent"] and avoid slow-joiner flake.
         zmq = pytest.importorskip("zmq")
         pub_ep = "inproc://test-kv-replay-pub"
         replay_ep = "inproc://test-kv-replay-router"
@@ -425,36 +443,26 @@ class TestReplayEndpointWiring:
             endpoint=pub_ep, replay_endpoint=replay_ep, buffer_steps=64
         )
         ctx = zmq.Context.instance()
-        sub = ctx.socket(zmq.SUB)
         try:
-            sub.setsockopt(zmq.SUBSCRIBE, b"")
-            sub.connect(pub_ep)
             for i in range(3):
                 pub.publish([BlockRemoved(block_hashes=[i])])
-            received = 0
-            polls = 50
-            while received < 3 and polls > 0:
-                if sub.poll(timeout=200):
-                    sub.recv_multipart()
-                    received += 1
+            polls = 100
+            while pub.stats["sent"] < 3 and polls > 0:
+                time.sleep(0.02)
                 polls -= 1
-            assert received == 3
+            assert pub.stats["sent"] == 3
 
             dealer = ctx.socket(zmq.DEALER)
             dealer.connect(replay_ep)
             dealer.send(b"\x00" * 8)  # start_seq = 0
             replayed_seqs: list[int] = []
-            replay_polls = 50
-            while len(replayed_seqs) < 3 and replay_polls > 0:
-                if dealer.poll(timeout=200):
-                    seq_bytes, payload = dealer.recv_multipart()
-                    replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
-                    msgspec.msgpack.Decoder(EventBatch).decode(payload)
-                replay_polls -= 1
+            while len(replayed_seqs) < 3 and dealer.poll(timeout=1000):
+                seq_bytes, payload = dealer.recv_multipart()
+                replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
+                msgspec.msgpack.Decoder(EventBatch).decode(payload)
             dealer.close(linger=0)
             assert replayed_seqs == [0, 1, 2]
         finally:
-            sub.close(linger=0)
             pub.shutdown()
 
     def test_replay_only_returns_from_start_seq(self):
@@ -465,36 +473,53 @@ class TestReplayEndpointWiring:
             endpoint=pub_ep, replay_endpoint=replay_ep, buffer_steps=64
         )
         ctx = zmq.Context.instance()
-        sub = ctx.socket(zmq.SUB)
         try:
-            sub.setsockopt(zmq.SUBSCRIBE, b"")
-            sub.connect(pub_ep)
             for i in range(4):
                 pub.publish([BlockRemoved(block_hashes=[i])])
-            received = 0
-            polls = 50
-            while received < 4 and polls > 0:
-                if sub.poll(timeout=200):
-                    sub.recv_multipart()
-                    received += 1
+            polls = 100
+            while pub.stats["sent"] < 4 and polls > 0:
+                time.sleep(0.02)
                 polls -= 1
-            assert received == 4
+            assert pub.stats["sent"] == 4
 
             dealer = ctx.socket(zmq.DEALER)
             dealer.connect(replay_ep)
             dealer.send((2).to_bytes(8, "big"))  # start_seq = 2
             replayed_seqs: list[int] = []
-            replay_polls = 50
-            while len(replayed_seqs) < 2 and replay_polls > 0:
-                if dealer.poll(timeout=200):
-                    seq_bytes, _ = dealer.recv_multipart()
-                    replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
-                replay_polls -= 1
+            while len(replayed_seqs) < 2 and dealer.poll(timeout=1000):
+                seq_bytes, _ = dealer.recv_multipart()
+                replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
             dealer.close(linger=0)
             assert replayed_seqs == [2, 3]
         finally:
-            sub.close(linger=0)
             pub.shutdown()
+
+    def test_dropped_batches_consume_seq_numbers(self):
+        # seq must be assigned at enqueue time so that a batch dropped on queue
+        # overflow still consumes a sequence number -> the drop shows up as a
+        # gap for subscribers (rather than silently vanishing).
+        pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(endpoint="inproc://test-kv-seq-drop", buffer_steps=1)
+        pub._queue.put_nowait(None)  # stop the sender so the queue stays full
+        pub._sender.join(timeout=2.0)
+        try:
+            for i in range(5):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            # buffer_steps=1 => 4 dropped, 1 remains; the survivor is the LAST
+            # published batch (seq=4), proving seqs 0..3 were assigned to the
+            # dropped batches and are now gaps.
+            remaining = [it for it in list(pub._queue.queue) if it is not None]
+            assert len(remaining) == 1
+            item = remaining[0]
+            assert (
+                isinstance(item, tuple) and item[0] == 4
+            ), f"expected (seq=4, payload); got {item!r}"
+            assert pub.stats["dropped"] >= 4
+        finally:
+            try:
+                pub._socket.close(linger=0)
+            except Exception:
+                pass
 
     def test_publish_drops_oldest_on_overflow(self):
         # buffer_steps=1 + stopped sender => every publish past the first must

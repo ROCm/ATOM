@@ -142,16 +142,17 @@ class ZmqEventPublisher(EventPublisher):
 
     Every message is a three-frame multipart `[topic, seq, payload]`, where
     `topic` is the (possibly empty) subscription key, `seq` is a monotonic
-    8-byte big-endian batch counter, and `payload` is the msgpack-encoded
-    EventBatch. Consumers must use `recv_multipart()`. The sequence number
-    lets a subscriber detect batches it missed (e.g. a slow/late SUB that the
-    PUB socket dropped at the transport level) and, when a `replay_endpoint`
-    is configured, request them back from the in-memory replay buffer.
+    8-byte big-endian batch counter (wrapping at 2**64), and `payload` is the
+    msgpack-encoded EventBatch. Consumers must use `recv_multipart()`.
 
-    Note: `seq` is assigned at send time, so it counts only batches that left
-    the sender. Batches dropped from the internal queue on overflow (slow
-    encoder) are advisory losses tracked in `stats['dropped']`; they consume
-    no sequence number and are not replayable.
+    `seq` is assigned at enqueue time, so a batch dropped on queue overflow
+    still consumes a sequence number: the drop surfaces to subscribers as a
+    gap in the seq stream rather than vanishing silently. Two loss cases:
+      * transport drop (slow/late SUB) — detectable as a gap AND recoverable
+        from the replay buffer (the batch was sent, so it is buffered);
+      * queue-overflow drop (slow encoder/sender) — detectable as a gap but
+        NOT recoverable (never sent, never buffered); also counted in
+        `stats['dropped']`.
     """
 
     def __init__(
@@ -177,7 +178,10 @@ class ZmqEventPublisher(EventPublisher):
         self._dp_rank = data_parallel_rank
         self._topic_bytes = topic.encode("utf-8")
         self._encoder = encoder or msgspec.msgpack.Encoder()
-        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=buffer_steps)
+        # Queue items are (seq, payload) tuples; None is the shutdown sentinel.
+        self._queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue(
+            maxsize=buffer_steps
+        )
 
         ctx = zmq.Context.instance()
         self._socket = ctx.socket(zmq.PUB)
@@ -235,10 +239,15 @@ class ZmqEventPublisher(EventPublisher):
                 )
             return
 
+        # Assign the sequence number here (at enqueue), not at send: a batch
+        # dropped on overflow below still consumes a seq, so the drop is
+        # visible to subscribers as a gap instead of vanishing silently.
+        seq = next(self._seq_gen)
+
         # Non-blocking enqueue; drop oldest on overflow.
         while True:
             try:
-                self._queue.put_nowait(payload)
+                self._queue.put_nowait((seq, payload))
                 return
             except queue.Full:
                 try:
@@ -291,12 +300,14 @@ class ZmqEventPublisher(EventPublisher):
                 continue
             if item is None:
                 return
+            seq, payload = item
             try:
-                seq = next(self._seq_gen)
-                seq_bytes = seq.to_bytes(8, "big")
-                self._socket.send_multipart([self._topic_bytes, seq_bytes, item])
+                # Wrap at 2**64 so the fixed 8-byte frame never overflows on a
+                # very long-running publisher; wrap-around is expected.
+                seq_bytes = (seq & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big")
+                self._socket.send_multipart([self._topic_bytes, seq_bytes, payload])
                 if self._replay_buffer is not None:
-                    self._replay_buffer.append((seq, seq_bytes, item))
+                    self._replay_buffer.append((seq, seq_bytes, payload))
                 with self._lock:
                     self._sent += 1
             except self._zmq_error_cls:  # pragma: no cover - socket closed
