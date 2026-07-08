@@ -61,8 +61,6 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-MOONCAKE_PING_INTERVAL_SECONDS = 5
-MOONCAKE_MAX_PING_RETRIES = 100
 MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
@@ -272,10 +270,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         self.is_consumer = not self.is_producer
 
-        # Networking / service discovery config
+        # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
-        self.proxy_ping_port = kv_transfer_config.get("proxy_ping_port", 36367)
-        self.proxy_ip = kv_transfer_config.get("proxy_ip")
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.protocol = kv_transfer_config.get("protocol", MOONCAKE_DEFAULT_PROTOCOL)
 
@@ -411,82 +407,6 @@ class MooncakeConnector(KVConnectorBase):
         # --- Msgspec encoder/decoder for bootstrap metadata ---
         self._encoder = msgspec.msgpack.Encoder()
         self._decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
-
-        # --- Service discovery ping (rank 0 only) ---
-        if self.tp_rank == 0 and self.dp_rank == 0:
-            self._ping_thread = threading.Thread(
-                target=self._service_discovery_ping,
-                args=(self.zmq_context,),
-                daemon=True,
-                name="mooncake-ping",
-            )
-            self._ping_thread.start()
-
-    # -----------------------------------------------------------------
-    # Service discovery
-    # -----------------------------------------------------------------
-
-    def _service_discovery_ping(self, zmq_context: zmq.Context) -> None:
-        """Periodically register with the proxy (rank 0 only)."""
-        grpc_endpoint = f"http://{self.request_address}/v1/completions"
-        role_code = "P" if self.is_producer else "D"
-        retry_count = 0
-        msg_index = 1
-        proxy_path = f"tcp://{self.proxy_ip}:{self.proxy_ping_port}"
-
-        with zmq_context.socket(zmq.DEALER) as sock:
-            sock.connect(proxy_path)
-
-            while True:
-                try:
-                    registration_data = {
-                        "type": "register",
-                        "role": role_code,
-                        "index": str(msg_index),
-                        "request_address": grpc_endpoint,
-                        "rpc_port": self.rpc_port,
-                        "handshake_port": self.base_handshake_port,
-                        "dp_size": self.dp_size,
-                        "tp_size": self.tp_size,
-                        "transfer_mode": "write",
-                    }
-                    sock.send(msgpack.dumps(registration_data))
-                    logger.debug(
-                        "Ping #%d sent to %s (role=%s)",
-                        msg_index,
-                        proxy_path,
-                        role_code,
-                    )
-                    retry_count = 0
-
-                except ConnectionRefusedError:
-                    logger.info(
-                        "Proxy connection refused: %s -> %s",
-                        self.local_ip,
-                        proxy_path,
-                    )
-                    retry_count += 1
-
-                except OSError as e:
-                    logger.info("OS error during ping: %s", e)
-                    retry_count += 1
-
-                except Exception as e:
-                    logger.info("Unexpected ping error: %s", e)
-                    retry_count += 1
-                    if retry_count >= MOONCAKE_MAX_PING_RETRIES:
-                        logger.error(
-                            "Ping failed after %d retries, aborting",
-                            MOONCAKE_MAX_PING_RETRIES,
-                        )
-                        raise RuntimeError(
-                            f"Service discovery ping failed after "
-                            f"{retry_count} retries"
-                        ) from e
-
-                finally:
-                    time.sleep(MOONCAKE_PING_INTERVAL_SECONDS)
-                    msg_index += 1
 
     # -----------------------------------------------------------------
     # KVConnectorBase: register_kv_caches
