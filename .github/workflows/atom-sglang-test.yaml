@@ -3,7 +3,7 @@ name: ATOM SGLang Test
 on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
-    types: [opened, synchronize, reopened, ready_for_review, closed]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -16,10 +16,12 @@ on:
       - '.github/benchmark/oot_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
+  pull_request_review:
+    types: [submitted]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'pull_request_review' && github.event.review.state == 'approved') }}
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
@@ -31,8 +33,42 @@ env:
 
 jobs:
   # ---------- SGLANG CI path (pull_request only) ----------
+  ci-gate:
+    name: Check Heavy CI Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Check approval and label gate
+        id: gate
+        env:
+          CI_GATE_LABELS: ci:full,ci:sglang
+          CI_GATE_PATHS_IGNORE: |
+            **/*.md
+            docs/**
+            atom/plugin/vllm/**
+            atom/mesh/**
+            .github/workflows/atomesh-*.yaml
+            .github/scripts/atomesh_*.sh
+            .github/dashboard/atomesh_*.html
+            .github/workflows/atom-vllm-*.yaml
+            .github/benchmark/oot_models_accuracy.json
+            LICENSE
+            .gitignore
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash ./.github/scripts/check_heavy_ci_gate.sh
+
   check-signal:
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    needs: [ci-gate]
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
     permissions:
@@ -47,10 +83,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
+          CHECK_SIGNAL_EVENT_NAME: pull_request
+          CHECK_SIGNAL_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha }}
 
   download_aiter_wheel:
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
-    needs: [check-signal]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' }}
+    needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
     outputs:
@@ -233,8 +272,8 @@ jobs:
           retention-days: 7
 
   atom-sglang-accuracy:
-    needs: [check-signal, download_aiter_wheel]
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
+    needs: [ci-gate, check-signal, download_aiter_wheel]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' && needs.download_aiter_wheel.result == 'success' }}
     name: Accuracy (${{ matrix.model_name }})
     strategy:
       fail-fast: false

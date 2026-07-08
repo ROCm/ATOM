@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -20,6 +20,8 @@ on:
       - '.github/benchmark/sglang_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
+  pull_request_review:
+    types: [submitted]
   schedule:
     # Nightly at 00:00 Beijing time (16:00 UTC)
     - cron: '0 16 * * *'
@@ -38,8 +40,8 @@ on:
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved') }}
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
@@ -50,8 +52,44 @@ env:
   AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
 
 jobs:
+  ci-gate:
+    name: Check Heavy CI Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Check approval and label gate
+        id: gate
+        env:
+          CI_GATE_LABELS: ci:full,ci:atom
+          CI_GATE_PATHS_IGNORE: |
+            **/*.md
+            docs/**
+            atom/plugin/**
+            atom/mesh/**
+            .github/workflows/atomesh-*.yaml
+            .github/scripts/atomesh_*.sh
+            .github/dashboard/atomesh_*.html
+            .github/workflows/atom-vllm-*.yaml
+            .github/workflows/atom-sglang-*.yaml
+            .github/benchmark/oot_models_accuracy.json
+            .github/benchmark/sglang_models_accuracy.json
+            LICENSE
+            .gitignore
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash ./.github/scripts/check_heavy_ci_gate.sh
+
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    needs: [ci-gate]
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
     permissions:
@@ -68,10 +106,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
+          CHECK_SIGNAL_EVENT_NAME: ${{ github.event.pull_request && 'pull_request' || github.event_name }}
+          CHECK_SIGNAL_HEAD_REF: ${{ github.event.pull_request.head.ref || github.head_ref || github.ref_name }}
+          CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
   download_aiter_wheel:
-    if: ${{ needs.check-signal.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
-    needs: [check-signal]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' }}
+    needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
     steps:
@@ -90,6 +131,8 @@ jobs:
           retention-days: 7
 
   load-test-models:
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    needs: [ci-gate]
     name: Load test model configs
     runs-on: ubuntu-latest
     outputs:
@@ -120,13 +163,13 @@ jobs:
           PY
 
   atom-test:
-    needs: [download_aiter_wheel, load-test-models]
+    needs: [ci-gate, download_aiter_wheel, load-test-models]
     name: Accuracy
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.load-test-models.outputs.models_json) }}
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+        include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' }}
     runs-on: ${{ matrix.runner }}
 
     env:

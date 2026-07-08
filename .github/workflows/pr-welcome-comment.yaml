@@ -1,0 +1,45 @@
+name: PR Welcome Comment
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              "### 🏷️ CI Guide",
+              "",
+              "**Runs automatically on every eligible PR before approval:**",
+              "- ✅ Pre Checkin: Black, Ruff, catalog schema validation, non-GPU unit tests",
+              "",
+              "**Heavy model tests:**",
+              "- ✅ Run after the PR is approved and Pre Checkin passes",
+              "- ✅ Run immediately when an approval review is submitted",
+              "- ✅ Can be requested before approval with labels",
+              "",
+              "| Label | Tests |",
+              "|-------|-------|",
+              "| `ci:full` | Run all heavy PR model tests: native ATOM, vLLM, and SGLang |",
+              "| `ci:atom` | Run native ATOM model accuracy tests |",
+              "| `ci:vllm` | Run ATOM vLLM OOT model accuracy tests |",
+              "| `ci:sglang` | Run ATOM SGLang model accuracy tests |",
+              "",
+              "> Heavy jobs are skipped when the PR is not approved and no matching `ci:*` label was just added.",
+              `> Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``,
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
