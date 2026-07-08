@@ -259,3 +259,8 @@ Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
 | 16 | 160 | 78.17 | 430.34 | 2680.95 | 7.91 | 15.58 | 1876.30 | 16928.43 |
 | 32 | 320 | 125.69 | 609.24 | 5304.23 | 12.60 | 23.81 | 2355.93 | 21132.49 |
 | 64 | 640 | 198.58 | 966.20 | 10476.78 | 19.97 | 40.44 | 2973.94 | 26857.80 |
+
+## PD Disaggregation
+
+For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without EAGLE3), see
+[recipes/mesh/MiniMax-M3.md](mesh/MiniMax-M3.md).

@@ -44,6 +44,8 @@ Numerics: identical online-softmax + sink finalization to
 (then equivalent to a decode call with the same prefix indices).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -57,6 +59,14 @@ try:
 except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
+
+try:
+    from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+
+    _HAS_AITER_TRITON = True
+except ImportError:
+    pa_prefill_sparse = None
+    _HAS_AITER_TRITON = False
 
 
 @triton.jit
@@ -371,6 +381,18 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
+    if os.environ.get("ATOM_USE_AITER_TRITON_ATTN", "0") == "1" and _HAS_AITER_TRITON:
+        return pa_prefill_sparse(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        )
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     if not envs.ATOM_FORCE_ATTN_TRITON and _HAS_OPUS:

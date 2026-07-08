@@ -276,7 +276,7 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
             lm_eval_num_fewshot: 3
-            accuracy_test_threshold: 0.70
+            accuracy_test_threshold: 0.77
             runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180

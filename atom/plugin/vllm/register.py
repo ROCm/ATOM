@@ -188,6 +188,10 @@ def register_model() -> None:
 
     _set_plugin_mode()
 
+    from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
+
+    register_gdn_attention_backend()
+
     import vllm.model_executor.models.registry as vllm_model_registry
 
     any_updated = False
