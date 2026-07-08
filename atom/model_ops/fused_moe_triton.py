@@ -400,7 +400,7 @@ def triton_kernel_fused_experts_a8w4_silu(
     swiglu_limit: float = 10.0,
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
-    """Decode-only A8W4 MoE for SiLU models (DSv4).
+    """Decode-only A8W4 MoE for SiLU models (DSv4), GUGU (interleaved gate/up).
 
     Pipeline: MXFP8 quant -> GEMM1(a8w4, fused SiLU(gate)*up + mxfp8 out) ->
     GEMM2(a8w4). Weights must be in the preshuffled a8w4 layout with w13 gate/up
@@ -431,6 +431,89 @@ def triton_kernel_fused_experts_a8w4_silu(
         swiglu_add_residual=False,
         preshuffled=True,
         out_mx_quant=True,
+    )
+
+    output_tensor = moe_gemm_a8w4(
+        interm_fp8,
+        w2,
+        interm_scale,
+        w2_scale,
+        a2_scale,
+        None,
+        w2_bias,
+        routing_data,
+        scatter_indx=scatter_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=w2_swizzle_layout,
+        preshuffled=True,
+    )
+
+    return output_tensor
+
+
+def triton_kernel_fused_experts_a8w4_silu_gguu(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_swizzle_layout,
+    w2_swizzle_layout,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 10.0,
+    apply_router_weight_on_input: bool = False,
+) -> torch.Tensor:
+    """Decode-only A8W4 MoE for SiLU models, GGUU (separated ``[gate|up]``).
+
+    GGUU keeps gate and up as contiguous halves, so the per-block SiLU cannot be
+    fused into GEMM1's write-back (a tile spans only gate *or* only up). The
+    activation and quant therefore run as a separate step:
+
+        MXFP8 quant -> GEMM1(a8w4, no swiglu, bf16 [gate|up]) ->
+        fused_clamp_act_mul(SiLU(gate)*up on the halves) ->
+        MXFP8 quant -> GEMM2(a8w4).
+
+    The intermediate is re-quantized with ``downcast_to_mxfp`` (same op as the x
+    path) so GEMM2 sees the identical activation-scale format. Weights are in the
+    preshuffled a8w4 layout with w13 gate/up separated.
+    """
+    assert hidden_states.ndim == 2
+    assert hidden_states.dtype == torch.bfloat16
+
+    gammas = routing_data.gate_scal if routing_data else None
+
+    x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+
+    # GEMM1: raw bf16 [gate|up] output; no fused activation for the separated layout.
+    interm = moe_gemm_a8w4(
+        x_fp8,
+        w1,
+        x_scale,
+        w13_scale,
+        a13_scale,
+        None,
+        w1_bias,
+        routing_data,
+        gather_indx=gather_indx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=w13_swizzle_layout,
+        apply_swiglu=False,
+        out_dtype=torch.bfloat16,
+        preshuffled=True,
+    )
+
+    # Standalone SiLU(gate)*up over the contiguous halves, then MXFP8 quant.
+    interm_act = fused_clamp_act_mul(
+        interm, swiglu_limit=swiglu_limit, activation="silu"
+    )
+    interm_fp8, interm_scale = downcast_to_mxfp(
+        interm_act, torch.float8_e4m3fn, axis=-1
     )
 
     output_tensor = moe_gemm_a8w4(
