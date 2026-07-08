@@ -181,7 +181,10 @@ impl Router {
             },
             // on_exhausted hook
             || {
-                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_REGULAR,
+                    endpoint,
+                );
             },
         )
         .await;

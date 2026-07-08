@@ -39,6 +39,54 @@
       "env_vars": "deepseek_v4_common"
     },
     {
+      "display": "DeepSeek-V4-Pro MTP1 TP8",
+      "dashboard_model": "DeepSeek-V4-Pro-MTP1",
+      "workload_label": "SGLang-OOB",
+      "source_path": "deepseek-ai/DeepSeek-V4-Pro",
+      "path": "deepseek-ai/DeepSeek-V4-Pro",
+      "prefix": "deepseek-v4-pro-mtp1-tp8",
+      "extra_args": [
+        "deepseek_v4_runtime",
+        "--speculative-algorithm EAGLE --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-aac-runner",
+      "nightly_group": "A",
+      "supported_input_output_pairs": ["1024x1024", "8192x1024"],
+      "supported_concurrency_values_by_pair": {
+        "1024x1024": [4, 8, 16, 32, 64, 128, 256],
+        "8192x1024": [4, 8, 16, 32, 64, 128, 256]
+      },
+      "env_vars": [
+        "deepseek_v4_common",
+        "ATOM_USE_TRITON_MOE=0\nATOM_SGLANG_V4_DISABLE_PRO_DRAFT_TRITON_MOE=1\nATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1"
+      ]
+    },
+    {
+      "display": "DeepSeek-V4-Pro MTP3 TP8",
+      "dashboard_model": "DeepSeek-V4-Pro-MTP3",
+      "workload_label": "SGLang-OOB",
+      "source_path": "deepseek-ai/DeepSeek-V4-Pro",
+      "path": "deepseek-ai/DeepSeek-V4-Pro",
+      "prefix": "deepseek-v4-pro-mtp3-tp8",
+      "extra_args": [
+        "deepseek_v4_runtime",
+        "--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-aac-runner",
+      "nightly_group": "A",
+      "supported_input_output_pairs": ["1024x1024", "8192x1024"],
+      "supported_concurrency_values_by_pair": {
+        "1024x1024": [4, 8, 16, 32, 64, 128, 256],
+        "8192x1024": [4, 8, 16, 32, 64, 128, 256]
+      },
+      "env_vars": [
+        "deepseek_v4_common",
+        "ATOM_USE_TRITON_MOE=0\nATOM_SGLANG_V4_DISABLE_PRO_DRAFT_TRITON_MOE=1\nATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1"
+      ]
+    },
+    {
       "display": "DeepSeek-V4-Pro Prefix Cache TP8",
       "dashboard_model": "DeepSeek-V4-Pro-prefix-cache",
       "workload_label": "SGLang-OOB",

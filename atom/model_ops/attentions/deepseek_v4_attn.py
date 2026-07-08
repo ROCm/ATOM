@@ -42,6 +42,15 @@ from typing import Any, Dict, Optional, Type, cast
 import numpy as np
 import torch
 from aiter import dtypes
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_is_enabled,
+    pcp_pad_dense,
+    pcp_pad_indptr,
+    pcp_pad_len,
+    pcp_reindex_ragged,
+    pcp_round_robin_query_indices,
+)
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
@@ -676,14 +685,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 ) % 4 == 0, f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
                 block_fp32_stride = (k1 * aligned_dim) // 4
                 scale_fp32_offset = (k1 * head_dim) // 4
-                module.cache_scale = (
-                    idx_kv.view(torch.float32)
-                    .view(-1)
-                    .as_strided(
-                        size=(nb, k1),
-                        stride=(block_fp32_stride, 1),
-                        storage_offset=scale_fp32_offset,
-                    )
+                # `as_strided(storage_offset=...)` is ABSOLUTE in the underlying
+                # storage, NOT relative to `idx_kv`. Since idx_kv =
+                # v4_csa_idx_kv[pos] carries its own storage_offset (pos *
+                # block_span), it MUST be added here — otherwise every CSA
+                # layer's `cache_scale` aliases pos 0's scale region, so only
+                # the first CSA layer's indexer reads valid scale and all other
+                # layers read zeros (FP8 indexer logits collapse at long
+                # context). The FP4 path is unaffected: it binds a real per-pos
+                # tensor (v4_csa_idx_kv_scale[pos]).
+                idx_kv_f32 = idx_kv.view(torch.float32)
+                module.cache_scale = idx_kv_f32.view(-1).as_strided(
+                    size=(nb, k1),
+                    stride=(block_fp32_stride, 1),
+                    storage_offset=idx_kv_f32.storage_offset() + scale_fp32_offset,
                 )
             elif ratio == 4:
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
@@ -1453,7 +1468,109 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             scheduled_bs,
             sum_scheduled_tokens,
         )
+
+        # ----- PCP: reindex per-query metadata to this rank's 1/W shard -----
+        # Mirrors SGLang's apply_cp_reindex (deepseek_v4_backend_hip_radix.py):
+        # all metadata above was built for the FULL sequence; under PCP the
+        # model.forward entry round-robin-splits hidden/positions to 1/W, so the
+        # per-query (per-token) metadata must be reduced to the SAME owned-query
+        # set. Per-seq / KV-write fields stay full (every rank keeps full KV).
+        if pcp_is_enabled() and not batch.is_dummy_run:
+            # Gate on `not is_dummy_run`: ForCausalLM.forward's round-robin-split is
+            # skipped on dummy/warmup runs (_pcp_active() returns False there),
+            # so reindexing metadata to 1/W here would pair full-size
+            # input_ids/positions with 1/W metadata (length mismatch). Keeping
+            # both full on dummy runs stays self-consistent.
+            # Reindex metadata to 1/W in-place. We intentionally DISCARD the
+            # returned 1/W positions: `positions` must stay FULL here so it
+            # lands on context.positions full, and ForCausalLM.forward does the
+            # one and only round-robin-split of positions (symmetric with input_ids,
+            # which never passes through the builder). Splitting here too would
+            # double-split positions (full -> 1/W -> 1/2W) while input_ids/kv
+            # are only split once, desyncing swa_write (kv full vs positions
+            # under-length). The builder still uses its internal 1/W positions
+            # for indexer_meta (rebuilt inside _apply_pcp_reindex).
+            self._apply_pcp_reindex(
+                attn_metadata, positions, scheduled_bs, sum_scheduled_tokens
+            )
         return attn_metadata, positions
+
+    def _apply_pcp_reindex(
+        self,
+        attn_metadata: AttentionMetaData_DSV4,
+        positions: torch.Tensor,
+        scheduled_bs: int,
+        total_tokens: int,
+    ) -> torch.Tensor:
+        """Reduce per-query prefill metadata to this PCP rank's round-robin shard.
+
+        Splits the per-token / per-query fields by `token_idx % pcp == rank`
+        (matching model.forward's round-robin split of hidden/positions) while
+        leaving per-seq and KV-write fields full. The indexer metadata is
+        REBUILT from the sliced batch_id_per_token + positions (its per-token
+        fields all derive from those two), mirroring SGLang's
+        init_forward_metadata_indexer(core_meta) after apply_cp_reindex.
+
+        Returns the sliced `positions` (the model.forward entry slices its own
+        copy identically; this keeps attn_metadata-internal users consistent).
+
+        Token count is padded to a multiple of pcp_size (dummy queries with
+        zero-length KV) so every rank gets an equal shard — matching
+        model.forward's pad-then-split of hidden/positions.
+        """
+        pcp_size = get_pcp_world_size()
+        device = attn_metadata.batch_id_per_token.device
+        # Pad to a multiple of pcp_size; dummy (pad) queries get zero-length KV.
+        padded_total = pcp_pad_len(total_tokens, pcp_size)
+        n_pad = padded_total - total_tokens
+        owned_q = pcp_round_robin_query_indices(padded_total, pcp_size).to(device)
+
+        # --- ragged per-query buffers: pad indptr to padded_total, then 1/W ---
+        for ind_attr, idx_attr in (
+            ("kv_indptr_prefix_swa", "kv_indices_prefix_swa"),
+            ("kv_indptr_prefix_csa", "kv_indices_prefix_csa"),
+            ("kv_indptr_prefix_hca", "kv_indices_prefix_hca"),
+            ("kv_indptr_extend", "kv_indices_extend"),
+        ):
+            indptr = getattr(attn_metadata, ind_attr, None)
+            indices = getattr(attn_metadata, idx_attr, None)
+            if indptr is None or indices is None:
+                continue
+            indptr = pcp_pad_indptr(indptr, n_pad)  # dummy queries: 0-length KV
+            new_indptr, new_indices = pcp_reindex_ragged(indptr, indices, owned_q)
+            setattr(attn_metadata, ind_attr, new_indptr)
+            setattr(attn_metadata, idx_attr, new_indices)
+
+        # --- dense per-token fields: pad then round-robin-slice to 1/W ---
+        if attn_metadata.skip_prefix_len_csa is not None:
+            skip = pcp_pad_dense(attn_metadata.skip_prefix_len_csa, n_pad)
+            attn_metadata.skip_prefix_len_csa = skip[owned_q].contiguous()
+        # batch_id_per_token drives the indexer rebuild below. Pad with -1
+        # (dummy-token sentinel; downstream kernels skip on bid < 0), then slice.
+        bid = attn_metadata.batch_id_per_token[:total_tokens]
+        if n_pad > 0:
+            bid = torch.cat([bid, bid.new_full((n_pad,), -1)], dim=0)
+        attn_metadata.batch_id_per_token = bid[owned_q].contiguous()
+        pos_padded = positions[:total_tokens]
+        if n_pad > 0:
+            pos_padded = torch.cat([pos_padded, pos_padded.new_zeros(n_pad)], dim=0)
+        positions_local = pos_padded[owned_q].contiguous()
+
+        # --- rebuild indexer metadata from the sliced batch_id + positions ---
+        # Its per-token fields (seq_base/cu_starts/cu_ends/visible_end) all
+        # derive from batch_id_per_token + positions, so rebuilding with the
+        # sliced inputs yields the 1/W layout; per-seq fields (cu_committed,
+        # n_committed_per_seq) stay full. Skip if the model has no CSA/indexer.
+        if attn_metadata.indexer_meta is not None:
+            local_tokens = owned_q.shape[0]
+            attn_metadata.indexer_meta = self._build_v4_indexer_meta(
+                attn_metadata=attn_metadata,
+                positions_gpu=positions_local,
+                scheduled_bs=scheduled_bs,
+                total_tokens=local_tokens,
+                device=device,
+            )
+        return positions_local
 
     def _get_ubatch_compress_plan_buffers(
         self, ubatch_idx: int
@@ -2152,6 +2269,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # NB: no `csa_indices.fill_(-1)` — per-token CSA reservation now
         # matches Indexer visibility exactly (csa_valid_k_per_token), so
         # csa_translate_pack writes every reserved cell.
+        # PCP exception: under prefill context parallel, _apply_pcp_reindex
+        # rebuilds this buffer via pcp_reindex_ragged into a FRESH torch.empty
+        # tensor and re-slices the indptr, so the "every cell written" invariant
+        # no longer holds (the CSA-topk section is filled per-layer in forward
+        # AFTER reindex). Restore the -1 sentinel the consumer relies on: fill
+        # BEFORE the builder kernel writes the SWA section, so SWA stays real and
+        # unwritten cells stay -1 through reindex until csa_translate_pack
+        # overwrites the CSA head. pcp=1 keeps the original zero-fill fast path.
+        if pcp_is_enabled():
+            csa_indices.fill_(-1)
 
         # ----- Single Triton kernel: scatter SWA-prefix / extend / HCA-compress -----
         write_v4_paged_prefill_indices(
