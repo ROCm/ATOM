@@ -15,6 +15,7 @@
       "deepseek_mtp_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_ENABLE_SPEC_V2=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
       "deepseek_mtp_dp_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_ENABLE_SPEC_V2=1\nMORI_SHMEM_MODE=ISOLATION\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
       "deepseek_v4_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=true\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
+      "deepseek_v4_flash_fp8_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=0\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
       "deepseek_v4_prefix_cache_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=true\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
       "qwen_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0"
     }
@@ -1027,6 +1028,24 @@
       "runner": "atom-mi308-8gpu-plugins-benchmark",
       "nightly_group": "B",
       "env_vars": "qwen_common"
+    },
+    {
+      "display": "DeepSeek-V4-Flash FP8 TP8 MI308",
+      "dashboard_model": "DeepSeek-V4-Flash-FP8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sgl-project/DeepSeek-V4-Flash-FP8",
+      "path": "sgl-project/DeepSeek-V4-Flash-FP8",
+      "prefix": "deepseek-v4-flash-fp8-mi308",
+      "extra_args": "deepseek_v4_runtime",
+      "bench_args": "",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["1024x1024", "8192x1024"],
+      "supported_concurrency_values_by_pair": {
+        "1024x1024": [4, 8, 16, 32, 64],
+        "8192x1024": [4, 8, 16, 32, 64]
+      },
+      "env_vars": "deepseek_v4_flash_fp8_common"
     }
   ]
 }
