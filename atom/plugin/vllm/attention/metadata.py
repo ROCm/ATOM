@@ -434,11 +434,13 @@ class MinimaxM3SparseMetadata:
 
 
 class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    # Only uniform single-token decode is safe to capture. Prefill/mixed batches
-    # still use build(), where variable query lengths and CPU-side max reduction
-    # are allowed. The decode kernels consume per-step seq_lens/block_table from
-    # vLLM's fixed metadata buffers and keep their grids shape-constant.
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # Uniform decode batches are safe to capture, including spec-decode verify
+    # (query_len == num_spec + 1): the decode index-topk and sparse-attn kernels
+    # thread MAX_Q with per-token causality (causal_len = seq_len - MAX_Q + tok +
+    # 1) and their grids depend only on shape constants, so a captured (batch,
+    # query_len) shape is fixed. Prefill/mixed batches still use build(), where 
+    # variable query lengths and CPU-side max reduction are allowed.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
 
     def __init__(
