@@ -145,6 +145,33 @@ class SGLangDeepseekMLAAttention(nn.Module):
             dtype=torch.bfloat16,
         )
 
+    def _get_sparse_topk_indices(self, num_tokens: int) -> torch.Tensor | None:
+        attn = self.owner_attn
+        if not getattr(attn, "use_nsa", False):
+            return None
+
+        source_indexer = getattr(attn, "_atom_sglang_topk_source_indexer", None)
+        if source_indexer is None:
+            source_indexer = getattr(attn, "indexer", None)
+        if source_indexer is None:
+            raise RuntimeError(
+                "SGLang sparse MLA requires a top-k indexer source. "
+                f"layer={getattr(attn, 'prefix', '<unknown>')!r}"
+            )
+
+        topk_indices = getattr(source_indexer, "topk_indices_buffer", None)
+        if topk_indices is None:
+            raise RuntimeError(
+                "SGLang sparse MLA top-k buffer is not initialized before attention. "
+                f"layer={getattr(attn, 'prefix', '<unknown>')!r}"
+            )
+        if topk_indices.dim() != 2 or topk_indices.shape[0] < num_tokens:
+            raise RuntimeError(
+                "SGLang sparse MLA top-k buffer has invalid shape: "
+                f"got {tuple(topk_indices.shape)}, need at least {num_tokens} rows"
+            )
+        return topk_indices[:num_tokens]
+
     def _forward_absorbed(
         self,
         q_input: torch.Tensor,
@@ -186,13 +213,8 @@ class SGLangDeepseekMLAAttention(nn.Module):
             )
 
         save_kv_cache = True
-        topk_indices = None
+        topk_indices = self._get_sparse_topk_indices(q_input.shape[0])
         q_descale = None
-        if (
-            getattr(attn, "use_nsa", False)
-            and getattr(attn, "indexer", None) is not None
-        ):
-            topk_indices = attn.indexer.topk_indices_buffer[: q_input.shape[0]]
         if attn.use_fused_qk_rope_concat_and_cache_mla:
             mla_attn = _get_sglang_radix_attn(self.base_attn)
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(mla_attn.layer_id)
