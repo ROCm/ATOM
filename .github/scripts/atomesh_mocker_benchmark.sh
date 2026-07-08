@@ -4,7 +4,7 @@ set -euo pipefail
 SCENARIO="${SCENARIO:-pd-chat}"
 BENCHMARK_NAME="${BENCHMARK_NAME:-${SCENARIO}}"
 DURATION="${DURATION:-20s}"
-KILL_AFTER="${KILL_AFTER:-300s}"
+KILL_AFTER="${KILL_AFTER:-30s}"
 PRODUCER_THREADS="${PRODUCER_THREADS:-1}"
 CONSUMER_THREADS="${CONSUMER_THREADS:-8}"
 PREFILL_WORKERS="${PREFILL_WORKERS:-1}"
@@ -35,6 +35,29 @@ if (( PREFILL_WORKERS < 1 || DECODE_WORKERS < 1 )); then
   echo "PREFILL_WORKERS and DECODE_WORKERS must both be >= 1" >&2
   exit 2
 fi
+
+duration_seconds() {
+  local value="$1"
+  local number
+  local multiplier
+  case "${value}" in
+    *s) number="${value%s}"; multiplier=1 ;;
+    *m) number="${value%m}"; multiplier=60 ;;
+    *h) number="${value%h}"; multiplier=3600 ;;
+    *[!0-9]* | "") echo "Invalid duration '${value}'; use an integer with s, m, or h" >&2; return 2 ;;
+    *) number="${value}"; multiplier=1 ;;
+  esac
+
+  if [[ ! "${number}" =~ ^[0-9]+$ || "${number}" -eq 0 ]]; then
+    echo "Invalid duration '${value}'; use a positive integer with s, m, or h" >&2
+    return 2
+  fi
+
+  echo "$((number * multiplier))"
+}
+
+DURATION_SECONDS="$(duration_seconds "${DURATION}")"
+BENCH_TIMEOUT="$((DURATION_SECONDS + 30))s"
 
 pick_ports() {
   python3 - <<'PY'
@@ -134,9 +157,10 @@ wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "Atomesh router"
 echo "=== Running request benchmark ${BENCHMARK_NAME} for ${DURATION} ==="
 BENCH_LOG="${LOG_DIR}/benchmark-request.log"
 set +e
-timeout --signal=INT --kill-after="${KILL_AFTER}" "${DURATION}" \
+timeout --signal=TERM --kill-after="${KILL_AFTER}" "${BENCH_TIMEOUT}" \
   "${MOCKER_BIN}" benchmark-request \
     --base-url "http://127.0.0.1:${ROUTER_PORT}" \
+    --duration "${DURATION}" \
     --producer-threads "${PRODUCER_THREADS}" \
     --consumer-threads "${CONSUMER_THREADS}" \
     "${FIXTURE}" \
