@@ -535,19 +535,15 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
-                gsm8k=fmt_raw(row.get("gsm8k_raw", row.get("gsm8k"))),
+                gsm8k=fmt(row.get("gsm8k"), digits=4),
             )
         )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def fmt_raw(value: Any) -> str:
-    return "--" if value in (None, "") else str(value)
-
-
-def fmt(value: Any) -> str:
+def fmt(value: Any, digits: int = 2) -> str:
     parsed = number(value)
-    return "--" if parsed is None else f"{parsed:.2f}"
+    return "--" if parsed is None else f"{parsed:.{digits}f}"
 
 
 def main() -> None:

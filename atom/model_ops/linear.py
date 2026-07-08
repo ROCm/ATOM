@@ -698,13 +698,28 @@ class LinearBase(nn.Module):
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
-        if (
-            self.quant_type == QuantType.per_Tensor
-            and len(self.output_partition_sizes) > 1
+        if self.quant_type == QuantType.per_Tensor and (
+            len(self.output_partition_sizes) > 1
+            or hasattr(self, "_loaded_weight_scale_for_requant")
+            or hasattr(self, "_loaded_weight_scale_for_requant_parts")
         ):
+            loaded_weight_scale = getattr(
+                self, "_loaded_weight_scale_for_requant", None
+            )
+            loaded_weight_scale_parts = getattr(
+                self, "_loaded_weight_scale_for_requant_parts", None
+            )
+            if loaded_weight_scale is None and loaded_weight_scale_parts is not None:
+                if all(part is not None for part in loaded_weight_scale_parts):
+                    loaded_weight_scale = torch.cat(loaded_weight_scale_parts, dim=0)
+            weight_scale_for_requant = (
+                loaded_weight_scale
+                if loaded_weight_scale is not None
+                else self.weight_scale.data
+            )
             weight_scale, weight = requantize_with_max_scale(
                 weight=self.weight.data,
-                weight_scale=self.weight_scale.data,
+                weight_scale=weight_scale_for_requant.to(self.weight.device),
                 logical_widths=self.output_partition_sizes,
                 normalize_e4m3fn_to_e4m3fnuz=self.need_normalize_e4m3fn_to_e4m3fnuz,
             )
@@ -1052,9 +1067,26 @@ class MergedColumnParallelLinear(LinearBase):
                 shard_offset = (shard_offset + 127) // 128
                 shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
-                loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
-                shard_offset = loaded_shard_id
-                shard_size = 1
+                param_data = param_data.narrow(self.tp_dim, loaded_shard_id, 1)
+                if (
+                    loaded_weight.ndim > self.tp_dim
+                    and loaded_weight.shape[self.tp_dim] > 1
+                ):
+                    local_scale = loaded_weight.chunk(self.tp_size, self.tp_dim)[
+                        self.tp_rank
+                    ].contiguous()
+                    if not hasattr(self, "_loaded_weight_scale_for_requant_parts"):
+                        self._loaded_weight_scale_for_requant_parts = [None] * len(
+                            self.output_sizes
+                        )
+                    self._loaded_weight_scale_for_requant_parts[loaded_shard_id] = (
+                        local_scale
+                    )
+                    loaded_weight = local_scale.max().view(1, 1)
+                else:
+                    loaded_weight = loaded_weight.max().view(1, 1)
+                param.weight_loader_process(param_data, loaded_weight)
+                return
 
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
@@ -1787,6 +1819,14 @@ class RowParallelLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if param is not getattr(self, "bias", None):
+            if (
+                param is getattr(self, "weight_scale", None)
+                or param is getattr(self, "input_scale", None)
+            ) and self.quant_type == QuantType.per_Tensor:
+                if loaded_weight.ndim > 0 and loaded_weight.shape[0] > 1:
+                    self._loaded_weight_scale_for_requant = loaded_weight.contiguous()
+                param.weight_loader_process(param_data, loaded_weight.max().view(1, 1))
+                return
             if len(loaded_weight.shape) == 0:
                 loaded_weight = loaded_weight.view(1, 1)
             if loaded_weight.ndim <= self.tp_dim:
