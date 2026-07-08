@@ -352,7 +352,6 @@ start_router() {
     --policy "${ROUTER_POLICY}" \
     --backend atom \
     --log-level info \
-    --disable-health-check \
     --disable-circuit-breaker \
     --prometheus-port "${PROMETHEUS_PORT}" \
     2>&1 | tee "${RUN_DIR}/logs/router.log" &

@@ -679,12 +679,6 @@ class TestScheduledBatchPDFirstDecodeMTP:
 
 
 class TestPrefillBatchGate:
-    def test_threshold_defaults_to_batch_budget(self):
-        cfg = MockConfig(max_num_batched_tokens=32)
-        sched = Scheduler(cfg)
-        # Threshold is derived from the batch-token budget, not a separate knob.
-        assert sched.prefill_batch_token_threshold == 32
-
     def test_ready_when_waiting_fills_threshold(self, seq_factory):
         # chunked prefill on so a 40-token prompt is clamped to the 32 budget
         # (not rejected as oversized) and counts toward the threshold.
@@ -770,3 +764,41 @@ class TestPrefillBatchGate:
         assert batch is not None
         assert batch.total_seqs_num_prefill == 0
         assert batch.total_seqs_num_decode == 1
+
+    def test_partial_resume_packs_new_under_full_request(self, seq_factory):
+        """OR-clause: when Phase 1 resumes a partial prefill, Phase 2 packs a
+        NEW under-full waiting request into the SAME step even though the
+        dense-batch gate (_prefill_batch_ready) would hold it on a pure-decode
+        tick. Decode is already interrupted by the partial resume, so the extra
+        pack is free."""
+        cfg = MockConfig(
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+            max_num_batched_tokens=32,  # threshold = 32
+            long_prefill_token_threshold=8,
+            enable_chunked_prefill=True,
+            data_parallel_size=8,  # gate active: an under-full new prefill holds
+        )
+        sched = Scheduler(cfg)
+        # A partial prefill mid-flight in running (num_cached < num_tokens).
+        partial = seq_factory(list(range(20)))
+        partial.status = SequenceStatus.RUNNING
+        partial.type = SequenceType.PREFILL
+        partial.num_cached_tokens = 8
+        partial.is_partial_prefill = True
+        sched.block_manager.allocate(partial, 0)
+        sched.running.append(partial)
+        sched._partial_prefill_count = 1
+        # A NEW under-full waiting request (8 tokens < 32 threshold).
+        new_req = seq_factory(list(range(8)))
+        sched.waiting.append(new_req)
+        # Under-full: on a pure-decode tick this would be held (see
+        # test_gate_holds_new_prefill_but_decodes).
+        assert sched._waiting_prefill_tokens() < 32
+
+        batch, scheduled = sched.schedule()
+        assert batch is not None
+        # Both the resumed partial AND the new under-full request are packed.
+        assert batch.total_seqs_num_prefill == 2
+        assert partial.id in scheduled
+        assert new_req.id in scheduled

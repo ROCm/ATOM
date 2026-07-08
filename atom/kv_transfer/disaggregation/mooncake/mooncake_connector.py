@@ -65,6 +65,23 @@ MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
 
+
+def _ib_device_exists(device_name: str) -> bool:
+    return os.path.exists(f"/sys/class/infiniband/{device_name}")
+
+
+def _auto_select_ib_device(phys_idx: int) -> str:
+    # Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
+    # them as ionic_N, so try ionic_N only when rdmaN is not present.
+    rdma_device = f"rdma{phys_idx}"
+    if _ib_device_exists(rdma_device):
+        return rdma_device
+    ionic_device = f"ionic_{phys_idx}"
+    if _ib_device_exists(ionic_device):
+        return ionic_device
+    return rdma_device
+
+
 # ZMQ side-channel message types
 MSG_WRITE_REQUEST = b"write_request"
 MSG_WRITE_DONE = b"write_done"
@@ -289,7 +306,8 @@ class MooncakeConnector(KVConnectorBase):
             )
 
         # Determine which RDMA device this TP rank should use.
-        # On AMD MI300X, each GPU has a paired RDMA NIC: GPU N → rdmaN.
+        # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
+        # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
         # Registering GPU memory with a non-local RDMA NIC fails with
         # EINVAL.  Pass the device name as a filter so Mooncake only
         # creates a context for the local NIC.
@@ -306,7 +324,7 @@ class MooncakeConnector(KVConnectorBase):
                 phys_idx = int(visible_list[visible_idx])
             else:
                 phys_idx = visible_idx
-            ib_device = f"rdma{phys_idx}"
+            ib_device = _auto_select_ib_device(phys_idx)
             logger.info(
                 "Auto-selecting RDMA device %s for physical GPU %d "
                 "(visible_idx=%d, tp_rank=%d)",
