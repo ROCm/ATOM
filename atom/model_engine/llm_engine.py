@@ -94,9 +94,9 @@ class LLMEngine:
                     "--enable-tbo all (decode TBO) is not supported yet. "
                     "Use --enable-tbo (prefill only) with -pcp."
                 )
-            # Under PCP, TBO prefill uses request-boundary balanced grouping
-            # (never token-midpoint split), so ATOM_TBO_PREFILL_TOKEN_SPLIT is
-            # ignored.
+            # Under PCP, TBO prefill uses a request-boundary split (the
+            # non-default TBO split mode; never token-midpoint split), so
+            # ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored.
             if config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
                 logger.warning(
                     "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
