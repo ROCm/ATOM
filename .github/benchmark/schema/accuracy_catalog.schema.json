@@ -34,6 +34,7 @@
       "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
       "lm_eval_num_fewshot": { "type": "integer", "minimum": 0 },
       "lm_eval_num_concurrent": { "type": "integer", "minimum": 1 },
+      "lm_eval_extra_model_args": { "type": "string" },
       "_baseline_note": { "type": "string" }
     }
   }

@@ -53,6 +53,42 @@ class UBatchWrapper(nn.Module):
         # TBO CUDAGraph storage: keyed by (graph_bs, max_q_len)
         self.tbo_graphs: dict[tuple, TBOGraphData] = {}
 
+        # Persistent ubatch worker pool. Previously every forward spawned + joined
+        # 2 threads.
+        self._num_workers = 2
+        self._workers: list[threading.Thread] = []
+        self._worker_jobs: list[Optional[callable]] = [None] * self._num_workers
+        self._worker_job_ready = [threading.Event() for _ in range(self._num_workers)]
+        self._worker_job_done = [threading.Event() for _ in range(self._num_workers)]
+        self._workers_device: Optional[torch.device] = None
+
+    def _worker_loop(self, idx: int):
+        # Bind this long-lived thread to the device ONCE — the HIP per-thread
+        # context (and its getprops storm) is paid here, not every forward.
+        if self._workers_device is not None:
+            torch.cuda.set_device(self._workers_device)
+        while True:
+            self._worker_job_ready[idx].wait()
+            self._worker_job_ready[idx].clear()
+            job = self._worker_jobs[idx]
+            self._worker_jobs[idx] = None
+            try:
+                if job is not None:
+                    job()
+            finally:
+                self._worker_job_done[idx].set()
+
+    def _ensure_workers(self, device: torch.device):
+        if self._workers:
+            return
+        self._workers_device = device
+        for i in range(self._num_workers):
+            t = threading.Thread(
+                target=self._worker_loop, args=(i,), daemon=True, name=f"tbo-ub-{i}"
+            )
+            self._workers.append(t)
+            t.start()
+
     def _ensure_comm_stream(self):
         if self.comm_stream is None:
             self.comm_stream = torch.cuda.Stream()
@@ -139,47 +175,47 @@ class UBatchWrapper(nn.Module):
         errors: list[Optional[Exception]] = [None] * N
 
         device = input_ids.device
+        assert (
+            N <= self._num_workers
+        ), f"TBO needs {N} ubatch workers but pool has {self._num_workers}"
+        self._ensure_workers(device)
 
-        @torch.inference_mode()
-        def _ubatch_thread(idx):
-            try:
-                # Ensure the child thread has a HIP/CUDA context on the
-                # correct device — without this, the first HIP API call
-                # (e.g. RCCL collective, kernel launch) may block or fail
-                # because the runtime lazily initialises per-thread state.
-                torch.cuda.set_device(device)
+        def _make_job(idx):
+            @torch.inference_mode()
+            def _job():
+                try:
+                    ub_input_ids, ub_positions = ub_inputs[idx]
+                    with tbo_ctxs[idx]:
+                        model_output = self.model(ub_input_ids, ub_positions)
+                    results.append((idx, self._validate_ubatch_output(model_output)))
+                except Exception as e:
+                    # logger.exception captures the full traceback. The partner
+                    # thread is unblocked via TBOContext.partner.done (set in
+                    # __exit__) so the main thread's done-wait returns promptly
+                    # and re-raises errors[idx].
+                    logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
+                    errors[idx] = e
 
-                ub_input_ids, ub_positions = ub_inputs[idx]
-                with tbo_ctxs[idx]:
-                    model_output = self.model(ub_input_ids, ub_positions)
-                results.append((idx, self._validate_ubatch_output(model_output)))
-            except Exception as e:
-                # `logger.exception` captures the full traceback to the atom
-                # logger (which goes to stderr + log file); previously the
-                # bare `traceback.print_exc()` could be drowned by other
-                # stderr output across 8 worker procs. The partner thread
-                # is now unblocked via TBOContext.partner.done (set in
-                # __exit__) so the main thread's `t.join()` will return
-                # promptly and re-raise this `errors[idx]`.
-                logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
-                errors[idx] = e
+            return _job
 
-        # Clear thread-local forward context so threads don't inherit it
+        # Clear thread-local forward context so worker threads don't inherit it
         saved_ctx = getattr(_forward_context_local, "ctx", None)
         _forward_context_local.ctx = None
 
         try:
-            threads = []
+            # Hand each ubatch job to its persistent worker and wake it.
             for i in range(N):
-                t = threading.Thread(target=_ubatch_thread, args=(i,))
-                threads.append(t)
-                t.start()
+                self._worker_job_done[i].clear()
+                self._worker_jobs[i] = _make_job(i)
+                self._worker_job_ready[i].set()
 
+            # Same handshake as before: all reach the barrier, then wake thread 0.
             self.ready_barrier.wait()
             tbo_ctxs[0].cpu_wait_event.set()
 
-            for t in threads:
-                t.join()
+            # Wait for this step's jobs to finish (replaces Thread.join()).
+            for i in range(N):
+                self._worker_job_done[i].wait()
         finally:
             # Restore original forward context
             _forward_context_local.ctx = saved_ctx
