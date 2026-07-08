@@ -453,7 +453,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                                  max_model_len) / bs) + 1   # vLLM boundary +1
 
         Every active seq (prefilling OR decoding) retains ~one window, covered by
-        `max_num_seqs * per_decode` (per_decode = ceil(window/bs)+1). Keep BOTH
+        `max_num_seqs * per_decode` (per_decode = ceil(win_with_spec/bs)+1, where
+        win_with_spec = window + max_spec_steps covers the MTP draft tail). Keep BOTH
         terms: `one_prefill` = the current step's fresh chunk; the per-seq term =
         each seq's retained window. Do NOT drop the per-seq term thinking
         one_prefill subsumes it — that under-provisions under concurrent prefill
@@ -461,7 +462,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ceil(max_model_len/bs) (e.g. 1024 → ~66 blocks at 131072/8192/128/128).
         """
         bs = self.block_size
-        per_decode = (self.window_size + bs - 1) // bs + 1
+        # per_decode uses win_with_spec (= window + max_spec_steps), not window
+        # alone: under MTP each decoding seq writes up to `max_spec_steps` draft
+        # tokens into the SWA pool before the next window-free, so its peak
+        # footprint spans the window PLUS the spec lookahead = win_with_spec
+        # tokens (this is the same quantity SlidingWindowPool.tail_blocks uses).
+        # Sizing on `window` alone under-provisions by ~1 block/seq at spec>0 and
+        # hits "No free SWA blocks" at high concurrency. MTP off → max_spec_steps
+        # == 0 → win_with_spec == window, so this is a no-op for non-spec runs.
+        per_decode = (self.win_with_spec + bs - 1) // bs + 1
         num_tokens = min(
             max(0, self.window_size - 1) + self.max_num_batched_tokens, max_model_len
         )
