@@ -12,6 +12,8 @@ Use this skill to turn framework trace files into kernel breakdown CSVs with:
 - `kernel_name`: normalized kernel name
 - `kernel_time_us`: GPU kernel duration
 - `m,n,k`: shape fields when reliable
+- `variant`: optional execution variant such as `index` or `shared_index`
+- `tflops`, `bandwidth_gb_s`: derived metrics when shape metadata is reliable
 
 It also supports optional baseline-vs-candidate comparison after breakdown CSVs are generated.
 
@@ -34,6 +36,16 @@ Useful options:
 # Force framework if auto-detection is ambiguous.
 --framework atom
 --framework sglang
+
+# Select decode annotations by token count, e.g. decode[bs=32 tok=32 d=32].
+--target-decode-tokens 32
+
+# Generate an analysis summary with per-kernel ratios, variant counts,
+# weighted total time, TFLOPS, and memory bandwidth estimates.
+--summary-out /path/to/summary.csv
+
+# Read model config for GLM-style IndexShare counts (full/index vs shared).
+--model-config /path/to/config.json
 
 # Generate an optional comparison report from two generated CSVs.
 --compare-baseline baseline_breakdown.csv --compare-candidate candidate_breakdown.csv --compare-out compare_report.md
@@ -90,6 +102,11 @@ When the model changes:
    - `FillFunctor` -> `fill_`
    - `CUDAFunctor_add` -> `add`
    - `MulFunctor` -> `mul`
+7. For IndexShare models, output both representative variants when present:
+   - `variant=index`: full/indexer layer that computes sparse top-k.
+   - `variant=shared_index`: layer that reuses a prior index and skips logits/top-k.
+   - This applies to both prefill and decode. Prefill `index` commonly includes `fp8_mqa_logits`; decode `index` commonly includes `deepgemm_fp8_paged_mqa_logits`.
+   - Weighted totals must use model config counts, not a simple average. For GLM-5.2, `indexer_types` commonly gives 21 `full` layers and 57 `shared` layers.
 
 ## Module naming guidance
 
@@ -152,6 +169,38 @@ SGLang names can differ, but keep equivalent structure:
 - `mla_value_gemm`, `mla_cache_update`, `mla_reduce`
 - `attn_out_quant`, `attn_out_proj_gemm`
 - `moe_gate_setup`, `moe_gate_gemm`, `moe_expert`
+
+## Summary CSV Guidance
+
+When a user asks for an Excel/summary-style breakdown:
+
+1. Generate the detailed breakdown first.
+2. Generate a summary CSV with `--summary-out` and, when available, `--model-config`.
+3. The summary rows should include:
+   - `variant_count`: number of model layers represented by this variant.
+   - `ratio`: kernel time divided by that variant's single-layer time.
+   - `weighted_time_ms`: `kernel_time_us * variant_count / 1000`.
+   - `layer_time`: one single-layer total per `(phase, variant)`.
+   - `phase_weighted_total`: sum of weighted totals for all variants in a phase.
+4. For GLM IndexShare, check that totals match the model config:
+   - `prefill_total_ms = prefill_index_layer_us * full_count / 1000 + prefill_shared_layer_us * shared_count / 1000`.
+   - `decode_total_ms = decode_index_layer_us * full_count / 1000 + decode_shared_layer_us * shared_count / 1000`.
+5. A wide spreadsheet layout is acceptable for presentation, but the generated summary should stay long-form so it can be filtered and pivoted.
+
+## Derived Metrics
+
+The helper estimates performance metrics only when shape metadata is reliable:
+
+- GEMM-like kernels (`gemm`, `Cijk`, `batched_gemm`, `mfma_moe`) use:
+  - `flops = 2 * m * n * k`
+  - `tflops = flops / kernel_time_us / 1e6`
+  - `bandwidth_gb_s = estimated_bytes / kernel_time_us / 1e3`
+- GEMM byte estimates use `A + B + C` traffic with dtype inferred from the kernel name:
+  - BF16/HGEMM/Cijk: 2 bytes
+  - FP8/A8W8: 1 byte
+  - FP4/MXFP4 weights: 0.5 bytes for weights, BF16 output when indicated
+- Non-GEMM attention/MoE kernels with reliable 2D shape use a conservative read+write bandwidth estimate.
+- If shape metadata is missing or ambiguous, leave `tflops` / `bandwidth_gb_s` blank and explain in `metric_note`. Do not guess decode shapes.
 
 ## Optional comparison
 
