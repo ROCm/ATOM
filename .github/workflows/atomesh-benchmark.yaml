@@ -126,6 +126,11 @@ on:
         required: false
         default: false
         type: boolean
+      publish_dashboard:
+        description: 'Publish workflow_dispatch results to the benchmark dashboard'
+        required: false
+        default: false
+        type: boolean
 
 env:
   ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account || 'amd-frameworks' }}
@@ -141,7 +146,7 @@ concurrency:
 
 permissions:
   actions: read
-  contents: read
+  contents: write
 
 jobs:
   load-config:
@@ -336,3 +341,65 @@ jobs:
           path: |
             atomesh-benchmark-action.json
             atomesh-benchmark-summary.md
+
+  dashboard:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
+    name: Update ATOMesh Benchmark Dashboard
+    needs: [summarize-results]
+    if: >-
+      !cancelled()
+      && needs.summarize-results.result == 'success'
+      && (
+        github.event_name == 'schedule'
+        || github.event_name == 'push'
+        || (github.event_name == 'workflow_dispatch' && inputs.publish_dashboard)
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download CI benchmark summary markdown
+        uses: actions/download-artifact@v8
+        with:
+          name: atomesh-benchmark-summary
+          path: atomesh-dashboard-input
+
+      - name: Build ATOMesh dashboard data from CI summary markdown
+        run: |
+          set -euo pipefail
+          test -s atomesh-dashboard-input/atomesh-benchmark-summary.md
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          summary = Path("atomesh-dashboard-input/atomesh-benchmark-summary.md").read_text(encoding="utf-8")
+          Path("/tmp/atomesh_summary.js").write_text(
+              "window.ATOMESH_RUN_URL = "
+              + json.dumps("https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+              + ";\n"
+              + "window.ATOMESH_SUMMARY_MARKDOWN = "
+              + json.dumps(summary, ensure_ascii=False)
+              + ";\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Deploy ATOMesh dashboard markdown to gh-pages
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin gh-pages
+          git checkout gh-pages
+          mkdir -p benchmark-dashboard
+
+          cp /tmp/atomesh_summary.js benchmark-dashboard/atomesh_summary.js
+
+          git add benchmark-dashboard/atomesh_summary.js
+          git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
+          git push origin gh-pages

@@ -143,12 +143,17 @@
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {
-      "display": "Kimi-K2.5-MXFP4",
-      "path": "amd/Kimi-K2.5-MXFP4",
-      "prefix": "kimi-k25-mxfp4",
+      "display": "Kimi-K2.7-Code-MXFP4",
+      "path": "amd/Kimi-K2.7-Code-MXFP4",
+      "prefix": "kimi-k27-code-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 4, "kv_cache_dtype": "fp8", "trust_remote_code": true },
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "trust_remote_code": true,
+        "extra_args": "--gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"\", \"layer_quant_config\": {\"model.layers.*.self_attn.fused_qkv_a_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.q_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.kv_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.o_proj\": \"ptpc_fp8\"}}'"
+      },
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {
