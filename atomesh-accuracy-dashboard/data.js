@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783446365327,
+  "lastUpdate": 1783478192193,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -702,6 +702,42 @@ window.BENCHMARK_DATA = {
             "value": 0.8802,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28883623174 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202607071606 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3442 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "yajizhan@amd.com",
+            "name": "jasen",
+            "username": "Jasen2201"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c069049670db6917f80d98b2e35bd7ad47313ce0",
+          "message": " Remove legacy proxy, update docs, and enhance scripts (#1447)\n\n* refactor(pd): remove legacy Python proxy and ZMQ service discovery\n\nThe old `proxy.py` routing proxy is superseded by atomesh. Remove it\nalong with the `_service_discovery_ping` heartbeat threads in both\nmooncake and moriio connectors that registered with it. The\n`proxy_ip` / `proxy_ping_port` config keys are still accepted but\nsilently ignored, so existing kv-transfer-config payloads keep working.\n\n* chore(mesh): remove obsolete benchmark scripts\n\nKeep only the 7 scripts referenced by scripts/README.md (docker_start,\nstart_prefill, start_decode, start_router, run_gsm8k, run_benchmark,\nds_fp8_1p_tp4_1d_tp8_slurm). The rest are superseded by the weekly\nbenchmark harness and per-model slurm scripts outside the repo.\n\n* feat(mesh): add RDMA NIC auto-detection and SO mapping to docker_start.sh\n\nAuto-detect bnxt/ionic/mlx5 NICs and mount the correct host ibverbs\nprovider libraries into the container. Also adds /dev/infiniband,\n--shm-size 128G, and post-start TCP backlog tuning. Verified on\nionic (mia1-p02-g42).\n\n* docs: replace legacy proxy with atomesh in all PD guides\n\nUpdate kv-transfer-config examples to drop proxy_ip/proxy_ping_port\nand add atomesh router launch steps. Affected docs:\n- recipes/pd_disaggregation_guide.md\n- recipes/DeepSeek-V4.md\n- recipes/mesh/multi-node-atom.md\n- atom/kv_transfer/disaggregation/README.md\n\n* docs(pd): replace build-from-source with docker setup in PD guide\n\nRemove the Mooncake build-from-source section (67 lines) and replace\nwith docker pull + docker_start.sh which handles RDMA NIC detection\nand SO mounting automatically.\n\n* docs: add MiniMax-M3 PD disaggregation recipe\n\nSingle-node 1P+1D setup (GPU 0-3 prefill, GPU 4-7 decode, TP=4 each)\nwith atomesh router. Covers base MXFP4, EAGLE3 variant, GSM8K accuracy\nvalidation, and serving benchmark — all via the router endpoint.\n\n* docs: add MiniMax-M3 multi-node 2P+1D DPA+TBO recipe\n\n3-node setup: 2 prefill instances (TP=4, DPA + TBO) + 1 decode instance\n(TP=4, DPA, max-num-seqs=1024). Covers atomesh router with dual\n--prefill flags, GSM8K accuracy, and high-concurrency benchmark sweep.\n\n* docs: add online_quant_config to MiniMax-M3 PD recipes\n\nAdd --online_quant_config to all PD server commands (1P1D and 2P1D).\nInclude a reference table documenting the exclude_layer differences\nbetween MXFP4/MXFP8 and TP-only/DPA modes.\n\n* docs: fix online quant config section title to be mode-agnostic\n\n* refactor(pd): remove dead proxy_ip/proxy_ping_port attributes from connectors\n\nThese config reads were kept for backward compatibility but the only\nconsumer (_service_discovery_ping) was already removed. Old configs\nthat pass proxy_ip still work — dict.get() silently discards the value.\n\n* chore: rename default image to rocm/atom-dev:latest and container to atom_mesh\n\nReplace mesh-sglang-latest with rocm/atom-dev:latest as the default\ndocker image. List vllm-latest and sglang-latest as alternatives in\ncomments. Rename default container from atom_sglang_mesh to atom_mesh.\n\n* chore(mesh): remove obsolete ds_fp8 slurm script and its README section\n\nThe SLURM one-shot automation is now handled by per-model scripts\noutside the repo. Remove the generic ds_fp8_1p_tp4_1d_tp8_slurm.sh\nand its corresponding documentation from the scripts README.\n\n* docs: extract MiniMax-M3 PD recipes into recipes/mesh/MiniMax-M3.md\n\nMove all PD disaggregation sections (1P+1D, 2P+1D DPA, EAGLE3 variants,\nonline_quant_config reference) from recipes/MiniMax-M3.md into a dedicated\nmesh recipe. The original file now has a cross-reference link.\n\nThe new doc covers all 8 benchmark configurations (FP4/FP8 × 1P1D/2P1D ×\nplain/EAGLE3), distilled from the weekly_mesh_benchmark scripts.\n\n* docs: add DeepSeek-V4-Pro PD mesh recipe\n\nDistill the 5 weekly benchmark scripts (1P1D TP, 1P1D MTP, 2P1D DPA,\n2P1D MTP DPA, 2P1D MTP3 DPA) into a single user-facing recipe at\nrecipes/mesh/DeepSeek-V4.md covering all topologies with MTP as an\nadd-on section.\n\n* docs: drop MTP-3 DPA variant from DeepSeek-V4 mesh recipe\n\n* docs: replace inline PD section in DeepSeek-V4 recipe with mesh link\n\n* docs: replace obsolete ATOM_CPU_AFFINITY with ATOM_NUMA_BIND in DeepSeek-V4 recipe\n\nATOM_CPU_AFFINITY was the old NUMA-blind linear CPU slice, replaced by\nthe topology-aware ATOM_NUMA_BIND. The old var is not read by any code.",
+          "timestamp": "2026-07-08T10:10:54+08:00",
+          "tree_id": "d540d0cfb2e6de6311714bd6f57dcc61b210d162",
+          "url": "https://github.com/ROCm/ATOM/commit/c069049670db6917f80d98b2e35bd7ad47313ce0"
+        },
+        "date": 1783478172877,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9507,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28912426945 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202607071606 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9477 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7604,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28912426945 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607071606 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7604 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
           }
         ]
       }
