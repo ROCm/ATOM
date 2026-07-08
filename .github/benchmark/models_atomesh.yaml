@@ -100,6 +100,8 @@ models:
             workers: 1
             tp: 8
             extra_args: "--enable-dp-attention --enable-tbo"
+          benchmark:
+            wait_server_timeout: 4500
           run_eval: true
 
     accuracy:
@@ -145,7 +147,7 @@ models:
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
-            wait_server_timeout: 1800
+            wait_server_timeout: 4500
           runner:
             time_limit: "04:00:00"
           run_eval: true
@@ -165,7 +167,7 @@ models:
             workers: 1
             tp: 4
           benchmark:
-            wait_server_timeout: 1800
+            wait_server_timeout: 4500
           runner:
             time_limit: "06:00:00"
           run_eval: true
