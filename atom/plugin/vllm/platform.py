@@ -35,13 +35,13 @@ def _chunked_prefill_on(scheduler_config) -> bool:
 def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     """Apply V4-specific plugin constraints.
 
-    1. Disable prefix caching: V4's per-request SWA sliding-window buffer cannot
-       be reconstructed from the cached classical KV blocks on a prefix-cache
-       hit, so a hit would leave attention with a stale/empty window. Native
-       ATOM disables this in its own config; in plugin mode vLLM owns paging, so
-       we must turn it off here. (This also keeps each active request's first
-       block id unique, which the V4 bridge relies on for stable per-request
-       state slots.)
+    1. Enable prefix caching via SWA recompute: V4's per-request SWA
+       sliding-window ring is not carried by vLLM's block-level prefix cache
+       (only the CSA/HCA compressed pages are). Rather than disable caching, we
+       install a KVCacheManager patch that, on a prefix hit, drops the last
+       ``ceil(win_with_spec / block_size)`` cached blocks so the SWA tail is
+       re-forwarded and the ring is repopulated (mirrors native ATOM "fix B'").
+       See ``deepseek_v4_prefix_patch``.
 
     2. Guard the non-chunked oversized forward: with chunked prefill off, vLLM
        couples max_num_batched_tokens to max_model_len, so a native max_model_len
@@ -58,11 +58,11 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     if cache_config is not None and getattr(
         cache_config, "enable_prefix_caching", False
     ):
-        cache_config.enable_prefix_caching = False
-        logger.warning(
-            "DeepSeek-V4: disabling prefix caching (the per-request SWA window "
-            "cannot be restored from cached KV blocks)."
+        from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+            apply_vllm_v4_prefix_swa_patch,
         )
+
+        apply_vllm_v4_prefix_swa_patch(vllm_config)
 
     sc = getattr(vllm_config, "scheduler_config", None)
     if sc is None or _chunked_prefill_on(sc):

@@ -162,10 +162,6 @@ class MoRIIOConstants:
     OVER = b"OVER"
     COMPLETION_PREFIX = "cmpl"
 
-    # Service discovery
-    PING_INTERVAL_SECONDS = 5
-    MAX_PING_RETRIES = 100
-
     # Networking
     DEFAULT_HANDSHAKE_PORT = 6301
     DEFAULT_NOTIFY_PORT = "61005"
