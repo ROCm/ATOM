@@ -104,6 +104,20 @@ def weight_dequant_fp8(
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 
 
+def _mx_block_scale_dtype():
+    """The block-scale dtype mandated by the MX (microscaling) format: E8M0.
+
+    Every MX scheme (``QuantType.per_1x32``) stores a shared power-of-two block
+    scale in E8M0, regardless of whether the elements are FP4 or FP8 — this is
+    fixed by the MX spec, not a per-call choice. Resolving it here gives both the
+    MXFP4 and MXFP8 online-quant paths a single source of truth, so callers pass
+    a value derived from the format rather than a repeated literal.
+    """
+    from aiter import dtypes
+
+    return dtypes.fp8_e8m0
+
+
 def weight_dequant_mxfp8(
     x: torch.Tensor, s: torch.Tensor, block_size: int = 32
 ) -> torch.Tensor:
@@ -149,7 +163,7 @@ def quant_mxfp4_online_even(
     if q_in.dtype not in (torch.float16, torch.bfloat16):
         q_in = q_in.to(torch.bfloat16)
     q_weight, weight_scale = quant_mxfp4_hip(q_in, round_mode=MxScaleRoundModeInt.Even)
-    return q_weight.view(dtypes.fp4x2), weight_scale.view(dtypes.fp8_e8m0)
+    return q_weight.view(dtypes.fp4x2), weight_scale.view(_mx_block_scale_dtype())
 
 
 def quant_weight_online(
@@ -180,17 +194,21 @@ def quant_weight_online(
     if online_quant_dtype == dtypes.fp4x2:
         return quant_mxfp4_online_even(weight)
     quant_func = get_hip_quant(online_quant_type)
-    if online_quant_type == QuantType.per_1x32 and online_quant_dtype == dtypes.fp8:
-        # MXFP8: aiter's per_1x32 fp8 quantizer defaults scale_type=fp32 for
-        # backward compat, but that fp32 scale is NOT what we want here —
-        # Fp8MoEMethod.create_weights allocates an e8m0 (uint8) scale buffer for
-        # per_1x32, and the MXFP8 GEMM / flydsl MoE kernels only consume the
-        # e8m0 byte scale. Force scale_type=fp8_e8m0 so the produced scale
-        # matches the buffer and the kernel; DO NOT drop this argument or the
-        # scale silently reverts to fp32 and loading/inference breaks.
+    # A per_1x32 scheme *is* MX (microscaling): its block scale is E8M0 by
+    # definition of the format, independent of the element dtype. So the scale
+    # dtype is derived from the scheme, not chosen per case — the MXFP4 branch
+    # above already relies on this (aiter forces e8m0 for fp4x2), and here the
+    # MXFP8 (fp8) branch needs the same E8M0 scale. We only have to pass it
+    # explicitly because aiter's per_1x32 fp8 quantizer keeps scale_type=fp32 as
+    # a backward-compat default, whereas the whole consuming side is E8M0:
+    # Fp8MoEMethod.create_weights allocates an e8m0 (uint8) scale buffer and the
+    # MXFP8 GEMM / flydsl MoE kernels only read that byte scale. Without it the
+    # scale silently reverts to fp32 and weight loading / inference break.
+    if online_quant_type == QuantType.per_1x32:
+        mx_scale_type = _mx_block_scale_dtype()
         return quant_func(
             weight,
             quant_dtype=online_quant_dtype,
-            scale_type=dtypes.fp8_e8m0,
+            scale_type=mx_scale_type,
         )
     return quant_func(weight, quant_dtype=online_quant_dtype)

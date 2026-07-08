@@ -19,7 +19,7 @@ ATOM supports running the model with different parallelism, e.g., tensor paralle
 ```bash
 #!/bin/bash
 
-model_path=zai-org/GLM-5-FP8
+model_path=zai-org/GLM-5.2-FP8
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=8
@@ -37,7 +37,7 @@ python -m atom.entrypoints.openai_server \
 ```bash
 #!/bin/bash
 
-model_path=zai-org/GLM-5-FP8
+model_path=zai-org/GLM-5.2-FP8
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=4
