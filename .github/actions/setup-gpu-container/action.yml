@@ -52,11 +52,12 @@ inputs:
     default: ""
   disable-mmap:
     description: >-
-      When 'true' (default) inject `-e ATOM_DISABLE_MMAP=true`. Set 'false' for
-      callers whose container never set it (e.g. mmstar) to stay byte-for-byte
-      equivalent.
+      When 'true', inject `-e ATOM_DISABLE_MMAP=true` into the container.
+      Defaults to 'false' (mmap enabled) now that the batched parallel loader
+      makes the non-mmap load path unnecessary; set 'true' for callers that
+      still need mmap disabled.
     required: false
-    default: "true"
+    default: "false"
 
 runs:
   using: composite
