@@ -740,6 +740,10 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # PCP is compile-safe: its runtime-varying branches live inside opaque
+        # splitting ops (indexer_with_output / unified_attention_with_output_base)
+        # that run eager, so Dynamo never bakes `_pcp_active()` to its dummy-warmup
+        # value. No PCP-specific compile guard needed here.
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
             if hasattr(self, "drafter"):

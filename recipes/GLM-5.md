@@ -194,3 +194,57 @@ Reference numbers on 8×MI355X (TP8, FP8 weights, bf16 KV cache), using the benc
 | 8192 | 1024 | 1   | 73   | 669   | 409 | 13.2 |
 | 8192 | 1024 | 16  | 645  | 5818  | 418 | 23.3 |
 | 8192 | 1024 | 64  | 1210 | 10853 | 483 | 51.3 |
+
+## GLM-5.2 Prefill Context Parallel (PCP)
+
+Prefill Context Parallel accelerates **long-context prefill** (large ISL) by
+round-robin splitting the prompt tokens across an extra parallel dimension
+(`world = tp × pcp`). Only the query side is sharded — every rank keeps the
+**full KV cache**, so decode, the KV-cache layout, and accuracy are unchanged.
+The dominant `O(S²)` DSA indexer scoring and the sparse MLA attention run on
+`1/pcp` of the queries per rank, cutting TTFT on long inputs. GLM-5.2 runs on
+the DeepSeek-V3.2 sparse-MLA (DSA) path, so PCP applies here just like on
+DeepSeek-V4.
+
+Enable it with `--prefill-context-parallel-size` (`-pcp`). `pcp` is orthogonal
+to `-tp`, and the two multiply into the number of GPUs used
+(`GPUs = tp × pcp`). MTP speculative decoding is supported — the draft's prefill
+pass is split and gathered the same way.
+
+Constraints in this release (the engine raises a clear error otherwise):
+- DSA models only (GLM-5.2 / DeepSeek-V3.2 — configs with `index_topk`).
+- `--no-enable_chunked_prefill` (PCP needs the whole prompt in one forward).
+- `--no-enable_prefix_caching`.
+- Not compatible with `--enable-dp-attention` or `--enable-tbo`.
+- `pcp = 1` (the default) is a bit-exact no-op — the non-PCP code path is
+  unchanged.
+
+### Serving on 4 GPUs (TP2 × PCP2)
+
+```bash
+#!/bin/bash
+
+model_path=/shared/data/amd_int/models/GLM-5.2-FP8
+
+rm -rf /root/.cache/atom/*
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8000 \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  --no-enable_chunked_prefill \
+  -tp 2 -pcp 2 2>&1 | tee server_pcp.log &
+```
+
+Pure context parallel (`TP1 × PCP4`) is also valid on 4 GPUs — swap `-tp 2 -pcp 2`
+for `-tp 1 -pcp 4`.
+
+### Validating PCP
+
+Compare a PCP run against a same-GPU-count `-tp 4 -pcp 1` baseline. Accuracy
+should match the baseline (PCP does not change decode), and TTFT should improve
+as ISL grows. Use a long-input workload, e.g. `ISL=60000`, `OSL=1024`,
+concurrency 8, with the benchmark command from
+[Performance baseline](#performance-baseline), and the gsm8k
+[Accuracy test](#accuracy-test) for parity.

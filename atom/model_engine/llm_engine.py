@@ -84,6 +84,38 @@ class LLMEngine:
                 "independently (double-split) and corrupt the output. For now, "
                 "disable one of them."
             )
+        # PCP for the native ATOM engine is implemented only on the DeepSeek-V3.2
+        # / GLM-5.2 sparse-MLA (DSA) path (indexer + sparse attention). Those
+        # configs expose `index_topk`. Non-sparse models (dense DeepSeek-V2,
+        # non-DSA archs) have no PCP wiring, so reject pcp>1 for them with a clear
+        # message instead of silently running the un-split path.
+        if config.prefill_context_parallel_size > 1 and not hasattr(
+            config.hf_config, "index_topk"
+        ):
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) is currently only "
+                "supported for sparse-MLA / DSA models (DeepSeek-V3.2, GLM-5.2 — "
+                "configs with `index_topk`). The requested model "
+                f"({getattr(config.hf_config, 'model_type', 'unknown')}) is not a "
+                "DSA model. Run it with -pcp 1."
+            )
+        # PCP v1 requires chunked prefill OFF: the round-robin token split assumes
+        # the whole prefill sequence is present in one forward (it pads the global
+        # token count to a multiple of pcp and needs each query's full history).
+        if config.prefill_context_parallel_size > 1 and config.enable_chunked_prefill:
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) requires chunked "
+                "prefill disabled in this release. Pass "
+                "--no-enable_chunked_prefill."
+            )
+        # PCP v1 requires prefix caching OFF: mixing a full cached KV prefix with
+        # 1/pcp new tokens in the indexer gather is not yet handled.
+        if config.prefill_context_parallel_size > 1 and config.enable_prefix_caching:
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) requires prefix "
+                "caching disabled in this release. Pass "
+                "--no-enable_prefix_caching."
+            )
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
