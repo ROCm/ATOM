@@ -16,6 +16,14 @@ on:
       - '.github/benchmark/sglang_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
+      - 'scripts/**'
+      - '.github/dashboard/**'
+      - '.github/benchmark/vllm*'
+      - '.github/benchmark/oot_*'
+      - '.github/workflows/vllm-benchmark.yaml'
+      - '.github/workflows/atom-benchmark.yaml'
+      - '.github/workflows/docker-release.yaml'
+      - '.github/workflows/gpu-load-test.yaml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
