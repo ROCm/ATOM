@@ -126,6 +126,28 @@ models:
         max_num_batched_tokens: 32768
         extra_args: ""
     suites:
+      smoke:
+        - name: glm-5-2-fp8-1p1d-tp8-smoke
+          topology: 1p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [4, 8]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          benchmark:
+            wait_server_timeout: 4200
+          runner:
+            time_limit: "04:00:00"
+          run_eval: true
+          eval_limit: 64
+          eval_concurrency: [64]
+
       nightly:
         - name: glm-5-2-fp8-1p1d-tp8
           topology: 1p1d
