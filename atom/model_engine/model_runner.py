@@ -2035,7 +2035,40 @@ class ModelRunner:
                 graph_bs = context.graph_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
                 graph_key = (graph_bs, max_q_len)
+                try:
+                    self._host16 = self.forward_vars["cu_seqlens_q"].np[:16].tolist()
+                except Exception:
+                    self._host16 = None
+                try:
+                    import atom.model_ops.attention_mla as _am
+                    if _am._PRE_SNAP is not None:
+                        _am._PRE_SNAP.copy_(self.forward_vars["cu_seqlens_q"].gpu[:16])
+                except Exception:
+                    pass
                 self.graphs[graph_key].replay()
+                try:
+                    if self._host16 is not None and int(self._host16[1]) != 1:
+                        self._cuq_host_bad = getattr(self, "_cuq_host_bad", 0) + 1
+                except Exception:
+                    pass
+                self._probe_step = getattr(self, "_probe_step", 0) + 1
+                if self._probe_step % 200 == 0:
+                    try:
+                        import atom.model_ops.attention_mla as _am2
+                        _p = getattr(_am2, "_DBG_PROBE", None)
+                        _hits = int(_p[0].item()) if _p is not None else -1
+                        _sb = _am2._SRC_BAD_AT_COPY[0]
+                        _ls = _am2._LAST_SRC_AT_COPY[:6] if _am2._LAST_SRC_AT_COPY else None
+                        _bad = None
+                        if _p is not None and _hits > 0:
+                            _r = _p[2:2 + 64].tolist()
+                            _bad = {"after_copy": _r[16:22], "pre_replay": _r[32:38], "live": _r[0:6]}
+                        logger.warning(
+                            "[PROBE_HOSTSRC] step=%d hits=%d host_bad=%d src_bad_at_copy=%d last_src=%s %s",
+                            self._probe_step, _hits, getattr(self, "_cuq_host_bad", 0), _sb, _ls, _bad,
+                        )
+                    except Exception:
+                        pass
                 num_tokens = context.batch_size * max_q_len
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
                 if graph_key in self.graph_aux_hidden:
