@@ -42,6 +42,11 @@ on:
         required: false
         default: false
         type: boolean
+      run_glm_5_2_fp8:
+        description: 'Run GLM-5.2-FP8'
+        required: false
+        default: false
+        type: boolean
       run_kimi_k25_mxfp4:
         description: 'Run Kimi-K2.5-MXFP4'
         required: false
@@ -152,6 +157,7 @@ jobs:
           SUITE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           RUN_DEEPSEEK_V4_PRO: ${{ github.event_name == 'workflow_dispatch' && inputs.run_deepseek_v4_pro || false }}
+          RUN_GLM_5_2_FP8: ${{ github.event_name == 'workflow_dispatch' && inputs.run_glm_5_2_fp8 || false }}
           RUN_KIMI_K25_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.run_kimi_k25_mxfp4 || false }}
           RUN_MINIMAX_M3_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.run_minimax_m3_mxfp4 || false }}
           RUN_MINIMAX_M3_MXFP8: ${{ github.event_name == 'workflow_dispatch' && inputs.run_minimax_m3_mxfp8 || false }}
@@ -164,6 +170,7 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${RUN_ALL_MODELS}" != "true" ]]; then
             selected_models=()
             [[ "${RUN_DEEPSEEK_V4_PRO}" == "true" ]] && selected_models+=("DeepSeek-V4-Pro")
+            [[ "${RUN_GLM_5_2_FP8}" == "true" ]] && selected_models+=("GLM-5.2-FP8")
             [[ "${RUN_KIMI_K25_MXFP4}" == "true" ]] && selected_models+=("Kimi-K2.5-MXFP4")
             [[ "${RUN_MINIMAX_M3_MXFP4}" == "true" ]] && selected_models+=("MiniMax-M3-MXFP4")
             [[ "${RUN_MINIMAX_M3_MXFP8}" == "true" ]] && selected_models+=("MiniMax-M3-MXFP8")

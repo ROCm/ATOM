@@ -107,6 +107,51 @@ models:
       fewshot: 3
       limit: null
 
+  GLM-5.2-FP8:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/GLM-5.2-FP8/"
+    precision: FP8
+    env:
+      common: {}
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        gpu_memory_utilization: 0.8
+        max_model_len: 32768
+        max_num_seqs: 256
+        max_num_batched_tokens: 32768
+        extra_args: ""
+    suites:
+      nightly:
+        - name: glm-5-2-fp8-1p1d-tp8
+          topology: 1p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [128, 256]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          benchmark:
+            wait_server_timeout: 4200
+          runner:
+            time_limit: "08:00:00"
+          run_eval: true
+          eval_concurrency: [64, 256]
+
+    accuracy:
+      task: gsm8k
+      fewshot: 3
+      limit: null
+
   Kimi-K2.5-MXFP4:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/"
