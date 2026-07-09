@@ -5,6 +5,7 @@ from collections import deque
 
 import numpy as np
 import xxhash
+
 from atom.config import Config
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
@@ -309,7 +310,9 @@ class BlockManager:
         if seq.has_per_req_cache:
             seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
 
-    def hash_blocks(self, seq: Sequence, num_new_tokens: int) -> None:
+    def hash_blocks(
+        self, seq: Sequence, num_new_tokens: int, start_tokens: int | None = None
+    ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
         Called from scheduler.postprocess() after the forward completes, so a
@@ -320,12 +323,17 @@ class BlockManager:
         Caller passes `num_new_tokens` = tokens forwarded in this step. For
         single-shot prefill that's `seq.num_tokens - seq.num_cached_tokens`;
         chunked prefill will pass the per-chunk count.
+
+        `start_tokens` overrides the token offset the range starts at. Pipeline-
+        parallel schedule-time advancement already bumped seq.num_cached_tokens
+        past this chunk, so the head passes the chunk's pre-advance offset here.
         """
         if not self.enable_prefix_caching:
             return
         hbs = self._hash_block_size()
-        start = seq.num_cached_tokens // hbs
-        end = (seq.num_cached_tokens + num_new_tokens) // hbs
+        base = seq.num_cached_tokens if start_tokens is None else start_tokens
+        start = base // hbs
+        end = (base + num_new_tokens) // hbs
         if start >= end:
             return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
