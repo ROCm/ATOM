@@ -419,6 +419,8 @@ jobs:
           )
           PY
 
+          cp .github/dashboard/index.html /tmp/atomesh_dashboard_index.html
+
       - name: Deploy ATOMesh dashboard markdown to gh-pages
         run: |
           set -euo pipefail
@@ -429,8 +431,9 @@ jobs:
           git checkout gh-pages
           mkdir -p benchmark-dashboard
 
+          cp /tmp/atomesh_dashboard_index.html benchmark-dashboard/index.html
           cp /tmp/atomesh_summary.js benchmark-dashboard/atomesh_summary.js
 
-          git add benchmark-dashboard/atomesh_summary.js
+          git add benchmark-dashboard/index.html benchmark-dashboard/atomesh_summary.js
           git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
           git push origin gh-pages
