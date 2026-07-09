@@ -37,9 +37,13 @@ jobs:
               `> Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``,
             ].join("\n");
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body,
-            });
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            } catch (error) {
+              core.warning(`Failed to post CI Guide comment: ${error.message}`);
+            }
