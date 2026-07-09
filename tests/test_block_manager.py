@@ -402,7 +402,15 @@ class TestM2DualSwaPool:
         # After ensure, the touched logical blocks hold real disjoint phys ids.
         assert all(s in bm.swa.used_block_ids for s in seq.swa_block_table)
 
-    def test_prefix_hit_reuses_swa(self, seq_factory):
+    def test_windowonly_prefill_no_cross_request_swa_reuse(self, seq_factory):
+        # Window-only prefill writes/publishes SWA only for the trailing
+        # `window` tokens relative to the FULL prompt. Cross-request prefix
+        # reuse needs the trailing window *at the hit boundary* (mid-prompt)
+        # to be SWA-present — which window-only never writes — so bounded_hit
+        # finds no complete in-window run and gates the whole hit to 0. This
+        # trades away cross-request SWA prefix reuse for prefill scatter-write
+        # cost (see paged-SWA perf notes); correctness is preserved (a denied
+        # hit just recomputes, never reads stale SWA).
         bm = _swa_bm()
         toks = list(range(1, 13))  # 3 blocks
         s1 = seq_factory(toks)
@@ -413,7 +421,7 @@ class TestM2DualSwaPool:
         bm.hash_blocks(s1, len(toks))  # publish hashes (compressed + swa)
         s2 = seq_factory(toks)
         n2 = bm.can_allocate(s2)
-        assert n2 >= 1  # prefix hit
+        assert n2 == 0  # window-only: no cross-request SWA prefix reuse
         bm.allocate(s2, n2)
         # reused cached blocks share the SAME swa phys ids as s1.
         for i in range(n2):

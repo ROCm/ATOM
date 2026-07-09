@@ -541,9 +541,7 @@ def qk_norm_rope_maybe_quant(
             )
         else:
             if swa_cache_size is None:
-                raise ValueError(
-                    "ring swa_kv fallback requires swa_cache_size"
-                )
+                raise ValueError("ring swa_kv fallback requires swa_cache_size")
             swa_write(
                 kv_out,
                 positions,
