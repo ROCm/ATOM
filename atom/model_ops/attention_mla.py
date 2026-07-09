@@ -189,6 +189,57 @@ def dynamic_per_batched_tensor_quant(
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
+# =====================================================================
+# TEMP DEBUG (remove after measurement): MLA fp8-KV amax probe.
+# Answers: with the hardcoded scale=1.0, do the latent (k_nope), the rope
+# part (k_rope), or q ever exceed the e4m3fnuz max (240) and get clamped?
+# Enable with ATOM_DEBUG_MLA_AMAX=1 and run with --enforce-eager.
+# Per-rank running maxima are dumped to /tmp/mla_amax_pid<PID>.json.
+# =====================================================================
+import os as _os_dbg  # noqa: E402
+import json as _json_dbg  # noqa: E402
+
+_MLA_AMAX_DEBUG = _os_dbg.environ.get("ATOM_DEBUG_MLA_AMAX", "0") == "1"
+_MLA_AMAX_STATS: dict = {}
+_MLA_AMAX_STEP = [0]
+_MLA_FP8_MAX = 240.0  # e4m3fnuz max on gfx942/MI3xx
+
+
+def _mla_amax_probe(layer_num, k_nope, k_rope, q):
+    try:
+
+        def _s(t):
+            tf = t.detach().float().abs()
+            return tf.amax().item(), (tf > _MLA_FP8_MAX).float().mean().item()
+
+        kn, kr, qq = _s(k_nope), _s(k_rope), _s(q)
+        rec = _MLA_AMAX_STATS.setdefault(
+            int(layer_num),
+            {
+                "k_nope_amax": 0.0,
+                "k_nope_clampfrac": 0.0,
+                "k_rope_amax": 0.0,
+                "k_rope_clampfrac": 0.0,
+                "q_amax": 0.0,
+                "q_clampfrac": 0.0,
+                "n": 0,
+            },
+        )
+        rec["k_nope_amax"] = max(rec["k_nope_amax"], kn[0])
+        rec["k_nope_clampfrac"] = max(rec["k_nope_clampfrac"], kn[1])
+        rec["k_rope_amax"] = max(rec["k_rope_amax"], kr[0])
+        rec["k_rope_clampfrac"] = max(rec["k_rope_clampfrac"], kr[1])
+        rec["q_amax"] = max(rec["q_amax"], qq[0])
+        rec["q_clampfrac"] = max(rec["q_clampfrac"], qq[1])
+        rec["n"] += 1
+        _MLA_AMAX_STEP[0] += 1
+        if _MLA_AMAX_STEP[0] % 200 == 0:
+            with open(f"/tmp/mla_amax_pid{_os_dbg.getpid()}.json", "w") as f:
+                _json_dbg.dump(_MLA_AMAX_STATS, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
 class MLAAttention(nn.Module):
     def __init__(
         self,
@@ -1140,6 +1191,8 @@ class MLAAttention(nn.Module):
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output
+        if _MLA_AMAX_DEBUG:
+            _mla_amax_probe(self.layer_num, k_nope, k_rope, q)
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
