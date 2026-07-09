@@ -600,6 +600,10 @@ class ModelRunner:
                 rank_name = f"dp{dp_rank_local}_tp{rank}"
             else:
                 rank_name = f"rank_{rank}"
+            if config.pipeline_parallel_size > 1:
+                rank_name = (
+                    f"pp{config.parallel_config.pipeline_parallel_rank}_{rank_name}"
+                )
             self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
