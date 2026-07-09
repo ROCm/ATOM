@@ -701,7 +701,12 @@ class ModelRunner:
         else:
             self.rank_name = f"rank_{rank}"
         if config.torch_profiler_dir is not None:
-            self.profiler_dir = os.path.join(config.torch_profiler_dir, self.rank_name)
+            rank_name = self.rank_name
+            if config.pipeline_parallel_size > 1:
+                rank_name = (
+                    f"pp{config.parallel_config.pipeline_parallel_rank}_{rank_name}"
+                )
+            self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self._setup_device_and_distributed(rank, config)
