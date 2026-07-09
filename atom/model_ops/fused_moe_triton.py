@@ -471,17 +471,17 @@ def triton_kernel_fused_experts_a8w4_silu_gguu(
 ) -> torch.Tensor:
     """Decode-only A8W4 MoE for SiLU models, GGUU (separated ``[gate|up]``).
 
-    GGUU keeps gate and up as contiguous halves, so the per-block SiLU cannot be
-    fused into GEMM1's write-back (a tile spans only gate *or* only up). The
-    activation and quant therefore run as a separate step:
+    GGUU keeps gate and up as contiguous halves. The fused swiglu can still run
+    inside GEMM1's write-back if a single N-block spans the whole gate|up row so
+    both halves pair in-tile; ``is_guinterleave=False`` makes ``moe_gemm_a8w4``
+    force that full-width block. Act + MXFP8 quant are therefore fused into GEMM1:
 
-        MXFP8 quant -> GEMM1(a8w4, no swiglu, bf16 [gate|up]) ->
-        fused_clamp_act_mul(SiLU(gate)*up on the halves) ->
-        MXFP8 quant -> GEMM2(a8w4).
+        MXFP8 quant -> GEMM1(a8w4, fused SiLU(gate)*up + mxfp8 out) -> GEMM2(a8w4).
 
-    The intermediate is re-quantized with ``downcast_to_mxfp`` (same op as the x
-    path) so GEMM2 sees the identical activation-scale format. Weights are in the
-    preshuffled a8w4 layout with w13 gate/up separated.
+    This replaces the earlier unfused path (GEMM1 bf16 [gate|up] ->
+    fused_clamp_act_mul -> downcast_to_mxfp), dropping one kernel launch and the
+    bf16 intermediate. Weights are in the preshuffled a8w4 layout, gate/up
+    separated; scales carry the swizzle label in w13/w2_swizzle_layout.
     """
     assert hidden_states.ndim == 2
     assert hidden_states.dtype == torch.bfloat16
@@ -490,8 +490,8 @@ def triton_kernel_fused_experts_a8w4_silu_gguu(
 
     x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
 
-    # GEMM1: raw bf16 [gate|up] output; no fused activation for the separated layout.
-    interm = moe_gemm_a8w4(
+    # GEMM1: fused SiLU(gate)*up + MXFP8 quant over the separated [gate|up] row.
+    interm_fp8, interm_scale = moe_gemm_a8w4(
         x_fp8,
         w1,
         x_scale,
@@ -503,17 +503,13 @@ def triton_kernel_fused_experts_a8w4_silu_gguu(
         gather_indx=gather_indx,
         gammas=gammas if apply_router_weight_on_input else None,
         swizzle_mx_scale=w13_swizzle_layout,
-        apply_swiglu=False,
-        out_dtype=torch.bfloat16,
+        apply_swiglu=True,
+        alpha=1.0,
+        limit=swiglu_limit,
+        swiglu_add_residual=False,
+        is_guinterleave=False,
+        out_mx_quant=True,
         preshuffled=True,
-    )
-
-    # Standalone SiLU(gate)*up over the contiguous halves, then MXFP8 quant.
-    interm_act = fused_clamp_act_mul(
-        interm, swiglu_limit=swiglu_limit, activation="silu"
-    )
-    interm_fp8, interm_scale = downcast_to_mxfp(
-        interm_act, torch.float8_e4m3fn, axis=-1
     )
 
     output_tensor = moe_gemm_a8w4(
