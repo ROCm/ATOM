@@ -405,7 +405,7 @@ jobs:
               {
                   "model_name": "MI308 GLM-5.1-FP8 TP8",
                   "model_path": "zai-org/GLM-5.1-FP8",
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache",
                   "lm_eval_num_fewshot": 20,
                   "lm_eval_num_concurrent": 64,
                   "accuracy_test_threshold": 0.93,
@@ -414,7 +414,7 @@ jobs:
               },
               {
                   "model_name": "MI308 DeepSeek-V4-Flash",
-                  "model_path": "deepseek-ai/DeepSeek-V4-Flash",
+                  "model_path": "sgl-project/DeepSeek-V4-Flash-FP8",
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4",
                   "lm_eval_num_fewshot": 5,
                   "lm_eval_num_concurrent": 8,
