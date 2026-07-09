@@ -193,6 +193,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_EVENTS_REPLAY_ENDPOINT": lambda: os.getenv(
         "ATOM_KV_EVENTS_REPLAY_ENDPOINT", ""
     ),
+    # Size of the replay ring buffer (distinct from the send queue depth).
+    "ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS": lambda: int(
+        os.getenv("ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS", "10000") or "10000"
+    ),
     "ATOM_KV_EVENTS_HWM": lambda: int(os.getenv("ATOM_KV_EVENTS_HWM", "0") or "0"),
     "ATOM_KV_EVENTS_BUFFER_STEPS": lambda: int(
         os.getenv("ATOM_KV_EVENTS_BUFFER_STEPS", "10000") or "10000"

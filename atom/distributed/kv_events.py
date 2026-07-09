@@ -26,6 +26,14 @@ MEDIUM_CPU: Final[str] = "CPU"
 MEDIUM_DISK: Final[str] = "DISK"
 MEDIUM_REMOTE: Final[str] = "REMOTE"
 
+# Reserved seq frame that terminates a replay response. Its payload is a
+# msgpack `[oldest_available_seq, latest_seq]` window so a consumer knows when
+# the replay is complete and whether earlier events were already evicted
+# (start_seq < oldest). 2**64-1 is reserved for this and never used as a data
+# seq. (Replay requires a DEALER/ROUTER-style client that can read the
+# multi-message reply; a REQ socket cannot.)
+REPLAY_DONE: Final[bytes] = b"\xff" * 8
+
 
 class KVCacheEvent(
     msgspec.Struct,
@@ -163,6 +171,7 @@ class ZmqEventPublisher(EventPublisher):
         hwm: int = 0,
         buffer_steps: int = 10_000,
         replay_endpoint: str = "",
+        replay_buffer_steps: int = 10_000,
         data_parallel_rank: int | None = None,
         encoder: msgspec.msgpack.Encoder | None = None,
     ) -> None:
@@ -193,12 +202,16 @@ class ZmqEventPublisher(EventPublisher):
         # batches. A subscriber that detects a seq gap can request everything
         # from a start sequence number and get the buffered batches back. The
         # ROUTER is created here but used only by the sender thread.
+        # `replay_buffer_steps` is a distinct knob from `buffer_steps` (the
+        # in-flight send queue): it bounds the long-lived retention of encoded
+        # payloads (which can include large token_id lists) for the publisher's
+        # lifetime, and only when replay is enabled.
         self._replay = None
         self._replay_buffer: deque[tuple[int, bytes, bytes]] | None = None
         if replay_endpoint:
             self._replay = ctx.socket(zmq.ROUTER)
             self._replay.bind(replay_endpoint)
-            self._replay_buffer = deque(maxlen=buffer_steps)
+            self._replay_buffer = deque(maxlen=replay_buffer_steps)
 
         self._seq_gen = itertools.count()
         self._drops = 0
@@ -317,8 +330,15 @@ class ZmqEventPublisher(EventPublisher):
 
     def _service_replay(self) -> None:
         """Answer a pending replay request: resend every buffered batch with
-        seq >= the requested start sequence. Request frame is
-        `[client_id, (delim,) start_seq]`; we echo the routing prefix back."""
+        seq >= the requested start sequence, then a terminal frame so the
+        consumer knows the reply is complete. Request frame is
+        `[client_id, (delim,) start_seq]`; we echo the routing prefix back.
+
+        The terminal frame is `[*prefix, REPLAY_DONE, [oldest, latest]]`:
+        REPLAY_DONE distinguishes it from data frames, and the msgpack window
+        lets the consumer see whether events before `start_seq` were already
+        evicted (start_seq < oldest) and terminate without a timeout even on a
+        zero-match request."""
         frames = self._replay.recv_multipart()
         if len(frames) < 2:
             logger.warning("KV event replay: malformed request %r", frames)
@@ -331,11 +351,19 @@ class ZmqEventPublisher(EventPublisher):
         prefix = frames[:-1]  # [client_id] or [client_id, empty_delim]
         # Safe to iterate the deque directly: the sender thread is the only
         # mutator and it is the same thread running this method.
-        for seq, seq_bytes, payload in self._replay_buffer or ():
+        buf = self._replay_buffer or ()
+        for seq, seq_bytes, payload in buf:
             if seq >= start_seq:
                 self._replay.send_multipart([*prefix, seq_bytes, payload])
                 with self._lock:
                     self._replayed += 1
+        # Terminal frame with the available window. Encode with the module
+        # helper (fresh encoder) rather than self._encoder, which the scheduler
+        # thread uses concurrently in publish().
+        oldest = buf[0][0] if buf else None
+        latest = buf[-1][0] if buf else None
+        window = msgspec.msgpack.encode([oldest, latest])
+        self._replay.send_multipart([*prefix, REPLAY_DONE, window])
 
     # Test/diagnostic hooks.
     @property
@@ -358,6 +386,7 @@ def make_publisher(
     hwm: int = 0,
     buffer_steps: int = 10_000,
     replay_endpoint: str = "",
+    replay_buffer_steps: int = 10_000,
     data_parallel_rank: int | None = None,
 ) -> EventPublisher:
     """Construct a publisher from plain-config args. Returns `NullEventPublisher`
@@ -371,6 +400,7 @@ def make_publisher(
             hwm=hwm,
             buffer_steps=buffer_steps,
             replay_endpoint=replay_endpoint,
+            replay_buffer_steps=replay_buffer_steps,
             data_parallel_rank=data_parallel_rank,
         )
     raise ValueError(f"unknown KV event publisher: {publisher_kind!r}")

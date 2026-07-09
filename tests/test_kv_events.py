@@ -30,6 +30,7 @@ from atom.distributed.kv_events import (
     BlockTransferred,
     EventBatch,
     NullEventPublisher,
+    REPLAY_DONE,
     ZmqEventPublisher,
     make_publisher,
 )
@@ -360,6 +361,28 @@ class TestReplayEndpointWiring:
         monkeypatch.setenv("ATOM_KV_EVENTS_REPLAY_ENDPOINT", "tcp://127.0.0.1:5558")
         assert envs.ATOM_KV_EVENTS_REPLAY_ENDPOINT == "tcp://127.0.0.1:5558"
 
+    def test_replay_buffer_steps_is_independent_knob(self):
+        pytest.importorskip("zmq")
+        # replay buffer size is decoupled from the send-queue depth.
+        pub = ZmqEventPublisher(
+            endpoint="inproc://rb-knob-pub",
+            replay_endpoint="inproc://rb-knob-router",
+            buffer_steps=64,
+            replay_buffer_steps=3,
+        )
+        try:
+            assert pub._replay_buffer.maxlen == 3
+        finally:
+            pub.shutdown()
+
+    def test_env_replay_buffer_steps(self, monkeypatch):
+        import atom.utils.envs as envs
+
+        monkeypatch.delenv("ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS", raising=False)
+        assert envs.ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS == 10000
+        monkeypatch.setenv("ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS", "7")
+        assert envs.ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS == 7
+
     def test_zmq_publisher_roundtrip(self):
         # Skip cleanly when pyzmq isn't installed (zmq is an optional dep of
         # the publisher, not of the engine).
@@ -491,6 +514,75 @@ class TestReplayEndpointWiring:
                 replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
             dealer.close(linger=0)
             assert replayed_seqs == [2, 3]
+        finally:
+            pub.shutdown()
+
+    def test_replay_sends_terminal_frame(self):
+        # After the matched batches, a REPLAY_DONE terminal frame carries the
+        # [oldest, latest] window so the consumer knows replay is complete.
+        zmq = pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(
+            endpoint="inproc://term-pub",
+            replay_endpoint="inproc://term-router",
+            buffer_steps=64,
+        )
+        ctx = zmq.Context.instance()
+        try:
+            for i in range(3):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            polls = 100
+            while pub.stats["sent"] < 3 and polls > 0:
+                time.sleep(0.02)
+                polls -= 1
+            assert pub.stats["sent"] == 3
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.connect("inproc://term-router")
+            dealer.send(b"\x00" * 8)
+            data: list[int] = []
+            window = None
+            while dealer.poll(timeout=1000):
+                seq_bytes, payload = dealer.recv_multipart()
+                if seq_bytes == REPLAY_DONE:
+                    window = msgspec.msgpack.decode(payload)
+                    break
+                data.append(int.from_bytes(seq_bytes, "big"))
+            dealer.close(linger=0)
+            assert data == [0, 1, 2]
+            assert window == [0, 2]  # [oldest, latest]
+        finally:
+            pub.shutdown()
+
+    def test_replay_zero_match_still_terminates(self):
+        # A start_seq past the newest batch yields no data frames but still a
+        # terminal frame, so the consumer never hangs waiting.
+        zmq = pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(
+            endpoint="inproc://term-pub2",
+            replay_endpoint="inproc://term-router2",
+            buffer_steps=64,
+        )
+        ctx = zmq.Context.instance()
+        try:
+            for i in range(2):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            polls = 100
+            while pub.stats["sent"] < 2 and polls > 0:
+                time.sleep(0.02)
+                polls -= 1
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.connect("inproc://term-router2")
+            dealer.send((99).to_bytes(8, "big"))  # start_seq beyond latest
+            data: list[int] = []
+            got_terminal = False
+            while dealer.poll(timeout=1000):
+                seq_bytes, _ = dealer.recv_multipart()
+                if seq_bytes == REPLAY_DONE:
+                    got_terminal = True
+                    break
+                data.append(int.from_bytes(seq_bytes, "big"))
+            dealer.close(linger=0)
+            assert data == []
+            assert got_terminal
         finally:
             pub.shutdown()
 

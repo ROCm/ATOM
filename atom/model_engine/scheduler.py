@@ -484,6 +484,7 @@ class Scheduler:
                 hwm=kv_events_cfg.hwm,
                 buffer_steps=kv_events_cfg.buffer_steps,
                 replay_endpoint=kv_events_cfg.replay_endpoint,
+                replay_buffer_steps=kv_events_cfg.replay_buffer_steps,
                 data_parallel_rank=dp_rank,
             )
             logger.info(
@@ -1318,6 +1319,7 @@ class Scheduler:
             remote_tokens: list[int] = []
             parent_block_hash: int | None = None
             prev_hash: int | None = None
+            first_remote_index: int | None = None
             for i, block_id in enumerate(seq.block_table):
                 blk = bm.blocks[block_id]
                 if blk.hash == -1:
@@ -1327,6 +1329,12 @@ class Scheduler:
                     continue
                 if not remote_hashes:
                     parent_block_hash = prev_hash
+                    # Derive the token offset from the first remote block's
+                    # actual block-table index, not num_cached_blocks: an
+                    # unhashed block skipped above can push the first remote
+                    # block past num_cached_blocks, which would otherwise
+                    # undercount the offset by whole blocks.
+                    first_remote_index = i
                 remote_hashes.append(blk.hash)
                 remote_tokens.extend(blk.token_ids)
                 prev_hash = blk.hash
@@ -1335,7 +1343,7 @@ class Scheduler:
                     block_hashes=remote_hashes,
                     token_ids=remote_tokens,
                     parent_block_hash=parent_block_hash,
-                    token_offset=num_cached_blocks * bm.block_size,
+                    token_offset=first_remote_index * bm.block_size,
                 )
         return True
 
