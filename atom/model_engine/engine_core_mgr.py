@@ -29,7 +29,10 @@ class CoreManager:
     def __init__(self, config: Config):
         self.label = "Engine Core Mgr"
         self._closed = False  # Track whether already closed
+        pp_size = config.pipeline_parallel_size
+        self.pp_size = pp_size
         if config.enable_dp_attention:
+            assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
             self.local_engine_count = (
                 config.tensor_parallel_size * config.parallel_config.data_parallel_size
             )
@@ -39,7 +42,21 @@ class CoreManager:
             config.parallel_config.data_parallel_size = self.local_engine_count
             config.tensor_parallel_size = 1
         else:
-            self.local_engine_count = config.parallel_config.data_parallel_size
+            dp_size = config.parallel_config.data_parallel_size
+            assert not (pp_size > 1 and dp_size > 1), (
+                "Pipeline parallel combined with data parallel is not supported "
+                "yet (phase-1 targets dp=1)."
+            )
+            # One EngineCore per (dp_rank, pp_rank) stage.
+            self.local_engine_count = dp_size * pp_size
+        # Inter-stage ZMQ channels (head<->downstream metadata, last->head
+        # tokens), shared across the single dp group. PP+DP would need per-group
+        # sets — deferred with the assertion above.
+        self.pp_meta_addrs = []
+        self.pp_token_addr = ""
+        if pp_size > 1:
+            self.pp_meta_addrs = [get_open_zmq_ipc_path() for _ in range(pp_size)]
+            self.pp_token_addr = get_open_zmq_ipc_path()
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[List[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
@@ -62,16 +79,23 @@ class CoreManager:
         local_dp_ranks = []
 
         try:
-            for dp_rank in range(self.local_engine_count):
+            for engine_index in range(self.local_engine_count):
+                dp_rank = engine_index // self.pp_size
+                pp_rank = engine_index % self.pp_size
                 logger.info(
-                    f"{self.label}: Creating EngineCore for DP rank {dp_rank}/{self.local_engine_count}"
+                    f"{self.label}: Creating EngineCore engine {engine_index}"
+                    f" (dp={dp_rank}, pp={pp_rank}) of {self.local_engine_count}"
                 )
 
-                # Create config for this DP rank
+                # Create config for this (dp, pp) stage
                 import copy
 
                 rank_config = copy.deepcopy(config)
                 rank_config.parallel_config.data_parallel_rank = dp_rank
+                rank_config.parallel_config.pipeline_parallel_rank = pp_rank
+                if self.pp_size > 1:
+                    rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
+                    rank_config.parallel_config.pp_token_addr = self.pp_token_addr
 
                 engine_core_process, addresses, local_dp_rank = launch_engine_core(
                     rank_config, dp_rank
@@ -382,7 +406,30 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        if self.local_engine_count == 1:
+        if self.pp_size > 1:
+            # Pipeline parallel: requests enter only at stage 0 (the head) of
+            # each dp group; the head drives the pipeline downstream. Round-robin
+            # across dp-group heads (single head when dp=1).
+            num_dp = self.local_engine_count // self.pp_size
+            heads = [d * self.pp_size for d in range(num_dp)]
+            head_seqs = {h: [] for h in heads}
+            for seq in seqs:
+                h = heads[self._rr_counter % len(heads)]
+                head_seqs[h].append(seq)
+                self._rr_counter += 1
+            for h, rank_seqs in head_seqs.items():
+                if rank_seqs:
+                    logger.debug(
+                        f"{self.label}: Add {len(rank_seqs)} requests to PP head {h}"
+                    )
+                    self.input_sockets[h].send_multipart(
+                        [
+                            self.engine_core_identities[h],
+                            pickle.dumps((EngineCoreRequestType.ADD, rank_seqs)),
+                        ],
+                        copy=False,
+                    )
+        elif self.local_engine_count == 1:
             # Single DP rank, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
             self.input_sockets[0].send_multipart(

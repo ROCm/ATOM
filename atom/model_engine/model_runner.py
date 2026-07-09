@@ -96,7 +96,14 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = True
+        # Deferred output keeps the sampled token on-GPU (prev_token_ids) and
+        # feeds it directly as the next decode's input_ids — a single-runner
+        # optimization. Under pipeline parallel this is INVALID: sampling runs on
+        # the last stage but the decode input_ids are consumed on the first
+        # stage, so the first stage's prev_token_ids is never populated (it would
+        # decode a stale/EOS token -> garbage). Disable it under PP so the decode
+        # input_ids come from the scheduled batch instead.
+        self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
 
         self.runner = runner
         device = runner.device
@@ -805,16 +812,17 @@ class ModelRunner:
         return False
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
-        # Calculate local device rank considering both TP and DP
-        # When data parallelism is enabled on the same node, different DP ranks
-        # need to use different sets of GPUs
+        # Calculate local device rank considering DP, PP and PCP.
+        # On a single node the physical GPU index equals the global distributed
+        # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
+        # stage) owns a contiguous tp*pcp GPU slice. `rank` is this worker's
+        # local index (0..tp*pcp-1) within its stage.
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
-        local_device_rank = (
-            dp_rank_local
-            * config.tensor_parallel_size
-            * config.prefill_context_parallel_size
-            + rank
-        )
+        pp_rank = config.parallel_config.pipeline_parallel_rank
+        pp_size = config.pipeline_parallel_size
+        stage_span = config.tensor_parallel_size * config.prefill_context_parallel_size
+        engine_index = dp_rank_local * pp_size + pp_rank
+        local_device_rank = engine_index * stage_span + rank
         num_gpus = torch.cuda.device_count()
         if local_device_rank >= num_gpus:
             raise ValueError(
@@ -824,7 +832,8 @@ class ModelRunner:
         self.device = torch.device(f"cuda:{local_device_rank}")
         logger.info(
             f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, "
-            f"local_device_rank={local_device_rank}, device={self.device}"
+            f"pp_rank={pp_rank}, local_device_rank={local_device_rank}, "
+            f"device={self.device}"
         )
 
         torch.cuda.set_device(self.device)
@@ -834,15 +843,37 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
-        init_dist_env(
-            config.tensor_parallel_size,
-            rankID=rank,
-            backend="nccl",
-            distributed_init_method=distributed_init_method,
-            data_parallel_size=config.parallel_config.data_parallel_size,
-            data_parallel_rank=config.parallel_config.data_parallel_rank,
-            prefill_context_model_parallel_size=config.prefill_context_parallel_size,
-        )
+        if config.pipeline_parallel_size > 1:
+            # aiter's init_dist_env pins pp=1; use the PP-aware equivalent that
+            # threads pipeline_parallel_size through to build the _PP group. Each
+            # stage is a separate EngineCore, so we pass the resolved GLOBAL rank
+            # (== local_device_rank on one node) and the full world size.
+            from atom.distributed.pp_comm import init_pp_aware_dist_env
+
+            dp_size = config.parallel_config.data_parallel_size
+            world_size = dp_size * pp_size * stage_span
+            dp_rank = config.parallel_config.data_parallel_rank
+            global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+            init_pp_aware_dist_env(
+                tensor_model_parallel_size=config.tensor_parallel_size,
+                pipeline_model_parallel_size=pp_size,
+                global_rank=global_rank,
+                world_size=world_size,
+                distributed_init_method=distributed_init_method,
+                backend="nccl",
+                data_parallel_size=dp_size,
+                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+            )
+        else:
+            init_dist_env(
+                config.tensor_parallel_size,
+                rankID=rank,
+                backend="nccl",
+                distributed_init_method=distributed_init_method,
+                data_parallel_size=config.parallel_config.data_parallel_size,
+                data_parallel_rank=config.parallel_config.data_parallel_rank,
+                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+            )
 
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
@@ -1469,6 +1500,17 @@ class ModelRunner:
             self.num_swa_blocks = 0
             num_kvcache_blocks = available_for_pool // block_bytes
 
+        # Pipeline parallel: each stage has a different free-memory footprint
+        # (different layer counts), so stages compute different block counts. The
+        # scheduler (on the head) allocates block ids that must be valid on EVERY
+        # stage's KV tensor, so all ranks must agree on the global minimum.
+        if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+            t = torch.tensor(
+                [num_kvcache_blocks], dtype=torch.int64, device=self.device
+            )
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+            num_kvcache_blocks = int(t.item())
+
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB, "
@@ -1640,6 +1682,13 @@ class ModelRunner:
             models_to_bind.append(("draft", self.drafter.model))
 
         kv_cache_tensors = []
+        # Key each bound tensor by the attention module's own layer_num, which is
+        # exactly what it looks up at forward time (kv_cache_data[f"layer_{self.
+        # layer_num}"]). Under pipeline parallel a stage only holds layers
+        # start_layer..end_layer, so layer_num is the GLOBAL index (e.g. 39..77)
+        # while the local bind counter is 0-based — keying by the counter would
+        # KeyError. With pp=1 layer_num == the counter, so this is a no-op there.
+        kv_cache_keys = []
         layer_id = 0
         # Promote to self so the attention builder's build_kv_cache_tensor()
         # can access it without recomputing from drafter state. Heterogeneous
@@ -1672,6 +1721,7 @@ class ModelRunner:
                     )
                     if kv_cache_tensor is not None:
                         kv_cache_tensors.append(kv_cache_tensor)
+                        kv_cache_keys.append(getattr(module, "layer_num", layer_id))
                         layer_id += 1
                         continue
 
@@ -1687,12 +1737,15 @@ class ModelRunner:
                 )
                 if kv_cache_tensor is not None:
                     kv_cache_tensors.append(kv_cache_tensor)
+                    kv_cache_keys.append(getattr(module, "layer_num", layer_id))
                     layer_id += 1
 
-        # Store KVCacheConfig
+        # Store KVCacheConfig, keyed by each module's (global) layer_num so it
+        # matches the attention's own kv_cache_data[f"layer_{self.layer_num}"]
+        # lookup under pipeline parallel.
         kv_cache_data = {
-            f"layer_{i}": kv_cache_tensor
-            for i, kv_cache_tensor in enumerate(kv_cache_tensors)
+            f"layer_{key}": kv_cache_tensor
+            for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
         if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
@@ -2109,18 +2162,46 @@ class ModelRunner:
                         input_ids, text_embeds, vision_embeds
                     )
 
-                if inputs_embeds is None:
+                pp_group = get_pp_group()
+                pp_enabled = pp_group.world_size > 1
+
+                # Pipeline parallel (serial, ring=1): non-first stages receive
+                # hidden_states/residual from upstream; non-last stages forward
+                # their IntermediateTensors downstream and produce no logits.
+                intermediate_tensors = None
+                if pp_enabled and not pp_group.is_first_rank:
+                    from atom.distributed.pp_comm import recv_intermediate_tensors
+
+                    intermediate_tensors = recv_intermediate_tensors()
+
+                if pp_enabled:
+                    model_output = self.model(
+                        input_ids,
+                        positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                    )
+                elif inputs_embeds is None:
                     model_output = self.model(input_ids, positions)
                 else:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
-                if self.use_aux_hidden_state_outputs:
-                    hidden_states, self._aux_hidden_states = model_output
-                else:
-                    hidden_states = model_output
+
+                if pp_enabled and not pp_group.is_last_rank:
+                    from atom.distributed.pp_comm import send_intermediate_tensors
+
+                    send_intermediate_tensors(model_output)
+                    hidden_states = None
                     self._aux_hidden_states = None
-                logits = self.model.compute_logits(hidden_states)
+                    logits = None
+                else:
+                    if self.use_aux_hidden_state_outputs:
+                        hidden_states, self._aux_hidden_states = model_output
+                    else:
+                        hidden_states = model_output
+                        self._aux_hidden_states = None
+                    logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
             label = f"decode[bs={bs}"
@@ -2331,6 +2412,20 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
+        # Pipeline parallel: only the last stage has logits and samples. Non-last
+        # stages already forwarded their hidden states downstream inside
+        # run_model; they produce no tokens, so skip sampling and return an empty
+        # output (the head owns the request lifecycle via the last stage's tokens).
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1 and not pp_group.is_last_rank:
+            reset_forward_context()
+            return ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            )
         fwd_output = self.postprocess(
             batch,
             logits,

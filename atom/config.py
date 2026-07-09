@@ -756,8 +756,19 @@ class ParallelConfig:
     data_parallel_rank_local: Optional[int] = None
     """Local rank of the data parallel group,
     set only in SPMD mode."""
+    pipeline_parallel_rank: int = 0
+    """Pipeline stage index of this EngineCore (0 = first stage). Each PP stage
+    runs as an independent EngineCore process; this identifies which stage."""
+    pp_meta_addrs: list = field(default_factory=list)
+    """ZMQ endpoints (len == pp_size) where each downstream stage receives the
+    scheduled batch from the head. Populated by CoreManager for pp_size > 1."""
+    pp_token_addr: str = ""
+    """ZMQ endpoint where the head receives sampled tokens back from the last
+    stage. Populated by CoreManager for pp_size > 1."""
     world_size: int = field(init=False)
-    """world_size is TPxPP, it affects the number of workers we create."""
+    """Vestigial: never assigned or read. Worker count is derived directly in
+    engine_core from tensor_parallel_size x pipeline_parallel_size x
+    prefill_context_parallel_size, not from this field."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -1036,6 +1047,7 @@ class Config:
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
@@ -1103,9 +1115,16 @@ class Config:
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
+        assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", None)
+        if num_hidden_layers is not None:
+            assert num_hidden_layers >= self.pipeline_parallel_size, (
+                f"num_hidden_layers ({num_hidden_layers}) must be >= "
+                f"pipeline_parallel_size ({self.pipeline_parallel_size})"
+            )
         if self.hf_overrides:
             self.hf_config.update(self.hf_overrides)
             logger.info("Applied HF config overrides: %s", self.hf_overrides)
