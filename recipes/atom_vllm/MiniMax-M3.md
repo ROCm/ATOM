@@ -26,7 +26,7 @@ checkpoint path or the corresponding model id for `MODEL`.
 MODEL=/path/to/MiniMax-M3-MXFP8
 TP=4
 PORT=8001
-
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 vllm serve "${MODEL}" \
     --dtype auto \
     --load-format auto \
@@ -42,6 +42,7 @@ vllm serve "${MODEL}" \
     --no-enable-prefix-caching \
     --language-model-only \
     --no-trust-remote-code \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}}' \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
 ```
@@ -51,7 +52,7 @@ config:
 
 ```bash
 MODEL=/path/to/MiniMax-M3-MXFP4
-
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 vllm serve "${MODEL}" \
     --dtype auto \
     --load-format auto \
@@ -67,6 +68,7 @@ vllm serve "${MODEL}" \
     --no-enable-prefix-caching \
     --language-model-only \
     --no-trust-remote-code \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
 ```
 

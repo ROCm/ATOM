@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import signal
 import socket
+import sys
 import tempfile
 import time
 from functools import lru_cache
@@ -171,6 +172,29 @@ def get_mp_context() -> Union[ForkContext, SpawnContext]:
     return multiprocessing.get_context("spawn")
 
 
+def set_process_title(
+    name: str, suffix: str = "", prefix: Optional[str] = None
+) -> None:
+    """Set the current process title (comm/cmdline) for ps/top/rocm-smi.
+
+    rocm-smi --showpids reads the process ``comm`` field, which defaults to the
+    interpreter name (``python``). Setting a title makes GPU-holding worker
+    processes distinguishable by rank. Soft dependency: no-op if setproctitle
+    is not installed.
+    """
+    try:
+        import setproctitle
+    except ImportError:
+        return
+    from atom.utils import envs
+
+    if prefix is None:
+        prefix = envs.ATOM_PROCESS_NAME_PREFIX
+    if suffix:
+        name = f"{name}_{suffix}"
+    setproctitle.setproctitle(f"{prefix}::{name}")
+
+
 def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
     # First join any already-exited processes (instant, no wait).
     for proc in procs:
@@ -200,6 +224,73 @@ def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
             proc.close()
         except (ValueError, OSError):
             pass
+
+
+def enable_orphan_reaping(sig: int = signal.SIGKILL) -> bool:
+    """Arm the kernel to reap *this* process if its parent ever exits.
+
+    ATOM runs a tree of processes: the server (main) -> one ``EngineCore``
+    process per DP rank -> ``tensor_parallel_size`` ``ModelRunner`` worker
+    processes.  Each worker holds a large slice of GPU VRAM plus the custom
+    all-reduce IPC resources (``hipIpcGetMemHandle`` handles + the rendezvous
+    ``TCPStore`` bound to ``MASTER_PORT``).
+
+    If a parent exits abnormally (OOM-kill, segfault, ``SIGKILL``,
+    ``docker stop``) the kernel does not clean up its children: the worker's
+    ``busy_loop`` blocks forever on the shared-memory RPC dequeue and the
+    EngineCore blocks on its input queue.  These orphans keep the VRAM and the
+    IPC/TCP resources pinned, so a subsequent restart either fails to bind the
+    rendezvous port or, worse, opens a *stale* IPC mem handle exported by the
+    dead run -> the ``hipIpcGetMemHandle`` all-reduce crash operators work
+    around with ``docker rm -f`` + a lowered ``--gpu-memory-utilization``.
+
+    This helper wires up ``prctl(PR_SET_PDEATHSIG)`` so the kernel delivers
+    ``sig`` to the caller the instant its parent exits, for *any* reason --
+    turning a silent orphan into an immediate, self-reaping exit that releases
+    every GPU and IPC resource it held.  The setting is per-thread and is
+    cleared across ``execve``, so it cannot be inherited: each process must arm
+    itself early in its entrypoint, before any GPU / IPC state is created.
+
+    Linux-only (no-op elsewhere).  Returns ``True`` when reaping is armed and
+    ``False`` if it could not be set.  If the parent is found to be already gone
+    at arm time, it does not return: it calls ``os._exit(1)`` rather than let the
+    process linger as the orphan this is meant to prevent.
+
+    Caveat: ``PR_SET_PDEATHSIG`` fires when the *thread that created this
+    process* exits, not when the parent process as a whole exits.  Arm it only
+    from a process whose creating thread lives for the process's lifetime --
+    ATOM spawns workers from the main thread, so this holds; a short-lived
+    creator thread could otherwise trigger a premature kill.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+
+        PR_SET_PDEATHSIG = 1
+        # Resolve libc from the already-loaded image (``CDLL(None)``) rather than
+        # hard-coding ``libc.so.6``; this works on glibc and musl (e.g. Alpine)
+        # alike, where the soname differs.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
+            err = ctypes.get_errno()
+            logger.warning("prctl(PR_SET_PDEATHSIG) failed: errno=%d", err)
+            return False
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not arm orphan reaping: %s", e)
+        return False
+
+    # The parent can die between spawning us and this call -- before or after the
+    # prctl above -- so PR_SET_PDEATHSIG may never fire.  Detect it unambiguously
+    # via multiprocessing's parent handle (a sentinel pipe): unlike
+    # ``getppid() == 1``, this is not fooled by a parent that legitimately runs
+    # as PID 1 (ATOM's server is PID 1 in the container).  If the parent is
+    # already gone, exit now rather than linger as the orphan this prevents.
+    parent = multiprocessing.parent_process()
+    if parent is not None and not parent.is_alive():
+        logger.warning("Parent already exited while arming orphan reaping; exiting.")
+        os._exit(1)
+    return True
 
 
 def kill_process_tree(pid: int):
