@@ -136,6 +136,7 @@ _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
+SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -1312,14 +1313,6 @@ class Indexer(nn.Module):
 
         cu_starts = indexer_meta["cu_starts_gpu"]  # [total_tokens] int32
         cu_ends = indexer_meta["cu_ends_gpu"]  # [total_tokens] int32
-        logits = fp8_mqa_logits(
-            Q=q_fp8,
-            KV=k_fp8,
-            kv_scales=k_scale,
-            weights=weights,
-            cu_starts=cu_starts,
-            cu_ends=cu_ends,
-        )  # [total_tokens, total_committed] fp32; outside [start,end) is -inf
 
         # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
         # pybind kwarg). Honors per-row [cu_starts[i], cu_ends[i]) so cells
@@ -1336,17 +1329,65 @@ class Indexer(nn.Module):
         topk_global = torch.empty(
             (total_tokens, topk), dtype=torch.int32, device=device
         )
-        top_k_per_row_prefill(
-            logits,
-            cu_starts,
-            cu_ends,
-            topk_global,
-            None,  # values not needed, only indices
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
+        # The dense `fp8_mqa_logits` buffer is [total_tokens, total_committed]
+        # fp32. total_committed is the sum of all co-scheduled prefill contexts
+        # and is unbounded by max_num_batched_tokens, so a burst of long-context
+        # requests can push a single allocation to tens of GiB (#1376). Under
+        # chunked prefill total_tokens is already capped by
+        # max_num_batched_tokens, so the OOM is driven by total_committed (the
+        # column dim). Chunk along the Q (query-row) dimension with q_chunk sized
+        # so the buffer [q_chunk, total_committed] fp32 stays within the memory
+        # budget — q_chunk shrinks as total_committed grows. Each chunk still
+        # scores the FULL KV, so every row's top-k is computed completely in one
+        # shot: the result is exact with no cross-chunk merge, and the kernel's
+        # global column indices need no remapping (the seq_base subtraction below
+        # is per-token). When the budget is disabled (0) or a single chunk fits,
+        # the loop runs exactly once and matches the original single-shot path.
+        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
+        if (
+            budget_bytes > 0
+            and total_committed > 0
+            and budget_bytes // (total_committed * 4) < total_tokens
+        ):
+            # 4 bytes per fp32 logit; total_committed * 4 is one row's footprint.
+            # Round the budget-derived row count DOWN to keep the buffer within
+            # budget: a multiple of 128 (aligned to the kernel's row tiling) in
+            # the normal regime, avoiding the coarse power-of-2 doubling. When
+            # the budget affords < 128 rows (extreme total_committed), fall back
+            # to a power-of-2 floor so it degrades to 64/32/.../1 instead of
+            # collapsing straight to 1.
+            budget_rows = budget_bytes // (total_committed * 4)
+            if budget_rows >= 128:
+                chunk_tokens = (budget_rows // 128) * 128
+            else:
+                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
+        else:
+            # Budget disabled, or a single chunk already fits all rows.
+            chunk_tokens = total_tokens
+        for chunk_start in range(0, total_tokens, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, total_tokens)
+            # Per-row window bounds slice 1:1 with this chunk's rows.
+            row_starts = cu_starts[chunk_start:chunk_end]
+            row_ends = cu_ends[chunk_start:chunk_end]
+            logits = fp8_mqa_logits(
+                Q=q_fp8[chunk_start:chunk_end],
+                KV=k_fp8,
+                kv_scales=k_scale,
+                weights=weights[chunk_start:chunk_end],
+                cu_starts=row_starts,
+                cu_ends=row_ends,
+            )  # [chunk, total_committed] fp32; outside [start,end) is -inf
+            top_k_per_row_prefill(
+                logits,
+                row_starts,
+                row_ends,
+                topk_global[chunk_start:chunk_end],
+                None,  # values not needed, only indices
+                chunk_end - chunk_start,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
         seq_base = indexer_meta["seq_base_per_token_gpu"].unsqueeze(
             1
         )  # [total_tokens, 1] int32
@@ -1978,6 +2019,9 @@ class DeepseekV4Attention(nn.Module):
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
+                # Reuse q_sa as the attention output buffer; q_sa is not needed
+                # after this call and this avoids an extra empty_like allocation.
+                out=q_sa,
             )  # [S, H, head_dim]
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
             # prior chunk's contents (not this chunk's just-computed tail).
@@ -3082,9 +3126,21 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mis-load expert weights -> garbage.
         num_fused_shared = 0
         for _m in self.model.modules():
-            if _m.__class__.__name__ == "FusedMoE":
+            if hasattr(_m, "num_fused_shared_experts"):
                 num_fused_shared = getattr(_m, "num_fused_shared_experts", 0)
                 break
+        if num_fused_shared == 0:
+            # Some plugin builds wrap/alias FusedMoE such that the exact class-name
+            # probe above misses it.  If the owning MoE layer was constructed in
+            # fused-shared mode, the loader will rewrite ffn.shared_experts.* to
+            # ffn.experts.{n_routed_experts}.*; include that final slot here so the
+            # generic expert mapping loads it into w13/w2 instead of dropping it.
+            for _m in self.model.modules():
+                if _m.__class__.__name__ == "MoE" and getattr(
+                    _m, "_fuse_shared_into_routed", False
+                ):
+                    num_fused_shared = getattr(self.args, "n_shared_experts", 0)
+                    break
         num_experts = self.args.n_routed_experts + num_fused_shared
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",

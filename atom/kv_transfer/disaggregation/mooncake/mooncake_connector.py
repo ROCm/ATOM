@@ -10,8 +10,10 @@ KV cache data from producer (prefill) to consumer (decode) nodes.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -61,11 +63,26 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-MOONCAKE_PING_INTERVAL_SECONDS = 5
-MOONCAKE_MAX_PING_RETRIES = 100
 MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
+
+
+def _ib_device_exists(device_name: str) -> bool:
+    return os.path.exists(f"/sys/class/infiniband/{device_name}")
+
+
+def _auto_select_ib_device(phys_idx: int) -> str:
+    # Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
+    # them as ionic_N, so try ionic_N only when rdmaN is not present.
+    rdma_device = f"rdma{phys_idx}"
+    if _ib_device_exists(rdma_device):
+        return rdma_device
+    ionic_device = f"ionic_{phys_idx}"
+    if _ib_device_exists(ionic_device):
+        return ionic_device
+    return rdma_device
+
 
 # ZMQ side-channel message types
 MSG_WRITE_REQUEST = b"write_request"
@@ -101,6 +118,115 @@ class MooncakeAgentMetadata(
 
 def _port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return dp_rank * tp_size + tp_rank
+
+
+def _ip_for_ib_device(ib_device: str, fallback: str) -> str:
+    """Return the IPv4 address bound to the netdev backing an RDMA HCA."""
+    net_root = f"/sys/class/infiniband/{ib_device}/device/net"
+    netdevs: list[str] = []
+    try:
+        netdevs = sorted(os.listdir(net_root))
+    except OSError:
+        logger.info(
+            "Could not list netdevs for ib_device=%s under %s; "
+            "falling back to RDMA GID lookup",
+            ib_device,
+            net_root,
+        )
+
+    for netdev in netdevs:
+        try:
+            out = subprocess.check_output(
+                ["ip", "-o", "-4", "addr", "show", "dev", netdev, "scope", "global"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        for line in out.splitlines():
+            parts = line.split()
+            if "inet" in parts:
+                ip_cidr = parts[parts.index("inet") + 1]
+                return ip_cidr.split("/", 1)[0]
+
+    gid_ip = _ip_for_ib_device_from_gid(ib_device)
+    if gid_ip:
+        logger.info(
+            "Using IPv4 %s parsed from RDMA GID for ib_device=%s", gid_ip, ib_device
+        )
+        return gid_ip
+
+    logger.info(
+        "Could not determine RDMA-local IPv4 for ib_device=%s (netdevs=%s); "
+        "falling back to default IP %s",
+        ib_device,
+        ",".join(netdevs) if netdevs else "<none>",
+        fallback,
+    )
+    return fallback
+
+
+def _ip_for_ib_device_from_gid(ib_device: str) -> str | None:
+    """Parse an IPv4-mapped RoCE GID from sysfs for containers without host netns."""
+    ports_root = f"/sys/class/infiniband/{ib_device}/ports"
+    try:
+        ports = sorted(os.listdir(ports_root))
+    except OSError:
+        return None
+
+    preferred_gid_indexes: list[str] = []
+    for env_name in ("MC_IB_GID_INDEX", "MOONCAKE_IB_GID_INDEX"):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            preferred_gid_indexes.append(env_value)
+    preferred_gid_indexes.extend(["1", "3", "0"])
+
+    for port in ports:
+        gids_root = os.path.join(ports_root, port, "gids")
+        try:
+            available_indexes = sorted(os.listdir(gids_root), key=lambda x: int(x))
+        except (OSError, ValueError):
+            available_indexes = []
+
+        seen_indexes: set[str] = set()
+        gid_indexes = []
+        for idx in preferred_gid_indexes + available_indexes:
+            if idx not in seen_indexes:
+                seen_indexes.add(idx)
+                gid_indexes.append(idx)
+
+        for gid_index in gid_indexes:
+            gid_path = os.path.join(gids_root, gid_index)
+            try:
+                with open(gid_path) as f:
+                    gid = f.read().strip()
+            except OSError:
+                continue
+            ip = _ipv4_from_gid(gid)
+            if ip and ip != "0.0.0.0":
+                logger.info(
+                    "Parsed RDMA GID %s from %s for ib_device=%s as IPv4 %s",
+                    gid,
+                    gid_path,
+                    ib_device,
+                    ip,
+                )
+                return ip
+    return None
+
+
+def _ipv4_from_gid(gid: str) -> str | None:
+    try:
+        ip = ipaddress.ip_address(gid)
+    except ValueError:
+        return None
+
+    if isinstance(ip, ipaddress.IPv4Address):
+        return str(ip)
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return str(mapped)
+    return None
 
 
 # ===================================================================
@@ -270,7 +396,8 @@ class MooncakeConnector(KVConnectorBase):
         self.dp_size = get_dp_group().world_size
 
         kv_transfer_config = config.kv_transfer_config
-        self.local_ip = get_ip()
+        default_local_ip = get_ip()
+        self.local_ip = default_local_ip
         self._local_ping_port = get_open_port()
 
         self.is_producer = (
@@ -278,10 +405,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         self.is_consumer = not self.is_producer
 
-        # Networking / service discovery config
+        # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
-        self.proxy_ping_port = kv_transfer_config.get("proxy_ping_port", 36367)
-        self.proxy_ip = kv_transfer_config.get("proxy_ip")
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.protocol = kv_transfer_config.get("protocol", MOONCAKE_DEFAULT_PROTOCOL)
 
@@ -299,7 +424,8 @@ class MooncakeConnector(KVConnectorBase):
             )
 
         # Determine which RDMA device this TP rank should use.
-        # On AMD MI300X, each GPU has a paired RDMA NIC: GPU N → rdmaN.
+        # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
+        # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
         # Registering GPU memory with a non-local RDMA NIC fails with
         # EINVAL.  Pass the device name as a filter so Mooncake only
         # creates a context for the local NIC.
@@ -316,7 +442,7 @@ class MooncakeConnector(KVConnectorBase):
                 phys_idx = int(visible_list[visible_idx])
             else:
                 phys_idx = visible_idx
-            ib_device = f"rdma{phys_idx}"
+            ib_device = _auto_select_ib_device(phys_idx)
             logger.info(
                 "Auto-selecting RDMA device %s for physical GPU %d "
                 "(visible_idx=%d, tp_rank=%d)",
@@ -325,6 +451,17 @@ class MooncakeConnector(KVConnectorBase):
                 visible_idx,
                 self.tp_rank,
             )
+
+        rdma_local_ip = _ip_for_ib_device(ib_device, default_local_ip)
+        if rdma_local_ip != default_local_ip:
+            logger.info(
+                "Using RDMA-local IP %s for ib_device=%s instead of default IP %s",
+                rdma_local_ip,
+                ib_device,
+                default_local_ip,
+            )
+        self.local_ip = rdma_local_ip
+        self.request_address = f"{self.local_ip}:{self.http_port}"
 
         self.transfer_engine = TransferEngine()
         ret = self.transfer_engine.initialize(
@@ -420,82 +557,6 @@ class MooncakeConnector(KVConnectorBase):
         # --- Msgspec encoder/decoder for bootstrap metadata ---
         self._encoder = msgspec.msgpack.Encoder()
         self._decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
-
-        # --- Service discovery ping (rank 0 only) ---
-        if self.tp_rank == 0 and self.dp_rank == 0:
-            self._ping_thread = threading.Thread(
-                target=self._service_discovery_ping,
-                args=(self.zmq_context,),
-                daemon=True,
-                name="mooncake-ping",
-            )
-            self._ping_thread.start()
-
-    # -----------------------------------------------------------------
-    # Service discovery
-    # -----------------------------------------------------------------
-
-    def _service_discovery_ping(self, zmq_context: zmq.Context) -> None:
-        """Periodically register with the proxy (rank 0 only)."""
-        grpc_endpoint = f"http://{self.request_address}/v1/completions"
-        role_code = "P" if self.is_producer else "D"
-        retry_count = 0
-        msg_index = 1
-        proxy_path = f"tcp://{self.proxy_ip}:{self.proxy_ping_port}"
-
-        with zmq_context.socket(zmq.DEALER) as sock:
-            sock.connect(proxy_path)
-
-            while True:
-                try:
-                    registration_data = {
-                        "type": "register",
-                        "role": role_code,
-                        "index": str(msg_index),
-                        "request_address": grpc_endpoint,
-                        "rpc_port": self.rpc_port,
-                        "handshake_port": self.base_handshake_port,
-                        "dp_size": self.dp_size,
-                        "tp_size": self.tp_size,
-                        "transfer_mode": "write",
-                    }
-                    sock.send(msgpack.dumps(registration_data))
-                    logger.debug(
-                        "Ping #%d sent to %s (role=%s)",
-                        msg_index,
-                        proxy_path,
-                        role_code,
-                    )
-                    retry_count = 0
-
-                except ConnectionRefusedError:
-                    logger.info(
-                        "Proxy connection refused: %s -> %s",
-                        self.local_ip,
-                        proxy_path,
-                    )
-                    retry_count += 1
-
-                except OSError as e:
-                    logger.info("OS error during ping: %s", e)
-                    retry_count += 1
-
-                except Exception as e:
-                    logger.info("Unexpected ping error: %s", e)
-                    retry_count += 1
-                    if retry_count >= MOONCAKE_MAX_PING_RETRIES:
-                        logger.error(
-                            "Ping failed after %d retries, aborting",
-                            MOONCAKE_MAX_PING_RETRIES,
-                        )
-                        raise RuntimeError(
-                            f"Service discovery ping failed after "
-                            f"{retry_count} retries"
-                        ) from e
-
-                finally:
-                    time.sleep(MOONCAKE_PING_INTERVAL_SECONDS)
-                    msg_index += 1
 
     # -----------------------------------------------------------------
     # KVConnectorBase: register_kv_caches
@@ -946,7 +1007,7 @@ class MooncakeConnector(KVConnectorBase):
                     )
 
             if has_slot_data:
-                self._execute_block_slot_transfer(
+                transfer_ok = self._execute_block_slot_transfer(
                     request_data,
                     target,
                     src_block_ids,
@@ -955,13 +1016,22 @@ class MooncakeConnector(KVConnectorBase):
                     req_id,
                 )
             else:
-                self._execute_block_transfer(
+                transfer_ok = self._execute_block_transfer(
                     request_data,
                     target,
                     src_block_ids,
                     dst_block_ids,
                     req_id,
                 )
+
+            if not transfer_ok:
+                logger.error(
+                    "[PRODUCER] transfer failed for req %s (transfer_id=%s); "
+                    "not sending write-done",
+                    req_id,
+                    transfer_id,
+                )
+                return
 
             # Notify consumer — all data (blocks + slot state) is written.
             self._send_write_done(notify_host, notify_port, req_id)
@@ -1001,7 +1071,7 @@ class MooncakeConnector(KVConnectorBase):
         src_block_ids: list[int],
         dst_block_ids: list[int],
         req_id: str,
-    ) -> None:
+    ) -> bool:
         """Block-only RDMA transfer (MHA, MLA, and other block-indexed backends)."""
         consumer_base_addrs = request_data["consumer_base_addrs"]
 
@@ -1032,6 +1102,8 @@ class MooncakeConnector(KVConnectorBase):
             target, src_addrs, dst_addrs, sizes, req_id, "block"
         ):
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+            return False
+        return True
 
     def _execute_block_slot_transfer(
         self,
@@ -1041,7 +1113,7 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         prefill_data: dict,
         req_id: str,
-    ) -> None:
+    ) -> bool:
         """Two-phase RDMA for backends with per-request state: block regions first, then slot regions."""
         consumer_block_addrs = request_data["consumer_block_base_addrs"]
         consumer_block_bpb = request_data["consumer_block_bpb"]
@@ -1091,7 +1163,7 @@ class MooncakeConnector(KVConnectorBase):
             target, block_src, block_dst, block_sizes, req_id, "block"
         ):
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)
-            return
+            return False
 
         # ---- Phase 2: Slot transfer ----
         if src_slot < 0 or dst_slot < 0:
@@ -1100,7 +1172,7 @@ class MooncakeConnector(KVConnectorBase):
                 src_slot,
                 dst_slot,
             )
-            return
+            return True
 
         slot_src: list[int] = []
         slot_dst: list[int] = []
@@ -1139,13 +1211,15 @@ class MooncakeConnector(KVConnectorBase):
             sum(slot_sizes),
         )
 
-        if not self._rdma_write_with_retry(
+        slot_ok = self._rdma_write_with_retry(
             target, slot_src, slot_dst, slot_sizes, req_id, "slot"
-        ):
+        )
+        if not slot_ok:
             logger.error("[PRODUCER] slot transfer failed for req %s", req_id)
 
         if producer_pool_idx >= 0:
             self._release_staging_slot(producer_pool_idx)
+        return slot_ok
 
     def _wait_for_prefill_data(self, req_id: str) -> dict | None:
         """Wait until prefill data is available for this request.

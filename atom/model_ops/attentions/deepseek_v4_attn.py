@@ -1005,11 +1005,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # batch_id_per_token + n_committed_csa: reuse the shared GPU
         # tensors set in `_attach_v4_per_fwd_meta` (which MUST run before
-        # this helper — see prepare_decode/prefill ordering). int64
-        # batch_id is mandated by PyTorch fancy indexing; int32 n_committed
-        # is the gather SOURCE so any dtype works (and both downstream
+        # this helper — see prepare_decode/prefill ordering). batch_id is
+        # int32 (accepted by PyTorch advanced-indexing); n_committed is int32
+        # too — it is the gather SOURCE so any dtype works, and both downstream
         # kernels — `deepgemm_fp8_paged_mqa_logits`, `top_k_per_row_decode`
-        # — want int32 anyway).
+        # — want int32 anyway.
         batch_id_per_token_gpu = attn_metadata.batch_id_per_token[:total_tokens]
         n_committed_per_seq_gpu = attn_metadata.n_committed_csa_per_seq
         # cu_committed_gpu is consumed both as `cu_starts/cu_ends` for the
@@ -2909,8 +2909,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     def _stage(self, name: str, arr) -> torch.Tensor:
         """Write numpy `arr` into `forward_vars[name]` (CpuGpuBuffer) and
-        return its GPU view sliced to len(arr). Auto-casts dtype to match
-        the buffer (e.g. int64 → int32). Asserts the buffer is large enough.
+        return its GPU view sliced to len(arr). Asserts the buffer is large
+        enough and that `arr.dtype` matches the buffer dtype (callers must
+        cast to the buffer dtype before staging).
         """
         buf = self.model_runner.forward_vars[name]
         n = arr.shape[0] if arr.ndim > 0 else 1

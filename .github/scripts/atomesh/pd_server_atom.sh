@@ -84,7 +84,8 @@ EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-16}"
 WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-2500}"
 WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 
-mkdir -p "${RUN_DIR}"/{logs,benchmark_results,eval_results}
+export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${RUN_DIR}/online_quant/rank-${NODE_RANK}}"
+mkdir -p "${RUN_DIR}"/{logs,benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
 if [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
@@ -352,7 +353,6 @@ start_router() {
     --policy "${ROUTER_POLICY}" \
     --backend atom \
     --log-level info \
-    --disable-health-check \
     --disable-circuit-breaker \
     --prometheus-port "${PROMETHEUS_PORT}" \
     2>&1 | tee "${RUN_DIR}/logs/router.log" &

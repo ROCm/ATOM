@@ -47,8 +47,11 @@ impl AtomAdapter {
             })?;
         obj.insert("remote_dp_size".to_string(), json!(ctx.prefill_dp_size));
         obj.insert("remote_tp_size".to_string(), json!(tp_size));
-        // Only a numeric rank; else leave unset so decode defaults to 0.
-        if let Some(dp_rank) = obj.get("dp_rank").filter(|v| v.is_number()).cloned() {
+        let remote_dp_rank = ctx
+            .prefill_dp_rank
+            .map(|r| json!(r))
+            .or_else(|| obj.get("dp_rank").filter(|v| v.is_number()).cloned());
+        if let Some(dp_rank) = remote_dp_rank {
             obj.insert("remote_dp_rank".to_string(), dp_rank);
         }
         Ok(())
@@ -60,6 +63,8 @@ pub struct AtomPairCtx {
     pub transfer_id: String,
     pub prefill_url: String,
     pub prefill_dp_size: usize,
+    pub prefill_dp_rank: Option<usize>,
+    pub decode_dp_rank: Option<usize>,
 }
 
 fn downcast(ctx: &PairCtx) -> Result<&AtomPairCtx, AdapterError> {
@@ -77,6 +82,8 @@ impl BackendAdapter for AtomAdapter {
             transfer_id: format!("xfer-{}", Uuid::new_v4()),
             prefill_url: prefill.url().to_string(),
             prefill_dp_size: prefill.dp_size().unwrap_or(1),
+            prefill_dp_rank: prefill.dp_rank(),
+            decode_dp_rank: _decode.dp_rank(),
         }))
     }
 
