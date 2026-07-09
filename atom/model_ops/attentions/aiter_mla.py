@@ -658,7 +658,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
-        total_num_layers = hf_config.num_hidden_layers + num_draft_layers
+        total_num_layers = runner._get_total_num_layers()
         out: dict = {
             "kv_cache": torch.zeros(
                 total_num_layers,

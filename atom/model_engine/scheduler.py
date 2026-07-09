@@ -227,6 +227,7 @@ class ScheduledBatch:
         remote_kv_block_ids: list[int] | None = None,
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
+        is_final_chunk: list[bool] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -284,6 +285,15 @@ class ScheduledBatch:
             if num_cached_tokens is not None
             else [seq.num_cached_tokens for seq in seqs.values()]
         )
+
+        # Per-seq flag (prefill batches only): True if this chunk finishes the
+        # prompt (produces the real first token), False if it is a middle chunk
+        # whose sampled token must be discarded. Under pipeline-parallel
+        # schedule-time advancement the live seq.is_partial_prefill may already
+        # have been flipped by a later schedule() before this batch's output is
+        # postprocessed, so the decision is frozen here. None on decode/pp=1
+        # batches (legacy postprocess path).
+        self.is_final_chunk = is_final_chunk
 
         # context_lens: for prefill seqs, use num_cached_tokens + num_scheduled_tokens
         self.context_lens = np.asarray(
@@ -472,6 +482,22 @@ class Scheduler:
         # of `schedule()` can skip the running-queue scan entirely on
         # pure-decode steps (the common case).
         self._partial_prefill_count: int = 0
+
+        # Pipeline-parallel (CPP P2) schedule-time advancement. When True, the
+        # head EngineCore keeps up to pp_size batches in flight, so schedule()
+        # must advance chunked-prefill progress (num_cached_tokens /
+        # is_partial_prefill) itself instead of deferring it to postprocess —
+        # otherwise back-to-back schedule() calls would re-issue the same chunk.
+        # pp=1 leaves this False → byte-identical legacy path.
+        self.advance_on_schedule: bool = (
+            getattr(config, "pipeline_parallel_size", 1) > 1
+        )
+        # Seq ids whose sampled token is in flight (a decode step, or a final
+        # prefill chunk producing the first token). The decode scheduler skips
+        # them until the head releases the id after postprocess, so a seq is
+        # never decoded against a token that has not been appended yet. Mirrors
+        # vLLM's `next_decode_eligible_step = step + pp_size` guard.
+        self._pp_inflight_token_block: set[int] = set()
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -927,19 +953,39 @@ class Scheduler:
             connector_meta_output = None
             if self.kv_connector is not None:
                 connector_meta_output = self.kv_connector.build_connector_meta()
-            return (
-                ScheduledBatch(
-                    seqs=scheduled_seqs,
-                    num_scheduled_tokens=num_scheduled_tokens,
-                    total_tokens_num=total_tokens_num_prefill,
-                    total_tokens_num_prefill=total_tokens_num_prefill,
-                    total_seqs_num=num_seqs_prefill,
-                    total_seqs_num_prefill=num_seqs_prefill,
-                    connector_meta_output=connector_meta_output,
-                    num_cached_tokens=num_cached_tokens_list,
-                ),
-                scheduled_seqs,
+
+            # Freeze, per seq, whether this chunk finishes the prompt. Uses the
+            # pre-advance offsets so it is correct whether or not schedule-time
+            # advancement runs below.
+            is_final_chunk = [
+                (num_cached_tokens_list[i] + int(num_scheduled_tokens[i]))
+                >= seq.num_prompt_tokens
+                for i, seq in enumerate(scheduled_seqs.values())
+            ]
+
+            prefill_batch = ScheduledBatch(
+                seqs=scheduled_seqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=total_tokens_num_prefill,
+                total_tokens_num_prefill=total_tokens_num_prefill,
+                total_seqs_num=num_seqs_prefill,
+                total_seqs_num_prefill=num_seqs_prefill,
+                connector_meta_output=connector_meta_output,
+                num_cached_tokens=num_cached_tokens_list,
+                is_final_chunk=is_final_chunk,
             )
+
+            if self.advance_on_schedule:
+                # Advance chunked-prefill progress now (post batch build so the
+                # batch keeps pre-advance offsets), so the next schedule() issues
+                # the following chunk instead of re-issuing this one. Hash
+                # registration stays in postprocess (after the forward computes
+                # the KV); num_cached_tokens is the deferred hash start.
+                self._advance_prefill_on_schedule(
+                    scheduled_seqs, num_scheduled_tokens, is_final_chunk
+                )
+
+            return (prefill_batch, scheduled_seqs)
 
         # --- Decode scheduling ---
         num_seqs_decode = 0
@@ -949,12 +995,20 @@ class Scheduler:
         remote_kv_blocks: set[int] = set()
         remote_kv_seq_blocks: dict[int, list[int]] = {}
         skipped_partial_prefills: list[Sequence] = []
+        # Pipeline-parallel: seqs whose sampled token is still in flight cannot
+        # be decoded yet. Re-queue them at the tail (like partial prefills) so
+        # they are reconsidered once the head releases them post-postprocess.
+        skipped_pp_inflight: list[Sequence] = []
+        _pp_block = self._pp_inflight_token_block
         while self.running and num_seqs_decode < self.max_num_seqs:
             if num_decode_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
                 break
             seq = self.running.popleft()
             if seq.is_partial_prefill:
                 skipped_partial_prefills.append(seq)
+                continue
+            if _pp_block and seq.id in _pp_block:
+                skipped_pp_inflight.append(seq)
                 continue
             while not self.block_manager.can_append(seq, num_new_tokens):
                 if self.running:
@@ -1020,6 +1074,8 @@ class Scheduler:
             # decode seqs stay contiguous from position 0 and the safe
             # [new | deferred] slice path is used.
             self.running.extend(skipped_partial_prefills)
+        if skipped_pp_inflight:
+            self.running.extend(skipped_pp_inflight)
 
         connector_meta_output = None
         if self.kv_connector is not None:
@@ -1232,6 +1288,48 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    def _advance_prefill_on_schedule(
+        self,
+        scheduled_seqs: dict[int, Sequence],
+        num_scheduled_tokens: list[int],
+        is_final_chunk: list[bool],
+    ) -> None:
+        """Advance chunked-prefill progress at schedule time (pipeline-parallel).
+
+        Mirrors the num_cached_tokens / is_partial_prefill bookkeeping that
+        postprocess() does in the legacy path, so the head can schedule the next
+        chunk before this one's output returns. Hash registration is NOT done
+        here — it stays in postprocess where the forward has computed the KV.
+        """
+        for i, seq in enumerate(scheduled_seqs.values()):
+            seq.num_cached_tokens += int(num_scheduled_tokens[i])
+            now_partial = not is_final_chunk[i]
+            if now_partial != seq.is_partial_prefill:
+                self._partial_prefill_count += 1 if now_partial else -1
+                seq.is_partial_prefill = now_partial
+
+    def mark_pp_inflight(self, batch: ScheduledBatch) -> None:
+        """Head: block re-scheduling of seqs whose token is now in flight.
+
+        A decode seq, or a prefill seq on its final chunk, will produce a token
+        the head has not yet appended. Blocking them until release_pp_inflight()
+        prevents decoding against a stale token while the pipeline is filled.
+        """
+        final = batch.is_final_chunk
+        is_decode_batch = batch.total_seqs_num_decode > 0
+        if is_decode_batch:
+            for req_id in batch.req_ids:
+                self._pp_inflight_token_block.add(req_id)
+        elif final is not None:
+            for i, req_id in enumerate(batch.req_ids):
+                if final[i]:
+                    self._pp_inflight_token_block.add(req_id)
+
+    def release_pp_inflight(self, batch: ScheduledBatch) -> None:
+        """Head: release seqs blocked by mark_pp_inflight after postprocess."""
+        for req_id in batch.req_ids:
+            self._pp_inflight_token_block.discard(req_id)
+
     def postprocess(
         self,
         seqs: list[Sequence],
@@ -1254,7 +1352,28 @@ class Scheduler:
         # generated token. Keep the old partial state so we can drop that stale
         # token later in this loop.
         prev_partial_ids: set[int] = set()
-        if batch is not None:
+        # Pipeline-parallel: middle-chunk req_ids whose sampled token must be
+        # dropped. Frozen from batch.is_final_chunk, not the live
+        # seq.is_partial_prefill (which a later schedule() may already have
+        # flipped while this batch was in flight).
+        pp_middle_chunk_ids: set[int] = set()
+        if batch is not None and self.advance_on_schedule:
+            # Progress already advanced at schedule time; here we only publish
+            # prefix-cache hashes (KV now computed) using the chunk's pre-advance
+            # offset, and record which chunks were non-final.
+            running_by_id = {seq.id: seq for seq in self.running}
+            final = batch.is_final_chunk
+            for i, req_id in enumerate(batch.req_ids):
+                seq = running_by_id.get(req_id)
+                if seq is None or final is None:
+                    continue
+                is_final = final[i]
+                chunk = int(batch.num_scheduled_tokens[i])
+                start_tokens = int(batch.num_cached_tokens[i])
+                self.block_manager.hash_blocks(seq, chunk, start_tokens=start_tokens)
+                if not is_final:
+                    pp_middle_chunk_ids.add(req_id)
+        elif batch is not None:
             running_by_id = {seq.id: seq for seq in self.running}
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -1309,7 +1428,14 @@ class Scheduler:
             # Partial prefill: KV written but prefill not complete — discard
             # the sampled token. Prefix hashes are also deferred since
             # num_tokens < num_prompt_tokens until the prompt finishes.
-            if seq.is_partial_prefill:
+            #
+            # Under schedule-time advancement seq.is_partial_prefill reflects a
+            # possibly-later schedule() and cannot gate THIS batch's output;
+            # use the frozen middle-chunk set instead.
+            if self.advance_on_schedule:
+                if seq.id in pp_middle_chunk_ids:
+                    continue
+            elif seq.is_partial_prefill:
                 continue
             # Drop stale tokens produced by chunked-prefill steps.
             #
