@@ -33,7 +33,7 @@ jobs:
               "| `ci:vllm` | Run ATOM vLLM OOT model accuracy tests |",
               "| `ci:sglang` | Run ATOM SGLang model accuracy tests |",
               "",
-              "> Heavy jobs are skipped when the PR is not approved and no matching `ci:*` label was just added.",
+              "> Heavy jobs are skipped when the PR is not approved and no matching `ci:*` label is present.",
               `> Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``,
             ].join("\n");
 

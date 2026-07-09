@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # Decide whether an expensive PR CI workflow should run.
-# Non-PR events keep their existing behavior. For PR events, run only when the
-# current event explicitly adds one of CI_GATE_LABELS, or the PR has any
-# historical APPROVED review.
+# Non-PR events keep their existing behavior. For PR events, run when the PR
+# currently has one of CI_GATE_LABELS, or the PR has any historical APPROVED
+# review.
 
 set -euo pipefail
 
@@ -30,6 +30,24 @@ label_is_allowed() {
       return 0
     fi
   done
+
+  return 1
+}
+
+find_allowed_pr_label() {
+  local labels label
+  labels="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
+
+  if [ -z "${labels}" ] && [ -n "${REPO:-}" ] && [ -n "${PR_NUMBER:-}" ]; then
+    labels="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name' 2>/dev/null || true)"
+  fi
+
+  while IFS= read -r label; do
+    if [ -n "${label}" ] && label_is_allowed "${label}"; then
+      printf '%s\n' "${label}"
+      return 0
+    fi
+  done <<< "${labels}"
 
   return 1
 }
@@ -178,8 +196,9 @@ fi
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
 
-if [ "${ACTION}" = "labeled" ] && label_is_allowed "${EVENT_LABEL}"; then
-  emit_decision "true" "manual-label" "${EVENT_LABEL}"
+MATCHED_LABEL="$(find_allowed_pr_label || true)"
+if [ -n "${MATCHED_LABEL}" ]; then
+  emit_decision "true" "label-present" "${MATCHED_LABEL}"
   exit 0
 fi
 
