@@ -355,10 +355,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._swa_dtype = dtypes.fp8
             self._classical_dtype = dtypes.fp8
             self._rope_dtype = torch.bfloat16  # rope pool is always bf16
-            # aiter prefill (op4) / decode (op5) hard-check gfx950 internally.
-            assert get_gfx() == "gfx950", (
-                "DeepSeek-V4 --kv_cache_dtype fp8 requires gfx950 (MI350); "
-                f"got {get_gfx()!r}. Use --kv_cache_dtype bf16 on this platform."
+            # aiter prefill (op4) / decode (op5) support gfx950 (MI350) and
+            # gfx1250 (MI450) for the fp8 (2buff) path.
+            assert get_gfx() in ("gfx950", "gfx1250"), (
+                "DeepSeek-V4 --kv_cache_dtype fp8 (2buff) requires gfx950 (MI350) "
+                f"or gfx1250 (MI450); got {get_gfx()!r}. "
+                "Use --kv_cache_dtype bf16 on this platform."
             )
         else:
             self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
