@@ -886,7 +886,11 @@ class PagedAttentionImpl(nn.Module):
             # _can_use_prefill_sink_asm is valid.
             if self._can_use_prefill_sink_asm(q, k, v, fwd_ctx):
                 return self.prefill_attention
-            if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
+            if (
+                envs.ATOM_USE_UNIFIED_ATTN
+                or self.use_flash_layout
+                or get_gfx() == "gfx1250"
+            ):
                 return self.prefill_attention_triton
             return self.prefill_attention
         return self._dispatch_decode()
