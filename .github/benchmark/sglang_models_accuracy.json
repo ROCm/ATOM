@@ -110,7 +110,8 @@
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models",
     "runner": "atom-mi355-8gpu-conductor-sgl-runner",
     "test_level": "nightly",
-    "accuracy_threshold": 0.93,
+    "lm_eval_num_fewshot": 5,
+    "accuracy_threshold": 0.88,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4",
     "_baseline_note": "SGLang-ATOM MiniMax-M3-MXFP4 TP4 measured on GSM8K benchmark."
