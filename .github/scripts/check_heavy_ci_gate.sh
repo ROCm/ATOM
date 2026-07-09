@@ -2,8 +2,8 @@
 
 # Decide whether an expensive PR CI workflow should run.
 # Non-PR events keep their existing behavior. For PR events, run only when the
-# current event explicitly adds one of CI_GATE_LABELS, or the PR review decision
-# is already APPROVED.
+# current event explicitly adds one of CI_GATE_LABELS, or the PR has any
+# historical APPROVED review.
 
 set -euo pipefail
 
@@ -190,51 +190,17 @@ fi
 
 check_relevant_paths
 
-QUERY='
-query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      reviewDecision
-      latestReviews(first: 100) {
-        nodes {
-          state
-        }
-      }
-    }
-  }
-}'
-
-if ! REVIEWS_JSON="$(
-  gh api graphql \
-    -f query="${QUERY}" \
-    -f owner="${OWNER}" \
-    -f name="${NAME}" \
-    -F number="${PR_NUMBER}"
-)"; then
+if ! REVIEW_STATES="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --jq '.[].state')"; then
   echo "Failed to query PR review state; skipping heavy CI."
   emit_decision "false" "review-query-failed"
   exit 0
 fi
 
-REVIEW_DECISION="$(jq -r '.data.repository.pullRequest.reviewDecision // ""' <<< "${REVIEWS_JSON}")"
-APPROVAL_COUNT="$(jq '[.data.repository.pullRequest.latestReviews.nodes[]? | select(.state == "APPROVED")] | length' <<< "${REVIEWS_JSON}")"
-CHANGES_REQUESTED_COUNT="$(jq '[.data.repository.pullRequest.latestReviews.nodes[]? | select(.state == "CHANGES_REQUESTED")] | length' <<< "${REVIEWS_JSON}")"
+APPROVAL_COUNT="$(printf '%s\n' "${REVIEW_STATES}" | awk '$0 == "APPROVED" { count++ } END { print count + 0 }')"
+CHANGES_REQUESTED_COUNT="$(printf '%s\n' "${REVIEW_STATES}" | awk '$0 == "CHANGES_REQUESTED" { count++ } END { print count + 0 }')"
 
-case "${REVIEW_DECISION}" in
-  APPROVED)
-    emit_decision "true" "approved" "" "${REVIEW_DECISION}" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
-    ;;
-  CHANGES_REQUESTED)
-    emit_decision "false" "changes-requested" "" "${REVIEW_DECISION}" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
-    ;;
-  REVIEW_REQUIRED)
-    emit_decision "false" "review-required" "" "${REVIEW_DECISION}" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
-    ;;
-  *)
-    if [ "${APPROVAL_COUNT}" -gt 0 ] && [ "${CHANGES_REQUESTED_COUNT}" -eq 0 ]; then
-      emit_decision "true" "approved" "" "${REVIEW_DECISION}" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
-    else
-      emit_decision "false" "not-approved" "" "${REVIEW_DECISION}" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
-    fi
-    ;;
-esac
+if [ "${APPROVAL_COUNT}" -gt 0 ]; then
+  emit_decision "true" "approved-history" "" "APPROVED_HISTORY" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
+else
+  emit_decision "false" "not-approved" "" "" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
+fi
