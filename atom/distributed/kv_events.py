@@ -242,7 +242,10 @@ class ZmqEventPublisher(EventPublisher):
         # Assign the sequence number here (at enqueue), not at send: a batch
         # dropped on overflow below still consumes a seq, so the drop is
         # visible to subscribers as a gap instead of vanishing silently.
-        seq = next(self._seq_gen)
+        # Mask to uint64 up front so the wire frame, the replay-buffer key, and
+        # the start_seq comparison in _service_replay all use the same value
+        # (wrap-around at 2**64 is expected on an extremely long-lived sender).
+        seq = next(self._seq_gen) & 0xFFFFFFFFFFFFFFFF
 
         # Non-blocking enqueue; drop oldest on overflow.
         while True:
@@ -302,9 +305,8 @@ class ZmqEventPublisher(EventPublisher):
                 return
             seq, payload = item
             try:
-                # Wrap at 2**64 so the fixed 8-byte frame never overflows on a
-                # very long-running publisher; wrap-around is expected.
-                seq_bytes = (seq & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big")
+                # seq is already masked to uint64 at enqueue.
+                seq_bytes = seq.to_bytes(8, "big")
                 self._socket.send_multipart([self._topic_bytes, seq_bytes, payload])
                 if self._replay_buffer is not None:
                     self._replay_buffer.append((seq, seq_bytes, payload))
@@ -327,7 +329,9 @@ class ZmqEventPublisher(EventPublisher):
             logger.warning("KV event replay: bad start_seq %r", frames[-1])
             return
         prefix = frames[:-1]  # [client_id] or [client_id, empty_delim]
-        for seq, seq_bytes, payload in list(self._replay_buffer or ()):
+        # Safe to iterate the deque directly: the sender thread is the only
+        # mutator and it is the same thread running this method.
+        for seq, seq_bytes, payload in self._replay_buffer or ():
             if seq >= start_seq:
                 self._replay.send_multipart([*prefix, seq_bytes, payload])
                 with self._lock:
