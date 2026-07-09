@@ -1780,11 +1780,6 @@ class DeepseekV2MLAAttention(nn.Module):
         layer_quant_type = quant_config.get_layer_quant_config(
             f"{prefix}.{q_a_proj_name}"
         ).quant_type
-        # Keep a plain int on the module so Dynamo does not guard on a
-        # QuantType enum attribute.
-        layer_quant_type_value = (
-            None if layer_quant_type is None else layer_quant_type.value
-        )
         if layer_quant_dtype == dtypes.fp4x2:
             if not use_triton_gemm():
                 source_quant_dtype = None
@@ -2203,19 +2198,40 @@ class DeepseekV2DecoderLayer(nn.Module):
                     and layer_quant_config.quant_dtype in (dtypes.fp8, dtypes.fp4x2)
                 )
 
-            if quant_config.online_quant and not uses_quantized_attn_input(
-                attn_input_quant_config
-            ):
-                attn_input_quant_config = quant_config.get_layer_quant_config(
+            # Consult the online override whenever it actually applies (same rule
+            # as should_skip_online_quant, which governs the real weight quant in
+            # the input_norm_fused_quant block below) — not only when the base is
+            # unquantized. A block-scale FP8 base that ptpc-online overrides to
+            # per_Token must report per_Token here; otherwise quant_dtype /
+            # input_norm_quant_type disagree with the actual runtime quant.
+            if quant_config.online_quant:
+                online_cfg = quant_config.get_layer_quant_config(
                     attn_input_layer_name,
                     use_online_quant=True,
                 )
+                if not should_skip_online_quant(
+                    attn_input_quant_config.quant_type,
+                    attn_input_quant_config.quant_dtype,
+                    online_cfg,
+                ):
+                    attn_input_quant_config = online_cfg
 
             if uses_quantized_attn_input(attn_input_quant_config):
                 self.quant_dtype = attn_input_quant_config.quant_dtype
                 self.input_norm_quant_type = attn_input_quant_config.quant_type.value
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
+        # DSA models (e.g., GLM-5/DeepSeek-V3.2): the indexer's wk/weights_proj GEMMs
+        # run in BF16 and consume the same normed activation, so the RMSNorm(+quant)
+        # must also emit the pre-quant bf16 mirror. Gate the mirror on this layer
+        # actually owning an active indexer (shared / skip_topk layers don't).
+        is_v32 = getattr(self.self_attn, "is_v32", False)
+        emit_bf16_for_indexer = (
+            is_v32
+            and getattr(self.self_attn, "indexer", None) is not None
+            and not getattr(self.self_attn, "skip_topk", False)
+        )
+        self.emit_bf16_for_indexer = emit_bf16_for_indexer
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
             enable_fp8_input_norm_quant = self.quant_dtype == dtypes.fp8 and (
                 use_triton_gemm()
@@ -2230,14 +2246,18 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_mtp_block,
                 )
             )
-            if enable_fp8_input_norm_quant or enable_fp4_input_norm_quant:
-                self.fuse_input_norm_quant = True
-                if self.fuse_ar_input_norm:
-                    self.fuse_ar_input_norm = False
-                    if layer_idx == 0:
-                        logger.info(
-                            "Warning: Because ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on, AR + RMS fusion is turned off for input_layernorm and reduce_results is re-enabled for first k dense layer down_proj"
-                        )
+            self.fuse_input_norm_quant = (
+                enable_fp8_input_norm_quant or enable_fp4_input_norm_quant
+            )
+        # When both AR fusion and quant fusion are on they can't co-exist on one
+        # input_layernorm.
+        if self.fuse_input_norm_quant and self.fuse_ar_input_norm:
+            if self.layer_idx == 0:
+                logger.info(
+                    "Warning: Both ENABLE_ALLREDUCE_RMSNORM_FUSION and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION are enabled, INPUT_RMSNORM_QUANT_FUSION is applied on layer 0, ALLREDUCE_RMSNORM_FUSION (with possible quant fusion) is applied on other layers."
+                )
+            else:
+                self.fuse_input_norm_quant = False
 
         if (
             config.n_routed_experts is not None
@@ -2260,42 +2280,21 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
             )
-        # Fuse activation quant into AR+RMSNorm when fused_qkv_a_proj is
-        # per-1x128/per-token FP8, so the GEMM consumes the (fp8, scale) directly.
-        # Use the online-quant target (get_layer_quant_config(..., online)), not
-        # the static params_dtype: online quant flips the qkv proj to fp8 only in
-        # process_weights_after_loading, which runs after this __init__.
-        qkv_proj = getattr(self.self_attn, "fused_qkv_a_proj", None)
-        eff_quant_type = None if qkv_proj is None else qkv_proj.quant_type
-        eff_quant_dtype = None if qkv_proj is None else qkv_proj.params_dtype
-        if (
-            qkv_proj is not None
-            and quant_config is not None
-            and quant_config.online_quant
-        ):
-            online_cfg = quant_config.get_layer_quant_config(
-                qkv_proj.prefix, use_online_quant=True
-            )
-            if not should_skip_online_quant(
-                eff_quant_type, eff_quant_dtype, online_cfg
-            ):
-                eff_quant_type = online_cfg.quant_type
-                eff_quant_dtype = online_cfg.quant_dtype
+        # Fuse activation quant into the AR+RMSNorm when the attention input
+        # projection is per-1x128/per-token FP8, so the GEMM consumes the
+        # (fp8, scale) directly. self.quant_dtype / self.input_norm_quant_type
+        # were already resolved above (including the online-quant override).
+        # Restricted to the fused_qkv_a_proj MLA path: on the q_proj path the
+        # normed output also feeds kv_a_proj_with_mqa, whose quant isn't checked
+        # here, so fusing there could emit the wrong dtype for that GEMM.
         input_norm_fused_quant = (
-            qkv_proj is not None
-            and eff_quant_dtype == dtypes.fp8
-            and eff_quant_type.value
+            attn_input_proj_name == "fused_qkv_a_proj"
+            and self.quant_dtype == dtypes.fp8
+            and self.input_norm_quant_type
             in (QuantType.per_1x128.value, QuantType.per_Token.value)
         )
         fused_allreduce = (
             self.fuse_ar_input_norm and self.layer_idx > 0 and not is_mtp_block
-        )
-        # GLM-5.2 (v32) DSA: the indexer's wk/weights_proj GEMMs run in BF16 and
-        # consume the same normed activation, so the fused kernel must also emit
-        # the pre-quant bf16 mirror alongside the fp8 for fused_qkv_a_proj.
-        emit_bf16_for_indexer = (
-            getattr(self.self_attn, "is_v32", False)
-            and getattr(self.self_attn, "indexer", None) is not None
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -2306,11 +2305,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 fused_allreduce and input_norm_fused_quant and emit_bf16_for_indexer
             ),
             quant_config=quant_config,
-            prefix=(
-                f"{prefix}.self_attn.fused_qkv_a_proj"
-                if qkv_proj is not None
-                else f"{prefix}.self_attn.q_a_proj"
-            ),
+            prefix=f"{prefix}.self_attn.{attn_input_proj_name}",
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -2318,9 +2313,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.fuse_rmsnorm_quant = (
-            ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
-        )
 
     def forward(
         self,
@@ -2342,45 +2334,60 @@ class DeepseekV2DecoderLayer(nn.Module):
                 scale_shuffle_padding = True
             if residual is None:
                 residual = hidden_states
-                (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
-                    _fuse_rmsnorm_quant(
-                        hidden_states,
-                        weight,
-                        eps,
-                        None,
-                        None,
-                        None,
-                        None,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=shuffle_input_norm_quant,
-                        scale_shuffle_padding=scale_shuffle_padding,
-                        group_size=128,
-                        quant_type=self.input_norm_quant_type,
-                        output_unquantized_inp1=False,
-                        transpose_scale=True,
-                    )
+                (
+                    (hidden_states_quant, hidden_states_quant_scale),
+                    hidden_states_bf16,
+                    _,
+                    _,
+                ) = _fuse_rmsnorm_quant(
+                    hidden_states,
+                    weight,
+                    eps,
+                    None,
+                    None,
+                    None,
+                    None,
+                    dtype_quant=self.quant_dtype,
+                    shuffle=shuffle_input_norm_quant,
+                    scale_shuffle_padding=scale_shuffle_padding,
+                    group_size=128,
+                    quant_type=self.input_norm_quant_type,
+                    output_unquantized_inp1=self.emit_bf16_for_indexer,
+                    transpose_scale=True,
                 )
             else:
-                (hidden_states_quant, hidden_states_quant_scale), _, _, residual = (
-                    _fuse_rmsnorm_quant(
-                        hidden_states,
-                        weight,
-                        eps,
-                        None,
-                        None,
-                        None,
-                        residual,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=shuffle_input_norm_quant,
-                        scale_shuffle_padding=scale_shuffle_padding,
-                        group_size=128,
-                        quant_type=self.input_norm_quant_type,
-                        output_unquantized_inp1=False,
-                        transpose_scale=True,
-                    )
+                (
+                    (hidden_states_quant, hidden_states_quant_scale),
+                    hidden_states_bf16,
+                    _,
+                    residual,
+                ) = _fuse_rmsnorm_quant(
+                    hidden_states,
+                    weight,
+                    eps,
+                    None,
+                    None,
+                    None,
+                    residual,
+                    dtype_quant=self.quant_dtype,
+                    shuffle=shuffle_input_norm_quant,
+                    scale_shuffle_padding=scale_shuffle_padding,
+                    group_size=128,
+                    quant_type=self.input_norm_quant_type,
+                    output_unquantized_inp1=self.emit_bf16_for_indexer,
+                    transpose_scale=True,
                 )
 
-            hidden_states = (hidden_states_quant, hidden_states_quant_scale)
+            # v32 indexer layers: pass the bf16 mirror as the 3rd tuple slot so the
+            # indexer's BF16 wk/weights_proj GEMMs get bf16, while qkv proj gets fp8.
+            if self.emit_bf16_for_indexer:
+                hidden_states = (
+                    hidden_states_quant,
+                    hidden_states_quant_scale,
+                    hidden_states_bf16,
+                )
+            else:
+                hidden_states = (hidden_states_quant, hidden_states_quant_scale)
 
         else:
             if residual is None:
