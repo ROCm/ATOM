@@ -299,6 +299,14 @@ jobs:
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.88
             runner: atom-mi355-8gpu-vllm-sgl-ci
+          - display_name: "GLM-5.1-FP8 TP8"
+            model_name: "GLM-5.1-FP8"
+            model_path: "zai-org/GLM-5.1-FP8"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --max-num-batched-tokens 16384 --max-model-len 16384"
+            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+            lm_eval_num_fewshot: 20
+            accuracy_test_threshold: 0.88
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Kimi-K2.5-MXFP4 TP4"
             model_name: "Kimi-K2.5-MXFP4"
             model_path: "amd/Kimi-K2.5-MXFP4-AttnFP8"
@@ -307,15 +315,16 @@ jobs:
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.92
             runner: atom-mi355-8gpu-vllm-sgl-ci
-          - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
-            model_name: "Qwen3.5-35B-A3B-FP8"
-            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
-            extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
+          - display_name: "Qwen3.5-397B-A17B-MXFP4 TP4"
+            model_name: "Qwen3.5-397B-A17B-MXFP4"
+            model_path: "amd/Qwen3.5-397B-A17B-MXFP4"
+            extra_args: "--tensor-parallel-size 4"
             env_vars: |
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
+              ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
             lm_eval_num_fewshot: 3
-            accuracy_test_threshold: 0.77
+            accuracy_test_threshold: 0.83
             runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
