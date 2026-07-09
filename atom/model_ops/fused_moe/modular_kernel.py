@@ -395,28 +395,98 @@ class FusedMoEModularKernel(torch.nn.Module):
         # gate_mode=INTERLEAVE + swiglu_limit) are forwarded verbatim from the
         # quant method's apply() via `moe_extra_args`.
         extra_kwargs = dict(moe_extra_args or {})
-        fused_out = fused_moe(
-            dispatch_a1,
-            w1,
-            w2,
-            dispatch_weights,
-            dispatch_ids,
-            expert_mask,
-            activation,
-            quant_type=quant_type,
-            num_local_tokens=expert_tokens_meta.expert_num_tokens,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
-            a2_scale=a2_scale,
-            doweight_stage1=apply_router_weight_on_input,
-            hidden_pad=hidden_pad,
-            intermediate_pad=intermediate_pad,
-            bias1=bias1,
-            bias2=bias2,
-            dtype=hidden_states.dtype,
-            **extra_kwargs,
-        )
+
+        from atom.utils import envs
+
+        if envs.ATOM_RCCL_MOE_IMPL in (
+            "batched",
+            "flydsl_batched_gemm",
+            "triton_batched_gemm",
+        ):
+            # Batched grouped-expert path: re-sort dispatched rows into a dense
+            # [local_experts, capacity, hidden] grid and run a strided-batched
+            # w4a8 (MXFP8xMXFP4) GEMM per expert instead of the token-major
+            # fused_moe. Only valid under the RCCL backend (topk==1 dispatched
+            # layout). capacity == graph_bs*topk mirrors the LL dispatch bound.
+            from atom.model_ops.fused_moe.rccl_batched_experts import (
+                batched_expert_compute,
+            )
+            from aiter.dist.parallel_state import get_ep_group
+
+            ctx = get_forward_context().context
+            ep_group = get_ep_group()
+            topk = topk_ids.shape[1]
+            # Capacity for the per-local-expert [E, C, H] grid (LL / CUDA-graph).
+            #
+            # The LL dispatch delivers a [ws * graph_bs * topk, hidden] recv
+            # buffer: up to R = ws * graph_bs * topk (token, expert) pairs can
+            # land on this rank, spread over E local experts. The grid caps each
+            # expert at C rows and DROPS overflow (standard capacity-based MoE),
+            # so C must balance two failure modes:
+            #   - too small (e.g. graph_bs*topk): drops tokens under any skew.
+            #   - too large (e.g. the ws*graph_bs*topk worst case): the [E, C, H]
+            #     grid is E * C * H * 2 bytes -- at graph_bs=512 that's ~45GB and
+            #     OOMs during capture.
+            # So size C to a load factor over the AVERAGE per-expert occupancy
+            # (R / E), rounded up to a multiple of 32 (FlyDSL scale stride), and
+            # clamp to R (can't exceed the whole recv buffer). Factor is tunable
+            # via ATOM_RCCL_LL_CAP_FACTOR (default 2.0). Overflow beyond C is
+            # dropped by resort_to_batched, exactly like DeepEP/mori LL capacity.
+            #
+            # HT variable-length dispatch and prefill (graph_bs == 0) are eager,
+            # so pass None -> resort sizes C to the actual max tokens per local
+            # expert (no drops, no wasted pad).
+            uniform_decode = (not ctx.is_prefill) and getattr(
+                ctx, "dp_uniform_decode", True
+            )
+            from atom.utils import envs as _envs
+
+            if uniform_decode and not _envs.ATOM_ALL2ALL_FORCE_HT:
+                ws = ep_group.world_size
+                R = ws * ctx.graph_bs * topk
+                E = max(local_num_experts, 1)
+                cap_factor = _envs.ATOM_RCCL_LL_CAP_FACTOR
+                avg = R / E
+                C = int((avg * cap_factor + 31) // 32) * 32
+                C = max(32, min(C, R))  # >=32, never exceed the recv buffer
+                capacity = C
+            else:
+                capacity = None  # HT / eager: data-dependent max-per-expert
+            fused_out = batched_expert_compute(
+                dispatch_a1=dispatch_a1,
+                dispatch_ids=dispatch_ids,
+                w13=w1,
+                w13_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                activation=activation,
+                local_num_experts=local_num_experts,
+                capacity=capacity,
+                ep_rank=ep_group.rank_in_group,
+            )
+        else:
+            fused_out = fused_moe(
+                dispatch_a1,
+                w1,
+                w2,
+                dispatch_weights,
+                dispatch_ids,
+                expert_mask,
+                activation,
+                quant_type=quant_type,
+                num_local_tokens=expert_tokens_meta.expert_num_tokens,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
+                a2_scale=a2_scale,
+                doweight_stage1=apply_router_weight_on_input,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                dtype=hidden_states.dtype,
+                **extra_kwargs,
+            )
         return self._finalize(
             output,
             fused_out,

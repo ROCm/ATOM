@@ -26,8 +26,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
+    "ATOM_DP_SIZE_LOCAL": lambda: int(os.getenv("ATOM_DP_SIZE_LOCAL", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    "ATOM_DISTRIBUTED_DP": lambda: os.getenv("ATOM_DISTRIBUTED_DP", "0") == "1",
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # --- Compilation & Execution ---
@@ -46,6 +48,53 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # --- Expert-parallel all2all backend ---
+    # Selects the MoE dispatch/combine implementation used under DP+EP.
+    #   "mori" (default): MoRI kernels (MoriPrepareAndFinalize). Requires the
+    #                     optional `mori` package.
+    #   "rccl":           native RCCL collectives (RcclPrepareAndFinalize),
+    #                     dependency-free. HT path (allgather topk -> variable
+    #                     all_to_all_single) for prefill/non-uniform-decode; LL
+    #                     path (fixed cross-DP-unified capacity, CUDA-graph safe)
+    #                     for uniform decode.
+    "ATOM_ALL2ALL_BACKEND": lambda: os.getenv("ATOM_ALL2ALL_BACKEND", "mori").lower(),
+    # Force the RCCL backend to use the HT (variable-length all_to_all_single)
+    # path for BOTH prefill and decode, instead of routing uniform decode to the
+    # fixed-capacity LL path. HT is not CUDA-graph capturable (it does host sync
+    # on the token counts), so run with --enforce-eager / --level 0 when this is
+    # on. Useful for bring-up / debugging without the LL padding + capacity cap.
+    "ATOM_ALL2ALL_FORCE_HT": lambda: os.getenv("ATOM_ALL2ALL_FORCE_HT", "0") == "1",
+    # Expert compute implementation for the RCCL all2all backend:
+    #   "default":              feed dispatched rows to aiter fused_moe (token-
+    #                           major GEMM with internal expert masking).
+    #   "flydsl_batched_gemm":  re-sort dispatched rows into a dense
+    #                           [local_experts, capacity, hidden] grid and run
+    #                           the FlyDSL batched w4a8 GEMM. Requires FlyDSL
+    #                           support_f8f4_batchgemm.
+    #   "triton_batched_gemm":  re-sort into the same dense grid and run AITER's
+    #                           Triton batched A8W4 GEMM. This consumes plain,
+    #                           non-shuffled MXFP4 weights/scales.
+    # Backward-compatible aliases: "token_sort" == "default", "batched" ==
+    # "flydsl_batched_gemm".
+    "ATOM_RCCL_MOE_IMPL": lambda: os.getenv("ATOM_RCCL_MOE_IMPL", "default").lower(),
+    # BENCH ONLY: override the router's topk_ids with a perfectly load-balanced
+    # round-robin assignment (expert = global_pair_index % num_routing_experts),
+    # so every expert / EP rank receives an identical token count. Measures the
+    # best-case (no routing skew) MoE all2all + expert GEMM perf. Corrupts model
+    # output — do NOT use for accuracy. The override is a single cached-arange
+    # gather (no gate recompute), so it adds negligible time.
+    "ATOM_FORCE_BALANCE_FOR_BENCH": lambda: os.getenv(
+        "ATOM_FORCE_BALANCE_FOR_BENCH", "0"
+    )
+    == "1",
+    # Capacity factor for the RCCL LL (fixed-capacity, CUDA-graph) batched MoE
+    # grid. The per-local-expert grid holds C = round_up_32(factor * R / E) rows
+    # where R = ws*graph_bs*topk received pairs and E = local experts; overflow
+    # beyond C is dropped (standard capacity-based dispatch). Higher = fewer
+    # drops under routing skew but more VRAM (grid is E*C*hidden). Default 2.0.
+    "ATOM_RCCL_LL_CAP_FACTOR": lambda: float(
+        os.getenv("ATOM_RCCL_LL_CAP_FACTOR", "2.0")
+    ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

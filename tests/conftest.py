@@ -52,8 +52,10 @@ class _StubKVCacheTensor:
 class _StubParallelConfig:
     """Placeholder for ParallelConfig."""
 
-    def __init__(self, data_parallel_size: int = 1):
+    def __init__(self, data_parallel_size: int = 1, **kwargs):
         self.data_parallel_size = data_parallel_size
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 _atom_config.Config = _StubConfig

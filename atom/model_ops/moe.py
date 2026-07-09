@@ -8,6 +8,9 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
+
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
@@ -66,6 +69,76 @@ from transformers import PretrainedConfig
 logger = logging.getLogger("atom")
 
 
+# --------------------------------------------------------------------------- #
+# BENCH-ONLY perfectly-balanced topk override (ATOM_FORCE_BALANCE_FOR_BENCH).
+# --------------------------------------------------------------------------- #
+
+
+@triton.jit
+def _force_balance_kernel(
+    ids_ptr,  # (tokens, stride) topk_ids buffer (row-major)
+    tokens,
+    top_k,  # routed columns to overwrite (first top_k of each row)
+    stride,  # row stride of topk_ids (>= top_k; extra cols left intact)
+    E,  # num_routing_experts
+    BLOCK_K: tl.constexpr,  # next pow2 >= top_k
+):
+    """One program per token row: write the routed columns with a round-robin
+    ``expert = (t*top_k + k) % E`` so every expert gets an identical token count.
+    Single launch, in place, no allocation. Columns >= top_k (fused shared
+    experts) are not touched (masked)."""
+    t = tl.program_id(0)
+    if t >= tokens:
+        return
+    k = tl.arange(0, BLOCK_K)
+    mask = k < top_k
+    pair = t * top_k + k  # global routed-pair index
+    expert = pair % E
+    tl.store(ids_ptr + t * stride + k, expert.to(ids_ptr.dtype.element_ty), mask=mask)
+
+
+def _force_balance_topk_ids_(
+    topk_ids: torch.Tensor, top_k: int, num_routing_experts: int
+) -> None:
+    """Overwrite the first ``top_k`` (routed) columns of ``topk_ids`` in place
+    with a perfectly load-balanced round-robin: the p-th routed (token, k) pair
+    gets expert ``p % num_routing_experts``. Every expert (and, since experts are
+    owned contiguously by EP rank, every rank) then receives an identical number
+    of tokens — the best case for all2all + expert-GEMM perf. Only the routed
+    columns are touched; any fused shared-expert columns past ``top_k`` are left
+    intact.
+
+    BENCH ONLY: destroys routing correctness. A single Triton kernel (one program
+    per token row) writes the round-robin in place — no arange/modulo/copy torch
+    ops on the hot path. Falls back to torch on CPU / non-CUDA.
+    """
+    tokens = topk_ids.shape[0]
+    stride = topk_ids.shape[1]
+    top_k = min(top_k, stride)
+    if tokens == 0 or top_k == 0 or num_routing_experts <= 0:
+        return
+    if topk_ids.device.type != "cuda":
+        n = tokens * top_k
+        pattern = (
+            (
+                torch.arange(n, device=topk_ids.device, dtype=torch.int64)
+                % num_routing_experts
+            )
+            .to(topk_ids.dtype)
+            .view(tokens, top_k)
+        )
+        topk_ids[:, :top_k].copy_(pattern)
+        return
+    _force_balance_kernel[(tokens,)](
+        topk_ids,
+        tokens,
+        top_k,
+        stride,
+        num_routing_experts,
+        BLOCK_K=triton.next_power_of_2(top_k),
+    )
+
+
 class MoEActivationQuant(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
@@ -106,8 +179,15 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled
-        return self.dp_size > 1 and self.use_ep and _has_module("mori")
+        # Use all2all kernels only when DP+EP is active. The native RCCL backend
+        # (ATOM_ALL2ALL_BACKEND=rccl) needs no external dep; mori backend does.
+        from atom.utils import envs
+
+        if not (self.dp_size > 1 and self.use_ep):
+            return False
+        if envs.ATOM_ALL2ALL_BACKEND == "rccl":
+            return True
+        return _has_module("mori")
 
     @property
     def use_mori_kernels(self):
@@ -392,6 +472,55 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         assert all2all_manager is not None
 
         prepare_finalize: FusedMoEPrepareAndFinalize | None = None
+
+        from atom.utils import envs
+
+        if envs.ATOM_ALL2ALL_BACKEND == "rccl":
+            from atom.model_ops.fused_moe.rccl_prepare_finalize import (
+                RcclPrepareAndFinalize,
+            )
+            from aiter import QuantType
+
+            scale_dim = (
+                1
+                if (quant_config is not None and quant_config.is_per_act_token)
+                else moe.hidden_dim // 128
+            )
+            fp8_dtypes = (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+                torch.float8_e5m2,
+                torch.float8_e5m2fnuz,
+            )
+            is_fp8 = quant_config is not None and quant_config.quant_dtype in fp8_dtypes
+            quant_type = None
+            if is_fp8:
+                if quant_config.is_block_quantized:
+                    quant_type = QuantType.per_1x128
+                elif quant_config.is_per_act_token:
+                    quant_type = QuantType.per_Token
+            # The batched MoE impl quantizes activations to MXFP8 itself (inside
+            # batched_w4a8_mlp), so it must receive bf16 dispatched activations,
+            # not pre-fp8-dispatched ones. Only the token_sort impl consumes an
+            # fp8 dispatch. Disable fp8 dispatch when the batched path is active.
+            use_batched_impl = envs.ATOM_RCCL_MOE_IMPL in (
+                "batched",
+                "flydsl_batched_gemm",
+                "triton_batched_gemm",
+            )
+            use_fp8_dispatch = is_fp8 and quant_type is not None and not use_batched_impl
+            return RcclPrepareAndFinalize(
+                rank=all2all_manager.rank,
+                world_size=all2all_manager.world_size,
+                hidden_dim=moe.hidden_dim,
+                scale_dim=scale_dim,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_local_experts=moe.num_experts // all2all_manager.world_size,
+                num_experts_per_token=moe.experts_per_token,
+                in_dtype=moe.in_dtype,
+                use_fp8_dispatch=use_fp8_dispatch,
+                quant_type=quant_type,
+            )
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
@@ -1056,6 +1185,52 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             orig_w13_weight_scale = layer.w13_weight_scale.data.clone()
             orig_w2_weight_scale = layer.w2_weight_scale.data.clone()
+        # RCCL batched w4a8 expert compute owns the expert weight layout:
+        # - flydsl_batched_gemm wants the gate_up=False FlyDSL/aiter preshuffle.
+        # - triton_batched_gemm wants the plain checkpoint layout.
+        # The default/token_sort and MORI paths still use the normal aiter
+        # fused_moe shuffle below.
+        if envs.ATOM_ALL2ALL_BACKEND == "rccl" and envs.ATOM_RCCL_MOE_IMPL in (
+            "batched",
+            "flydsl_batched_gemm",
+            "triton_batched_gemm",
+        ):
+            if envs.ATOM_RCCL_MOE_IMPL == "triton_batched_gemm":
+                # AITER's Triton batched A8W4 kernel consumes the plain MXFP4
+                # checkpoint layout: weight [E, N, K/2], scale [E, N, K/32].
+                # Do not apply aiter/FlyDSL preshuffle to weights or scales.
+                layer.w13_weight.is_shuffled = False
+                layer.w2_weight.is_shuffled = False
+                return
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight, is_guinterleave=self.is_guinterleave, gate_up=False
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight, is_guinterleave=self.is_guinterleave, gate_up=False
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+            _w13s2d = layer.w13_weight_scale.reshape(
+                -1, layer.w13_weight_scale.shape[-1]
+            )
+            _w2s2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
+            layer.w13_weight_scale = atom_parameter(
+                moe_shuffle_scale(
+                    _w13s2d,
+                    self.num_experts,
+                    is_guinterleave=self.is_guinterleave,
+                    gate_up=False,
+                )
+            )
+            layer.w2_weight_scale = atom_parameter(
+                moe_shuffle_scale(
+                    _w2s2d,
+                    self.num_experts,
+                    is_guinterleave=self.is_guinterleave,
+                    gate_up=False,
+                )
+            )
+            return
 
         # shuffle weight
         layer.w13_weight.data = shuffle_weight(
@@ -1372,6 +1547,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias2=layer.w2_bias,
                 **moe_extra_args,
             )
+        # The RCCL batched w4a8 path needs the gate_up=False FlyDSL layout stashed
+        # in process_weights_after_loading (in place, gate_up=False for the
+        # batched RCCL path; gate_up=True aiter layout otherwise), so apply()
+        # just uses the canonical w13_weight / w13_weight_scale either way.
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -2114,6 +2293,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return
 
+        # The RCCL batched block-fp8 expert path
+        # runs aiter ``gemm_a8w8_blockscale`` per expert, which consumes PLAIN
+        # row-major [N, K] weights. ``shuffle_weights`` reorders them into aiter
+        # fused_moe's CK 16x16 tile layout, which that blockscale GEMM misreads
+        # (verified: rel err ~1.4 shuffled vs ~0.04 plain). When the batched path
+        # is active the shuffled layout is never used, so just skip the shuffle
+        # and keep the plain weights in place (no second copy -> no VRAM double).
+        if envs.ATOM_ALL2ALL_BACKEND == "rccl" and envs.ATOM_RCCL_MOE_IMPL in (
+            "batched",
+            "flydsl_batched_gemm",
+            "triton_batched_gemm",
+        ):
+            return
+
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
@@ -2268,6 +2461,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=apply_router_weight_on_input,
                 **moe_extra_args,
             )
+        # For the RCCL batched block-fp8 path, process_weights_after_loading
+        # skips the CK shuffle and leaves w13_weight / w2_weight PLAIN row-major
+        # (what aiter gemm_a8w8_blockscale needs); other paths get the CK-shuffled
+        # layout. Either way apply() just uses the canonical w13_weight / w2_weight.
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -3371,6 +3568,16 @@ class FusedMoE(torch.nn.Module):
                 topk=top_k,
                 renormalize=renormalize,
             )
+            if envs.ATOM_FORCE_BALANCE_FOR_BENCH:
+                # Balance across the ACTUAL routed-expert count for this model:
+                # the caller-supplied num_routing_experts, falling back to the
+                # router logit width (both are the routed count, never hardcoded).
+                n_experts = (
+                    num_routing_experts
+                    if num_routing_experts > 0
+                    else router_logits.shape[-1]
+                )
+                _force_balance_topk_ids_(topk_ids, top_k, n_experts)
             return topk_weights, topk_ids
 
         # DeekSeekv2 uses grouped_top_k
@@ -3464,6 +3671,15 @@ class FusedMoE(torch.nn.Module):
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"
                 )
 
+        if envs.ATOM_FORCE_BALANCE_FOR_BENCH:
+            # Balance across the ACTUAL routed-expert count for this model (the
+            # caller-supplied num_routing_experts, else the router logit width).
+            n_experts = (
+                num_routing_experts
+                if num_routing_experts > 0
+                else router_logits.shape[-1]
+            )
+            _force_balance_topk_ids_(topk_ids, top_k, n_experts)
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
