@@ -190,11 +190,15 @@ def dynamic_per_batched_tensor_quant(
 
 
 # =====================================================================
-# TEMP DEBUG (remove after measurement): MLA fp8-KV amax probe.
-# Answers: with the hardcoded scale=1.0, do the latent (k_nope), the rope
-# part (k_rope), or q ever exceed the e4m3fnuz max (240) and get clamped?
-# Enable with ATOM_DEBUG_MLA_AMAX=1 and run with --enforce-eager.
-# Per-rank running maxima are dumped to /tmp/mla_amax_pid<PID>.json.
+# Gated diagnostic: MLA fp8-KV amax probe. Records per-layer running maxima
+# of the pre-cast latent (k_nope), rope part (k_rope) and q, plus the fraction
+# above the fp8 max. Used to distinguish clamping (overflow) from subnormal
+# flush (underflow) in the fp8 KV path. Measurement on GLM-5.2 showed amax is
+# tiny vs the e4m3 max (kv_c ~0.02-5, k_pe ~13, q ~21 vs 448) with zero
+# clamping -> the loss is underflow, addressed by the per-layer KV-scale
+# calibration in MLAAttention._calibrate_kv_scale.
+# Enable with ATOM_DEBUG_MLA_AMAX=1 and run with --enforce-eager; per-rank
+# running maxima are dumped to /tmp/mla_amax_pid<PID>.json.
 # =====================================================================
 import os as _os_dbg  # noqa: E402
 import json as _json_dbg  # noqa: E402
@@ -292,8 +296,28 @@ class MLAAttention(nn.Module):
         self.kv_b_proj = mla_modules.kv_b_proj
         self.kv_cache = torch.tensor([])
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
-        self._k_scale = self.one_scale
         self._q_scale = self.one_scale
+        # MLA fp8 KV cache underflow fix. The packed kv_c latent + k_pe is cast
+        # to e4m3 with a single per-tensor scale. kv_c is RMS-normed and tiny
+        # (measured amax ~0.02 in early layers vs e4m3 max 448), so the legacy
+        # scale=1.0 raw cast drops it into the e4m3 subnormal / flush-to-zero
+        # band -> the up-projected K is corrupted -> reasoning accuracy loss
+        # (gsm8k ~0.925 vs bf16-kv ~0.94). The aiter MLA cache kernels only
+        # accept a scalar static scale (no per-token), so we calibrate a
+        # per-layer scale from the first real batch's amax and freeze it,
+        # mapping amax -> fp8_max/headroom so the tiny kv_c is lifted into the
+        # normal e4m3 band. Updated in place (copy_, no host sync) so a captured
+        # CUDA graph / eager split-op reads the new value on replay. The write
+        # (quant) and read (dequant) both use self._k_scale, so it stays
+        # consistent. NOTE: one scalar is shared by kv_c and k_pe (~500x
+        # magnitude gap in low layers); the complete fix is per-1x128 ue8m0
+        # block scale as the DSA indexer uses (needs an aiter MLA cache kernel).
+        if self.kv_cache_dtype == "fp8":
+            self._k_scale = torch.tensor(1.0, dtype=torch.float32)
+            self._kv_scale_calibrated = False
+        else:
+            self._k_scale = self.one_scale
+            self._kv_scale_calibrated = True
         # Derive sparsity from the model-level flag, not from whether THIS layer
         # owns an indexer: GLM-5.2 IndexShare "shared" layers have indexer=None
         # but must still run sparse MLA, reusing the prior "full" layer's top-k.
@@ -1174,6 +1198,27 @@ class MLAAttention(nn.Module):
 
         return self._v_up_proj_and_o_proj(o)
 
+    # Store the calibrated amax at fp8_max/headroom, leaving margin so batches
+    # with a larger amax than the calibration batch do not clamp.
+    _KV_SCALE_HEADROOM = 2.0
+
+    def _calibrate_kv_scale(self, k_nope: torch.Tensor, k_rope: torch.Tensor) -> None:
+        """One-shot per-layer calibration of the fp8 KV-cache scale.
+
+        The packed cache shares one scalar scale between kv_c (tiny) and k_pe,
+        so calibrate from their combined amax. Kept on-device (no .item()) so it
+        is safe if traced/captured; frozen after the first real batch so all
+        cached tokens use the same scale (write and read both read _k_scale).
+        """
+        amax = torch.maximum(
+            k_nope.detach().abs().amax(), k_rope.detach().abs().amax()
+        ).clamp(min=1e-6)
+        # stored = value / scale; map amax -> fp8_max/headroom to lift the tiny
+        # kv_c out of the e4m3 subnormal band while leaving clamp headroom.
+        scale = (amax * self._KV_SCALE_HEADROOM / _MLA_FP8_MAX).to(torch.float32)
+        self._k_scale.copy_(scale)
+        self._kv_scale_calibrated = True
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -1198,6 +1243,8 @@ class MLAAttention(nn.Module):
             return output
         if _MLA_AMAX_DEBUG:
             _mla_amax_probe(self.layer_num, k_nope, k_rope, q)
+        if not self._kv_scale_calibrated:
+            self._calibrate_kv_scale(k_nope, k_rope)
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
