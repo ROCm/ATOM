@@ -202,7 +202,12 @@ import json as _json_dbg  # noqa: E402
 _MLA_AMAX_DEBUG = _os_dbg.environ.get("ATOM_DEBUG_MLA_AMAX", "0") == "1"
 _MLA_AMAX_STATS: dict = {}
 _MLA_AMAX_STEP = [0]
-_MLA_FP8_MAX = 240.0  # e4m3fnuz max on gfx942/MI3xx
+# Real fp8 max for the KV cache format: e4m3fn=448 (gfx950/CDNA4),
+# e4m3fnuz=240 (gfx942/CDNA3). Derived from the actual aiter fp8 dtype.
+try:
+    _MLA_FP8_MAX = float(torch.finfo(dtypes.fp8).max)
+except Exception:
+    _MLA_FP8_MAX = 240.0
 
 
 def _mla_amax_probe(layer_num, k_nope, k_rope, q):
