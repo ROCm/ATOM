@@ -11,6 +11,7 @@ import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.utils.forward_context import get_forward_context
 from aiter import QuantType, dtypes
+from aiter.jit.utils.chip_info import get_cu_num
 
 try:
     import mori
@@ -160,11 +161,22 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         atom-vllm has no stable prefill/decode flag at this call site and
         instead selects by a token-count threshold; it overrides this method
         via a plugin patch, so keep this body frontend-agnostic.
+
+        block_num is capped at the device CU count: mori's IntraNode
+        dispatch/combine use a hand-rolled grid-wide barrier
+        (CrossDeviceBarrierIntraNodeKernel) that spins until *all* gridDim.x
+        blocks have arrived, which requires every block to be co-resident. The
+        combine block (1024 threads + larger dynamic smem) gets ~1 block/CU
+        occupancy, so launching more blocks than CUs (e.g. 128 on the 80-CU
+        MI308X) leaves the surplus blocks unscheduled -> the barrier never
+        completes -> warmup deadlocks. Capping at multi_processor_count keeps
+        big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
         """
+        mp = get_cu_num()
         context = get_forward_context().context
         if context.is_prefill:
-            return 128, 16
-        return 64, 4
+            return min(128, mp), 16
+        return min(64, mp), 4
 
     # ---- Synchronous (non-TBO) path ----
 

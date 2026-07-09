@@ -218,6 +218,33 @@ jobs:
                   json.dump(d, f, indent=2)
           "
 
+      - name: Validate benchmark result completeness
+        run: |
+          docker exec -i \
+            -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
+            atom-benchmark python3 - <<'PY'
+          import json, os, sys
+
+          path = os.environ["RESULT_PATH"]
+          with open(path, encoding="utf-8") as f:
+              data = json.load(f)
+
+          num_prompts = int(data.get("num_prompts"))
+          completed = int(data.get("completed"))
+          if completed != num_prompts:
+              print(
+                  f"::error::Invalid benchmark result in {path}: completed requests "
+                  f"({completed}) did not match num_prompts ({num_prompts}).",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(
+              f"Validated benchmark result {path}: completed requests "
+              f"{completed}/{num_prompts}."
+          )
+          PY
+
       - name: Copy profiler traces
         if: inputs.enable_profiler
         run: docker cp atom-benchmark:/app/trace ./profiler-traces 2>/dev/null || true

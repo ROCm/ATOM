@@ -127,6 +127,7 @@ ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_F
 ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
     envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
 )
+SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 _FP8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -172,6 +173,23 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
         getattr(config, "index_head_dim", None) == 128
         and getattr(config, "qk_rope_head_dim", None) == 64
     )
+
+
+def _is_neox_rope_style(
+    config: PretrainedConfig, interleave_attr: str, *, default_is_neox: bool
+) -> bool:
+    """Resolve ``is_neox_style`` from a model's ``*_interleave`` rope config flag.
+
+    neox and interleaved (GPT-J) are the two mutually-exclusive rope layouts, so
+    an interleave flag of True means ``is_neox_style=False``. A missing or null
+    flag falls back to ``default_is_neox`` — the layout of DeepSeek checkpoints
+    that predate the flag, which differs per rope instance (see call sites):
+    DeepSeek's main MLA rope is interleaved, but its V3.2 indexer rope is neox.
+    """
+    interleave = getattr(config, interleave_attr, None)
+    if interleave is None:
+        return default_is_neox
+    return not bool(interleave)
 
 
 def _can_fuse_indexer_wk_weights_proj(
@@ -724,6 +742,12 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
 
+    # NOTE: this fused path always calls aiter's *preshuffle* blockscale GEMMs,
+    # which require a 16x16-shuffled weight. fused_qkv_a_proj is flagged with
+    # needs_preshuffled_weight=True so the loader shuffles it once even under the
+    # non-preshuffle path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) -- see
+    # LinearBase.process_weights_after_loading.
+
     if hidden_states_quant_scale is None:
         if M <= 32:
             qkv_lora = gemm_a16w8_blockscale_preshuffle(
@@ -1216,28 +1240,69 @@ def sparse_attn_indexer(
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
         num_tokens = hidden_states.shape[0]
-        logits = fp8_mqa_logits(
-            Q=q_fp8[num_decode_tokens:num_tokens],
-            KV=k_fp8,
-            kv_scales=k_scale,
-            weights=weights[num_decode_tokens:num_tokens],
-            cu_starts=cu_seqlen_ks,
-            cu_ends=cu_seqlen_ke,
-        )
-
-        num_rows = logits.shape[0]
+        q_prefill = q_fp8[num_decode_tokens:num_tokens]
+        weights_prefill = weights[num_decode_tokens:num_tokens]
+        num_rows = q_prefill.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_prefill = topk_indices[num_decode_tokens:num_tokens, :topk_tokens]
-        top_k_per_row_prefill(
-            logits=logits,
-            rowStarts=cu_seqlen_ks,
-            rowEnds=cu_seqlen_ke,
-            indices=topk_indices_prefill,
-            values=None,
-            numRows=num_rows,
-            stride0=logits.stride(0),
-            stride1=logits.stride(1),
-        )
+        # The dense logits buffer is [num_rows, total_kv] fp32. total_kv is the
+        # sum of all co-scheduled prefill contexts and is unbounded by
+        # max_num_batched_tokens, so a burst of long-context requests can push a
+        # single allocation to tens of GiB (#1376). Under chunked prefill
+        # num_rows is already capped by max_num_batched_tokens, so the OOM is
+        # driven by total_kv (the column dim). Chunk along the Q (query-row)
+        # dimension with q_chunk sized so the buffer [q_chunk, total_kv] fp32
+        # stays within the memory budget — q_chunk shrinks as total_kv grows.
+        # Each chunk still scores the FULL KV, so every row's top-k is computed
+        # completely in one shot: the result is exact with no cross-chunk merge,
+        # the kernel's column indices are already global (no remapping), and each
+        # chunk writes straight into its output row slice (no copy). When the
+        # budget is disabled (0) or a single chunk fits, the loop runs exactly
+        # once and matches the original single-shot behavior.
+        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
+        if (
+            budget_bytes > 0
+            and total_kv > 0
+            and budget_bytes // (total_kv * 4) < num_rows
+        ):
+            # 4 bytes per fp32 logit; total_kv * 4 is one query row's footprint.
+            # Round the budget-derived row count DOWN to keep the buffer within
+            # budget: a multiple of 128 (aligned to the kernel's row tiling) in
+            # the normal regime, avoiding the coarse power-of-2 doubling. When
+            # the budget affords < 128 rows (extreme total_kv), fall back to a
+            # power-of-2 floor so it degrades to 64/32/.../1 instead of
+            # collapsing straight to 1.
+            budget_rows = budget_bytes // (total_kv * 4)
+            if budget_rows >= 128:
+                chunk_tokens = (budget_rows // 128) * 128
+            else:
+                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
+        else:
+            # Budget disabled, or a single chunk already fits all rows.
+            chunk_tokens = num_rows
+        for chunk_start in range(0, num_rows, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+            # Per-row window bounds slice 1:1 with this chunk's rows.
+            row_starts = cu_seqlen_ks[chunk_start:chunk_end]
+            row_ends = cu_seqlen_ke[chunk_start:chunk_end]
+            logits = fp8_mqa_logits(
+                Q=q_prefill[chunk_start:chunk_end],
+                KV=k_fp8,
+                kv_scales=k_scale,
+                weights=weights_prefill[chunk_start:chunk_end],
+                cu_starts=row_starts,
+                cu_ends=row_ends,
+            )
+            top_k_per_row_prefill(
+                logits=logits,
+                rowStarts=row_starts,
+                rowEnds=row_ends,
+                indices=topk_indices_prefill[chunk_start:chunk_end],
+                values=None,
+                numRows=chunk_end - chunk_start,
+                stride0=logits.stride(0),
+                stride1=logits.stride(1),
+            )
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
@@ -1745,6 +1810,11 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype=source_quant_dtype,
                 prefix=f"{prefix}.fused_qkv_a_proj",
             )
+            # The fused qkv_a_proj forward calls *preshuffle* blockscale GEMMs, so
+            # its weight must be 16x16-shuffled even when the global non-preshuffle
+            # path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) is selected. The loader
+            # honors this flag in LinearBase.process_weights_after_loading.
+            self.fused_qkv_a_proj.needs_preshuffled_weight = True
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -1822,7 +1892,11 @@ class DeepseekV2MLAAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=False,
+            # DeepSeek's main MLA rope is interleaved (is_neox_style=False) when
+            # unspecified; GLM-5.x sets rope_interleave=true, i.e. also interleaved.
+            is_neox_style=_is_neox_rope_style(
+                config, "rope_interleave", default_is_neox=False
+            ),
         )
         if rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
@@ -1841,7 +1915,12 @@ class DeepseekV2MLAAttention(nn.Module):
                 max_position=max_position_embeddings,
                 base=rope_theta,
                 rope_scaling=rope_scaling,
-                is_neox_style=True,
+                # DeepSeek-V3.2's indexer rope is neox (is_neox_style=True) when
+                # unspecified; GLM-5.x sets indexer_rope_interleave=true to override
+                # it to interleaved.
+                is_neox_style=_is_neox_rope_style(
+                    config, "indexer_rope_interleave", default_is_neox=True
+                ),
             )
             if _indexer_weights_shared(config, prefix):
                 # GLM-5.2 IndexShare: reuses prior "full" layer's indexer; the
@@ -1888,6 +1967,12 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_b_proj=self.kv_b_proj,
             o_proj=self.o_proj,
             indexer=self.indexer,
+            # v3.2 / GLM-5.2 runs sparse MLA on every layer. For GLM-5.2 IndexShare
+            # "shared" layers self.indexer is None, but they must still run sparse
+            # attention and reuse the prior full layer's top-k, so flag sparsity at
+            # the model level rather than per-layer.
+            is_sparse=self.is_v32,
+            topk_tokens=(config.index_topk if self.is_v32 else None),
         )
 
         self.mla_attn = Attention(
@@ -2035,6 +2120,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
+        self.quant_dtype = None
+        self.input_norm_quant_type = None
 
         self.self_attn = DeepseekV2MLAAttention(
             config=config,
@@ -2053,28 +2140,47 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
-        # Keep input RMSNorm quant fusion narrow: the legacy FP8/FP4 path uses
-        # Triton GEMM, while the non-Triton FP4 path is only enabled for the
-        # pure global MXFP4 DeepSeek v2 checkpoint layout.
+        # Keep input RMSNorm quant fusion narrow: non-Triton FP8 activation quant is only supported for per-token layouts.
+        # Block/group FP8 would hit aiter's dynamic_per_group_scaled_quant FP8 path, which is not implemented.
+        # The non-Triton FP4 path is only enabled for the pure global MXFP4 DeepSeek v2 checkpoint layout.
         # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
         #   1. RMS_Quant fusion is only used for input_layernorm
         #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
         #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm if ENABLE_ALLREDUCE_RMSNORM_FUSION is turned on
-        self.quant_dtype = (
-            None
-            if quant_config is None
-            else quant_config.get_layer_quant_config(prefix).quant_dtype
+        attn_input_proj_name = (
+            "fused_qkv_a_proj"
+            if getattr(config, "q_lora_rank", None) is not None
+            else "q_proj"
         )
-        self.input_norm_quant_type = (
-            None
-            if quant_config is None
-            else quant_config.get_layer_quant_config(prefix).quant_type.value
-        )
+        if quant_config is not None:
+            attn_input_layer_name = f"{prefix}.self_attn.{attn_input_proj_name}"
+            attn_input_quant_config = quant_config.get_layer_quant_config(
+                attn_input_layer_name
+            )
+
+            def uses_quantized_attn_input(layer_quant_config):
+                return (
+                    layer_quant_config.quant_type != QuantType.No
+                    and layer_quant_config.quant_dtype in (dtypes.fp8, dtypes.fp4x2)
+                )
+
+            if quant_config.online_quant and not uses_quantized_attn_input(
+                attn_input_quant_config
+            ):
+                attn_input_quant_config = quant_config.get_layer_quant_config(
+                    attn_input_layer_name,
+                    use_online_quant=True,
+                )
+
+            if uses_quantized_attn_input(attn_input_quant_config):
+                self.quant_dtype = attn_input_quant_config.quant_dtype
+                self.input_norm_quant_type = attn_input_quant_config.quant_type.value
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
-            enable_fp8_input_norm_quant = (
-                self.quant_dtype == dtypes.fp8 and use_triton_gemm()
+            enable_fp8_input_norm_quant = self.quant_dtype == dtypes.fp8 and (
+                use_triton_gemm()
+                or self.input_norm_quant_type == QuantType.per_Token.value
             )
             enable_fp4_input_norm_quant = self.quant_dtype == dtypes.fp4x2 and (
                 use_triton_gemm()

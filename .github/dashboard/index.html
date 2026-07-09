@@ -63,9 +63,11 @@
     h1 .h1-sub { color: var(--text-secondary); font-weight: 400; }
     .meta { font-size: 12px; color: var(--text-tertiary); margin-top: 2px; }
 
-    .filter-bar { display: flex; gap: var(--gap-sm); flex-wrap: wrap; align-items: center; }
+    .filter-bar { display: flex; gap: var(--gap-sm); flex-wrap: wrap; align-items: center; position: relative; }
     .filter-group { position: relative; }
     .filter-btn { background: var(--bg-secondary); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+    .filter-btn[data-filter="dashboard-mode"] { width: 116px; text-align: left; }
+    .dashboard-mode-group { position: absolute; right: calc(100% + var(--gap-sm)); top: 0; }
     .filter-btn:hover, .filter-btn.open { background: var(--bg-tertiary); color: var(--text-primary); }
     .filter-btn .count { background: var(--ui); color: #fff; border-radius: 10px; padding: 1px 6px; margin-left: 4px; font-size: 10px; }
     .filter-dropdown { display: none; position: absolute; top: 100%; left: 0; margin-top: 4px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 0; min-width: 200px; max-height: 300px; overflow-y: auto; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); right: auto; }
@@ -76,6 +78,7 @@
     .filter-dropdown input[type="checkbox"],
     .filter-dropdown input[type="radio"] { accent-color: var(--ui); }
     .filter-dropdown .sep { border-top: 1px solid var(--border); margin: 4px 0; }
+    .filter-summary { font-size: 11px; color: var(--text-tertiary); margin-left: 4px; white-space: nowrap; }
     .filter-reset { background: none; color: var(--text-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
     .filter-reset:hover { color: var(--text-secondary); background: var(--bg-tertiary); }
 
@@ -347,6 +350,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js" integrity="sha384-y49Zu59jZHJL/PLKgZPv3k2WI9c0Yp3pWB76V8OBVCb0QBKS8l4Ff3YslzHVX76Y" crossorigin="anonymous"></script>
 <script src="data.js"></script>
 <script src="models_map.js"></script>
+<script src="atomesh_summary.js"></script>
 <script>
 'use strict';
 (function() {
@@ -503,7 +507,82 @@ const REGRESSION_CRITICAL = 0.10;  // 10% → critical
 /* ================================================================
    2. DATA PARSING
    ================================================================ */
-const rawData = window.BENCHMARK_DATA;
+const rawData = window.BENCHMARK_DATA || {
+  lastUpdate: Date.now(),
+  repoUrl: 'https://github.com/ROCm/ATOM',
+  entries: {},
+};
+const DASHBOARD_MODES = ['Aggregated', 'Disaggregated'];
+const ATOMESH_DATA = {
+  updatedAt: Date.UTC(2026, 6, 3, 7, 9, 0),
+  backend: 'ATOMesh',
+  hardware: window.ATOMESH_HARDWARE || 'MI355X',
+  gpuCount: 16,
+  rocmVersion: '7.2.4',
+  dockerImage: 'rocm/atom-dev:nightly_202607030204',
+  runUrl: window.ATOMESH_RUN_URL || '',
+  summaryMarkdown: window.ATOMESH_SUMMARY_MARKDOWN || '',
+};
+
+function parseAtomeshNumber(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text || text === '--' || text === '—') return null;
+  const parsed = Number(text.replace(/,/g, ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function atomeshSummaryHeaderKey(header) {
+  return String(header || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function atomeshHardwareKey(value) {
+  const text = String(value || ATOMESH_DATA.hardware || '').toLowerCase();
+  if (text.includes('mi350')) return 'mi350x';
+  if (text.includes('mi355')) return 'mi355x';
+  return text || 'unknown';
+}
+
+function parseAtomeshSummaryRows(markdown) {
+  const lines = String(markdown || '').split(/\r?\n/).filter(line => line.trim().startsWith('|'));
+  if (lines.length < 3) return [];
+  const headers = lines[0].split('|').slice(1, -1).map(h => atomeshSummaryHeaderKey(h.trim()));
+  return lines.slice(2).map((line, idx) => {
+    const cells = line.split('|').slice(1, -1).map(cell => cell.trim());
+    const raw = {};
+    headers.forEach((header, i) => { raw[header] = cells[i] || ''; });
+    const [isl, osl] = String(raw.islosl || '').split('/');
+    const totalTputPerGpu = parseAtomeshNumber(raw.totaltoksgpu);
+    const outputTputPerGpu = parseAtomeshNumber(raw.outputtoksgpu);
+    const interactivity = parseAtomeshNumber(raw.interactivity);
+    return {
+      id: `atomesh-summary-${idx}`,
+      backend: ATOMESH_DATA.backend,
+      hardware: atomeshHardwareKey(raw.hardware),
+      model: raw.model || 'unknown',
+      topology: raw.topology || 'unknown',
+      islOsl: raw.islosl || '--',
+      isl: parseAtomeshNumber(isl),
+      osl: parseAtomeshNumber(osl),
+      concurrency: parseAtomeshNumber(raw.concurrency),
+      interactivity,
+      totalTput: parseAtomeshNumber(raw.totaltoks),
+      inputTput: parseAtomeshNumber(raw.inputtoks),
+      outputTput: parseAtomeshNumber(raw.outputtoks),
+      totalTputPerGpu,
+      inputTputPerGpu: parseAtomeshNumber(raw.inputtoksgpu),
+      outputTputPerGpu,
+      ttftMs: parseAtomeshNumber(raw.ttftms),
+      tpotMs: parseAtomeshNumber(raw.tpotms),
+      e2eMs: parseAtomeshNumber(raw.e2ems),
+      gsm8k: parseAtomeshNumber(raw.gsm8k),
+      gsm8kRaw: raw.gsm8k || '--',
+      runUrl: ATOMESH_DATA.runUrl,
+      status: Number.isFinite(interactivity) && Number.isFinite(totalTputPerGpu ?? outputTputPerGpu) ? 'completed' : 'incomplete',
+    };
+  }).filter(row => row.model !== 'unknown' || row.topology !== 'unknown');
+}
+const atomeshSummaryRows = parseAtomeshSummaryRows(ATOMESH_DATA.summaryMarkdown);
 
 // Normalize legacy model names using HF-path->display mapping from models_map.js
 const _displayMap = window.MODELS_DISPLAY_MAP || {};
@@ -554,6 +633,7 @@ const allRuns = Object.values(rawData.entries).flat().sort((a, b) => b.date - a.
 
 function hardwareFromGpuName(name) {
   const text = String(name || '').toLowerCase();
+  if (text.includes('mi350')) return 'mi350x';
   if (text.includes('mi355') || text.includes('mi35x')) return 'mi355x';
   if (text.includes('mi325')) return 'mi325x';
   if (text.includes('mi308')) return 'mi308x';
@@ -820,11 +900,11 @@ function buildAccuracyPreviewRows(preview) {
 
 // Extract unique filter values from ALL runs (not just latest) so historical models are always visible
 const _lc = (a, b) => { const la = a.toLowerCase(), lb = b.toLowerCase(); return la < lb ? -1 : la > lb ? 1 : 0; };
-const allBackends = [...new Set(Object.keys(historyMap).map(k => k.split('|')[0]))].sort(_lc);
-const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))].sort(_lc);
-const allIslOsl = [...new Set(Object.keys(historyMap).map(k => k.split('|')[2]))].sort();
-const allConc = [...new Set(Object.keys(historyMap).map(k => +k.split('|')[3]))].sort((a, b) => a - b);
-const allHardware = [...new Set(Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'))].sort(_lc);
+const allBackends = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[0]), ...atomeshSummaryRows.map(row => row.backend)])].sort(_lc);
+const allModels = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[1]), ...atomeshSummaryRows.map(row => row.model)])].sort(_lc);
+const allIslOsl = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[2]), ...atomeshSummaryRows.map(row => row.islOsl)])].sort();
+const allConc = [...new Set([...Object.keys(historyMap).map(k => +k.split('|')[3]), ...atomeshSummaryRows.map(row => row.concurrency)].filter(Number.isFinite))].sort((a, b) => a - b);
+const allHardware = [...new Set([...Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'), ...atomeshSummaryRows.map(row => row.hardware || 'unknown')])].sort(_lc);
 const defaultHardware = allHardware.includes('mi355x') ? 'mi355x' : (allHardware[0] || 'unknown');
 const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort(_lc);
 
@@ -838,6 +918,7 @@ const PERF_METRICS = [
   { key: 'TTFT',        label: 'TTFT',              unit: 'ms',    lower: true },
 ];
 const state = {
+  dashboardMode: 'Aggregated',
   filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [defaultHardware] },
   activeTab: 'performance',
   perfMetric: 'Total Tput',
@@ -857,6 +938,16 @@ function filteredConfigs() {
     out[key] = cfg;
   }
   return out;
+}
+
+function filteredAtomeshRows() {
+  return atomeshSummaryRows.filter(row => (
+    state.filters.backends.includes(row.backend)
+    && state.filters.models.includes(row.model)
+    && state.filters.islOsl.includes(row.islOsl)
+    && state.filters.conc.includes(row.concurrency)
+    && state.filters.hardware.includes(row.hardware || 'unknown')
+  ));
 }
 
 /* ================================================================
@@ -1125,6 +1216,10 @@ document.querySelector('.meta').appendChild(_headerGpuMeta);
 function updateHeaderGpuMeta() {
   const span = document.getElementById('header-gpu-meta');
   if (!span) return;
+  if (state.dashboardMode === 'Disaggregated') {
+    span.textContent = ` · ${fmtHardware(selectedHardware())} · ROCm ${ATOMESH_DATA.rocmVersion}`;
+    return;
+  }
   const entries = Object.values(filteredConfigs());
   if (!entries.length) { span.textContent = ''; return; }
 
@@ -1156,6 +1251,29 @@ function getFilterState(id) {
   return id === 'conc' ? state.filters.conc.map(String) : state.filters[id];
 }
 
+function appendDashboardModeSelector(bar) {
+  const group = document.createElement('div');
+  group.className = 'filter-group dashboard-mode-group';
+  group.innerHTML = `<button class="filter-btn" data-filter="dashboard-mode">${state.dashboardMode} ▾</button>
+    <div class="filter-dropdown" id="fd-dashboard-mode">
+      ${DASHBOARD_MODES.map(mode => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${mode}</label>`).join('')}
+    </div>`;
+  bar.appendChild(group);
+}
+
+function setDashboardMode(mode) {
+  if (!DASHBOARD_MODES.includes(mode) || state.dashboardMode === mode) return;
+  state.dashboardMode = mode;
+  if (mode === 'Disaggregated' && !['performance', 'accuracy'].includes(state.activeTab)) {
+    state.activeTab = 'performance';
+  }
+  renderFilters();
+  updateHeaderGpuMeta();
+  renderKPICards();
+  renderActiveTab();
+  syncToHash();
+}
+
 // Update only the button badge text — no DOM rebuild
 function updateFilterBadge(id) {
   const btn = document.querySelector(`.filter-btn[data-filter="${id}"]`);
@@ -1173,6 +1291,7 @@ function updateFilterBadge(id) {
 function renderFilters() {
   const bar = document.getElementById('filter-bar');
   bar.innerHTML = '';
+  appendDashboardModeSelector(bar);
   for (const d of filterDefs) {
     const sel = getFilterState(d.id);
     const allSelected = sel.length === d.options.length;
@@ -1197,8 +1316,12 @@ function renderFilters() {
   // Filter summary
   const allSelected = filterDefs.every(d => getFilterState(d.id).length === d.options.length);
   const summaryEl = document.createElement('span');
-  summaryEl.style.cssText = 'font-size:11px;color:var(--text-tertiary);margin-left:4px';
-  if (allSelected) {
+  summaryEl.className = 'filter-summary';
+  if (state.dashboardMode === 'Disaggregated') {
+    const rows = filteredAtomeshRows();
+    const completed = rows.filter(row => row.status === 'completed').length;
+    summaryEl.textContent = `${completed}/${rows.length} ATOMesh rows`;
+  } else if (allSelected) {
     summaryEl.textContent = 'Showing all';
   } else {
     const fc = filteredConfigs();
@@ -1237,6 +1360,10 @@ function renderFilters() {
   });
   bar.appendChild(copyLinkBtn);
 
+  bindFilterDropdownEvents(bar);
+}
+
+function bindFilterDropdownEvents(bar) {
   // Event: toggle dropdown (stopPropagation keeps it open)
   bar.querySelectorAll('.filter-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -1257,6 +1384,10 @@ function renderFilters() {
   bar.querySelectorAll('.filter-dropdown').forEach(dd => {
     dd.addEventListener('change', (e) => {
       const filterId = dd.id.replace('fd-', '');
+      if (filterId === 'dashboard-mode') {
+        if (e.target.type === 'radio') setDashboardMode(e.target.value);
+        return;
+      }
       if (filterId === 'hardware') {
         if (e.target.type !== 'radio') return;
         state.filters.hardware = [e.target.value];
@@ -1299,7 +1430,30 @@ document.addEventListener('click', closeAllDropdowns);
 /* ================================================================
    7. KPI CARDS
    ================================================================ */
+function updateDashboardTabs() {
+  const allowedTabs = state.dashboardMode === 'Disaggregated'
+    ? ['performance', 'accuracy']
+    : ['performance', 'tradeoff', 'trends', 'data', 'accuracy'];
+  if (!allowedTabs.includes(state.activeTab)) state.activeTab = 'performance';
+  document.querySelectorAll('#tabs-nav .tab').forEach(tab => {
+    const tabName = tab.dataset.tab;
+    tab.style.display = allowedTabs.includes(tabName) ? '' : 'none';
+    if (tabName === 'performance' && tab.firstChild) {
+      tab.firstChild.nodeValue = state.dashboardMode === 'Disaggregated'
+        ? 'Token Throughput per GPU vs. Interactivity'
+        : 'Performance';
+    }
+  });
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === state.activeTab));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-' + state.activeTab));
+}
+
 function renderKPICards() {
+  updateDashboardTabs();
+  if (state.dashboardMode === 'Disaggregated') {
+    renderAtomeshKPICards();
+    return;
+  }
   const fc = filteredConfigs();
   const entries = Object.entries(fc);
   const row = document.getElementById('kpi-row');
@@ -1492,6 +1646,13 @@ document.getElementById('tabs-nav').addEventListener('click', (e) => {
 });
 
 function renderActiveTab() {
+  updateDashboardTabs();
+  if (state.dashboardMode === 'Disaggregated') {
+    if (state.activeTab === 'accuracy') renderAtomeshAccuracyTab();
+    else renderAtomeshPerformanceTab();
+    syncHeaderH();
+    return;
+  }
   switch (state.activeTab) {
     case 'performance': renderPerformanceTab(); break;
     case 'tradeoff': renderTradeoffTab(); break;
@@ -2634,6 +2795,7 @@ document.addEventListener('keydown', (e) => {
 let hashUpdateFromCode = false;
 function syncToHash() {
   const parts = [];
+  if (state.dashboardMode !== 'Aggregated') parts.push('mode=' + state.dashboardMode);
   if (state.filters.backends.length !== allBackends.length) parts.push('backend=' + state.filters.backends.join(','));
   if (state.filters.models.length !== allModels.length) parts.push('model=' + state.filters.models.join(','));
   if (state.filters.islOsl.length !== allIslOsl.length) parts.push('isl=' + state.filters.islOsl.join(','));
@@ -2650,6 +2812,7 @@ function readFromHash() {
   for (const part of hash.split('&')) {
     const [k, v] = part.split('=');
     if (!v) continue;
+    if (k === 'mode' && DASHBOARD_MODES.includes(v)) state.dashboardMode = v;
     if (k === 'backend') state.filters.backends = v.split(',').filter(b => allBackends.includes(b));
     if (k === 'model') state.filters.models = v.split(',').filter(m => allModels.includes(m));
     if (k === 'isl') state.filters.islOsl = v.split(',').filter(i => allIslOsl.includes(i));
@@ -3050,8 +3213,244 @@ function renderMtpAcceptanceMiniChart(key) {
   });
 }
 
+/* ================================================================
+   17. ATOMESH DISAGGREGATED DASHBOARD
+   ================================================================ */
+let _atomeshRowsCache = null;
+function atomeshNumber(value) {
+  return parseAtomeshNumber(value);
+}
+
+function atomeshHeaderKey(header) {
+  return atomeshSummaryHeaderKey(header);
+}
+
+function atomeshParseSummaryMarkdown(markdown) {
+  return parseAtomeshSummaryRows(markdown);
+}
+
+function atomeshRows() {
+  if (!_atomeshRowsCache) _atomeshRowsCache = atomeshSummaryRows;
+  return _atomeshRowsCache;
+}
+
+function atomeshCompletedCases() {
+  return filteredAtomeshRows().filter(c => c.status === 'completed' && Number.isFinite(c.interactivity) && Number.isFinite(c.totalTputPerGpu));
+}
+
+function atomeshPrimaryModel() {
+  return filteredAtomeshRows()[0]?.model || 'ATOMesh';
+}
+
+function atomeshPrimaryTopology() {
+  return filteredAtomeshRows()[0]?.topology || 'unknown';
+}
+
+function atomeshCaseStatus(row) {
+  return row.status === 'completed'
+    ? '<span class="trend-up">completed</span>'
+    : '<span class="trend-neutral">incomplete</span>';
+}
+
+function atomeshRunCell(row) {
+  const href = safeHref(row.runUrl || ATOMESH_DATA.runUrl);
+  return href ? `<a href="${escHTML(href)}" target="_blank" rel="noopener noreferrer">view</a>` : '—';
+}
+
+function renderAtomeshKPICards() {
+  const row = document.getElementById('kpi-row');
+  const totalRows = atomeshRows();
+  const rows = filteredAtomeshRows();
+  const completed = atomeshCompletedCases();
+  const best = completed.reduce((max, c) => !max || c.totalTputPerGpu > max.totalTputPerGpu ? c : max, null);
+  const bestInteractivity = completed.reduce((max, c) => !max || c.interactivity > max.interactivity ? c : max, null);
+  const acc = rows.find(c => c.gsm8k != null);
+  row.innerHTML = `
+    <div class="kpi-group">
+      <div class="kpi-card">
+        <div class="kpi-label">Peak Token Throughput / GPU</div>
+        <div class="kpi-value">${best ? fmtNum(best.totalTputPerGpu, 2) : '—'} <span class="kpi-unit">tok/s/gpu</span></div>
+        <div class="kpi-sub">${best ? `${best.model} ${best.islOsl} c=${best.concurrency}` : ''}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Best Interactivity</div>
+        <div class="kpi-value">${bestInteractivity ? fmtNum(bestInteractivity.interactivity, 2) : '—'} <span class="kpi-unit">tok/s/user</span></div>
+        <div class="kpi-sub">${bestInteractivity?.tpotMs ? `${fmtNum(bestInteractivity.tpotMs, 2)} ms TPOT` : ''}</div>
+      </div>
+    </div>
+    <div class="kpi-group">
+      <div class="kpi-card">
+        <div class="kpi-label">Markdown Rows</div>
+        <div class="kpi-value">${completed.length}/${rows.length} <span class="kpi-unit">cases</span></div>
+        <div class="kpi-sub">${rows.length === totalRows.length ? 'All ATOMesh rows' : `${rows.length}/${totalRows.length} selected`}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Hardware</div>
+        <div class="kpi-value">${ATOMESH_DATA.gpuCount} <span class="kpi-unit">GPUs</span></div>
+        <div class="kpi-sub">${fmtHardware(selectedHardware())} · ROCm ${ATOMESH_DATA.rocmVersion}</div>
+      </div>
+      <div class="kpi-card clickable" id="atomesh-acc-card" title="Click to view accuracy">
+        <div class="kpi-label">Accuracy</div>
+        <div class="kpi-value">${acc ? (acc.gsm8k * 100).toFixed(1) : '—'} <span class="kpi-unit">${acc ? '%' : ''}</span></div>
+        <div class="kpi-sub">${acc ? `GSM8K · c=${acc.concurrency}` : 'No GSM8K markdown value'}</div>
+      </div>
+    </div>`;
+  const accCard = document.getElementById('atomesh-acc-card');
+  if (accCard) {
+    accCard.addEventListener('click', () => {
+      state.activeTab = 'accuracy';
+      renderActiveTab();
+      syncToHash();
+    });
+  }
+}
+
+function renderAtomeshPerformanceTab() {
+  const container = document.getElementById('tab-performance');
+  destroyChartsIn(container);
+  const rows = filteredAtomeshRows().sort((a, b) => _lc(a.model, b.model) || _lc(a.topology, b.topology) || (a.concurrency || 0) - (b.concurrency || 0));
+  const completed = atomeshCompletedCases().sort((a, b) => a.concurrency - b.concurrency);
+  if (!completed.length) {
+    container.innerHTML = '<div class="chart-empty">No completed ATOMesh performance row matches the current filters.</div>';
+    return;
+  }
+  const groups = {};
+  for (const c of completed) {
+    const key = `${c.model}|${c.topology}|${c.islOsl}`;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(c);
+  }
+  const datasets = Object.values(groups).map(groupRows => {
+    groupRows.sort((a, b) => a.concurrency - b.concurrency);
+    const first = groupRows[0];
+    const color = getModelColor(ATOMESH_DATA.backend, first.model);
+    return {
+      label: `${first.model} ${first.topology} ${first.islOsl}`,
+      data: groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c })),
+      borderColor: color.border,
+      backgroundColor: color.bg,
+      borderWidth: 2,
+      pointRadius: 6,
+      pointHoverRadius: 8,
+      showLine: groupRows.length > 1,
+    };
+  });
+
+  let html = `<div class="section-container"><div class="section-header">
+    <span class="section-title">ATOMesh Token Throughput per GPU vs. Interactivity</span>
+    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">${completed.length}/${atomeshRows().length} selected rows · source: atomesh-benchmark-summary.md</span>
+  </div>
+  <div class="chart-card hero"><h3>${ATOMESH_DATA.backend} · ${datasets.length} selected series</h3><div class="chart-wrap"><canvas id="atomesh-tradeoff"></canvas></div></div></div>`;
+
+  html += `<div class="section-container"><div class="section-header"><span class="section-title">Detail Table</span></div>
+  <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
+    <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
+    <th class="num">Interactivity</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
+    <th class="num">Total tok/s/GPU</th><th class="num">Input tok/s/GPU</th><th class="num">Output tok/s/GPU</th>
+    <th class="num">TTFT ms</th><th class="num">TPOT ms</th><th class="num">E2E ms</th><th class="num">GSM8K</th><th>Run</th>
+  </tr></thead><tbody>`;
+  for (const c of rows) {
+    html += `<tr>
+      <td style="white-space:nowrap;font-weight:600">${escHTML(ATOMESH_DATA.backend)}</td>
+      <td class="model-name" style="color:${getModelColor(ATOMESH_DATA.backend, c.model).text}">${escHTML(c.model)}</td>
+      <td>${escHTML(c.topology)}</td>
+      <td>${escHTML(c.islOsl)}</td>
+      <td class="num">${c.concurrency}</td>
+      <td class="num">${c.interactivity != null ? fmtNum(c.interactivity, 2) : '—'}</td>
+      <td class="num">${c.totalTput != null ? fmtNum(c.totalTput, 2) : '—'}</td>
+      <td class="num">${c.inputTput != null ? fmtNum(c.inputTput, 2) : '—'}</td>
+      <td class="num">${c.outputTput != null ? fmtNum(c.outputTput, 2) : '—'}</td>
+      <td class="num">${c.totalTputPerGpu != null ? fmtNum(c.totalTputPerGpu, 2) : '—'}</td>
+      <td class="num">${c.inputTputPerGpu != null ? fmtNum(c.inputTputPerGpu, 2) : '—'}</td>
+      <td class="num">${c.outputTputPerGpu != null ? fmtNum(c.outputTputPerGpu, 2) : '—'}</td>
+      <td class="num">${c.ttftMs != null ? fmtNum(c.ttftMs, 2) : '—'}</td>
+      <td class="num">${c.tpotMs != null ? fmtNum(c.tpotMs, 2) : '—'}</td>
+      <td class="num">${c.e2eMs != null ? fmtNum(c.e2eMs, 2) : '—'}</td>
+      <td class="num">${escHTML(c.gsm8kRaw || '—')}</td>
+      <td>${atomeshRunCell(c)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div></div></div>';
+  container.innerHTML = html;
+
+  new Chart(document.getElementById('atomesh-tradeoff'), {
+    type: 'scatter',
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { top: 8, right: 16 } },
+      plugins: {
+        legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
+        tooltip: { ...chartTooltipOpts(), callbacks: {
+          title: items => {
+            const c = items[0].raw.row;
+            return `${c.model} ${c.topology} ${c.islOsl} · c=${c.concurrency}`;
+          },
+          label: item => [
+            ` Interactivity: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
+            ` Total tok/s/GPU: ${fmtNum(item.parsed.y, 2)}`,
+            ` GSM8K: ${item.raw.row.gsm8kRaw || '—'}`,
+          ],
+        }},
+        datalabels: { display: true, color: C_LEGEND, align: 'top', formatter: value => 'c' + value.row.concurrency },
+      },
+      scales: {
+        x: { grid: chartGridOpts(), title: { display: true, text: 'Interactivity (tok/s/user)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+        y: { grid: chartGridOpts(), title: { display: true, text: 'Token Throughput per GPU (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+      },
+    },
+  });
+  syncHeaderH();
+  bindFixedThead(container);
+}
+
+function renderAtomeshAccuracyTab() {
+  const container = document.getElementById('tab-accuracy');
+  destroyChartsIn(container);
+  const rows = filteredAtomeshRows().filter(c => c.gsm8k != null);
+  if (!rows.length) {
+    container.innerHTML = '<div class="chart-empty">No GSM8K row matches the current ATOMesh filters.</div>';
+    return;
+  }
+  let html = `<div class="section-container"><div class="section-header">
+    <span class="section-title">ATOMesh Accuracy (GSM8K)</span>
+    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">source: atomesh-benchmark-summary.md</span>
+  </div>
+  <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
+    <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
+    <th class="num">Flexible-Extract</th><th class="num">Strict-Match</th><th class="num">Baseline</th>
+    <th class="num">Recovery</th><th class="num">Threshold</th><th class="num">Margin</th>
+    <th class="num">Trend</th><th class="num">Fewshot</th><th>Last Tested</th><th>Run</th>
+  </tr></thead><tbody>`;
+  for (const c of rows) {
+    html += `<tr>
+      <td style="white-space:nowrap;font-weight:600">${escHTML(ATOMESH_DATA.backend)}</td>
+      <td class="model-name" style="color:${getModelColor(ATOMESH_DATA.backend, c.model).text}">${escHTML(c.model)}</td>
+      <td>${escHTML(c.topology)}</td>
+      <td>${escHTML(c.islOsl)}</td>
+      <td class="num">${c.concurrency}</td>
+      <td class="num"><strong>${escHTML(c.gsm8kRaw || '—')}</strong></td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td>${fmtDate(ATOMESH_DATA.updatedAt)}</td>
+      <td>${atomeshRunCell(c)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div></div></div>';
+  container.innerHTML = html;
+  syncHeaderH();
+  bindFixedThead(container);
+}
+
 // Re-render everything (used by theme toggle)
 function renderAll() {
+  updateDashboardTabs();
   updateHeaderGpuMeta();
   renderKPICards();
   renderActiveTab();

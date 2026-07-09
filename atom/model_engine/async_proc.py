@@ -32,6 +32,7 @@ from atom.utils import (
     init_exit_handler,
     make_zmq_socket,
     resolve_obj_by_qualname,
+    set_process_title,
     shutdown_all_processes,
 )
 from atom.utils.numa_utils import numa_bind_to_node
@@ -71,6 +72,17 @@ class AsyncIOProc:
         *args,
         **kwargs,
     ):
+        # Bind this worker's lifetime to its parent EngineCore: if the parent
+        # exits for any reason, have the kernel reap this process immediately
+        # instead of leaving it orphaned. A ModelRunner worker holds a large GPU
+        # allocation and the custom all-reduce IPC resources; an orphan blocks
+        # forever in busy_loop() on the shm dequeue while keeping those pinned,
+        # causing the stale-IPC all-reduce crash on the next restart. Must be
+        # armed here, before any GPU / IPC state is created.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
+
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by
         # ATOM_NUMA_BIND. Must run before any large allocation / native
@@ -86,6 +98,16 @@ class AsyncIOProc:
         except Exception as e:
             logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
+        # Set process title so this GPU worker is distinguishable by rank in
+        # ps/top/rocm-smi (otherwise all workers show as "python").
+        try:
+            cfg = args[0]
+            if cfg.parallel_config.data_parallel_size > 1:
+                set_process_title(f"DP{cfg.parallel_config.data_parallel_rank}TP{rank}")
+            else:
+                set_process_title(f"TP{rank}")
+        except Exception:
+            set_process_title(f"TP{rank}")
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads: list[threading.Thread] = []

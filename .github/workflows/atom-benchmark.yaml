@@ -6,24 +6,20 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 01:00 Beijing time (17:00 UTC)
-    - cron: '0 17 * * *'
+    # Nightly at 00:12 Beijing time (16:12 UTC)
+    - cron: '12 16 * * *'
   workflow_dispatch:
     inputs:
-      deepseek-r1-0528:
-        description: "Benchmark DeepSeek-R1-0528 (+ MTP3)"
-        type: boolean
-        default: true
       deepseek-v4-pro:
         description: "Benchmark DeepSeek-V4-Pro"
         type: boolean
         default: true
-      glm-5.1-fp4:
-        description: "Benchmark GLM-5.1-MXFP4"
-        type: boolean
-        default: true
       glm-5-2-fp8:
         description: "Benchmark GLM-5.2-FP8"
+        type: boolean
+        default: true
+      glm-5-2-mxfp4:
+        description: "Benchmark GLM-5.2-MXFP4 (+ MTP3)"
         type: boolean
         default: true
       deepseek-r1-0528-mxfp4:
@@ -34,8 +30,8 @@ on:
         description: "Benchmark gpt-oss-120b"
         type: boolean
         default: true
-      kimi-k25-mxfp4:
-        description: "Benchmark Kimi-K2.5-MXFP4"
+      kimi-k27-code-mxfp4:
+        description: "Benchmark Kimi-K2.7-Code-MXFP4"
         type: boolean
         default: true
       m3-mxfp8:

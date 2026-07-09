@@ -26,6 +26,8 @@ on:
         options:
           - "none (do not run SGLang-OOB models)"
           - "deepseek-v4-pro-tp8 (1024x1024/8192x1024: [4,8,16,32,64,128,256])"
+          - "deepseek-v4-pro-mtp1-tp8 (1024x1024/8192x1024: [4,8,16,32,64,128,256])"
+          - "deepseek-v4-pro-mtp3-tp8 (1024x1024/8192x1024: [4,8,16,32,64,128,256])"
           - "deepseek-v4-pro-prefix-cache-tp8 (1024x1024/8192x1024: [4,8,16,32,64,128,256])"
           - "deepseek-r1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
@@ -50,14 +52,14 @@ on:
           - "qwen3-32b-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-v3-2-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "glm-5-1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
-          - "all-deepseek (17 DeepSeek configs)"
+          - "all-deepseek (19 DeepSeek configs)"
           - "all-deepseek-non-mtp (13 DeepSeek non-MTP configs)"
-          - "all-deepseek-mtp (4 DeepSeek MTP configs x 10 default params)"
+          - "all-deepseek-mtp (6 DeepSeek MTP configs x 10 default params)"
           - "all-deepseek-v3-2 (4 DeepSeek-V3.2 FP8 OOB configs x 10 default params)"
           - "all-deepseek-v3-2_glm_qwen (DeepSeek-V3.2 + GLM + Qwen OOB configs x 10 default params)"
           - "all-qwen (7 Qwen configs x 10 default params)"
           - "all-glm (1 GLM config x 10 default params)"
-          - "all-oob (25 SGLang-OOB configs x 10 default params)"
+          - "all-oob (27 SGLang-OOB configs x 10 default params)"
         default: "none (do not run SGLang-OOB models)"
       mesh_config_preset:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
@@ -111,8 +113,214 @@ on:
         default: ""
 
 jobs:
+  wait-for-scheduled-sglang-image:
+    name: Wait for scheduled SGLang Docker image
+    runs-on: ubuntu-latest
+    outputs:
+      scheduled_sglang_image: ${{ steps.wait.outputs.scheduled_sglang_image }}
+      scheduled_sglang_tag: ${{ steps.wait.outputs.scheduled_sglang_tag }}
+      scheduled_sglang_digest: ${{ steps.wait.outputs.scheduled_sglang_digest }}
+      scheduled_sglang_resolution: ${{ steps.wait.outputs.scheduled_sglang_resolution }}
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v6
+
+      - name: Wait for today's SGLang nightly tag
+        id: wait
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          WAIT_FOR_SGLANG_IMAGE: ${{ github.event_name == 'schedule' && github.ref_name == 'main' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${WAIT_FOR_SGLANG_IMAGE}" != "true" ]]; then
+            echo "Not a scheduled main run; skipping SGLang nightly image wait."
+            {
+              echo "scheduled_sglang_image="
+              echo "scheduled_sglang_tag="
+              echo "scheduled_sglang_digest="
+              echo "scheduled_sglang_resolution="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote, urlencode
+          from urllib.parse import urljoin
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+
+          repository = "rocm/atom-dev"
+          auth_url = "https://auth.docker.io/token"
+          registry_url = "https://registry-1.docker.io"
+          manifest_accept = ", ".join(
+              (
+                  "application/vnd.oci.image.index.v1+json",
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+              )
+          )
+
+          text = Path(".github/workflows/docker-release.yaml").read_text(encoding="utf-8")
+          version_match = re.search(r'^\s*SGLANG_VERSION:\s*"([^"]+)"', text, re.MULTILINE)
+          if not version_match:
+              raise SystemExit("Failed to read SGLANG_VERSION from .github/workflows/docker-release.yaml")
+
+          today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+          version = version_match.group(1)
+          tag = f"sglang-v{version}-nightly_{today}"
+          nightly_pattern = re.compile(r"^sglang-v(?P<version>.+)-nightly_(?P<date>\d{8})$")
+
+          def request(url, *, headers=None):
+              req = Request(url, headers=headers or {})
+              with urlopen(req, timeout=30) as response:
+                  return response.read(), response.headers
+
+          def get_token():
+              query = urlencode(
+                  {
+                      "service": "registry.docker.io",
+                      "scope": f"repository:{repository}:pull",
+                  }
+              )
+              headers = {"User-Agent": "ATOM SGLang Benchmark Image Gate/1.0"}
+              username = os.environ.get("DOCKER_USERNAME")
+              password = os.environ.get("DOCKER_PASSWORD")
+              if username and password:
+                  creds = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+                  headers["Authorization"] = f"Basic {creds}"
+              body, _ = request(f"{auth_url}?{query}", headers=headers)
+              token = json.loads(body.decode("utf-8")).get("token")
+              if not token:
+                  raise RuntimeError(f"Registry token response did not include a token for {repository}")
+              return token
+
+          def get_digest(token, image_tag):
+              manifest_url = f"{registry_url}/v2/{repository}/manifests/{quote(image_tag, safe='')}"
+              _, headers = request(
+                  manifest_url,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": manifest_accept,
+                      "User-Agent": "ATOM SGLang Benchmark Image Gate/1.0",
+                  },
+              )
+              digest = headers.get("Docker-Content-Digest") or headers.get("docker-content-digest")
+              if not digest:
+                  raise RuntimeError(f"Registry did not return Docker-Content-Digest for {repository}:{image_tag}")
+              return str(digest).strip()
+
+          def next_page_url(base_url, link_header):
+              if not link_header:
+                  return None
+              for part in link_header.split(","):
+                  match = re.match(r'\s*<([^>]+)>\s*;\s*rel="next"\s*', part)
+                  if match:
+                      return urljoin(base_url, match.group(1))
+              return None
+
+          def list_tags(token):
+              tags = []
+              url = f"{registry_url}/v2/{repository}/tags/list?n=1000"
+              while url:
+                  body, headers = request(
+                      url,
+                      headers={
+                          "Authorization": f"Bearer {token}",
+                          "User-Agent": "ATOM SGLang Benchmark Image Gate/1.0",
+                      },
+                  )
+                  payload = json.loads(body.decode("utf-8"))
+                  tags.extend(payload.get("tags") or [])
+                  url = next_page_url(url, headers.get("Link"))
+              return tags
+
+          def latest_recent_nightly_tag(token):
+              candidates = []
+              for candidate in list_tags(token):
+                  match = nightly_pattern.match(candidate)
+                  if not match:
+                      continue
+                  candidates.append(
+                      (
+                          match.group("date"),
+                          1 if match.group("version") == version else 0,
+                          candidate,
+                      )
+                  )
+              if not candidates:
+                  raise RuntimeError(f"No SGLang nightly tags were found in {repository}")
+              return max(candidates)[2]
+
+          def write_selected_image(image_tag, digest, resolution):
+              image = f"{repository}:{image_tag}@{digest}"
+              output_path = os.environ["GITHUB_OUTPUT"]
+              with open(output_path, "a", encoding="utf-8") as fh:
+                  fh.write(f"scheduled_sglang_image={image}\n")
+                  fh.write(f"scheduled_sglang_tag={image_tag}\n")
+                  fh.write(f"scheduled_sglang_digest={digest}\n")
+                  fh.write(f"scheduled_sglang_resolution={resolution}\n")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+                  fh.write("### Scheduled SGLang image\n")
+                  fh.write(f"- Image: `{image}`\n")
+                  fh.write(f"- Tag: `{image_tag}`\n")
+                  fh.write(f"- Digest: `{digest}`\n")
+                  fh.write(f"- Resolution: `{resolution}`\n")
+              return image
+
+          token = get_token()
+          timeout_seconds = 2 * 60 * 60
+          interval_seconds = 5 * 60
+          deadline = time.monotonic() + timeout_seconds
+          last_error = ""
+
+          print(f"Waiting up to {timeout_seconds // 60} minutes for {repository}:{tag}")
+          while True:
+              try:
+                  digest = get_digest(token, tag)
+                  image = write_selected_image(tag, digest, "scheduled-nightly-tag")
+                  print(f"Found scheduled SGLang image: {image}")
+                  break
+              except HTTPError as exc:
+                  last_error = f"HTTP {exc.code}"
+                  if exc.code in (401, 403):
+                      token = get_token()
+                  elif exc.code != 404:
+                      print(f"Warning: failed to check {repository}:{tag}: {last_error}", file=sys.stderr)
+              except (RuntimeError, URLError) as exc:
+                  last_error = str(exc)
+                  print(f"Warning: failed to check {repository}:{tag}: {last_error}", file=sys.stderr)
+
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  print(
+                      f"Timed out waiting for scheduled SGLang image {repository}:{tag}. "
+                      f"Falling back to the latest recent SGLang nightly tag. Last error: {last_error or 'not found'}"
+                  )
+                  fallback_tag = latest_recent_nightly_tag(token)
+                  digest = get_digest(token, fallback_tag)
+                  image = write_selected_image(fallback_tag, digest, "recent-nightly-tag")
+                  print(f"Using latest recent SGLang image: {image}")
+                  break
+              sleep_for = min(interval_seconds, remaining)
+              print(f"{repository}:{tag} is not available yet; retrying in {int(sleep_for)} seconds.")
+              time.sleep(sleep_for)
+          PY
+
   resolve-atom-source:
     name: Resolve ATOM benchmark source
+    needs: [wait-for-scheduled-sglang-image]
     runs-on: ubuntu-latest
     outputs:
       atom_repository: ${{ steps.resolve.outputs.atom_repository }}
@@ -141,6 +349,10 @@ jobs:
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
           INPUT_WORKLOAD_LABEL: ${{ inputs.benchmark_suite || 'SGLang-OOB' }}
           SCHEDULE_CRON: ${{ github.event.schedule || '' }}
+          SCHEDULED_SGLANG_IMAGE: ${{ needs.wait-for-scheduled-sglang-image.outputs.scheduled_sglang_image }}
+          SCHEDULED_SGLANG_TAG: ${{ needs.wait-for-scheduled-sglang-image.outputs.scheduled_sglang_tag }}
+          SCHEDULED_SGLANG_DIGEST: ${{ needs.wait-for-scheduled-sglang-image.outputs.scheduled_sglang_digest }}
+          SCHEDULED_SGLANG_RESOLUTION: ${{ needs.wait-for-scheduled-sglang-image.outputs.scheduled_sglang_resolution }}
         run: |
           set -euo pipefail
 
@@ -163,6 +375,13 @@ jobs:
             PREBUILT_SGLANG_IMAGE="${INPUT_DOCKER_IMAGE}"
             SGLANG_IMAGE_SOURCE="user-provided"
             USER_PROVIDED_SGLANG_IMAGE=true
+          elif [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${NORMALIZED_REF}" == "main" && -n "${SCHEDULED_SGLANG_IMAGE}" ]]; then
+            PREBUILT_SGLANG_IMAGE="${SCHEDULED_SGLANG_IMAGE}"
+            SGLANG_IMAGE_SOURCE="prebuilt-scheduled-nightly"
+            RESOLVED_PREBUILT_ALIAS="rocm/atom-dev:${SCHEDULED_SGLANG_TAG}"
+            RESOLVED_PREBUILT_DIGEST="${SCHEDULED_SGLANG_DIGEST}"
+            PREBUILT_RESOLUTION_TYPE="${SCHEDULED_SGLANG_RESOLUTION:-scheduled-nightly-tag}"
+            RESOLVED_NIGHTLY_TAG="${SCHEDULED_SGLANG_TAG}"
           elif [[ "${NORMALIZED_REF}" == "main" ]]; then
             PREBUILT_SGLANG_IMAGE="rocm/atom-dev:sglang-latest"
             SGLANG_IMAGE_SOURCE="prebuilt"
@@ -309,6 +528,16 @@ jobs:
               reverse-lookup-failed-digest-pinned-latest)
                 printf -- '- Resolution: reverse lookup could not complete, so this run pins `sglang-latest` to its current digest instead of falling back to the floating tag.\n' \
                   >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              scheduled-nightly-tag)
+                printf -- '- Resolution: scheduled run waited for today'\''s nightly tag `%s` and pinned it to digest `%s`.\n' \
+                  "${RESOLVED_NIGHTLY_TAG}" \
+                  "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              recent-nightly-tag)
+                printf -- '- Resolution: today'\''s nightly tag was not available before the wait timeout, so this run uses the latest recent SGLang nightly tag `%s` pinned to digest `%s`.\n' \
+                  "${RESOLVED_NIGHTLY_TAG}" \
+                  "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
                 ;;
               resolution-failed)
                 printf -- '- Resolution: digest pinning itself failed, so this run falls back to floating `sglang-latest`.\n' \
@@ -481,7 +710,12 @@ jobs:
                   return prefix.startswith("glm")
               return prefix == preset
 
-          OOB_P0_PREFIX_ORDER = ["glm-5-1-fp8-tp8"]
+          OOB_P0_PREFIX_ORDER = [
+              "deepseek-v4-pro-tp8",
+              "deepseek-v4-pro-mtp1-tp8",
+              "deepseek-v4-pro-mtp3-tp8",
+              "glm-5-1-fp8-tp8",
+          ]
           OOB_P1_PREFIX_ORDER = [
               "deepseek-v3-2-fp8-tp4",
               "deepseek-v3-2-fp8-tp4-dp4-ep4",

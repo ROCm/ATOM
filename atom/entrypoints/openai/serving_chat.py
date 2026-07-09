@@ -74,6 +74,7 @@ async def stream_chat_response(
     """
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
+    num_cached_tokens = 0
     reasoning_filter = ReasoningFilter()
     tool_parser = ToolCallStreamParser(tools=tools)
     has_tool_calls = False
@@ -87,6 +88,9 @@ async def stream_chat_response(
         chunk_data = await stream_queue.get()
         new_text = chunk_data["text"]
         num_tokens_output += len(chunk_data.get("token_ids", []))
+        _ct = chunk_data.get("num_cached_tokens", 0)
+        if _ct:
+            num_cached_tokens = _ct
 
         if "kv_transfer_params" in chunk_data:
             kv_transfer_params_value = chunk_data["kv_transfer_params"]
@@ -149,6 +153,7 @@ async def stream_chat_response(
         "prompt_tokens": num_tokens_input,
         "completion_tokens": num_tokens_output,
         "total_tokens": num_tokens_input + num_tokens_output,
+        "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
     }
     usage_chunk = {
         "id": request_id,
@@ -220,6 +225,9 @@ def build_chat_response(
             "completion_tokens": final_output["num_tokens_output"],
             "total_tokens": final_output["num_tokens_input"]
             + final_output["num_tokens_output"],
+            "prompt_tokens_details": {
+                "cached_tokens": final_output.get("num_cached_tokens", 0)
+            },
             "ttft_s": round(final_output.get("ttft", 0.0), 4),
             "tpot_s": round(final_output.get("tpot", 0.0), 4),
             "latency_s": round(final_output.get("latency", 0.0), 4),
@@ -264,6 +272,9 @@ def build_chat_response_multi(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": final_outputs[0].get("num_cached_tokens", 0)
+            },
             "ttft_s": round(
                 max((out.get("ttft", 0.0) for out in final_outputs), default=0.0), 4
             ),
@@ -306,6 +317,7 @@ async def stream_chat_response_fanout(
     has_tool_calls = [False] * n
     finished = [False] * n
     kv_transfer_params_value = None
+    num_cached_tokens = 0
 
     for i in range(n):
         yield create_chat_chunk(request_id, model, delta={"role": "assistant"}, index=i)
@@ -317,6 +329,9 @@ async def stream_chat_response_fanout(
             continue
         new_text = chunk_data["text"]
         num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
+        _ct = chunk_data.get("num_cached_tokens", 0)
+        if _ct:
+            num_cached_tokens = _ct
 
         if "kv_transfer_params" in chunk_data:
             kv_transfer_params_value = chunk_data["kv_transfer_params"]
@@ -388,6 +403,7 @@ async def stream_chat_response_fanout(
         "completion_tokens": sum(num_tokens_output),
         "total_tokens": num_tokens_input + sum(num_tokens_output),
         "num_choices": n,
+        "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
     }
     usage_chunk = {
         "id": request_id,

@@ -30,7 +30,9 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 32768 \
   --max-num-seqs 128 \
   --max-num-batched-tokens 32768 \
-  --no-enable_prefix_caching 2>&1 | tee "${run_name}-server.log"
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+  --no-enable_prefix_caching \
+  --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' 2>&1 | tee "${run_name}-server.log"
 ```
 
 ## MXFP8 on 4xMI355 GPUs
@@ -57,7 +59,8 @@ python -m atom.entrypoints.openai_server \
   --max-num-seqs 128 \
   --max-num-batched-tokens 32768 \
   --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
-  --no-enable_prefix_caching 2>&1 | tee "${run_name}-server.log"
+  --no-enable_prefix_caching \
+  --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' 2>&1 | tee "${run_name}-server.log"
 ```
 
 
@@ -170,7 +173,6 @@ draft_path=Inferact/MiniMax-M3-EAGLE3
 
 export ATOM_FORCE_ATTN_TRITON=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
@@ -183,7 +185,9 @@ python -m atom.entrypoints.openai_server \
   --max-num-seqs 256 \
   --kv_cache_dtype fp8 \
   --max-num-batched-tokens 32768 \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
   --no-enable_prefix_caching \
+  --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
   --method eagle3 \
   --draft-model "$draft_path" \
   --num-speculative-tokens 3 2>&1 | tee m3-mxfp4-eagle3-server.log
@@ -255,3 +259,8 @@ Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
 | 16 | 160 | 78.17 | 430.34 | 2680.95 | 7.91 | 15.58 | 1876.30 | 16928.43 |
 | 32 | 320 | 125.69 | 609.24 | 5304.23 | 12.60 | 23.81 | 2355.93 | 21132.49 |
 | 64 | 640 | 198.58 | 966.20 | 10476.78 | 19.97 | 40.44 | 2973.94 | 26857.80 |
+
+## PD Disaggregation
+
+For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without EAGLE3), see
+[recipes/mesh/MiniMax-M3.md](mesh/MiniMax-M3.md).

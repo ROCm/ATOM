@@ -2,6 +2,9 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
+from collections import deque
+from types import SimpleNamespace
+
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     Scheduler,
@@ -103,6 +106,42 @@ class TestSchedule:
         assert batch.total_tokens_num_prefill == 6
         assert list(batch.num_scheduled_tokens) == [4, 2]
 
+    def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+
+        batch1, _ = sched.schedule()
+        assert batch1.total_tokens_num_prefill == 6
+        assert list(batch1.scheduled_tokens) == list(range(6))
+        assert list(batch1.num_cached_tokens) == [0]
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+        assert seq.is_partial_prefill is True
+        assert seq.num_cached_tokens == 6
+
+        batch2, _ = sched.schedule()
+        assert batch2.total_tokens_num_prefill == 4
+        assert list(batch2.scheduled_tokens) == list(range(6, 10))
+        assert list(batch2.num_cached_tokens) == [6]
+
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
         sched.add(seq_factory([1, 2, 3, 4]))  # 1 block
@@ -134,6 +173,83 @@ class TestSchedule:
         statuses = {s1.status, s2.status}
         assert SequenceStatus.RUNNING in statuses
         assert SequenceStatus.WAITING in statuses
+
+    def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
+        sched = Scheduler.__new__(Scheduler)
+        fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
+        ready = SimpleNamespace(id=2, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
+        blocked = SimpleNamespace(id=3, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
+        sched.waiting = deque([fresh, ready, blocked])
+        sched.finished_recving_kv_req_ids = ["2"]
+        sched.failed_recving_kv_req_ids = []
+
+        sched._promote_ready_remote_kv_requests()
+
+        assert [seq.id for seq in sched.waiting] == [2, 1, 3]
+
+    def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
+        class _Connector:
+            def should_park_partial_prefill_for_load(self, seq):
+                return seq.id == 2
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = _Connector()
+        sched.waiting = deque()
+        sched._partial_prefill_count = 1
+        keep = SimpleNamespace(
+            id=1,
+            status=SequenceStatus.RUNNING,
+            is_partial_prefill=False,
+        )
+        ready = SimpleNamespace(
+            id=2,
+            status=SequenceStatus.RUNNING,
+            is_partial_prefill=True,
+        )
+        sched.running = deque([keep, ready])
+
+        sched._park_ready_offload_partial_prefills()
+
+        assert [seq.id for seq in sched.running] == [1]
+        assert [seq.id for seq in sched.waiting] == [2]
+        assert ready.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        assert ready.is_partial_prefill is False
+        assert ready._discard_next_deferred_output is True
+        assert sched._partial_prefill_count == 0
+
+    def test_offload_partial_handoff_discards_stale_deferred_output(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=10,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)), sampling_params=SamplingParams(max_tokens=4))
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.PREFILL
+        seq.num_cached_tokens = 8
+        seq._discard_next_deferred_output = True
+        sched.running = deque([seq])
+
+        sched.postprocess(
+            [seq],
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(999,)],
+                num_rejected=[0],
+                num_bonus=[0],
+                draft_token_ids=None,
+                is_deferred_out=True,
+            ),
+            batch=SimpleNamespace(req_ids=[seq.id], num_scheduled_tokens=[2]),
+        )
+
+        assert seq.num_cached_tokens == 10
+        assert seq._discard_next_deferred_output is False
+        assert 999 not in seq.output_tokens
+        assert seq.output_tokens == [sched.eos_token_id]
 
 
 # ── long_prefill_token_threshold ──────────────────────────────────────────
@@ -557,3 +673,132 @@ class TestScheduledBatchPDFirstDecodeMTP:
         )
 
         assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]
+
+
+# ── Prefill dense-batch gate (threshold = max_num_batched_tokens) ───────────
+
+
+class TestPrefillBatchGate:
+    def test_ready_when_waiting_fills_threshold(self, seq_factory):
+        # chunked prefill on so a 40-token prompt is clamped to the 32 budget
+        # (not rejected as oversized) and counts toward the threshold.
+        cfg = MockConfig(max_num_batched_tokens=32, enable_chunked_prefill=True)
+        sched = Scheduler(cfg)
+        # Keep a decode running so the tail-escape doesn't trivially allow.
+        r = seq_factory([1, 2, 3])
+        r.status = SequenceStatus.RUNNING
+        sched.block_manager.allocate(r, 0)
+        sched.running.append(r)
+        # 40 waiting tokens, clamped to 32 == threshold -> ready.
+        sched.waiting.append(seq_factory(list(range(40))))
+        assert sched._waiting_prefill_tokens() >= 32
+        assert sched._prefill_batch_ready() is True
+
+    def test_holds_when_under_full(self, seq_factory):
+        # gate only active under DP>1
+        cfg = MockConfig(max_num_batched_tokens=32, data_parallel_size=8)
+        sched = Scheduler(cfg)
+        r = seq_factory([1, 2, 3])
+        r.status = SequenceStatus.RUNNING
+        sched.block_manager.allocate(r, 0)
+        sched.running.append(r)
+        # Only 8 waiting tokens < 32 -> hold (keep decoding).
+        sched.waiting.append(seq_factory(list(range(8))))
+        assert sched._prefill_batch_ready() is False
+        assert sched._prefill_hold_passes == 1
+
+    def test_gate_disabled_without_dp(self, seq_factory):
+        # DP<=1 (default): gate off -> under-full prefill is NOT held.
+        cfg = MockConfig(max_num_batched_tokens=32)  # data_parallel_size=1
+        sched = Scheduler(cfg)
+        assert sched._prefill_gate_enabled is False
+        r = seq_factory([1, 2, 3])
+        r.status = SequenceStatus.RUNNING
+        sched.block_manager.allocate(r, 0)
+        sched.running.append(r)
+        sched.waiting.append(seq_factory(list(range(8))))  # under-full
+        # Gate off -> ready True (legacy behavior), no hold counter advance.
+        assert sched._prefill_batch_ready() is True
+        assert sched._prefill_hold_passes == 0
+
+    def test_tail_escape_when_no_decode_left(self, seq_factory):
+        cfg = MockConfig(max_num_batched_tokens=32)  # threshold = 32
+        sched = Scheduler(cfg)
+        # running empty -> even an under-full waiting batch must be allowed,
+        # else the final partial batch would deadlock.
+        sched.waiting.append(seq_factory(list(range(8))))
+        assert not sched.running
+        assert sched._prefill_batch_ready() is True
+
+    def test_hold_pass_budget_forces_fire(self, seq_factory):
+        cfg = MockConfig(max_num_batched_tokens=32, data_parallel_size=8)
+        sched = Scheduler(cfg)
+        sched._prefill_hold_max_passes = 3
+        r = seq_factory([1, 2, 3])
+        r.status = SequenceStatus.RUNNING
+        sched.block_manager.allocate(r, 0)
+        sched.running.append(r)
+        sched.waiting.append(seq_factory(list(range(8))))  # under-full
+        # First (max_passes - 1) calls hold, then it force-fires and resets.
+        assert sched._prefill_batch_ready() is False  # pass 1
+        assert sched._prefill_batch_ready() is False  # pass 2
+        assert sched._prefill_batch_ready() is True  # pass 3 -> force
+        assert sched._prefill_hold_passes == 0
+
+    def test_gate_holds_new_prefill_but_decodes(self, seq_factory):
+        """End-to-end: under-full waiting + running decode -> schedule() should
+        NOT start a new prefill; it should return a decode batch instead."""
+        cfg = MockConfig(
+            max_num_batched_tokens=32,  # threshold = 32
+            enable_chunked_prefill=False,
+            data_parallel_size=8,  # gate only active under DP>1
+        )
+        sched = Scheduler(cfg)
+        r = seq_factory([1, 2, 3])
+        r.status = SequenceStatus.RUNNING
+        r.type = SequenceType.DECODE
+        sched.block_manager.allocate(r, 0)
+        sched.running.append(r)
+        sched.waiting.append(seq_factory(list(range(8))))  # under-full prefill
+        batch, _ = sched.schedule()
+        assert batch is not None
+        assert batch.total_seqs_num_prefill == 0
+        assert batch.total_seqs_num_decode == 1
+
+    def test_partial_resume_packs_new_under_full_request(self, seq_factory):
+        """OR-clause: when Phase 1 resumes a partial prefill, Phase 2 packs a
+        NEW under-full waiting request into the SAME step even though the
+        dense-batch gate (_prefill_batch_ready) would hold it on a pure-decode
+        tick. Decode is already interrupted by the partial resume, so the extra
+        pack is free."""
+        cfg = MockConfig(
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+            max_num_batched_tokens=32,  # threshold = 32
+            long_prefill_token_threshold=8,
+            enable_chunked_prefill=True,
+            data_parallel_size=8,  # gate active: an under-full new prefill holds
+        )
+        sched = Scheduler(cfg)
+        # A partial prefill mid-flight in running (num_cached < num_tokens).
+        partial = seq_factory(list(range(20)))
+        partial.status = SequenceStatus.RUNNING
+        partial.type = SequenceType.PREFILL
+        partial.num_cached_tokens = 8
+        partial.is_partial_prefill = True
+        sched.block_manager.allocate(partial, 0)
+        sched.running.append(partial)
+        sched._partial_prefill_count = 1
+        # A NEW under-full waiting request (8 tokens < 32 threshold).
+        new_req = seq_factory(list(range(8)))
+        sched.waiting.append(new_req)
+        # Under-full: on a pure-decode tick this would be held (see
+        # test_gate_holds_new_prefill_but_decodes).
+        assert sched._waiting_prefill_tokens() < 32
+
+        batch, scheduled = sched.schedule()
+        assert batch is not None
+        # Both the resumed partial AND the new under-full request are packed.
+        assert batch.total_seqs_num_prefill == 2
+        assert partial.id in scheduled
+        assert new_req.id in scheduled

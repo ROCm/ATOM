@@ -17,7 +17,12 @@ from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import envs, init_exit_handler, make_zmq_socket
+from atom.utils import (
+    envs,
+    init_exit_handler,
+    make_zmq_socket,
+    set_process_title,
+)
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -92,9 +97,13 @@ class EngineCore:
         # Initialize model runner processes
         try:
             good = False
+            # Number of worker processes = full model-parallel world size.
+            # PCP is an independent dimension (world = tp x pcp), so spawn
+            # tp x pcp workers; otherwise init_dist_env (which expects a world
+            # of tp x pcp) would hang waiting for the PCP ranks.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tensor_parallel_size,
+                config.tensor_parallel_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
                 config,
             )
@@ -189,11 +198,25 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        # Bind this EngineCore's lifetime to its parent (the server /
+        # CoreManager): if the parent exits, have the kernel reap this process —
+        # and, transitively, the ModelRunner workers it spawns — instead of
+        # leaving them orphaned. Orphans keep pinning GPU VRAM + the custom
+        # all-reduce IPC handles / rendezvous TCPStore, which makes the next
+        # restart reuse a stale hipIpc handle and crash. See
+        # atom.utils.enable_orphan_reaping for the full rationale.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
         engine: EngineCore = None
         try:
             if config.parallel_config.data_parallel_size > 1:
+                set_process_title(
+                    f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
+                )
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
+                set_process_title("EngineCore")
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:
@@ -259,21 +282,13 @@ class EngineCore:
             self.output_queue.put_nowait(rejected)
 
         if result is None:
-            if self.kv_transfer_enabled:
-                kvoutput = self.runner_mgr.call_func_with_aggregation(
-                    "async_proc_aggregation"
-                )
-                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            self._advance_idle_kv_transfer()
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
-            if self.kv_transfer_enabled:
-                kvoutput = self.runner_mgr.call_func_with_aggregation(
-                    "async_proc_aggregation"
-                )
-                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            self._advance_idle_kv_transfer()
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
@@ -293,11 +308,7 @@ class EngineCore:
             )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        if self.kv_transfer_enabled:
-            kvoutput = self.runner_mgr.call_func_with_aggregation(
-                "async_proc_aggregation"
-            )
-            self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
@@ -325,6 +336,29 @@ class EngineCore:
             self.output_queue.put_nowait(finished_seqs)
 
         return True
+
+    def _advance_idle_kv_transfer(self) -> None:
+        # No forward batch will run this tick, but offload load/save work may
+        # still need to be dispatched or reported back to the scheduler.
+        self._dispatch_idle_offload_work()
+        self._poll_kv_transfer_progress()
+
+    def _poll_kv_transfer_progress(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+    def _dispatch_idle_offload_work(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not getattr(connector, "is_offload", False):
+            return
+        meta = connector.build_connector_meta()
+        if meta is None or not getattr(meta, "requests", None):
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", meta)
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
