@@ -61,20 +61,59 @@ The expert-ownership map is static: global expert `e` is owned by EP rank
 
 ### 3.1 New class
 
+Mirroring vLLM's DeepEP HT/LL split, the native backend is **two algorithm
+classes over a shared base, behind a thin per-step dispatcher**. The two
+algorithms are genuinely different (variable-length `all_to_all_single` vs
+fixed-capacity graph-safe exchange), but they share FP8 quant, expert-ownership
+math, and the finalize scatter-add — which live on the base.
+
 `atom/model_ops/fused_moe/rccl_prepare_finalize.py`:
 
 ```
-class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+class RcclAll2AllBase:
+    """Shared helpers: FP8 quant, dest_rank(expert), scatter-add combine,
+    EP-group collective wrappers, routing-state stack. Holds no path policy."""
     def __init__(self, rank, world_size, hidden_dim, scale_dim,
                  max_tokens_per_rank, num_local_experts, num_experts_per_token,
-                 in_dtype, use_fp8_dispatch, quant_type, ep_group):
-        ...
+                 in_dtype, use_fp8_dispatch, quant_type, ep_group): ...
+
+class RcclHTPrepareAndFinalize(RcclAll2AllBase, mk.FusedMoEPrepareAndFinalize):
+    """High-throughput / prefill: allgather topk -> host counts ->
+    variable-length all_to_all_single (§4)."""
+
+class RcclLLPrepareAndFinalize(RcclAll2AllBase, mk.FusedMoEPrepareAndFinalize):
+    """Low-latency / decode: fixed cross-DP-unified capacity C, equal-split
+    all_to_all_single, no host sync, CUDA-graph safe (§5)."""
+
+class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+    """Dispatcher held by the MoE layer. Constructs one HT and one LL instance
+    (sharing config) and forwards each prepare()/finalize() to the right one
+    based on forward_context, because a served model alternates prefill and
+    decode steps through the same MoE module."""
+    def prepare(self, ...):
+        ctx = get_forward_context().context
+        impl = self._ll if (not ctx.is_prefill and ctx.dp_uniform_decode) \
+               else self._ht
+        return impl.prepare(...)
+    # finalize() mirrors prepare(); the interface passthroughs
+    # (topk_indices_dtype, output_is_reduced, num_dispatchers,
+    #  max_num_tokens_per_rank) delegate to either impl (identical values).
 ```
 
-It holds a reference to the EP `GroupCoordinator` (`get_ep_group()`), from which
-it uses `all_gather_into_tensor` and `all_to_all_single` via
-`torch.distributed`. No MoRI handle and no `all2all_manager` handle are required,
-so the class is usable when `_has_module("mori")` is False.
+Why a dispatcher rather than two independently-selected objects: the MoE layer
+holds exactly one `prepare_finalize` object for the model's lifetime, yet each
+forward step may be prefill **or** decode. The dispatcher is the object that
+holds that single reference and routes per step. The HT/LL classes stay
+single-responsibility and independently testable.
+
+Non-uniform decode (`not dp_uniform_decode`) is forced eager and also routes to
+the HT (variable-length) implementation — see §5 intro — so the LL class is only
+ever entered under the graph-safe uniform-decode contract.
+
+All three hold a reference to the EP `GroupCoordinator` (`get_ep_group()`), using
+`all_gather_into_tensor` and `all_to_all_single` via `torch.distributed`. No MoRI
+handle and no `all2all_manager` handle are required, so the classes are usable
+when `_has_module("mori")` is False.
 
 ### 3.2 Selection
 
@@ -82,33 +121,36 @@ so the class is usable when `_has_module("mori")` is False.
   `ATOM_ALL2ALL_BACKEND` ∈ {`mori` (default), `rccl`}.
 - In `atom/model_ops/moe.py:_maybe_make_prepare_finalize`, after computing the
   common MoE dimensions, branch:
-  - `rccl` → build `RcclPrepareAndFinalize`.
+  - `rccl` → build the `RcclPrepareAndFinalize` dispatcher (which internally
+    constructs the HT and LL implementations sharing one config).
   - `mori` (default) → existing `MoriPrepareAndFinalize` path, unchanged.
 - `FusedMoEParallelConfig.use_all2all_kernels` currently requires
   `_has_module("mori")`. Relax it so that when
   `ATOM_ALL2ALL_BACKEND == "rccl"` the all2all path is enabled without MoRI
   present. (`dp_size > 1 and use_ep and (mori_present or backend == "rccl")`.)
 
-### 3.3 Path split inside prepare/finalize
+### 3.3 Path selection & routing-state hand-off
 
-`prepare()` / `finalize()` read
-`get_forward_context().context.is_prefill` to pick the prefill (§4) or decode
-(§5) algorithm. Both paths share the FP8 quant helper (§6) and the
-expert-ownership arithmetic.
+The dispatcher (§3.1) selects HT vs LL per step from
+`get_forward_context().context` (`is_prefill`, `dp_uniform_decode`). The chosen
+implementation runs the algorithm in §4 (HT) or §5 (LL). FP8 quant (§6) and the
+expert-ownership arithmetic live on `RcclAll2AllBase` and are shared by both.
 
 **Routing state hand-off.** `finalize()` must invert the exact routing computed
 in `prepare()` (send/recv split sizes and the per-(token,expert) pack index).
 Because `FusedMoEModularKernel` calls `prepare` then `fused_moe` then `finalize`
-synchronously within one layer's forward on one instance, the routing state is
-stored on the `RcclPrepareAndFinalize` instance in a small stack (one entry
-pushed by `prepare`, popped by `finalize`). This mirrors how MoRI caches its
+synchronously within one layer's forward, each HT/LL instance stores its routing
+state in a small stack on the instance (one entry pushed by `prepare`, popped by
+`finalize`) — a helper on `RcclAll2AllBase`. This mirrors how MoRI caches its
 routing map internally on the op handle. The stack (not a single slot) keeps
 shared-expert-overlap and repeated calls correct; entries hold only device
-tensors + the cpu split lists (prefill).
+tensors + the cpu split lists (HT). Because HT and LL are separate instances,
+their stacks never interleave even if a (pathological) mixed step occurred.
 
-## 4. Prefill dispatch (variable-length, host sync allowed)
+## 4. Prefill / HT dispatch (variable-length, host sync allowed)
 
-`prepare()` when `context.is_prefill`:
+Implemented by `RcclHTPrepareAndFinalize`. Entered for prefill steps and for
+non-uniform decode (§5 intro). `prepare()`:
 
 1. **Quantize (optional).** If `use_fp8_dispatch`, quantize `a1` to fp8 with the
    configured `quant_type` (`per_1x128` or `per_Token`) via `get_hip_quant`,
@@ -136,10 +178,12 @@ the per-(token,expert) contributions back to `[num_tokens, hidden]`, weighting b
 `topk_weights` unless `apply_router_weight_on_input`. Save the routing index from
 `prepare()` (per-layer, per-forward) to drive the inverse scatter.
 
-## 5. Decode dispatch (fixed-shape, CUDA-graph safe)
+## 5. Decode / LL dispatch (fixed-shape, CUDA-graph safe)
 
-Constraint: constant tensor shapes across capture/replay and **no host sync** on
-routing tensors (`topk_ids` never leaves device).
+Implemented by `RcclLLPrepareAndFinalize`. Entered only for
+`dp_uniform_decode=True` steps. Constraint: constant tensor shapes across
+capture/replay and **no host sync** on routing tensors (`topk_ids` never leaves
+device).
 
 **Per-rank batch sizes differ across DP ranks.** Under DP+EP each DP rank runs
 attention on its own local decode batch, but the MoE all2all crosses all EP
@@ -227,9 +271,11 @@ capture/replay; the decode path here follows the same constant-shape discipline.
   dispatch→combine is identity on hidden_states for a known routing, and that
   the dispatched buffer is grouped by local expert with the correct
   `expert_num_tokens`.
-- **Numerical parity test (GPU + mori):** RCCL backend vs. MoRI backend on the
-  same routing/inputs; assert max abs diff within fp tolerance for bf16 and fp8
-  dispatch.
+- **Numerical parity test (GPU + mori):** both `RcclHTPrepareAndFinalize`
+  (prefill) and `RcclLLPrepareAndFinalize` (decode) vs. `MoriPrepareAndFinalize`
+  on the same routing/inputs; assert max abs diff within fp tolerance for bf16
+  and fp8 dispatch. Also test the `RcclPrepareAndFinalize` dispatcher routes to
+  the correct impl per forward_context.
 - **CUDA-graph smoke test:** capture the decode `prepare`+`finalize` under a
   graph and replay with different (but ≤ graph_bs) token counts; assert no host
   sync (no `.item()`/`.cpu()` on routing tensors) and correct output.
@@ -243,7 +289,8 @@ capture/replay; the decode path here follows the same constant-shape discipline.
 ## 9. Files touched
 
 - **New:** `atom/model_ops/fused_moe/rccl_prepare_finalize.py`
-  (`RcclPrepareAndFinalize`, device pack/unpack helpers).
+  (`RcclAll2AllBase`, `RcclHTPrepareAndFinalize`, `RcclLLPrepareAndFinalize`,
+  `RcclPrepareAndFinalize` dispatcher, device pack/unpack helpers).
 - **New:** `tests/model_ops/test_rccl_all2all.py` (layout + parity + graph tests).
 - **Edit:** `atom/utils/envs.py` — add `ATOM_ALL2ALL_BACKEND`.
 - **Edit:** `atom/model_ops/moe.py` — backend branch in
