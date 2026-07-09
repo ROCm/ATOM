@@ -1292,18 +1292,6 @@ class ModelRunner:
         # consumed by THIS process only (model weights + peak activations).
         peak_torch = max(peak, current)
 
-        # Non-torch committed memory: CUDA context, RCCL/NCCL communication
-        # buffers (large under tensor/data parallel), and the torch caching
-        # allocator's reserved-but-free segments. None of these appear in
-        # torch's `allocated_bytes` stats, but they ARE physically resident, so
-        # `peak_torch` alone under-reserves them and the KV pool overshoots
-        # gpu_memory_utilization (e.g. tp8 was measured at 93% actual for a 90%
-        # target — the ~3% gap is exactly this non-torch footprint). Measure it
-        # as (physically used) - (torch allocated) = (total - free) - current.
-        # On a shared GPU this also folds in other processes' usage, which only
-        # makes the budget more conservative (never an over-allocation).
-        non_torch_overhead = max(0, (total - free) - current)
-
         # CUDA graph capture overhead estimate
         cudagraph_overhead = self._estimate_cudagraph_overhead()
 
@@ -1311,18 +1299,12 @@ class ModelRunner:
         safety_margin = int(total * 0.02)
 
         # Budget: this server may use up to gpu_memory_utilization * total.
-        # Subtract our own PyTorch usage + non-torch footprint + CUDA graph
-        # estimate + safety.
+        # Subtract our own PyTorch usage + CUDA graph estimate + safety.
+        # This is independent of other processes on the GPU.
         budget = int(total * config.gpu_memory_utilization)
         # Fixed (utilization-independent) overhead of this process: model
-        # weights + peak activations (peak_torch) + CUDA context / RCCL buffers
-        # / allocator reserve (non_torch_overhead) + CUDA graph capture +
-        # safety margin. peak_torch + non_torch_overhead == current committed
-        # footprint plus the transient torch activation headroom (weights are
-        # not double-counted: non_torch subtracts `current`, peak_torch adds it).
-        non_kv_overhead = (
-            peak_torch + non_torch_overhead + cudagraph_overhead + safety_margin
-        )
+        # weights + peak activations + CUDA graph capture + safety margin.
+        non_kv_overhead = peak_torch + cudagraph_overhead + safety_margin
         available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
@@ -1450,7 +1432,6 @@ class ModelRunner:
             f"utilization={config.gpu_memory_utilization}, "
             f"budget={budget / (1 << 30):.2f}GB, "
             f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
-            f"non_torch={non_torch_overhead / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
@@ -1506,7 +1487,6 @@ class ModelRunner:
             f"but available_for_kv={available_for_kv / (1 << 20):.2f}MB "
             f"(budget={budget / (1 << 30):.2f}GB, "
             f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
-            f"non_torch={non_torch_overhead / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
