@@ -804,9 +804,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         gfx = get_gfx()
         self.is_gfx1250 = gfx == "gfx1250"
-        # gfx1250 GUGU is handled arch-aware by moe_shuffle_weight /
-        # moe_shuffle_scale (row-level gate/up interleave + WMMA tile shuffle),
-        # so is_guinterleave is supported on gfx1250 as well.
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             self.use_triton = envs.ATOM_USE_TRITON_MOE
         else:
