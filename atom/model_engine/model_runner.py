@@ -1262,12 +1262,26 @@ class ModelRunner:
     def _get_total_num_layers(self):
         """Return total layer count including draft (MTP) layers.
 
+        Under pipeline parallelism each stage only owns a slice of the model
+        layers, so allocating KV for all num_hidden_layers wastes most of GPU
+        memory. Use get_pp_indices to resolve the actual layer count.
+
         Drafts that own an independent KV cache via their own builder
         (e.g. Eagle3 MHA draft on an MLA target) account for their layers
         through that builder, so they are NOT added here. Only MTP-style
         drafts that share the target's KV pool contribute.
         """
-        total = self.config.hf_config.num_hidden_layers
+        num_hidden = self.config.hf_config.num_hidden_layers
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1:
+            from atom.models.utils import get_pp_indices
+
+            start, end = get_pp_indices(
+                num_hidden, pp_group.rank_in_group, pp_group.world_size
+            )
+            total = end - start
+        else:
+            total = num_hidden
         if self.config.speculative_config and hasattr(self, "drafter"):
             if not hasattr(self, "eagle3_draft_builder"):
                 draft_hf = self.config.speculative_config.draft_model_hf_config
@@ -1612,7 +1626,7 @@ class ModelRunner:
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
         # Calculate total number of layers (target + draft)
-        total_num_layers = hf_config.num_hidden_layers
+        total_num_layers = self._get_total_num_layers()
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config

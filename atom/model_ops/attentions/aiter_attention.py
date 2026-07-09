@@ -461,7 +461,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # Standard MHA path.
         block_bytes = (
             2
-            * hf_config.num_hidden_layers
+            * total_num_layers
             * runner.block_size
             * num_kv_heads
             * hf_config.head_dim
@@ -469,7 +469,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         block_bytes += (
             2
-            * hf_config.num_hidden_layers
+            * total_num_layers
             * num_kv_heads
             * runner.physical_block_size
             * 4  # float32 kv_scale
@@ -514,10 +514,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "_kv_layer_cache_store": [],
             }
 
+        total_num_layers = runner._get_total_num_layers()
         tensors = {
             "kv_cache": torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
                 num_kv_heads,
@@ -527,7 +528,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ),
             "kv_scale": torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 num_kv_heads,
                 runner.physical_block_size,
