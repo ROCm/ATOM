@@ -8,7 +8,7 @@ use http::HeaderMap;
 
 use super::traits::{PolicySource, WorkerSource};
 use super::types::RequestDescriptor;
-use crate::core::{BasicWorkerBuilder, ConnectionMode, HashRing, RuntimeType, Worker, WorkerType};
+use crate::core::{BasicWorkerBuilder, ConnectionMode, Framework, HashRing, Worker, WorkerType};
 use crate::policies::{LoadBalancingPolicy, RoundRobinPolicy, SelectWorkerInfo};
 
 #[derive(Debug, Clone)]
@@ -280,12 +280,12 @@ pub fn make_worker(
     model_id: Option<&str>,
     api_key: Option<&str>,
     connection_mode: ConnectionMode,
-    runtime_type: RuntimeType,
+    framework: Framework,
 ) -> Arc<dyn Worker> {
     let mut builder = BasicWorkerBuilder::new(url.to_string())
         .worker_type(worker_type)
         .connection_mode(connection_mode)
-        .runtime_type(runtime_type);
+        .framework(framework);
     if let Some(m) = model_id {
         builder = builder.model_id(m.to_string());
     }
@@ -307,7 +307,7 @@ pub fn make_regular_http(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Some(model_id),
         None,
         ConnectionMode::Http,
-        RuntimeType::Sglang,
+        Framework::Sglang,
     )
 }
 
@@ -319,7 +319,7 @@ pub fn make_regular_grpc(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Some(model_id),
         None,
         ConnectionMode::Grpc { port: None },
-        RuntimeType::Sglang,
+        Framework::Sglang,
     )
 }
 
@@ -335,7 +335,7 @@ pub fn make_prefill_http(
         Some(model_id),
         None,
         ConnectionMode::Http,
-        RuntimeType::Sglang,
+        Framework::Sglang,
     )
 }
 
@@ -347,7 +347,7 @@ pub fn make_decode_http(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Some(model_id),
         None,
         ConnectionMode::Http,
-        RuntimeType::Sglang,
+        Framework::Sglang,
     )
 }
 
@@ -363,7 +363,7 @@ pub fn make_prefill_grpc(
         Some(model_id),
         None,
         ConnectionMode::Grpc { port: None },
-        RuntimeType::Sglang,
+        Framework::Sglang,
     )
 }
 
@@ -375,7 +375,7 @@ pub fn make_decode_grpc(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Some(model_id),
         None,
         ConnectionMode::Grpc { port: None },
-        RuntimeType::Sglang,
+        Framework::Sglang,
     )
 }
 
@@ -516,7 +516,7 @@ mod fixture_smoke_tests {
             Some("m"),
             None,
             ConnectionMode::Http,
-            RuntimeType::Sglang,
+            Framework::Sglang,
         );
         assert!(!w.is_healthy());
     }

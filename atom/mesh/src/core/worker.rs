@@ -119,6 +119,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Returns a reference to avoid cloning on every access
     fn connection_mode(&self) -> &ConnectionMode;
 
+    /// Get the inference framework this worker runs (Sglang/Vllm/Atom/Anonymous)
+    fn framework(&self) -> &Framework {
+        &self.metadata().framework
+    }
+
+    /// Get this worker's pool role (regular vs PD prefill/decode)
+    fn pool_role(&self) -> PoolRole {
+        self.worker_type().pool_role()
+    }
+
     /// Get the bootstrap hostname for PD mode
     /// Returns cached hostname parsed from URL at construction time
     fn bootstrap_host(&self) -> &str {
@@ -346,37 +356,57 @@ impl fmt::Display for ConnectionMode {
     }
 }
 
-/// Runtime implementation type for workers
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+/// Inference framework that a worker runs.
+///
+/// This is a per-worker property (distinct from the router-level `BackendType`,
+/// which selects the PD-disaggregation protocol). When a worker does not declare
+/// a framework it is classified as `Anonymous`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum RuntimeType {
-    /// SGLang runtime (default)
-    #[default]
+pub enum Framework {
+    /// SGLang framework
     Sglang,
-    /// vLLM runtime
+    /// vLLM framework
     Vllm,
+    /// ATOM framework
+    Atom,
+    /// Framework not declared (default)
+    #[default]
+    Anonymous,
 }
 
-impl fmt::Display for RuntimeType {
+impl fmt::Display for Framework {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RuntimeType::Sglang => write!(f, "sglang"),
-            RuntimeType::Vllm => write!(f, "vllm"),
+            Framework::Sglang => write!(f, "sglang"),
+            Framework::Vllm => write!(f, "vllm"),
+            Framework::Atom => write!(f, "atom"),
+            Framework::Anonymous => write!(f, "anonymous"),
         }
     }
 }
 
-impl std::str::FromStr for RuntimeType {
-    type Err = String;
+impl std::str::FromStr for Framework {
+    type Err = std::convert::Infallible;
 
+    /// Parse a framework name. Unknown / empty values map to `Anonymous`
+    /// so callers never fail on an undeclared framework.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Framework::from(s))
+    }
+}
+
+impl From<&str> for Framework {
+    fn from(s: &str) -> Self {
         // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
         if s.eq_ignore_ascii_case("sglang") {
-            Ok(RuntimeType::Sglang)
+            Framework::Sglang
         } else if s.eq_ignore_ascii_case("vllm") {
-            Ok(RuntimeType::Vllm)
+            Framework::Vllm
+        } else if s.eq_ignore_ascii_case("atom") {
+            Framework::Atom
         } else {
-            Err(format!("Unknown runtime type: {}", s))
+            Framework::Anonymous
         }
     }
 }
@@ -415,6 +445,40 @@ impl WorkerType {
             WorkerType::Regular => metrics_labels::WORKER_REGULAR,
             WorkerType::Prefill { .. } => metrics_labels::WORKER_PREFILL,
             WorkerType::Decode => metrics_labels::WORKER_DECODE,
+        }
+    }
+
+    /// Map this worker type to its pool role (regular pool vs PD prefill/decode).
+    pub fn pool_role(&self) -> PoolRole {
+        match self {
+            WorkerType::Regular => PoolRole::Regular,
+            WorkerType::Prefill { .. } => PoolRole::PrefillPD,
+            WorkerType::Decode => PoolRole::DecodePD,
+        }
+    }
+}
+
+/// Role of a worker within a model's pool.
+///
+/// A regular worker lives in the regular pool; prefill/decode workers live in
+/// the PD pool but are stored in separate buckets so P and D nodes can be
+/// selected independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PoolRole {
+    /// Regular (non-disaggregated) worker
+    Regular,
+    /// Prefill node of the PD pool
+    PrefillPD,
+    /// Decode node of the PD pool
+    DecodePD,
+}
+
+impl fmt::Display for PoolRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PoolRole::Regular => write!(f, "regular"),
+            PoolRole::PrefillPD => write!(f, "pd-prefill"),
+            PoolRole::DecodePD => write!(f, "pd-decode"),
         }
     }
 }
@@ -458,8 +522,8 @@ pub struct WorkerMetadata {
     pub worker_type: WorkerType,
     /// Connection mode
     pub connection_mode: ConnectionMode,
-    /// Runtime type (for gRPC workers)
-    pub runtime_type: RuntimeType,
+    /// Inference framework this worker runs (Sglang/Vllm/Atom/Anonymous)
+    pub framework: Framework,
     /// Additional labels/tags
     pub labels: std::collections::HashMap<String, String>,
     /// Health check configuration
@@ -673,7 +737,7 @@ impl Worker for BasicWorker {
                 let client = self
                     .grpc_client
                     .get_or_try_init(|| async {
-                        let runtime_str = self.metadata.runtime_type.to_string();
+                        let runtime_str = self.metadata.framework.to_string();
                         tracing::info!(
                             "Lazily initializing gRPC client ({}) for worker: {}",
                             runtime_str,
@@ -1051,7 +1115,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
     };
 
     let runtime_type = match connection_mode {
-        ConnectionMode::Grpc { .. } => Some(worker.metadata().runtime_type.to_string()),
+        ConnectionMode::Grpc { .. } => Some(worker.metadata().framework.to_string()),
         ConnectionMode::Http => None,
     };
 
@@ -1759,7 +1823,7 @@ mod tests {
             url: "http://test:8080".to_string(),
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            framework: Framework::default(),
             labels: std::collections::HashMap::new(),
             health_config: HealthConfig::default(),
             api_key: None,

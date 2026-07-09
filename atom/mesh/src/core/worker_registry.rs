@@ -1,10 +1,12 @@
 //! Worker Registry for multi-router support
 //!
-//! Provides centralized registry for workers with model-based indexing
+//! Provides a centralized registry for workers organized as a layered pool:
+//! `model_id -> framework -> {regular, pd-prefill, pd-decode}`.
 //!
 //! # Performance Optimizations
-//! The model index uses immutable Arc snapshots instead of RwLock for lock-free reads.
-//! This is critical for high-concurrency scenarios where many requests query the same model.
+//! Each pool bucket is an immutable Arc slice updated copy-on-write, so reads
+//! are lock-free. This is critical for high-concurrency scenarios where many
+//! requests query the same model.
 //!
 //! # Consistent Hash Ring
 //! The registry maintains a pre-computed hash ring per model for O(log n) consistent hashing.
@@ -19,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     core::{
         circuit_breaker::CircuitState,
-        worker::{HealthChecker, RuntimeType, WorkerType},
+        worker::{Framework, HealthChecker, PoolRole, WorkerType},
         ConnectionMode, Worker,
     },
     observability::metrics::MeshMetrics,
@@ -169,27 +171,143 @@ impl Default for WorkerId {
     }
 }
 
-/// Model index using immutable snapshots for lock-free reads.
-/// Each model maps to an Arc'd slice of workers that can be read without locking.
-/// Updates create new snapshots (copy-on-write semantics).
-type ModelIndex = Arc<DashMap<String, Arc<[Arc<dyn Worker>]>>>;
+/// Empty immutable worker slice (shared, avoids per-bucket allocation).
+fn empty_worker_slice() -> Arc<[Arc<dyn Worker>]> {
+    Arc::from(Vec::new().into_boxed_slice())
+}
 
-/// Worker registry with model-based indexing
+/// The three role buckets for a single (model, framework) pair.
+///
+/// `regular` holds standard (non-disaggregated) workers; `prefill` and `decode`
+/// hold the P and D nodes of the PD pool, kept separate so each can be selected
+/// independently. Each bucket is an immutable Arc slice updated copy-on-write,
+/// preserving the lock-free read path.
+#[derive(Debug, Clone)]
+pub struct FrameworkBuckets {
+    regular: Arc<[Arc<dyn Worker>]>,
+    prefill: Arc<[Arc<dyn Worker>]>,
+    decode: Arc<[Arc<dyn Worker>]>,
+}
+
+impl Default for FrameworkBuckets {
+    fn default() -> Self {
+        Self {
+            regular: empty_worker_slice(),
+            prefill: empty_worker_slice(),
+            decode: empty_worker_slice(),
+        }
+    }
+}
+
+impl FrameworkBuckets {
+    /// Immutable view of the bucket for a given role.
+    pub fn bucket(&self, role: PoolRole) -> Arc<[Arc<dyn Worker>]> {
+        match role {
+            PoolRole::Regular => Arc::clone(&self.regular),
+            PoolRole::PrefillPD => Arc::clone(&self.prefill),
+            PoolRole::DecodePD => Arc::clone(&self.decode),
+        }
+    }
+
+    /// All workers across the three buckets.
+    pub fn all(&self) -> Vec<Arc<dyn Worker>> {
+        let mut out =
+            Vec::with_capacity(self.regular.len() + self.prefill.len() + self.decode.len());
+        out.extend(self.regular.iter().cloned());
+        out.extend(self.prefill.iter().cloned());
+        out.extend(self.decode.iter().cloned());
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.regular.is_empty() && self.prefill.is_empty() && self.decode.is_empty()
+    }
+
+    fn slot_mut(&mut self, role: PoolRole) -> &mut Arc<[Arc<dyn Worker>]> {
+        match role {
+            PoolRole::Regular => &mut self.regular,
+            PoolRole::PrefillPD => &mut self.prefill,
+            PoolRole::DecodePD => &mut self.decode,
+        }
+    }
+
+    /// Return a new buckets snapshot with `worker` added to `role`'s bucket
+    /// (replacing any existing entry with the same URL). Copy-on-write.
+    fn with_added(&self, role: PoolRole, worker: Arc<dyn Worker>) -> Self {
+        let mut next = self.clone();
+        let slot = next.slot_mut(role);
+        let mut v: Vec<Arc<dyn Worker>> = slot
+            .iter()
+            .filter(|w| w.url() != worker.url())
+            .cloned()
+            .collect();
+        v.push(worker);
+        *slot = Arc::from(v.into_boxed_slice());
+        next
+    }
+
+    /// Return a new buckets snapshot with the worker at `url` removed from
+    /// `role`'s bucket. Copy-on-write.
+    fn with_removed(&self, role: PoolRole, url: &str) -> Self {
+        let mut next = self.clone();
+        let slot = next.slot_mut(role);
+        let v: Vec<Arc<dyn Worker>> = slot.iter().filter(|w| w.url() != url).cloned().collect();
+        *slot = Arc::from(v.into_boxed_slice());
+        next
+    }
+}
+
+/// All workers for one model, organized by framework then role.
+///
+/// Layer hierarchy: `model_id -> framework -> {regular, pd-prefill, pd-decode}`.
+#[derive(Debug, Default)]
+pub struct ModelPool {
+    /// framework -> role buckets (copy-on-write snapshots for lock-free reads)
+    buckets: DashMap<Framework, FrameworkBuckets>,
+}
+
+impl ModelPool {
+    /// Buckets for a specific framework, if any workers are registered under it.
+    pub fn framework_buckets(&self, framework: &Framework) -> Option<FrameworkBuckets> {
+        self.buckets.get(framework).map(|b| b.clone())
+    }
+
+    /// Frameworks that currently have at least one worker in this model pool.
+    pub fn frameworks(&self) -> Vec<Framework> {
+        self.buckets
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| *e.key())
+            .collect()
+    }
+
+    /// All workers for this model across every framework and role.
+    pub fn all(&self) -> Vec<Arc<dyn Worker>> {
+        self.buckets.iter().flat_map(|e| e.value().all()).collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buckets.iter().all(|e| e.value().is_empty())
+    }
+}
+
+/// Worker registry with a layered pool structure.
+///
+/// Workers are organized as `model_id -> framework -> {regular, pd-prefill,
+/// pd-decode}` in `pools`. The other maps are secondary indexes over the same
+/// workers for lookup by ID / URL / connection mode and for consistent hashing.
 #[derive(Debug)]
 pub struct WorkerRegistry {
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
-    /// Model index for O(1) lookups using immutable snapshots.
-    /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
-    model_index: ModelIndex,
+    /// Layered pools: model_id -> framework -> role buckets.
+    /// Replaces the former flat model_index + type_workers indexes.
+    pools: Arc<DashMap<String, Arc<ModelPool>>>,
 
     /// Consistent hash rings per model for O(log n) routing.
     /// Rebuilt on worker add/remove (copy-on-write).
     hash_rings: Arc<DashMap<String, Arc<HashRing>>>,
-
-    /// Workers indexed by worker type
-    type_workers: Arc<DashMap<WorkerType, Vec<WorkerId>>>,
 
     /// Workers indexed by connection mode
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
@@ -203,28 +321,58 @@ impl WorkerRegistry {
     pub fn new() -> Self {
         Self {
             workers: Arc::new(DashMap::new()),
-            model_index: Arc::new(DashMap::new()),
+            pools: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
-            type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
         }
     }
 
-    /// Rebuild the hash ring for a model based on current workers in the model index
+    /// Rebuild the hash ring for a model based on the current workers in its pool
     fn rebuild_hash_ring(&self, model_id: &str) {
-        if let Some(workers) = self.model_index.get(model_id) {
-            let ring = HashRing::new(&workers);
-            self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
-        } else {
+        let workers = self.get_by_model(model_id);
+        if workers.is_empty() {
             // No workers for this model, remove the ring
             self.hash_rings.remove(model_id);
+        } else {
+            let ring = HashRing::new(&workers);
+            self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
         }
     }
 
     /// Get the hash ring for a model (O(1) lookup)
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
+    }
+
+    /// Add a worker into its `model -> framework -> role` bucket (copy-on-write).
+    fn pool_add(&self, worker: &Arc<dyn Worker>) {
+        let model_id = worker.model_id().to_string();
+        let framework = *worker.framework();
+        let role = worker.worker_type().pool_role();
+
+        let pool = self
+            .pools
+            .entry(model_id)
+            .or_insert_with(|| Arc::new(ModelPool::default()))
+            .clone();
+
+        let mut bucket = pool.buckets.entry(framework).or_default();
+        *bucket = bucket.with_added(role, worker.clone());
+    }
+
+    /// Remove a worker (identified by url) from its `model -> framework -> role`
+    /// bucket (copy-on-write). Cleans up empty pools.
+    fn pool_remove(&self, model_id: &str, framework: Framework, role: PoolRole, url: &str) {
+        if let Some(pool) = self.pools.get(model_id).map(|p| p.clone()) {
+            if let Some(mut bucket) = pool.buckets.get_mut(&framework) {
+                *bucket = bucket.with_removed(role, url);
+            }
+            pool.buckets.retain(|_, b| !b.is_empty());
+            if pool.is_empty() {
+                self.pools.remove(model_id);
+            }
+        }
     }
 
     /// Register a new worker
@@ -236,6 +384,24 @@ impl WorkerRegistry {
             WorkerId::new()
         };
 
+        // If a worker with this URL already exists, drop its old pool entry first
+        // (its model/framework/role may have changed on update).
+        if let Some(old) = self.workers.get(&worker_id).map(|w| w.clone()) {
+            let old_model = old.model_id().to_string();
+            self.pool_remove(
+                &old_model,
+                *old.framework(),
+                old.worker_type().pool_role(),
+                old.url(),
+            );
+            if let Some(mut conn_workers) = self.connection_workers.get_mut(old.connection_mode()) {
+                conn_workers.retain(|id| id != &worker_id);
+            }
+            if old_model != worker.model_id() {
+                self.rebuild_hash_ring(&old_model);
+            }
+        }
+
         // Store worker
         self.workers.insert(worker_id.clone(), worker.clone());
 
@@ -243,27 +409,12 @@ impl WorkerRegistry {
         self.url_to_id
             .insert(worker.url().to_string(), worker_id.clone());
 
-        // Update model index for O(1) lookups using copy-on-write
-        // This creates a new immutable snapshot with the added worker
+        // Insert into the layered pool (model -> framework -> role), copy-on-write.
         let model_id = worker.model_id().to_string();
-        self.model_index
-            .entry(model_id.clone())
-            .and_modify(|existing| {
-                // Create new snapshot with the additional worker
-                let mut new_workers: Vec<Arc<dyn Worker>> = existing.iter().cloned().collect();
-                new_workers.push(worker.clone());
-                *existing = Arc::from(new_workers.into_boxed_slice());
-            })
-            .or_insert_with(|| Arc::from(vec![worker.clone()].into_boxed_slice()));
+        self.pool_add(&worker);
 
         // Rebuild hash ring for this model
         self.rebuild_hash_ring(&model_id);
-
-        // Update type index (clone needed for DashMap key ownership)
-        self.type_workers
-            .entry(worker.worker_type().clone())
-            .or_default()
-            .push(worker_id.clone());
 
         // Update connection mode index (clone needed for DashMap key ownership)
         self.connection_workers
@@ -296,26 +447,17 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
-            // Remove from model index using copy-on-write
-            // Create new snapshot without the removed worker
-            let worker_url = worker.url();
+            // Remove from the layered pool (model -> framework -> role), copy-on-write.
             let model_id = worker.model_id().to_string();
-            if let Some(mut entry) = self.model_index.get_mut(&model_id) {
-                let new_workers: Vec<Arc<dyn Worker>> = entry
-                    .iter()
-                    .filter(|w| w.url() != worker_url)
-                    .cloned()
-                    .collect();
-                *entry = Arc::from(new_workers.into_boxed_slice());
-            }
+            self.pool_remove(
+                &model_id,
+                *worker.framework(),
+                worker.worker_type().pool_role(),
+                worker.url(),
+            );
 
             // Rebuild hash ring for this model
             self.rebuild_hash_ring(&model_id);
-
-            // Remove from type index
-            if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
-                type_workers.retain(|id| id != worker_id);
-            }
 
             // Remove from connection mode index
             if let Some(mut conn_workers) =
@@ -352,44 +494,78 @@ impl WorkerRegistry {
         self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
-    /// Empty worker slice constant for returning when no workers found
-    const EMPTY_WORKERS: &'static [Arc<dyn Worker>] = &[];
-
-    /// Get all workers for a model (O(1) optimized, lock-free)
-    /// Returns an Arc to the immutable worker slice - just an atomic refcount bump.
-    /// This is the fastest possible read path with zero contention.
-    pub fn get_by_model(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
-        self.model_index
-            .get(model_id)
-            .map(|workers| Arc::clone(&workers))
-            .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
+    /// Get the layered pool for a model, if it exists.
+    pub fn get_model_pool(&self, model_id: &str) -> Option<Arc<ModelPool>> {
+        self.pools.get(model_id).map(|p| p.clone())
     }
 
-    /// Get all workers by worker type
-    pub fn get_by_type(&self, worker_type: &WorkerType) -> Vec<Arc<dyn Worker>> {
-        self.type_workers
-            .get(worker_type)
-            .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
+    /// Frameworks that currently have workers registered for a model.
+    pub fn get_frameworks(&self, model_id: &str) -> Vec<Framework> {
+        self.pools
+            .get(model_id)
+            .map(|p| p.frameworks())
             .unwrap_or_default()
     }
 
-    /// Get all prefill workers (regardless of bootstrap_port)
-    pub fn get_prefill_workers(&self) -> Vec<Arc<dyn Worker>> {
-        self.workers
+    /// Direct access to a single pool bucket: (model, framework, role).
+    /// Returns an immutable Arc slice — lock-free, just a refcount bump.
+    pub fn get_pool(
+        &self,
+        model_id: &str,
+        framework: &Framework,
+        role: PoolRole,
+    ) -> Arc<[Arc<dyn Worker>]> {
+        self.pools
+            .get(model_id)
+            .and_then(|p| p.framework_buckets(framework))
+            .map(|b| b.bucket(role))
+            .unwrap_or_else(empty_worker_slice)
+    }
+
+    /// Get all workers for a model (across every framework and role).
+    pub fn get_by_model(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
+        match self.pools.get(model_id) {
+            Some(pool) => Arc::from(pool.all().into_boxed_slice()),
+            None => empty_worker_slice(),
+        }
+    }
+
+    /// Get all workers matching a worker type (across all models/frameworks).
+    pub fn get_by_type(&self, worker_type: &WorkerType) -> Vec<Arc<dyn Worker>> {
+        let role = worker_type.pool_role();
+        self.pools
             .iter()
-            .filter_map(|entry| {
-                let worker = entry.value();
-                match worker.worker_type() {
-                    WorkerType::Prefill { .. } => Some(worker.clone()),
-                    _ => None,
-                }
+            .flat_map(|pool| {
+                pool.buckets
+                    .iter()
+                    .flat_map(|b| b.value().bucket(role).iter().cloned().collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|w| w.worker_type() == worker_type)
+            .collect()
+    }
+
+    /// Collect every worker in a given pool role across all models/frameworks.
+    fn collect_role(&self, role: PoolRole) -> Vec<Arc<dyn Worker>> {
+        self.pools
+            .iter()
+            .flat_map(|pool| {
+                pool.buckets
+                    .iter()
+                    .flat_map(|b| b.value().bucket(role).iter().cloned().collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
 
+    /// Get all prefill workers (regardless of bootstrap_port)
+    pub fn get_prefill_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.collect_role(PoolRole::PrefillPD)
+    }
+
     /// Get all decode workers
     pub fn get_decode_workers(&self) -> Vec<Arc<dyn Worker>> {
-        self.get_by_type(&WorkerType::Decode)
+        self.collect_role(PoolRole::DecodePD)
     }
 
     /// Get all workers by connection mode
@@ -448,7 +624,7 @@ impl WorkerRegistry {
 
     /// Get all model IDs with workers (lock-free)
     pub fn get_models(&self) -> Vec<String> {
-        self.model_index
+        self.pools
             .iter()
             .filter(|entry| !entry.value().is_empty())
             .map(|entry| entry.key().clone())
@@ -461,22 +637,22 @@ impl WorkerRegistry {
     /// - model_id: Filter by specific model
     /// - worker_type: Filter by worker type (Regular, Prefill, Decode)
     /// - connection_mode: Filter by connection mode (Http, Grpc)
-    /// - runtime_type: Filter by runtime type (Sglang, Vllm)
+    /// - framework: Filter by framework (Sglang, Vllm, Atom, Anonymous)
     /// - healthy_only: Only return healthy workers
     pub fn get_workers_filtered(
         &self,
         model_id: Option<&str>,
         worker_type: Option<WorkerType>,
         connection_mode: Option<ConnectionMode>,
-        runtime_type: Option<RuntimeType>,
+        framework: Option<Framework>,
         healthy_only: bool,
     ) -> Vec<Arc<dyn Worker>> {
-        // Start with the most efficient collection based on filters
-        // Use model index when possible as it's O(1) lookup
-        let workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
-            self.get_by_model(model).to_vec()
-        } else {
-            self.get_all()
+        // Start with the narrowest collection the pool layout allows.
+        // Best case: (model, framework, role) hits a single bucket directly.
+        let workers: Vec<Arc<dyn Worker>> = match (model_id, &framework, &worker_type) {
+            (Some(model), Some(fw), Some(wt)) => self.get_pool(model, fw, wt.pool_role()).to_vec(),
+            (Some(model), _, _) => self.get_by_model(model).to_vec(),
+            _ => self.get_all(),
         };
 
         // Apply remaining filters
@@ -497,9 +673,9 @@ impl WorkerRegistry {
                     }
                 }
 
-                // Check runtime_type if specified
-                if let Some(ref rt) = runtime_type {
-                    if w.metadata().runtime_type != *rt {
+                // Check framework if specified
+                if let Some(ref fw) = framework {
+                    if w.framework() != fw {
                         return false;
                     }
                 }
@@ -519,7 +695,7 @@ impl WorkerRegistry {
         let total_workers = self.workers.len();
         // Count models directly instead of allocating Vec via get_models() (lock-free)
         let total_models = self
-            .model_index
+            .pools
             .iter()
             .filter(|entry| !entry.value().is_empty())
             .count();
@@ -579,12 +755,17 @@ impl WorkerRegistry {
     /// Get counts of regular and PD workers efficiently (O(1))
     /// This avoids the overhead of get_all() which allocates memory and iterates all workers
     pub fn get_worker_distribution(&self) -> (usize, usize) {
-        // Use the existing type_workers index for O(1) lookup
-        let regular_count = self
-            .type_workers
-            .get(&WorkerType::Regular)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        // Sum the regular buckets across every model/framework pool.
+        let regular_count: usize = self
+            .pools
+            .iter()
+            .map(|pool| {
+                pool.buckets
+                    .iter()
+                    .map(|b| b.value().bucket(PoolRole::Regular).len())
+                    .sum::<usize>()
+            })
+            .sum();
 
         // Get total workers count efficiently from DashMap
         let total_workers = self.workers.len();
@@ -686,7 +867,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+    use crate::core::{
+        circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, UNKNOWN_MODEL_ID,
+    };
 
     #[test]
     fn test_worker_registry() {
@@ -1133,5 +1316,159 @@ mod tests {
 
         assert_eq!(id1.as_str(), id2.as_str());
         assert_eq!(registry.len(), 1);
+    }
+
+    fn make_worker_fw(
+        url: &str,
+        wtype: WorkerType,
+        model_id: &str,
+        framework: Framework,
+    ) -> Arc<dyn Worker> {
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), model_id.to_string());
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(wtype)
+                .framework(framework)
+                .labels(labels)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn test_layered_pool_direct_bucket_access() {
+        let registry = WorkerRegistry::new();
+        // Same model, different frameworks and roles.
+        registry.register(make_worker_fw(
+            "http://r1:8000",
+            WorkerType::Regular,
+            "m",
+            Framework::Vllm,
+        ));
+        registry.register(make_worker_fw(
+            "http://p1:8000",
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            "m",
+            Framework::Vllm,
+        ));
+        registry.register(make_worker_fw(
+            "http://d1:8000",
+            WorkerType::Decode,
+            "m",
+            Framework::Vllm,
+        ));
+        registry.register(make_worker_fw(
+            "http://r2:8000",
+            WorkerType::Regular,
+            "m",
+            Framework::Sglang,
+        ));
+
+        // Direct bucket access hits exactly one (model, framework, role).
+        assert_eq!(
+            registry
+                .get_pool("m", &Framework::Vllm, PoolRole::Regular)
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .get_pool("m", &Framework::Vllm, PoolRole::PrefillPD)
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .get_pool("m", &Framework::Vllm, PoolRole::DecodePD)
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .get_pool("m", &Framework::Sglang, PoolRole::Regular)
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .get_pool("m", &Framework::Sglang, PoolRole::PrefillPD)
+                .len(),
+            0
+        );
+
+        // Frameworks present for the model.
+        let mut fws = registry.get_frameworks("m");
+        fws.sort_by_key(|f| f.to_string());
+        assert_eq!(fws, vec![Framework::Sglang, Framework::Vllm]);
+
+        // Aggregates across frameworks/roles.
+        assert_eq!(registry.get_by_model("m").len(), 4);
+        assert_eq!(registry.get_prefill_workers().len(), 1);
+        assert_eq!(registry.get_decode_workers().len(), 1);
+    }
+
+    #[test]
+    fn test_layered_pool_defaults_unknown_and_anonymous() {
+        let registry = WorkerRegistry::new();
+        // No model_id label and default (Anonymous) framework.
+        let w: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .worker_type(WorkerType::Regular)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+        registry.register(w);
+
+        assert_eq!(
+            registry
+                .get_pool(UNKNOWN_MODEL_ID, &Framework::Anonymous, PoolRole::Regular)
+                .len(),
+            1
+        );
+        assert_eq!(registry.get_models(), vec![UNKNOWN_MODEL_ID.to_string()]);
+    }
+
+    #[test]
+    fn test_layered_pool_remove_shrinks_bucket() {
+        let registry = WorkerRegistry::new();
+        registry.register(make_worker_fw(
+            "http://a:8000",
+            WorkerType::Regular,
+            "m",
+            Framework::Atom,
+        ));
+        registry.register(make_worker_fw(
+            "http://b:8000",
+            WorkerType::Regular,
+            "m",
+            Framework::Atom,
+        ));
+        assert_eq!(
+            registry
+                .get_pool("m", &Framework::Atom, PoolRole::Regular)
+                .len(),
+            2
+        );
+
+        registry.remove_by_url("http://a:8000");
+        assert_eq!(
+            registry
+                .get_pool("m", &Framework::Atom, PoolRole::Regular)
+                .len(),
+            1
+        );
+
+        registry.remove_by_url("http://b:8000");
+        // Pool emptied -> model gone.
+        assert_eq!(
+            registry
+                .get_pool("m", &Framework::Atom, PoolRole::Regular)
+                .len(),
+            0
+        );
+        assert!(registry.get_models().is_empty());
     }
 }

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     worker::{
-        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
+        BasicWorker, ConnectionMode, DPAwareWorker, Framework, HealthConfig, WorkerMetadata,
         WorkerRoutingKeyLoad, WorkerType,
     },
 };
@@ -17,7 +17,7 @@ pub struct BasicWorkerBuilder {
     api_key: Option<String>,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
-    runtime_type: RuntimeType,
+    framework: Framework,
     labels: HashMap<String, String>,
     model_id: Option<String>,
     tokenizer_path: Option<String>,
@@ -37,7 +37,7 @@ impl BasicWorkerBuilder {
             api_key: None,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            framework: Framework::default(),
             labels: HashMap::new(),
             model_id: None,
             tokenizer_path: None,
@@ -57,7 +57,7 @@ impl BasicWorkerBuilder {
             api_key: None,
             worker_type,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            framework: Framework::default(),
             labels: HashMap::new(),
             model_id: None,
             tokenizer_path: None,
@@ -88,9 +88,9 @@ impl BasicWorkerBuilder {
         self
     }
 
-    /// Set the runtime type (SGLang or vLLM)
-    pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
-        self.runtime_type = runtime_type;
+    /// Set the inference framework (Sglang/Vllm/Atom/Anonymous)
+    pub fn framework(mut self, framework: Framework) -> Self {
+        self.framework = framework;
         self
     }
 
@@ -196,7 +196,7 @@ impl BasicWorkerBuilder {
             api_key: self.api_key,
             worker_type: self.worker_type,
             connection_mode: self.connection_mode,
-            runtime_type: self.runtime_type,
+            framework: self.framework,
             labels: self.labels,
             health_config: self.health_config,
             bootstrap_host,
@@ -247,7 +247,7 @@ pub struct DPAwareWorkerBuilder {
     dp_size: usize,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
-    runtime_type: RuntimeType,
+    framework: Framework,
     labels: HashMap<String, String>,
     model_id: Option<String>,
     tokenizer_path: Option<String>,
@@ -269,7 +269,7 @@ impl DPAwareWorkerBuilder {
             dp_size,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            framework: Framework::default(),
             labels: HashMap::new(),
             model_id: None,
             tokenizer_path: None,
@@ -296,7 +296,7 @@ impl DPAwareWorkerBuilder {
             dp_size,
             worker_type,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            framework: Framework::default(),
             labels: HashMap::new(),
             model_id: None,
             tokenizer_path: None,
@@ -327,9 +327,9 @@ impl DPAwareWorkerBuilder {
         self
     }
 
-    /// Set the runtime type (SGLang or vLLM)
-    pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
-        self.runtime_type = runtime_type;
+    /// Set the inference framework (Sglang/Vllm/Atom/Anonymous)
+    pub fn framework(mut self, framework: Framework) -> Self {
+        self.framework = framework;
         self
     }
 
@@ -399,7 +399,7 @@ impl DPAwareWorkerBuilder {
         let mut builder = BasicWorkerBuilder::new(worker_url)
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
-            .runtime_type(self.runtime_type)
+            .framework(self.framework)
             .labels(self.labels)
             .health_config(self.health_config)
             .circuit_breaker_config(self.circuit_breaker_config);
@@ -655,18 +655,18 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_worker_runtime_type() {
+    fn test_basic_worker_framework() {
         let worker = BasicWorkerBuilder::new("http://w:8000")
-            .runtime_type(RuntimeType::Vllm)
+            .framework(Framework::Vllm)
             .build();
 
-        assert_eq!(worker.metadata().runtime_type, RuntimeType::Vllm);
+        assert_eq!(worker.metadata().framework, Framework::Vllm);
     }
 
     #[test]
-    fn test_basic_worker_default_runtime_is_sglang() {
+    fn test_basic_worker_default_framework_is_anonymous() {
         let worker = BasicWorkerBuilder::new("http://w:8000").build();
-        assert_eq!(worker.metadata().runtime_type, RuntimeType::Sglang);
+        assert_eq!(worker.metadata().framework, Framework::Anonymous);
     }
 
     #[test]
@@ -756,12 +756,12 @@ mod tests {
     }
 
     #[test]
-    fn test_dp_aware_worker_runtime_type() {
+    fn test_dp_aware_worker_framework() {
         let worker = DPAwareWorkerBuilder::new("http://w:8000", 0, 2)
-            .runtime_type(RuntimeType::Vllm)
+            .framework(Framework::Vllm)
             .build();
 
-        assert_eq!(worker.metadata().runtime_type, RuntimeType::Vllm);
+        assert_eq!(worker.metadata().framework, Framework::Vllm);
     }
 
     #[test]

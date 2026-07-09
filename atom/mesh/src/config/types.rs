@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ConfigResult;
-use crate::core::ConnectionMode;
+use crate::core::{ConnectionMode, Framework};
 
 /// Backend runtime type for inference workers.
 /// Determines PD-disaggregation protocol (SGLang dual-dispatch+bootstrap vs vLLM Mooncake kv_transfer_params).
@@ -14,6 +14,18 @@ pub enum BackendType {
     Vllm,
     #[serde(rename = "atom")]
     Atom,
+}
+
+/// Map the router-level backend to a per-worker framework.
+/// (`BackendType` has no anonymous variant, so this is total.)
+impl From<BackendType> for Framework {
+    fn from(backend: BackendType) -> Self {
+        match backend {
+            BackendType::Sglang => Framework::Sglang,
+            BackendType::Vllm => Framework::Vllm,
+            BackendType::Atom => Framework::Atom,
+        }
+    }
 }
 
 /// Main router configuration

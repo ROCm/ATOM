@@ -100,7 +100,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     crate::core::DPAwareWorkerBuilder::new(base_url, dp_rank, dp_size)
                         .worker_type(worker.worker_type().clone())
                         .connection_mode(worker.connection_mode().clone())
-                        .runtime_type(worker.metadata().runtime_type.clone())
+                        .framework(worker.metadata().framework)
                         .labels(updated_labels)
                         .health_config(updated_health_config.clone());
 
@@ -129,7 +129,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 let mut builder = BasicWorkerBuilder::new(worker.url())
                     .worker_type(worker.worker_type().clone())
                     .connection_mode(worker.connection_mode().clone())
-                    .runtime_type(worker.metadata().runtime_type.clone())
+                    .framework(worker.metadata().framework)
                     .labels(updated_labels)
                     .health_config(updated_health_config.clone());
 

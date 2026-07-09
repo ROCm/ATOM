@@ -30,8 +30,8 @@ pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
-    AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoadGuard,
-    WorkerType,
+    AttachedBody, BasicWorker, ConnectionMode, Framework, HealthConfig, PoolRole, Worker,
+    WorkerLoadGuard, WorkerType,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};

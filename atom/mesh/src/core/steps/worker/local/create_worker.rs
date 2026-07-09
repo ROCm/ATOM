@@ -11,7 +11,7 @@ use crate::{
     core::{
         circuit_breaker::CircuitBreakerConfig,
         steps::workflow_data::LocalWorkerWorkflowData,
-        worker::{HealthConfig, RuntimeType, WorkerType},
+        worker::{Framework, HealthConfig, WorkerType},
         BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
     protocols::worker_spec::WorkerConfigRequest,
@@ -95,7 +95,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         let worker_type = parse_worker_type(config);
 
         // Get runtime type (for gRPC workers)
-        let runtime_type = determine_runtime_type(connection_mode, &context.data, config);
+        let framework = determine_framework(connection_mode, &context.data, config);
 
         // Build circuit breaker config
         let circuit_breaker_config = build_circuit_breaker_config(app_context);
@@ -121,7 +121,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                 &model_id,
                 worker_type,
                 connection_mode,
-                runtime_type,
+                framework,
                 circuit_breaker_config,
                 health_config,
                 config,
@@ -133,7 +133,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                 &model_id,
                 worker_type,
                 connection_mode,
-                runtime_type,
+                framework,
                 circuit_breaker_config,
                 health_config,
                 config,
@@ -166,27 +166,29 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
         .unwrap_or(WorkerType::Regular)
 }
 
-fn determine_runtime_type(
+fn determine_framework(
     connection_mode: &ConnectionMode,
     data: &LocalWorkerWorkflowData,
     config: &WorkerConfigRequest,
-) -> RuntimeType {
-    if !matches!(connection_mode, ConnectionMode::Grpc { .. }) {
-        return RuntimeType::Sglang;
-    }
+) -> Framework {
+    // Prefer the framework detected from the worker, then the configured one.
+    let declared = data
+        .detected_runtime_type
+        .as_deref()
+        .or(config.runtime.as_deref());
 
-    if let Some(ref detected_runtime) = data.detected_runtime_type {
-        match detected_runtime.as_str() {
-            "vllm" => RuntimeType::Vllm,
-            _ => RuntimeType::Sglang,
-        }
-    } else if let Some(ref runtime) = config.runtime {
-        match runtime.as_str() {
-            "vllm" => RuntimeType::Vllm,
-            _ => RuntimeType::Sglang,
-        }
-    } else {
-        RuntimeType::Sglang
+    match connection_mode {
+        // gRPC transport is only implemented for Sglang/Vllm engine clients,
+        // so a gRPC worker must resolve to one of those. Default to Sglang.
+        ConnectionMode::Grpc { .. } => match declared.map(Framework::from) {
+            Some(Framework::Vllm) => Framework::Vllm,
+            _ => Framework::Sglang,
+        },
+        // HTTP workers carry framework for pool classification only.
+        // Honor whatever was declared (incl. atom); undeclared -> Anonymous.
+        ConnectionMode::Http => declared
+            .map(Framework::from)
+            .unwrap_or(Framework::Anonymous),
     }
 }
 
@@ -230,7 +232,7 @@ fn create_dp_aware_workers(
     model_id: &str,
     worker_type: WorkerType,
     connection_mode: &ConnectionMode,
-    runtime_type: RuntimeType,
+    framework: Framework,
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
     config: &WorkerConfigRequest,
@@ -253,7 +255,7 @@ fn create_dp_aware_workers(
                 .model_id(model_id)
                 .worker_type(worker_type.clone())
                 .connection_mode(connection_mode.clone())
-                .runtime_type(runtime_type.clone())
+                .framework(framework)
                 .circuit_breaker_config(circuit_breaker_config.clone())
                 .health_config(health_config.clone());
 
@@ -299,7 +301,7 @@ fn create_single_worker(
     model_id: &str,
     worker_type: WorkerType,
     connection_mode: &ConnectionMode,
-    runtime_type: RuntimeType,
+    framework: Framework,
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
     config: &WorkerConfigRequest,
@@ -311,7 +313,7 @@ fn create_single_worker(
         .model_id(model_id)
         .worker_type(worker_type)
         .connection_mode(connection_mode.clone())
-        .runtime_type(runtime_type)
+        .framework(framework)
         .circuit_breaker_config(circuit_breaker_config)
         .health_config(health_config);
 
