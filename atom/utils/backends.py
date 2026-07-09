@@ -420,26 +420,35 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 self.vllm_backend,
             )
 
-            # if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            #     # resolve the static graph wrapper class (e.g. CUDAGraphWrapper
-            #     # class) as platform dependent.
-            #     static_graph_wrapper_class = resolve_obj_by_qualname(
-            #         get_static_graph_wrapper_cls())
+            # Wrap each compiled dense piece in a PIECEWISE CUDAGraphWrapper so
+            # it captures/replays its own cudagraph (attention runs eager between
+            # pieces). Gated on cudagraph_mode requesting piecewise; otherwise
+            # keep the bare piecewise_backend (compiled, no per-piece cudagraph —
+            # the pre-existing behavior, e.g. FULL manual capture in the runner).
+            _cg_mode = self.compilation_config.cudagraph_mode
+            # Driven by --cudagraph-mode. Default FULL -> requires_piecewise is
+            # False -> bare piecewise_backend (compiled pieces inside the manual
+            # FULL whole-forward capture, i.e. existing behavior). PIECEWISE ->
+            # wrap each piece in its own cudagraph.
+            _pw_cg = (
+                _cg_mode is not None
+                and _cg_mode.requires_piecewise_compilation()
+            )
+            if _pw_cg:
+                from .cuda_graph import CUDAGraphOptions, CUDAGraphWrapper
 
-            #     # Always assign PIECEWISE runtime mode to the
-            #     # CUDAGraphWrapper for piecewise_backend, to distinguish
-            #     # it from the FULL cudagraph runtime mode, no matter it
-            #     # is wrapped on a full or piecewise fx graph.
-            #     self.module.__dict__[target] = static_graph_wrapper_class(
-            #         runnable=piecewise_backend,
-            #         vllm_config=self.vllm_config,
-            #         runtime_mode=CUDAGraphMode.PIECEWISE,
-            #         cudagraph_options=CUDAGraphOptions(
-            #             debug_log_enable=piecewise_backend.is_first_graph,
-            #             gc_disable=not piecewise_backend.is_first_graph,
-            #             weak_ref_output=piecewise_backend.is_last_graph))
-            # else:
-            self.module.__dict__[target] = piecewise_backend
+                self.module.__dict__[target] = CUDAGraphWrapper(
+                    runnable=piecewise_backend,
+                    vllm_config=self.vllm_config,
+                    runtime_mode=CUDAGraphMode.PIECEWISE,
+                    cudagraph_options=CUDAGraphOptions(
+                        debug_log_enable=piecewise_backend.is_first_graph,
+                        gc_disable=not piecewise_backend.is_first_graph,
+                        weak_ref_output=piecewise_backend.is_last_graph,
+                    ),
+                )
+            else:
+                self.module.__dict__[target] = piecewise_backend
 
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
 

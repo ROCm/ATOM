@@ -545,6 +545,16 @@ class ForwardContext:
     # forward, so it ignores the flag entirely.
     in_hipgraph: bool = False
 
+    # Piecewise-cudagraph dispatch. CUDAGraphWrapper (atom/utils/cuda_graph.py)
+    # reads these per forward: cudagraph_runtime_mode selects which wrapper
+    # (PIECEWISE / FULL) captures-or-replays this step, and batch_descriptor is
+    # the dispatch key (num_tokens). Defaults keep every wrapper INERT
+    # (pass-through) — None never equals CUDAGraphMode.NONE nor any wrapper's
+    # runtime_mode, so nothing changes until model_runner sets them per step.
+    # Typed Any to avoid a circular import of CUDAGraphMode/BatchDescriptor.
+    cudagraph_runtime_mode: Any = None
+    batch_descriptor: Optional[Any] = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}

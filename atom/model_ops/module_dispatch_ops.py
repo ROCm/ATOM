@@ -54,7 +54,21 @@ def maybe_dual_stream_forward(
     # Under TBO the two micro-batches already overlap on separate threads
     from atom.utils.tbo.ubatching import tbo_active
 
-    if self._use_dual_stream and 0 < num_tokens <= threshold and not tbo_active():
+    # cudagraph capture: dual_stream_moe_forward forks work onto `alt_stream`
+    # and allocates there; a side-stream allocation while the stream is capturing
+    # raises HIP "operation not permitted when stream is capturing". The whole
+    # per-bucket capture (incl. the eager warmup forward) runs inside a
+    # graph_capture() stream-capture context, and cudagraph_runtime_mode is only
+    # PIECEWISE for the narrow capture call (not the warmup) — so gate on the
+    # ACTUAL capture state, which covers warmup + capture and FULL too.
+    _capturing = torch.cuda.is_current_stream_capturing()
+
+    if (
+        self._use_dual_stream
+        and 0 < num_tokens <= threshold
+        and not tbo_active()
+        and not _capturing
+    ):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)
 

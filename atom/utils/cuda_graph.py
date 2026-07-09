@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional, NamedTuple
 from unittest.mock import patch
@@ -61,6 +62,21 @@ class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+
+
+# Shared cudagraph pool across piecewise pieces. Start None (first
+# torch.cuda.graph makes a private pool the warmup primed -> no hipMalloc during
+# capture on ROCm), then reuse that graph's pool for the rest.
+_shared_graph_pool: Optional[Any] = None
+
+# Per-num_tokens cudagraph pools. Under PIECEWISE with per-step VARYING
+# num_tokens (DSpark 1d), a single global pool lets graphs of DIFFERENT shapes
+# reuse overlapping memory -> replay reads another shape's leftover -> silent
+# corruption (replay != eager, only at large/varied num_tokens). Isolating one
+# pool PER num_tokens bucket removes the cross-shape overlap while keeping the
+# 61 same-shape pieces sharing (sequential -> safe). Memory ~ n_buckets * one
+# forward's pool (a few GB), vs ~22GB for fully-independent per-graph pools.
+_graph_pools: dict = {}
 
 
 class CUDAGraphWrapper:
@@ -187,8 +203,23 @@ class CUDAGraphWrapper:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
 
-                # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool):
+                import atom.utils.cuda_graph as _cg_mod
+                # One cudagraph pool PER num_tokens bucket. A single global pool
+                # would let graphs of DIFFERENT num_tokens (PIECEWISE + DSpark 1d
+                # varying shapes) reuse overlapping memory -> replay reads another
+                # shape's leftover -> silent output corruption (only at
+                # large/varied num_tokens; confirmed via GSM8K). Isolating per
+                # num_tokens removes the cross-shape overlap; the same-shape pieces
+                # still share their bucket's pool. ATOM_GLOBAL_POOL=1 restores the
+                # old single pool (reproduces the corruption; A/B only).
+                _global = os.environ.get("ATOM_GLOBAL_POOL") == "1"
+                _bkey = batch_descriptor.num_tokens if batch_descriptor else 0
+                _pool = (
+                    _cg_mod._shared_graph_pool
+                    if _global
+                    else _cg_mod._graph_pools.get(_bkey)
+                )
+                with torch.cuda.graph(cudagraph, pool=_pool):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.cudagraph_options.weak_ref_output:
@@ -202,6 +233,14 @@ class CUDAGraphWrapper:
 
             # here we always use weak ref for the output
             # to save memory
+            if _global:
+                if _cg_mod._shared_graph_pool is None:
+                    _cg_mod._shared_graph_pool = cudagraph.pool()
+            elif _bkey not in _cg_mod._graph_pools:
+                # first graph of this num_tokens bucket -> remember its pool so
+                # the remaining same-bucket pieces reuse it.
+                _cg_mod._graph_pools[_bkey] = cudagraph.pool()
+
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
 
