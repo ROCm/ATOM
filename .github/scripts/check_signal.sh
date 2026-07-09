@@ -51,7 +51,7 @@ get_target_head_sha() {
   fi
 
   case "${SIGNAL_EVENT_NAME}" in
-    pull_request|pull_request_target)
+    pull_request|pull_request_target|pull_request_review)
       python3 - <<'PY'
 import json
 import os
