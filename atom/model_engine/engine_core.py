@@ -97,10 +97,10 @@ class EngineCore:
         # Initialize model runner processes
         try:
             good = False
-            # Number of worker processes = full model-parallel world size.
-            # PCP is an independent dimension (world = tp x pcp), so spawn
-            # tp x pcp workers; otherwise init_dist_env (which expects a world
-            # of tp x pcp) would hang waiting for the PCP ranks.
+            # Number of worker processes for THIS EngineCore = one pipeline
+            # stage's slice = tp x pcp. Pipeline parallelism spans *separate*
+            # EngineCores (one per stage, spawned by CoreManager), not extra
+            # workers inside a single EngineCore — so pp does NOT multiply here.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
                 config.tensor_parallel_size * config.prefill_context_parallel_size,
@@ -215,7 +215,14 @@ class EngineCore:
         enable_orphan_reaping()
         engine: EngineCore = None
         try:
-            if config.parallel_config.data_parallel_size > 1:
+            if config.pipeline_parallel_size > 1:
+                from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+                set_process_title(
+                    f"EngineCore_PP{config.parallel_config.pipeline_parallel_rank}"
+                )
+                engine = PPEngineCoreProc(config, input_address, output_address)
+            elif config.parallel_config.data_parallel_size > 1:
                 set_process_title(
                     f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
                 )

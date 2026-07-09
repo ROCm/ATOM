@@ -30,6 +30,7 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
@@ -80,6 +81,14 @@ class EngineArgs:
             type=int,
             default=1,
             help="Tensor parallel size.",
+        )
+        parser.add_argument(
+            "--pipeline-parallel-size",
+            "-pp",
+            type=int,
+            default=1,
+            help="Pipeline parallel size. Splits the model's layers across "
+            "stages (world = tp x pp x pcp).",
         )
         parser.add_argument(
             "--prefill-context-parallel-size",
