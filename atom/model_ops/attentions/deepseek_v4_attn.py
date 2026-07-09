@@ -179,6 +179,26 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     `max_per_req_cache_slots * win_with_spec` (per-slot SWA region holds
     `win + mtp_k` ring entries; reduces to `win` when MTP is off)."""
 
+    # ----- Per-token paged-decode index tensors (window-invariant) -----
+    # These feed the aiter asm decode kernel `mla_decode_fwd_v4_nm`, which
+    # treats each token as a 1-token page (page_size=1): every decode query
+    # row is its own "sequence" of q-length 1. Both depend ONLY on N (the
+    # padded decode token count = the captured kernel grid), never on the
+    # batch content — the values are always arange(N+1) / ones(N). Staged
+    # every fwd via the SAME forward_vars path as `kv_indptr_*` /
+    # `kv_indices_*` (`self._stage` → per-fwd H2D into a persistent
+    # CpuGpuBuffer), which is what makes them CUDAGraph-safe: `prepare_decode`
+    # re-copies them into the captured buffer before each `graph.replay()`.
+    # This is the single source of these tensors — the asm wrapper no longer
+    # builds them itself.
+    qo_indptr: Optional[torch.Tensor] = None
+    """[padded_T+1] int32 GPU — per-token q indptr `arange(N+1)` (page_size=1,
+    max_seqlen_q=1). NOT `cu_seqlens_q` (which is per-seq and differs under
+    MTP); this is the per-token indptr the decode kernel consumes."""
+    kv_last_page_lens: Optional[torch.Tensor] = None
+    """[padded_T] int32 GPU — per-token last-page length `ones(N)` (page_size=1
+    → every page is full)."""
+
     # ----- Indexer / sparse-layout side metadata -----
     indexer_meta: Optional[Dict[str, Any]] = None
     """dict — `Indexer.forward_batched` per-fwd GPU tensors. Notable keys:
@@ -1174,6 +1194,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indices_swa = swa_indices_buf
         attn_metadata.kv_indptr_swa = swa_indptr
         attn_metadata.batch_id_per_token = batch_id_per_token
+        # MTP draft step is 1-token-per-seq → the asm decode kernel sees N = bs.
+        # Stage the constant per-token index tensors to that length (same
+        # builder-staged path as the verify-fwd `_attach_v4_paged_decode_meta`).
+        # A tiny constant H2D — independent of eagle's GPU-side state — so it
+        # doesn't reintroduce the CPU-mirror staleness this fast path avoids.
+        attn_metadata.qo_indptr = self._stage(
+            "v4_qo_indptr", self._v4_qo_indptr_np[: bs + 1]
+        )
+        attn_metadata.kv_last_page_lens = self._stage(
+            "v4_kv_last_page_lens", self._v4_kv_last_page_lens_np[:bs]
+        )
+        # [DBG] set ATOM_DBG_QO=1 to inspect whether this MTP fast path is
+        # CG-padded (→ same arange-tail hazard as the decode path). positions is
+        # [bs]; stale/duplicate tail values ⇒ pad rows present. qo_indptr tail
+        # incrementing past the real count ⇒ pad tokens are bogus 1-len queries.
+        if os.environ.get("ATOM_DBG_QO") == "1":
+            print(
+                f"[DBG qo mtp] bs={bs} max_seqlen_q={max_seqlen_q} "
+                f"positions={positions.detach().cpu().tolist()} "
+                f"context_lens={attn_metadata.context_lens.detach().cpu().tolist()} "
+                f"qo_indptr={attn_metadata.qo_indptr.detach().cpu().tolist()}",
+                flush=True,
+            )
 
         # NOT rebuilt (unused by SWA-only MTP layer; would block a future
         # CSA/HCA MTP layer — assert at top guards):
@@ -2188,6 +2231,54 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indptr_hca = hca_indptr_gpu
         attn_metadata.swa_pages = swa_pages
 
+        # Per-token paged-decode index tensors for the asm decode kernel. The
+        # kernel sees N = q_packed.shape[0] = T_pad (padded decode grid). Both
+        # are re-staged every fwd (like kv_indptr_*) so the captured graph sees a
+        # freshly-copied backing store at replay.
+        # qo_indptr: per-token q indptr (page_size=1, max_seqlen_q=1), recomputed
+        # every fwd. The REAL region [0..T] is arange(T+1) — one 1-length query
+        # per real decode token. The CG-padded tail [T+1..T_pad] must NOT keep
+        # counting up (arange-continued): that turns each padded slot into a
+        # bogus 1-length query, which the asm decode kernel then runs against
+        # kv_len=0 (the indptr tail already repeats → 0 keys). An empty-softmax
+        # over 0 keys yields NaN, and because the kernel tiles several tokens per
+        # workgroup, that NaN bleeds into real tokens sharing the tile → CG+bs>1
+        # garbage. Repeating the last real value instead makes each padded slot a
+        # 0-length query (qo_indptr[t+1]-qo_indptr[t]==0) → the kernel bails on it
+        # exactly like the kv_indptr pad tail. Shape stays T_pad+1 (asm contract
+        # qo_indptr.shape[0]==N+1). Per-token, so correct for MTP too.
+        qo_indptr_np = np.empty(T_pad + 1, dtype=np.int32)
+        qo_indptr_np[: T + 1] = np.arange(T + 1, dtype=np.int32)
+        if T_pad > T:
+            qo_indptr_np[T + 1 :] = T
+        attn_metadata.qo_indptr = self._stage("v4_qo_indptr", qo_indptr_np)
+        attn_metadata.kv_last_page_lens = self._stage(
+            "v4_kv_last_page_lens", self._v4_kv_last_page_lens_np[:T_pad]
+        )
+        # [DBG] set ATOM_DBG_QO=1 to inspect the decode path (the garbage path).
+        # T=real decode tokens, T_pad=captured grid. T_pad>T ⇒ CG padding active;
+        # qo_indptr tail should now be flat (repeats T) instead of arange —
+        # padded slots become 0-len queries the asm kernel skips.
+        if os.environ.get("ATOM_DBG_QO") == "1":
+            kv_last_np = self._v4_kv_last_page_lens_np[:T_pad]
+            print(
+                f"[DBG qo decode] state={attn_metadata.state} "
+                f"scheduled_bs={scheduled_bs} T={T} T_pad={T_pad} "
+                f"max_seqlen_q={attn_metadata.max_seqlen_q} "
+                f"(max_seqlen_q==1 & T==scheduled_bs ⇒ pure decode; "
+                f"else MTP verify) "
+                f"qo_indptr={qo_indptr_np.tolist()}\n"
+                f"[DBG kv decode] swa_indptr={swa_indptr_np.tolist()}\n"
+                f"[DBG kv decode] csa_indptr={csa_indptr_np.tolist()}\n"
+                f"[DBG kv decode] hca_indptr={hca_indptr_np.tolist()}\n"
+                f"[DBG kv decode] kv_last_page_lens={kv_last_np.tolist()} "
+                f"(len={kv_last_np.shape[0]})\n"
+                f"[DBG kv decode] kv_indices lens: "
+                f"swa={int(swa_indptr_np[T])} csa={int(csa_indptr_np[T])} "
+                f"hca={int(hca_indptr_np[T])}",
+                flush=True,
+            )
+
     def _build_paged_prefill_meta(
         self,
         attn_metadata: AttentionMetaData_DSV4,
@@ -2415,6 +2506,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indptr_prefix_hca = hca_indptr
         attn_metadata.skip_prefix_len_csa = skip_csa_gpu
         attn_metadata.swa_pages = swa_pages
+
+        # [DBG] set ATOM_DBG_QO=1 to inspect prefill. Per-seq kv_len at prefill
+        # end = chunk_start (this chunk's start pos in the full seq) + token_num
+        # (tokens written this fwd) = position of the last written token + 1 =
+        # the context length the FIRST decode step will attend over. For a
+        # non-chunked prefill chunk_start==0 so kv_len == prompt length.
+        if os.environ.get("ATOM_DBG_QO") == "1":
+            kv_len_end_np = chunk_start_per_seq_np + token_num_per_seq[:scheduled_bs]
+            print(
+                f"[DBG kv prefill] state={attn_metadata.state} "
+                f"scheduled_bs={scheduled_bs} T={T} "
+                f"chunk_start_per_seq={chunk_start_per_seq_np.tolist()} "
+                f"token_num_per_seq={token_num_per_seq[:scheduled_bs].tolist()} "
+                f"kv_len_at_prefill_end={kv_len_end_np.tolist()}",
+                flush=True,
+            )
 
     def _build_compress_plans(
         self,
@@ -2704,6 +2811,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
+
+        # Per-token paged-decode index tensors for the asm decode kernel
+        # (`mla_decode_fwd_v4_nm`, page_size=1). Values are CONSTANT — they
+        # depend only on the (padded) decode token count N, not the batch:
+        #   qo_indptr        = arange(N+1)   (per-token q indptr, max_seqlen_q=1)
+        #   kv_last_page_lens = ones(N)       (page_size=1 → every page full)
+        # Built the SAME way as `kv_indptr_*` / `kv_indices_*`: a CpuGpuBuffer
+        # re-staged via `self._stage(...)` EVERY fwd (see
+        # `_attach_v4_paged_decode_meta` / `prepare_mtp_decode`). The per-fwd
+        # H2D of these constants is what makes them CUDAGraph-safe — at replay,
+        # `prepare_decode` re-copies them into the captured buffer before
+        # `graph.replay()`, exactly as it does for kv_indptr. (A fill-once GPU
+        # buffer is NOT safe here: nothing refreshes it per replay, so a stale
+        # / zero backing store silently corrupts the decode.) The constant
+        # numpy sources are precomputed once so the per-fwd cost is just a
+        # slice + H2D, no arange/ones rebuild.
+        # Sized to the max decode token count (T_dec = max_bs * (1+spec)).
+        bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
+        bufs["v4_kv_last_page_lens"] = CpuGpuBuffer(T_dec, **i32)
+        self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
+        self._v4_kv_last_page_lens_np = np.ones(T_dec, dtype=np.int32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by csa_translate_pack
         # (kernel masks `(k < n_committed) & (k < index_topk)`) AND by the
         # indexer (cast to int64 inline). Built unconditionally in

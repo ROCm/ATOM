@@ -63,46 +63,6 @@ LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use e
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
 
-# Per-device persistent (iota, ones) base buffers, sized once to an upper bound
-# on N and sliced per call — see _v4_decode_const_indices.
-_V4_DECODE_IDX_BUFS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
-
-
-def _v4_decode_const_indices(
-    n: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-token paged-decode index tensors, sliced from persistent buffers.
-
-    ``qo_indptr = arange(N+1)`` (per-token: the kernel runs ``max_seqlen_q=1``,
-    so this is a per-token indptr, NOT the per-seq ``cu_seqlens_q`` — they differ
-    under MTP) and ``kv_last_page_lens = ones(N)`` (page_size=1) depend only on N.
-    Rather than re-allocating them on every layer × window × decode step (each a
-    ``arange`` + ``ones`` fill launch), allocate a single per-device iota/ones
-    buffer once, sized to ``max_num_batched_tokens`` (an upper bound on N), and
-    return contiguous prefix slices ``[:n+1]`` / ``[:n]``.
-
-    The base buffers are persistent with stable addresses and are sized to the
-    max before any CUDAGraph capture, so they are never reallocated — the slices
-    are capture-safe. Values are constant and the decode kernel treats them as
-    read-only, so sharing across calls/layers is safe. This replaces the earlier
-    per-N ``lru_cache`` (which grew unbounded when N was not CG-quantised).
-    """
-    buf = _V4_DECODE_IDX_BUFS.get(device)
-    if buf is None:
-        from atom.config import get_current_atom_config
-
-        max_tokens = int(get_current_atom_config().max_num_batched_tokens)
-        iota = torch.arange(max_tokens + 1, dtype=torch.int32, device=device)
-        ones = torch.ones(max_tokens, dtype=torch.int32, device=device)
-        buf = (iota, ones)
-        _V4_DECODE_IDX_BUFS[device] = buf
-    iota, ones = buf
-    assert (
-        n + 1 <= iota.numel()
-    ), f"decode N={n} exceeds max_num_batched_tokens buffer ({iota.numel() - 1})"
-    return iota[: n + 1], ones[:n]
-
-
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
 #
 # Storage: unified_kv[total_pages, D] in e4m3fnuz + kv_scales[total_pages,
@@ -954,6 +914,8 @@ def _sparse_attn_v4_paged_decode_asm(
     unified_kv_rope: torch.Tensor,
     q_packed_in: torch.Tensor,
     q_rope_in: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
     num_kv_splits: int | None = None,
 ) -> torch.Tensor:
     """Native 2buff fp8 V4 decode via the aiter assembly kernel
@@ -1012,10 +974,17 @@ def _sparse_attn_v4_paged_decode_asm(
     kv_rope = unified_kv_rope.view(-1, page_size, nhead_kv, V4_DIM_ROPE)
 
     # ---- per-token paged layout (one slot per token, decode=1) ----------
-    # qo_indptr/kv_last_page_lens depend only on N (constant per CUDAGraph
-    # batch size) → build once per (N, device) and reuse, instead of firing a
-    # fresh arange + ones (fill) on every layer × window × decode step.
-    qo_indptr, kv_last_page_lens = _v4_decode_const_indices(N, device)
+    # qo_indptr = arange(N+1) and kv_last_page_lens = ones(N) are per-token
+    # (max_seqlen_q=1, page_size=1) and depend ONLY on N. They are built by the
+    # attn_metadata builder (deepseek_v4_attn._attach_v4_paged_decode_meta /
+    # prepare_mtp_decode) via the SAME forward_vars staging path as kv_indptr /
+    # kv_indices — re-staged (H2D into a persistent CpuGpuBuffer) every fwd so
+    # the captured graph reads a freshly-copied backing store at replay — and
+    # threaded in through `sparse_attn_v4_paged_decode`. Required here (the
+    # dispatcher forwards them as Optional only because the bf16/triton path
+    # does not consume them; the asm path always needs them).
+    qo_indptr = qo_indptr.to(torch.int32)
+    kv_last_page_lens = kv_last_page_lens.to(torch.int32)
     kv_indptr_i32 = kv_indptr.to(torch.int32)
     kv_page_indices_i32 = kv_indices.to(torch.int32).contiguous()
     max_seqlen_q = 1
@@ -1061,6 +1030,8 @@ def sparse_attn_v4_paged_decode(
     unified_kv_rope: torch.Tensor | None = None,
     q_packed_in: torch.Tensor | None = None,
     q_rope_in: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    kv_last_page_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -1083,6 +1054,8 @@ def sparse_attn_v4_paged_decode(
             unified_kv_rope,
             q_packed_in,
             q_rope_in,
+            qo_indptr=qo_indptr,
+            kv_last_page_lens=kv_last_page_lens,
         )
     if get_gfx() == "gfx1250":
         return pa_decode_sparse(

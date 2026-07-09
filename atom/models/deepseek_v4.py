@@ -2021,6 +2021,8 @@ class DeepseekV4Attention(nn.Module):
                 unified_kv_rope=self.unified_kv_rope if self.kv_fp8 else None,
                 q_packed_in=q_packed,
                 q_rope_in=q_rope_q,
+                qo_indptr=attn_md.qo_indptr,
+                kv_last_page_lens=attn_md.kv_last_page_lens,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
