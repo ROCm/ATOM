@@ -348,11 +348,16 @@ class LinearBase(nn.Module):
                     torch.empty(self.output_size, 1, dtype=dtypes.fp32)
                 )
             elif quant_type == QuantType.per_1x128:
+                scale_dtype = (
+                    dtypes.fp8_e8m0
+                    if envs.ATOM_USE_FLYDSL_GFX1250_GEMM
+                    else dtypes.fp32
+                )
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
-                        dtype=dtypes.fp32,
+                        dtype=scale_dtype,
                     )
                 )
             elif quant_type == QuantType.per_1x32:
@@ -628,10 +633,17 @@ class LinearBase(nn.Module):
                 if self.quant_type.value == QuantType.per_1x128.value:
                     # preshuffle GEMM expects column-major x_scale;
                     # non-preshuffle GEMM expects row-major x_scale
-                    quant_func = functools_partial(
-                        self.quant_func,
-                        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
-                    )
+                    if envs.ATOM_USE_FLYDSL_GFX1250_GEMM:
+                        quant_func = functools_partial(
+                            self.quant_func,
+                            transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                            scale_type=dtypes.fp8_e8m0,
+                        )
+                    else:
+                        quant_func = functools_partial(
+                            self.quant_func,
+                            transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                        )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(
                         x,
@@ -669,14 +681,29 @@ class LinearBase(nn.Module):
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
                 if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
-                    y = gemm_a8w8_blockscale_preshuffle_impl(
-                        x,
-                        self.weight,
-                        x_scale,
-                        self.weight_scale,
-                        dtype=otype,
-                        prefix=self.prefix,
-                    )
+                    if (
+                        envs.ATOM_USE_FLYDSL_GFX1250_GEMM
+                        and self.weight_scale.dtype == dtypes.fp8_e8m0
+                    ):
+                        if x_scale.dtype != dtypes.fp8_e8m0:
+                            # fused RMSNorm+quant fall back to fp32 blockscale.
+                            self.weight_scale.data = self.weight_scale.data.to(dtypes.fp32)
+                    if (
+                        envs.ATOM_USE_FLYDSL_GFX1250_GEMM
+                        and self.weight_scale.dtype == dtypes.fp8_e8m0
+                    ):
+                        y = gemm_a8w8_blockscale_bpreshuffle(
+                            x, self.weight, x_scale, self.weight_scale, dtype=otype
+                        )
+                    else:
+                        y = gemm_a8w8_blockscale_preshuffle_impl(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                            prefix=self.prefix,
+                        )
                 else:
                     y = gemm_a8w8_blockscale(
                         x,
