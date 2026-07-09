@@ -419,7 +419,7 @@ jobs:
                   "lm_eval_num_fewshot": 5,
                   "lm_eval_num_concurrent": 8,
                   "accuracy_test_threshold": 0.94,
-                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=0\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
                   "runner": "atom-mi308-8gpu-plugins-benchmark",
               },
           ]
