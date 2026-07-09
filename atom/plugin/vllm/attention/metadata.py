@@ -2037,8 +2037,20 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        # ``arange_buffer`` is sliced to ``actual_expanded`` (the flattened
+        # multi-token decode count) in ``_build_indexer``. During MTP drafting a
+        # decode request carries up to ``1 + num_speculative_tokens`` tokens, so
+        # the expansion can reach ``num_decode_tokens`` (bounded by
+        # ``max_num_batched_tokens``) -- larger than ``max_num_seqs`` for a draft
+        # builder whose ``num_speculative_tokens`` is forced to 0. Guard with
+        # ``max_num_batched_tokens`` exactly as upstream vLLM's indexer does so
+        # the buffer always covers ``actual_expanded``.
         self.arange_buffer = torch.arange(
-            config.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
+            max(
+                config.scheduler_config.max_num_seqs
+                * (1 + self.num_speculative_tokens),
+                max_num_batched_tokens,
+            ),
             dtype=torch.int32,
             device=self.device,
         )
