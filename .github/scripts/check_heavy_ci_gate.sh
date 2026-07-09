@@ -196,7 +196,7 @@ if ! REVIEW_STATES="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/review
   exit 0
 fi
 
-APPROVAL_COUNT="$(printf '%s\n' "${REVIEW_STATES}" | awk '$0 == "APPROVED" { count++ } END { print count + 0 }')"
+APPROVAL_COUNT="$(printf '%s\n' "${REVIEW_STATES}" | awk '$0 == "APPROVED" || $0 == "DISMISSED" { count++ } END { print count + 0 }')"
 CHANGES_REQUESTED_COUNT="$(printf '%s\n' "${REVIEW_STATES}" | awk '$0 == "CHANGES_REQUESTED" { count++ } END { print count + 0 }')"
 
 if [ "${APPROVAL_COUNT}" -gt 0 ]; then
