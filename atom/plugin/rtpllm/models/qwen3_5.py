@@ -245,11 +245,11 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
             raise ValueError(
-                "RTP plugin requires inputs.attention_inputs to provide position_ids."
+                "RTP plugin requires inputs.attention_inputs to provide combo_position_ids."
             )
         # Keep plugin semantics aligned with RTP native path:
-        # first use attention_inputs.position_ids, then fallback to combo_position_ids.
-        positions = getattr(attn_inputs, "position_ids", None)
+        # first use attention_inputs.combo_position_ids, then fallback to bert_embedding_inputs.combo_position_ids.
+        positions = getattr(attn_inputs, "combo_position_ids", None)
         if positions is None or positions.numel() == 0:
             positions = self._extract_combo_positions(
                 inputs=inputs, model_device=model_device
@@ -262,14 +262,14 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         if positions is None or positions.numel() == 0:
             raise ValueError(
                 "RTP plugin requires real position metadata from attention_inputs "
-                "(position_ids or input/prefix/sequence lengths); fallback positions are disabled."
+                "(combo_position_ids or input/prefix/sequence lengths); fallback positions are disabled."
             )
         positions = positions.to(
             device=model_device, dtype=torch.int32, non_blocking=True
         ).contiguous()
         # Eager-only: shape-based fallback rebuild. In cuda-graph capture mode
         # this Python-level branch on tensor shape is unsafe (and unnecessary
-        # because RTP guarantees position_ids has the same length as the
+        # because RTP guarantees combo_position_ids has the same length as the
         # capture-time max_num_token). See rtp+atom_graph.md §4.3.
         if not torch.cuda.is_current_stream_capturing():
             pos_tokens = (
@@ -299,8 +299,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                     positions = positions[..., -token_num:].contiguous()
                 else:
                     raise ValueError(
-                        "RTP plugin position_ids/token_num mismatch "
-                        f"(position_ids_tokens={pos_tokens}, token_num={token_num})."
+                        "RTP plugin combo_position_ids/token_num mismatch "
+                        f"(combo_position_ids_tokens={pos_tokens}, token_num={token_num})."
                     )
         return positions
 

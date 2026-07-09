@@ -356,7 +356,7 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
             return self._build_token_positions(input_lengths_i32, starts)
 
         sequence_lengths_plus_1 = getattr(
-            attn_inputs, "sequence_lengths_plus_1_d", None
+            attn_inputs, "sequence_lengths_plus_1_device", None
         )
         if sequence_lengths_plus_1 is not None and sequence_lengths_plus_1.numel() > 0:
             seq_plus_one_i32 = sequence_lengths_plus_1.to(
@@ -388,7 +388,7 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         self, attn_inputs: Any, model_device: torch.device
     ) -> torch.Tensor | None:
         sequence_lengths_plus_1 = getattr(
-            attn_inputs, "sequence_lengths_plus_1_d", None
+            attn_inputs, "sequence_lengths_plus_1_device", None
         )
         if sequence_lengths_plus_1 is None or sequence_lengths_plus_1.numel() == 0:
             return None
@@ -447,15 +447,15 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
             getattr(attn_inputs, "is_prefill", False)
         )
         if graph_decode:
-            # RTP CudaGraphRunner refreshes sequence_lengths_plus_1_d before
-            # replay, but not position_ids. Build decode positions from the
+            # RTP CudaGraphRunner refreshes sequence_lengths_plus_1_device before
+            # replay, but not combo_position_ids. Build decode positions from the
             # refreshed RTP length tensors so RoPE advances on every replay.
             positions = self._build_graph_decode_positions(
                 attn_inputs=attn_inputs,
                 model_device=model_device,
             )
         if positions is None or positions.numel() == 0:
-            positions = getattr(attn_inputs, "position_ids", None)
+            positions = getattr(attn_inputs, "combo_position_ids", None)
         if positions is None or positions.numel() == 0:
             positions = self._extract_combo_positions(
                 inputs=inputs, model_device=model_device
@@ -507,8 +507,8 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
                     positions = positions[..., -token_num:].contiguous()
                 else:
                     raise ValueError(
-                        "GLM5 RTP plugin position_ids/token_num mismatch "
-                        f"(position_ids_tokens={pos_tokens}, token_num={token_num})."
+                        "GLM5 RTP plugin combo_position_ids/token_num mismatch "
+                        f"(combo_position_ids_tokens={pos_tokens}, token_num={token_num})."
                     )
         return positions
 

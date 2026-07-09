@@ -183,7 +183,7 @@ class RTPForwardContext:
         # Decode: query length is runtime step token count (usually 1 per sequence),
         # not prompt input_lengths.
         sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-            getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+            getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
             device=device,
         )
         sequence_lengths = RTPForwardContext._non_empty_int32(
@@ -262,7 +262,7 @@ class RTPForwardContext:
 
         if is_prefill:
             prefix_lengths = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "prefix_lengths_d", None),
+                getattr(attn_inputs, "prefix_lengths_device", None),
                 device=device,
             )
             if prefix_lengths is None:
@@ -281,16 +281,16 @@ class RTPForwardContext:
                 )
             last_token_idx = prefix_lengths + input_lengths - 1
         else:
-            # RTP decode kernels use sequence_lengths_plus_1_d as canonical runtime value.
+            # RTP decode kernels use sequence_lengths_plus_1_device as canonical runtime value.
             sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
                 device=device,
             )
             if sequence_lengths_plus_1 is not None:
                 if int(sequence_lengths_plus_1.numel()) != int(base.shape[0]):
                     raise ValueError(
-                        "RTP plugin sequence_lengths_plus_1_d/block_table batch mismatch "
-                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        "RTP plugin sequence_lengths_plus_1_device/block_table batch mismatch "
+                        f"(sequence_lengths_plus_1_device={int(sequence_lengths_plus_1.numel())}, "
                         f"block_table={int(base.shape[0])})."
                     )
                 last_token_idx = sequence_lengths_plus_1 - 1
@@ -308,12 +308,12 @@ class RTPForwardContext:
                         "RTP plugin sequence_lengths/block_table batch mismatch "
                         f"(sequence_lengths={int(sequence_lengths.numel())}, block_table={int(base.shape[0])})."
                     )
-                # Legacy fallback when sequence_lengths_plus_1_d is unavailable.
+                # Legacy fallback when sequence_lengths_plus_1_device is unavailable.
                 last_token_idx = sequence_lengths + input_lengths - 1
 
         # Keep eager semantics strict (fail fast on malformed metadata).
         # CUDA-graph warmup/replay may temporarily feed placeholder
-        # sequence_lengths_plus_1_d=0, so only graph-mode relaxes by clamping.
+        # sequence_lengths_plus_1_device=0, so only graph-mode relaxes by clamping.
         in_capture = torch.cuda.is_current_stream_capturing()
         graph_mode = bool(getattr(attn_inputs, "is_cuda_graph", False))
         relaxed_validation = in_capture or graph_mode
@@ -604,7 +604,7 @@ class RTPForwardContext:
     def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
         """Build kernel seq_lens using RTP-native field priority.
 
-        Decode uses RTP's canonical sequence_lengths_plus_1_d first in both
+        Decode uses RTP's canonical sequence_lengths_plus_1_device first in both
         eager and CUDA-graph paths. This keeps context_lens aligned with the
         block-table slot/state-index calculation during graph replay.
         """
@@ -619,21 +619,21 @@ class RTPForwardContext:
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if is_prefill:
             # For chunked prefill, prefix_lengths can remain per-chunk while
-            # sequence_lengths_plus_1_d tracks the true cumulative context length.
+            # sequence_lengths_plus_1_device tracks the true cumulative context length.
             sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
                 device=device,
             )
             if sequence_lengths_plus_1 is not None:
                 if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
                     raise ValueError(
-                        "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
-                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        "RTP plugin sequence_lengths_plus_1_device/input_lengths batch mismatch "
+                        f"(sequence_lengths_plus_1_device={int(sequence_lengths_plus_1.numel())}, "
                         f"input_lengths={int(input_lengths.numel())})."
                     )
                 return sequence_lengths_plus_1.contiguous()
             prefix_lengths = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "prefix_lengths_d", None),
+                getattr(attn_inputs, "prefix_lengths_device", None),
                 device=device,
             )
             if prefix_lengths is None:
@@ -654,14 +654,14 @@ class RTPForwardContext:
             return (prefix_lengths + input_lengths).contiguous()
 
         sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-            getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+            getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
             device=device,
         )
         if sequence_lengths_plus_1 is not None:
             if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
                 raise ValueError(
-                    "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
-                    f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                    "RTP plugin sequence_lengths_plus_1_device/input_lengths batch mismatch "
+                    f"(sequence_lengths_plus_1_device={int(sequence_lengths_plus_1.numel())}, "
                     f"input_lengths={int(input_lengths.numel())})."
                 )
             return sequence_lengths_plus_1.contiguous()
@@ -682,7 +682,7 @@ class RTPForwardContext:
             return (sequence_lengths + input_lengths).contiguous()
 
         raise ValueError(
-            "RTP decode requires attention_inputs.sequence_lengths_plus_1_d or "
+            "RTP decode requires attention_inputs.sequence_lengths_plus_1_device or "
             "sequence_lengths for seq_lens."
         )
 
@@ -1861,9 +1861,6 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
     @staticmethod
     def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
         """Qwen3.5 decode-cudagraph compatible seq_lens priority.
-
-        Keep the validated sequence_lengths_plus_1_d ordering from
-        `develop/rtp_atom_0526_qwen35_cuda_graph_ok`.
         """
         input_lengths = RTPForwardContext._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
@@ -1876,7 +1873,7 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if is_prefill:
             prefix_lengths = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "prefix_lengths_d", None),
+                getattr(attn_inputs, "prefix_lengths_device", None),
                 device=device,
             )
             if prefix_lengths is None:
@@ -1901,14 +1898,14 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         )
         if non_cuda_graph_mode:
             sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
                 device=device,
             )
             if sequence_lengths_plus_1 is not None:
                 if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
                     raise ValueError(
-                        "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
-                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        "RTP plugin sequence_lengths_plus_1_device/input_lengths batch mismatch "
+                        f"(sequence_lengths_plus_1_device={int(sequence_lengths_plus_1.numel())}, "
                         f"input_lengths={int(input_lengths.numel())})."
                     )
                 return sequence_lengths_plus_1.contiguous()
@@ -1928,20 +1925,20 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
 
         if not non_cuda_graph_mode:
             sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
                 device=device,
             )
             if sequence_lengths_plus_1 is not None:
                 if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
                     raise ValueError(
-                        "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
-                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        "RTP plugin sequence_lengths_plus_1_device/input_lengths batch mismatch "
+                        f"(sequence_lengths_plus_1_device={int(sequence_lengths_plus_1.numel())}, "
                         f"input_lengths={int(input_lengths.numel())})."
                     )
                 return sequence_lengths_plus_1.contiguous()
 
         raise ValueError(
-            "RTP decode requires attention_inputs.sequence_lengths_plus_1_d or "
+            "RTP decode requires attention_inputs.sequence_lengths_plus_1_device or "
             "sequence_lengths for seq_lens."
         )
 
