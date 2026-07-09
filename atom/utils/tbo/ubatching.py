@@ -53,6 +53,8 @@ def local_tbo_precompute(
         # slices → all_gather size mismatch → RCCL hang.
         from atom.utils import envs
 
+        # Skip TBO when this rank's prefill is too small
+        _min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
         # MUST mirror maybe_create_ubatch_slices' gating exactly, or the
         # cross-DP MAX-reduced ub0/ub1 disagree with the realised slices → hang.
         if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
@@ -61,6 +63,8 @@ def local_tbo_precompute(
             toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)
             total = int(toks.sum())
             if total < 2:
+                return False, 0, 0
+            if _min_pref > 0 and total < _min_pref:
                 return False, 0, 0
             ub0 = total // 2
             ub1 = total - ub0
@@ -72,6 +76,8 @@ def local_tbo_precompute(
         # produce post-decision.
         toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)
         total = int(toks.sum())
+        if _min_pref > 0 and total < _min_pref:
+            return False, 0, 0
         target = total // 2
         cumsum = 0
         split_idx = 1

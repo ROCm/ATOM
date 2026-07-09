@@ -256,6 +256,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
         os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
     ),
+    # Minimum prefill tokens (per rank) required to TBO-split.
+    "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
+    ),
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.
