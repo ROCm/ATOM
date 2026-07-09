@@ -1346,9 +1346,14 @@ class RTPForwardContext:
             if isinstance(module, GatedDeltaNet):
                 gdn_layer_map[int(module.layer_num)] = module
             elif (
-                getattr(module, "indexer", None) is not None
-                and getattr(module, "mla_attn", None) is not None
+                getattr(module, "mla_attn", None) is not None
                 and getattr(module, "layer_num", None) is not None
+                and (
+                    getattr(module, "indexer", None) is not None
+                    # GLM-5.2 IndexShare: shared layers have indexer=None but still
+                    # need kv_cache binding; is_v32=True identifies all sparse MLA layers.
+                    or getattr(module, "is_v32", False)
+                )
             ):
                 mla_layer_map[int(module.layer_num)] = module
             elif rtp_mla_attention_cls is not None and isinstance(
