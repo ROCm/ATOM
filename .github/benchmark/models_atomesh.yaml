@@ -16,6 +16,7 @@ defaults:
   env:
     common:
       PYTHONUNBUFFERED: "1"
+      ATOM_PD_RANK_MAPPING_POLICY: "${ATOMESH_PD_RANK_MAPPING_POLICY}"
 
 backends:
   atom:
