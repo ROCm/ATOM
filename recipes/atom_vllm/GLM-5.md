@@ -57,6 +57,69 @@ vllm serve amd/GLM-5.2-MXFP4 \
     --no-enable-prefix-caching
 ```
 
+### GLM-5.2-MXFP4 MTP3 Recipe
+```
+#!/usr/bin/env bash
+set -euo pipefail
+ 
+rm -rf /root/.cache/vllm/torch_compile_cache
+rm -rf /root/.cache/atom/torch_compile_cache
+
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+model_path="${MODEL_PATH:-/home/models/GLM-5.2-MXFP4}"
+server_host="${SERVER_HOST:-localhost}"
+server_port="${PORT:-8004}"
+tensor_parallel_size="${TP_SIZE:-4}"
+gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.9}"
+max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-16384}"
+enable_prefix_caching="${ENABLE_PREFIX_CACHING:-1}"
+enable_mtp="${ENABLE_MTP:-1}"
+server_log="${SERVER_LOG:-$(pwd)/logs/glm5_vllm_server.log}"
+ 
+mkdir -p "$(dirname "${server_log}")"
+: > "${server_log}"
+ 
+vllm_args=(
+    vllm serve "${model_path}"
+    --host "${server_host}"
+    --port "${server_port}"
+    --tensor-parallel-size "${tensor_parallel_size}"
+    --gpu_memory_utilization "${gpu_memory_utilization}"
+    --max-num-batched-tokens "${max_num_batched_tokens}"
+    --trust-remote-code
+    --kv-cache-dtype fp8
+    --async-scheduling
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "model.layers.[0-9].mlp.*expert*", "model.layers.[1-6][0-9].mlp.*expert*", "model.layers.7[0-7].mlp.*expert*"]}}'
+    --load-format fastsafetensors
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+)
+ 
+if [[ "${enable_prefix_caching}" != "1" ]]; then
+    vllm_args+=(--no-enable-prefix-caching)
+fi
+
+if [[ "${enable_mtp}" == "1" ]]; then
+    vllm_args+=(--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}')
+    echo "MTP: ENABLED (mtp, num_speculative_tokens=3)"
+else
+    echo "MTP: DISABLED (ENABLE_MTP=${enable_mtp})"
+fi
+ 
+{
+    echo "Starting GLM vLLM server at ${server_host}:${server_port}"
+    echo "Log file: ${server_log}"
+    printf 'Command:'
+    printf ' %q' "${vllm_args[@]}"
+    printf '\n'
+    "${vllm_args[@]}"
+} 2>&1 | tee -a "${server_log}"
+ 
+```
+
+
+
 ## Step 3: Performance Benchmark
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash
