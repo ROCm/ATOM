@@ -16,6 +16,7 @@ defaults:
   env:
     common:
       PYTHONUNBUFFERED: "1"
+      ATOM_PD_RANK_MAPPING_POLICY: "${ATOMESH_PD_RANK_MAPPING_POLICY}"
 
 backends:
   atom:
@@ -45,7 +46,7 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    model_path: /mnt/models/DeepSeek-V4-Pro/
+    model_path: "${ATOMESH_MODEL_ROOT}/DeepSeek-V4-Pro/"
     precision: FP4
     env:
       common:
@@ -100,6 +101,8 @@ models:
             workers: 1
             tp: 8
             extra_args: "--enable-dp-attention --enable-tbo"
+          benchmark:
+            wait_server_timeout: 4500
           run_eval: true
 
     accuracy:
@@ -109,11 +112,11 @@ models:
 
   Kimi-K2.5-MXFP4:
     backend: atom
-    model_path: /mnt/models/Kimi-K2.5-MXFP4/
+    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/"
     precision: MXFP4
     env:
       common:
-        HSA_NO_SCRATCH_RECLAIM: "1"
+        AITER_QUICK_REDUCE_QUANTIZATION: "INT4"
       prefill: {}
       decode: {}
     server:
@@ -121,8 +124,10 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 16
-        gpu_memory_utilization: 0.85
+        gpu_memory_utilization: 0.9
         max_num_seqs: 256
+        max_num_batched_tokens: 32768
+        max_model_len: 32768
         extra_args: ""
     suites:
       nightly:
@@ -139,15 +144,18 @@ models:
           decode:
             workers: 1
             tp: 4
+            cudagraph: >-
+              [8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+          server:
+            common_args:
+              decode_max_num_seqs: 256
           env:
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
-            wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
+            wait_server_timeout: 4500
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -157,17 +165,43 @@ models:
           nodes: "${ATOMESH_2P1D_NODES}"
           isl: [8192]
           osl: 1024
-          concurrency: [128, 256, 768, 1024]
+          concurrency: [256, 512, 768, 1024]
           prefill:
             workers: 2
             tp: 4
           decode:
             workers: 1
             tp: 4
+            cudagraph: >-
+              [8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,264,272,280,288,296,304,312,320,328,336,344,352,360,368,376,384,392,400,408,416,424,432,440,448,456,464,472,480,488,496,504,512,520,528,536,544,552,560,568,576,584,592,600,608,616,624,632,640,648,656,664,672,680,688,696,704,712,720,728,736,744,752,760,768,776,784,792,800,808,816,824,832,840,848,856,864,872,880,888,896,904,912,920,928,936,944,952,960,968,976,984,992,1000,1008,1016,1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
           benchmark:
-            wait_server_timeout: 1800
-          runner:
-            time_limit: "06:00:00"
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: kimi-k25-1p2d-tp4
+          topology: 1p2d
+          pd_worker_layout: decode_single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 2
+            tp: 4
+            cudagraph: >-
+              [8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,264,272,280,288,296,304,312,320,328,336,344,352,360,368,376,384,392,400,408,416,424,432,440,448,456,464,472,480,488,496,504,512,520,528,536,544,552,560,568,576,584,592,600,608,616,624,632,640,648,656,664,672,680,688,696,704,712,720,728,736,744,752,760,768,776,784,792,800,808,816,824,832,840,848,856,864,872,880,888,896,904,912,920,928,936,944,952,960,968,976,984,992,1000,1008,1016,1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 4500
           run_eval: true
           eval_concurrency: [128, 768]
 
@@ -178,7 +212,7 @@ models:
 
   MiniMax-M3-MXFP4:
     backend: atom
-    model_path: /mnt/models/MiniMax-M3-MXFP4
+    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP4"
     precision: MXFP4
     env:
       common:
@@ -224,8 +258,6 @@ models:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -249,8 +281,6 @@ models:
             extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
@@ -264,7 +294,7 @@ models:
           server:
             common_args:
               method: eagle3
-              draft_model: /mnt/models/MiniMax-M3-EAGLE3
+              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 1
@@ -279,8 +309,6 @@ models:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -295,7 +323,7 @@ models:
             common_args:
               decode_max_num_seqs: 1024
               method: eagle3
-              draft_model: /mnt/models/MiniMax-M3-EAGLE3
+              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 2
@@ -307,8 +335,6 @@ models:
             extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
@@ -325,7 +351,7 @@ models:
 
   MiniMax-M3-MXFP8:
     backend: atom
-    model_path: /mnt/models/MiniMax-M3-MXFP8
+    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP8"
     precision: MXFP8
     env:
       common:
@@ -370,8 +396,6 @@ models:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -396,8 +420,6 @@ models:
             extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
@@ -411,7 +433,7 @@ models:
           server:
             common_args:
               method: eagle3
-              draft_model: /mnt/models/MiniMax-M3-EAGLE3
+              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 1
@@ -426,8 +448,6 @@ models:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -442,7 +462,7 @@ models:
             common_args:
               decode_max_num_seqs: 1024
               method: eagle3
-              draft_model: /mnt/models/MiniMax-M3-EAGLE3
+              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
               online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
           prefill:
@@ -455,8 +475,6 @@ models:
             extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 

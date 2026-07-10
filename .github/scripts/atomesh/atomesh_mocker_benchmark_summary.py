@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--benchmark-script",
-        default=".github/scripts/atomesh_mocker_benchmark.sh",
+        default=".github/scripts/atomesh/atomesh_mocker_benchmark.sh",
         help="Single-cell benchmark script to invoke.",
     )
     return parser.parse_args()

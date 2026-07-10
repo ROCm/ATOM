@@ -54,7 +54,21 @@ def maybe_dual_stream_forward(
     # Under TBO the two micro-batches already overlap on separate threads
     from atom.utils.tbo.ubatching import tbo_active
 
-    if self._use_dual_stream and 0 < num_tokens <= threshold and not tbo_active():
+    # PIECEWISE cudagraph only: dual_stream_moe_forward forks work onto
+    # `alt_stream` and does a caching-allocator alloc there; under PIECEWISE
+    # per-piece capture close the dual stream
+    compilation_config = get_current_atom_config().compilation_config
+    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    is_piecewise_cudagraph = (
+        cudagraph_mode is not None and cudagraph_mode.requires_piecewise_compilation()
+    )
+
+    if (
+        self._use_dual_stream
+        and 0 < num_tokens <= threshold
+        and not tbo_active()
+        and not is_piecewise_cudagraph
+    ):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)
 
