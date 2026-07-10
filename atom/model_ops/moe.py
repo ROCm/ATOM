@@ -1072,7 +1072,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton_decode:
             from aiter.ops.triton.utils.shuffle import (
-                moe_weight_gfx1250_decode_view as moe_weight_decode_view,
+                moe_weight_decode_view,
                 shuffle_scale_moe,
             )
 
