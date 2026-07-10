@@ -14,7 +14,7 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight, shuffle_weight_gfx1250
+from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -1029,12 +1029,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton_decode:
-            # Triton decode is GGUU-only (gate/up separated), so there is no
-            # interleave to apply here. Snapshot the pre-shuffle weights/scales;
-            # the decode (gluon a8w4) tensors are built from these, separate from
-            # the FlyDSL prefill shuffle below.
-            orig_w13_weight = layer.w13_weight.data.clone()
-            orig_w2_weight = layer.w2_weight.data.clone()
+            # Triton decode is GGUU-only (gate/up separated). Snapshot only the
+            # raw SCALES (small) before the FlyDSL shuffle overwrites them — the
+            # decode WEIGHTS are a zero-copy view of the FlyDSL-shuffled weight
+            # (built below), so they share storage and don't double weight memory.
             orig_w13_weight_scale = layer.w13_weight_scale.data.clone()
             orig_w2_weight_scale = layer.w2_weight_scale.data.clone()
 
@@ -1077,19 +1075,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
         if self.use_triton_decode:
-            from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
-
-            # FlyDSL (prefill) and Triton/gluon (decode) are two different
-            # layouts. layer.w13_weight / w13_weight_scale stay in the FlyDSL
-            # layout shuffled above; the *_preshuffled / *_a8w4 tensors below
-            # hold the separate Triton gluon a8w4 layout for the decode kernel.
-            # The decode preshuffle is aiter's canonical gfx1250 WMMA shuffle on
-            # the (E, K, N) weight; feed the stored (E, N, K) weights transposed.
-            layer.w13_weight_preshuffled = shuffle_weight_gfx1250(
-                orig_w13_weight.transpose(1, 2)
+            from aiter.ops.triton.utils.shuffle import (
+                moe_weight_gfx1250_decode_view,
+                shuffle_scale_moe,
             )
-            layer.w2_weight_preshuffled = shuffle_weight_gfx1250(
-                orig_w2_weight.transpose(1, 2)
+
+            # Decode weights: zero-copy view of the FlyDSL-shuffled weight into
+            # the gfx1250 a8w4 decode layout. Shares storage with layer.w{13,2}
+            # _weight (no second weight copy); scales differ, so the *_a8w4 scale
+            # tensors below are separate (scale duplication is acceptable).
+            layer.w13_weight_preshuffled = moe_weight_gfx1250_decode_view(
+                layer.w13_weight.data
+            )
+            layer.w2_weight_preshuffled = moe_weight_gfx1250_decode_view(
+                layer.w2_weight.data
             )
 
             w13_scale_for_a8w4 = orig_w13_weight_scale.transpose(-2, -1)
