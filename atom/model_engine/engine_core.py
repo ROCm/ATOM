@@ -198,6 +198,16 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        # Bind this EngineCore's lifetime to its parent (the server /
+        # CoreManager): if the parent exits, have the kernel reap this process —
+        # and, transitively, the ModelRunner workers it spawns — instead of
+        # leaving them orphaned. Orphans keep pinning GPU VRAM + the custom
+        # all-reduce IPC handles / rendezvous TCPStore, which makes the next
+        # restart reuse a stale hipIpc handle and crash. See
+        # atom.utils.enable_orphan_reaping for the full rationale.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
         engine: EngineCore = None
         try:
             if config.parallel_config.data_parallel_size > 1:

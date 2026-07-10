@@ -107,7 +107,11 @@ def requantize_with_max_scale(
         start = 0
         for idx, logical_width in enumerate(logical_widths):
             end = start + logical_width
-            weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
+            if weight_scale.ndim > 0 and weight_scale.shape[0] == weight.shape[0]:
+                shard_scale = weight_scale[start:end, :]
+            else:
+                shard_scale = weight_scale[idx]
+            weight_dq = per_tensor_dequantize(weight[start:end, :], shard_scale)
             weight.view(quant_dtype)[start:end, :], _ = per_tensor_quant(
                 weight_dq, max_w_scale, quant_dtype=quant_dtype
             )

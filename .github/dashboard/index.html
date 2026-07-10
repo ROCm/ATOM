@@ -516,7 +516,7 @@ const DASHBOARD_MODES = ['Aggregated', 'Disaggregated'];
 const ATOMESH_DATA = {
   updatedAt: Date.UTC(2026, 6, 3, 7, 9, 0),
   backend: 'ATOMesh',
-  hardware: 'MI355X',
+  hardware: window.ATOMESH_HARDWARE || 'MI355X',
   gpuCount: 16,
   rocmVersion: '7.2.4',
   dockerImage: 'rocm/atom-dev:nightly_202607030204',
@@ -536,6 +536,13 @@ function atomeshSummaryHeaderKey(header) {
   return String(header || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+function atomeshHardwareKey(value) {
+  const text = String(value || ATOMESH_DATA.hardware || '').toLowerCase();
+  if (text.includes('mi350')) return 'mi350x';
+  if (text.includes('mi355')) return 'mi355x';
+  return text || 'unknown';
+}
+
 function parseAtomeshSummaryRows(markdown) {
   const lines = String(markdown || '').split(/\r?\n/).filter(line => line.trim().startsWith('|'));
   if (lines.length < 3) return [];
@@ -551,7 +558,7 @@ function parseAtomeshSummaryRows(markdown) {
     return {
       id: `atomesh-summary-${idx}`,
       backend: ATOMESH_DATA.backend,
-      hardware: ATOMESH_DATA.hardware.toLowerCase(),
+      hardware: atomeshHardwareKey(raw.hardware),
       model: raw.model || 'unknown',
       topology: raw.topology || 'unknown',
       islOsl: raw.islosl || '--',
@@ -626,6 +633,7 @@ const allRuns = Object.values(rawData.entries).flat().sort((a, b) => b.date - a.
 
 function hardwareFromGpuName(name) {
   const text = String(name || '').toLowerCase();
+  if (text.includes('mi350')) return 'mi350x';
   if (text.includes('mi355') || text.includes('mi35x')) return 'mi355x';
   if (text.includes('mi325')) return 'mi325x';
   if (text.includes('mi308')) return 'mi308x';
@@ -1209,7 +1217,7 @@ function updateHeaderGpuMeta() {
   const span = document.getElementById('header-gpu-meta');
   if (!span) return;
   if (state.dashboardMode === 'Disaggregated') {
-    span.textContent = ` · ${ATOMESH_DATA.hardware} · ROCm ${ATOMESH_DATA.rocmVersion}`;
+    span.textContent = ` · ${fmtHardware(selectedHardware())} · ROCm ${ATOMESH_DATA.rocmVersion}`;
     return;
   }
   const entries = Object.values(filteredConfigs());
@@ -3279,7 +3287,7 @@ function renderAtomeshKPICards() {
       <div class="kpi-card">
         <div class="kpi-label">Hardware</div>
         <div class="kpi-value">${ATOMESH_DATA.gpuCount} <span class="kpi-unit">GPUs</span></div>
-        <div class="kpi-sub">${ATOMESH_DATA.hardware} · ROCm ${ATOMESH_DATA.rocmVersion}</div>
+        <div class="kpi-sub">${fmtHardware(selectedHardware())} · ROCm ${ATOMESH_DATA.rocmVersion}</div>
       </div>
       <div class="kpi-card clickable" id="atomesh-acc-card" title="Click to view accuracy">
         <div class="kpi-label">Accuracy</div>

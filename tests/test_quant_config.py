@@ -204,6 +204,23 @@ class TestParserRegistry:
         assert isinstance(parser, GenericParser)
 
 
+class TestGenericParser:
+    def test_fbgemm_fp8_uses_per_tensor_scales(self):
+        parser = GenericParser()
+        result = parser.parse(
+            {
+                "quant_method": "fbgemm_fp8",
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+            }
+        )
+
+        assert result.global_spec.quant_type == QuantType.per_Tensor
+        assert result.global_spec.quant_dtype == FP8
+        assert result.global_spec.is_dynamic is True
+        assert result.global_spec.quant_method == "fbgemm_fp8"
+
+
 # =========================================================================
 # Tests — QuarkParser
 # =========================================================================

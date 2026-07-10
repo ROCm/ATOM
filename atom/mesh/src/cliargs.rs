@@ -4,8 +4,9 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::{
     config::{
-        BackendType, CircuitBreakerConfig, ConfigError, ConfigResult, HealthCheckConfig,
-        MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+        AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigError, ConfigResult,
+        HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+        TokenizerCacheConfig,
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
@@ -264,6 +265,10 @@ pub struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash"], help_heading = "PD Disaggregation")]
     pub decode_policy: Option<String>,
+
+    /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks
+    #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
+    pub atom_pd_rank_mapping_policy: String,
 
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
@@ -548,6 +553,14 @@ impl CliArgs {
         };
 
         let policy = self.parse_policy(&self.policy);
+        let atom_pd_rank_mapping_policy = self
+            .atom_pd_rank_mapping_policy
+            .parse::<AtomPdRankMappingPolicy>()
+            .map_err(|reason| ConfigError::InvalidValue {
+                field: "atom_pd_rank_mapping_policy".to_string(),
+                value: self.atom_pd_rank_mapping_policy.clone(),
+                reason,
+            })?;
 
         let metrics = Some(MetricsConfig {
             port: self.prometheus_port,
@@ -575,6 +588,7 @@ impl CliArgs {
         RouterConfig::builder()
             .mode(mode)
             .backend(self.backend.into())
+            .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .policy(policy)
             .connection_mode(connection_mode)
             .host(&self.host)
@@ -699,6 +713,7 @@ impl Default for CliArgs {
             decode: Vec::new(),
             prefill_policy: None,
             decode_policy: None,
+            atom_pd_rank_mapping_policy: "none".to_string(),
             worker_startup_timeout_secs: 1800,
             worker_startup_check_interval: 30,
             log_dir: None,
