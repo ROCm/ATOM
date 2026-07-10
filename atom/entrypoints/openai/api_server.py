@@ -855,37 +855,30 @@ async def _listen_for_disconnect(request) -> None:
             break
 
 
-async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
-    """Drive a non-stream ``generate_async*`` async-generator while actively
-    watching for client disconnect (vLLM ``with_cancellation`` style).
+async def _race_disconnect(coro, raw_request, request_id):
+    """Race an awaitable against client disconnect (vLLM ``with_cancellation``
+    style).
 
     Starlette does NOT cancel a *non-streaming* request handler when the client
     goes away (unlike StreamingResponse, which is cancelled on http.disconnect).
     Without this, an abandoned non-stream request keeps ``await``-ing the engine
     until it hits ``max_tokens`` -- burning GPU on output nobody will read AND
-    leaking the seq in ``io_processor.requests`` (its finally never fires).
+    leaking the seq(s) in ``io_processor.requests`` (their finally never fires).
 
-    We race two tasks: one collects the generator, one listens for the ASGI
-    ``http.disconnect`` event. Whichever finishes first wins; the loser is
-    cancelled. On disconnect the collector's cancellation propagates into
-    ``generate_async``'s ``await token_queue.get()`` so its ``finally`` runs ->
-    ``abort_request`` + ``io_processor.requests.pop``. Returns the last yielded
-    output, or raises ``_ClientDisconnected``.
+    We run ``coro`` (which produces the final result) as a task alongside a task
+    that awaits the ASGI ``http.disconnect`` event. Whichever finishes first
+    wins; the loser is cancelled. On disconnect, the coro's cancellation
+    propagates into its ``await`` points so its own ``try/finally`` runs ->
+    ``abort_request`` + ``io_processor.requests.pop`` (for fan-out, this aborts
+    every sibling). We then raise ``_ClientDisconnected``.
 
     ``request.receive()`` is safe here because FastAPI has already parsed the
     request body into a pydantic model before this handler runs, so there is no
     unread body for ``receive()`` to race against.
     """
+    handler_task = asyncio.ensure_future(coro)
 
-    async def _collect():
-        final_output = None
-        async for output in agen:
-            final_output = output
-        return final_output
-
-    handler_task = asyncio.ensure_future(_collect())
-
-    # No ASGI request object (e.g. internal call) -> just await the generator.
+    # No ASGI request object (e.g. internal call) -> just await the coro.
     if raw_request is None:
         return await handler_task
 
@@ -896,17 +889,22 @@ async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
         return_when=asyncio.FIRST_COMPLETED,
     )
 
-    # Cancel the loser and let its cancellation settle (drives generate_async's
-    # finally -> abort_request when the collector is the loser).
+    # Cancel the loser and let its cancellation settle (drives the coro's own
+    # finally -> abort_request when the handler is the loser). Only swallow the
+    # expected CancelledError; log anything else, and let BaseException
+    # (KeyboardInterrupt/SystemExit) propagate.
     for task in pending:
         task.cancel()
     for task in pending:
         try:
             await task
-        except BaseException:
-            # CancelledError (expected) or any teardown error; the generator's
-            # own finally already aborted + popped the seq.
+        except asyncio.CancelledError:
             pass
+        except Exception:
+            logger.warning(
+                f"Error tearing down cancelled task for request {request_id}",
+                exc_info=True,
+            )
 
     if handler_task in done:
         return handler_task.result()
@@ -915,6 +913,24 @@ async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
         f"Client disconnected (non-stream), aborting request {request_id}"
     )
     raise _ClientDisconnected(request_id)
+
+
+async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
+    """Drive a non-stream ``generate_async*`` async-*generator* while watching
+    for client disconnect.
+
+    Thin wrapper over :func:`_race_disconnect` that collects the generator's
+    last yielded output. Use :func:`_race_disconnect` directly for the fan-out
+    path, whose ``generate_async_fanout`` is a coroutine returning a list.
+    """
+
+    async def _collect():
+        final_output = None
+        async for output in agen:
+            final_output = output
+        return final_output
+
+    return await _race_disconnect(_collect(), raw_request, request_id)
 
 
 async def setup_streaming_request_fanout(
@@ -1138,12 +1154,16 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         # Non-streaming
         if is_multimodal and effective_n > 1:
-            outputs = await generate_async_fanout(
-                token_ids,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    token_ids,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
+                ),
+                raw_request,
                 request_id,
-                multimodal_data=multimodal_data,
-                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -1151,14 +1171,16 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 request_id, model_name, outputs, tools=request.tools
             )
         elif is_multimodal:
-            final_output = None
-            async for output in generate_async_multimodal(
-                token_ids,
-                multimodal_data,
-                sampling_params,
+            final_output = await _run_nonstream_with_disconnect(
+                generate_async_multimodal(
+                    token_ids,
+                    multimodal_data,
+                    sampling_params,
+                    request_id,
+                ),
+                raw_request,
                 request_id,
-            ):
-                final_output = output
+            )
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
@@ -1169,11 +1191,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
             )
         elif effective_n > 1:
-            outputs = await generate_async_fanout(
-                prompt,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -1278,12 +1304,16 @@ async def completions(request: CompletionRequest, raw_request: Request):
 
         # Non-streaming
         if effective_n > 1:
-            outputs = await generate_async_fanout(
-                request.prompt,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
-                data_parallel_rank=request.data_parallel_rank,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
