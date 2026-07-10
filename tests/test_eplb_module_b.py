@@ -58,20 +58,28 @@ def test_manager_steps_with_dummy_and_triggers_by_interval(monkeypatch):
     manager = eplb.EPLBManager(
         enabled=True,
         monitor=monitor,
-        rebalance_interval=3,
+        rebalance_interval=8,
         rebalance_min_balancedness=0.8,
         rebalance_balancedness_agg="min",
     )
     manager.bind_runtime_owner(owner)
 
-    # interval=3: call 1-3 consume scheduler yields; rebalance runs on call 4.
-    manager.on_forward_pass_end(is_dummy_run=False)
-    manager.on_forward_pass_end(is_dummy_run=True)
-    manager.on_forward_pass_end(is_dummy_run=False)
+    # vllm-style warm start: first window = interval//4 = 2, so the first LIVE
+    # rebalance fires on call 3; steady state then uses the full interval (8).
+    manager.on_forward_pass_end(is_dummy_run=False)  # 1 (first window)
+    manager.on_forward_pass_end(is_dummy_run=True)  # 2 (first window)
     assert triggered["n"] == 0
-    manager.on_forward_pass_end(is_dummy_run=False)
+    manager.on_forward_pass_end(is_dummy_run=False)  # 3 -> first rebalance
     assert triggered["n"] == 1
     assert manager.rebalance_count == 1
+
+    # Steady state: the next rebalance is a full interval (8 calls) later.
+    for _ in range(7):
+        manager.on_forward_pass_end(is_dummy_run=False)
+    assert triggered["n"] == 1
+    manager.on_forward_pass_end(is_dummy_run=False)  # 8th steady call -> fire
+    assert triggered["n"] == 2
+    assert manager.rebalance_count == 2
 
 
 def test_manager_balancedness_gate_skips_when_balanced(monkeypatch):

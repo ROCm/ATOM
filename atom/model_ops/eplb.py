@@ -873,6 +873,7 @@ def _migrate_single_layer(
     rank: int,
     world_size: int,
     ep_group: Any,
+    num_logical_experts: int,
     p2p_batch_chunk_size: int = 32,
     cuda_stream: Optional[torch.cuda.Stream] = None,
 ) -> BufferCopyPlan:
@@ -927,7 +928,7 @@ def _migrate_single_layer(
 
     _execute_batched_p2p_ops(
         ops_by_logical=ops_by_logical,
-        num_logical_experts=int(old_p2l_layer.max().item()) + 1,
+        num_logical_experts=num_logical_experts,
         p2p_batch_chunk_size=p2p_batch_chunk_size,
         cuda_stream=cuda_stream,
     )
@@ -954,6 +955,10 @@ def migrate_experts_chunk(
 
         cfg = get_current_atom_config()
         p2p_batch_chunk_size = int(getattr(cfg.eplb_config, "p2p_batch_chunk_size", 32))
+    # num_logical is uniform across layers; read it once from metadata instead of
+    # a per-layer `old_p2l_layer.max().item()` (a GPU->CPU sync that, on a busy
+    # default stream, blocks until the whole forward backlog drains).
+    num_logical_experts = int(old_meta.num_logical_experts)
     plans: dict[int, BufferCopyPlan] = {}
     for layer_id in layer_ids:
         old_p2l_layer = old_meta.physical_to_logical_map[layer_id]
@@ -977,6 +982,7 @@ def migrate_experts_chunk(
             rank=rank,
             world_size=world_size,
             ep_group=ep_group,
+            num_logical_experts=num_logical_experts,
             p2p_batch_chunk_size=p2p_batch_chunk_size,
             cuda_stream=cuda_stream,
         )
@@ -1636,6 +1642,16 @@ class EPLBManager:
             pass  # drain generator synchronously
 
     def _entrypoint(self):
+        # vllm-style warm start: the first LIVE rebalance fires after a quarter
+        # of the interval (equivalent to vllm initializing its rearrangement
+        # step counter to 3/4 of the interval), so balancing on real traffic
+        # kicks in early. The pre-serving profile rearrange
+        # (trigger_eplb_profile_rearrange) already reserved buffers and did the
+        # initial placement on idle GPU; this is the first real-load rebalance.
+        first_window = max(1, self.rebalance_interval // 4)
+        for _ in range(first_window):
+            yield
+        yield from self._rebalance()
         while True:
             for _ in range(self.rebalance_interval):
                 yield
@@ -1748,8 +1764,12 @@ class EPLBManager:
         )
 
         # Diagnostic: relocation's benefit is per-GPU total-load balance (not per-
-        # expert). Compare per-GPU balancedness (mean/max over ranks) old vs new to
-        # confirm the new placement actually flattens per-GPU load.
+        # expert). per-GPU balancedness = per-layer (mean/max over ranks), mean over
+        # layers -- the textbook metric.
+        #
+        # `realized`: the LIVE placement (installed at the *previous* rebalance)
+        # scored on THIS window's actual traffic. This is what EPLB truly achieved
+        # on real load, and is directly comparable to vllm's per-window balancedness.
         try:
             _ep = int(self.live_metadata.ep_size)
             _ll = logical_load.detach().to("cpu", torch.float32)
@@ -1766,14 +1786,13 @@ class EPLBManager:
                 _b = torch.where(_mx > 0, _mn / _mx, torch.ones_like(_mn))
                 return float(_b.mean().item())
 
-            _old_b = _pergpu_bal(self.live_metadata.physical_to_logical_map)
-            _new_b = _pergpu_bal(new_meta.physical_to_logical_map)
+            _realized_b = _pergpu_bal(self.live_metadata.physical_to_logical_map)
             logger.info(
-                "EPLB rebalance #%d ep_rank=%d per-GPU balancedness: old=%.3f -> new=%.3f",
+                "EPLB rebalance #%d ep_rank=%d per-GPU balancedness: "
+                "realized(live placement, this window)=%.3f",
                 _rc,
                 _ep_rank,
-                _old_b,
-                _new_b,
+                _realized_b,
             )
         except Exception as _e:  # pragma: no cover - diagnostic only
             logger.warning("EPLB per-GPU balancedness diag failed: %s", _e)
@@ -1920,6 +1939,21 @@ def initialize_eplb_runtime(
         return None
     manager.bind_runtime_owner(owner, strict=strict)
     return manager
+
+
+def trigger_eplb_profile_rearrange() -> None:
+    """Run the first expert rearrange once, before serving live traffic.
+
+    Called after model warmup / cudagraph capture while the GPU is idle, so the
+    migration's default-stream GPU syncs don't have to drain a live forward
+    backlog. This mirrors vllm's pre-serving profile rearrange and prevents the
+    first rebalance from colliding with a warmup traffic burst (which otherwise
+    inflates migration from ~1.6s to tens of seconds and can deadlock).
+    """
+    manager = _get_configured_eplb_manager()
+    if manager is None:
+        return
+    manager.trigger_offline_rebalance(reason="profile")
 
 
 def with_eplb_forward_monitor(fn):
