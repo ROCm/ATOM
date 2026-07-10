@@ -800,6 +800,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         gfx = get_gfx()
         self.is_gfx1250 = gfx == "gfx1250"
+        # gfx1250 grouped a8w4 MoE kernel only supports the non-interleaved
+        # (gate|up separated) scale layout; reject is_guinterleave up front.
+        if self.is_gfx1250 and self.is_guinterleave:
+            raise NotImplementedError(
+                "gfx1250 MoE only supports is_guinterleave=False; "
+                "unset ATOM_MOE_GU_ITLV."
+            )
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             self.use_triton = envs.ATOM_USE_TRITON_MOE
         else:
@@ -807,20 +814,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
             )
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
-        if envs.is_set("ATOM_USE_TRITON_MOE_DECODE"):
+        if envs.is_set("ATOM_USE_TRITON_MOE_DECODE") and not self.is_guinterleave:
             self.use_triton_decode = envs.ATOM_USE_TRITON_MOE_DECODE
         else:
             self.use_triton_decode = False
-        # The triton decode path handles GGUU (separated gate|up) only. GUGU uses
-        # the FlyDSL path, which applies the gate/up interleave natively, so there
-        # is no gate/up reorder to do in the triton decode weight prep.
-        if self.is_guinterleave:
-            self.use_triton_decode = False
-            if self.is_gfx1250:
-                raise NotImplementedError(
-                    "gfx1250 MoE only supports is_guinterleave=False (GGUU); "
-                    "unset ATOM_MOE_GU_ITLV."
-                )
 
     def create_weights(
         self,
