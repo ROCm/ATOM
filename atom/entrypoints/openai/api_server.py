@@ -842,9 +842,22 @@ class _ClientDisconnected(Exception):
         self.request_id = request_id
 
 
+async def _listen_for_disconnect(request) -> None:
+    """Block until the client sends an ``http.disconnect`` ASGI event.
+
+    Unlike polling ``request.is_disconnected()`` on a timer, this awaits the
+    disconnect event directly, so detection is immediate and costs nothing while
+    the client stays connected.
+    """
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            break
+
+
 async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
     """Drive a non-stream ``generate_async*`` async-generator while actively
-    watching for client disconnect.
+    watching for client disconnect (vLLM ``with_cancellation`` style).
 
     Starlette does NOT cancel a *non-streaming* request handler when the client
     goes away (unlike StreamingResponse, which is cancelled on http.disconnect).
@@ -852,47 +865,56 @@ async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
     until it hits ``max_tokens`` -- burning GPU on output nobody will read AND
     leaking the seq in ``io_processor.requests`` (its finally never fires).
 
-    We run the generator in a task and poll ``raw_request.is_disconnected()``
-    concurrently. On disconnect we cancel the task; the cancellation propagates
-    into ``generate_async``'s ``await token_queue.get()`` so its ``finally``
-    runs -> ``abort_request`` + ``io_processor.requests.pop``. Returns the last
-    yielded output, or raises ``_ClientDisconnected``.
+    We race two tasks: one collects the generator, one listens for the ASGI
+    ``http.disconnect`` event. Whichever finishes first wins; the loser is
+    cancelled. On disconnect the collector's cancellation propagates into
+    ``generate_async``'s ``await token_queue.get()`` so its ``finally`` runs ->
+    ``abort_request`` + ``io_processor.requests.pop``. Returns the last yielded
+    output, or raises ``_ClientDisconnected``.
+
+    ``request.receive()`` is safe here because FastAPI has already parsed the
+    request body into a pydantic model before this handler runs, so there is no
+    unread body for ``receive()`` to race against.
     """
-    final_output = None
 
     async def _collect():
-        nonlocal final_output
+        final_output = None
         async for output in agen:
             final_output = output
         return final_output
 
-    task = asyncio.ensure_future(_collect())
-    try:
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=0.5)
-            if task in done:
-                return task.result()
-            disconnected = False
-            if raw_request is not None:
-                try:
-                    disconnected = await raw_request.is_disconnected()
-                except Exception:
-                    disconnected = False
-            if disconnected:
-                logger.info(
-                    f"Client disconnected (non-stream), aborting request "
-                    f"{request_id}"
-                )
-                raise _ClientDisconnected(request_id)
-    finally:
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except BaseException:
-                # CancelledError (expected) or any error from generator
-                # teardown; generate_async's finally already aborted + popped.
-                pass
+    handler_task = asyncio.ensure_future(_collect())
+
+    # No ASGI request object (e.g. internal call) -> just await the generator.
+    if raw_request is None:
+        return await handler_task
+
+    disconnect_task = asyncio.ensure_future(_listen_for_disconnect(raw_request))
+
+    done, pending = await asyncio.wait(
+        [handler_task, disconnect_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    # Cancel the loser and let its cancellation settle (drives generate_async's
+    # finally -> abort_request when the collector is the loser).
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        try:
+            await task
+        except BaseException:
+            # CancelledError (expected) or any teardown error; the generator's
+            # own finally already aborted + popped the seq.
+            pass
+
+    if handler_task in done:
+        return handler_task.result()
+
+    logger.info(
+        f"Client disconnected (non-stream), aborting request {request_id}"
+    )
+    raise _ClientDisconnected(request_id)
 
 
 async def setup_streaming_request_fanout(
