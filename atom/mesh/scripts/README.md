@@ -10,7 +10,7 @@ End-to-end guide for building, deploying, and benchmarking the Atomesh prefill-d
 
 ## 1. Start Docker Container
 
-Pre-built images are available at `rocm/atom-dev:mesh-sglang-latest`. Run on **each node** (prefill and decode):
+Pre-built images are available at `rocm/atom-dev:latest`. Run on **each node** (prefill and decode):
 
 ```bash
 bash docker_start.sh
@@ -19,7 +19,7 @@ bash docker_start.sh
 Then enter the container:
 
 ```bash
-docker exec -it atom_sglang_mesh bash
+docker exec -it atom_mesh bash
 ```
 
 All remaining scripts are run **inside the container**.
@@ -143,89 +143,13 @@ bash run_benchmark.sh
 | `RESULT_DIR` | `/workspace/benchmark_results` | Results directory |
 | `BACKEND` | `sglang` | Benchmark backend |
 
-## One-Shot SLURM Automation
-
-For two-node SLURM clusters, `ds_fp8_1p_tp4_1d_tp8_slurm.sh` runs the entire flow
-(pre-cleanup → containers → prefill + decode servers → router → GSM8K accuracy →
-performance benchmark → cleanup) in a single `sbatch` submission. It is
-**self-contained** — does not depend on any of the other scripts above.
-
-### Submit
-
-```bash
-mkdir -p /it-share/yajizhan/slurm_logs
-sbatch atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
-```
-
-### Override defaults
-
-```bash
-# Fast smoke test with random weights (skips weight load + GSM8K)
-sbatch --export=ALL,LOAD_DUMMY=1 atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
-
-# Custom workload (multiple ISL, custom concurrency)
-sbatch --export=ALL,ISL_LIST="1024,4096,8192",CONC_LIST="32,64,128" \
-    atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
-
-# Skip GSM8K even with real weights (just run perf benchmark)
-sbatch --export=ALL,RUN_GSM8K=0 atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
-```
-
-### Defaults
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MODEL_PATH` | `/mnt/models/deepseek-ai/DeepSeek-R1` | Model path |
-| `DOCKER_IMAGE` | `rocm/atom-dev:mesh-sglang-latest` | Container image |
-| `PREFILL_TP` / `DECODE_TP` | `4` / `8` | Tensor parallel sizes |
-| `LOAD_DUMMY` | `<empty>` | Load real weights by default. Set `LOAD_DUMMY=1` to skip weight loading for fast smoke-test |
-| `ISL_LIST` | `8192` | Input sequence lengths (comma-separated) |
-| `OSL` | `1024` | Output sequence length |
-| `CONC_LIST` | `16,32,64` | Concurrency levels |
-| `RUN_GSM8K` | `auto` | Run GSM8K accuracy eval before perf benchmark. `auto` = on iff real weights; `0` to force-skip; `1` to force-run |
-| `GSM8K_LIMIT` | `100` | Number of GSM8K samples |
-| `GSM8K_NUM_FEWSHOT` | `3` | Few-shot examples |
-| `GSM8K_NUM_CONCURRENT` | `65` | Concurrent eval requests |
-| `WAIT_SERVER_TIMEOUT` | `1800` | Per-server cold-start timeout (s) |
-
-SBATCH directives (edit in script if your cluster differs):
-- partition / account: `amd-frameworks`
-- nodelist: `mia1-p02-g42,mia1-p02-g44`
-- 2 nodes × 8 GPUs, exclusive, 4-hour walltime
-
-### Outputs
-
-```
-/it-share/yajizhan/slurm_logs/
-├── ds_fp8_1p_tp4_1d_tp8-<jobid>.out      # sbatch stdout (orchestration log)
-├── ds_fp8_1p_tp4_1d_tp8-<jobid>.err      # sbatch stderr
-└── <MMDD>_ds_fp8_1p_tp4_1d_tp8_<jobid>/
-    ├── prefill/prefill.log               # sglang prefill server
-    ├── decode/decode.log                 # sglang decode server
-    ├── router/                           # atomesh router
-    ├── gsm8k/<timestamp>_gsm8k/          # lm_eval GSM8K results (if enabled)
-    ├── bench/pd-mesh-<isl>-<osl>-<conc>-<ratio>.json
-    └── scripts/                          # generated in-container scripts
-```
-
-### Cancel / Cleanup
-
-```bash
-scancel <jobid>
-```
-
-`scancel` does not propagate into docker containers, so the script's pre-cleanup
-step force-stops all stale containers on both nodes at the start of every run.
-Residual GPU memory from a prior failed run is cleared automatically.
-
 ## Script Summary
 
 | Script | Where to Run | Purpose |
 |--------|-------------|---------|
-| `docker_start.sh` | Host | Start Docker container |
+| `docker_start.sh` | Host | Start Docker container (RDMA NIC auto-detection) |
 | `start_prefill.sh` | Container | Launch prefill server |
 | `start_decode.sh` | Container | Launch decode server |
 | `start_router.sh` | Container | Launch mesh router (waits for prefill/decode) |
 | `run_gsm8k.sh` | Container | Run GSM8K accuracy evaluation |
 | `run_benchmark.sh` | Container | Run performance benchmark |
-| `ds_fp8_1p_tp4_1d_tp8_slurm.sh` | SLURM head node | One-shot end-to-end PD benchmark on 2 nodes |

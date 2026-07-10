@@ -170,16 +170,16 @@
     "_baseline_note": "HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909"
   },
   {
-    "model_name": "Kimi-K2.5-MXFP4",
-    "model_path": "amd/Kimi-K2.5-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code",
-    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
+    "model_name": "Kimi-K2.7-Code-MXFP4",
+    "model_path": "amd/Kimi-K2.7-Code-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code --gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"\", \"layer_quant_config\": {\"model.layers.*.self_attn.fused_qkv_a_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.q_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.kv_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.o_proj\": \"ptpc_fp8\"}}'",
+    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.9409,
-    "accuracy_baseline_model": "moonshotai/Kimi-K2.5",
-    "_baseline_note": "HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409"
+    "accuracy_baseline_model": "moonshotai/Kimi-K2.7-Code",
+    "_baseline_note": "Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold inherited from Kimi-K2.5-MXFP4 until CI baseline is refreshed."
   },
   {
     "model_name": "Kimi-K2.5-MXFP4 Eagle3",
@@ -235,23 +235,11 @@
     "extraArgs": "--kv_cache_dtype fp8 -tp 4 --default-chat-template-kwargs '{\"enable_thinking\":false}' --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}' --method mtp --num-speculative-tokens 3",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
     "runner": "linux-atom-do-mi350x-8",
-    "test_level": "nightly",
+    "test_level": "pr",
     "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.9447,
     "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
     "_baseline_note": "Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated."
-  },
-  {
-    "model_name": "GLM-5.1-FP8",
-    "model_path": "zai-org/GLM-5.1-FP8",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
-    "env_vars": "",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "pr",
-    "accuracy_threshold": 0.875,
-    "accuracy_baseline": 0.9545,
-    "accuracy_baseline_model": "zai-org/GLM-5.1",
-    "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
   },
   {
     "model_name": "Qwen3.5-35B-A3B TP2",
@@ -324,18 +312,6 @@
     "accuracy_baseline": 0.9022,
     "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
     "_baseline_note": "ATOM CI measured: 0.9022 (gsm8k 3-shot flexible-extract). Threshold = baseline - 0.015."
-  },
-  {
-    "model_name": "MiniMax-M2.7-MXFP4",
-    "model_path": "amd/MiniMax-M2.7-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 --trust-remote-code",
-    "env_vars": "",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "nightly",
-    "accuracy_threshold": 0.8872,
-    "accuracy_baseline": 0.9022,
-    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
-    "_baseline_note": "ATOM CI measured BF16=0.9022 (gsm8k 3-shot flexible-extract). HF amd/MiniMax-M2.7-MXFP4: MXFP4=91.89, baseline=91.81 (percentage)."
   },
   {
     "model_name": "MiniMax-M3-MXFP4",

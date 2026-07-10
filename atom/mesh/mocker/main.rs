@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use atomesh_mocker::{
     MockCase, VirtualRequestMode, VirtualRequestPipeline, VirtualRequestPipelineConfig,
@@ -51,6 +51,10 @@ struct BenchmarkRequestArgs {
     #[arg(long, default_value_t = 4096)]
     queue_capacity: usize,
 
+    /// Optional run duration, for example 30s, 3m, or 1h. Without this, run until Ctrl-C.
+    #[arg(long)]
+    duration: Option<String>,
+
     /// Fixture file paths to run.
     #[arg(required = true)]
     fixtures: Vec<PathBuf>,
@@ -93,12 +97,14 @@ async fn run_benchmark_request(
         .map(MockCase::from_fixture)
         .collect::<Result<Vec<_>, _>>()?;
     let mode = request_mode_from_base_url(&args.base_url);
+    let duration = args.duration.as_deref().map(parse_duration).transpose()?;
     let pipeline = VirtualRequestPipeline::try_new(
         VirtualRequestPipelineConfig::new(args.base_url)
             .mode(mode)
             .host_header(args.host)
             .tls_ca_cert_path(args.tls_ca_cert_path)
             .tls_accept_invalid_certs(args.tls_accept_invalid_certs)
+            .duration(duration)
             .producer_threads(args.producer_threads)
             .consumer_threads(args.consumer_threads)
             .queue_capacity(args.queue_capacity),
@@ -122,6 +128,34 @@ fn request_mode_from_base_url(base_url: &str) -> VirtualRequestMode {
     } else {
         VirtualRequestMode::Http
     }
+}
+
+fn parse_duration(value: &str) -> Result<Duration, Box<dyn std::error::Error>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("duration must not be empty".into());
+    }
+
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's') => (&value[..value.len() - 1], 1),
+        Some(b'm') => (&value[..value.len() - 1], 60),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60),
+        Some(byte) if byte.is_ascii_digit() => (value, 1),
+        _ => {
+            return Err(
+                format!("unsupported duration `{value}`; use an integer with s, m, or h").into(),
+            )
+        }
+    };
+
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| format!("invalid duration `{value}`; use an integer with s, m, or h"))?;
+    if amount == 0 {
+        return Err("duration must be greater than zero".into());
+    }
+
+    Ok(Duration::from_secs(amount.saturating_mul(multiplier)))
 }
 
 async fn run_virtual_workers(args: VirtualWorkersArgs) -> Result<(), Box<dyn std::error::Error>> {

@@ -73,6 +73,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
+    # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
+    # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
+    # max_num_batched_tokens, so a concurrency burst of long-context requests
+    # can drive a single allocation to tens of GiB (see GLM-5.2 OOM #1376).
+    # Target peak (in MiB) for the indexer's dense fp32 logits buffer during
+    # prefill. The indexer chunks along the query (Q) dimension so the buffer
+    # stays ~[q_chunk, total_kv] with q_chunk = budget_bytes // (total_kv * 4);
+    # q_chunk shrinks automatically as total_kv (the unbounded KV dimension)
+    # grows. Under chunked prefill num_rows is already capped by
+    # max_num_batched_tokens, so a fixed row count would not adapt to total_kv
+    # (see GLM-5.2 OOM #1376) — a memory budget does. Each chunk still scores
+    # the full KV, so every row's top-k is exact (no cross-chunk merge). Set to
+    # 0 to disable chunking (always single-shot).
+    "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
+        os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),

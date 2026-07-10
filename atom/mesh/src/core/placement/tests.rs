@@ -1486,10 +1486,13 @@ mod f_atom_adapter {
             transfer_id: "xfer-test".to_string(),
             prefill_url: "http://p:8000".to_string(),
             prefill_dp_size: 4,
+            prefill_dp_rank: Some(2),
+            decode_dp_rank: Some(2),
         });
         let mut kv = json!({});
         adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
         assert_eq!(kv["remote_dp_size"], json!(4));
+        assert_eq!(kv["remote_dp_rank"], json!(2));
         assert_eq!(kv["remote_tp_size"], json!(8));
     }
 
@@ -1537,6 +1540,8 @@ mod f_atom_adapter {
             transfer_id: "x".to_string(),
             prefill_url: "http://unknown:8000".to_string(),
             prefill_dp_size: 1,
+            prefill_dp_rank: None,
+            decode_dp_rank: None,
         });
         let mut kv = json!({});
         let err = adapter.enrich_decode_kv(&mut kv, &ctx).unwrap_err();

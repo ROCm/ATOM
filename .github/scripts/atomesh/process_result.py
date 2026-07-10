@@ -18,6 +18,10 @@ RESULT_RE = re.compile(
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
 EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
+EVAL_TOPOLOGY_RE = re.compile(
+    r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?)(?:$|[_-])",
+    re.IGNORECASE,
+)
 
 
 def number(*values: Any) -> float | None:
@@ -56,6 +60,8 @@ def slurm_job_env(path: Path) -> dict[str, str]:
     for parent in path.parents:
         env_path = parent / "docker.env"
         if env_path.is_file():
+            return read_env_file(env_path)
+        for env_path in sorted(parent.glob("docker-rank-*.env")):
             return read_env_file(env_path)
     return {}
 
@@ -205,6 +211,12 @@ def perf_point_extra(base_extra: str, point: dict[str, Any]) -> str:
     return " | ".join(part for part in (base_extra, f"perf_point={encoded}") if part)
 
 
+def topology_key(value: Any) -> str:
+    text = string_value(value).lower().replace("-", "_")
+    match = EVAL_TOPOLOGY_RE.search(text)
+    return match.group("topology").replace("-", "_") if match else text
+
+
 def derive_fields(path: Path, payload: dict[str, Any]) -> dict[str, Any] | None:
     match = RESULT_RE.match(path.name)
     if match:
@@ -231,7 +243,7 @@ def derive_fields(path: Path, payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def enrich_payload(
-    path: Path, payload: dict[str, Any], fields: dict[str, Any]
+    path: Path, payload: dict[str, Any], fields: dict[str, Any], hardware: str | None
 ) -> dict[str, Any]:
     env = slurm_job_env(path)
     enriched = dict(payload)
@@ -251,6 +263,13 @@ def enrich_payload(
     enriched.setdefault("decode_workers", env.get("DECODE_WORKERS"))
     enriched.setdefault("prefill_tp", env.get("PREFILL_TP"))
     enriched.setdefault("decode_tp", env.get("DECODE_TP"))
+    runner = env.get("SLURM_SUBMIT_RUNNER", "")
+    if hardware:
+        enriched["hardware"] = hardware
+    elif runner == "atomesh-cicd-mi350":
+        enriched["hardware"] = "MI350X"
+    elif runner == "atomesh-cicd":
+        enriched["hardware"] = "MI355X"
 
     if "total_token_throughput" not in enriched:
         enriched["total_token_throughput"] = number(
@@ -318,7 +337,9 @@ def perf_point(
     hardware = string_value(
         payload.get("hardware"), payload.get("gpu_name"), default="mi355x"
     ).lower()
-    if "mi355" in hardware:
+    if "mi350" in hardware:
+        hardware = "mi350x"
+    elif "mi355" in hardware:
         hardware = "mi355x"
     backend = string_value(
         payload.get("backend"), fields.get("backend"), default="atom"
@@ -444,7 +465,8 @@ def dashboard_point_entry(point: dict[str, Any], extra: str) -> dict[str, Any] |
 def collect_dashboard_entries(
     paths: list[Path],
     run_url: str | None,
-    gsm8k_scores: dict[int, dict[str, Any]],
+    gsm8k_scores: dict[tuple[str, int], dict[str, Any]],
+    hardware: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
@@ -457,10 +479,11 @@ def collect_dashboard_entries(
         fields = derive_fields(path, payload)
         if not fields:
             continue
-        payload = enrich_payload(path, payload, fields)
-        gsm8k_score = gsm8k_scores.get(
-            int(payload.get("max_concurrency", fields["conc"]))
-        )
+        payload = enrich_payload(path, payload, fields, hardware)
+        conc = int(payload.get("max_concurrency", fields["conc"]))
+        gsm8k_score = gsm8k_scores.get((topology_key(fields["topology"]), conc))
+        if gsm8k_score is None:
+            gsm8k_score = gsm8k_scores.get(("", conc))
         gsm8k = gsm8k_score.get("value") if gsm8k_score else None
         if gsm8k_score is not None:
             payload["gsm8k"] = gsm8k
@@ -482,7 +505,15 @@ def eval_concurrency(path: Path) -> int | None:
     return None
 
 
-def find_eval_scores(root: Path) -> dict[int, dict[str, Any]]:
+def eval_topology(path: Path) -> str:
+    for part in reversed(path.parts):
+        match = EVAL_TOPOLOGY_RE.search(part)
+        if match:
+            return match.group("topology").replace("-", "_").lower()
+    return ""
+
+
+def find_eval_scores(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
     scores = {}
     for path in sorted(root.rglob("results*.json")):
         payload = read_json(path)
@@ -506,7 +537,10 @@ def find_eval_scores(root: Path) -> dict[int, dict[str, Any]]:
         )
         score = number(score_raw)
         if score is not None:
-            scores[conc] = {"value": round(score, 4), "raw": f"{score:.4f}"}
+            scores[(eval_topology(path), conc)] = {
+                "value": round(score, 4),
+                "raw": f"{score:.4f}",
+            }
     return scores
 
 
@@ -514,12 +548,13 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | GSM8K |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | GSM8K |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {gsm8k} |".format(
+            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {gsm8k} |".format(
+                hardware=row.get("hardware", "--"),
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
                 isl=row.get("random_input_len", "--"),
@@ -535,19 +570,15 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
-                gsm8k=fmt_raw(row.get("gsm8k_raw", row.get("gsm8k"))),
+                gsm8k=fmt(row.get("gsm8k"), digits=4),
             )
         )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def fmt_raw(value: Any) -> str:
-    return "--" if value in (None, "") else str(value)
-
-
-def fmt(value: Any) -> str:
+def fmt(value: Any, digits: int = 2) -> str:
     parsed = number(value)
-    return "--" if parsed is None else f"{parsed:.2f}"
+    return "--" if parsed is None else f"{parsed:.{digits}f}"
 
 
 def main() -> None:
@@ -558,12 +589,15 @@ def main() -> None:
     )
     parser.add_argument("--summary", default="benchmark-summary.md")
     parser.add_argument("--run-url", default=None)
+    parser.add_argument("--hardware", default=None)
     args = parser.parse_args()
 
     root = Path(args.result_dir)
     bench_paths = list(root.rglob("pd-*.json"))
     gsm8k_scores = find_eval_scores(root)
-    entries, rows = collect_dashboard_entries(bench_paths, args.run_url, gsm8k_scores)
+    entries, rows = collect_dashboard_entries(
+        bench_paths, args.run_url, gsm8k_scores, args.hardware
+    )
     Path(args.output).write_text(json.dumps(entries, indent=2), encoding="utf-8")
     write_summary(rows, Path(args.summary))
     print(
