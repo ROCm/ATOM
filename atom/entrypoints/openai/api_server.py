@@ -68,6 +68,18 @@ from .serving_completion import (
     stream_completion_response,
     stream_completion_response_fanout,
 )
+from .serving_responses import (
+    ResponsesStreamEmitter,
+    inject_tool_format_instruction,
+    shell_arg_key,
+    build_responses_object,
+    remap_tool_name,
+    extract_cwd,
+    responses_input_to_messages,
+    responses_tools_to_openai,
+    tool_name_lookup,
+    translate_client_tool,
+)
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -324,6 +336,24 @@ def _prepare_multimodal_inputs(
     return inputs["input_ids"][0].tolist(), multimodal_data
 
 
+# ── Batched stream dispatch ──────────────────────────────────────────────
+# Per-seq `call_soon_threadsafe` floods the API event loop at high batch size
+# (one call per token). Instead the callback only buffers the raw chunk; the
+# mgr flushes a whole step with a single `tokenizer.batch_decode` (one
+# GIL-released call instead of one decode per seq) plus one scheduled call per
+# loop (see `flush_stream_batch`).
+import threading as _threading  # noqa: E402
+
+_stream_batch_tls = _threading.local()
+
+# Per-request incremental detokenization state (vLLM-style sliding window).
+# Decoding each step's new tokens in isolation splits multi-byte UTF-8 chars
+# (byte-BPE tokenizers like DeepSeek-V4 split one CJK char across several
+# byte-tokens) into U+FFFD. Keep accumulated tokens + prefix/read offsets so
+# we only emit fully-formed characters.
+_stream_detok_state: Dict[str, dict] = {}
+
+
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
@@ -346,7 +376,70 @@ def _send_stream_chunk_direct(
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
+
+    chunk_data["request_id"] = request_id
+    buf = getattr(_stream_batch_tls, "buf", None)
+    if buf is None:
+        buf = _stream_batch_tls.buf = []
+    buf.append((loop, stream_queue, chunk_data))
+
+
+def _drain_batch_into_queues(items: list) -> None:
+    """Runs ON the event loop: push each chunk into its per-request queue.
+    One scheduled call handles a whole step's worth of chunks."""
+    for _loop, q, chunk in items:
+        q.put_nowait(chunk)
+
+
+def flush_stream_batch() -> None:
+    """Flush a step's buffered chunks: one ``batch_decode`` for the whole step,
+    then one call_soon_threadsafe per loop (normally one — all requests on a
+    rank share the API loop)."""
+    global tokenizer
+
+    buf = getattr(_stream_batch_tls, "buf", None)
+    if not buf:
+        return
+    _stream_batch_tls.buf = []
+    # Decode the whole step in a single call. batch_decode is element-wise
+    # identical to per-seq decode but acquires/releases the GIL once instead of
+    # once per seq, cutting GIL ping-pong against the other rank output threads
+    # and the API event loop at high batch size.
+    # Incremental per-request detokenization: correct UTF-8 at token
+    # boundaries (see _stream_detok_state). Emits only fully-formed chars;
+    # a trailing partial multi-byte char is held until the next step.
+    for (_loop, _q, chunk) in buf:
+        rid = chunk.get("request_id")
+        st = _stream_detok_state.get(rid)
+        if st is None:
+            st = _stream_detok_state[rid] = {
+                "tokens": [], "prefix_offset": 0, "read_offset": 0,
+            }
+        toks = st["tokens"]
+        toks.extend(chunk["token_ids"])
+        prefix_text = tokenizer.decode(
+            toks[st["prefix_offset"]:st["read_offset"]], skip_special_tokens=True
+        )
+        new_text = tokenizer.decode(
+            toks[st["prefix_offset"]:], skip_special_tokens=True
+        )
+        if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
+            chunk["text"] = new_text[len(prefix_text):]
+            st["prefix_offset"] = st["read_offset"]
+            st["read_offset"] = len(toks)
+        elif chunk["finished"]:
+            chunk["text"] = new_text[len(prefix_text):]
+        else:
+            chunk["text"] = ""
+        if chunk["finished"]:
+            _stream_detok_state.pop(rid, None)
+    # Group by loop (normally a single loop). dict preserves insertion order
+    # so per-request chunk ordering within the step is maintained.
+    by_loop: Dict[AbstractEventLoop, list] = {}
+    for loop, q, chunk in buf:
+        by_loop.setdefault(loop, []).append((loop, q, chunk))
+    for loop, items in by_loop.items():
+        loop.call_soon_threadsafe(_drain_batch_into_queues, items)
 
 
 def _send_stream_chunk_tagged(
@@ -1426,6 +1519,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 if prompt.rstrip().endswith("<think>"):
                     reasoning_filter.state = 1
                 tool_parser = ToolCallStreamParser()
+                tool_parser.tools = anthropic_to_openai_tools(request.tools)
                 block_index = 0
                 started_text = False
                 started_thinking = False
@@ -1590,15 +1684,17 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         from .reasoning import separate_reasoning
         from .tool_parser import parse_tool_calls
 
-        final_output = None
-        async for output in generate_async(prompt, sampling_params, request_id):
-            final_output = output
+        final_output = await _run_nonstream_with_disconnect(
+            generate_async(prompt, sampling_params, request_id),
+            raw_request,
+            request_id,
+        )
         if final_output is None:
             raise RuntimeError("No output generated")
 
         raw_text = final_output["text"]
         reasoning_content, content_with_tools = separate_reasoning(raw_text)
-        content_text, tool_calls = parse_tool_calls(content_with_tools)
+        content_text, tool_calls = parse_tool_calls(content_with_tools, anthropic_to_openai_tools(request.tools))
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         if not getattr(request, "thinking", None):
@@ -1615,6 +1711,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             cache_read_input_tokens=cache_read_input_tokens,
         )
 
+    except _ClientDisconnected:
+        # Client hung up; seq already aborted + popped. Nothing to return.
+        return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except Exception as e:
         logger.error(f"Error in anthropic_messages: {e}", exc_info=True)
         return JSONResponse(
@@ -1623,6 +1722,222 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 "type": "error",
                 "error": {"type": "api_error", "message": str(e)},
             },
+        )
+
+
+@app.post("/v1/responses")
+async def responses_endpoint(raw_request: Request):
+    """Handle OpenAI **Responses API** requests (`/v1/responses`).
+
+    Native support so OpenAI Codex CLI (>= 0.14x, which speaks only the Responses
+    API) can talk to ATOM directly — no external responses->chat proxy needed.
+    Reuses ATOM's proven streaming path (setup_streaming_request + ReasoningFilter
+    + ToolCallStreamParser), the same one /v1/messages (claude-local) uses, so it
+    streams correctly for reasoning models. Stateless (full input sent each turn,
+    as Codex does); reasoning items are dropped from visible output.
+    """
+    global engine, tokenizer, model_name
+
+    try:
+        body = await raw_request.json()
+        model = body.get("model") or model_name
+
+        from .protocol import ChatMessage
+        from .reasoning import ReasoningFilter, separate_reasoning
+        from .tool_parser import ToolCallStreamParser, parse_tool_calls
+
+        openai_tools = responses_tools_to_openai(body.get("tools"))
+        valid_names, shell_tool = tool_name_lookup(openai_tools)
+        shell_param = shell_arg_key(openai_tools, shell_tool)
+        req_cwd = extract_cwd(body)  # Codex <cwd> — used to fix hallucinated paths
+        openai_messages = responses_input_to_messages(
+            body.get("instructions"), body.get("input")
+        )
+        if openai_tools:
+            openai_messages = inject_tool_format_instruction(openai_messages)
+        messages = [ChatMessage(**m) for m in openai_messages]
+
+        merged_kwargs = dict(default_chat_template_kwargs)
+        prompt = apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            [msg.to_template_dict() for msg in messages],
+            tools=openai_tools or None,
+            **merged_kwargs,
+        )
+
+        max_out = int(body.get("max_output_tokens") or 32768)
+        sampling_params = _build_sampling_params(
+            temperature=body.get("temperature") if body.get("temperature") is not None else 1.0,
+            max_tokens=max_out,
+            stop_strings=None,
+            ignore_eos=False,
+            top_k=-1,
+            top_p=body.get("top_p") if body.get("top_p") is not None else 1.0,
+        )
+
+        request_id = "resp_" + uuid.uuid4().hex[:24]
+        input_tokens = len(tokenizer.encode(prompt))
+
+        # Resolve max context to bound the prompt (same probes as anthropic).
+        max_ctx = None
+        for _path in (
+            lambda: engine.config.max_model_len,
+            lambda: engine.model_config.max_model_len,
+            lambda: engine.scheduler.max_model_len,
+            lambda: getattr(engine, "max_model_len"),
+        ):
+            try:
+                _v = _path()
+                if _v:
+                    max_ctx = int(_v)
+                    break
+            except Exception:
+                continue
+        if not max_ctx:
+            max_ctx = 30720
+        headroom = min(max_out, max(1024, max_ctx // 8))
+        max_input = max_ctx - headroom
+        if input_tokens > max_input:
+            logger.warning(
+                f"[responses] prompt too long ({input_tokens} > {max_input}), truncating"
+            )
+            token_ids = tokenizer.encode(prompt)[:max_input]
+            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
+            input_tokens = max_input
+
+        if body.get("stream"):
+            seq_id, stream_queue, _num_prompt_tokens = await setup_streaming_request(
+                prompt, sampling_params, request_id
+            )
+
+            async def generate_responses_stream():
+                emitter = ResponsesStreamEmitter(request_id, model)
+                reasoning_filter = ReasoningFilter()
+                if prompt.rstrip().endswith("<think>"):
+                    reasoning_filter.state = 1
+                tool_parser = ToolCallStreamParser()
+                tool_parser.tools = openai_tools or None  # enables schema-based
+                # type coercion + key-alias (command->cmd) in _parse_dsml
+                output_tokens = 0
+
+                # Buffer each tool call (name + full args) so read/grep/ls/find
+                # can be translated to exec_command before emitting (name AND
+                # args change). See translate_client_tool.
+                _pending = {"tc": None}
+
+                def _flush_pending():
+                    tc = _pending["tc"]
+                    if tc is None:
+                        return []
+                    _pending["tc"] = None
+                    name, args = translate_client_tool(
+                        tc["name"], tc["args"], valid_names, shell_tool, req_cwd, shell_param
+                    )
+                    out = emitter.tool_start(tc["id"], name)
+                    if args:
+                        out += emitter.tool_args(args)
+                    out += emitter.tool_end()
+                    return out
+
+                def handle(etype, edata):
+                    # Map ToolCallStreamParser events -> Responses SSE strings,
+                    # buffering tool calls for client-tool translation.
+                    if etype == "content":
+                        out = _flush_pending()
+                        return out + emitter.text_delta(edata)
+                    if etype == "tool_call_start":
+                        out = _flush_pending()
+                        fn = edata.get("function", {})
+                        _pending["tc"] = {
+                            "id": edata.get("id", ""),
+                            "name": fn.get("name", ""),
+                            "args": "",
+                        }
+                        return out
+                    if etype == "tool_call_args":
+                        if _pending["tc"] is not None:
+                            _pending["tc"]["args"] += (
+                                edata.get("function", {}).get("arguments", "") or ""
+                            )
+                        return []
+                    if etype == "tool_call_end":
+                        return _flush_pending()
+                    return []
+
+                try:
+                    for s in emitter.created():
+                        yield s
+                    while True:
+                        chunk_data = await stream_queue.get()
+                        new_text = chunk_data["text"]
+                        output_tokens += len(chunk_data.get("token_ids", []))
+                        finished = chunk_data.get("finished", False)
+
+                        segments = reasoning_filter.process(new_text)
+                        if finished:
+                            segments.extend(reasoning_filter.flush())
+                        for field, text in segments:
+                            if not text or field == "reasoning_content":
+                                continue  # drop reasoning from visible output
+                            for etype, edata in tool_parser.process(text):
+                                for s in handle(etype, edata):
+                                    yield s
+
+                        if finished:
+                            for etype, edata in tool_parser.flush():
+                                for s in handle(etype, edata):
+                                    yield s
+                            for s in _flush_pending():  # emit any unclosed tool call
+                                yield s
+                            for s in emitter.finish(input_tokens, output_tokens):
+                                yield s
+                            yield "data: [DONE]\n\n"
+                            break
+                finally:
+                    cleanup_streaming_request(request_id, seq_id)
+
+            return StreamingResponse(
+                generate_responses_stream(),
+                media_type="text/event-stream",
+                headers={"x-request-id": request_id},
+            )
+
+        # Non-streaming response
+        final_output = await _run_nonstream_with_disconnect(
+            generate_async(prompt, sampling_params, request_id),
+            raw_request,
+            request_id,
+        )
+        if final_output is None:
+            raise RuntimeError("No output generated")
+
+        raw_text = final_output["text"]
+        _reasoning, content_with_tools = separate_reasoning(raw_text)
+        content_text, tool_calls = parse_tool_calls(content_with_tools, openai_tools or None)
+        output_tokens = len(tokenizer.encode(raw_text))
+
+        return JSONResponse(
+            content=build_responses_object(
+                resp_id=request_id,
+                model=model,
+                content_text=content_text,
+                tool_calls=tool_calls,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                valid=valid_names,
+                shell_tool=shell_tool,
+                cwd=req_cwd,
+            )
+        )
+
+    except _ClientDisconnected:
+        return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except Exception as e:
+        logger.error(f"Error in responses_endpoint: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"type": "api_error", "message": str(e)}},
         )
 
 
