@@ -99,6 +99,22 @@ fi
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 echo "[runtime] HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}"
 
+dump_launch_info() {
+  local role="$1"
+  shift
+  echo ""
+  echo "========================================"
+  echo "  ${role} launch info"
+  echo "========================================"
+  echo "--- environment ---"
+  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|UCX_)' | sort || true
+  echo "--- command ---"
+  printf '%q ' "$@"
+  echo ""
+  echo "========================================"
+  echo ""
+}
+
 apply_prefixed_env() {
   local prefix="$1"
   local role_ip="$2"
@@ -306,15 +322,18 @@ start_prefill() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
-  python3 -m atom.entrypoints.openai_server \
-    "${server_common[@]}" \
-    --server-port "${server_port}" \
-    "${prefill_parallel[@]}" \
-    --max-num-seqs "${MAX_NUM_SEQS}" \
-    --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}" \
-    "${prefill_cudagraph_args[@]}" \
-    ${PREFILL_SERVER_ARGS} \
-    2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
+  local -a prefill_cmd=(
+    python3 -m atom.entrypoints.openai_server
+    "${server_common[@]}"
+    --server-port "${server_port}"
+    "${prefill_parallel[@]}"
+    --max-num-seqs "${MAX_NUM_SEQS}"
+    --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
+    "${prefill_cudagraph_args[@]}"
+    ${PREFILL_SERVER_ARGS}
+  )
+  dump_launch_info "PREFILL" "${prefill_cmd[@]}"
+  "${prefill_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
   server_pid=$!
 }
 
@@ -330,32 +349,38 @@ start_decode() {
     decode_max_num_seqs="${max_conc}"
   fi
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} cudagraph=${DECODE_CUDAGRAPH:-none}"
-  python3 -m atom.entrypoints.openai_server \
-    "${server_common[@]}" \
-    --server-port "${DECODE_PORT}" \
-    "${decode_parallel[@]}" \
-    --max-num-seqs "${decode_max_num_seqs}" \
-    --kv-transfer-config "{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}" \
-    "${decode_cudagraph_args[@]}" \
-    ${DECODE_SERVER_ARGS} \
-    2>&1 | tee "${RUN_DIR}/logs/decode-rank-${NODE_RANK}.log" &
+  local -a decode_cmd=(
+    python3 -m atom.entrypoints.openai_server
+    "${server_common[@]}"
+    --server-port "${DECODE_PORT}"
+    "${decode_parallel[@]}"
+    --max-num-seqs "${decode_max_num_seqs}"
+    --kv-transfer-config "{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}"
+    "${decode_cudagraph_args[@]}"
+    ${DECODE_SERVER_ARGS}
+  )
+  dump_launch_info "DECODE" "${decode_cmd[@]}"
+  "${decode_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/decode-rank-${NODE_RANK}.log" &
   server_pid=$!
 }
 
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
-  /usr/local/bin/atomesh launch \
-    --host 0.0.0.0 \
-    --port "${ROUTER_PORT}" \
-    --pd-disaggregation \
-    "${prefill_args[@]}" \
-    "${decode_args[@]}" \
-    --policy "${ROUTER_POLICY}" \
-    --backend atom \
-    --log-level info \
-    --disable-circuit-breaker \
-    --prometheus-port "${PROMETHEUS_PORT}" \
-    2>&1 | tee "${RUN_DIR}/logs/router.log" &
+  local -a router_cmd=(
+    /usr/local/bin/atomesh launch
+    --host 0.0.0.0
+    --port "${ROUTER_PORT}"
+    --pd-disaggregation
+    "${prefill_args[@]}"
+    "${decode_args[@]}"
+    --policy "${ROUTER_POLICY}"
+    --backend atom
+    --log-level info
+    --disable-circuit-breaker
+    --prometheus-port "${PROMETHEUS_PORT}"
+  )
+  dump_launch_info "ROUTER" "${router_cmd[@]}"
+  "${router_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/router.log" &
   router_pid=$!
 }
 

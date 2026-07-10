@@ -338,6 +338,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "=== docker.env (passed to container) ==="
+cat "${ENV_FILE}"
+echo "=== end docker.env ==="
+
 srun \
   --nodes="${NUM_NODES}" \
   --ntasks="${NUM_NODES}" \
