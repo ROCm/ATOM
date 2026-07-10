@@ -1191,10 +1191,9 @@ class Config:
             if self.compilation_config.level == CompilationLevel.PIECEWISE:
                 self.compilation_config.set_splitting_ops_for_v1()
                 self._set_cudagraph_sizes()
-                # Respect an explicitly chosen cudagraph_mode (e.g. FULL for the
-                # manual whole-forward capture). Only default to PIECEWISE when
-                # unset. splitting_ops/sizes above are set regardless so the
-                # model is still piece-split-compiled at level 3.
+                # Keep an explicit cudagraph_mode (e.g. FULL); default to
+                # PIECEWISE only when unset. splitting_ops/sizes are set either
+                # way so the model is still piece-split-compiled at level 3.
                 if self.compilation_config.cudagraph_mode is None:
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
                 self.compilation_config.init_with_cudagraph_sizes()

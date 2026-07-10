@@ -64,18 +64,15 @@ class CUDAGraphOptions:
     weak_ref_output: bool = True
 
 
-# Shared cudagraph pool across piecewise pieces. Start None (first
-# torch.cuda.graph makes a private pool the warmup primed -> no hipMalloc during
-# capture on ROCm), then reuse that graph's pool for the rest.
+# Shared cudagraph pool across all piecewise pieces (default). Combined with the
+# weak_ref_tensor op it lets the pool OVERLAY piece outputs across shapes, so the
+# retained pool stays small (~10GB vs ~35GB unshared on DSV4 TP8). First
+# torch.cuda.graph makes the pool; the rest reuse it.
 _shared_graph_pool: Optional[Any] = None
 
-# Per-num_tokens cudagraph pools. Under PIECEWISE with per-step VARYING
-# num_tokens (DSpark 1d), a single global pool lets graphs of DIFFERENT shapes
-# reuse overlapping memory -> replay reads another shape's leftover -> silent
-# corruption (replay != eager, only at large/varied num_tokens). Isolating one
-# pool PER num_tokens bucket removes the cross-shape overlap while keeping the
-# 61 same-shape pieces sharing (sequential -> safe). Memory ~ n_buckets * one
-# forward's pool (a few GB), vs ~22GB for fully-independent per-graph pools.
+# Per-num_tokens pools (ATOM_PER_BUCKET_POOL=1 fallback). Isolates each shape's
+# pool so shapes can't overlap — costs more memory but avoids any cross-shape
+# reuse. Kept as a safety escape hatch; default is the shared pool above.
 _graph_pools: dict = {}
 
 
@@ -204,20 +201,18 @@ class CUDAGraphWrapper:
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
 
                 import atom.utils.cuda_graph as _cg_mod
-                # One cudagraph pool PER num_tokens bucket. A single global pool
-                # would let graphs of DIFFERENT num_tokens (PIECEWISE + DSpark 1d
-                # varying shapes) reuse overlapping memory -> replay reads another
-                # shape's leftover -> silent output corruption (only at
-                # large/varied num_tokens; confirmed via GSM8K). Isolating per
-                # num_tokens removes the cross-shape overlap; the same-shape pieces
-                # still share their bucket's pool. ATOM_GLOBAL_POOL=1 restores the
-                # old single pool (reproduces the corruption; A/B only).
-                _global = os.environ.get("ATOM_GLOBAL_POOL") == "1"
+
+                # Default: single shared pool (overlays piece outputs across
+                # shapes -> low memory; safe here because pieces replay serially
+                # and inter-piece tensors are pinned via persistent buffers).
+                # ATOM_PER_BUCKET_POOL=1 isolates a pool per num_tokens bucket
+                # (more memory) as a fallback.
+                _per_bucket = os.environ.get("ATOM_PER_BUCKET_POOL") == "1"
                 _bkey = batch_descriptor.num_tokens if batch_descriptor else 0
                 _pool = (
-                    _cg_mod._shared_graph_pool
-                    if _global
-                    else _cg_mod._graph_pools.get(_bkey)
+                    _cg_mod._graph_pools.get(_bkey)
+                    if _per_bucket
+                    else _cg_mod._shared_graph_pool
                 )
                 with torch.cuda.graph(cudagraph, pool=_pool):
                     # `output` is managed by pytorch's cudagraph pool
@@ -233,13 +228,13 @@ class CUDAGraphWrapper:
 
             # here we always use weak ref for the output
             # to save memory
-            if _global:
-                if _cg_mod._shared_graph_pool is None:
-                    _cg_mod._shared_graph_pool = cudagraph.pool()
-            elif _bkey not in _cg_mod._graph_pools:
-                # first graph of this num_tokens bucket -> remember its pool so
-                # the remaining same-bucket pieces reuse it.
-                _cg_mod._graph_pools[_bkey] = cudagraph.pool()
+            if _per_bucket:
+                if _bkey not in _cg_mod._graph_pools:
+                    # first graph of this bucket -> remember its pool.
+                    _cg_mod._graph_pools[_bkey] = cudagraph.pool()
+            elif _cg_mod._shared_graph_pool is None:
+                # first graph overall -> remember the shared pool.
+                _cg_mod._shared_graph_pool = cudagraph.pool()
 
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph

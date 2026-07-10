@@ -2624,9 +2624,9 @@ class ModelRunner:
             import atom.utils.cuda_graph as _cg_mod
 
             logger.info(
-                "PIECEWISE POOL-DIAG global_env=%s shared_pool=%s n_bucket_pools=%d "
-                "bucket_pool_keys=%s",
-                os.environ.get("ATOM_GLOBAL_POOL"),
+                "PIECEWISE POOL-DIAG per_bucket_env=%s shared_pool=%s "
+                "n_bucket_pools=%d bucket_pool_keys=%s",
+                os.environ.get("ATOM_PER_BUCKET_POOL"),
                 _cg_mod._shared_graph_pool is not None,
                 len(_cg_mod._graph_pools),
                 sorted(_cg_mod._graph_pools.keys()),
