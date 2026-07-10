@@ -1,8 +1,8 @@
 # GLM-5 with ATOM vLLM Plugin Backend
 
-This recipe shows how to run a `GLM-5.1` model with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `GLM-5.1` and `GLM-5.2` models with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
-GLM-5 features sparse MLA, and is architecturally similar to DeepSeek-V3.2. Its architecture is exposed through `GlmMoeDsaForCausalLM` to be picked up by ATOM OOT.
+GLM-5 features sparse MLA, and is architecturally similar to DeepSeek-V3.2. Its architecture is exposed through `GlmMoeDsaForCausalLM` to be picked up by ATOM OOT. GLM-5.2 additionally uses IndexShare: `"shared"` layers reuse the preceding `"full"` layer's DSA indexer.
 
 ## Step 1: Pull the OOT Docker
 
@@ -30,6 +30,30 @@ vllm serve zai-org/GLM-5.1-FP8 \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
     --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching
+```
+
+### GLM-5.2-MXFP4 Nightly Recipe
+
+The nightly OOT accuracy recipe uses TP4 with FP8 KV cache and 20-shot GSM8K, matching the IndexShare coverage in CI:
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+vllm serve amd/GLM-5.2-MXFP4 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.8 \
+    --default-chat-template-kwargs '{"enable_thinking":false}' \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
@@ -74,8 +98,10 @@ The sparse MLA mechanism contains an indexer that selects the top-k tokens it de
 
 
 ```bash
+MODEL_PATH=amd/GLM-5.2-MXFP4
+
 lm_eval --model local-completions \
-        --model_args model=zai-org/GLM-5.1-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3 \
+        --model_args model="${MODEL_PATH}",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
         --num_fewshot 20
 ```

@@ -2120,6 +2120,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
+        self.quant_dtype = None
+        self.input_norm_quant_type = None
 
         self.self_attn = DeepseekV2MLAAttention(
             config=config,
@@ -2138,28 +2140,47 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
-        # Keep input RMSNorm quant fusion narrow: the legacy FP8/FP4 path uses
-        # Triton GEMM, while the non-Triton FP4 path is only enabled for the
-        # pure global MXFP4 DeepSeek v2 checkpoint layout.
+        # Keep input RMSNorm quant fusion narrow: non-Triton FP8 activation quant is only supported for per-token layouts.
+        # Block/group FP8 would hit aiter's dynamic_per_group_scaled_quant FP8 path, which is not implemented.
+        # The non-Triton FP4 path is only enabled for the pure global MXFP4 DeepSeek v2 checkpoint layout.
         # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
         #   1. RMS_Quant fusion is only used for input_layernorm
         #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
         #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm if ENABLE_ALLREDUCE_RMSNORM_FUSION is turned on
-        self.quant_dtype = (
-            None
-            if quant_config is None
-            else quant_config.get_layer_quant_config(prefix).quant_dtype
+        attn_input_proj_name = (
+            "fused_qkv_a_proj"
+            if getattr(config, "q_lora_rank", None) is not None
+            else "q_proj"
         )
-        self.input_norm_quant_type = (
-            None
-            if quant_config is None
-            else quant_config.get_layer_quant_config(prefix).quant_type.value
-        )
+        if quant_config is not None:
+            attn_input_layer_name = f"{prefix}.self_attn.{attn_input_proj_name}"
+            attn_input_quant_config = quant_config.get_layer_quant_config(
+                attn_input_layer_name
+            )
+
+            def uses_quantized_attn_input(layer_quant_config):
+                return (
+                    layer_quant_config.quant_type != QuantType.No
+                    and layer_quant_config.quant_dtype in (dtypes.fp8, dtypes.fp4x2)
+                )
+
+            if quant_config.online_quant and not uses_quantized_attn_input(
+                attn_input_quant_config
+            ):
+                attn_input_quant_config = quant_config.get_layer_quant_config(
+                    attn_input_layer_name,
+                    use_online_quant=True,
+                )
+
+            if uses_quantized_attn_input(attn_input_quant_config):
+                self.quant_dtype = attn_input_quant_config.quant_dtype
+                self.input_norm_quant_type = attn_input_quant_config.quant_type.value
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
-            enable_fp8_input_norm_quant = (
-                self.quant_dtype == dtypes.fp8 and use_triton_gemm()
+            enable_fp8_input_norm_quant = self.quant_dtype == dtypes.fp8 and (
+                use_triton_gemm()
+                or self.input_norm_quant_type == QuantType.per_Token.value
             )
             enable_fp4_input_norm_quant = self.quant_dtype == dtypes.fp4x2 and (
                 use_triton_gemm()

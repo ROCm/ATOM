@@ -11,6 +11,13 @@ import triton.language as tl
 SPARSE_BLOCK_SIZE = 128
 
 
+def _is_stream_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 @dataclass
 class MiniMaxM3SGLangMetadata:
     """Per-forward SGLang metadata for MiniMax-M3 sparse attention."""
@@ -614,8 +621,11 @@ def build_minimax_m3_block_table(forward_batch, page_size: int) -> torch.Tensor:
             offset += query_len
 
     seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
-    max_seq_len = int(seq_lens.max().item()) if batch_size else 0
-    max_blocks = (max_seq_len + page_size - 1) // page_size
+    if _is_stream_capturing() and forward_batch.forward_mode.is_decode_or_idle():
+        max_blocks = int(token_table.shape[1]) // page_size
+    else:
+        max_seq_len = int(seq_lens.max().item()) if batch_size else 0
+        max_blocks = (max_seq_len + page_size - 1) // page_size
     block_table = token_table[:, : max_blocks * page_size : page_size] // page_size
     return block_table.to(dtype=torch.int32).contiguous()
 
@@ -630,7 +640,10 @@ def build_minimax_m3_forward_metadata(
     validate_minimax_m3_page_size(page_size)
     batch_size = _get_batch_size(forward_batch)
     seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
-    max_seq_len = int(seq_lens.max().item()) if batch_size else 0
+    if _is_stream_capturing() and forward_batch.forward_mode.is_decode_or_idle():
+        max_seq_len = int(block_table.shape[1]) * page_size
+    else:
+        max_seq_len = int(seq_lens.max().item()) if batch_size else 0
 
     if forward_batch.forward_mode.is_decode_or_idle():
         return MiniMaxM3SGLangMetadata(
@@ -717,14 +730,21 @@ def _insert_sparse_cache(
     page_size = _get_page_size(forward_batch)
     slot_mapping = forward_batch.out_cache_loc[: key.shape[0]].to(dtype=torch.long)
     valid = slot_mapping >= 0
-
-    slots = slot_mapping[valid]
+    is_capture = _is_stream_capturing()
+    if is_capture:
+        # CUDA graph capture uses fixed-size decode batches; boolean compaction
+        # launches a dynamic-shape HIP op that is not graph-capture safe.
+        slots = slot_mapping
+        key = key.view(-1, layer.num_kv_heads, layer.head_dim)
+        value = value.view(-1, layer.num_kv_heads, layer.head_dim)
+        index_key = index_key.view(-1, layer.idx_head_dim)
+    else:
+        slots = slot_mapping[valid]
+        key = key.view(-1, layer.num_kv_heads, layer.head_dim)[valid]
+        value = value.view(-1, layer.num_kv_heads, layer.head_dim)[valid]
+        index_key = index_key.view(-1, layer.idx_head_dim)[valid]
     block_ids = torch.div(slots, page_size, rounding_mode="floor")
     block_offsets = slots % page_size
-
-    key = key.view(-1, layer.num_kv_heads, layer.head_dim)[valid]
-    value = value.view(-1, layer.num_kv_heads, layer.head_dim)[valid]
-    index_key = index_key.view(-1, layer.idx_head_dim)[valid]
     key_cache[block_ids, block_offsets] = key.to(key_cache.dtype)
     value_cache[block_ids, block_offsets] = value.to(value_cache.dtype)
     index_cache[block_ids, block_offsets] = index_key.to(index_cache.dtype)

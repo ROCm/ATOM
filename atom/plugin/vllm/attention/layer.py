@@ -68,7 +68,10 @@ class AttentionForVllm:
             raise RuntimeError("atom_config is required for vLLM plugin attention")
 
         if use_mla:
-            if mla_modules is not None and mla_modules.indexer is not None:
+            is_sparse_mla = mla_modules is not None and (
+                mla_modules.is_sparse or mla_modules.indexer is not None
+            )
+            if is_sparse_mla:
                 return AttentionForVllmSparseMLA(
                     *args, mla_modules=mla_modules, **kwargs
                 )

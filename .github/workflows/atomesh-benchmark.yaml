@@ -17,10 +17,11 @@ on:
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
-    # Start weekend nightly runs at 21:00 Beijing time (13:00 UTC).
-    # Runs are expected to occupy the Sat 21:00-Sun 09:00 and Sun 21:00-Mon 09:00 windows.
+    # TW weekend nightly at 21:00 Beijing time (13:00 UTC).
     - cron: '0 13 * * 6'
     - cron: '0 13 * * 0'
+    # Spur nightly at 00:10 Beijing time (16:10 UTC).
+    - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
       suite:
@@ -56,26 +57,6 @@ on:
         required: false
         default: false
         type: boolean
-      deepseek_v4_pro_model_path:
-        description: 'Model path for DeepSeek-V4-Pro'
-        required: false
-        default: /mnt/models/DeepSeek-V4-Pro/
-        type: string
-      kimi_k25_mxfp4_model_path:
-        description: 'Model path for Kimi-K2.5-MXFP4'
-        required: false
-        default: /mnt/models/Kimi-K2.5-MXFP4/
-        type: string
-      minimax_m3_mxfp4_model_path:
-        description: 'Model path for MiniMax-M3-MXFP4'
-        required: false
-        default: /mnt/models/MiniMax-M3-MXFP4
-        type: string
-      minimax_m3_mxfp8_model_path:
-        description: 'Model path for MiniMax-M3-MXFP8'
-        required: false
-        default: /mnt/models/MiniMax-M3-MXFP8
-        type: string
       atomesh_image:
         description: 'Override ATOM docker image'
         required: false
@@ -84,12 +65,12 @@ on:
       atomesh_slurm_account:
         description: 'Slurm account'
         required: false
-        default: amd-frameworks
+        default: ''
         type: string
       atomesh_slurm_partition:
         description: 'Slurm partition'
         required: false
-        default: amd-frameworks
+        default: ''
         type: string
       atomesh_slurm_submit_runner:
         description: 'GitHub runner label used to submit Slurm jobs'
@@ -99,17 +80,17 @@ on:
       atomesh_log_root:
         description: 'Root directory for ATOMesh Slurm logs'
         required: false
-        default: /it-share/ATOMESH_LOG/
+        default: ''
         type: string
       atomesh_1p1d_nodes:
-        description: 'Comma-separated ATOMesh 1P1D nodes'
+        description: 'Optional comma-separated ATOMesh 1P1D nodes'
         required: false
-        default: mia1-p02-g42,mia1-p02-g44
+        default: ''
         type: string
       atomesh_2p1d_nodes:
-        description: 'Comma-separated ATOMesh 2P1D nodes'
+        description: 'Optional comma-separated ATOMesh 2P1D nodes'
         required: false
-        default: mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
+        default: ''
         type: string
       benchmark_concurrency:
         description: 'Optional benchmark concurrency override, e.g. 1,2,4 (no quotes)'
@@ -133,15 +114,17 @@ on:
         type: boolean
 
 env:
-  ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account || 'amd-frameworks' }}
-  ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition || 'amd-frameworks' }}
-  ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || 'atomesh-cicd' }}
-  ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root || '/it-share/ATOMESH_LOG/' }}
-  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes || 'mia1-p02-g42,mia1-p02-g44' }}
-  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47' }}
+  ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != '' && inputs.atomesh_slurm_account || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks') }}
+  ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != '' && inputs.atomesh_slurm_partition || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks') }}
+  ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
+  ATOMESH_DASHBOARD_HARDWARE: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'MI350X' || 'MI355X' }}
+  ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root != '' && inputs.atomesh_log_root || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || '/it-share/ATOMESH_LOG/') }}
+  ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || '/mnt/models' }}
+  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != '' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'mia1-p02-g42,mia1-p02-g44') }}
+  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != '' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47') }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -172,10 +155,6 @@ jobs:
           RUN_KIMI_K25_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.run_kimi_k25_mxfp4 || false }}
           RUN_MINIMAX_M3_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.run_minimax_m3_mxfp4 || false }}
           RUN_MINIMAX_M3_MXFP8: ${{ github.event_name == 'workflow_dispatch' && inputs.run_minimax_m3_mxfp8 || false }}
-          ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO: ${{ github.event_name == 'workflow_dispatch' && inputs.deepseek_v4_pro_model_path || '' }}
-          ATOMESH_MODEL_PATH_KIMI_K2_5_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.kimi_k25_mxfp4_model_path || '' }}
-          ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP4: ${{ github.event_name == 'workflow_dispatch' && inputs.minimax_m3_mxfp4_model_path || '' }}
-          ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8: ${{ github.event_name == 'workflow_dispatch' && inputs.minimax_m3_mxfp8_model_path || '' }}
           ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
@@ -264,9 +243,35 @@ jobs:
         env:
           CELL_JSON: ${{ toJson(matrix) }}
           RESULT_DIR: atomesh-results
+          SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}
         run: |
           set -euo pipefail
+          ORIGINAL_WORKSPACE="${GITHUB_WORKSPACE}"
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            SHARED_WORKSPACE="/data/$(id -un)/atomesh-ci/${GITHUB_RUN_ID}/${{ matrix.id }}"
+            rm -rf "${SHARED_WORKSPACE}"
+            mkdir -p "${SHARED_WORKSPACE}"
+            if command -v rsync >/dev/null 2>&1; then
+              rsync -a --delete "${ORIGINAL_WORKSPACE}/" "${SHARED_WORKSPACE}/"
+            else
+              tar -C "${ORIGINAL_WORKSPACE}" -cf - . | tar -C "${SHARED_WORKSPACE}" -xf -
+            fi
+            cd "${SHARED_WORKSPACE}"
+            RESULT_DIR="${ORIGINAL_WORKSPACE}/${RESULT_DIR}"
+          fi
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+          SLURM_CANCEL_HELPER="${RESULT_DIR}/${{ matrix.id }}.slurm-cancel.sh"
+          cancel_slurm_from_wrapper() {
+            local rc=$?
+            if [[ "${rc}" -ne 0 && -x "${SLURM_CANCEL_HELPER}" ]]; then
+              echo "=== cancelling Slurm job from workflow wrapper rc=${rc} ==="
+              bash "${SLURM_CANCEL_HELPER}" || true
+            fi
+            exit "${rc}"
+          }
+          trap cancel_slurm_from_wrapper EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           bash .github/scripts/atomesh/pd_submit.sh \
             --cell-json "$CELL_JSON" \
             --result-dir "$RESULT_DIR"
@@ -285,6 +290,7 @@ jobs:
             "atomesh-results/${MATRIX_ID}" \
             --output "${BENCHMARK_ACTION_INPUT}" \
             --summary "${SUMMARY_PATH}" \
+            --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           {
@@ -311,8 +317,10 @@ jobs:
   summarize-results:
     name: Summarize ATOMesh benchmark results
     needs: [run-model-benchmark]
-    if: ${{ !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
+    if: ${{ always() && !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
     runs-on: ubuntu-latest
+    outputs:
+      has_results: ${{ steps.summary.outputs.has_results }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -325,16 +333,35 @@ jobs:
           path: atomesh-results
 
       - name: Build benchmark summary
+        id: summary
         run: |
           set -euo pipefail
+          mkdir -p atomesh-results
           python3 .github/scripts/atomesh/process_result.py \
             atomesh-results \
             --output atomesh-benchmark-action.json \
             --summary atomesh-benchmark-summary.md \
+            --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           cat atomesh-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+          ENTRY_COUNT="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("atomesh-benchmark-action.json")
+          entries = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
+          print(len(entries))
+          PY
+          )"
+          echo "entry_count=${ENTRY_COUNT}" >> "$GITHUB_OUTPUT"
+          if [[ "${ENTRY_COUNT}" -gt 0 ]]; then
+            echo "has_results=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+            echo "No successful ATOMesh benchmark result JSONs were produced; dashboard publish will be skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload benchmark summary
+        if: ${{ steps.summary.outputs.has_results == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: atomesh-benchmark-summary
@@ -351,6 +378,7 @@ jobs:
     if: >-
       !cancelled()
       && needs.summarize-results.result == 'success'
+      && needs.summarize-results.outputs.has_results == 'true'
       && (
         github.event_name == 'schedule'
         || github.event_name == 'push'
@@ -381,12 +409,17 @@ jobs:
               "window.ATOMESH_RUN_URL = "
               + json.dumps("https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}")
               + ";\n"
+              + "window.ATOMESH_HARDWARE = "
+              + json.dumps("${{ env.ATOMESH_DASHBOARD_HARDWARE }}")
+              + ";\n"
               + "window.ATOMESH_SUMMARY_MARKDOWN = "
               + json.dumps(summary, ensure_ascii=False)
               + ";\n",
               encoding="utf-8",
           )
           PY
+
+          cp .github/dashboard/index.html /tmp/atomesh_dashboard_index.html
 
       - name: Deploy ATOMesh dashboard markdown to gh-pages
         run: |
@@ -398,8 +431,9 @@ jobs:
           git checkout gh-pages
           mkdir -p benchmark-dashboard
 
+          cp /tmp/atomesh_dashboard_index.html benchmark-dashboard/index.html
           cp /tmp/atomesh_summary.js benchmark-dashboard/atomesh_summary.js
 
-          git add benchmark-dashboard/atomesh_summary.js
+          git add benchmark-dashboard/index.html benchmark-dashboard/atomesh_summary.js
           git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
           git push origin gh-pages
