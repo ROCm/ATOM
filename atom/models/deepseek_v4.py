@@ -1257,6 +1257,27 @@ class Indexer(nn.Module):
         q_fp8, weights = self.forward_pre(x_full, qr_full, positions, qr_full_scale)
         return self.score_topk_from(q_fp8, weights)
 
+    def topk(
+        self,
+        x_full: torch.Tensor,
+        qr_full: torch.Tensor,
+        positions: torch.Tensor,
+        qr_full_scale: Optional[torch.Tensor] = None,
+        *,
+        pre_q_fp8: Optional[torch.Tensor] = None,
+        pre_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the top-k, reusing precomputed projections when available.
+
+        PIECEWISE narrow split projects Q/weights in `_attn_pre` (graphed piece)
+        and passes them as ``pre_q_fp8``/``pre_weights`` so only the eager paged
+        ``score_topk_from`` runs here. Otherwise (FULL/legacy) project inline via
+        ``forward_batched``. Same result either way — only the split site differs.
+        """
+        if pre_q_fp8 is not None:
+            return self.score_topk_from(pre_q_fp8, pre_weights)
+        return self.forward_batched(x_full, qr_full, positions, qr_full_scale)
+
     def forward_pre(
         self,
         x_full: torch.Tensor,  # [total_tokens, dim]
@@ -2135,29 +2156,20 @@ class DeepseekV4Attention(nn.Module):
             if self.indexer is not None:
                 current_stream.wait_stream(self.indexer_stream)
         # ===== Compressor + Indexer =====
-        # Two indexer paths (same result, different split site):
-        #  - PIECEWISE: Q/weights were projected in `_attn_pre` (graphed piece)
-        #    and passed as idx_q_fp8/idx_weights; here only the paged gather +
-        #    score + top-k runs eager via `score_topk_from`.
-        #  - FULL: idx_q_fp8 is None; `forward_batched` projects + scores inline
-        #    (unchanged legacy path).
+        # `topk` reuses the Q/weights projected in `_attn_pre` (graphed piece)
+        # when passed, else projects inline (FULL/legacy) — same result, only the
+        # split site differs. Then translate the seq-local top-k → physical paged
+        # offsets into the active CSA buffer (`_fill_csa_paged_compress`
+        # dispatches on decode vs prefill).
         if self.indexer is not None and not self.skip_topk:
-            if idx_q_fp8 is not None:
-                indexer_topk_batched = self.indexer.score_topk_from(
-                    idx_q_fp8, idx_weights
-                )
-            else:
-                indexer_topk_batched = self.indexer.forward_batched(
-                    x_full=x,
-                    qr_full=qr,
-                    qr_full_scale=qr_scale,
-                    positions=positions,
-                )
-            # Translate seq-local topk → physical paged offsets and write into
-            # the CSA section of either:
-            #   - decode buffer `kv_indices_csa` (state is DECODE)
-            #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
-            # `_fill_csa_paged_compress` dispatches internally on state.
+            indexer_topk_batched = self.indexer.topk(
+                x,
+                qr,
+                positions,
+                qr_scale,
+                pre_q_fp8=idx_q_fp8,
+                pre_weights=idx_weights,
+            )
             self._fill_csa_paged_compress(
                 attn_md, indexer_topk_batched, positions, num_tokens
             )
