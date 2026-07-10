@@ -21,7 +21,11 @@ from aiter import (
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
-from aiter.utility import fp4_utils
+from aiter.ops.triton.utils.shuffle import (
+    collapse_mxfp4_gemm_scale,
+    quant_mxfp4_act_preshuffle,
+    shuffle_scale_gemm_e8m0,
+)
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_ops.utils import (
@@ -197,30 +201,22 @@ def gemm_a4w4_quant(
             device=x.device,
         )
         if x_scale is None:
-            quant_func = get_hip_quant(QuantType.per_1x32)
-            x, x_scale = quant_func(
-                x,
-                quant_dtype=params_dtype,
-                shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
+            # quant with no shuffle + manual shuffle + collapse
+            x, x_scale = quant_mxfp4_act_preshuffle(
+                x, params_dtype, m, MXFP4_QUANT_BLOCK_SIZE
             )
         else:
-            x_scale = x_scale.view(torch.float8_e8m0fnu)
+            # collapse in arch-aware layout
+            x_scale = collapse_mxfp4_gemm_scale(
+                x_scale.view(torch.float8_e8m0fnu), MXFP4_QUANT_BLOCK_SIZE, rows_valid=m
+            )
             x = x.view(torch.float4_e2m1fn_x2)
-
-        if m >= MXFP4_QUANT_BLOCK_SIZE:
-            x_scale = x_scale.view(torch.uint8).view(
-                x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
-            )
-        else:
-            x_scale = x_scale[:m, ...].view(torch.uint8)
 
         y = gemm_afp4wfp4_preshuffle(
             x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
-            weight_scale.view(torch.uint8).view(
-                weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
-            ),
+            collapse_mxfp4_gemm_scale(weight_scale, MXFP4_QUANT_BLOCK_SIZE),
             y=y,
         )
     # Default AITER path: quantize/shuffle into the layout expected by gemm_a4w4
@@ -782,13 +778,22 @@ class LinearBase(nn.Module):
                     need_shuffle = True
             if need_shuffle:
                 if self.weight.dim() == 2:
-                    shuffle_weights(self.weight)
+                    if use_triton_gemm():
+                        # arch-aware weight shuffle
+                        from aiter.ops.triton.utils.shuffle import (
+                            shuffle_weight as _triton_shuffle_weight,
+                        )
+
+                        self.weight.data = _triton_shuffle_weight(self.weight.data)
+                        self.weight.is_shuffled = True
+                    else:
+                        shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
-        # shuffle weight scale once so no reshuffling for every gemm
+        # shuffle the weight scale once
         if self.quant_type == QuantType.per_1x32 and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
-            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+            self.weight_scale.data = shuffle_scale_gemm_e8m0(self.weight_scale.data)
 
     @mark_trace
     def forward(
@@ -837,16 +842,7 @@ class LinearBase(nn.Module):
                         scale_b=self.weight_scale,
                     )
             elif self.quant_type.value == QuantType.per_Token.value:
-                if self.params_dtype == dtypes.i8:
-                    y = gemm_a8w8(
-                        x,
-                        self.weight,
-                        x_scale,
-                        self.weight_scale,
-                        self.bias,
-                        dtype=otype,
-                    )
-                elif use_triton_gemm() and gemm_a8w8_triton is not None:
+                if use_triton_gemm() and gemm_a8w8_triton is not None:
                     # Triton a8w8 per-token-per-channel GEMM (unshuffled weight).
                     y = gemm_a8w8_per_token_impl(
                         x,
@@ -854,6 +850,15 @@ class LinearBase(nn.Module):
                         x_scale,
                         self.weight_scale,
                         bias=self.bias,
+                        dtype=otype,
+                    )
+                elif self.params_dtype == dtypes.i8:
+                    y = gemm_a8w8(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        self.bias,
                         dtype=otype,
                     )
                 else:

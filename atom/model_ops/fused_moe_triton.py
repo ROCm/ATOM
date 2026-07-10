@@ -29,7 +29,6 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
-        swizzle_scales as swizzle_scales_a8w4,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
@@ -37,8 +36,8 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
         moe_gemm_a4w4,
         mxfp4_quant,
-        swizzle_scales as swizzle_scales_cdna4,
     )
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 
 from atom.model_ops.moe import MoEActivationQuant
@@ -51,10 +50,10 @@ def _swizzle_scales_for_kernel(scale, act_quant: MoEActivationQuant):
     BF16/FP4 (a16w4/a4w4): CDNA4 swizzle on gfx942/gfx950, no swizzle elsewhere.
     """
     if act_quant == MoEActivationQuant.FP8:
-        return swizzle_scales_a8w4(scale)
+        return shuffle_scale_moe(scale)
     # TODO: move arch dispatch into aiter's a4w4/a16w4 swizzle_scales (like a8w4)
     if get_arch() in ("gfx942", "gfx950"):
-        return swizzle_scales_cdna4(scale), "CDNA4_SCALE"
+        return shuffle_scale_moe(scale), "CDNA4_SCALE"
     return scale, None
 
 
