@@ -2337,6 +2337,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 shuffle_input_norm_quant = True
                 scale_shuffle_padding = True
+            # Emit the pre-quant BF16 mirror for the DSA indexer's BF16 GEMMs.
+            # Only the FP8 fused kernel can produce it (the fp4x2 path returns
+            # None), so gate on fp8; fp4 attention-input keeps the 2-tuple output.
+            want_bf16_for_indexer = (
+                self.emit_bf16_for_indexer and self.quant_dtype == dtypes.fp8
+            )
             if residual is None:
                 residual = hidden_states
                 (
@@ -2357,7 +2363,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     scale_shuffle_padding=scale_shuffle_padding,
                     group_size=128,
                     quant_type=self.input_norm_quant_type,
-                    output_unquantized_inp1=self.emit_bf16_for_indexer,
+                    output_unquantized_inp1=want_bf16_for_indexer,
                     transpose_scale=True,
                 )
             else:
@@ -2379,13 +2385,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                     scale_shuffle_padding=scale_shuffle_padding,
                     group_size=128,
                     quant_type=self.input_norm_quant_type,
-                    output_unquantized_inp1=self.emit_bf16_for_indexer,
+                    output_unquantized_inp1=want_bf16_for_indexer,
                     transpose_scale=True,
                 )
 
-            # v32 indexer layers: pass the bf16 mirror as the 3rd tuple slot so the
-            # indexer's BF16 wk/weights_proj GEMMs get bf16, while qkv proj gets fp8.
-            if self.emit_bf16_for_indexer:
+            if want_bf16_for_indexer and hidden_states_bf16 is not None:
+                # (fp8, scale, bf16) — MLA forward unpacks the 3rd element as the
+                # indexer's BF16 activation (see DeepseekV2MLAAttention.forward).
                 hidden_states = (
                     hidden_states_quant,
                     hidden_states_quant_scale,
