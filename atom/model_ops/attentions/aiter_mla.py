@@ -857,9 +857,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : sum_scheduled_tokens + 1
             ]
+            # Per-token last-page lens for sparse (DSA) attention: one entry per
+            # query token (all 1s, page_size=1). Kept on a dedicated attr so the
+            # has_cached block below — which sets the DENSE per-seq
+            # kv_last_page_lens of length bs — cannot clobber it. The sparse
+            # prefill attention reads sparse_kv_last_page_lens, matching decode.
             attn_metadata.kv_last_page_lens = var["sparse_kv_last_page_lens"].gpu[
                 :sum_scheduled_tokens
             ]
+            attn_metadata.sparse_kv_last_page_lens = attn_metadata.kv_last_page_lens
 
             # Per-query req_id: token_id 0..sum_scheduled_tokens-1 maps to batch id.
             # Use counts (new tokens per batch), not context_lens (full seq len).
