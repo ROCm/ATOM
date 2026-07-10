@@ -760,20 +760,32 @@ class LinearBase(nn.Module):
             self.output_partition_sizes,
         )
 
-        q_weight, weight_scale = quant_weight_online(
-            weight, online_quant_type, online_quant_dtype
-        )
+        if online_quant_type == QuantType.per_1x128:
+            # The blockscale GEMM path consumes true 128x128 scales shaped
+            # (N//128, K//128). Keep online load/reload aligned with the
+            # RLHF weight-sync requantization path.
+            q_weight, weight_scale = quantize_weight_to_fp8_128x128_blockscale(
+                weight, online_quant_dtype
+            )
+        else:
+            q_weight, weight_scale = quant_weight_online(
+                weight, online_quant_type, online_quant_dtype
+            )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
                 q_weight, weight_scale
             )
         self.weight = nn.Parameter(q_weight, requires_grad=False)
         self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+        self.weight.weight_loader_process = self.weight_loader_process
+        self.weight_scale.weight_loader_process = self.weight_loader_process
 
         # Update quant state
         self.quant_type = online_quant_type
         self.params_dtype = online_quant_dtype
         self.quant_func = get_hip_quant(online_quant_type)
+        # get_hip_quant already returns fnuz when quant_dtype=fnuz on gfx942;
+        # only normalize when output is still non-fnuz.
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
             and online_quant_type == QuantType.per_Token
