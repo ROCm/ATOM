@@ -100,6 +100,8 @@ models:
             workers: 1
             tp: 8
             extra_args: "--enable-dp-attention --enable-tbo"
+          benchmark:
+            wait_server_timeout: 4500
           run_eval: true
 
     accuracy:
@@ -145,9 +147,7 @@ models:
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
-            wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
+            wait_server_timeout: 4500
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -165,9 +165,7 @@ models:
             workers: 1
             tp: 4
           benchmark:
-            wait_server_timeout: 1800
-          runner:
-            time_limit: "06:00:00"
+            wait_server_timeout: 4500
           run_eval: true
           eval_concurrency: [128, 768]
 
@@ -224,8 +222,6 @@ models:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -249,8 +245,6 @@ models:
             extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
@@ -279,8 +273,6 @@ models:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -307,8 +299,6 @@ models:
             extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
@@ -370,8 +360,6 @@ models:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -396,8 +384,6 @@ models:
             extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
@@ -426,8 +412,6 @@ models:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [64, 256]
 
@@ -455,8 +439,6 @@ models:
             extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 1800
-          runner:
-            time_limit: "04:00:00"
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 

@@ -253,9 +253,21 @@ class DeepseekV4MTP(nn.Module):
         """
         num_fused_shared = 0
         for m in self.model.modules():
-            if m.__class__.__name__ == "FusedMoE":
+            if hasattr(m, "num_fused_shared_experts"):
                 num_fused_shared = getattr(m, "num_fused_shared_experts", 0)
                 break
+        if num_fused_shared == 0:
+            # Some plugin builds wrap/alias FusedMoE such that the exact class-name
+            # probe above misses it. If the owning MoE layer was constructed in
+            # fused-shared mode, the loader rewrites ffn.shared_experts.* to
+            # ffn.experts.{n_routed_experts}.*; include that final slot here so the
+            # generic expert mapping loads it instead of dropping it.
+            for m in self.model.modules():
+                if m.__class__.__name__ == "MoE" and getattr(
+                    m, "_fuse_shared_into_routed", False
+                ):
+                    num_fused_shared = getattr(self.args, "n_shared_experts", 0)
+                    break
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
