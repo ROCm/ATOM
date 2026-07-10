@@ -3098,9 +3098,21 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mis-load expert weights -> garbage.
         num_fused_shared = 0
         for _m in self.model.modules():
-            if _m.__class__.__name__ == "FusedMoE":
+            if hasattr(_m, "num_fused_shared_experts"):
                 num_fused_shared = getattr(_m, "num_fused_shared_experts", 0)
                 break
+        if num_fused_shared == 0:
+            # Some plugin builds wrap/alias FusedMoE such that the exact class-name
+            # probe above misses it.  If the owning MoE layer was constructed in
+            # fused-shared mode, the loader will rewrite ffn.shared_experts.* to
+            # ffn.experts.{n_routed_experts}.*; include that final slot here so the
+            # generic expert mapping loads it into w13/w2 instead of dropping it.
+            for _m in self.model.modules():
+                if _m.__class__.__name__ == "MoE" and getattr(
+                    _m, "_fuse_shared_into_routed", False
+                ):
+                    num_fused_shared = getattr(self.args, "n_shared_experts", 0)
+                    break
         num_experts = self.args.n_routed_experts + num_fused_shared
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
