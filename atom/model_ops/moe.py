@@ -1036,15 +1036,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # shuffle weight + scale. GUGU (is_guinterleave) only reaches the FlyDSL
         # path (use_triton_decode is forced off for it), so the aiter shuffles
         # apply the gate/up interleave directly.
-        shuffle_guinterleave = self.is_guinterleave
         layer.w13_weight.data = shuffle_weight(
             layer.w13_weight,
-            is_guinterleave=shuffle_guinterleave,
+            is_guinterleave=self.is_guinterleave,
             gate_up=True,
         )
         layer.w2_weight.data = shuffle_weight(
             layer.w2_weight,
-            is_guinterleave=shuffle_guinterleave,
+            is_guinterleave=self.is_guinterleave,
             gate_up=False,
         )
         layer.w13_weight.is_shuffled = True
@@ -1059,13 +1058,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         shuffled_w13_scale = moe_shuffle_scale(
             w13_scale_2d,
             self.num_experts,
-            is_guinterleave=shuffle_guinterleave,
+            is_guinterleave=self.is_guinterleave,
             gate_up=True,
         )
         shuffled_w2_scale = moe_shuffle_scale(
             w2_scale_2d,
             self.num_experts,
-            is_guinterleave=shuffle_guinterleave,
+            is_guinterleave=self.is_guinterleave,
             gate_up=False,
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
