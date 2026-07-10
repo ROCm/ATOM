@@ -34,6 +34,7 @@ PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
 ROUTER_POLICY="${ROUTER_POLICY:-random}"
+ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
 
@@ -351,6 +352,7 @@ start_router() {
     "${prefill_args[@]}" \
     "${decode_args[@]}" \
     --policy "${ROUTER_POLICY}" \
+    --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}" \
     --backend atom \
     --log-level info \
     --disable-circuit-breaker \
