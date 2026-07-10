@@ -72,8 +72,10 @@ def _make_consumer(pp_size):
     c._pending_recv_blocks = {}
     c._pending_recv_slots = {}
     c._pending_recv_expected = {}
+    c._pending_recv_stages = {}
     c._release_targets = {}
     c._release_count = {}
+    c._released_transfers = set()
     c._completed_prefills = {}
     c._completed_prefills_lock = threading.Lock()
     c.done_sending = set()
@@ -127,21 +129,38 @@ def test_fanout_sends_one_request_per_stage_with_src_blocks():
     assert "r0" in c._pending_recv
 
 
-def test_completion_requires_all_stage_write_dones():
+def test_completion_requires_all_distinct_stage_write_dones():
     c = _make_consumer(4)
     c._pending_recv_expected["r0"] = 4
     c._pending_recv.add("r0")
     c._pending_recv_blocks["r0"] = [10, 11, 12]
 
-    assert c._record_write_done("r0") is False  # stage 1
-    assert c._record_write_done("r0") is False  # stage 2
-    assert c._record_write_done("r0") is False  # stage 3
+    assert c._record_write_done("r0", 0) is False  # stage 0
+    assert c._record_write_done("r0", 1) is False  # stage 1
+    assert c._record_write_done("r0", 2) is False  # stage 2
     assert c.done_recving == set()
 
-    assert c._record_write_done("r0") is True  # stage 4 → complete
+    assert c._record_write_done("r0", 3) is True  # stage 3 → all distinct
     assert "r0" in c.done_recving
     assert "r0" not in c._pending_recv
     assert c._blocks_pending_fence == [10, 11, 12]
+
+
+def test_duplicate_stage_write_dones_do_not_finalize_early():
+    # The producer resends write-done 3x for reliability; duplicates from the
+    # SAME stage must not advance completion (regression for the 3x-send bug).
+    c = _make_consumer(4)
+    c._pending_recv_expected["r0"] = 4
+    c._pending_recv.add("r0")
+    c._pending_recv_blocks["r0"] = [10]
+
+    # Stages 0 and 1 each land 3 times = 6 messages, but only 2 distinct stages.
+    for pp in (0, 0, 0, 1, 1, 1):
+        assert c._record_write_done("r0", pp) is False
+    assert c.done_recving == set()  # NOT finalized despite 6 messages
+    assert c._record_write_done("r0", 2) is False
+    assert c._record_write_done("r0", 3) is True  # 4 distinct stages
+    assert "r0" in c.done_recving
 
 
 def test_release_frees_only_after_all_decode_ranks():
@@ -164,18 +183,31 @@ def test_completion_pp1_single_write_done():
     c._pending_recv_expected["r0"] = 1
     c._pending_recv.add("r0")
     c._pending_recv_blocks["r0"] = [1]
-    assert c._record_write_done("r0") is True
+    assert c._record_write_done("r0", 0) is True
     assert "r0" in c.done_recving
 
 
-def test_duplicate_write_done_ignored():
+def test_late_write_done_after_complete_ignored():
     c = _make_consumer(2)
     c._pending_recv_expected["r0"] = 2
     c._pending_recv.add("r0")
     c._pending_recv_blocks["r0"] = [1]
-    assert c._record_write_done("r0") is False  # stage 1
-    assert c._record_write_done("r0") is True  # stage 2 → complete
+    assert c._record_write_done("r0", 0) is False  # stage 0
+    assert c._record_write_done("r0", 1) is True  # stage 1 → complete
     c.done_recving.clear()  # simulate get_finished() draining it
     # A late/duplicate write-done for the same req must not re-finalize.
-    assert c._record_write_done("r0") is False
+    assert c._record_write_done("r0", 1) is False
     assert c.done_recving == set()
+
+
+def test_release_idempotent_no_double_free():
+    # A duplicate release after completion must not re-add to done_sending
+    # (would crash the scheduler on a missing deferred block).
+    c = _make_consumer(4)
+    c._record_release(9, 2)
+    assert c.done_sending == set()
+    c._record_release(9, 2)
+    assert 9 in c.done_sending
+    c.done_sending.clear()
+    c._record_release(9, 2)  # stray late release
+    assert c.done_sending == set()
