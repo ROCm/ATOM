@@ -123,8 +123,22 @@ class WeightUpdaterMixin:
                     requires_grad=False,
                 )
                 wlp = getattr(param, "weight_loader_process", None)
+                if wlp is None:
+                    wlp = getattr(module, "weight_loader_process", None)
                 if wlp is not None:
                     buf.weight_loader_process = wlp
+                else:
+                    def _weight_loader_process(param_data, loaded_weight):
+                        if param_data.dtype != loaded_weight.dtype:
+                            loaded_weight = loaded_weight.to(param_data.dtype)
+                        if (
+                            loaded_weight.shape != param_data.shape
+                            and loaded_weight.numel() == param_data.numel()
+                        ):
+                            loaded_weight = loaded_weight.reshape(param_data.shape)
+                        param_data.copy_(loaded_weight)
+
+                    buf.weight_loader_process = _weight_loader_process
 
                 for sid in expected:
                     shard_t = self._packed_weight_accum[atom_name]["shards"][sid]
@@ -297,11 +311,16 @@ class WeightUpdaterMixin:
             return
 
         from aiter import QuantType as _QT
+        from atom.utils import envs
         from atom.model_ops.utils import shuffle_weights
 
         needs_shuffle = False
         if quant_type.value == _QT.per_1x128.value:
-            needs_shuffle = True
+            # Match LinearBase.process_weights_after_loading(): blockscale FP8
+            # weights are only preshuffled when ATOM is configured to use the
+            # preshuffle GEMM path. Forcing a shuffle here makes post-sync
+            # weights use a different layout from initial online quantization.
+            needs_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         elif quant_type.value == _QT.per_1x32.value:
             needs_shuffle = True
         elif quant_type.value == _QT.per_Token.value:
@@ -312,7 +331,7 @@ class WeightUpdaterMixin:
             except ImportError:
                 needs_shuffle = param.element_size() < 2
 
-        if needs_shuffle:
+        if needs_shuffle and param.dim() == 2:
             shuffle_weights(param)
 
     def update_weights(
