@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import bisect
 import gc
 import logging
 import math
@@ -1473,7 +1474,25 @@ class ModelRunner:
             cap_sizes = self.config.compilation_config.cudagraph_capture_sizes or [
                 self.config.max_num_seqs
             ]
-            # Non-spec decode: one token per seq, so num_tokens == bs.
+            # Captured num_tokens shapes are bs * q for each q we capture. Non-spec
+            # decode is q=1 (num_tokens == bs); DSpark captures one graph set per
+            # query-length bucket, so fold those q's in to size the pool right.
+            q_buckets = [1]
+            if hasattr(self, "drafter") and getattr(
+                self.drafter, "dspark_confidence_schedule", False
+            ):
+                from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+                from atom.utils import envs as _envs
+
+                full_q = self.drafter.mtp_k + 1
+                _sizes_spec = (
+                    _envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES
+                    if _envs.ATOM_DSPARK_RAGGED
+                    else _envs.ATOM_DSPARK_Q_BUCKETS
+                )
+                q_buckets = resolve_q_buckets(_sizes_spec, full_q)
+                if os.environ.get("ATOM_PIECEWISE_FINE_TOKENS", "0") == "1":
+                    q_buckets = sorted(set(q_buckets) | set(range(1, full_q + 1)))
             hf_config = self.config.hf_config
             hidden = int(hf_config.hidden_size)
             num_layers = int(hf_config.num_hidden_layers)
@@ -1487,9 +1506,10 @@ class ModelRunner:
             # total) as the reference — it tracks the configured memory envelope.
             budget = self.config.gpu_memory_utilization * torch.cuda.mem_get_info()[1]
             target_reserve = 0.15 * budget
+            all_shapes = sorted({bs * q for bs in cap_sizes for q in q_buckets})
             captured = []
             acc = 0
-            for num_tokens in sorted(set(cap_sizes)):
+            for num_tokens in all_shapes:
                 if captured and per_token_bytes * (acc + num_tokens) > target_reserve:
                     break
                 captured.append(num_tokens)
@@ -1499,7 +1519,7 @@ class ModelRunner:
                 "PIECEWISE cudagraph mem estimate: n_shapes=%d/%d Σtok=%d "
                 "per_token=%.3fMB hidden=%d layers=%d -> overhead=%.2fGB",
                 len(captured),
-                len(set(cap_sizes)),
+                len(all_shapes),
                 acc,
                 per_token_bytes / (1 << 20),
                 hidden,
@@ -2705,14 +2725,48 @@ class ModelRunner:
                 num_tokens = context.batch_size * max_q_len  # real (output slice)
 
                 if self._piecewise_cg_active():
-                    # PIECEWISE replay at the captured num_tokens bucket >= real
-                    # token count (non-spec decode: num_tokens == bs); the pad tail
-                    # is ignored by the model.
-                    _is_dummy = batch is not None and batch.is_dummy_run
-                    num_tokens_pad = graph_bs * max_q_len
-                    _captured = num_tokens_pad in getattr(
-                        self, "_piecewise_captured_tokens", ()
+                    # PIECEWISE replay: no whole-forward graph. Dense pieces are
+                    # per-token. DSpark (has drafter, TP-only) replays at a 1D
+                    # num_tokens bucket sized to the REAL ragged token count Σ (=
+                    # total_tokens_num_decode) so MoE/linear shrink with Σ (dynamic
+                    # verify length); attention is eager on the flat [0:Σ] tokens,
+                    # the [Σ:pad] tail is masked. Non-spec (or DP) uses the
+                    # rectangular bucket num_tokens == bs.
+                    _one_d = (
+                        os.environ.get("ATOM_PIECEWISE_1D_RAGGED", "1") == "1"
+                        and batch is not None
+                        and getattr(self, "_piecewise_sorted_tokens", None)
+                        and hasattr(self, "drafter")
+                        and self.config.parallel_config.data_parallel_size <= 1
                     )
+                    _is_dummy = batch is not None and batch.is_dummy_run
+                    if _one_d and not _is_dummy:
+                        # TP-only: all ranks share the same batch -> same Σ ->
+                        # num_tokens_pad identical, no cross-rank sync needed.
+                        real_tokens = int(batch.total_tokens_num_decode)
+                        _bk = self._piecewise_sorted_tokens
+                        _i = bisect.bisect_left(_bk, real_tokens)
+                        if _i < len(_bk):
+                            num_tokens_pad = _bk[_i]
+                            _captured = True
+                        else:
+                            # Σ exceeds the largest captured bucket -> eager.
+                            num_tokens_pad = max(real_tokens, graph_bs * max_q_len)
+                            _captured = False
+                        # Pad tail to a legal vocab id / position (builder fills to
+                        # graph_cap >= num_tokens_pad, so a no-op safety net).
+                        if num_tokens_pad > real_tokens:
+                            self.forward_vars["input_ids"].gpu[
+                                real_tokens:num_tokens_pad
+                            ].zero_()
+                            self.forward_vars["positions"].gpu[
+                                real_tokens:num_tokens_pad
+                            ].zero_()
+                    else:
+                        num_tokens_pad = graph_bs * max_q_len
+                        _captured = num_tokens_pad in getattr(
+                            self, "_piecewise_captured_tokens", ()
+                        )
                     _pos = (
                         self._mrope_positions_view(num_tokens_pad)
                         if self.use_mrope
@@ -2736,15 +2790,16 @@ class ModelRunner:
                     else:
                         hidden_states = model_output
                         self._aux_hidden_states = None
-                    # DSpark: forward hooks wrote per-layer aux hidden into fixed
-                    # buffers during the forward above; assemble them (sliced to
-                    # the real num_tokens). Required for spec decode under
-                    # PIECEWISE — without it propose() finds no target aux hidden.
-                    self._collect_dspark_aux(num_tokens)
-                    # Slice pad tail before sampling: pad rows must not leak into
-                    # sampled_token_ids -> prev_token_ids -> next-step shape
-                    # mismatch. num_tokens == the non-PIECEWISE real length.
-                    hidden_states = hidden_states[:num_tokens]
+                    # DSpark: forward hooks wrote per-layer aux hidden during the
+                    # forward; assemble them. Spec keeps the padded [0:Σ] layout
+                    # (postprocess/draft re-gather to bs via next_token_locs);
+                    # non-spec slices to the real num_tokens so pad rows never leak
+                    # into sampled_token_ids -> prev_token_ids -> next-step shape
+                    # mismatch.
+                    _is_spec = hasattr(self, "drafter")
+                    _slice_len = num_tokens_pad if _is_spec else num_tokens
+                    self._collect_dspark_aux(_slice_len)
+                    hidden_states = hidden_states[:_slice_len]
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
