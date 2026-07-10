@@ -1557,10 +1557,18 @@ class EPLBManager:
             if ref_experts is not None and d0 == ref_experts:
                 per_expert = tensor
             elif ref_experts is not None and d0 > ref_experts and d0 % ref_experts == 0:
-                # Flattened [#experts * N, ...] -> per-expert view [#experts, N, ...].
-                # reshape on a contiguous tensor returns a view sharing storage, so
-                # in-place migration copy_ updates the real tensor the kernel reads.
-                per_expert = tensor.reshape(
+                if not tensor.is_contiguous():
+                    raise RuntimeError(
+                        "EPLB cannot migrate flattened per-expert tensor "
+                        f"{name!r}: expected contiguous storage so the "
+                        "per-expert view aliases the live weight buffer, got "
+                        f"shape={tuple(tensor.shape)} stride={tuple(tensor.stride())}."
+                    )
+                # Flattened [#experts * N, ...] -> per-expert view
+                # [#experts, N, ...]. view() is intentional: migration copy_
+                # must update the live tensor storage the kernel reads, not a
+                # reshape-created temporary copy.
+                per_expert = tensor.view(
                     ref_experts, d0 // ref_experts, *tensor.shape[1:]
                 )
             else:
@@ -1752,6 +1760,31 @@ class EPLBManager:
         layer_ids = sorted(self._moe_layers)
         num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
         _t_rearrange_ms = (_time.perf_counter() - _t0) * 1000.0
+
+        # TEMP DEBUG: quantify how much traffic actually flows to replicated
+        # (num_redundant>0) logical experts -- this bounds the ceiling of any
+        # locality-first dispatch benefit, since non-replicated experts have
+        # no dispatch choice at all. Remove after investigation.
+        if _ep_rank == 0:
+            try:
+                _ll_cpu = logical_load.detach().to("cpu", torch.float32)
+                _logcnt_cpu = logcnt.detach().to("cpu")
+                _redundant_mask = _logcnt_cpu > 1
+                _total = float(_ll_cpu.sum().item())
+                _redundant_traffic = float(_ll_cpu[_redundant_mask].sum().item())
+                _num_redundant_experts = int(_redundant_mask.sum().item())
+                _frac = _redundant_traffic / _total if _total > 0 else 0.0
+                logger.info(
+                    "EPLB DEBUG rebalance #%d: num_replicated_logical_experts=%d/%d "
+                    "(%.1f avg per layer), traffic_to_replicated=%.4f of total",
+                    _rc,
+                    _num_redundant_experts,
+                    _logcnt_cpu.numel(),
+                    _num_redundant_experts / _logcnt_cpu.shape[0],
+                    _frac,
+                )
+            except Exception as _e:  # pragma: no cover - diagnostic only
+                logger.warning("EPLB DEBUG traffic-share calc failed: %s", _e)
         logger.info(
             "EPLB rebalance #%d ep_rank=%d: rearrange=%.1fms; migrating %d layers "
             "in %d chunks (size=%d)",

@@ -390,6 +390,45 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> FusedMoEQuantConfig | None:
         raise NotImplementedError
 
+    def select_experts_with_record(
+        self,
+        *,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        fused_shared_experts_scoring_func: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_weights, topk_logical = FusedMoE.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_routing_experts=getattr(
+                layer, "num_logical_experts", global_num_experts
+            ),
+            num_fused_shared_experts=layer.num_fused_shared_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+        topk_physical = eplb_map_logical_to_physical(layer, topk_logical)
+        record_eplb_expert_load(layer, topk_physical)
+        return topk_weights, topk_physical
+
     @staticmethod
     def _maybe_make_prepare_finalize(
         moe: FusedMoEConfig,
@@ -1305,28 +1344,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 act_quant=self.act_quant,
             )
 
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        topk_weights, topk_ids = self.select_experts_with_record(
+            layer=layer,
             hidden_states=x,
             router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
             top_k=top_k,
             renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            global_num_experts=global_num_experts,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=getattr(
-                layer, "num_logical_experts", global_num_experts
-            ),
-            num_fused_shared_experts=layer.num_fused_shared_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
-            routed_scaling_factor=layer.routed_scaling_factor,
         )
-        topk_ids = eplb_map_logical_to_physical(
-            layer, topk_ids
-        )  # logical → physical for EP dispatch
-        record_eplb_expert_load(layer, topk_ids)
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
