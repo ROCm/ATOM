@@ -1055,13 +1055,8 @@ class MergedColumnParallelLinear(LinearBase):
             current_offset = 0
             for shard_id, output_size in enumerate(self.output_sizes):
                 shard_size = output_size
-                if is_scale_param:
-                    if self.quant_type == QuantType.per_Token:
-                        pass
-                    elif self.quant_type == QuantType.per_1x128:
-                        shard_size = (shard_size + 127) // 128
-                    elif self.quant_type != QuantType.per_1x32:
-                        shard_size //= 128
+                if is_scale_param and self.quant_type == QuantType.per_1x128:
+                    shard_size //= 128
 
                 shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
                 self.weight_loader(param, shard, shard_id)
