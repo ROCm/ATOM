@@ -366,7 +366,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
                   "model_name": "MI308 Qwen3.5-397B-A17B-FP8 TP8",
@@ -374,7 +374,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
                   "model_name": "MI308 Qwen3.5-35B-A3B-FP8 TP1",
@@ -382,7 +382,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.76,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
                   "model_name": "MI308 Qwen3-32B-FP8 TP1",
@@ -391,7 +391,7 @@ jobs:
                   "lm_eval_extra_model_args": "max_gen_toks=1024",
                   "accuracy_test_threshold": 0.8,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
                   "model_name": "MI308 Qwen3-32B-FP8 TP8",
@@ -400,7 +400,7 @@ jobs:
                   "lm_eval_extra_model_args": "max_gen_toks=1024",
                   "accuracy_test_threshold": 0.8,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
                   "model_name": "MI308 GLM-5.1-FP8 TP8",
@@ -410,7 +410,7 @@ jobs:
                   "lm_eval_num_concurrent": 64,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
-                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
                   "model_name": "MI308 DeepSeek-V4-Flash",
@@ -420,7 +420,7 @@ jobs:
                   "lm_eval_num_concurrent": 8,
                   "accuracy_test_threshold": 0.94,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
-                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
           ]
           models.extend(mi308_models)
