@@ -1072,7 +1072,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton_decode:
             from aiter.ops.triton.utils.shuffle import (
-                moe_weight_gfx1250_decode_view,
+                moe_weight_gfx1250_decode_view as moe_weight_decode_view,
                 shuffle_scale_moe,
             )
 
@@ -1080,12 +1080,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the gfx1250 a8w4 decode layout. Shares storage with layer.w{13,2}
             # _weight (no second weight copy); scales differ, so the *_a8w4 scale
             # tensors below are separate (scale duplication is acceptable).
-            layer.w13_weight_preshuffled = moe_weight_gfx1250_decode_view(
-                layer.w13_weight.data
-            )
-            layer.w2_weight_preshuffled = moe_weight_gfx1250_decode_view(
-                layer.w2_weight.data
-            )
+            layer.w13_weight_preshuffled = moe_weight_decode_view(layer.w13_weight.data)
+            layer.w2_weight_preshuffled = moe_weight_decode_view(layer.w2_weight.data)
 
             w13_scale_for_a8w4 = orig_w13_weight_scale.transpose(-2, -1)
             w2_scale_for_a8w4 = orig_w2_weight_scale.transpose(-2, -1)
