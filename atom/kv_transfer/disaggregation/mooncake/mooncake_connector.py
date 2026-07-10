@@ -1072,44 +1072,43 @@ class MooncakeConnector(KVConnectorBase):
             )
 
             request_src_block_ids = request_data.get("src_block_ids")
-            if self.pp_rank == 0:
-                # Head stage owns the scheduler: wait for its cached prefill data
-                # (authoritative block_ids + slot_index). If the cache lookup
-                # times out, fall back to the consumer-supplied block_ids.
+            if self.pp_size == 1:
+                # TP-TP: authoritative block_ids come from the local prefill
+                # cache (populated by the scheduler). Wait for it.
                 prefill_data = self._wait_for_prefill_data(transfer_id)
                 if prefill_data is None:
-                    if request_src_block_ids is None:
-                        logger.error(
-                            "[PRODUCER] Timed out waiting for prefill data for "
-                            "transfer_id=%s (req_id=%s). Available keys: %s",
-                            transfer_id,
-                            req_id,
-                            list(self._completed_prefills.keys()),
-                        )
-                        return
-                    prefill_data = {
-                        "block_ids": request_src_block_ids,
-                        "slot_index": request_data.get("src_slot_index", -1),
-                    }
+                    logger.error(
+                        "[PRODUCER] Timed out waiting for prefill data for "
+                        "transfer_id=%s (req_id=%s). Available keys: %s",
+                        transfer_id,
+                        req_id,
+                        list(self._completed_prefills.keys()),
+                    )
+                    return
             else:
-                # Downstream PP stages never run the scheduler, so their
-                # _completed_prefills is always empty — do NOT wait (it would
-                # block a send thread for the full timeout). Use the
-                # consumer-supplied block_ids (all stages share the head's page
-                # table); per-request slot state is not routed to downstream
-                # stages in this path, so skip it with slot_index=-1.
+                # PP: the consumer supplies src_block_ids for EVERY stage (all
+                # stages share the head's page table). Never block on the local
+                # cache — under the PP engine loop even stage-0's may be empty,
+                # so waiting would burn the full PREFILL_LOOKUP_TIMEOUT per
+                # request. Peek non-blocking for slot_index only (slot path).
                 if request_src_block_ids is None:
                     logger.error(
-                        "[PRODUCER] Downstream stage %d got no src_block_ids for "
+                        "[PRODUCER] PP stage %d got no src_block_ids for "
                         "transfer_id=%s (req_id=%s); cannot transfer.",
                         self.pp_rank,
                         transfer_id,
                         req_id,
                     )
                     return
+                with self._completed_prefills_lock:
+                    cached = self._completed_prefills.get(transfer_id)
                 prefill_data = {
                     "block_ids": request_src_block_ids,
-                    "slot_index": -1,
+                    "slot_index": (
+                        cached["slot_index"]
+                        if cached
+                        else request_data.get("src_slot_index", -1)
+                    ),
                 }
 
             src_block_ids = prefill_data["block_ids"]
