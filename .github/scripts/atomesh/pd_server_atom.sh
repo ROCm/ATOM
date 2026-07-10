@@ -14,12 +14,16 @@ DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-${TOPOLOGY}}"
 ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
 SINGLE_NODE_PD=0
 PREFILL_SINGLE_NODE_PD=0
+DECODE_SINGLE_NODE_PD=0
 case "${ATOMESH_PD_WORKER_LAYOUT}" in
   single_node)
     SINGLE_NODE_PD=1
     ;;
   prefill_single_node)
     PREFILL_SINGLE_NODE_PD=1
+    ;;
+  decode_single_node)
+    DECODE_SINGLE_NODE_PD=1
     ;;
 esac
 
@@ -167,6 +171,20 @@ elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
     decode_ips+=("${IP_ARRAY[$node_idx]}")
     decode_ports+=("${DECODE_PORT}")
     decode_args+=(--decode "http://${IP_ARRAY[$node_idx]}:${DECODE_PORT}")
+  done
+elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
+  for idx in $(seq 0 $((xP - 1))); do
+    prefill_ips+=("${IP_ARRAY[$idx]}")
+    prefill_ports+=("${PREFILL_PORT}")
+    prefill_args+=(--prefill "http://${IP_ARRAY[$idx]}:${PREFILL_PORT}")
+  done
+
+  decode_node_idx="${xP}"
+  for idx in $(seq 0 $((yD - 1))); do
+    decode_port=$((DECODE_PORT + idx))
+    decode_ips+=("${IP_ARRAY[$decode_node_idx]}")
+    decode_ports+=("${decode_port}")
+    decode_args+=(--decode "http://${IP_ARRAY[$decode_node_idx]}:${decode_port}")
   done
 else
   for idx in $(seq 0 $((xP - 1))); do
@@ -339,6 +357,8 @@ start_prefill() {
 }
 
 start_decode() {
+  local log_name="${1:-decode-rank-${NODE_RANK}}"
+  local server_port="${2:-${DECODE_PORT}}"
   apply_prefixed_env "ATOMESH_DECODE_ENV_" "${host_ip}"
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
@@ -349,11 +369,11 @@ start_decode() {
   if [[ "${ISL_LIST}" == "1024" && "${OSL}" == "1024" ]]; then
     decode_max_num_seqs="${max_conc}"
   fi
-  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} cudagraph=${DECODE_CUDAGRAPH:-none}"
+  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} cudagraph=${DECODE_CUDAGRAPH:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
-    --server-port "${DECODE_PORT}"
+    --server-port "${server_port}"
     "${decode_parallel[@]}"
     --max-num-seqs "${decode_max_num_seqs}"
     --kv-transfer-config "{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}"
@@ -361,7 +381,7 @@ start_decode() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
-  "${decode_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/decode-rank-${NODE_RANK}.log" &
+  "${decode_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
   server_pid=$!
 }
 
@@ -555,17 +575,35 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
   start_prefill "prefill-rank-0"
   trap 'kill ${router_pid:-0} ${server_pid:-0} 2>/dev/null || true' EXIT
-  for ip in "${prefill_ips[@]}"; do
-    wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  for idx in "${!prefill_ips[@]}"; do
+    wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
+      "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
+      "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   done
-  for ip in "${decode_ips[@]}"; do
-    wait_http "http://${ip}:${DECODE_PORT}/health" "decode-${ip}" "${WAIT_SERVER_TIMEOUT}"
+  for idx in "${!decode_ips[@]}"; do
+    wait_http "http://${decode_ips[$idx]}:${decode_ports[$idx]}/health" \
+      "decode-${decode_ips[$idx]}:${decode_ports[$idx]}" \
+      "${WAIT_SERVER_TIMEOUT}"
   done
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_eval
   run_benchmark
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
+elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
+  decode_pids=()
+  for idx in $(seq 0 $((yD - 1))); do
+    gpu_start=$((idx * DECODE_TP_SIZE))
+    gpu_end=$((gpu_start + DECODE_TP_SIZE - 1))
+    export HIP_VISIBLE_DEVICES="$(seq -s, "${gpu_start}" "${gpu_end}")"
+    decode_port="${decode_ports[$idx]}"
+    start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_port}"
+    decode_pids+=("${server_pid}")
+  done
+  trap 'kill ${decode_pids[*]:-} 2>/dev/null || true' EXIT
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
+  wait_router_closed
+  kill "${decode_pids[@]}" 2>/dev/null || true
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   start_decode
   trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
