@@ -32,7 +32,11 @@ TP and Expert Parallelism (EP): the total world size is `world = tp × pcp`.
   TBO is only usable with `ATOM_PCP_MOE_MERGE=1` **and `-tp 1`** (see
   [Constraints & Compatibility](#constraints--compatibility)).
 - **Requires**: `world = tp × pcp` GPUs, e.g. `-tp 4 -pcp 2` on 8 GPUs.
-- **Little benefit**: decode-heavy or short-prompt workloads — use TP/EP as usual.
+- **Little benefit / avoid**: decode-heavy or short-prompt workloads. PCP only
+  shards **prefill** tokens to lower TTFT on long sequences; decode is left
+  unsharded and runs redundantly across the PCP ranks. For long-decode
+  (large `output_len`) workloads PCP can **hurt TPOT** — do not enable it there;
+  use TP/EP as usual.
 
 ## Quick Reference
 
@@ -41,6 +45,8 @@ TP and Expert Parallelism (EP): the total world size is `world = tp × pcp`.
 | `-pcp N` / `--prefill-context-parallel-size N` | `1` | Enable PCP with size `N` (`world = tp × pcp`) |
 | `ATOM_PCP_MOE_MERGE` | `1` | Whether to shard MoE across the PCP ranks too |
 | `--enable-tbo [prefill\|all]` | off | Overlap compute with PCP communication. With PCP, only prefill TBO is supported, and only when `ATOM_PCP_MOE_MERGE=1` and `-tp 1` |
+| `--no-enable_chunked_prefill` | chunked on | Disable chunked prefill. Recommended with PCP (see [Tuning for long sequences](#tuning-for-long-sequences)) |
+| `--max-num-batched-tokens N` | `16384` | Max tokens scheduled per step. Raise (e.g. `131072`) for long-sequence PCP so a full long prompt is prefilled in one step |
 
 | Goal (8 GPUs) | Command |
 |------|---------|
@@ -110,6 +116,26 @@ Tips:
   therefore has no effect when PCP is enabled.
 - `--torch-profiler-dir ./log` can be added to collect traces for performance
   analysis.
+
+## Tuning for long sequences
+
+PCP targets long-prefill TTFT, but the default scheduler settings work against it. When serving long prompts:
+
+- **Disable chunked prefill** (`--no-enable_chunked_prefill`), or enlarge the chunk (`--attn_prefill_chunk_size`). It is on by default and splits a long prompt across steps, so PCP gets fewer tokens to shard per step and TBO's request-boundary split (needs ≥2 whole sequences per step) falls back to the non-overlapped path.
+- **Raise `--max-num-batched-tokens`** to `131072` (≥ `input_len`; ≥ `2 × input_len` for TBO's balanced split). The default `16384` forces a long prompt across multiple steps instead of prefilling it in one.
+- **Avoid PCP for long-decode workloads.** PCP shards only prefill; decode runs unsharded. A large `output_len` is decode-dominated, where PCP adds no benefit and can raise TPOT — use plain TP/EP.
+
+Example (long-context prefill, chunked off, larger batch budget):
+
+```bash
+ATOM_PCP_MOE_MERGE=1 \
+python -m atom.entrypoints.openai_server \
+    --model deepseek-ai/DeepSeek-V4 \
+    -tp 1 -pcp 8 --enable-tbo \
+    --no-enable_chunked_prefill \
+    --max-num-batched-tokens 131072 \
+    --kv_cache_dtype fp8
+```
 
 ## Performance baseline
 
