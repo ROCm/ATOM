@@ -547,11 +547,17 @@ class MooncakeConnector(KVConnectorBase):
         # request is served by one producer stage per port, so the consumer must
         # collect ``remote_pp_size`` notifications before the receive is complete.
         self._pending_recv_expected: dict[ReqId, int] = {}
+        # Distinct producer stages whose write-done has arrived, per request.
+        # Write-done is deduped by stage (pp_rank) — the producer may send a
+        # notification more than once for reliability, so counting messages would
+        # finalize early; we count distinct stages instead.
+        self._pending_recv_stages: dict[ReqId, set[int]] = {}
         # PP-prefill: consumer stashes stage-0's release address per request, and
         # the producer (stage-0) counts releases to defer freeing the shared page
         # table until every stage has written the KV out.
         self._release_targets: dict[ReqId, tuple[str, int, int]] = {}
         self._release_count: dict[TransferId, int] = {}
+        self._released_transfers: set[TransferId] = set()
         self._notification_port = get_open_port()
 
         # --- Completion tracking ---
@@ -1016,11 +1022,17 @@ class MooncakeConnector(KVConnectorBase):
         page table. Marks the request in ``done_sending`` for the scheduler.
         """
         with self._completion_lock:
+            if transfer_id in self._released_transfers:
+                # Already released once; a duplicate/late release must not
+                # re-add to done_sending (the block was already freed → the
+                # scheduler would assert on a missing deferred block).
+                return
             count = self._release_count.get(transfer_id, 0) + 1
             if count < consumer_tp_size:
                 self._release_count[transfer_id] = count
                 return
             self._release_count.pop(transfer_id, None)
+            self._released_transfers.add(transfer_id)
             self.done_sending.add(transfer_id)
         with self._completed_prefills_lock:
             self._completed_prefills.pop(transfer_id, None)
@@ -1139,7 +1151,7 @@ class MooncakeConnector(KVConnectorBase):
                 return
 
             # Notify consumer — all data (blocks + slot state) is written.
-            self._send_write_done(notify_host, notify_port, req_id)
+            self._send_write_done(notify_host, notify_port, req_id, self.pp_rank)
 
             # Track refcount for multi-consumer TP fan-out.
             all_done = False
@@ -1449,14 +1461,15 @@ class MooncakeConnector(KVConnectorBase):
                     return False
         return True
 
-    def _send_write_done(self, host: str, port: int, req_id: str) -> None:
+    def _send_write_done(self, host: str, port: int, req_id: str, pp_rank: int) -> None:
         """Send write-done notification to consumer via persistent socket.
 
-        Sends the notification multiple times for reliability — the consumer
-        uses a set so duplicates are harmless.
+        Sends the notification multiple times for reliability. The message
+        carries this stage's ``pp_rank`` and the consumer dedups by stage, so
+        duplicates are harmless (see _record_write_done).
         """
         path = make_zmq_path("tcp", host, port)
-        notification = msgpack.dumps({"request_id": req_id})
+        notification = msgpack.dumps({"request_id": req_id, "pp_rank": pp_rank})
         with self._notify_sockets_lock:
             sock = self._notify_sockets.get(path)
             if sock is None:
@@ -1485,7 +1498,7 @@ class MooncakeConnector(KVConnectorBase):
 
                 if msg_type == MSG_WRITE_DONE:
                     data = msgpack.loads(parts[2])
-                    self._record_write_done(data["request_id"])
+                    self._record_write_done(data["request_id"], data.get("pp_rank", 0))
                 else:
                     logger.error("Unknown notification type: %s", msg_type)
 
@@ -1512,32 +1525,35 @@ class MooncakeConnector(KVConnectorBase):
                 self._notify_sockets[remote_addr] = sock
             sock.send_multipart([MSG_RELEASE, payload])
 
-    def _record_write_done(self, req_id: str) -> bool:
-        """Register one producer stage's write-done for ``req_id``.
+    def _record_write_done(self, req_id: str, pp_rank: int) -> bool:
+        """Register producer stage ``pp_rank``'s write-done for ``req_id``.
 
         Under PP-prefill the receive spans ``remote_pp_size`` producer stages,
-        one write-done each; only the final one runs slot scatter / block fence
-        and marks the request done. Returns True when this was the final stage.
+        one write-done each. The producer may resend a notification for
+        reliability, so we dedup by distinct stage (``pp_rank``) rather than
+        counting messages — otherwise duplicates would finalize the receive
+        before lagging stages have written their layers. Only the message that
+        completes the last distinct stage runs slot scatter / block fence and
+        marks the request done. Returns True when this was that final message.
         """
-        # One producer stage per write-done; the receive is complete only once
-        # every stage has written its layer window.
         with self._completion_lock:
-            if req_id not in self._pending_recv_expected:
-                # Unknown or already-completed request (e.g. a duplicate/retried
-                # write-done). Ignore so we don't re-finalize.
+            expected = self._pending_recv_expected.get(req_id)
+            if expected is None:
+                # Unknown or already-completed request (late duplicate). Ignore.
                 return False
-            remaining = self._pending_recv_expected[req_id] - 1
-            if remaining > 0:
-                self._pending_recv_expected[req_id] = remaining
-            else:
-                del self._pending_recv_expected[req_id]
-        if remaining > 0:
-            logger.info(
-                "[CONSUMER] Write-done for req %s, %d stage(s) remaining",
-                req_id,
-                remaining,
-            )
-            return False
+            stages = self._pending_recv_stages.setdefault(req_id, set())
+            stages.add(pp_rank)
+            if len(stages) < expected:
+                logger.info(
+                    "[CONSUMER] Write-done req %s stage %d (%d/%d stages)",
+                    req_id,
+                    pp_rank,
+                    len(stages),
+                    expected,
+                )
+                return False
+            del self._pending_recv_expected[req_id]
+            self._pending_recv_stages.pop(req_id, None)
 
         slot_info = self._pending_recv_slots.pop(req_id, None)
         if slot_info is not None and self._scatter_slot is not None:
