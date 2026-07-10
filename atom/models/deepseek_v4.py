@@ -171,23 +171,13 @@ def v4_attention_with_output(
     positions: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
+    # WIDE split (legacy / FULL cudagraph path): the whole attention (pre + core
+    # + post) is a single eager splitting op. Used when NOT doing PIECEWISE
+    # cudagraph — the manual whole-forward FULL capture graphs everything at once
+    # so there are no inter-piece tensors to stabilise. Unchanged from baseline.
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    out = self.forward_impl(x, positions)
-
-    from atom.config import CUDAGraphMode
-    from atom.utils.forward_context import get_forward_context
-
-    fc = get_forward_context()
-    if getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE:
-        key = (layer_name, int(out.shape[0]))
-        buf = _v4_attn_piecewise_out.get(key)
-        if buf is None:
-            buf = torch.empty_like(out)
-            _v4_attn_piecewise_out[key] = buf
-        buf.copy_(out)
-        return buf
-    return out
+    return self.forward_impl(x, positions)
 
 
 # ---------------------------------------------------------------------------
@@ -1890,14 +1880,21 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        # Narrow split: projections (incl. indexer Q/weights) run HERE (traced
-        # -> graphed dense pieces); only the paged attention core is eager.
-        q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights = self._attn_pre(x, positions)
-        o = torch.ops.aiter.v4_core_attention(
-            x, q, kv_pre, qr, qr_scale, positions, idx_q_fp8, idx_weights,
-            self.layer_name,
-        )
-        return self._attn_post(o)
+        # Split-op granularity depends on the cudagraph mode
+        #  - PIECEWISE cudagraph -> NARROW split attention
+        #  - FULL / NONE -> WIDE split attention: the whole attention is one eager
+        #  for torch compile.
+        cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
+        if cg_mode is not None and cg_mode.requires_piecewise_compilation():
+            q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights = self._attn_pre(
+                x, positions
+            )
+            o = torch.ops.aiter.v4_core_attention(
+                x, q, kv_pre, qr, qr_scale, positions, idx_q_fp8, idx_weights,
+                self.layer_name,
+            )
+            return self._attn_post(o)
+        return torch.ops.aiter.v4_attention_with_output(x, positions, self.layer_name)
 
     def _attn_pre(self, x: torch.Tensor, positions: torch.Tensor):
         """Q/KV + indexer input projections (graphable, num_tokens-shaped).
@@ -1947,17 +1944,255 @@ class DeepseekV4Attention(nn.Module):
 
     def forward_impl(
         self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """Non-split (eager/FULL) full attention: pre + core + post fused.
+        x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
+        positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+    ) -> torch.Tensor:  # [num_tokens, dim]  BF16 attention output
+        """Compute attention for `x` at absolute token `positions`.
 
-        Kept for the legacy `v4_attention_with_output` op; the compiled path uses
-        the narrow `v4_core_attention` split via `forward` above.
+        PR3-main: handles batched multi-sequence input. Linear projections + RoPE
+        run once on the flat `[num_tokens, ...]` batch; SWA write, Compressor
+        scatter, sparse_attn (gather + score) iterate over sequences using
+        per-seq slot + block_table from the V4 attention builder's metadata.
+        Per-seq slicing uses `cu_seqlens_q` from `forward_context`.
         """
-        q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights = self._attn_pre(x, positions)
-        o = self._attn_core(x, q, kv_pre, qr, qr_scale, positions, idx_q_fp8, idx_weights)
-        return self._attn_post(o)
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        # warmup_model runs BEFORE allocate_kv_cache → `unified_kv` is unbound
+        # and the new sparse_attn_v4_paged_{decode,prefill} kernels would read
+        # OOB. Same pattern as `attention_mha.py:98` — short-circuit dummy_run
+        # with a zero output of the correct shape; downstream layers compile
+        # on a real fwd. swa_write / Compressor / Indexer are also skipped to
+        # avoid touching unbound state caches.
+        fc = get_forward_context()
+        if fc.context.is_dummy_run:
+            return torch.zeros_like(x)
+        if os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            return torch.zeros_like(x)
+        num_tokens = x.size(0)
+        cache_size = self.swa_kv.shape[1]
+        ratio = self.compress_ratio
+        rd = self.rope_head_dim
+
+        # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
+        # All per-fwd state read once. Production prepare_decode/prefill
+        # always populates these; warmup goes through the same path
+        # (`_populate_state_slot_mapping` falls back to slot 0).
+        # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
+        # compress_plans, ...) is well-typed for pyright.
+        attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
+        compress_plans = attn_md.compress_plans
+        block_tables_gpu = attn_md.block_tables
+        state_slot_mapping = attn_md.state_slot_mapping
+        plan_for_layer = compress_plans[ratio] if ratio else None
+
+        # ----- Batched ops on full flat tensors -----
+        # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
+        # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
+        # quantization. EXPERIMENT only.
+        if _V4_FORCE_UE8M0_QUANT:
+            x = x.clone()
+            act_quant_inplace(x, 128, "ue8m0")
+
+        # ===== Triple-stream: Q/KV path + both Compressors in parallel =====
+        use_async_compress = self.maybe_compressors_async(
+            x, plan_for_layer, state_slot_mapping, block_tables_gpu
+        )
+
+        # ----- Q/KV projections (main stream) -----
+        qkv_a = self.wqkv_a(x)
+        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        assert (
+            not _V4_FORCE_UE8M0_QUANT
+        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        qr, qr_scale = self.q_norm(q_lora)
+        q = self.wq_b(qr, x_scale=qr_scale)
+        is_decode = attn_md.state is AttnState.DECODE
+        # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
+        # (weighted) + GPT-J interleaved RoPE on the tail rd dims. Dispatches
+        # to flydsl when the shape matches (V4-Pro is always V4-Pro shape →
+        # always flydsl). Microbench shows flydsl wins at every measured T
+        # from 4 (1.12×) to 32k (1.04×); used for both decode and prefill.
+        # Optional FP8 quant outputs left off — downstream sparse_attn /
+        # swa_write are still bf16.
+        # Decode folds the SWA cache-write into qk_norm_rope_maybe_quant: the
+        # post-norm/rope KV row is written into swa_kv[slot, pos%cache, :]
+        # (slot = state_slot_mapping[batch_id_per_token[t]]). The flydsl path
+        # fuses it into the kernel launch; the Triton fallback emits a separate
+        # swa_write internally — either way the bridge owns the SWA write, so
+        # no backend dispatch is needed here. Prefill writes its in-chunk SWA
+        # tail after sparse_attn, so it passes swa_kv=None and never fuses.
+        # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
+        # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
+        # covers exactly the tokens the old standalone swa_write did.
+        q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
+            q,
+            kv_pre,
+            self.kv_norm.weight,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            positions,
+            self.n_local_heads,
+            self.head_dim,
+            rd,
+            self.eps,
+            quant_q=False,
+            quant_k=False,
+            swa_kv=self.swa_kv if is_decode else None,
+            state_slot_mapping=state_slot_mapping if is_decode else None,
+            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
+            swa_cache_size=cache_size if is_decode else None,
+            swa_write_per_batch=(
+                min(attn_md.max_seqlen_q, cache_size) if is_decode else None
+            ),
+        )
+        if _V4_USE_REF_QUANT:
+            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+
+        # HCA
+        if use_async_compress:
+            current_stream = fc.main_stream
+            if self.compressor is not None:
+                current_stream.wait_stream(self.alt_stream)
+            if self.indexer is not None:
+                current_stream.wait_stream(self.indexer_stream)
+        # ===== Compressor + Indexer =====
+        if self.indexer is not None and not self.skip_topk:
+            indexer_topk_batched = self.indexer.forward_batched(
+                x_full=x,
+                qr_full=qr,
+                qr_full_scale=qr_scale,
+                positions=positions,
+            )
+            # Translate seq-local topk → physical paged offsets and write into
+            # the CSA section of either:
+            #   - decode buffer `kv_indices_csa` (state is DECODE)
+            #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
+            # `_fill_csa_paged_compress` dispatches internally on state.
+            self._fill_csa_paged_compress(
+                attn_md, indexer_topk_batched, positions, num_tokens
+            )
+
+        # ===== Sparse attention dispatch =====
+        # Decode SWA write fires upstream of this dispatch via the
+        # ``swa_write`` call in the decode branch — so ``paged_decode``
+        # always sees the current token's K in the ring. Prefill does NOT
+        # call swa_write from this layer (prior-chunk K is read from
+        # ``unified_kv`` ring via the kv_indices_prefix_swa region).
+        if is_decode:
+            if ratio == 0:
+                kv_indices = attn_md.kv_indices_swa
+                kv_indptr = attn_md.kv_indptr_swa
+            elif ratio == 4:
+                kv_indices = attn_md.kv_indices_csa
+                kv_indptr = attn_md.kv_indptr_csa
+            else:  # ratio == 128
+                kv_indices = attn_md.kv_indices_hca
+                kv_indptr = attn_md.kv_indptr_hca
+            o = sparse_attn_v4_paged_decode(
+                q_sa,
+                self.unified_kv,
+                kv_indices,
+                kv_indptr,
+                self.attn_sink,
+                self.softmax_scale,
+            )  # [S, H, head_dim]
+        else:
+            # Two-source paged prefill: prefix from `unified_kv` (per-ratio
+            # buffer with SWA history + compress section), extend from per-fwd
+            # `kv` tensor (in-chunk SWA tail; extend buffer is layer-invariant).
+            #
+            # ===== PCP (full-KV) =====
+            # Under PCP the model.forward entry round-robin-split x/positions to 1/W,
+            # so `q_sa` and `kv` here are this rank's 1/W shard. The per-query
+            # metadata (kv_indptr/indices_*, indexer_meta) was already reduced
+            # to this rank's owned queries in the builder (_apply_pcp_reindex),
+            # so `q_sa` + those indices are aligned and used as-is. The only
+            # runtime fixups here are on the actual K/V data:
+            #   - swa_write must write the FULL sequence SWA ring (every PCP
+            #     rank keeps full KV), and
+            #   - sparse_attn's extend source must be the FULL `kv` so each 1/W
+            #     query can attend the whole in-chunk SWA window.
+            # So all-gather `kv` back to full order; positions/cu_seqlens_q/
+            # state_slot_mapping for the SWA write stay full (cu_seqlens_q /
+            # state_slot_mapping are per-seq, never split; positions_full comes
+            # from the forward context which holds the pre-split copy).
+            pcp_on = _pcp_active()
+            if pcp_on:
+                pcp_ws = get_pcp_world_size()
+                kv_full = pcp_allgather_rerange(kv, pcp_ws)
+                # positions must match kv_full's full-sequence coords for the
+                # swa_write ring addressing (`positions[src] % cache_size`).
+                # `positions` here is this rank's 1/W shard (split in
+                # ForCausalLM.forward); all-gather it back to full order with
+                # the same rerange used for kv (NOT fc.context.positions, which
+                # the builder reindexed to 1/W).
+                positions_full = pcp_allgather_rerange(positions, pcp_ws)
+            else:
+                kv_full = kv
+                positions_full = positions
+
+            if ratio == 0:
+                kv_indices_prefix = attn_md.kv_indices_prefix_swa
+                kv_indptr_prefix = attn_md.kv_indptr_prefix_swa
+            elif ratio == 4:
+                kv_indices_prefix = attn_md.kv_indices_prefix_csa
+                kv_indptr_prefix = attn_md.kv_indptr_prefix_csa
+            elif ratio == 128:
+                kv_indices_prefix = attn_md.kv_indices_prefix_hca
+                kv_indptr_prefix = attn_md.kv_indptr_prefix_hca
+            else:
+                raise ValueError(f"Unsupported compress_ratio {ratio}")
+            o = sparse_attn_v4_paged_prefill(
+                q_sa,
+                self.unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                kv_full,
+                attn_md.kv_indices_extend,
+                attn_md.kv_indptr_extend,
+                self.attn_sink,
+                self.softmax_scale,
+                # Reuse q_sa as the attention output buffer; q_sa is not needed
+                # after this call and this avoids an extra empty_like allocation.
+                out=q_sa,
+            )  # [S, H, head_dim]
+            # swa_write AFTER attn so chunked-prefill prefix SWA reads see
+            # prior-chunk's ring contents (current swa_write would overwrite
+            # ring slots `pos % cache_size` for positions in this chunk's tail).
+            # PCP: write the FULL sequence SWA ring from the gathered kv_full +
+            # full positions/cu_seqlens_q (full-KV scheme — every rank holds it).
+            swa_write(
+                kv_full,
+                positions_full,
+                attn_md.cu_seqlens_q,
+                state_slot_mapping,
+                self.swa_kv,
+                cache_size,
+                min(attn_md.max_seqlen_q, cache_size),
+            )
+
+        # Inverse RoPE on output's rope dims to remove absolute-position
+        # contribution carried in by the value-side RoPE of the KV entries.
+        self.rotary_emb.inverse(positions, o[..., -rd:])
+        # ----- Grouped output LoRA (batched on the full flat tensor) -----
+        o = o.view(num_tokens, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        if num_tokens <= 32 or get_gfx() == "gfx1250":
+            y = torch.empty(
+                num_tokens,
+                self.n_local_groups,
+                self.o_lora_rank,
+                dtype=o.dtype,
+                device=o.device,
+            ).transpose(0, 1)
+            y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
+            o = y.transpose(0, 1)
+        else:
+            o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        x = self.wo_b(o.flatten(1))
+        return x
 
     def _attn_core(
         self,
