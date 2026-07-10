@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import bisect
 import gc
 import logging
 import math
@@ -1276,51 +1275,47 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         activation_bytes = max(peak - current, 0)
 
-        # PIECEWISE: the pool holds each dense piece captured at every distinct
-        # num_tokens shape (num_tokens = bs*q; capture is memory-guarded, below).
-        # Memory ~ per_token * Σ(distinct captured num_tokens). Estimate from the
-        # shapes (not the FULL Σq formula, which under-reserves here -> OOM).
+        # PIECEWISE pool ~ per_token * Σ(captured num_tokens). per_token from model
+        # geometry (hidden*dtype*layers*k), not a magic constant. Under-reserve is
+        # safe: capture re-checks live free mem per bucket and skips oversized.
         if self._piecewise_cg_active():
             cap_sizes = self.config.compilation_config.cudagraph_capture_sizes or [
                 self.config.max_num_seqs
             ]
             # Non-spec decode: one token per seq, so num_tokens == bs.
-            q_buckets = [1]
-            hidden = int(self.config.hf_config.hidden_size)
-            # Per-token retained cudagraph-pool cost. Calibrated to the MEASURED
-            # per_token_actual on DSV4 TP8 PIECEWISE after the weak_ref_tensor fix
-            # (atom/utils weak-ref op) let the shared pool OVERLAY captured piece
-            # outputs across shapes: actual_pool=10.14GB / Σtok=4472 = 2.322MB/tok
-            # (was 8.5MB/tok when weak_ref silently fell back to a strong ref and
-            # every piece output was retained -> no overlay -> 35GB pool). 2.5MB
-            # keeps a small margin above the measured 2.322MB. NOTE: the
-            # sum-of-distinct model below now OVER-estimates (overlay makes the
-            # true pool ~max-bucket-driven, not a sum), so this is a safe upper
-            # bound on the KV reservation. Under-reserving never OOMs: the
-            # capture-time guard re-checks live free memory per bucket and skips
-            # any that would not fit.
-            per_token_gb = 0.0025 * (hidden / 7168.0)
-            total_gpu = torch.cuda.mem_get_info()[1]
-            target_reserve = 0.12 * total_gpu
-            _all = sorted({bs * q for bs in cap_sizes for q in q_buckets})
-            distinct = []
-            _acc = 0
-            for _nt in _all:
-                if (
-                    distinct
-                    and 1.2 * per_token_gb * (1 << 30) * (_acc + _nt) > target_reserve
-                ):
+            hf_config = self.config.hf_config
+            hidden = int(hf_config.hidden_size)
+            num_layers = int(hf_config.num_hidden_layers)
+            dtype_bytes = torch.finfo(self.config.torch_dtype).bits // 8
+            _PER_TOKEN_LAYER_TENSORS = 2.8  # live hidden tensors kept per layer
+            per_token_bytes = (
+                hidden * dtype_bytes * num_layers * _PER_TOKEN_LAYER_TENSORS
+            )
+            # Cap the reserved buckets at a fraction of the KV budget so a huge
+            # capture list can't starve KV. Use the utilization budget (not raw
+            # total) as the reference — it tracks the configured memory envelope.
+            budget = self.config.gpu_memory_utilization * torch.cuda.mem_get_info()[1]
+            target_reserve = 0.15 * budget
+            captured = []
+            acc = 0
+            for num_tokens in sorted(set(cap_sizes)):
+                if captured and per_token_bytes * (acc + num_tokens) > target_reserve:
                     break
-                distinct.append(_nt)
-                _acc += _nt
-            overhead = 1.2 * per_token_gb * (1 << 30) * sum(distinct)
+                captured.append(num_tokens)
+                acc += num_tokens
+            overhead = int(per_token_bytes * acc)
             logger.info(
                 "PIECEWISE cudagraph mem estimate: n_shapes=%d/%d Σtok=%d "
-                "hidden=%d target=%.1fGB -> overhead=%.2fGB",
-                len(distinct), len(_all), sum(distinct), hidden,
-                target_reserve / (1 << 30), overhead / (1 << 30),
+                "per_token=%.3fMB hidden=%d layers=%d -> overhead=%.2fGB",
+                len(captured),
+                len(set(cap_sizes)),
+                acc,
+                per_token_bytes / (1 << 20),
+                hidden,
+                num_layers,
+                overhead / (1 << 30),
             )
-            return int(overhead)
+            return overhead
         # CUDA graph pool overhead is roughly 20% of single-pass activation
         # memory due to pooling across multiple captured batch sizes.
         return int(activation_bytes * 0.2)
@@ -2085,12 +2080,9 @@ class ModelRunner:
                 num_tokens = context.batch_size * max_q_len  # real (output slice)
 
                 if self._piecewise_cg_active():
-                    # PIECEWISE replay: no whole-forward graph. Dense pieces are
-                    # per-token, so (TP only) we replay at a 1D num_tokens bucket
-                    # replayed at the captured num_tokens bucket >= the real token
-                    # count (non-spec decode: num_tokens == bs). Attention is eager
-                    # on the flat [0:num_tokens] tokens; the [num_tokens:pad] tail
-                    # is padding the model ignores.
+                    # PIECEWISE replay at the captured num_tokens bucket >= real
+                    # token count (non-spec decode: num_tokens == bs); the pad tail
+                    # is ignored by the model.
                     _is_dummy = batch is not None and batch.is_dummy_run
                     num_tokens_pad = graph_bs * max_q_len
                     _captured = num_tokens_pad in getattr(
@@ -2119,14 +2111,9 @@ class ModelRunner:
                     else:
                         hidden_states = model_output
                         self._aux_hidden_states = None
-                    # Slice off the pad tail before sampling. The forward ran on the
-                    # padded [0:num_tokens_pad] window (so the captured piece shapes
-                    # match), but rows [num_tokens:num_tokens_pad] are pad garbage
-                    # and must not reach the sampler — otherwise they leak into
-                    # sampled_token_ids -> prev_token_ids -> next step's
-                    # prepare_input_ids assigns a pad-sized tensor into a smaller
-                    # deferred slot -> shape-mismatch crash. num_tokens is the same
-                    # real length the non-PIECEWISE path uses below.
+                    # Slice pad tail before sampling: pad rows must not leak into
+                    # sampled_token_ids -> prev_token_ids -> next-step shape
+                    # mismatch. num_tokens == the non-PIECEWISE real length.
                     hidden_states = hidden_states[:num_tokens]
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
@@ -2488,8 +2475,8 @@ class ModelRunner:
                     # instead of being skipped. Still conservative: guard re-checks
                     # LIVE free each bucket, so if a bucket truly doesn't fit it is
                     # skipped rather than OOMing.
-                    _slope = 0.004 * (1 << 30) * (
-                        self.config.hf_config.hidden_size / 7168.0
+                    _slope = (
+                        0.004 * (1 << 30) * (self.config.hf_config.hidden_size / 7168.0)
                     )
                     _free = torch.cuda.mem_get_info()[0]
                     _need = _slope * num_tokens * 1.25 + (4 << 30)
@@ -2498,7 +2485,9 @@ class ModelRunner:
                             logger.info(
                                 "PIECEWISE skip num_tokens=%d: free=%.1fGB "
                                 "< need=%.1fGB",
-                                num_tokens, _free / 1e9, _need / 1e9,
+                                num_tokens,
+                                _free / 1e9,
+                                _need / 1e9,
                             )
                         continue
                 # Use a simple, safe position pattern for capture.
@@ -2633,6 +2622,7 @@ class ModelRunner:
             _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)
             _sumtok = sum(self._piecewise_sorted_tokens) or 1
             import atom.utils.cuda_graph as _cg_mod
+
             logger.info(
                 "PIECEWISE POOL-DIAG global_env=%s shared_pool=%s n_bucket_pools=%d "
                 "bucket_pool_keys=%s",
