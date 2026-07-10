@@ -142,17 +142,16 @@ jobs:
       # Remove once an atom-dev image ships aiter >= #4159.
       - name: Patch aiter flydsl for paged-SWA (aiter#4159)
         run: |
-          URL="https://raw.githubusercontent.com/ROCm/aiter/5dc443dad76567a970a77b7b5d098e46835603ec/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py"
-          docker exec -e AITER_FLYDSL_URL="$URL" atom-benchmark bash -lc '
-            set -euo pipefail
-            F=/app/aiter-test/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py
-            curl -fsSL "$AITER_FLYDSL_URL" -o "$F.new"
-            grep -q swa_block_tables "$F.new"
-            mv "$F.new" "$F"
-            echo "patched flydsl qk_norm_rope_quant:"
-            md5sum "$F"
-            echo "swa_block_tables hits: $(grep -c swa_block_tables "$F")"
-          '
+          set -euo pipefail
+          SRC=.github/patches/aiter_flydsl_qk_norm_rope_quant_4159.py
+          DST=/app/aiter-test/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py
+          grep -q swa_block_tables "$SRC"
+          docker cp "$SRC" atom-benchmark:"$DST"
+          docker exec atom-benchmark bash -lc "
+            echo 'patched flydsl qk_norm_rope_quant:'
+            md5sum '$DST'
+            echo \"swa_block_tables hits: \$(grep -c swa_block_tables '$DST')\"
+          "
 
       - name: Collect GPU info (inside container)
         id: gpu-info
