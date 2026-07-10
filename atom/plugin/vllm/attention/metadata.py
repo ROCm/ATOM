@@ -2222,14 +2222,31 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata = None
         if num_decodes > 0:
-            torch.diff(
-                common_attn_metadata.query_start_loc[: num_decodes + 1],
-                out=self.decode_lens_buffer[:num_decodes],
-            )
-            decode_lens = self.decode_lens_buffer[:num_decodes]
+            # Single-source the decode lengths from query_start_loc_cpu.
+            #
+            # `decode_lens` is used below as the `repeats` argument of
+            # torch.repeat_interleave, while `actual_expanded` (derived from
+            # decode_lens_cpu.sum()) is passed as its `output_size`. When
+            # output_size is given, repeat_interleave SKIPS the device sync and
+            # trusts that `output_size == repeats.sum()`; if that contract is
+            # violated it emits an internal gather index past the source rows and
+            # the underlying index_select over-reads -> random illegal memory
+            # access.
+            #
+            # Previously `decode_lens` was diffed from the GPU `query_start_loc`
+            # while `output_size` came from the CPU `query_start_loc_cpu`. Under
+            # async scheduling the GPU and CPU copies of query_start_loc can
+            # momentarily disagree, so `repeats` and `output_size` came from two
+            # different sources and could mismatch. Deriving `decode_lens` from
+            # the SAME CPU tensor (copied into the persistent GPU buffer) makes
+            # `decode_lens.sum() == actual_expanded` hold by construction.
             decode_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
+            self.decode_lens_buffer[:num_decodes].copy_(
+                decode_lens_cpu, non_blocking=True
+            )
+            decode_lens = self.decode_lens_buffer[:num_decodes]
 
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
