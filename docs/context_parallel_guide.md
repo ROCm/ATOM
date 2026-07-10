@@ -29,8 +29,8 @@ TP and Expert Parallelism (EP): the total world size is `world = tp × pcp`.
   TTFT dominates.
 - **Combine with**: `--enable-tbo` (prefill) to overlap the MoE communication PCP
   introduces (see [Overlapping communication with TBO](#overlapping-communication-with-tbo)).
-  TBO is only usable with `ATOM_PCP_MOE_MERGE=1` **and `-tp 1`** (`tp > 1` hangs —
-  see [Constraints & Compatibility](#constraints--compatibility)).
+  TBO is only usable with `ATOM_PCP_MOE_MERGE=1` **and `-tp 1`** (see
+  [Constraints & Compatibility](#constraints--compatibility)).
 - **Requires**: `world = tp × pcp` GPUs, e.g. `-tp 4 -pcp 2` on 8 GPUs.
 - **Little benefit**: decode-heavy or short-prompt workloads — use TP/EP as usual.
 
@@ -84,7 +84,7 @@ python -m atom.entrypoints.openai_server \
 ### DeepSeek-V4: TP1 + PCP8 + prefill TBO overlap (8 GPUs)
 
 TBO requires `ATOM_PCP_MOE_MERGE=1` (the default) **and `-tp 1`** — put every GPU
-into PCP. With `tp > 1` the run hangs.
+into PCP.
 
 ```bash
 ATOM_PCP_MOE_MERGE=1 \
@@ -101,8 +101,9 @@ Tips:
   `ATOM_PCP_MOE_MERGE=1`. It only helps in that mode: with `ATOM_PCP_MOE_MERGE=0`
   there is no MoE communication to overlap, so TBO is auto-disabled (a warning is
   logged).
-- `--enable-tbo` additionally requires `-tp 1`; with `tp > 1` the run **hangs**
-  (not yet supported). Give all GPUs to PCP instead, e.g. `-tp 1 -pcp 8`.
+- `--enable-tbo` additionally requires `-tp 1`; with `tp > 1` it **may hang** under
+  long-sequence / high-concurrency workloads (not yet supported). Give all GPUs to
+  PCP instead, e.g. `-tp 1 -pcp 8`.
 - Under PCP, TBO uses a **request-boundary split** (each micro-batch is a whole
   subset of requests) — the non-default TBO split mode — instead of the
   token-midpoint split used without PCP. `ATOM_TBO_PREFILL_TOKEN_SPLIT`
@@ -153,7 +154,7 @@ PCP baseline (not the `-tp 4 -pcp 2` numbers above).
 | PCP + DP-attention | Not supported (raises at startup) |
 | PCP + TBO decode (`--enable-tbo all`) | Not supported (raises at startup); use `--enable-tbo` prefill-only |
 | `ATOM_PCP_MOE_MERGE=0` + `--enable-tbo` | TBO auto-disabled (warning logged) |
-| PCP + TBO with `tp > 1` | **Not supported — hangs.** TBO requires `-tp 1` (all GPUs in PCP, e.g. `-tp 1 -pcp 8`) |
+| PCP + TBO with `tp > 1` | **Not supported.** May hang under long-sequence / high-concurrency workloads. TBO requires `-tp 1` (all GPUs in PCP, e.g. `-tp 1 -pcp 8`) |
 
 PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 `-tp 1`**. Decode is unchanged by PCP in all configurations.
