@@ -25,9 +25,7 @@ class _FakeTPGroup:
 def _init_monitor(monitor, *, num_layers=1, num_physical=4, device=None):
     if device is None:
         device = torch.device("cpu")
-    monitor.initialize(
-        num_layers=num_layers, num_physical=num_physical, device=device
-    )
+    monitor.initialize(num_layers=num_layers, num_physical=num_physical, device=device)
     return monitor
 
 
@@ -132,9 +130,7 @@ def test_monitor_initialize_rejects_runtime_resize():
     monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=2)
     _init_monitor(monitor, num_layers=1, num_physical=2)
     with pytest.raises(RuntimeError, match="already initialized"):
-        monitor.initialize(
-            num_layers=2, num_physical=2, device=torch.device("cpu")
-        )
+        monitor.initialize(num_layers=2, num_physical=2, device=torch.device("cpu"))
 
 
 def test_count_physical_load_rejects_float_dtype():

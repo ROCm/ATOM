@@ -20,9 +20,7 @@ class _FakeTPGroup:
 def _init_monitor(monitor, *, num_layers=1, num_physical=2, device=None):
     if device is None:
         device = torch.device("cpu")
-    monitor.initialize(
-        num_layers=num_layers, num_physical=num_physical, device=device
-    )
+    monitor.initialize(num_layers=num_layers, num_physical=num_physical, device=device)
     return monitor
 
 
