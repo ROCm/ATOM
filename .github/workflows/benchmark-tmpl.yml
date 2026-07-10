@@ -131,6 +131,29 @@ jobs:
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }}
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }}
 
+      # TEMP (ci/dsv4-pro-swa branch only): the paged-SWA PR calls
+      # flydsl_qk_norm_rope_quant(..., swa_block_tables=, swa_block_size=), which
+      # only exists in aiter after PR #4159 (merge 5dc443d). rocm/atom-dev:latest
+      # (built 2026-07-09 15:44 UTC, ~12 min after that merge) still ships the
+      # pre-#4159 flydsl file, so the server crashes at load with
+      # "unexpected keyword argument 'swa_block_tables'". #4159 is a single pure
+      # -Python file and the image's copy is byte-identical to #4159's parent, so
+      # overwriting just this file is a clean, self-consistent swap (no rebuild).
+      # Remove once an atom-dev image ships aiter >= #4159.
+      - name: Patch aiter flydsl for paged-SWA (aiter#4159)
+        run: |
+          F=/app/aiter-test/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py
+          URL=https://raw.githubusercontent.com/ROCm/aiter/5dc443dad76567a970a77b7b5d098e46835603ec/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py
+          docker exec atom-benchmark bash -lc "
+            set -euo pipefail
+            curl -fsSL '$URL' -o \"\$F.new\"
+            grep -q swa_block_tables \"\$F.new\"
+            mv \"\$F.new\" \"\$F\"
+            echo 'patched flydsl qk_norm_rope_quant:'
+            md5sum \"\$F\"
+            echo \"swa_block_tables hits: \$(grep -c swa_block_tables \"\$F\")\"
+          "
+
       - name: Collect GPU info (inside container)
         id: gpu-info
         env:
