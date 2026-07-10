@@ -870,6 +870,13 @@ class MLAAttention(nn.Module):
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
             paged_kv_indices = self.sparse_kv_indices_buffer
+            # Sparse attention treats each query token as its own length-1
+            # sequence, so kv_last_page_lens must have one entry per query token.
+            # attn_metadata.kv_last_page_lens is the DENSE per-seq buffer (length
+            # bs) on the has_cached prefix path; reading it here over-reads and
+            # causes an illegal memory access. Use the per-token sparse buffer,
+            # mirroring the decode sparse path.
+            kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
