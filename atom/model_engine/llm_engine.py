@@ -174,14 +174,14 @@ class LLMEngine:
             mm_data_iter,
             request_id_iter,
         ):
-            req = self.io_processor.preprocess(
+            fanout = self.io_processor.preprocess_fanout(
                 prompt,
                 sampling_param,
                 stream_callback=callback,
                 multimodal_data=mm_data,
-                request_id=request_id,
+                parent_request_id=request_id,
             )
-            reqs.append(req)
+            reqs.extend(fanout)
         self.core_mgr.add_request(reqs)
 
     def step(self) -> list[Sequence]:

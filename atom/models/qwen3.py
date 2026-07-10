@@ -24,6 +24,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Iterable, Union
 
 import torch
@@ -331,6 +332,9 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
+        true_vocab_size = int(os.environ.get("LUMENRL_ATOM_TRUE_VOCAB_SIZE", "0") or 0)
+        if true_vocab_size > 0 and logits.shape[-1] > true_vocab_size:
+            logits[..., true_vocab_size:] = float("-inf")
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
