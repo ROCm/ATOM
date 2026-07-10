@@ -88,6 +88,26 @@ class LLMEngine:
                 )
                 config.enable_tbo = False
                 config.enable_tbo_decode = False
+            elif config.tensor_parallel_size > 1:
+                # Cross-communicator (PCP x TP) RCCL deadlock:
+                # under TBO the PCP collectives (comm_stream) run concurrently
+                # and UNORDERED with the TP-group all_reduces (compute_stream,
+                # from attention wo_b / MoE RowParallelLinear). On the TPxPCP
+                # rank grid with large collectives this forms a cross-rank
+                # circular wait -> hang (reproduced MI355 TP4PCP2/TP2PCP4 merge
+                # +TBO, 64k/c32). Serialized (non-TBO single stream) is fine, and
+                # TP=1 has no TP communicator so it cannot form the cycle. Only
+                # TP=1 + PCP keeps TBO; TP>1 falls back to non-TBO.
+                logger.warning(
+                    "Disabling TBO: prefill_context_parallel_size > 1 (-pcp) "
+                    "with tensor_parallel_size > 1 (-tp) hangs under TBO due to "
+                    "a PCP<->TP cross-communicator RCCL deadlock (concurrent "
+                    "unordered collectives on comm/compute streams; see "
+                    "PCP_TBO.md 14.4). TBO with PCP is only supported at -tp 1 "
+                    "(e.g. -tp 1 -pcp 8)."
+                )
+                config.enable_tbo = False
+                config.enable_tbo_decode = False
             elif config.enable_tbo_decode:
                 raise ValueError(
                     "prefill_context_parallel_size > 1 (-pcp) combined with "
