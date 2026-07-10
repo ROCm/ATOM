@@ -14,7 +14,12 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import shuffle_weight
+
+try:
+    from aiter.ops.shuffle import moe_shuffle_scale
+except ImportError:
+    from aiter.ops.shuffle import shuffle_scale as moe_shuffle_scale
 from atom.config import (
     Config,
     QuantizationConfig,
