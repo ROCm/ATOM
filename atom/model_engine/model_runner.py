@@ -1888,7 +1888,9 @@ class ModelRunner:
 
         pcp_size = self.config.prefill_context_parallel_size
         _pcp_tbo_balanced = (
-            is_prefill and pcp_size > 1 and tbo_collective_active
+            is_prefill
+            and pcp_size > 1
+            and tbo_collective_active
             and not batch.is_dummy_run
             and getattr(self, "_pcp_tbo_balanced_active", False)
         )
@@ -1910,7 +1912,9 @@ class ModelRunner:
             # request boundary whose cumulative token count is closest to target
             split_idx = int(np.searchsorted(cum, target, side="left")) + 1
             split_idx = max(1, min(split_idx, num_prefill_reqs - 1))
-            B = int(cum[split_idx - 1])  # global token count of group0 (reqs [0:split_idx])
+            B = int(
+                cum[split_idx - 1]
+            )  # global token count of group0 (reqs [0:split_idx])
             H0 = pcp_pad_len(B, pcp_size)
             H1 = pcp_pad_len(total_tok - B, pcp_size)
             l0 = H0 // pcp_size

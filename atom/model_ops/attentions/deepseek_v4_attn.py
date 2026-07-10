@@ -1635,9 +1635,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # independent non-TBO PCP mini-batch. Slice the FULL (un-reindexed)
         # metadata to the group + call _apply_pcp_reindex on it (reuse the proven
         # reindex). Bypasses the token-split rebuild path entirely.
-        if getattr(self.model_runner, "_pcp_tbo_balanced_active", False) and getattr(
-            self.model_runner, "_pcp_bal_groups", None
-        ) is not None:
+        if (
+            getattr(self.model_runner, "_pcp_tbo_balanced_active", False)
+            and getattr(self.model_runner, "_pcp_bal_groups", None) is not None
+        ):
             return self._build_ubatch_prefill_metadata_balanced(
                 attn_metadata, ubatch_idx
             )
@@ -1826,7 +1827,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if src.state_slot_mapping_cpu is not None:
             ub.state_slot_mapping_cpu = src.state_slot_mapping_cpu[rs0:rs1]
         if src.n_committed_csa_per_seq is not None:
-            ub.n_committed_csa_per_seq = src.n_committed_csa_per_seq[rs0:rs1].contiguous()
+            ub.n_committed_csa_per_seq = src.n_committed_csa_per_seq[
+                rs0:rs1
+            ].contiguous()
         if src.n_committed_csa_per_seq_cpu is not None:
             ub.n_committed_csa_per_seq_cpu = src.n_committed_csa_per_seq_cpu[rs0:rs1]
         if src.n_committed_hca_per_seq_cpu is not None:
@@ -1867,7 +1870,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ---- compress_plans: group's GLOBAL per-request (compressor all-gathers
         # the group to full order). Built from global cu / context_lens slices. ----
         if self._unique_compress_ratios_overlap:
-            gcu = var["cu_seqlens_q"].np  # GLOBAL (not overwritten for request-boundary split)
+            gcu = var[
+                "cu_seqlens_q"
+            ].np  # GLOBAL (not overwritten for request-boundary split)
             ext = (gcu[rs0 + 1 : rs1 + 1] - gcu[rs0:rs1]).astype(np.int32)
             ctx = np.asarray(var["context_lens"].np[rs0:rs1], dtype=np.int32)
             plan_bufs = self._get_ubatch_compress_plan_buffers(ubatch_idx)
@@ -1903,7 +1908,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub.n_committed_csa_per_seq = ub.n_committed_csa_per_seq.clone()
         if ub.indexer_meta is not None:
             im = ub.indexer_meta
-            for k in ("cu_committed_gpu", "batch_id_per_token_gpu", "n_committed_per_seq_gpu"):
+            for k in (
+                "cu_committed_gpu",
+                "batch_id_per_token_gpu",
+                "n_committed_per_seq_gpu",
+            ):
                 if im.get(k) is not None:
                     im[k] = im[k].clone()
         return ub

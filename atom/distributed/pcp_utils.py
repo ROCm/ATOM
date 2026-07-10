@@ -29,11 +29,14 @@ class PcpBalGroup(NamedTuple):
     attn builder's `_build_ubatch_prefill_metadata_balanced` (slice + reindex).
     """
 
-    req_start: int   # first request index of this group (inclusive)
-    req_stop: int    # last request index of this group (exclusive)
-    tok_start: int   # global token offset of the group's first token
-    tok_end: int     # global token offset past the group's last REAL token
-    pad_total: int   # tok count padded to a pcp multiple = pcp_pad_len(tok_end-tok_start, pcp)
+    req_start: int  # first request index of this group (inclusive)
+    req_stop: int  # last request index of this group (exclusive)
+    tok_start: int  # global token offset of the group's first token
+    tok_end: int  # global token offset past the group's last REAL token
+    pad_total: (
+        int  # tok count padded to a pcp multiple = pcp_pad_len(tok_end-tok_start, pcp)
+    )
+
 
 from aiter.dist.parallel_state import (
     get_pcp_group,
@@ -170,7 +173,9 @@ def pcp_reduce_scatter(
     return get_pcp_group().reduce_scatter(input_.contiguous(), dim=0)
 
 
-def pcp_all_reduce(input_: torch.Tensor, pcp_size: Optional[int] = None) -> torch.Tensor:
+def pcp_all_reduce(
+    input_: torch.Tensor, pcp_size: Optional[int] = None
+) -> torch.Tensor:
     """All-reduce (sum) over the PCP group, no token reshaping. DECODE path:
     tokens are pcp-redundant (every rank holds the same full batch), so just sum
     the pcp-half of the intermediate that combine_outputs' tp all_reduce missed.

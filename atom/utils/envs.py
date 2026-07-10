@@ -258,7 +258,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
-    # Only meaningful when prefill_context_parallel_size > 1; 
+    # Only meaningful when prefill_context_parallel_size > 1;
     # Default "1": all-gather hidden 1/W -> full before MoE and slice
     # full -> 1/W after, so MoE sees the complete token set (MoE itself is
     # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.

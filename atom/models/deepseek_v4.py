@@ -1019,6 +1019,7 @@ class Compressor(nn.Module):
                 tbo_yield_and_switch_from_compute_to_comm,
                 tbo_switch_to_compute_sync,
             )
+
             _tbo = _tbo_active()
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
@@ -1990,6 +1991,7 @@ class DeepseekV4Attention(nn.Module):
                     tbo_yield_and_switch_from_compute_to_comm,
                     tbo_switch_to_compute_sync,
                 )
+
                 _tbo_attn = _tbo_active_attn()
                 if _tbo_attn:
                     tbo_yield_and_switch_from_compute_to_comm()
@@ -2881,6 +2883,7 @@ def moe_pcp_merge_forward(
             tbo_yield_and_switch_from_compute_to_comm,
             tbo_switch_to_compute_sync,
         )
+
         _tbo = _tbo_active()
         # allgather: when TBO is active, yield to the partner ubatch so its
         # compute overlaps this collective on the comm stream (P2 overlap).
@@ -3199,6 +3202,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         full_padded_ids = None
         if use_pcp:
             from atom.utils.tbo.ubatching import tbo_active as _tbo_active
+
             pcp_size = get_pcp_world_size()
             if _tbo_active():
                 # PCP+TBO prefill: the split was done upstream in run_model;
