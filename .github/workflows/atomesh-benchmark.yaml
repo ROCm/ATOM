@@ -227,7 +227,6 @@ jobs:
       needs.load-config.outputs.has_matrix == 'true'
       && (
         github.event_name == 'schedule'
-        || github.event_name == 'push'
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
@@ -381,7 +380,6 @@ jobs:
       && needs.summarize-results.outputs.has_results == 'true'
       && (
         github.event_name == 'schedule'
-        || github.event_name == 'push'
         || (github.event_name == 'workflow_dispatch' && inputs.publish_dashboard)
       )
     runs-on: ubuntu-latest
