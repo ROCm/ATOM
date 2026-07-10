@@ -10,8 +10,10 @@ KV cache data from producer (prefill) to consumer (decode) nodes.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -116,6 +118,115 @@ class MooncakeAgentMetadata(
 
 def _port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return dp_rank * tp_size + tp_rank
+
+
+def _ip_for_ib_device(ib_device: str, fallback: str) -> str:
+    """Return the IPv4 address bound to the netdev backing an RDMA HCA."""
+    net_root = f"/sys/class/infiniband/{ib_device}/device/net"
+    netdevs: list[str] = []
+    try:
+        netdevs = sorted(os.listdir(net_root))
+    except OSError:
+        logger.info(
+            "Could not list netdevs for ib_device=%s under %s; "
+            "falling back to RDMA GID lookup",
+            ib_device,
+            net_root,
+        )
+
+    for netdev in netdevs:
+        try:
+            out = subprocess.check_output(
+                ["ip", "-o", "-4", "addr", "show", "dev", netdev, "scope", "global"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        for line in out.splitlines():
+            parts = line.split()
+            if "inet" in parts:
+                ip_cidr = parts[parts.index("inet") + 1]
+                return ip_cidr.split("/", 1)[0]
+
+    gid_ip = _ip_for_ib_device_from_gid(ib_device)
+    if gid_ip:
+        logger.info(
+            "Using IPv4 %s parsed from RDMA GID for ib_device=%s", gid_ip, ib_device
+        )
+        return gid_ip
+
+    logger.info(
+        "Could not determine RDMA-local IPv4 for ib_device=%s (netdevs=%s); "
+        "falling back to default IP %s",
+        ib_device,
+        ",".join(netdevs) if netdevs else "<none>",
+        fallback,
+    )
+    return fallback
+
+
+def _ip_for_ib_device_from_gid(ib_device: str) -> str | None:
+    """Parse an IPv4-mapped RoCE GID from sysfs for containers without host netns."""
+    ports_root = f"/sys/class/infiniband/{ib_device}/ports"
+    try:
+        ports = sorted(os.listdir(ports_root))
+    except OSError:
+        return None
+
+    preferred_gid_indexes: list[str] = []
+    for env_name in ("MC_IB_GID_INDEX", "MOONCAKE_IB_GID_INDEX"):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            preferred_gid_indexes.append(env_value)
+    preferred_gid_indexes.extend(["1", "3", "0"])
+
+    for port in ports:
+        gids_root = os.path.join(ports_root, port, "gids")
+        try:
+            available_indexes = sorted(os.listdir(gids_root), key=lambda x: int(x))
+        except (OSError, ValueError):
+            available_indexes = []
+
+        seen_indexes: set[str] = set()
+        gid_indexes = []
+        for idx in preferred_gid_indexes + available_indexes:
+            if idx not in seen_indexes:
+                seen_indexes.add(idx)
+                gid_indexes.append(idx)
+
+        for gid_index in gid_indexes:
+            gid_path = os.path.join(gids_root, gid_index)
+            try:
+                with open(gid_path) as f:
+                    gid = f.read().strip()
+            except OSError:
+                continue
+            ip = _ipv4_from_gid(gid)
+            if ip and ip != "0.0.0.0":
+                logger.info(
+                    "Parsed RDMA GID %s from %s for ib_device=%s as IPv4 %s",
+                    gid,
+                    gid_path,
+                    ib_device,
+                    ip,
+                )
+                return ip
+    return None
+
+
+def _ipv4_from_gid(gid: str) -> str | None:
+    try:
+        ip = ipaddress.ip_address(gid)
+    except ValueError:
+        return None
+
+    if isinstance(ip, ipaddress.IPv4Address):
+        return str(ip)
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return str(mapped)
+    return None
 
 
 # ===================================================================
@@ -279,7 +390,8 @@ class MooncakeConnector(KVConnectorBase):
         self.dp_size = get_dp_group().world_size
 
         kv_transfer_config = config.kv_transfer_config
-        self.local_ip = get_ip()
+        default_local_ip = get_ip()
+        self.local_ip = default_local_ip
         self._local_ping_port = get_open_port()
 
         self.is_producer = (
@@ -333,6 +445,17 @@ class MooncakeConnector(KVConnectorBase):
                 visible_idx,
                 self.tp_rank,
             )
+
+        rdma_local_ip = _ip_for_ib_device(ib_device, default_local_ip)
+        if rdma_local_ip != default_local_ip:
+            logger.info(
+                "Using RDMA-local IP %s for ib_device=%s instead of default IP %s",
+                rdma_local_ip,
+                ib_device,
+                default_local_ip,
+            )
+        self.local_ip = rdma_local_ip
+        self.request_address = f"{self.local_ip}:{self.http_port}"
 
         self.transfer_engine = TransferEngine()
         ret = self.transfer_engine.initialize(
@@ -866,7 +989,7 @@ class MooncakeConnector(KVConnectorBase):
                     )
 
             if has_slot_data:
-                self._execute_block_slot_transfer(
+                transfer_ok = self._execute_block_slot_transfer(
                     request_data,
                     target,
                     src_block_ids,
@@ -875,13 +998,22 @@ class MooncakeConnector(KVConnectorBase):
                     req_id,
                 )
             else:
-                self._execute_block_transfer(
+                transfer_ok = self._execute_block_transfer(
                     request_data,
                     target,
                     src_block_ids,
                     dst_block_ids,
                     req_id,
                 )
+
+            if not transfer_ok:
+                logger.error(
+                    "[PRODUCER] transfer failed for req %s (transfer_id=%s); "
+                    "not sending write-done",
+                    req_id,
+                    transfer_id,
+                )
+                return
 
             # Notify consumer — all data (blocks + state for V4) is written.
             self._send_write_done(notify_host, notify_port, req_id)
@@ -921,7 +1053,7 @@ class MooncakeConnector(KVConnectorBase):
         src_block_ids: list[int],
         dst_block_ids: list[int],
         req_id: str,
-    ) -> None:
+    ) -> bool:
         """Block-only RDMA transfer (MHA, MLA, and other block-indexed backends)."""
         consumer_base_addrs = request_data["consumer_base_addrs"]
 
@@ -952,6 +1084,8 @@ class MooncakeConnector(KVConnectorBase):
             target, src_addrs, dst_addrs, sizes, req_id, "block"
         ):
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+            return False
+        return True
 
     def _execute_block_slot_transfer(
         self,
@@ -961,7 +1095,7 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         prefill_data: dict,
         req_id: str,
-    ) -> None:
+    ) -> bool:
         """Two-phase RDMA for backends with per-request state: block regions first, then slot regions."""
         consumer_block_addrs = request_data["consumer_v4_block_base_addrs"]
         consumer_block_bpb = request_data["consumer_v4_block_bpb"]
@@ -994,7 +1128,7 @@ class MooncakeConnector(KVConnectorBase):
             target, block_src, block_dst, block_sizes, req_id, "block"
         ):
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)
-            return
+            return False
 
         # ---- Phase 2: Slot transfer ----
         if src_slot < 0 or dst_slot < 0:
@@ -1003,7 +1137,7 @@ class MooncakeConnector(KVConnectorBase):
                 src_slot,
                 dst_slot,
             )
-            return
+            return True
 
         slot_src: list[int] = []
         slot_dst: list[int] = []
@@ -1042,13 +1176,15 @@ class MooncakeConnector(KVConnectorBase):
             sum(slot_sizes),
         )
 
-        if not self._rdma_write_with_retry(
+        slot_ok = self._rdma_write_with_retry(
             target, slot_src, slot_dst, slot_sizes, req_id, "slot"
-        ):
+        )
+        if not slot_ok:
             logger.error("[PRODUCER] slot transfer failed for req %s", req_id)
 
         if producer_pool_idx >= 0:
             self._release_staging_slot(producer_pool_idx)
+        return slot_ok
 
     def _wait_for_prefill_data(self, req_id: str) -> dict | None:
         """Wait until prefill data is available for this request.
