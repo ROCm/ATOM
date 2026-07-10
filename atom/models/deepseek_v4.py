@@ -2556,9 +2556,29 @@ class Block(nn.Module):
         self.enable_fused_hc = (
             hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
         )
+        self.enable_hc_fn_pack_bf16 = (
+            hasattr(aiter, "mhc_pre_convert_fn") if _dim_ok else False
+        )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
+
+    def process_weights_after_loading(self):
+        """Pack the fp32 mHC fn weights into int32 (bf16 hi<<16 | lo) in place.
+
+        The bf16 mHC kernels then bit-extract hi/lo instead of recomputing the
+        fp32->bf16 split per token (passed with is_fn_pack_bf16=1). fn are constant
+        weights, so this runs once here (after the checkpoint is loaded and the
+        module is on-device). No-op unless enable_hc_fn_pack_bf16.
+        """
+        if not self.enable_hc_fn_pack_bf16:
+            return
+        for name in ("hc_attn_fn", "hc_ffn_fn"):
+            fn = getattr(self, name).data
+            packed = torch.empty(fn.shape, dtype=torch.int32, device=fn.device)
+            # mhc_pre_convert_fn requires contiguous fp32 in.
+            aiter.mhc_pre_convert_fn(packed, fn.contiguous().float())
+            setattr(self, name, atom_parameter(packed))
 
     def hc_pre(
         self,
@@ -2584,6 +2604,10 @@ class Block(nn.Module):
         if self._mhc_pre is not None:
             # aiter mhc_pre wants [M, hc, dim] and returns
             # (post [M, hc, 1], comb [M, hc, hc], y [M, dim]).
+            # hc_fn is pre-packed int32 (bf16 hi/lo) when enable_hc_fn_pack_bf16 -> pass
+            # is_fn_pack_bf16=1. Only add the kwarg when enabled so the fp32 path stays
+            # identical to the pre-bf16 call.
+            pack_kw = {"is_fn_pack_bf16": 1} if self.enable_hc_fn_pack_bf16 else {}
             post, comb, y = self._mhc_pre(
                 residual,
                 hc_fn,
@@ -2596,6 +2620,7 @@ class Block(nn.Module):
                 int(self.hc_sinkhorn_iters),
                 norm_weight,
                 norm_eps,
+                **pack_kw,
             )
             return y, post.squeeze(-1), comb
 
@@ -2666,6 +2691,10 @@ class Block(nn.Module):
         comb = hc_state.comb_mix
         x = hc_state.x_prev
         if self.enable_fused_hc and x is not None:
+            # hc_fn is pre-packed int32 (bf16 hi/lo) when enable_hc_fn_pack_bf16 -> pass
+            # is_fn_pack_bf16=1. Only add the kwarg when enabled so the fp32 path stays
+            # identical to the pre-bf16 call.
+            pack_kw = {"is_fn_pack_bf16": 1} if self.enable_hc_fn_pack_bf16 else {}
             post, comb, x, res = self._mhc_fused_post_pre(
                 x,
                 residual,
@@ -2681,6 +2710,7 @@ class Block(nn.Module):
                 int(self.hc_sinkhorn_iters),
                 norm_weight,
                 norm_eps,
+                **pack_kw,
             )
         else:
             if x is not None:
