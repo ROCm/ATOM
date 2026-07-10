@@ -232,7 +232,7 @@
   {
     "model_name": "GLM-5.2-MXFP4 MTP",
     "model_path": "amd/GLM-5.2-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\", \"model.layers.[1-6][0-9].mlp.*expert*\", \"model.layers.7[0-7].mlp.*expert*\"]}' --method mtp --num-speculative-tokens 3",
+    "extraArgs": "-tp 4 --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\", \"model.layers.[1-6][0-9].mlp.*expert*\", \"model.layers.7[0-7].mlp.*expert*\"]}' --method mtp --num-speculative-tokens 3",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
