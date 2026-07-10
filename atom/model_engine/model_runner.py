@@ -2460,21 +2460,6 @@ class ModelRunner:
                     # without a hardcoded token cap. Free floored to GB so
                     # symmetric-TP ranks skip the same set (DP needs a cross-rank
                     # min-reduce — TODO).
-                    #
-                    # The per-token footprint here is the CAPTURE-TIME cost = the
-                    # transient forward peak (MoE/expert intermediates + attention/
-                    # indexer buffers, released after capture) PLUS the retained
-                    # pool growth. The old 10MB/token was calibrated when the
-                    # weak_ref_tensor fallback silently used a STRONG ref, so every
-                    # piece output was retained (no pool overlay) and the retained
-                    # part alone was ~8.5MB/token. After the weak-ref fix the pool
-                    # overlays (measured retained 2.3MB/token, total pool 10GB for
-                    # Σtok=4472), so the real capture footprint is dominated by the
-                    # transient forward, ~4MB/token here. This lets bs*q buckets up
-                    # to num_tokens=4096 (bs512×q8) fit at capture-time free≈56GB
-                    # instead of being skipped. Still conservative: guard re-checks
-                    # LIVE free each bucket, so if a bucket truly doesn't fit it is
-                    # skipped rather than OOMing.
                     _slope = (
                         0.004 * (1 << 30) * (self.config.hf_config.hidden_size / 7168.0)
                     )
@@ -2541,13 +2526,6 @@ class ModelRunner:
                     self.model.compute_logits(outputs[:num_tokens])
 
                 if _piecewise:
-                    # (Bucket already memory-guarded above; capture unconditionally.)
-                    # PIECEWISE capture: warmup above already ran eager (autotune).
-                    # Flip to PIECEWISE + this num_tokens descriptor and call the
-                    # model; each dense piece's CUDAGraphWrapper captures its own
-                    # cudagraph (inside the shared graph_capture() ctx so
-                    # cross-rank collectives capture in lockstep). No manual
-                    # whole-forward graph.
                     fc = get_forward_context()
                     fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
                     fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)

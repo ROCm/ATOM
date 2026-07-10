@@ -60,8 +60,7 @@ def maybe_dual_stream_forward(
     compilation_config = get_current_atom_config().compilation_config
     cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
     is_piecewise_cudagraph = (
-        cudagraph_mode is not None
-        and cudagraph_mode.requires_piecewise_compilation()
+        cudagraph_mode is not None and cudagraph_mode.requires_piecewise_compilation()
     )
 
     if (

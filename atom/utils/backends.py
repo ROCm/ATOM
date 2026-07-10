@@ -430,10 +430,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             # False -> bare piecewise_backend (compiled pieces inside the manual
             # FULL whole-forward capture, i.e. existing behavior). PIECEWISE ->
             # wrap each piece in its own cudagraph.
-            _pw_cg = (
-                _cg_mode is not None
-                and _cg_mode.requires_piecewise_compilation()
-            )
+            _pw_cg = _cg_mode is not None and _cg_mode.requires_piecewise_compilation()
             if _pw_cg:
                 from .cuda_graph import CUDAGraphOptions, CUDAGraphWrapper
 

@@ -155,13 +155,7 @@ def _v4_attention_fake(
 
 
 # PIECEWISE cudagraph: persistent per-(layer, num_tokens) buffers holding each
-# attention op's output. Attention is the graph SPLIT point (eager); its output
-# is the INPUT to the next captured dense piece, so its address MUST be identical
-# every replay. forward_impl allocates a fresh output whose address drifts with
-# allocator state -> the piece cudagraph's input-address assert fires on the 2nd
-# step. Copying into a persistent buffer (allocated once, never freed) pins the
-# address. Only the attention outputs are stabilised (the real inter-piece
-# tensors); pure eager / FULL-capture paths are untouched.
+# attention op's output.
 _v4_attn_piecewise_out: dict = {}
 
 
@@ -182,11 +176,7 @@ def v4_attention_with_output(
 
 # ---------------------------------------------------------------------------
 # Narrow PIECEWISE split: only the paged / dynamic-shape attention core stays
-# eager. The Q/KV/O linear projections (wqkv_a, wq_b, wo_a, wo_b) live OUTSIDE
-# this op, in the compiled dense pieces -> they get cudagraph-captured AND scale
-# with num_tokens (so DSpark dynamic-q saves projection compute too, not just
-# MoE). This is what vLLM does: keep only the cudagraph-incompatible attention
-# kernel eager, graph everything else.
+# eager.
 # ---------------------------------------------------------------------------
 def _v4_core_attention_fake(
     x: torch.Tensor,
