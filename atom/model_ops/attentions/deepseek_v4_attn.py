@@ -1799,7 +1799,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         grp = mr._pcp_bal_groups[ubatch_idx]  # PcpBalGroup
         rs0, rs1 = grp.req_start, grp.req_stop
         gts, gte = grp.tok_start, grp.tok_end
-        H = grp.pad_total
         group_bs = rs1 - rs0
         group_total = gte - gts  # group's global token count (real, pre-pad)
         device = self.device

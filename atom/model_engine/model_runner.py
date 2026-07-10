@@ -46,7 +46,6 @@ from atom.utils.tbo import (
 )
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
-    pcp_allgather_rankmajor,
     pcp_allgather_rerange,
     pcp_pad_len,
     pcp_round_robin_split,
@@ -2088,7 +2087,6 @@ class ModelRunner:
             and _pcp_bal_groups is not None
         )
         if _pcp_tbo_balanced:
-            n_global = input_ids.shape[0]
             g_ids, g_pos = [], []
             for grp in _pcp_bal_groups:
                 seg_ids = input_ids[grp.tok_start : grp.tok_end]

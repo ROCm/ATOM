@@ -18,6 +18,12 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from aiter.dist.parallel_state import (
+    get_pcp_group,
+    get_prefill_context_model_parallel_rank,
+    get_prefill_context_model_parallel_world_size,
+)
+
 
 class PcpBalGroup(NamedTuple):
     """One request group for PCP+TBO request-boundary split prefill.
@@ -37,12 +43,6 @@ class PcpBalGroup(NamedTuple):
         int  # tok count padded to a pcp multiple = pcp_pad_len(tok_end-tok_start, pcp)
     )
 
-
-from aiter.dist.parallel_state import (
-    get_pcp_group,
-    get_prefill_context_model_parallel_rank,
-    get_prefill_context_model_parallel_world_size,
-)
 
 logger = logging.getLogger("atom")
 
