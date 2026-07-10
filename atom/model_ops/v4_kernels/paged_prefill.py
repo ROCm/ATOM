@@ -60,13 +60,8 @@ except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 
-try:
-    from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
-
-    _HAS_AITER_TRITON = True
-except ImportError:
-    pa_prefill_sparse = None
-    _HAS_AITER_TRITON = False
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 
 
 @triton.jit
@@ -381,7 +376,7 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
-    if os.environ.get("ATOM_USE_AITER_TRITON_ATTN", "0") == "1" and _HAS_AITER_TRITON:
+    if get_gfx() == "gfx1250":
         return pa_prefill_sparse(
             q,
             unified_kv,
