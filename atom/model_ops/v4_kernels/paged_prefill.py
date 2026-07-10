@@ -44,8 +44,6 @@ Numerics: identical online-softmax + sink finalization to
 (then equivalent to a decode call with the same prefix indices).
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -62,7 +60,6 @@ except ImportError:
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
-
 
 # Fixed best-known Triton meta for DeepSeek-V4 TP=8 / local H=8 prefill.
 _BLOCK_H = 16
