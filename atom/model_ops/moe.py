@@ -14,7 +14,11 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import (
+    interleave_gate_up_rows,
+    moe_shuffle_scale,
+    moe_shuffle_weight,
+)
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -800,13 +804,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         gfx = get_gfx()
         self.is_gfx1250 = gfx == "gfx1250"
-        # gfx1250 grouped a8w4 MoE kernel only supports the non-interleaved
-        # (gate|up separated) scale layout; reject is_guinterleave up front.
-        if self.is_gfx1250 and self.is_guinterleave:
-            raise NotImplementedError(
-                "gfx1250 MoE only supports is_guinterleave=False; "
-                "unset ATOM_MOE_GU_ITLV."
-            )
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             self.use_triton = envs.ATOM_USE_TRITON_MOE
         else:
@@ -1033,21 +1030,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             orig_w13_weight_scale = layer.w13_weight_scale.data.clone()
             orig_w2_weight_scale = layer.w2_weight_scale.data.clone()
 
-        # shuffle weight + scale. GUGU (is_guinterleave) only reaches the FlyDSL
-        # path (use_triton_decode is forced off for it), so the aiter shuffles
-        # apply the gate/up interleave directly.
-        layer.w13_weight.data = shuffle_weight(
+        # shuffle weight (arch-aware: gfx1250 does the GUGU row interleave +
+        # WMMA tile shuffle internally, other archs use the lane-level path)
+        layer.w13_weight.data = moe_shuffle_weight(
             layer.w13_weight,
+            experts_cnt=self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=True,
         )
-        layer.w2_weight.data = shuffle_weight(
+        layer.w2_weight.data = moe_shuffle_weight(
             layer.w2_weight,
+            experts_cnt=self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=False,
         )
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
+
+        # GUGU (is_guinterleave) reorders the stage1 output rows to
+        # [g0, u0, g1, u1, ...]; moe_shuffle_weight interleaves the weight rows
+        # but not the bias, so interleave w13_bias to match. w2_bias (stage2,
+        # single N=hidden GEMM) has no gate/up concept and is left as-is.
+        if self.is_guinterleave and layer.w13_bias is not None:
+            layer.w13_bias.data = interleave_gate_up_rows(layer.w13_bias.data)
 
         # shuffle scale
         w13_scale_2d = layer.w13_weight_scale.reshape(
@@ -2045,13 +2050,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # aiter's MXFP8 MoE kernels consume the same gate/up interleaved
             # layout used by their 1x32 shuffle helpers. Keep this branch
             # isolated so the existing 1x128 FP8 path still uses shuffle_weights.
-            layer.w13_weight.data = shuffle_weight(
+            # moe_shuffle_weight mirrors moe_shuffle_scale: arch-aware GUGU
+            # handling (row interleave + WMMA tile shuffle on gfx1250).
+            layer.w13_weight.data = moe_shuffle_weight(
                 layer.w13_weight,
+                experts_cnt=self.num_experts,
                 is_guinterleave=True,
                 gate_up=True,
             )
-            layer.w2_weight.data = shuffle_weight(
+            layer.w2_weight.data = moe_shuffle_weight(
                 layer.w2_weight,
+                experts_cnt=self.num_experts,
                 is_guinterleave=True,
                 gate_up=False,
             )
