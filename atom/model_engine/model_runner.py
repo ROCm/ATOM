@@ -1474,25 +1474,29 @@ class ModelRunner:
             cap_sizes = self.config.compilation_config.cudagraph_capture_sizes or [
                 self.config.max_num_seqs
             ]
-            # Captured num_tokens shapes are bs * q for each q we capture. Non-spec
-            # decode is q=1 (num_tokens == bs); DSpark captures one graph set per
-            # query-length bucket, so fold those q's in to size the pool right.
-            q_buckets = [1]
-            if hasattr(self, "drafter") and getattr(
-                self.drafter, "dspark_confidence_schedule", False
-            ):
-                from atom.spec_decode.dspark_scheduler import resolve_q_buckets
-                from atom.utils import envs as _envs
-
+            # Captured num_tokens shapes are bs * q. The capture loop uses
+            # full_q_len = mtp_k+1 for ANY spec-decode drafter (plain MTP or
+            # DSpark), and q=1 for non-spec. Mirror that here or the estimate
+            # under-counts Σtok by a factor of q (plain MTP q=4 -> 4x under ->
+            # pool est 8.5GB vs actual 33GB -> OOM). DSpark additionally captures
+            # multiple q-buckets, so fold its whole bucket set in.
+            if hasattr(self, "drafter"):
                 full_q = self.drafter.mtp_k + 1
-                _sizes_spec = (
-                    _envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES
-                    if _envs.ATOM_DSPARK_RAGGED
-                    else _envs.ATOM_DSPARK_Q_BUCKETS
-                )
-                q_buckets = resolve_q_buckets(_sizes_spec, full_q)
-                if os.environ.get("ATOM_PIECEWISE_FINE_TOKENS", "0") == "1":
-                    q_buckets = sorted(set(q_buckets) | set(range(1, full_q + 1)))
+                q_buckets = [full_q]
+                if getattr(self.drafter, "dspark_confidence_schedule", False):
+                    from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+                    from atom.utils import envs as _envs
+
+                    _sizes_spec = (
+                        _envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES
+                        if _envs.ATOM_DSPARK_RAGGED
+                        else _envs.ATOM_DSPARK_Q_BUCKETS
+                    )
+                    q_buckets = resolve_q_buckets(_sizes_spec, full_q)
+                    if os.environ.get("ATOM_PIECEWISE_FINE_TOKENS", "0") == "1":
+                        q_buckets = sorted(set(q_buckets) | set(range(1, full_q + 1)))
+            else:
+                q_buckets = [1]
             hf_config = self.config.hf_config
             hidden = int(hf_config.hidden_size)
             num_layers = int(hf_config.num_hidden_layers)
@@ -1501,12 +1505,28 @@ class ModelRunner:
             per_token_bytes = (
                 hidden * dtype_bytes * num_layers * _PER_TOKEN_LAYER_TENSORS
             )
+            # DP amplification: under DP-attention the MoE all_gathers hidden to
+            # ~dp_size × local tokens, so each captured piece retains far more per
+            # local token than TP (measured DSV4: TP 2.32MB/tok vs DP 7.7MB/tok,
+            # i.e. ~3.3x at dp=8). Scale per_token so the reservation isn't wildly
+            # under (which packs the pool to ~97% and OOMs the runtime MoE
+            # all_gather / stage2 buffers). Attention doesn't amplify, so use a
+            # sub-linear dp**0.6 factor (8**0.6=3.48, just above the measured 3.3
+            # -> conservative).
+            dp_size = self.config.parallel_config.data_parallel_size
+            if dp_size > 1:
+                per_token_bytes *= float(dp_size) ** 0.6
             # Cap the reserved buckets at a fraction of the KV budget so a huge
             # capture list can't starve KV. Use the utilization budget (not raw
             # total) as the reference — it tracks the configured memory envelope.
             budget = self.config.gpu_memory_utilization * torch.cuda.mem_get_info()[1]
             target_reserve = 0.15 * budget
             all_shapes = sorted({bs * q for bs in cap_sizes for q in q_buckets})
+            # Mirror the capture-loop DP+spec num_tokens cap (see capture_cudagraph)
+            # so the reservation only counts buckets we actually capture.
+            if dp_size > 1 and hasattr(self, "drafter"):
+                _dp_cap = int(os.environ.get("ATOM_PIECEWISE_DP_MAX_TOKENS", "512"))
+                all_shapes = [s for s in all_shapes if s <= _dp_cap]
             captured = []
             acc = 0
             for num_tokens in all_shapes:
@@ -2420,10 +2440,18 @@ class ModelRunner:
 
         local_q = int(getattr(batch, "num_spec_query_tokens", 1))
         local_bs = int(getattr(batch, "total_seqs_num_decode", 0))
-        shape_t = torch.tensor([local_q, local_bs], device="cpu", dtype=torch.int64)
+        # Also DP-max the ragged token sum Σ (total_tokens_num_decode). PIECEWISE
+        # 1D-ragged replays at a num_tokens bucket sized to Σ; to keep the MoE
+        # all_gather row count identical across ranks (else RCCL deadlock) every
+        # rank must pick the SAME bucket, so bisect on the DP-max Σ, not local Σ.
+        local_sigma = int(getattr(batch, "total_tokens_num_decode", 0))
+        shape_t = torch.tensor(
+            [local_q, local_bs, local_sigma], device="cpu", dtype=torch.int64
+        )
         dist.all_reduce(shape_t, op=dist.ReduceOp.MAX, group=get_dp_group().cpu_group)
         batch.num_spec_query_tokens = int(shape_t[0].item())
         batch._dspark_dp_bs = int(shape_t[1].item())
+        batch._dspark_dp_sigma = int(shape_t[2].item())
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         # NOTE: DSpark q-bucket shrink happens in prepare_model BEFORE
@@ -2451,14 +2479,10 @@ class ModelRunner:
         decide_num_input_tokens = num_input_tokens
         dp_bs = getattr(batch, "_dspark_dp_bs", None)
         if not is_prefill and dp_bs is not None:
-            # DP-attention (see _dspark_sync_graph_shape_dp): the graph shape
-            # (bs, q) is DP-max-synced there. Recover the SAME padded_scheduled_bs
-            # = dp_bs on every rank via decide_num_input_tokens = dp_bs * q, so
-            # all ranks pick the identical (effective_bs, q) graph and the
-            # captured MoE all_gather (pad = graph_bs * max_seqlen_q) matches
-            # across ranks. Using the LOCAL bs*q (or the ragged Σ) here is what
-            # diverges and RCCL-deadlocks. Covers both the ragged and q-bucket
-            # dynamic paths (both set num_spec_query_tokens).
+            # DP-attention (see _dspark_sync_graph_shape_dp): the graph shape is
+            # DP-max-synced there so every rank picks the identical graph and the
+            # MoE all_gather (pad = graph_bs * max_seqlen_q) matches across ranks
+            # (a divergent local shape RCCL-deadlocks).
             q_eff = int(batch.num_spec_query_tokens)
             mtp_step = q_eff
             decide_num_input_tokens = int(dp_bs) * q_eff
@@ -2515,6 +2539,18 @@ class ModelRunner:
         # corner (enforce_eager / bs>graph_bs[-1]) where attention needs local
         # but MoE pad needs the DP-unified padded_scheduled_bs.
         graph_bs = num_input_tokens if is_prefill else forward_mode.moe_pad_bs
+        if not is_prefill:
+            _dp_sigma = getattr(batch, "_dspark_dp_sigma", None)
+            if (
+                self._piecewise_cg_active()
+                and _dp_sigma is not None
+                and getattr(self, "_piecewise_sorted_tokens", None)
+            ):
+                _q = int(batch.num_spec_query_tokens)
+                _bk = self._piecewise_sorted_tokens
+                _i = bisect.bisect_left(_bk, int(_dp_sigma))
+                if _i < len(_bk) and _q > 0 and _bk[_i] % _q == 0:
+                    graph_bs = _bk[_i] // _q
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -2737,13 +2773,14 @@ class ModelRunner:
                         and batch is not None
                         and getattr(self, "_piecewise_sorted_tokens", None)
                         and hasattr(self, "drafter")
-                        and self.config.parallel_config.data_parallel_size <= 1
                     )
                     _is_dummy = batch is not None and batch.is_dummy_run
                     if _one_d and not _is_dummy:
-                        # TP-only: all ranks share the same batch -> same Σ ->
-                        # num_tokens_pad identical, no cross-rank sync needed.
-                        real_tokens = int(batch.total_tokens_num_decode)
+                        _dp_sigma = getattr(batch, "_dspark_dp_sigma", None)
+                        if _dp_sigma is not None:
+                            real_tokens = int(_dp_sigma)
+                        else:
+                            real_tokens = int(batch.total_tokens_num_decode)
                         _bk = self._piecewise_sorted_tokens
                         _i = bisect.bisect_left(_bk, real_tokens)
                         if _i < len(_bk):
@@ -2753,6 +2790,18 @@ class ModelRunner:
                             # Σ exceeds the largest captured bucket -> eager.
                             num_tokens_pad = max(real_tokens, graph_bs * max_q_len)
                             _captured = False
+                        if os.environ.get("ATOM_RAGGED_DBG") == "1" and self.rank == 0:
+                            logger.info(
+                                "RAGGED-DBG Σ=%d local_Σ=%d bucket=%d "
+                                "rect=%d captured=%s scheduled_bs=%d q=%d",
+                                real_tokens,
+                                int(batch.total_tokens_num_decode),
+                                num_tokens_pad,
+                                graph_bs * max_q_len,
+                                _captured,
+                                int(batch.total_seqs_num_decode),
+                                max_q_len,
+                            )
                         # Pad tail to a legal vocab id / position (builder fills to
                         # graph_cap >= num_tokens_pad, so a no-op safety net).
                         if num_tokens_pad > real_tokens:
@@ -3317,18 +3366,57 @@ class ModelRunner:
 
                     num_tokens = bs * max_q_len
                     if _piecewise:
+                        _dp_size = self.config.parallel_config.data_parallel_size
+                        # DP+spec: cap captured num_tokens (big bs*q buckets never
+                        # run under DP but bloat the pool + don't overlap comm ->
+                        # slower/OOM). Larger falls back to eager.
+                        if _dp_size > 1 and hasattr(self, "drafter"):
+                            _dp_cap = int(
+                                os.environ.get("ATOM_PIECEWISE_DP_MAX_TOKENS", "512")
+                            )
+                            if num_tokens > _dp_cap:
+                                if self.rank == 0:
+                                    logger.info(
+                                        "PIECEWISE DP-cap skip num_tokens=%d "
+                                        "(> %d = ATOM_PIECEWISE_DP_MAX_TOKENS)",
+                                        num_tokens,
+                                        _dp_cap,
+                                    )
+                                continue
                         # Memory-guarded cap (replaces the ATOM_PIECEWISE_MAX_TOKENS
                         # env): skip a bucket whose estimated capture footprint would
                         # not fit in free GPU memory. Adapts to GPU size / config
-                        # without a hardcoded token cap. Free floored to GB so
-                        # symmetric-TP ranks skip the same set (DP needs a cross-rank
-                        # min-reduce — TODO).
+                        # without a hardcoded token cap. DP amplifies the retained
+                        # per-token footprint (MoE all_gather ~dp_size × tokens);
+                        # scale the slope by sqrt(dp) to match _estimate_cudagraph_
+                        # overhead so a big bucket that would pack the pool to ~99%
+                        # (and OOM the runtime all_gather) is skipped here too.
                         _slope = (
                             0.004
                             * (1 << 30)
                             * (self.config.hf_config.hidden_size / 7168.0)
                         )
+                        if _dp_size > 1:
+                            _slope *= float(_dp_size) ** 0.6
                         _free = torch.cuda.mem_get_info()[0]
+                        # DP: the skip decision MUST be identical on every rank,
+                        # otherwise capture loops desync (one rank continues, the
+                        # rest skip) and the next get_dp_padding all_reduce couples
+                        # mismatched num_tokens -> "batch_id_per_token len < T".
+                        # Min-reduce free across DP so all ranks skip the same set.
+                        if _dp_size > 1:
+                            import torch.distributed as _dist
+                            from aiter.dist.parallel_state import get_dp_group
+
+                            _free_t = torch.tensor(
+                                [_free], device="cpu", dtype=torch.int64
+                            )
+                            _dist.all_reduce(
+                                _free_t,
+                                op=_dist.ReduceOp.MIN,
+                                group=get_dp_group().cpu_group,
+                            )
+                            _free = int(_free_t.item())
                         _need = _slope * num_tokens * 1.25 + (4 << 30)
                         if (_free >> 30) < (int(_need) >> 30):
                             if self.rank == 0:
@@ -3374,6 +3462,15 @@ class ModelRunner:
                             num_pad,
                         )
                     num_tokens += num_pad
+                    # get_dp_padding built num_tokens_across_dp from the PRE-pad
+                    # count, but we just padded num_tokens. Capture is symmetric
+                    # (every DP rank captures the same bs), so the padded count is
+                    # uniform across ranks. Rebuild the tensor at the padded size
+                    # so DPMetadata.make's `across_dp[rank] == num_tokens` holds.
+                    if num_tokens_across_dp is not None:
+                        num_tokens_across_dp = torch.full_like(
+                            num_tokens_across_dp, num_tokens
+                        )
                     # Create ubatch slices for TBO capture (need > 2 requests)
                     ubatch_slices = None
                     if is_tbo and self.config.enable_tbo_decode and bs > 2:
