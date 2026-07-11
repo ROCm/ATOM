@@ -1339,6 +1339,10 @@ class Scheduler:
                 remote_tokens.extend(blk.token_ids)
                 prev_hash = blk.hash
             if remote_hashes:
+                # first_remote_index is always set when remote_hashes is
+                # non-empty; assert it so a future refactor can't silently
+                # regress into `None * block_size`.
+                assert first_remote_index is not None
                 self.block_manager.record_remote_store(
                     block_hashes=remote_hashes,
                     token_ids=remote_tokens,

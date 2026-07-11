@@ -586,6 +586,35 @@ class TestReplayEndpointWiring:
         finally:
             pub.shutdown()
 
+    def test_replay_buffer_steps_must_be_positive(self):
+        pytest.importorskip("zmq")
+        with pytest.raises(ValueError):
+            ZmqEventPublisher(
+                endpoint="inproc://rb-zero-pub",
+                replay_endpoint="inproc://rb-zero-router",
+                replay_buffer_steps=0,
+            )
+
+    def test_seq_never_equals_replay_done_sentinel(self):
+        # The reserved terminal value (2**64-1) must never be produced as a
+        # data seq, even when the raw counter lands exactly on it.
+        pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(endpoint="inproc://sentinel-pub", buffer_steps=4)
+        pub._queue.put_nowait(None)  # stop sender so we can inspect the queue
+        pub._sender.join(timeout=2.0)
+        try:
+            reserved = int.from_bytes(REPLAY_DONE, "big")  # 2**64 - 1
+            pub._seq_gen = iter([reserved, reserved + 1, 5])
+            pub.publish([BlockRemoved(block_hashes=[1])])
+            item = [it for it in list(pub._queue.queue) if it is not None][0]
+            assert item[0] != reserved
+            assert item[0] == 0  # reserved % (2**64 - 1)
+        finally:
+            try:
+                pub._socket.close(linger=0)
+            except Exception:
+                pass
+
     def test_dropped_batches_consume_seq_numbers(self):
         # seq must be assigned at enqueue time so that a batch dropped on queue
         # overflow still consumes a sequence number -> the drop shows up as a

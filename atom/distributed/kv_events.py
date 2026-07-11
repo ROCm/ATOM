@@ -180,6 +180,12 @@ class ZmqEventPublisher(EventPublisher):
                 f"buffer_steps must be >= 1 to keep the drop-on-overflow "
                 f"backpressure intact; got {buffer_steps}"
             )
+        if replay_endpoint and replay_buffer_steps < 1:
+            raise ValueError(
+                f"replay_buffer_steps must be >= 1 when replay is enabled "
+                f"(maxlen=0 would silently disable replay retention); "
+                f"got {replay_buffer_steps}"
+            )
         # Local import: keep pyzmq an optional runtime dep. BlockManager imports
         # this module unconditionally, but only the zmq publisher path needs pyzmq.
         import zmq
@@ -255,10 +261,12 @@ class ZmqEventPublisher(EventPublisher):
         # Assign the sequence number here (at enqueue), not at send: a batch
         # dropped on overflow below still consumes a seq, so the drop is
         # visible to subscribers as a gap instead of vanishing silently.
-        # Mask to uint64 up front so the wire frame, the replay-buffer key, and
-        # the start_seq comparison in _service_replay all use the same value
-        # (wrap-around at 2**64 is expected on an extremely long-lived sender).
-        seq = next(self._seq_gen) & 0xFFFFFFFFFFFFFFFF
+        # Keep seq in [0, 2**64-2] so the wire frame, the replay-buffer key, and
+        # the start_seq comparison in _service_replay all use the same value,
+        # AND never collide with the reserved all-0xFF REPLAY_DONE terminal
+        # (modulo, not mask). Wrap-around is expected on an extremely
+        # long-lived sender.
+        seq = next(self._seq_gen) % 0xFFFFFFFFFFFFFFFF
 
         # Non-blocking enqueue; drop oldest on overflow.
         while True:
@@ -305,9 +313,12 @@ class ZmqEventPublisher(EventPublisher):
         # so replay requests are serviced even while no events are flowing.
         get_timeout = 0.05 if self._replay is not None else None
         while True:
-            if self._replay is not None and self._replay.poll(0):
+            if self._replay is not None:
                 try:
-                    self._service_replay()
+                    if self._replay.poll(0):
+                        self._service_replay()
+                except self._zmq_error_cls:  # pragma: no cover - closed on shutdown
+                    return
                 except Exception:  # pragma: no cover - replay is non-critical
                     logger.exception("KV event replay request failed")
             try:
