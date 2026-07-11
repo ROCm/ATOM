@@ -378,6 +378,18 @@ jobs:
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           download-required: "false"
 
+      # TEMP (ci/dsv4-pro-swa branch only): mirror the flydsl patch from
+      # benchmark-tmpl.yml so the regression-rerun path also works on an
+      # atom-dev image predating aiter #4159. See that step for rationale.
+      - name: Patch aiter flydsl for paged-SWA (aiter#4159)
+        run: |
+          set -euo pipefail
+          SRC=.github/patches/aiter_flydsl_qk_norm_rope_quant_4159.py
+          DST=/app/aiter-test/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py
+          grep -q swa_block_tables "$SRC"
+          docker cp "$SRC" atom-regression:"$DST"
+          docker exec atom-regression bash -lc "md5sum '$DST'"
+
       - name: Launch server
         env:
           SERVER_ARGS: ${{ matrix.cell.server_args }}
