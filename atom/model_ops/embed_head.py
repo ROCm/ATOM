@@ -118,7 +118,20 @@ def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     # embedding gather into the surrounding graph, which corrupts the MTP draft
     # rollout (acceptance collapses ~69%->45%) — the same reason
     # VocabParallelEmbedding routes through the masked_embedding custom op.
-    return F.embedding(x, weight)
+    #
+    # Route through the masked kernel with the full-table range [0, num_rows) so
+    # out-of-range ids never reach a raw gather. Under async scheduling + MTP
+    # spec-decode, input_ids can transiently carry the optimistic placeholder
+    # token -1 (an unresolved "assumed-accepted" draft/bonus slot, produced in
+    # gpu_model_runner and read back via prepare_next_token_ids_padded's backup
+    # before the deferred correction lands) — for BOTH the target and the shared
+    # draft embedding. A raw F.embedding(-1) reads the row before the table ->
+    # random illegal memory access. The masked load returns a zero vector for any
+    # out-of-range id: bit-identical to F.embedding for every valid token, and
+    # matching vLLM's VocabParallelEmbedding (which masks the same -1 to 0) so the
+    # unverified -1 slots — whose output is discarded/corrected by async
+    # spec-decode — see the same value native does. No accuracy change.
+    return _masked_embedding_launcher(x, weight, 0, weight.shape[0])
 
 
 class VocabParallelEmbedding(nn.Module):
