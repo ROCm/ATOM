@@ -154,15 +154,75 @@ def _v4_attention_fake(
     return torch.empty_like(x)
 
 
+# PIECEWISE cudagraph: persistent per-(layer, num_tokens) buffers holding each
+# attention op's output.
+_v4_attn_piecewise_out: dict = {}
+
+
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
 def v4_attention_with_output(
     x: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
+    # WIDE split (legacy / FULL cudagraph path): the whole attention (pre + core
+    # + post) is a single eager splitting op. Used when NOT doing PIECEWISE
+    # cudagraph — the manual whole-forward FULL capture graphs everything at once
+    # so there are no inter-piece tensors to stabilise. Unchanged from baseline.
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     return self.forward_impl(x, positions)
+
+
+# ---------------------------------------------------------------------------
+# Narrow PIECEWISE split: only the paged / dynamic-shape attention core stays
+# eager.
+# ---------------------------------------------------------------------------
+def _v4_core_attention_fake(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    kv_pre: torch.Tensor,
+    qr: torch.Tensor,
+    qr_scale: torch.Tensor,
+    positions: torch.Tensor,
+    idx_q_fp8: Optional[torch.Tensor],
+    idx_weights: Optional[torch.Tensor],
+    layer_name: str,
+) -> torch.Tensor:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    return x.new_empty((x.shape[0], self.n_local_heads * self.head_dim))
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_v4_core_attention_fake, mutates_args=[])
+def v4_core_attention(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    kv_pre: torch.Tensor,
+    qr: torch.Tensor,
+    qr_scale: torch.Tensor,
+    positions: torch.Tensor,
+    idx_q_fp8: Optional[torch.Tensor],
+    idx_weights: Optional[torch.Tensor],
+    layer_name: str,
+) -> torch.Tensor:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    out = self._attn_core(x, q, kv_pre, qr, qr_scale, positions, idx_q_fp8, idx_weights)
+
+    from atom.config import CUDAGraphMode
+    from atom.utils.forward_context import get_forward_context
+
+    fc = get_forward_context()
+    if getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE:
+        key = (layer_name, int(out.shape[0]))
+        buf = _v4_attn_piecewise_out.get(key)
+        if buf is None:
+            buf = torch.empty_like(out)
+            _v4_attn_piecewise_out[key] = buf
+        buf.copy_(out)
+        return buf
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1194,6 +1254,43 @@ class Indexer(nn.Module):
             Consumer (`csa_translate_pack`) skips negative entries via its
             `topk >= 0` write mask.
         """
+        q_fp8, weights = self.forward_pre(x_full, qr_full, positions, qr_full_scale)
+        return self.score_topk_from(q_fp8, weights)
+
+    def topk(
+        self,
+        x_full: torch.Tensor,
+        qr_full: torch.Tensor,
+        positions: torch.Tensor,
+        qr_full_scale: Optional[torch.Tensor] = None,
+        *,
+        pre_q_fp8: Optional[torch.Tensor] = None,
+        pre_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the top-k, reusing precomputed projections when available.
+
+        PIECEWISE narrow split projects Q/weights in `_attn_pre` (graphed piece)
+        and passes them as ``pre_q_fp8``/``pre_weights`` so only the eager paged
+        ``score_topk_from`` runs here. Otherwise (FULL/legacy) project inline via
+        ``forward_batched``. Same result either way — only the split site differs.
+        """
+        if pre_q_fp8 is not None:
+            return self.score_topk_from(pre_q_fp8, pre_weights)
+        return self.forward_batched(x_full, qr_full, positions, qr_full_scale)
+
+    def forward_pre(
+        self,
+        x_full: torch.Tensor,  # [total_tokens, dim]
+        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank] fp8
+        positions: torch.Tensor,  # [total_tokens]
+        qr_full_scale: Optional[torch.Tensor] = None,
+    ):
+        """Graphable indexer Q proj + RoPE + weights (num_tokens-shaped).
+
+        No paged / KV-cache access, so this runs in the compiled dense piece.
+        Only `score_topk_from` (paged gather + score) must stay eager.
+        Returns (q_fp8, weights).
+        """
         assert self.rotary_emb is not None
         rd = self.rope_head_dim
         total_tokens = x_full.size(0)
@@ -1234,7 +1331,12 @@ class Indexer(nn.Module):
         # so no explicit `.float()` cast needed.
         weights = self.weights_proj(x_full)
         weights = scale_indexer_weights(weights, q_scale, self._weights_scale)
+        return q_fp8, weights
 
+    def score_topk_from(
+        self, q_fp8: torch.Tensor, weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Eager paged gather + score + top-k (reads compressor KV cache)."""
         return torch.ops.aiter.indexer_score_topk(
             q_fp8, weights, self.prefix, self.index_topk
         )  # [total_tokens, index_topk] int32
@@ -1590,6 +1692,9 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
+        # Cached at construction (non-compiled) so `_attn_post` — now traced into
+        # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
+        self._is_gfx1250 = get_gfx() == "gfx1250"
 
         # ----- Compressor (and Indexer for CSA) -----
         if self.compress_ratio:
@@ -1784,7 +1889,87 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # Split-op granularity depends on the cudagraph mode
+        #  - PIECEWISE cudagraph -> NARROW split attention
+        #  - FULL / NONE -> WIDE split attention: the whole attention is one eager
+        #  for torch compile.
+        cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
+        if cg_mode is not None and cg_mode.requires_piecewise_compilation():
+            q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights = self._attn_pre(
+                x, positions
+            )
+            o = torch.ops.aiter.v4_core_attention(
+                x,
+                q,
+                kv_pre,
+                qr,
+                qr_scale,
+                positions,
+                idx_q_fp8,
+                idx_weights,
+                self.layer_name,
+            )
+            return self._attn_post(o)
         return torch.ops.aiter.v4_attention_with_output(x, positions, self.layer_name)
+
+    def _attn_pre(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        run_indexer_proj: bool = True,
+    ):
+        """Q/KV (+ optional indexer input) projections (graphable, num_tokens).
+
+        Shared by both attention paths:
+          - PIECEWISE (narrow split): run_indexer_proj=True — the indexer Q/weights
+            projection is compiled into the graphed piece here; the eager core
+            then only does the paged score/top-k via `score_topk_from`.
+          - FULL (wide split): run_indexer_proj=False — the legacy `forward_impl`
+            keeps the indexer's `forward_batched` inline in the core (unchanged
+            ordering), so no indexer projection happens here.
+
+        Returns (q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights); the last two
+        are None when run_indexer_proj is False or the layer has no indexer.
+        """
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        if _V4_FORCE_UE8M0_QUANT:
+            x = x.clone()
+            act_quant_inplace(x, 128, "ue8m0")
+        qkv_a = self.wqkv_a(x)
+        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        assert (
+            not _V4_FORCE_UE8M0_QUANT
+        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        qr, qr_scale = self.q_norm(q_lora)
+        q = self.wq_b(qr, x_scale=qr_scale)
+        # Indexer Q/weights projection (no paged access) -> graphed piece.
+        idx_q_fp8 = idx_weights = None
+        if run_indexer_proj and self.indexer is not None and not self.skip_topk:
+            idx_q_fp8, idx_weights = self.indexer.forward_pre(
+                x, qr, positions, qr_scale
+            )
+        return q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights
+
+    def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
+        """Grouped output LoRA + wo_b (graphable, num_tokens-shaped)."""
+        num_tokens = o.shape[0]
+        o = o.view(num_tokens, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        if num_tokens <= 32 or self._is_gfx1250:
+            y = torch.empty(
+                num_tokens,
+                self.n_local_groups,
+                self.o_lora_rank,
+                dtype=o.dtype,
+                device=o.device,
+            ).transpose(0, 1)
+            y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
+            o = y.transpose(0, 1)
+        else:
+            o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        return self.wo_b(o.flatten(1))
 
     def forward_impl(
         self,
@@ -1799,6 +1984,84 @@ class DeepseekV4Attention(nn.Module):
         per-seq slot + block_table from the V4 attention builder's metadata.
         Per-seq slicing uses `cu_seqlens_q` from `forward_context`.
         """
+        # FULL / legacy wide-split path. Compose the shared helpers in the
+        # ORIGINAL order so behaviour is byte-equivalent to the pre-refactor
+        # inline body: launch the compressor BEFORE the Q/KV projections (to
+        # overlap on the side stream), run the projections (indexer projection
+        # stays inline in the core via forward_batched, so run_indexer_proj=
+        # False here), then the paged core, then the output LoRA.
+        fc = get_forward_context()
+        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            return torch.zeros_like(x)
+
+        # Experimental UE8M0 input round-trip BEFORE the compressor sees x, to
+        # match the legacy inline ordering (dead path: default off + asserted off
+        # under fused q_norm quant, but kept ordered for byte-equivalence).
+        if _V4_FORCE_UE8M0_QUANT:
+            x = x.clone()
+            act_quant_inplace(x, 128, "ue8m0")
+
+        # Metadata + compressor launch (must precede projections for overlap).
+        ratio = self.compress_ratio
+        attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
+        plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
+        self.maybe_compressors_async(
+            x,
+            plan_for_layer,
+            attn_md.state_slot_mapping,
+            attn_md.block_tables,
+        )
+
+        # Q/KV projections (indexer projection deferred to the core's inline
+        # forward_batched -> run_indexer_proj=False). x already UE8M0-quantised
+        # above, so _attn_pre must NOT re-quantise -> its guard is a no-op here
+        # because we pass the already-processed x (the flag re-clones, harmless
+        # on the dead path, but we rely on the assert keeping this off anyway).
+        q, kv_pre, qr, qr_scale, x, _idx_q, _idx_w = self._attn_pre(
+            x, positions, run_indexer_proj=False
+        )
+        # Paged attention core (compressor already launched above).
+        o = self._attn_core(
+            x,
+            q,
+            kv_pre,
+            qr,
+            qr_scale,
+            positions,
+            idx_q_fp8=None,
+            idx_weights=None,
+            compressor_already_launched=True,
+        )
+        # Output LoRA + wo_b.
+        return self._attn_post(o)
+
+    def _attn_core(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
+        q: torch.Tensor,  # [num_tokens, n_heads*head_dim]  from wq_b
+        kv_pre: torch.Tensor,  # [num_tokens, head_dim]  KV latent (pre-norm/rope)
+        qr: torch.Tensor,  # [num_tokens, q_lora_rank] FP8  q RMSNorm out (for indexer)
+        qr_scale: torch.Tensor,  # qr FP8 scale
+        positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+        idx_q_fp8: Optional[torch.Tensor] = None,  # indexer q_fp8 (from _attn_pre)
+        idx_weights: Optional[torch.Tensor] = None,  # indexer weights (from _attn_pre)
+        compressor_already_launched: bool = False,
+    ) -> torch.Tensor:  # [num_tokens, n_local_heads*head_dim]  flat attn output
+        """Paged/dynamic attention core — SINGLE source of the paged attention
+        body, shared by both the PIECEWISE narrow-split op and the FULL/legacy
+        `forward_impl`. The two paths differ only in the compressor launch timing
+        and the indexer projection site, both parameterised here:
+
+        - `compressor_already_launched`: FULL launches the compressor BEFORE the
+          Q/KV projections (in `forward_impl`, to overlap with them — unchanged
+          legacy ordering) and passes True so we don't relaunch. PIECEWISE passes
+          False and launches here (its projections are in a separate captured
+          piece, and side-stream alloc can't happen during capture anyway).
+        - `idx_q_fp8`/`idx_weights`: if provided (PIECEWISE, projected in
+          `_attn_pre`), the indexer runs only its paged score/top-k via
+          `score_topk_from`; if None (FULL), the indexer's `forward_batched`
+          projects + scores inline here (unchanged legacy path).
+        """
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
@@ -1809,10 +2072,8 @@ class DeepseekV4Attention(nn.Module):
         # on a real fwd. swa_write / Compressor / Indexer are also skipped to
         # avoid touching unbound state caches.
         fc = get_forward_context()
-        if fc.context.is_dummy_run:
-            return torch.zeros_like(x)
-        if os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
-            return torch.zeros_like(x)
+        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            return x.new_zeros((x.shape[0], self.n_local_heads * self.head_dim))
         num_tokens = x.size(0)
         cache_size = self.swa_kv.shape[1]
         ratio = self.compress_ratio
@@ -1830,27 +2091,20 @@ class DeepseekV4Attention(nn.Module):
         state_slot_mapping = attn_md.state_slot_mapping
         plan_for_layer = compress_plans[ratio] if ratio else None
 
-        # ----- Batched ops on full flat tensors -----
-        # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
-        # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
-        # quantization. EXPERIMENT only.
-        if _V4_FORCE_UE8M0_QUANT:
-            x = x.clone()
-            act_quant_inplace(x, 128, "ue8m0")
+        # ===== Compressor launch =====
+        # FULL already launched it before the projections (overlap); PIECEWISE
+        # launches here. maybe_compressors_async runs single-stream anyway when a
+        # cudagraph is capturing (side-stream alloc breaks capture).
+        if compressor_already_launched:
+            from atom.utils.tbo.ubatching import tbo_active
 
-        # ===== Triple-stream: Q/KV path + both Compressors in parallel =====
-        use_async_compress = self.maybe_compressors_async(
-            x, plan_for_layer, state_slot_mapping, block_tables_gpu
-        )
-
-        # ----- Q/KV projections (main stream) -----
-        qkv_a = self.wqkv_a(x)
-        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        assert (
-            not _V4_FORCE_UE8M0_QUANT
-        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
-        qr, qr_scale = self.q_norm(q_lora)
-        q = self.wq_b(qr, x_scale=qr_scale)
+            use_async_compress = (
+                self._use_async_compress and fc.in_hipgraph and not tbo_active()
+            )
+        else:
+            use_async_compress = self.maybe_compressors_async(
+                x, plan_for_layer, state_slot_mapping, block_tables_gpu
+            )
         is_decode = attn_md.state is AttnState.DECODE
         # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
         # (weighted) + GPT-J interleaved RoPE on the tail rd dims. Dispatches
@@ -1902,18 +2156,20 @@ class DeepseekV4Attention(nn.Module):
             if self.indexer is not None:
                 current_stream.wait_stream(self.indexer_stream)
         # ===== Compressor + Indexer =====
+        # `topk` reuses the Q/weights projected in `_attn_pre` (graphed piece)
+        # when passed, else projects inline (FULL/legacy) — same result, only the
+        # split site differs. Then translate the seq-local top-k → physical paged
+        # offsets into the active CSA buffer (`_fill_csa_paged_compress`
+        # dispatches on decode vs prefill).
         if self.indexer is not None and not self.skip_topk:
-            indexer_topk_batched = self.indexer.forward_batched(
-                x_full=x,
-                qr_full=qr,
-                qr_full_scale=qr_scale,
-                positions=positions,
+            indexer_topk_batched = self.indexer.topk(
+                x,
+                qr,
+                positions,
+                qr_scale,
+                pre_q_fp8=idx_q_fp8,
+                pre_weights=idx_weights,
             )
-            # Translate seq-local topk → physical paged offsets and write into
-            # the CSA section of either:
-            #   - decode buffer `kv_indices_csa` (state is DECODE)
-            #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
-            # `_fill_csa_paged_compress` dispatches internally on state.
             self._fill_csa_paged_compress(
                 attn_md, indexer_topk_batched, positions, num_tokens
             )
@@ -2020,23 +2276,8 @@ class DeepseekV4Attention(nn.Module):
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
         self.rotary_emb.inverse(positions, o[..., -rd:])
-        # ----- Grouped output LoRA (batched on the full flat tensor) -----
-        o = o.view(num_tokens, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if num_tokens <= 32 or get_gfx() == "gfx1250":
-            y = torch.empty(
-                num_tokens,
-                self.n_local_groups,
-                self.o_lora_rank,
-                dtype=o.dtype,
-                device=o.device,
-            ).transpose(0, 1)
-            y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
-            o = y.transpose(0, 1)
-        else:
-            o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        x = self.wo_b(o.flatten(1))
-        return x
+        # Output LoRA (wo_a/wo_b) now runs in `_attn_post` (graphed piece).
+        return o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
 
     def _fill_csa_paged_compress(
         self,

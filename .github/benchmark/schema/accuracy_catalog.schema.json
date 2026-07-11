@@ -29,6 +29,9 @@
       "accuracy_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
       "accuracy_test_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
 
+      "mtp_accept_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+      "mtp_per_pos_threshold": { "type": "string" },
+
       "accuracy_baseline_model": { "type": "string" },
       "client_command": { "type": "string" },
       "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
