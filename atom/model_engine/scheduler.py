@@ -447,7 +447,11 @@ class Scheduler:
         # Latency of the last prompt step
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
-        self.prefill_batch_token_threshold = self.max_num_batched_tokens
+        self.prefill_batch_token_threshold = (
+            config.prefill_batch_token_threshold
+            if config.prefill_batch_token_threshold > 0
+            else self.max_num_batched_tokens
+        )
         self._prefill_hold_passes = 0
         self._prefill_hold_max_passes = 30
         _pc = getattr(config, "parallel_config", None)

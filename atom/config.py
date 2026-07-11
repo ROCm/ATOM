@@ -1032,6 +1032,7 @@ class Config:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     scheduler_delay_factor: float = 0.0
+    prefill_batch_token_threshold: int = 0
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9

@@ -146,6 +146,7 @@ class MockConfig:
             eos_token_id=2,
             stop_token_ids=[],
             scheduler_delay_factor=0.0,
+            prefill_batch_token_threshold=0,
             speculative_config=None,
             # DP size gates the dense-batch prefill hold (see Scheduler). Default
             # 1 (gate off) so unrelated tests keep legacy behavior; gate tests

@@ -675,7 +675,7 @@ class TestScheduledBatchPDFirstDecodeMTP:
         assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]
 
 
-# ── Prefill dense-batch gate (threshold = max_num_batched_tokens) ───────────
+# ── Prefill dense-batch gate ───────────────────────────────────────────────
 
 
 class TestPrefillBatchGate:
@@ -684,6 +684,15 @@ class TestPrefillBatchGate:
         sched = Scheduler(cfg)
         # Threshold is derived from the batch-token budget, not a separate knob.
         assert sched.prefill_batch_token_threshold == 32
+
+    def test_token_threshold_can_be_lower_than_batch_budget(self):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=32,
+                prefill_batch_token_threshold=20,
+            )
+        )
+        assert sched.prefill_batch_token_threshold == 20
 
     def test_ready_when_waiting_fills_threshold(self, seq_factory):
         # chunked prefill on so a 40-token prompt is clamped to the 32 budget
