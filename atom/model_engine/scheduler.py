@@ -795,11 +795,15 @@ class Scheduler:
             # can admit a prefill AND has a full batch's worth of waiting tokens.
             # This makes all ranks align on firing dense prefills together
             # instead of straggling partials.
-            _local_prefillable = self._can_admit_head_prefill() and (
-                self._waiting_prefill_tokens() >= self.prefill_batch_token_threshold
+            _local_prefillable = self._can_admit_head_prefill()
+            _local_prefill_sufficient = (
+                _local_prefillable
+                and self._waiting_prefill_tokens()
+                >= self.prefill_batch_token_threshold
             )
             _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
                 local_prefillable=_local_prefillable,
+                local_prefill_sufficient=_local_prefill_sufficient,
                 token_usage=self._kv_usage(),
             )
 
