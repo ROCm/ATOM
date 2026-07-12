@@ -918,6 +918,11 @@ def sparse_attn_v4_paged_decode(
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
+    if os.environ.get("ATOM_V4_ATTN_REF", "0") == "1":
+        # Debug: force the pure-torch reference attention (bisect gfx1250 kernels).
+        return sparse_attn_v4_paged_decode_reference(
+            q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale, kv_scales
+        )
     if get_gfx() == "gfx1250":
         return pa_decode_sparse(
             q,

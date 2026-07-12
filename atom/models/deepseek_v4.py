@@ -2817,13 +2817,24 @@ class Block(nn.Module):
         # `x.is_cuda` is implicit here — model lives on GPU post-`.to()`; a CPU tensor
         # would have crashed earlier in DeepseekV4Attention.
         _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
-        self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
-        self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
+        # Debug: force the pure-torch mHC reference (hc_split_sinkhorn) instead of
+        # the aiter mhc_pre/post kernels (bisect the CK-free gfx1250 mHC shim).
+        _mhc_ref = os.environ.get("ATOM_V4_MHC_REF", "0") == "1"
+        self._mhc_pre = (
+            getattr(aiter, "mhc_pre", None) if (_dim_ok and not _mhc_ref) else None
+        )
+        self._mhc_post = (
+            getattr(aiter, "mhc_post", None) if (_dim_ok and not _mhc_ref) else None
+        )
         self._mhc_fused_post_pre = (
-            getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
+            getattr(aiter, "mhc_fused_post_pre", None)
+            if (_dim_ok and not _mhc_ref)
+            else None
         )
         self.enable_fused_hc = (
-            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+            hasattr(aiter, "mhc_fused_post_pre")
+            and not self.layer_id == 0
+            and not _mhc_ref
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
