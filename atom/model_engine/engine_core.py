@@ -490,10 +490,12 @@ class DPEngineCoreProc(EngineCore):
         dp_rank = config.parallel_config.data_parallel_rank
         dp_size = config.parallel_config.data_parallel_size
         local_dp_rank = config.parallel_config.data_parallel_rank_local
+        local_dp_size = config.parallel_config.data_parallel_size_local
 
         assert dp_size > 1
         assert local_dp_rank is not None
-        assert 0 <= local_dp_rank <= dp_rank < dp_size
+        assert 0 <= dp_rank < dp_size
+        assert 0 <= local_dp_rank < local_dp_size
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()

@@ -21,6 +21,10 @@ if _atom_config_stub is not None:
         _atom_config_stub.SpeculativeConfig = MagicMock(
             side_effect=lambda **kw: MagicMock(**kw)
         )
+    if not hasattr(_atom_config_stub, "ParallelConfig"):
+        _atom_config_stub.ParallelConfig = MagicMock(
+            side_effect=lambda **kw: MagicMock(**kw)
+        )
 
 from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
 
@@ -64,3 +68,44 @@ class TestEngineArgsSpeculativeValidation:
             num_speculative_tokens=3,
         )
         assert kwargs["speculative_config"] is fake_spec_config
+
+
+class TestEngineArgsDistributedDP:
+    """Tests for distributed DP/EP engine parameter plumbing."""
+
+    def test_parallel_config_contains_global_and_local_dp_ranks(self):
+        args = EngineArgs(
+            data_parallel_size=16,
+            data_parallel_size_local=8,
+            data_parallel_rank=8,
+            data_parallel_master_ip="10.0.0.1",
+            data_parallel_master_port=29600,
+            distributed_dp=True,
+            distributed_dp_serving=True,
+        )
+
+        kwargs = args._get_engine_kwargs()
+        pc = kwargs["parallel_config"]
+
+        assert pc.data_parallel_size == 16
+        assert pc.data_parallel_size_local == 8
+        assert pc.data_parallel_rank == 8
+        assert pc.data_parallel_master_ip == "10.0.0.1"
+        assert pc.data_parallel_master_port == 29600
+        assert pc.distributed_dp is True
+        assert kwargs["distributed_dp_serving"] is True
+        assert "data_parallel_size" not in kwargs
+
+    def test_moe_backend_selectors_are_engine_parameters(self):
+        args = EngineArgs(
+            moe_all2all_backend="rccl",
+            rccl_moe_impl="triton_batched_gemm",
+            mori_all2all_mode="low-latency",
+        )
+
+        kwargs = args._get_engine_kwargs()
+
+        assert kwargs["moe_all2all_backend"] == "rccl"
+        assert kwargs["rccl_moe_impl"] == "triton_batched_gemm"
+        assert kwargs["mori_all2all_mode"] == "low-latency"
+        assert kwargs["enable_low_latency"] is True

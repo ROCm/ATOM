@@ -7,6 +7,7 @@ import multiprocessing
 import pickle
 import queue
 import weakref
+from dataclasses import dataclass
 from threading import Thread
 from typing import List
 
@@ -25,21 +26,93 @@ from atom.utils import (
 logger = logging.getLogger("atom")
 
 
+@dataclass(frozen=True)
+class DistributedDPSocketPlan:
+    rank: int
+    bind_input: str
+    connect_input: str
+    bind_output: str
+    connect_output: str
+
+
+def _distributed_dp_socket_plan(
+    *,
+    data_parallel_size: int,
+    master_ip: str,
+    master_port: int,
+    bind_host: str = "0.0.0.0",
+) -> list[DistributedDPSocketPlan]:
+    """Derive deterministic coordinator/worker ZMQ endpoints.
+
+    Ports are intentionally derived from data_parallel_master_port so users do
+    not need a separate public control-port parameter.
+    """
+    base = master_port + 100
+    return [
+        DistributedDPSocketPlan(
+            rank=rank,
+            bind_input=f"tcp://{bind_host}:{base + rank * 2}",
+            connect_input=f"tcp://{master_ip}:{base + rank * 2}",
+            bind_output=f"tcp://{bind_host}:{base + rank * 2 + 1}",
+            connect_output=f"tcp://{master_ip}:{base + rank * 2 + 1}",
+        )
+        for rank in range(data_parallel_size)
+    ]
+
+
+def _iter_dp_rank_assignments(config: Config):
+    """Yield ``(global_dp_rank, local_dp_rank)`` for ranks owned by this node."""
+    pc = config.parallel_config
+    tp_size = config.tensor_parallel_size
+    global_dp_size = pc.data_parallel_size
+    distributed_dp = getattr(pc, "distributed_dp", False)
+    local_dp_size = pc.data_parallel_size_local if distributed_dp else global_dp_size
+    rank_offset = pc.data_parallel_rank if distributed_dp else 0
+
+    if config.enable_dp_attention:
+        for local_base in range(local_dp_size):
+            for tp_rank in range(tp_size):
+                global_rank = (rank_offset + local_base) * tp_size + tp_rank
+                local_rank = local_base * tp_size + tp_rank
+                yield global_rank, local_rank
+    else:
+        for local_rank in range(local_dp_size):
+            yield rank_offset + local_rank, local_rank
+
+
 class CoreManager:
     def __init__(self, config: Config):
         self.label = "Engine Core Mgr"
         self._closed = False  # Track whether already closed
-        if config.enable_dp_attention:
-            self.local_engine_count = (
-                config.tensor_parallel_size * config.parallel_config.data_parallel_size
+        rank_assignments = list(_iter_dp_rank_assignments(config))
+        self._distributed_dp_serving = (
+            getattr(config.parallel_config, "distributed_dp", False)
+            and getattr(config, "distributed_dp_serving", False)
+        )
+        self._distributed_coordinator = (
+            not self._distributed_dp_serving
+            or config.parallel_config.data_parallel_rank == 0
+        )
+        socket_plan = None
+        if self._distributed_dp_serving:
+            socket_plan = _distributed_dp_socket_plan(
+                data_parallel_size=config.parallel_config.data_parallel_size
+                * (config.tensor_parallel_size if config.enable_dp_attention else 1),
+                master_ip=config.parallel_config.data_parallel_master_ip,
+                master_port=config.parallel_config.data_parallel_master_port,
             )
+        if config.enable_dp_attention:
+            self.local_engine_count = len(rank_assignments)
             logger.info(
                 f"Enable dp attention, using {self.local_engine_count} data parallel ranks"
             )
-            config.parallel_config.data_parallel_size = self.local_engine_count
+            config.parallel_config.data_parallel_size *= config.tensor_parallel_size
+            config.parallel_config.data_parallel_size_local = self.local_engine_count
+            if getattr(config.parallel_config, "distributed_dp", False):
+                config.parallel_config.data_parallel_rank *= config.tensor_parallel_size
             config.tensor_parallel_size = 1
         else:
-            self.local_engine_count = config.parallel_config.data_parallel_size
+            self.local_engine_count = len(rank_assignments)
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[List[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
@@ -64,7 +137,7 @@ class CoreManager:
         local_dp_ranks = []
 
         try:
-            for dp_rank in range(self.local_engine_count):
+            for dp_rank, local_dp_rank in rank_assignments:
                 logger.info(
                     f"{self.label}: Creating EngineCore for DP rank {dp_rank}/{self.local_engine_count}"
                 )
@@ -74,9 +147,19 @@ class CoreManager:
 
                 rank_config = copy.deepcopy(config)
                 rank_config.parallel_config.data_parallel_rank = dp_rank
+                rank_config.parallel_config.data_parallel_rank_local = local_dp_rank
 
-                engine_core_process, addresses, local_dp_rank = launch_engine_core(
-                    rank_config, dp_rank
+                if socket_plan is not None:
+                    plan = socket_plan[dp_rank]
+                    addresses = {
+                        "input_address": plan.connect_input,
+                        "output_address": plan.connect_output,
+                    }
+                else:
+                    addresses = None
+
+                engine_core_process, addresses, returned_local_dp_rank = launch_engine_core(
+                    rank_config, dp_rank, local_dp_rank, addresses=addresses
                 )
 
                 processes_info.append(
@@ -87,10 +170,25 @@ class CoreManager:
                         "config": rank_config,
                     }
                 )
-                local_dp_ranks.append(local_dp_rank)
+                local_dp_ranks.append(returned_local_dp_rank)
 
             data_parallel = config.parallel_config.data_parallel_size > 1
             try:
+                if self._distributed_coordinator and socket_plan is not None:
+                    for plan in socket_plan:
+                        input_socket = make_zmq_socket(
+                            self.ctx, plan.bind_input, zmq.ROUTER, bind=True
+                        )
+                        self.input_sockets.append(input_socket)
+
+                        output_socket = make_zmq_socket(
+                            self.ctx, plan.bind_output, zmq.PULL, bind=True
+                        )
+                        self.output_sockets.append(output_socket)
+
+                        shutdown_path = get_open_zmq_inproc_path()
+                        self.shutdown_paths.append(shutdown_path)
+
                 for info, local_dp_rank in zip(processes_info, local_dp_ranks):
                     dp_rank = info["dp_rank"]
                     logger.info(
@@ -105,27 +203,40 @@ class CoreManager:
 
                     self.engine_core_processes.append(info["process"])
 
-                    input_address = info["addresses"]["input_address"]
-                    input_socket = make_zmq_socket(
-                        self.ctx, input_address, zmq.ROUTER, bind=True
-                    )
+                    if self._distributed_coordinator and socket_plan is None:
+                        input_address = info["addresses"]["input_address"]
+                        input_socket = make_zmq_socket(
+                            self.ctx, input_address, zmq.ROUTER, bind=True
+                        )
+                        self.input_sockets.append(input_socket)
+
+                        output_address = info["addresses"]["output_address"]
+                        output_socket = make_zmq_socket(
+                            self.ctx, output_address, zmq.PULL
+                        )
+                        self.output_sockets.append(output_socket)
+
+                        shutdown_path = get_open_zmq_inproc_path()
+                        self.shutdown_paths.append(shutdown_path)
+
+                    if not self._distributed_coordinator:
+                        continue
+
+                if not self._distributed_coordinator:
+                    for proc in self.engine_core_processes:
+                        proc.join()
+                    raise SystemExit(0)
+
+                for input_socket in self.input_sockets:
                     identity, _ = input_socket.recv_multipart()
-                    self.input_sockets.append(input_socket)
                     self.engine_core_identities.append(identity)
-
-                    output_address = info["addresses"]["output_address"]
-                    output_socket = make_zmq_socket(self.ctx, output_address, zmq.PULL)
-                    self.output_sockets.append(output_socket)
-
-                    shutdown_path = get_open_zmq_inproc_path()
-                    self.shutdown_paths.append(shutdown_path)
 
                 self._wait_for_all_ready_signals()
                 logger.info(
                     f"{self.label}: All EngineCores are fully initialized and ready"
                 )
 
-                for dp_rank in range(self.local_engine_count):
+                for dp_rank in range(len(self.output_sockets)):
                     output_thread = self._create_output_thread(
                         dp_rank,
                         self.output_sockets[dp_rank],
@@ -163,8 +274,9 @@ class CoreManager:
         for dp_rank, output_socket in enumerate(self.output_sockets):
             poller.register(output_socket, zmq.POLLIN)
 
-        ready_received = [False] * self.local_engine_count
-        remaining = self.local_engine_count
+        engine_count = len(self.output_sockets)
+        ready_received = [False] * engine_count
+        remaining = engine_count
 
         while remaining > 0:
             socks = poller.poll()  # Wait indefinitely
@@ -320,10 +432,10 @@ class CoreManager:
         self._closed = True
 
         logger.info(
-            f"{self.label}: Shutting down all {self.local_engine_count} EngineCores"
+            f"{self.label}: Shutting down all {len(self.input_sockets) or self.local_engine_count} EngineCores"
         )
 
-        for dp_rank in range(self.local_engine_count):
+        for dp_rank in range(len(self.input_sockets)):
             self._shutdown_engine_core_rank(dp_rank)
 
         for input_socket in self.input_sockets:
@@ -386,7 +498,8 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        if self.local_engine_count == 1:
+        engine_count = len(self.input_sockets)
+        if engine_count == 1:
             # Single DP rank, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
             self.input_sockets[0].send_multipart(
@@ -398,9 +511,9 @@ class CoreManager:
             )
         else:
             # DP ranks, round-robin with counter for load balancing for atom server
-            dp_seqs = [[] for _ in range(self.local_engine_count)]
+            dp_seqs = [[] for _ in range(engine_count)]
             for seq in seqs:
-                dp_rank = self._rr_counter % self.local_engine_count
+                dp_rank = self._rr_counter % engine_count
                 dp_seqs[dp_rank].append(seq)
                 self._rr_counter += 1
 
@@ -440,7 +553,7 @@ class CoreManager:
     def send_utility_command(self, cmd: str, dp_rank: int = None):
         if dp_rank is None:
             # Send to all DP ranks
-            for rank in range(self.local_engine_count):
+            for rank in range(len(self.input_sockets)):
                 logger.debug(
                     f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
                 )
@@ -467,7 +580,7 @@ class CoreManager:
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
-        for rank in range(self.local_engine_count):
+        for rank in range(len(self.input_sockets)):
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
@@ -493,7 +606,7 @@ class CoreManager:
 
         # Collect one response per DP rank
         responses = []
-        for _ in range(self.local_engine_count):
+        for _ in range(len(self.input_sockets)):
             try:
                 resp = self.utility_response_queue.get(timeout=timeout)
                 responses.append(resp)
@@ -505,26 +618,21 @@ class CoreManager:
         return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
-        if dp_rank >= len(self.engine_core_processes):
-            return
-
-        process = self.engine_core_processes[dp_rank]
-        if process is not None and process.is_alive():
-            try:
-                input_socket = self.input_sockets[dp_rank]
-                if not input_socket.closed:
-                    input_socket.send_multipart(
-                        [
-                            self.engine_core_identities[dp_rank],
-                            pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)),
-                        ],
-                        copy=False,
-                    )
-                    logger.debug(f"{self.label}: Sent shutdown to DP rank {dp_rank}")
-            except Exception as e:
-                logger.debug(
-                    f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}"
+        try:
+            input_socket = self.input_sockets[dp_rank]
+            if not input_socket.closed and dp_rank < len(self.engine_core_identities):
+                input_socket.send_multipart(
+                    [
+                        self.engine_core_identities[dp_rank],
+                        pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)),
+                    ],
+                    copy=False,
                 )
+                logger.debug(f"{self.label}: Sent shutdown to DP rank {dp_rank}")
+        except Exception as e:
+            logger.debug(
+                f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}"
+            )
 
     def get_output(self) -> List[Sequence]:
         seqs = self.outputs_queue.get()
@@ -547,19 +655,30 @@ class CoreManager:
         )
 
 
-def launch_engine_core(config: Config, dp_rank: int = 0):
-    input_address = get_open_zmq_ipc_path()
-    output_address = get_open_zmq_ipc_path()
+def launch_engine_core(
+    config: Config,
+    dp_rank: int = 0,
+    local_dp_rank: int | None = None,
+    addresses: dict | None = None,
+):
+    if addresses is None:
+        input_address = get_open_zmq_ipc_path()
+        output_address = get_open_zmq_ipc_path()
+    else:
+        input_address = addresses["input_address"]
+        output_address = addresses["output_address"]
     import torch
 
     if torch.multiprocessing.get_start_method(allow_none=True) is None:
         torch.multiprocessing.set_start_method("spawn", force=False)
 
+    if local_dp_rank is None:
+        local_dp_rank = dp_rank
     config.parallel_config.data_parallel_rank = dp_rank
-    config.parallel_config.data_parallel_rank_local = dp_rank
+    config.parallel_config.data_parallel_rank_local = local_dp_rank
 
     logger.info(
-        f"Creating EngineCore process: DP rank {dp_rank}, will use GPUs {dp_rank * config.tensor_parallel_size} to {(dp_rank + 1) * config.tensor_parallel_size - 1}"
+        f"Creating EngineCore process: DP rank {dp_rank} (local {local_dp_rank}), will use GPUs {local_dp_rank * config.tensor_parallel_size} to {(local_dp_rank + 1) * config.tensor_parallel_size - 1}"
     )
 
     process = multiprocessing.Process(
@@ -575,5 +694,5 @@ def launch_engine_core(config: Config, dp_rank: int = 0):
     return (
         process,
         {"input_address": input_address, "output_address": output_address},
-        dp_rank,
+        local_dp_rank,
     )

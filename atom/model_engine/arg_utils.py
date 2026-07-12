@@ -8,7 +8,7 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, SpeculativeConfig
+from atom.config import CompilationConfig, ParallelConfig, SpeculativeConfig
 
 logger = logging.getLogger("atom")
 
@@ -32,6 +32,13 @@ class EngineArgs:
     tensor_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
+    data_parallel_size_local: Optional[int] = None
+    data_parallel_rank: int = 0
+    data_parallel_rank_local: Optional[int] = None
+    data_parallel_master_ip: str = "127.0.0.1"
+    data_parallel_master_port: int = 29500
+    distributed_dp: bool = False
+    distributed_dp_serving: bool = False
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
@@ -53,6 +60,9 @@ class EngineArgs:
     enable_dp_attention: bool = False
     enable_tbo: Optional[str] = None
     all2all_backend: Optional[str] = None
+    moe_all2all_backend: Optional[str] = None
+    mori_all2all_mode: Optional[str] = None
+    rccl_moe_impl: Optional[str] = None
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
@@ -93,7 +103,53 @@ class EngineArgs:
             "-dp",
             type=int,
             default=1,
-            help="Data parallel size.",
+            help="Global data parallel size.",
+        )
+        parser.add_argument(
+            "--data-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of data-parallel ranks to spawn on this node. "
+                "Defaults to --data-parallel-size for single-node launches."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-rank",
+            type=int,
+            default=0,
+            help="First global data-parallel rank owned by this node.",
+        )
+        parser.add_argument(
+            "--data-parallel-rank-local",
+            type=int,
+            default=None,
+            help="Local data-parallel rank for a worker process; normally assigned internally.",
+        )
+        parser.add_argument(
+            "--data-parallel-master-ip",
+            type=str,
+            default="127.0.0.1",
+            help="Rendezvous IP for data-parallel process groups.",
+        )
+        parser.add_argument(
+            "--data-parallel-master-port",
+            type=int,
+            default=29500,
+            help="Rendezvous port for data-parallel process groups.",
+        )
+        parser.add_argument(
+            "--distributed-dp",
+            action="store_true",
+            help="Enable multi-node distributed data-parallel rank semantics.",
+        )
+        parser.add_argument(
+            "--distributed-dp-serving",
+            action="store_true",
+            help=(
+                "Enable experimental coordinator/worker serving for distributed DP. "
+                "Node with --data-parallel-rank 0 acts as coordinator; other nodes act as workers."
+            ),
         )
         parser.add_argument(
             "--enforce-eager",
@@ -176,6 +232,24 @@ class EngineArgs:
             help="All2all backend mode for MORI. "
             "Default is 'high-throughput'. "
             "Use '--all2all-backend low-latency' for AsyncLL MORI kernel overlap.",
+        )
+        parser.add_argument(
+            "--moe-all2all-backend",
+            choices=["mori", "rccl"],
+            default=None,
+            help="MoE expert-parallel dispatch/combine backend.",
+        )
+        parser.add_argument(
+            "--mori-all2all-mode",
+            choices=["high-throughput", "low-latency"],
+            default=None,
+            help="MORI all2all mode. Replaces --all2all-backend for new launches.",
+        )
+        parser.add_argument(
+            "--rccl-moe-impl",
+            choices=["default", "token_sort", "flydsl_batched_gemm", "triton_batched_gemm", "batched"],
+            default=None,
+            help="Expert GEMM implementation for the native RCCL all2all backend.",
         )
         parser.add_argument(
             "--method",
@@ -347,13 +421,48 @@ class EngineArgs:
             kwargs.pop("draft_model")
             kwargs["speculative_config"] = None
 
+        data_parallel_size = kwargs.pop("data_parallel_size")
+        data_parallel_size_local = kwargs.pop("data_parallel_size_local")
+        data_parallel_rank = kwargs.pop("data_parallel_rank")
+        data_parallel_rank_local = kwargs.pop("data_parallel_rank_local")
+        data_parallel_master_ip = kwargs.pop("data_parallel_master_ip")
+        data_parallel_master_port = kwargs.pop("data_parallel_master_port")
+        distributed_dp = kwargs.pop("distributed_dp")
+        distributed_dp_serving = kwargs.pop("distributed_dp_serving")
+        kwargs["parallel_config"] = ParallelConfig(
+            data_parallel_size=data_parallel_size,
+            data_parallel_size_local=(
+                data_parallel_size_local
+                if data_parallel_size_local is not None
+                else data_parallel_size
+            ),
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_rank_local=data_parallel_rank_local,
+            data_parallel_master_ip=data_parallel_master_ip,
+            data_parallel_master_port=data_parallel_master_port,
+            distributed_dp=distributed_dp,
+        )
+        kwargs["distributed_dp_serving"] = distributed_dp_serving
+
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
         tbo_mode = kwargs.pop("enable_tbo", None)
         kwargs["enable_tbo"] = tbo_mode is not None
         kwargs["enable_tbo_decode"] = tbo_mode == "all"
 
         all2all_backend = kwargs.pop("all2all_backend", None)
-        kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+        mori_all2all_mode = kwargs.pop("mori_all2all_mode", None)
+        if mori_all2all_mode is None:
+            mori_all2all_mode = all2all_backend
+        kwargs["mori_all2all_mode"] = mori_all2all_mode or "high-throughput"
+        kwargs["enable_low_latency"] = kwargs["mori_all2all_mode"] == "low-latency"
+
+        moe_all2all_backend = kwargs.pop("moe_all2all_backend", None)
+        if moe_all2all_backend is not None:
+            kwargs["moe_all2all_backend"] = moe_all2all_backend
+
+        rccl_moe_impl = kwargs.pop("rccl_moe_impl", None)
+        if rccl_moe_impl is not None:
+            kwargs["rccl_moe_impl"] = rccl_moe_impl
 
         logger.info(f"Engine kwargs: {kwargs}")
 

@@ -756,7 +756,9 @@ class ParallelConfig:
     data_parallel_rank_local: Optional[int] = None
     """Local rank of the data parallel group,
     set only in SPMD mode."""
-    world_size: int = field(init=False)
+    distributed_dp: bool = False
+    """Whether data_parallel_rank is a global rank offset for this node."""
+    world_size: int = field(default=1, init=False)
     """world_size is TPxPP, it affects the number of workers we create."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
@@ -829,6 +831,8 @@ class ParallelConfig:
         factors.append(self.data_parallel_rank_local)
         factors.append(self.data_parallel_master_ip)
         factors.append(self.data_parallel_master_port)
+        factors.append(self.data_parallel_size_local)
+        factors.append(self.distributed_dp)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
     def __post_init__(self) -> None:
@@ -840,6 +844,14 @@ class ParallelConfig:
             self.data_parallel_rank = envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
+        if envs.is_set("ATOM_DP_SIZE_LOCAL"):
+            self.data_parallel_size_local = envs.ATOM_DP_SIZE_LOCAL
+        if envs.is_set("ATOM_DP_MASTER_IP"):
+            self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
+        if envs.is_set("ATOM_DP_MASTER_PORT"):
+            self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
+        if envs.is_set("ATOM_DISTRIBUTED_DP"):
+            self.distributed_dp = envs.ATOM_DISTRIBUTED_DP
         # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
         # self.data_parallel_master_port = get_open_port()
 
@@ -1077,6 +1089,10 @@ class Config:
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
+    moe_all2all_backend: str = field(default_factory=lambda: envs.ATOM_ALL2ALL_BACKEND)
+    mori_all2all_mode: str = "high-throughput"
+    rccl_moe_impl: str = field(default_factory=lambda: envs.ATOM_RCCL_MOE_IMPL)
+    distributed_dp_serving: bool = False
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
 
     # only use for plugin mode
@@ -1100,6 +1116,17 @@ class Config:
     def __post_init__(self):
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
+        self.moe_all2all_backend = self.moe_all2all_backend.lower()
+        self.mori_all2all_mode = self.mori_all2all_mode.lower()
+        self.rccl_moe_impl = self.rccl_moe_impl.lower()
+        self.enable_low_latency = (
+            self.enable_low_latency or self.mori_all2all_mode == "low-latency"
+        )
+        # Existing MoE code reads these through atom.utils.envs. Mirror explicit
+        # engine parameters into env-backed selectors until those call sites are
+        # migrated to Config fields directly.
+        os.environ["ATOM_ALL2ALL_BACKEND"] = self.moe_all2all_backend
+        os.environ["ATOM_RCCL_MOE_IMPL"] = self.rccl_moe_impl
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
