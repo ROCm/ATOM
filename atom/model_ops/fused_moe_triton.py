@@ -463,3 +463,73 @@ def triton_kernel_fused_experts_a8w4_silu_gguu(
     )
 
     return output_tensor
+
+
+def triton_kernel_fused_experts_a8w4_silu(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_swizzle_layout,
+    w2_swizzle_layout,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 10.0,
+    apply_router_weight_on_input: bool = False,
+) -> torch.Tensor:
+    """Decode-only A8W4 MoE for SiLU models, GUGU (interleaved gate/up).
+
+    GEMM1 fuses SiLU(gate)*up + MXFP8 quant into the write-back (out_mx_quant),
+    which is only valid for the interleaved layout where gate/up pairs are in-tile:
+        MXFP8 quant -> GEMM1(a8w4, fused SiLU*up + mxfp8 out) -> GEMM2(a8w4).
+    Weights must be in the preshuffled a8w4 layout with w13 gate/up interleaved.
+    """
+    assert hidden_states.ndim == 2
+    assert hidden_states.dtype == torch.bfloat16
+
+    gammas = routing_data.gate_scal if routing_data else None
+
+    x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+
+    interm_fp8, interm_scale = moe_gemm_a8w4(
+        x_fp8,
+        w1,
+        x_scale,
+        w13_scale,
+        a13_scale,
+        None,
+        w1_bias,
+        routing_data,
+        gather_indx=gather_indx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=w13_swizzle_layout,
+        apply_swiglu=True,
+        alpha=1.0,
+        limit=swiglu_limit,
+        swiglu_add_residual=False,
+        preshuffled=True,
+        out_mx_quant=True,
+    )
+
+    output_tensor = moe_gemm_a8w4(
+        interm_fp8,
+        w2,
+        interm_scale,
+        w2_scale,
+        a2_scale,
+        None,
+        w2_bias,
+        routing_data,
+        scatter_indx=scatter_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=w2_swizzle_layout,
+        preshuffled=True,
+    )
+
+    return output_tensor
