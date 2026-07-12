@@ -1078,6 +1078,11 @@ def sparse_attn_v4_paged_decode(
     in-kernel using 1xGROUP_SIZE (default 64) block scales (legacy 1buff,
     unreachable from the model).
     """
+    if os.environ.get("ATOM_V4_ATTN_REF", "0") == "1":
+        # Debug: force the pure-torch reference attention (bisect gfx1250 kernels).
+        return sparse_attn_v4_paged_decode_reference(
+            q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale, kv_scales
+        )
     if unified_kv_rope is not None:
         return _sparse_attn_v4_paged_decode_asm(
             unified_kv,
