@@ -811,7 +811,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
             )
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
-        if envs.is_set("ATOM_USE_TRITON_MOE_DECODE") and not self.is_guinterleave:
+        # Triton decode supports both GGUU (separated, external act+quant) and
+        # GUGU (interleaved, fused act+quant in GEMM1 via out_mx_quant).
+        if envs.is_set("ATOM_USE_TRITON_MOE_DECODE"):
             self.use_triton_decode = envs.ATOM_USE_TRITON_MOE_DECODE
         else:
             self.use_triton_decode = False
@@ -1088,11 +1090,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_preshuffled = moe_weight_decode_view(layer.w13_weight.data)
             layer.w2_weight_preshuffled = moe_weight_decode_view(layer.w2_weight.data)
 
+            # GUGU: interleave the w13 gate/up scale rows to match the interleaved
+            # decode weight (moe_shuffle_weight interleaves the weight but the a8w4
+            # decode scale is built from the raw snapshot). GGUU stays separated.
+            if self.is_guinterleave:
+                E_s, N_s, K_s = orig_w13_weight_scale.shape
+                orig_w13_weight_scale = (
+                    orig_w13_weight_scale.view(E_s, 2, N_s // 2, K_s)
+                    .permute(0, 2, 1, 3)
+                    .reshape(E_s, N_s, K_s)
+                    .contiguous()
+                )
+
             w13_scale_for_a8w4 = orig_w13_weight_scale.transpose(-2, -1)
             w2_scale_for_a8w4 = orig_w2_weight_scale.transpose(-2, -1)
 
             # Arch -> SWIZZLE_MX_SCALE label decision lives in aiter, not here.
-            # GGUU keeps gate/up separated, so no interleave on the decode scales.
             (
                 layer.w13_weight_scale_a8w4,
                 layer.w13_swizzle_layout_a8w4,
@@ -1146,8 +1159,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
-            # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
+            # Triton decode: GUGU (interleaved) uses the fused act+quant GEMM1;
+            # GGUU (separated) uses the external act+quant path.
             from atom.model_ops.fused_moe_triton import (
+                triton_kernel_fused_experts_a8w4_silu,
                 triton_kernel_fused_experts_a8w4_silu_gguu,
             )
             from aiter.ops.triton.moe.moe_routing.routing import routing
@@ -1169,7 +1184,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
             )
-            return triton_kernel_fused_experts_a8w4_silu_gguu(
+            decode_experts = (
+                triton_kernel_fused_experts_a8w4_silu
+                if self.is_guinterleave
+                else triton_kernel_fused_experts_a8w4_silu_gguu
+            )
+            return decode_experts(
                 x,
                 layer.w13_weight_preshuffled,
                 layer.w2_weight_preshuffled,
