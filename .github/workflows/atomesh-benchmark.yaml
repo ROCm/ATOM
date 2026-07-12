@@ -118,6 +118,7 @@ env:
   ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != '' && inputs.atomesh_slurm_partition || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks') }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
   ATOMESH_DASHBOARD_HARDWARE: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'MI350X' || 'MI355X' }}
+  ATOMESH_PD_RANK_MAPPING_POLICY: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'idx2idx' || 'none' }}
   ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root != '' && inputs.atomesh_log_root || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || '/it-share/ATOMESH_LOG/') }}
   ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || '/mnt/models' }}
   ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != '' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'mia1-p02-g42,mia1-p02-g44') }}
@@ -227,7 +228,6 @@ jobs:
       needs.load-config.outputs.has_matrix == 'true'
       && (
         github.event_name == 'schedule'
-        || github.event_name == 'push'
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
@@ -381,7 +381,6 @@ jobs:
       && needs.summarize-results.outputs.has_results == 'true'
       && (
         github.event_name == 'schedule'
-        || github.event_name == 'push'
         || (github.event_name == 'workflow_dispatch' && inputs.publish_dashboard)
       )
     runs-on: ubuntu-latest
@@ -389,39 +388,30 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
-      - name: Download CI benchmark summary markdown
+      - name: Download CI benchmark dashboard inputs
         uses: actions/download-artifact@v8
         with:
           name: atomesh-benchmark-summary
           path: atomesh-dashboard-input
 
-      - name: Build ATOMesh dashboard data from CI summary markdown
+      - name: Prepare ATOMesh dashboard assets
         run: |
           set -euo pipefail
-          test -s atomesh-dashboard-input/atomesh-benchmark-summary.md
-
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          summary = Path("atomesh-dashboard-input/atomesh-benchmark-summary.md").read_text(encoding="utf-8")
-          Path("/tmp/atomesh_summary.js").write_text(
-              "window.ATOMESH_RUN_URL = "
-              + json.dumps("https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}")
-              + ";\n"
-              + "window.ATOMESH_HARDWARE = "
-              + json.dumps("${{ env.ATOMESH_DASHBOARD_HARDWARE }}")
-              + ";\n"
-              + "window.ATOMESH_SUMMARY_MARKDOWN = "
-              + json.dumps(summary, ensure_ascii=False)
-              + ";\n",
-              encoding="utf-8",
-          )
-          PY
-
+          test -s atomesh-dashboard-input/atomesh-benchmark-action.json
           cp .github/dashboard/index.html /tmp/atomesh_dashboard_index.html
 
-      - name: Deploy ATOMesh dashboard markdown to gh-pages
+      - name: Store ATOMesh benchmark result to dashboard
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: atomesh-dashboard-input/atomesh-benchmark-action.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-dashboard
+          auto-push: true
+          max-items-in-chart: 300
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy ATOMesh dashboard shell to gh-pages
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -429,11 +419,11 @@ jobs:
 
           git fetch origin gh-pages
           git checkout gh-pages
+          git pull --ff-only origin gh-pages
           mkdir -p benchmark-dashboard
 
           cp /tmp/atomesh_dashboard_index.html benchmark-dashboard/index.html
-          cp /tmp/atomesh_summary.js benchmark-dashboard/atomesh_summary.js
 
-          git add benchmark-dashboard/index.html benchmark-dashboard/atomesh_summary.js
+          git add benchmark-dashboard/index.html
           git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
           git push origin gh-pages

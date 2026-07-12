@@ -493,6 +493,43 @@ jobs:
             echo "Accuracy test passed: $flexible_extract_value >= $threshold"
           fi
 
+      - name: Check MTP acceptance rate
+        # Only gates models that declare mtp_accept_threshold in the catalog
+        # (MTP/spec-decode entries); all other models skip this step.
+        if: ${{ success() && matrix.mtp_accept_threshold != '' }}
+        env:
+          MTP_ACCEPT_THRESHOLD: ${{ matrix.mtp_accept_threshold }}
+        run: |
+          # gsm8k accuracy alone CANNOT guard MTP: speculative decoding is
+          # lossless w.r.t. the target model, so a broken draft head leaves
+          # accuracy unchanged and only craters acceptance/throughput. This
+          # step is the only gate that catches such an MTP regression.
+          # atom_test.sh scrapes the cumulative "[MTP Stats ]" line from the
+          # server log during the gsm8k run and records mtp_acceptance_rate
+          # (a PERCENT, e.g. 62.5) into atom_ci_metadata. The catalog
+          # threshold is a FRACTION (0-1, same convention as accuracy_threshold),
+          # so we divide the recorded percent by 100 before comparing.
+          result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+            echo "ERROR: No results JSON file found for MTP acceptance check."
+            exit 2
+          fi
+          echo "RESULT_FILE: $result_file"
+
+          rate=$(jq -r '.atom_ci_metadata.mtp_acceptance_rate // empty' "$result_file")
+          if [ -z "$rate" ]; then
+            echo "FAIL: mtp_acceptance_rate missing — MTP stats were not emitted"
+            echo "      during the accuracy run. Treating as an MTP regression."
+            exit 1
+          fi
+
+          echo "MTP acceptance: ${rate}% (threshold ${MTP_ACCEPT_THRESHOLD} = $(awk -v t="$MTP_ACCEPT_THRESHOLD" 'BEGIN{printf "%.1f", t*100}')%)"
+          if awk -v v="$rate" -v t="$MTP_ACCEPT_THRESHOLD" 'BEGIN {exit !((v/100) < t)}'; then
+            echo "MTP acceptance gate FAILED: ${rate}% < threshold"
+            exit 1
+          fi
+          echo "MTP acceptance gate PASSED."
+
       - name: Collect Test Summary
         if: success()
         env:

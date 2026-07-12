@@ -627,14 +627,102 @@ def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
     return torch_version >= version.parse(target)
 
 
+# Lazily-compiled fallback weak-ref op. vLLM ships a `torch.ops._C.weak_ref_tensor`
+# (csrc/libtorch_stable/ops.h) that returns a tensor SHARING the input's memory
+# but NOT owning its storage — so once the original tensor is freed the
+# CUDACachingAllocator block is reclaimable and a cudagraph memory pool can
+# OVERLAY it across shapes. That op is absent in some ROCm builds (no vLLM _C),
+# and a pure-Python weak ref is impossible: dlpack / set_(untyped_storage) both
+# share the Storage object and thus KEEP it alive -> the pool cannot reuse the
+# memory -> every captured piece's output accumulates (35GB+ on DSV4 TP8
+# PIECEWISE). We therefore JIT-compile a tiny `at::from_blob(..., no-op deleter)`
+# equivalent once (cached under ~/.cache/torch_extensions) so PIECEWISE cudagraph
+# pools overlay exactly like upstream vLLM.
+_ATOM_WEAKREF_OP = None  # None = not attempted, False = unavailable, else callable
+
+
+def _get_weak_ref_op():
+    global _ATOM_WEAKREF_OP
+    if _ATOM_WEAKREF_OP is not None:
+        return _ATOM_WEAKREF_OP or None
+
+    # 1) Prefer a native op if this build already registered one (e.g. vLLM _C).
+    try:
+        op = torch.ops._C.weak_ref_tensor
+        # Probe that it is actually callable / registered.
+        op  # noqa: B018
+        _ATOM_WEAKREF_OP = op
+        return op
+    except (AttributeError, RuntimeError):
+        pass
+
+    # 2) JIT-compile a minimal from_blob weak ref (no-op deleter => shares memory
+    #    without owning the allocator block). One-time compile, then cached.
+    try:
+        import os as _os
+
+        if _os.environ.get("ATOM_DISABLE_JIT_WEAKREF", "0") == "1":
+            _ATOM_WEAKREF_OP = False
+            return None
+        from torch.utils.cpp_extension import load_inline
+
+        _cpp = r"""
+#include <torch/extension.h>
+at::Tensor atom_weak_ref_tensor(at::Tensor input) {
+  TORCH_CHECK(input.is_cuda(), "weak_ref_tensor: input must be CUDA");
+  void* data_ptr = input.data_ptr();
+  auto options = at::TensorOptions()
+                     .dtype(input.scalar_type())
+                     .device(input.device());
+  // Empty deleter: the returned tensor shares `input`'s memory but does NOT own
+  // the CUDACachingAllocator block, so freeing `input` lets the pool reclaim it.
+  return at::from_blob(data_ptr, input.sizes(), input.strides(),
+                       [](void*) {}, options);
+}
+"""
+        _mod = load_inline(
+            name="atom_weakref",
+            cpp_sources=[_cpp],
+            functions=["atom_weak_ref_tensor"],
+            with_cuda=True,
+            verbose=False,
+        )
+        _ATOM_WEAKREF_OP = _mod.atom_weak_ref_tensor
+        return _ATOM_WEAKREF_OP
+    except Exception as _e:  # noqa: BLE001
+        # Any build/compile failure -> disable (return-as-is is functionally
+        # correct, just uses more memory). Logged once.
+        try:
+            from aiter import logger as _logger
+
+            _logger.warning(
+                "atom weak_ref_tensor JIT compile failed (%s); PIECEWISE "
+                "cudagraph pools will NOT overlay -> higher memory. Set "
+                "ATOM_DISABLE_JIT_WEAKREF=1 to silence.",
+                _e,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        _ATOM_WEAKREF_OP = False
+        return None
+
+
 def weak_ref_tensor(tensor: Any) -> Any:
     """
     Create a weak reference to a tensor.
-    The new tensor will share the same data as the original tensor,
-    but will not keep the original tensor alive.
+    The new tensor shares the same data as the original tensor but does NOT keep
+    the original tensor's storage alive — essential for cudagraph memory pools to
+    overlay captured outputs across shapes. Falls back to returning the tensor
+    unchanged (functionally correct, more memory) if no weak-ref op is available.
     """
-    if isinstance(tensor, torch.Tensor):
-        return torch.ops._C.weak_ref_tensor(tensor)
+    if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+        op = _get_weak_ref_op()
+        if op is not None:
+            try:
+                return op(tensor)
+            except (AttributeError, RuntimeError):
+                return tensor
+        return tensor
     else:
         return tensor
 
