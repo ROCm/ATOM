@@ -44,6 +44,8 @@ Numerics: identical online-softmax + sink finalization to
 (then equivalent to a decode call with the same prefix indices).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -605,6 +607,23 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
+    if os.environ.get("ATOM_V4_ATTN_REF", "0") == "1":
+        # Debug: force the pure-torch reference attention (bisect gfx1250 kernels).
+        ref = sparse_attn_v4_paged_prefill_reference(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        )
+        if out is not None:
+            out.copy_(ref)
+            return out
+        return ref
     if get_gfx() == "gfx1250":
         return pa_prefill_sparse(
             q,

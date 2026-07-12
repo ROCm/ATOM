@@ -46,6 +46,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
+    # Use mori dispatch_combine_v2 (FlyDSL/cco, gfx1250 wave32) instead of the
+    # production mori v1 (mori.ops.EpDispatchCombineOp) for the EP+DP MoE
+    # all2all. v1 is authored for gfx942/950 and does not run on gfx1250; v2 is
+    # the gfx1250-capable path. Only takes effect when the mori all2all path is
+    # active (dp_size>1 + expert-parallel + mori installed).
+    "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a

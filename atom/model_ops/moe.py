@@ -400,6 +400,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
+            from atom.utils import envs as _atom_envs
+
+            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
+            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
+            if _atom_envs.ATOM_MORI_V2:
+                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                    make_mori_v2_prepare_finalize,
+                )
+
+                return make_mori_v2_prepare_finalize(moe, all2all_manager)
+
             assert quant_config is not None
             # For PTPC (per token per channel) quant, the scale dim for each token is 1
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
@@ -539,7 +550,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             ), f"Attempt to override experts for {id(self)}!"
             self.topk_indices_dtype = prepare_finalize.topk_indices_dtype()
             # experts = self.select_gemm_impl(prepare_finalize, layer)
-            self.fused_experts = FusedMoEModularKernel(
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                MoriV2ModularKernel,
+                MoriV2PrepareAndFinalize,
+            )
+
+            modular_cls = (
+                MoriV2ModularKernel
+                if isinstance(prepare_finalize, MoriV2PrepareAndFinalize)
+                else FusedMoEModularKernel
+            )
+            self.fused_experts = modular_cls(
                 prepare_finalize,
                 # experts,
                 # layer.shared_experts,
