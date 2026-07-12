@@ -1051,7 +1051,15 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = dp_size <= 8
+            # for DPA, AITER has no non-persistent kernel: fp8 Q + fp8 KV with a
+            # GQA ratio of 64.
+            gqa_ratio = self.padded_num_heads // self.num_kv_heads
+            requires_persistent_mode = (
+                q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and gqa_ratio == 64
+            )
+            use_persistent_mode = dp_size == 1 or requires_persistent_mode
             if envs.ATOM_MLA_PAGE_SIZE > 1:
                 use_persistent_mode = False
 
