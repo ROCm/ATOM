@@ -569,6 +569,7 @@ class TestReplayEndpointWiring:
             while pub.stats["sent"] < 2 and polls > 0:
                 time.sleep(0.02)
                 polls -= 1
+            assert pub.stats["sent"] == 2
             dealer = ctx.socket(zmq.DEALER)
             dealer.connect("inproc://term-router2")
             dealer.send((99).to_bytes(8, "big"))  # start_seq beyond latest

@@ -150,8 +150,10 @@ class ZmqEventPublisher(EventPublisher):
 
     Every message is a three-frame multipart `[topic, seq, payload]`, where
     `topic` is the (possibly empty) subscription key, `seq` is a monotonic
-    8-byte big-endian batch counter (wrapping at 2**64), and `payload` is the
-    msgpack-encoded EventBatch. Consumers must use `recv_multipart()`.
+    8-byte big-endian batch counter (wrapping at 2**64-1; the value 2**64-1 is
+    reserved for the REPLAY_DONE terminal frame and never used as a data seq),
+    and `payload` is the msgpack-encoded EventBatch. Consumers must use
+    `recv_multipart()`.
 
     `seq` is assigned at enqueue time, so a batch dropped on queue overflow
     still consumes a sequence number: the drop surfaces to subscribers as a
