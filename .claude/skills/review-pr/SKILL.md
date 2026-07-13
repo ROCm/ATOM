@@ -100,7 +100,8 @@ _Answer:_
 - [ ] **Bug fix** → A1 (sibling variant), HK3 (regression test); root cause explained?
 - [ ] **FP8 / quantization** → C1 (fnuz by dtype), C2 (dtype hardcoded)
 - [ ] **Weight transform / new weight attr** → F1 (double HBM pin)
-- [ ] **Async / multi-stream / weight prep** → G1 (stream sync missing)
+- [ ] **Async / multi-stream / weight prep** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
+- [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 
 ---
 
@@ -246,12 +247,22 @@ Trigger: new `tl.constexpr` bool in a Triton kernel that disables a bounds/senti
 Real example (ATOM#1498): `CHECK_NEG_ONE_SENTINEL=False` disables -1 slot filter in paged prefill kernel; illegal access if any -1 slot appears without the check.
 → `⚠️ B4: [constexpr] disables [check] — document which caller invariant guarantees no [invalid value] on that path`
 
-**B5 — Accepted parameter silently discarded** ⚠️ (🔴 if controls output correctness)
-Function accepts a parameter in its signature but the value is never used: discarded with `del param`, commented out, unreachable due to `or True` short-circuit, or passed to a callee that immediately discards it.
-Severity: 🔴 if the discarded parameter controls output correctness (e.g., `expert_mask`, `guidance_scale`, `q_scale`) — callers passing non-default values silently get wrong output. ⚠️ if it controls a performance knob or optional feature with a working default.
-Exception: method overrides where the base class signature requires the parameter but this subclass legitimately doesn't use it — flag as 📝 with a note that the discard is structural.
-Real examples: `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `needs_independent_noise` from `prepare_model()` return tuple dropped in `prefill_forward`, sampler called without it — first token uses wrong sampling mode (ATOM#860); `needs_independent_noise` structurally `del`-ed inside ATOM_USE_TORCH_SAMPLER override → 📝 not 🔴.
-→ `🔴/⚠️ B5: [param] accepted in [fn] signature but never used — callers passing non-default values silently have no effect`
+**B5 — API propagation incompleteness** 🔴/⚠️
+When an API surface changes in dimension X, all downstream receivers (Y) must be updated. Unhandled propagation silently falls through to wrong behavior (Z).
+
+| Sub-type | X (what changed) | Y (downstream not updated) | Z (failure) | Sev |
+|----------|-----------------|---------------------------|-------------|-----|
+| param-discard | new param in signature | function body | value accepted but never used | ⚠️/🔴 |
+| param-removed | param removed from call | same-file call sites | TypeError at call time | 🔴 |
+| attr-missing | new `getattr` attribute key | all call paths without the attr | silent zero/None fallback | ⚠️/🔴 |
+| dispatch-silent | multi-backend fallback | caller logging | backend switch with no diagnostic | ⚠️ |
+| rename | public symbol renamed | all importers | AttributeError at import time | 🔴 |
+
+Severity (param-discard): 🔴 if param controls output correctness (`expert_mask`, `q_scale`, `expert_mapping`); ⚠️ for performance knobs or optional features with working defaults.
+Exception: method override where base class forces the signature but subclass legitimately ignores the param — flag as 📝 (structural discard, not a bug). E.g., `needs_independent_noise` structurally `del`-ed inside `ATOM_USE_TORCH_SAMPLER` override → 📝.
+Real examples (param-discard): `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `needs_independent_noise` dropped in `prefill_forward` — first token uses wrong sampling mode (ATOM#860).
+Real example (attr-missing): `getattr(self.args,'n_shared_experts',0)` silent zero fallback — shared expert slots silently dropped from mapping with no warning if attribute absent (ATOM#1548).
+→ `🔴/⚠️ B5-[sub-type]: [what changed] — [downstream not updated] — [failure]`
 
 **B6 — New dispatch value not handled by all paths, no warning** ⚠️/🔴
 When a PR introduces a new routing value to a multi-way dispatch — a new dtype, a new arch string, a new layout flag, a new `getattr` attribute key — every reachable dispatch branch must either (a) handle it explicitly, (b) fall through to a documented safe default, or (c) assert/warn before the wrong branch is reached. Silent fallback to an incorrect behavior is a bug.
@@ -280,8 +291,8 @@ Real example (aiter#4073): valarLip: "check _is_fnuz by tensor's DType instead o
 **C3 — New GPU arch string or arch-specific constant hardcoded in dispatch** ⚠️
 **FP self-check first (do this before deciding to fire):** Search the unchanged lines of this file for the same arch string or constant value (e.g., `'gfx942'`, `576`). If it already appears on an unchanged line → **do not fire** (pre-existing style). Only proceed if it is genuinely new to this file.
 Trigger (only after self-check passes): a new `+` line introduces an arch string literal in a dispatch condition (`if arch == 'gfx942':`, `'gfx950' in arch_str`), or a magic constant tied to a specific arch/model config (`576` for MLA kv_lora_rank+qk_rope_head_dim), rather than deriving from config or a named constant.
-Also exempt: strings in comments, docstrings, or directory names; values imported from a central registry.
-Real examples: hardcoded `576` in `_bind_kv_cache_to_modules()` instead of `kv_lora_rank + qk_rope_head_dim` — breaks any MLA variant where the sum ≠ 576 (ATOM#860 → fire C3); `'gfx942'` already in `attention_mla.py` and new `+` line extends same pattern (→ skip, pre-existing style).
+Also exempt: strings in comments, docstrings, or directory names; values imported from a central registry; arch strings used as **capability guards inside a model-specific or kernel-specific function** (not in the centralized dispatch layer) — e.g., `gfx_name.startswith("gfx1201")` inside `activation.py`'s `_detect_gfx1201()` function determines backend availability; that check belongs at the detection layer and does not trigger C3.
+Real examples: hardcoded `576` in `_bind_kv_cache_to_modules()` instead of `kv_lora_rank + qk_rope_head_dim` — breaks any MLA variant where the sum ≠ 576 (ATOM#860 → fire C3); `'gfx942'` already in `attention_mla.py` and new `+` line extends same pattern (→ skip, pre-existing style); `gcnArchName.startswith("gfx1201")` in a dedicated `_detect_gfx1201()` helper (ATOM#749 → skip, capability guard).
 → `⚠️ C3: new arch-specific [string/constant] hardcoded in dispatch — derive from config or named constant`
 
 ---
@@ -297,6 +308,13 @@ Trigger: ATOM code passes a freshly-allocated `torch.empty()` tensor to an aiter
 Severity: 🔴 for atomic accumulation (atomic_fmax, atomicAdd) — garbage propagates into every output element. ⚠️ for partial-sum buffers where a zero-weight coefficient mathematically cancels the contribution (e.g., online softmax with empty batch: `exp(-inf) × garbage = 0`); still flag because `0.0 × NaN = NaN` on IEEE hardware if the allocator returns dirty pages.
 Real example (aiter#4015): yzhou103: "AiterTensor::empty does not zero-initialize... garbage in v_amax silently corrupts descale."
 → `🔴 D1: [buffer] passed to atomic kernel not zero-initialized — use torch.zeros not torch.empty`
+
+**D1b — Python-side UnboundLocalError from conditional assignment** 🔴
+A variable is assigned inside an `if/elif` branch but referenced unconditionally after the block. Python does not detect this statically — `UnboundLocalError` or `NameError` fires only at runtime when the skipped branch is exercised. Silent in test environments that never hit the uninitialized path.
+Trigger: new `if/elif` gate assigns a variable (`result = ...`) on some branches; a later line references it without a pre-block default. Check: is there a `var = None` or `var = default_val` before the if-block?
+Exception: if there is a definitive `else` branch that also assigns the variable, or if the variable is only ever used inside the branch that assigns it.
+Real example (ATOM#860): `needs_independent_noise` returned from `prepare_model()` tuple but assigned only in one branch of `prefill_forward` — other branch paths raised `NameError` when the sampler tried to use it.
+→ `🔴 D1b: [var] assigned only inside [branch] but referenced unconditionally — add [var = default] before the if-block`
 
 **D2 — New default path without rollback env-var** ⚠️
 New implementation replaces existing default before wide validation: is there an env var to revert?
@@ -380,6 +398,13 @@ HIP/CUDA streams execute concurrently by default. A tensor produced on stream A 
 Trigger: diff introduces a non-default `torch.cuda.Stream`, passes an explicit `stream=` argument to a kernel, or prepares weights/KV buffers on a side stream at model-load time that are later consumed during forward pass on the compute stream. Check: is there `stream.synchronize()`, `stream.wait_stream(other)`, `hipEventRecord` + `hipStreamWaitEvent`, or `torch.cuda.current_stream().wait_stream(other)` between the last write on stream A and the first read on stream B?
 → `🔴 G1: [tensor] written on [stream A] consumed on [stream B] without sync — add stream.wait_stream() or hipStreamWaitEvent`
 
+**G1b — Blocking queue.get() without timeout in production serving code** ⚠️
+`queue.get()` without `timeout=` in a worker or service thread that depends on an external producer (decode loop, stream consumer, request handler). If the producer exits abnormally, the worker blocks forever — no crash, no log, hung process.
+Trigger: `queue.get()` or `asyncio.Queue.get()` inside a `while True:` worker loop in production serving paths (entrypoints, engine loop, scheduler) without `timeout=` and without a corresponding `except queue.Empty` / `asyncio.TimeoutError` handler or a `done` flag.
+Exception: test code, CLI tools, or one-shot scripts where a hang is detectable (CI timeout, interactive TTY).
+Real example (ATOM#789): `loop.call_soon_threadsafe` routes incremental detokenizer state mutations to the event-loop thread — this is correct and is NOT a G1b violation.
+→ `⚠️ G1b: [worker] blocks on queue.get() without timeout — add timeout= and handle Empty/TimeoutError to survive producer failure`
+
 ---
 
 ### Performance Evidence (always check)
@@ -419,7 +444,7 @@ Real example: aiter#4166 — `shuffle_weight` excluded from timing; claimed 1.14
 | Unrelated files | Files with no connection to PR purpose | `⚠️ HK2: [file] appears unrelated` |
 | Bug fix without test | No regression test or repro script | `📝 HK3: bug fix without test — how to prevent regression?` |
 | TODO/stub in new path | `# TODO`, `# FIXME`, `raise NotImplementedError`, lone `pass` on a `+` line inside a new branch | `⚠️ HK4: [location] — incomplete implementation in new code path, will silently not execute on default path` |
-| Undocumented new env var | `os.environ.get("ATOM_...` or `os.environ.get("AITER_...` on a `+` line | `📝 HK5: new env var [NAME] not documented — add to README or known knobs list` |
+| Undocumented new env var | `os.environ.get("ATOM_...` or `os.environ.get("AITER_...` on a `+` line | `📝 HK5: new env var [NAME] — register in atom/envs.py AND document in README` |
 | Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ HK6: reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
 | New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 HK7: new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
 
