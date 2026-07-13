@@ -15,25 +15,6 @@
   ],
   "models": [
     {
-      "display": "DeepSeek-R1-0528",
-      "path": "deepseek-ai/DeepSeek-R1-0528",
-      "prefix": "deepseek-r1-0528",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 8, "kv_cache_dtype": "fp8" },
-      "variants": [
-        { "label": "", "suffix": "", "conc_max": 256 },
-        {
-          "label": "MTP3",
-          "suffix": "-mtp3",
-          "extra_args": "--method mtp --num-speculative-tokens 3",
-          "bench_args": "--use-chat-template",
-          "conc_min": 4,
-          "conc_max": 256
-        }
-      ]
-    },
-    {
       "display": "DeepSeek-V4-Pro",
       "path": "deepseek-ai/DeepSeek-V4-Pro",
       "prefix": "deepseek-v4-pro",
@@ -42,7 +23,7 @@
       "config": {
         "tp": 8,
         "kv_cache_dtype": "fp8",
-        "extra_args": "--hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'"
+        "extra_args": "--no-enable_prefix_caching"
       },
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },
@@ -65,7 +46,7 @@
           "label": "DPA TBO",
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
-          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_CPU_AFFINITY=1",
+          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
           "conc_min": 256,
           "conc_max": 1024
         },
@@ -108,13 +89,27 @@
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {
-      "display": "GLM-5.1-MXFP4",
-      "path": "amd/GLM-5.1-MXFP4",
-      "prefix": "glm-5.1-fp4",
+      "display": "GLM-5.2-MXFP4",
+      "path": "amd/GLM-5.2-MXFP4",
+      "prefix": "glm-5-2-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 4, "kv_cache_dtype": "fp8" },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "extra_args": "--online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}'"
+      },
+      "variants": [
+        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "MTP3",
+          "suffix": "-mtp3",
+          "extra_args": "--method mtp --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
     },
     {
       "display": "gpt-oss-120b",
@@ -129,31 +124,66 @@
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {
-      "display": "Kimi-K2.5-MXFP4",
-      "path": "amd/Kimi-K2.5-MXFP4",
-      "prefix": "kimi-k25-mxfp4",
+      "display": "Kimi-K2.7-Code-MXFP4",
+      "path": "amd/Kimi-K2.7-Code-MXFP4",
+      "prefix": "kimi-k27-code-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 4, "kv_cache_dtype": "fp8", "trust_remote_code": true },
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "trust_remote_code": true,
+        "extra_args": "--gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"\", \"layer_quant_config\": {\"model.layers.*.self_attn.fused_qkv_a_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.q_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.kv_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.o_proj\": \"ptpc_fp8\"}}'"
+      },
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {
-      "display": "MiniMax-M2.7",
-      "path": "MiniMaxAI/MiniMax-M2.7",
-      "prefix": "MiniMax-M2.7",
+      "display": "MiniMax-M3-MXFP8",
+      "path": "MiniMaxAI/MiniMax-M3-MXFP8",
+      "prefix": "m3-mxfp8",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 2, "kv_cache_dtype": "fp8", "trust_remote_code": true },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "trust_remote_code": true,
+        "extra_args": "--gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}' --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'"
+      },
+      "variants": [
+        { "label": "", "suffix": "", "extra_args": "--max-num-seqs 256" },
+        {
+          "label": "EAGLE3",
+          "suffix": "-eagle3",
+          "extra_args": "--max-num-seqs 256 --method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3 --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
     },
     {
-      "display": "MiniMax-M2.7-MXFP4",
-      "path": "amd/MiniMax-M2.7-MXFP4",
-      "prefix": "MiniMax-M2.7-MXFP4",
+      "display": "MiniMax-M3-MXFP4",
+      "path": "amd/MiniMax-M3-MXFP4",
+      "prefix": "m3-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 1, "kv_cache_dtype": "fp8", "trust_remote_code": true },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "trust_remote_code": true,
+        "extra_args": "--gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}' --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'"
+      },
+      "variants": [
+        { "label": "", "suffix": "", "extra_args": "--max-num-seqs 256" },
+        {
+          "label": "EAGLE3",
+          "suffix": "-eagle3",
+          "extra_args": "--max-num-seqs 256 --method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3 --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
     },
     {
       "display": "Qwen3.5-397B-A17B-FP8",

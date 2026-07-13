@@ -8,9 +8,10 @@ per-fwd index buffers consumed by `sparse_attn_v4_paged_prefill`:
                                   in-chunk SWA tail (one shared buffer).
   - ``kv_indices_prefix_swa``   : Dense path — SWA prior-chunk paged offsets
                                   into `unified_kv`.
-  - ``kv_indices_prefix_csa``   : CSA path — SWA prefix segment written here;
-                                  CSA topk tail kept at ``-1`` (filled per
-                                  layer by ``csa_translate_pack``).
+  - ``kv_indices_prefix_csa``   : CSA path — SWA prefix segment written at the
+                                  slice TAIL; the CSA topk HEAD section is filled
+                                  per layer by ``csa_translate_pack`` (head-CSA /
+                                  tail-SWA convention, matching decode, #1116).
   - ``kv_indices_prefix_hca``   : HCA path — SWA prefix segment + HCA
                                   all-committed compress section, both fully
                                   written.
@@ -22,10 +23,12 @@ entirely on GPU and is invoked AFTER the caller has computed the four
 indptrs via ``torch.cumsum`` (also on GPU).
 
 Caller responsibilities (no copies done here):
-  - Pre-fill ``prefix_csa_indices`` with ``-1`` (e.g. ``tensor.fill_(-1)``).
-    The kernel writes only the SWA prefix segment; the CSA topk tail must
-    stay at the ``-1`` sentinel until ``csa_translate_pack`` fills it per
-    layer. (HCA / Dense buffers are fully written by this kernel.)
+  - The CSA slice is fully covered without any ``-1`` pre-fill: this kernel
+    writes the SWA prefix at the slice TAIL (length ``prefix_swa_count``) and
+    ``csa_translate_pack`` writes the CSA topk at the HEAD (length
+    ``valid_k = slice_len - prefix_swa_count``) per layer — together they cover
+    ``[indptr[t], indptr[t+1])`` with no gap. (HCA / Dense buffers are likewise
+    fully written by this kernel.)
   - Compute and stage the four indptr buffers and the per-seq scalar inputs.
 
 Per-token quantities (kernel-computed from inputs; mirror the formulas in
@@ -55,8 +58,10 @@ def _v4_paged_prefill_indices_kernel(
     cu_seqlens_q_per_seq_ptr,  # [bs] int — per-seq prefix sum start in per-fwd kv tensor
     state_slot_per_seq_ptr,  # [bs] int — per-seq SWA ring slot
     n_committed_hca_per_seq_ptr,  # [bs] int — per-seq HCA compress entry count
-    block_tables_ptr,  # [bs, MAX_BLOCKS] int — per-seq paged block ids
-    bt_stride_bs,  # bytes between block_tables rows
+    block_tables_ptr,  # [bs, MAX_BLOCKS] int — compressed pool block ids (HCA)
+    bt_stride_bs,  # row stride of block_tables
+    swa_block_tables_ptr,  # [bs, MAX_BLOCKS] int — SWA pool block ids
+    swa_bt_stride_bs,  # row stride of swa_block_tables
     # Indptrs (already cumsum'd by caller, all length [T+1]).
     extend_indptr_ptr,
     prefix_swa_indptr_ptr,
@@ -69,15 +74,18 @@ def _v4_paged_prefill_indices_kernel(
     prefix_hca_indices_ptr,
     # Constants.
     win: tl.constexpr,
-    cs,  # win_with_spec — SWA ring stride (NOT constexpr because varies w/ mtp_k)
-    swa_pages,  # state_slot count * cs — boundary into HCA compress section
+    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
+    swa_pages,  # num_blocks * block_size — boundary into HCA compress section
+    HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
 ):
     """One program per token. Writes four per-token segments:
 
     - extend         : ``[extend_indptr[t], extend_indptr[t]+extend_count[t])``
-    - prefix SWA     : ``[*_swa_indptr[t], *_swa_indptr[t]+prefix_swa_count[t])``
-                        in all three of swa / csa / hca prefix buffers
+    - prefix SWA     : in swa / hca prefix buffers at the slice HEAD
+                        ``[*_indptr[t], *_indptr[t]+prefix_swa_count[t])``; in the
+                        csa prefix buffer at the slice TAIL
+                        ``[csa_indptr[t+1]-prefix_swa_count[t], csa_indptr[t+1])``
     - HCA compress   : ``[prefix_hca_indptr[t]+prefix_swa_count[t], +n_hca[bid])``
                         in prefix_hca_indices
 
@@ -91,8 +99,15 @@ def _v4_paged_prefill_indices_kernel(
     pos = tl.load(positions_ptr + t)
     chunk_start = tl.load(chunk_start_per_seq_ptr + bid)
     cu_q = tl.load(cu_seqlens_q_per_seq_ptr + bid)
-    state_slot = tl.load(state_slot_per_seq_ptr + bid)
-    n_hca = tl.load(n_committed_hca_per_seq_ptr + bid)
+    # Per-token CAUSAL HCA visibility: token at `pos` may see only the
+    # `(pos+1)//HCA_RATIO` compressed groups committed up to its own position
+    # (matches the reference `get_compress_topk_idxs` prefill mask, and mirrors
+    # the CSA `(pos+1)//4` cap). Without this cap every token saw the per-seq
+    # `n_committed_hca = ctx_end//128`, which over-reads FUTURE groups and makes
+    # a token's output depend on the forward's total length (chunked != single).
+    n_hca = tl.minimum(
+        (pos + 1) // HCA_RATIO, tl.load(n_committed_hca_per_seq_ptr + bid)
+    )
 
     # Per-token derived quantities (single-pass arithmetic).
     token_pos_in_chunk = pos - chunk_start
@@ -110,16 +125,35 @@ def _v4_paged_prefill_indices_kernel(
     tl.store(extend_indices_ptr + ext_base + i, ext_start_row + i, mask=ext_mask)
 
     # ---- SWA prefix paged offsets: written to all three prefix buffers ----
-    # paged = state_slot * cs + ((swa_low + k) % cs), k in [0, prefix_swa_count)
+    # paged-SWA: content-address each prior-chunk window position via
+    # block_tables (same physical block as the compressed cache) so a
+    # cross-request prefix-cache hit reads the original request's SWA instead of
+    # a stale per-request ring (issue #1417):
+    #   paged = block_tables[bid, gp//block_size]*block_size + gp%block_size,
+    #   gp = swa_low + k, k in [0, prefix_swa_count)
     swa_base_swa = tl.load(prefix_swa_indptr_ptr + t)
-    swa_base_csa = tl.load(prefix_csa_indptr_ptr + t)
     swa_base_hca = tl.load(prefix_hca_indptr_ptr + t)
     swa_mask = i < prefix_swa_count
     global_pos = swa_low + i
-    ring_idx = global_pos - (global_pos // cs) * cs  # global_pos % cs
-    paged = state_slot * cs + ring_idx
+    swa_blk = global_pos // block_size
+    swa_phys = tl.load(
+        swa_block_tables_ptr + bid * swa_bt_stride_bs + swa_blk,
+        mask=swa_mask,
+        other=0,
+    )
+    paged = swa_phys * block_size + (global_pos - swa_blk * block_size)
     tl.store(prefix_swa_indices_ptr + swa_base_swa + i, paged, mask=swa_mask)
-    tl.store(prefix_csa_indices_ptr + swa_base_csa + i, paged, mask=swa_mask)
+    # CSA buffer: the SWA prefix goes at the slice TAIL. `csa_translate_pack`
+    # writes the CSA topk section at the slice HEAD
+    # `[indptr[t], indptr[t]+valid_k)` (valid_k = slice_len - prefix_swa_count),
+    # so the SWA prefix must occupy `[indptr[t+1]-prefix_swa_count, indptr[t+1])`.
+    # Writing it at the head (the pre-#1116 layout) collides with the CSA topk
+    # head write and leaves the tail uninitialized — #1116 moved decode and
+    # csa_translate_pack to this head-CSA / tail-SWA convention but missed this
+    # prefill writer, corrupting chunked-prefill CSA slices (prefix_swa_count>0).
+    csa_end = tl.load(prefix_csa_indptr_ptr + t + 1)
+    csa_tail_base = csa_end - prefix_swa_count
+    tl.store(prefix_csa_indices_ptr + csa_tail_base + i, paged, mask=swa_mask)
     tl.store(prefix_hca_indices_ptr + swa_base_hca + i, paged, mask=swa_mask)
 
     # ---- HCA compress section: block_tables[bid, k] for k in [0, n_hca) ----
@@ -147,6 +181,7 @@ def write_v4_paged_prefill_indices(
     state_slot_per_seq: torch.Tensor,
     n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
+    swa_block_tables: torch.Tensor,
     extend_indptr: torch.Tensor,
     prefix_swa_indptr: torch.Tensor,
     prefix_csa_indptr: torch.Tensor,
@@ -157,8 +192,9 @@ def write_v4_paged_prefill_indices(
     prefix_hca_indices: torch.Tensor,
     T: int,
     win: int,
-    cs: int,
+    block_size: int,
     swa_pages: int,
+    hca_ratio: int = 128,
 ) -> None:
     """One-shot GPU build of the V4 paged-prefill index buffers.
 
@@ -168,9 +204,11 @@ def write_v4_paged_prefill_indices(
     no D2H, no allocator churn beyond the persistent buffers the caller owns.
 
     Caller is responsible for:
-      1. Pre-filling ``prefix_csa_indices`` with ``-1`` so the CSA topk
-         tail stays sentinel-marked until ``csa_translate_pack`` fills it
-         per layer. (Use ``prefix_csa_indices[:csa_total].fill_(-1)``.)
+      1. Sizing ``prefix_csa_indices`` so each token's slice is
+         ``prefix_swa_count[t] + csa_valid_k[t]`` long. No ``-1`` pre-fill is
+         needed: this kernel writes the SWA prefix at the slice tail and
+         ``csa_translate_pack`` writes the CSA topk at the head per layer,
+         jointly covering the whole slice.
       2. Computing the four indptr cumsums (e.g. via ``torch.cumsum`` over
          the per-token count vectors).
       3. Computing ``bid_per_token`` (e.g.
@@ -198,8 +236,9 @@ def write_v4_paged_prefill_indices(
       extend_indices:            ``[ext_total]`` int OUT — fully written.
       prefix_swa_indices:        ``[swa_total]`` int OUT — fully written.
       prefix_csa_indices:        ``[csa_total]`` int OUT — SWA prefix
-                                  segment written here; CSA topk tail
-                                  PRESERVED (caller pre-fills -1).
+                                  segment written at the slice TAIL; CSA topk
+                                  HEAD section filled per layer by
+                                  ``csa_translate_pack``.
       prefix_hca_indices:        ``[hca_total]`` int OUT — fully written.
       T:                         int — token count (grid size).
       win:                       int — SWA window size (per-token SWA cap).
@@ -236,6 +275,8 @@ def write_v4_paged_prefill_indices(
         n_committed_hca_per_seq,
         block_tables,
         block_tables.stride(0),
+        swa_block_tables,
+        swa_block_tables.stride(0),
         extend_indptr,
         prefix_swa_indptr,
         prefix_csa_indptr,
@@ -245,8 +286,9 @@ def write_v4_paged_prefill_indices(
         prefix_csa_indices,
         prefix_hca_indices,
         win=win,
-        cs=cs,
+        block_size=block_size,
         swa_pages=swa_pages,
+        HCA_RATIO=hca_ratio,
         BLOCK_N=BLOCK_N,
     )
 
@@ -260,6 +302,7 @@ def write_v4_paged_prefill_indices_reference(
     state_slot_per_seq: torch.Tensor,
     n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
+    swa_block_tables: torch.Tensor,
     extend_indptr: torch.Tensor,
     prefix_swa_indptr: torch.Tensor,
     prefix_csa_indptr: torch.Tensor,
@@ -270,15 +313,17 @@ def write_v4_paged_prefill_indices_reference(
     prefix_hca_indices: torch.Tensor,
     T: int,
     win: int,
-    cs: int,
+    block_size: int,
     swa_pages: int,
+    hca_ratio: int = 128,
 ) -> None:
     """Pure-Python equivalent of ``write_v4_paged_prefill_indices``.
     Per-token Python loop — slow but readable; used for unit-test bit-exact
     verification against the Triton kernel and dump-bisect debugging.
 
-    Same caller contract: ``prefix_csa_indices`` must be pre-filled with
-    ``-1`` for the CSA topk tail to stay sentinel-marked.
+    Same caller contract: the SWA prefix is written to the CSA slice TAIL and
+    the CSA topk head is filled per layer by ``csa_translate_pack`` — together
+    they cover the whole slice, so no ``-1`` pre-fill is needed.
     """
     if T == 0:
         return
@@ -286,9 +331,9 @@ def write_v4_paged_prefill_indices_reference(
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
     cu_q_cpu = cu_seqlens_q_per_seq.cpu().tolist()
-    state_slot_cpu = state_slot_per_seq.cpu().tolist()
     n_hca_cpu = n_committed_hca_per_seq.cpu().tolist()
     block_tables_cpu = block_tables.cpu()
+    swa_block_tables_cpu = swa_block_tables.cpu()
     ext_indptr_cpu = extend_indptr.cpu().tolist()
     swa_indptr_cpu = prefix_swa_indptr.cpu().tolist()
     csa_indptr_cpu = prefix_csa_indptr.cpu().tolist()
@@ -300,8 +345,8 @@ def write_v4_paged_prefill_indices_reference(
         pos = pos_cpu[t]
         chunk_start = cs_per_seq_cpu[bid]
         cu_q = cu_q_cpu[bid]
-        state_slot = state_slot_cpu[bid]
-        n_hca = n_hca_cpu[bid]
+        # Per-token causal HCA cap (mirrors kernel + reference get_compress_topk_idxs).
+        n_hca = min((pos + 1) // hca_ratio, n_hca_cpu[bid])
 
         token_pos_in_chunk = pos - chunk_start
         swa_low = max(pos - win + 1, 0)
@@ -321,7 +366,6 @@ def write_v4_paged_prefill_indices_reference(
 
         # SWA prefix (written to swa / csa / hca prefix buffers)
         sb_swa = swa_indptr_cpu[t]
-        sb_csa = csa_indptr_cpu[t]
         sb_hca = hca_indptr_cpu[t]
         if prefix_swa_count > 0:
             global_pos = torch.arange(
@@ -330,9 +374,19 @@ def write_v4_paged_prefill_indices_reference(
                 device=device,
                 dtype=prefix_swa_indices.dtype,
             )
-            paged = state_slot * cs + (global_pos % cs)
+            # paged-SWA: content-address via block_tables (issue #1417).
+            blk = (global_pos // block_size).long()
+            phys = swa_block_tables_cpu[bid, blk.cpu()].to(
+                device=device, dtype=prefix_swa_indices.dtype
+            )
+            paged = phys * block_size + (
+                global_pos - blk.to(global_pos.dtype) * block_size
+            )
             prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = paged
-            prefix_csa_indices[sb_csa : sb_csa + prefix_swa_count] = paged
+            # CSA: SWA prefix at the slice TAIL (head holds the CSA topk section
+            # filled by csa_translate_pack). See the kernel comment above.
+            csa_end = csa_indptr_cpu[t + 1]
+            prefix_csa_indices[csa_end - prefix_swa_count : csa_end] = paged
             prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = paged
 
         # HCA compress

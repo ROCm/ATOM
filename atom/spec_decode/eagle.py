@@ -159,6 +159,43 @@ class Eagle3DraftBuilder:
             v_scale=getattr(module, "v_scale", None),
         )
 
+    def get_kv_transfer_tensors(self) -> list:
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        runner = self.model_runner
+        if not hasattr(runner, "eagle3_kv_cache"):
+            return []
+
+        regions: list[KVTransferRegion] = []
+        cache = runner.eagle3_kv_cache
+        for layer_id in range(self.num_layers):
+            for kv in range(2):
+                t = cache[kv, layer_id]
+                regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=t.stride(0) * t.element_size(),
+                    )
+                )
+        scale = runner.eagle3_kv_scale
+        if (
+            self.model_runner.config.kv_cache_dtype == "fp8"
+            and scale is not None
+            and scale.numel() > 0
+        ):
+            for layer_id in range(self.num_layers):
+                for kv in range(2):
+                    t = scale[kv, layer_id]
+                    regions.append(
+                        KVTransferRegion(
+                            base_addr=t.data_ptr(),
+                            total_bytes=t.numel() * t.element_size(),
+                            unit_bytes=t.stride(0) * t.element_size(),
+                        )
+                    )
+        return regions
+
 
 class EagleProposer:
 
@@ -223,6 +260,8 @@ class EagleProposer:
         else:
             self.model = model_class(self.config)
 
+        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
+
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
@@ -251,8 +290,6 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         if self.speculative_config.method == "eagle3":
-            # Eagle3: load from a separate draft model checkpoint with
-            # independent embed_tokens and lm_head (no sharing).
             load_model(
                 self.model,
                 self.speculative_config.model,
@@ -415,8 +452,13 @@ class EagleProposer:
                     if i == 0
                     else ret_hidden_states
                 )
-                logits = self.model.compute_logits(sample_hidden_states)
-                new_draft_ids = logits.argmax(dim=-1)
+                # Distributed argmax (all-gather [N, 2] not [N, vocab]) when the
+                # draft supports it; token-identical to compute_logits().argmax().
+                if self._draft_argmax_fused:
+                    new_draft_ids = self.model.compute_draft_token(sample_hidden_states)
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -471,10 +513,20 @@ class EagleProposer:
 
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
-                    # Update context_lens for each draft step (needed by both
-                    # MHA attention and MLA+sparse indexer)
-                    attn_metadata.context_lens[:bs] += 1
-                    positions += 1
+                    fuse_mtp = positions.ndim == 1 and getattr(
+                        self.runner.attn_metadata_builder,
+                        "fuse_mtp_decode_position_update",
+                        False,
+                    )
+                    if fuse_mtp:
+                        mtp_decode_kwargs = {
+                            "update_context_lens": True,
+                            "positions_out": positions,
+                        }
+                    else:
+                        attn_metadata.context_lens[:bs] += 1
+                        positions += 1
+                        mtp_decode_kwargs = {}
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
@@ -486,10 +538,11 @@ class EagleProposer:
                         positions,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
+                        **mtp_decode_kwargs,
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
-                    if has_flat_kv:
+                    if has_flat_kv and "slot_mapping" not in workinfos:
                         # MLA/MHA path: slot derived from flat kv_indices.
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 

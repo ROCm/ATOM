@@ -8,7 +8,7 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, SpeculativeConfig
+from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
 
 logger = logging.getLogger("atom")
 
@@ -30,6 +30,7 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
@@ -38,6 +39,7 @@ class EngineArgs:
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
+    long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
@@ -45,6 +47,7 @@ class EngineArgs:
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
+    cudagraph_mode: str = "FULL"
     load_dummy: bool = False
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
@@ -78,6 +81,14 @@ class EngineArgs:
             type=int,
             default=1,
             help="Tensor parallel size.",
+        )
+        parser.add_argument(
+            "--prefill-context-parallel-size",
+            "-pcp",
+            type=int,
+            default=1,
+            help="Prefill context parallel size. Independent dimension "
+            "(world = tp x pcp); splits the sequence during prefill.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -128,6 +139,15 @@ class EngineArgs:
         )
         parser.add_argument(
             "--level", type=int, default=3, help="The level of compilation (0-3)."
+        )
+        parser.add_argument(
+            "--cudagraph-mode",
+            type=str,
+            default="FULL",
+            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+            help="CUDA graph runtime mode. FULL = manual whole-forward capture "
+            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
+            "attention eager (requires --level 3).",
         )
         parser.add_argument(
             "--load_dummy", action="store_true", help="Skip loading model weights."
@@ -198,6 +218,17 @@ class EngineArgs:
             type=int,
             default=16384,
             help="Maximum number of tokens to batch together in async engine",
+        )
+        parser.add_argument(
+            "--long-prefill-token-threshold",
+            type=int,
+            default=0,
+            help=(
+                "For chunked prefill, cap a single request's per-step prefill "
+                "size at this many tokens. 0 disables the cap (request is only "
+                "bounded by max_num_batched_tokens). Useful to interleave long "
+                "prefills with decode for lower ITL."
+            ),
         )
         parser.add_argument(
             "--attn-prefill-chunk-size",
@@ -305,6 +336,7 @@ class EngineArgs:
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
+            cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],
             cudagraph_capture_sizes=(
                 parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
                 if self.cudagraph_capture_sizes

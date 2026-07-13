@@ -314,13 +314,33 @@ class GenericParser(QuantConfigParser):
 
         quant_dtype = self._infer_dtype(hf_quant_config, config_str)
         quant_type = self._infer_qtype(hf_quant_config, config_str)
+        if quant_method == "fbgemm_fp8":
+            # HF fbgemm_fp8 checkpoints store FP8 weights plus per-tensor
+            # weight_scale tensors, while activations are dynamically quantized.
+            # The config does not spell out a qscheme, so text heuristics would
+            # otherwise leave dense linears as QuantType.No and run GEMM on raw
+            # FP8 weights without scales.
+            quant_type = QuantType.per_Tensor
         # MXFP4 (fp4x2) uses microscaling with 1x32 block scaling by definition
         if quant_dtype == d_dtypes.get("fp4x2") and quant_type not in (
             QuantType.per_1x32,
             QuantType.per_1x128,
         ):
             quant_type = QuantType.per_1x32
-        is_dynamic = hf_quant_config.get("is_dynamic", True)
+        # Mxfp8 ``[1, K]`` block to per_1x32.
+        weight_block_size = hf_quant_config.get("weight_block_size")
+        if (
+            isinstance(weight_block_size, (list, tuple))
+            and len(weight_block_size) == 2
+            and weight_block_size[0] == 1
+        ):
+            quant_type = QuantType.per_1x32
+        # `activation_scheme: static` ships precomputed input_scales in the
+        # checkpoint, so the activation quant is NOT dynamic (load the scales);
+        # `dynamic` (or unspecified) quantizes activations at runtime.
+        act_scheme = (hf_quant_config.get("activation_scheme") or "").lower()
+        default_dynamic = False if act_scheme == "static" else True
+        is_dynamic = hf_quant_config.get("is_dynamic", default_dynamic)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",
         # gpt-oss/HF transformers -> "modules_to_not_convert",
@@ -372,6 +392,27 @@ class GenericParser(QuantConfigParser):
         return torch.bfloat16
 
     def _infer_qtype(self, cfg: dict, config_str: str) -> QuantType:
+        # Prefer explicit HF/compressed-tensors block size over text heuristics
+        # so MXFP8 1x32 and blockscale 1x128/128x128 are not conflated.
+        if "weight_block_size" in cfg:
+            wbs = cfg.get("weight_block_size")
+            if wbs is None:
+                return QuantType.per_Tensor
+            if isinstance(wbs, (list, tuple)) and len(wbs) >= 2:
+                try:
+                    m, n = int(wbs[0]), int(wbs[1])
+                except (TypeError, ValueError):
+                    m = n = None
+                if (m, n) == (1, 128):
+                    return QuantType.per_1x128
+                if (m, n) == (128, 128):
+                    # per_128x128 enum has no consumers in linear.py / GEMM dispatch yet;
+                    # the per_1x128 path already allocates a (out//128, in//128)
+                    # scale grid which is exactly the (128, 128) block layout.
+                    return QuantType.per_1x128
+                if (m, n) == (1, 32):
+                    return QuantType.per_1x32
+                return QuantType.per_1x128
         # Check explicit fields
         for key in ("quant_type", "quantization_type", "scheme"):
             val = cfg.get(key)
@@ -393,26 +434,19 @@ class GenericParser(QuantConfigParser):
                         mapped = _QSCHEME_TO_QUANT_TYPE.get(f"per_{strategy}")
                     if mapped is not None:
                         return mapped
-        # Honor weight_block_size explicitly: a present-but-null value (Mistral
-        # FP8 native checkpoints) means per-tensor, not blockwise.
-        if "weight_block_size" in cfg:
-            wbs = cfg.get("weight_block_size")
-            if wbs is None:
-                return QuantType.per_Tensor
-            if isinstance(wbs, (list, tuple)) and len(wbs) >= 2:
-                m, n = int(wbs[0]), int(wbs[1])
-                if (m, n) == (1, 128):
-                    return QuantType.per_1x128
-                if (m, n) == (128, 128):
-                    # per_128x128 enum has no consumers in linear.py / GEMM dispatch yet;
-                    # the per_1x128 path already allocates a (out//128, in//128)
-                    # scale grid which is exactly the (128, 128) block layout.
-                    return QuantType.per_1x128
-                if (m, n) == (1, 32):
-                    return QuantType.per_1x32
-                return QuantType.per_1x128
         # Fall back to regex heuristics on full config string
         for pattern, qtype in self._QTYPE_PATTERNS.items():
             if re.search(pattern, config_str):
                 return qtype
+        # Bare compressed-tensors / vLLM fp8 (no weight_block_size, no config_groups,
+        # no explicit scheme/strategy) — e.g. Llama-3.1-8B-Instruct-FP8-KV with
+        # {"quant_method":"fp8","activation_scheme":"static"}. `activation_scheme`
+        # distinguishes per-tensor (static) from per-token (dynamic); default fp8 to
+        # per_Tensor so the weight/input scales actually get applied.
+        quant_method = (cfg.get("quant_method") or "").lower()
+        if quant_method in ("fp8", "float8") or re.search(r"fp8|float8", config_str):
+            act_scheme = (cfg.get("activation_scheme") or "").lower()
+            return (
+                QuantType.per_Token if act_scheme == "dynamic" else QuantType.per_Tensor
+            )
         return QuantType.No

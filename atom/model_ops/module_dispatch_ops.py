@@ -21,8 +21,6 @@ the methods listed in each op's docstring.
 Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4 MoE
   - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
-  - torch.ops.aiter.minimax_m3_sparse_attention_native
-      — native ATOM MiniMax-M3 sparse attention
 """
 
 import torch
@@ -56,7 +54,21 @@ def maybe_dual_stream_forward(
     # Under TBO the two micro-batches already overlap on separate threads
     from atom.utils.tbo.ubatching import tbo_active
 
-    if self._use_dual_stream and 0 < num_tokens <= threshold and not tbo_active():
+    # PIECEWISE cudagraph only: dual_stream_moe_forward forks work onto
+    # `alt_stream` and does a caching-allocator alloc there; under PIECEWISE
+    # per-piece capture close the dual stream
+    compilation_config = get_current_atom_config().compilation_config
+    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    is_piecewise_cudagraph = (
+        cudagraph_mode is not None and cudagraph_mode.requires_piecewise_compilation()
+    )
+
+    if (
+        self._use_dual_stream
+        and 0 < num_tokens <= threshold
+        and not tbo_active()
+        and not is_piecewise_cudagraph
+    ):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)
 
@@ -135,48 +147,5 @@ direct_register_custom_op(
     # in, so functionalization stays unaware and skips defensive clones.
     mutates_args=(),
     fake_impl=_indexer_score_topk_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
-
-
-# ---------------------------------------------------------------------------
-# MiniMax-M3 native sparse attention dispatch
-# ---------------------------------------------------------------------------
-#
-# Caller contract (the attention module looked up by `layer_name`):
-#   - `sparse_attention_forward_impl(qkv, positions) -> Tensor`
-#
-# The implementation owns paged-KV/index-cache mutations and reads per-forward
-# attention metadata from the global ForwardContext. Keeping only qkv/positions
-# in the op signature avoids exposing cache mutation side effects to Dynamo.
-
-
-def minimax_m3_sparse_attention_native(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
-    layer_name: str,
-    q_size: int,
-) -> torch.Tensor:
-    layer = get_current_atom_config().compilation_config.static_forward_context[
-        layer_name
-    ]
-    return layer.sparse_attention_forward_impl(qkv, positions)
-
-
-def _minimax_m3_sparse_attention_native_fake(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
-    layer_name: str,
-    q_size: int,
-) -> torch.Tensor:
-    del positions, layer_name
-    return torch.empty((qkv.shape[0], q_size), dtype=qkv.dtype, device=qkv.device)
-
-
-direct_register_custom_op(
-    op_name="minimax_m3_sparse_attention_native",
-    op_func=minimax_m3_sparse_attention_native,
-    mutates_args=(),
-    fake_impl=_minimax_m3_sparse_attention_native_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )

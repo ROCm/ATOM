@@ -15,8 +15,7 @@ pub(crate) struct DispatchCall {
     pub worker_url: String,
 }
 
-type StreamFactory =
-    Box<dyn Fn() -> Result<TokenHandle, EngineError> + Send + Sync + 'static>;
+type StreamFactory = Box<dyn Fn() -> Result<TokenHandle, EngineError> + Send + Sync + 'static>;
 
 enum DispatcherMode {
     Scripted(Mutex<VecDeque<Result<TokenHandle, EngineError>>>),
@@ -62,10 +61,7 @@ impl Dispatcher for MockDispatcher {
             PlacementPlan::Single { worker, .. } => ("single", worker.url().to_string()),
             PlacementPlan::Pair {
                 prefill, decode, ..
-            } => (
-                "pair",
-                format!("{}|{}", prefill.url(), decode.url()),
-            ),
+            } => ("pair", format!("{}|{}", prefill.url(), decode.url())),
         };
         self.call_log.lock().unwrap().push(DispatchCall {
             placement_kind,

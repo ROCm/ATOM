@@ -393,17 +393,32 @@ class CoreManager:
                 copy=False,
             )
         else:
-            # DP ranks, round-robin with counter for load balancing for atom server
+            # DP ranks: honor an explicit atomesh DPA routing hint when present;
+            # otherwise keep the existing round-robin behavior.
             dp_seqs = [[] for _ in range(self.local_engine_count)]
             for seq in seqs:
-                dp_rank = self._rr_counter % self.local_engine_count
+                requested_dp_rank = getattr(seq, "data_parallel_rank", None)
+                if requested_dp_rank is not None:
+                    dp_rank = int(requested_dp_rank)
+                    if not 0 <= dp_rank < self.local_engine_count:
+                        raise ValueError(
+                            f"Invalid data_parallel_rank={dp_rank}; "
+                            f"local_engine_count={self.local_engine_count}"
+                        )
+                else:
+                    dp_rank = self._rr_counter % self.local_engine_count
+                    self._rr_counter += 1
                 dp_seqs[dp_rank].append(seq)
-                self._rr_counter += 1
 
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if rank_seqs:
-                    logger.debug(
-                        f"{self.label}: Add {len(rank_seqs)} requests to DP rank {dp_rank}"
+                    request_ids = [seq.id for seq in rank_seqs]
+                    logger.info(
+                        "%s: Add %d request(s) to DP rank %d, sequence ids: %s",
+                        self.label,
+                        len(rank_seqs),
+                        dp_rank,
+                        request_ids,
                     )
                     self.input_sockets[dp_rank].send_multipart(
                         [

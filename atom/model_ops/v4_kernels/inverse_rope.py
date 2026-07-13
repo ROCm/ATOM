@@ -29,10 +29,11 @@ def _inverse_rope_gptj_kernel(
     BLOCK_RD: tl.constexpr,
     BLOCK_RD_HALF: tl.constexpr,
 ):
-    pid_h = tl.program_id(0)
-    pid_s = tl.program_id(1)
+    # int64 to avoid 32-bit overflow in x_offs (s_offs * stride_x_s).
+    pid_h = tl.program_id(0).to(tl.int64)
+    pid_s = tl.program_id(1).to(tl.int64)
 
-    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S).to(tl.int64)
     d_offs = tl.arange(0, BLOCK_RD)
     s_mask = s_offs < S
 

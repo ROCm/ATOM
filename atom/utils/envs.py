@@ -28,6 +28,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
+    "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
@@ -42,6 +44,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
+    == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
@@ -70,8 +74,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
+    # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
+    # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
+    # max_num_batched_tokens, so a concurrency burst of long-context requests
+    # can drive a single allocation to tens of GiB (see GLM-5.2 OOM #1376).
+    # Target peak (in MiB) for the indexer's dense fp32 logits buffer during
+    # prefill. The indexer chunks along the query (Q) dimension so the buffer
+    # stays ~[q_chunk, total_kv] with q_chunk = budget_bytes // (total_kv * 4);
+    # q_chunk shrinks automatically as total_kv (the unbounded KV dimension)
+    # grows. Under chunked prefill num_rows is already capped by
+    # max_num_batched_tokens, so a fixed row count would not adapt to total_kv
+    # (see GLM-5.2 OOM #1376) — a memory budget does. Each chunk still scores
+    # the full KV, so every row's top-k is exact (no cross-chunk merge). Set to
+    # 0 to disable chunking (always single-shot).
+    "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
+        os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
+    ),
+    # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
+    # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
+    # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
+    # identical to V3.2, so the fusion is math-equivalent to the unfused path. Set to
+    # "0" to fall back to the per-op Python path if a regression is suspected.
+    "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
+        os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
+    ),
+    # Replicate the EAGLE3 draft vocab embedding on every TP rank (full table per
+    # rank, local lookup) instead of sharding it — eliminates the post-embedding
+    # all-reduce. The draft embed is independent of the (sharded) lm_head.
+    "ATOM_EAGLE_REPLICATE_EMBED": lambda: (
+        os.getenv("ATOM_EAGLE_REPLICATE_EMBED", "1") == "1"
     ),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
@@ -85,6 +120,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
@@ -229,6 +265,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default on; set "0" to fall back to the request-boundary balanced split.
     "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
         os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
+    ),
+    # Minimum prefill tokens (per rank) required to TBO-split.
+    "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
+    ),
+    # --- NUMA binding ---
+    # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
+    # and preferred memory. Default off so baseline/pinned A/B stays clean.
+    "ATOM_NUMA_BIND": lambda: os.getenv("ATOM_NUMA_BIND", "0") == "1",
+    # Auto-detect the GPU->NUMA-node mapping (amdsmi first, sysfs fallback).
+    # Default on, so `ATOM_NUMA_BIND=1` alone is zero-config.
+    "ATOM_AUTO_NUMA_BIND": lambda: os.getenv("ATOM_AUTO_NUMA_BIND", "1") == "1",
+    # Explicit per-global-rank node ids (comma separated), overriding auto, e.g.
+    # ATOM_NUMA_NODE="0,0,0,0,1,1,1,1". A single value applies to all ranks.
+    "ATOM_NUMA_NODE": lambda: os.getenv("ATOM_NUMA_NODE", ""),
+    # Raise instead of warn when binding fails.
+    "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
+        os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
 }
 

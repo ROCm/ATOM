@@ -15,7 +15,6 @@ This module provides:
 
 import logging
 import multiprocessing
-import os
 import pickle
 import queue
 import threading
@@ -33,8 +32,10 @@ from atom.utils import (
     init_exit_handler,
     make_zmq_socket,
     resolve_obj_by_qualname,
+    set_process_title,
     shutdown_all_processes,
 )
+from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
 
@@ -71,30 +72,42 @@ class AsyncIOProc:
         *args,
         **kwargs,
     ):
-        # Per-rank CPU/NUMA pinning. Must run before any large allocation so
-        # Linux first-touch places memory on the local NUMA node (implicit
-        # membind without libnuma). Gated by env so baseline/pinned A/B is free.
-        # The global GPU index is dp_rank * tp_size + tp_rank (see
-        # engine_core_mgr GPU assignment); the `rank` arg is only the TP-local
-        # rank, which is always 0 under DP-attention (tp_size == 1 per engine).
-        if os.environ.get("ATOM_CPU_AFFINITY", "0") == "1":
-            try:
-                cfg = args[0]
-                tp_size = cfg.tensor_parallel_size
-                dp_size = cfg.parallel_config.data_parallel_size
-                dp_rank = cfg.parallel_config.data_parallel_rank
-                world = dp_size * tp_size
-                gpu = dp_rank * tp_size + rank
-                per = os.cpu_count() // world
-                lo = gpu * per
-                os.sched_setaffinity(0, set(range(lo, lo + per)))
-                logger.info(
-                    f"AsyncIOProc({label}): gpu={gpu}/{world} "
-                    f"pinned to cores {lo}-{lo + per - 1}"
-                )
-            except Exception as e:
-                logger.warning(f"AsyncIOProc({label}): CPU affinity skipped: {e}")
+        # Bind this worker's lifetime to its parent EngineCore: if the parent
+        # exits for any reason, have the kernel reap this process immediately
+        # instead of leaving it orphaned. A ModelRunner worker holds a large GPU
+        # allocation and the custom all-reduce IPC resources; an orphan blocks
+        # forever in busy_loop() on the shm dequeue while keeping those pinned,
+        # causing the stale-IPC all-reduce crash on the next restart. Must be
+        # armed here, before any GPU / IPC state is created.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
+
+        # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
+        # Auto-detects the GPU's local node by default; gated by
+        # ATOM_NUMA_BIND. Must run before any large allocation / native
+        # (mooncake) thread spawn so the mask is inherited by child threads and
+        # first-touch lands memory locally. The global GPU index is
+        # dp_rank*tp_size+tp_rank (engine_core_mgr GPU assignment).
+        try:
+            cfg = args[0]
+            gpu = (
+                cfg.parallel_config.data_parallel_rank * cfg.tensor_parallel_size + rank
+            )
+            numa_bind_to_node(gpu, label)
+        except Exception as e:
+            logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
+        # Set process title so this GPU worker is distinguishable by rank in
+        # ps/top/rocm-smi (otherwise all workers show as "python").
+        try:
+            cfg = args[0]
+            if cfg.parallel_config.data_parallel_size > 1:
+                set_process_title(f"DP{cfg.parallel_config.data_parallel_rank}TP{rank}")
+            else:
+                set_process_title(f"TP{rank}")
+        except Exception:
+            set_process_title(f"TP{rank}")
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads: list[threading.Thread] = []

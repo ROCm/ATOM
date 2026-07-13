@@ -13,6 +13,7 @@ from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils import envs
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 logger = logging.getLogger("atom")
@@ -54,6 +55,35 @@ class LLMEngine:
         if data_parallel_master_port is not None:
             config.parallel_config.data_parallel_master_port = data_parallel_master_port
         self.data_parallel_size = data_parallel_size
+        # PCP and DP-attention are not yet compatible: PCP stripe-splits
+        # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
+        # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
+        # the FULL (un-split) token count, so all_gatherv asserts
+        # `1/pcp_size != full`.
+        if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) combined with "
+                "--enable-dp-attention is not supported yet (may be supported "
+                "in a future release): PCP splits tokens to 1/pcp_size while "
+                "DP-attention's id-gather expects the full token count, "
+                "causing an all_gatherv size mismatch. For now, disable one of "
+                "them (use -tp N -pcp M without DP-attention, or -dp N "
+                "--enable-dp-attention without -pcp)."
+            )
+        # PCP and TBO (two-batch overlap) are not yet compatible: TBO's
+        # UBatchWrapper calls ForCausalLM.forward once per micro-batch with a
+        # sub-slice of tokens, and PCP stripe-splits at that entry — so each
+        # ubatch would be split independently (double-split), giving each rank
+        # ~1/(2*pcp) tokens and a corrupted all-gather restore.
+        if config.prefill_context_parallel_size > 1 and config.enable_tbo:
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) combined with "
+                "--enable-tbo is not supported yet (may be supported in a "
+                "future release): TBO calls ForCausalLM.forward per micro-batch "
+                "with a token sub-slice, so PCP would stripe-split each ubatch "
+                "independently (double-split) and corrupt the output. For now, "
+                "disable one of them."
+            )
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
@@ -211,7 +241,9 @@ class LLMEngine:
         logger.info("Profiling started")
 
     def stop_profile(self) -> List[Dict[str, Any]]:
-        responses = self.core_mgr.broadcast_utility_command_sync("stop_profile")
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "stop_profile", timeout=envs.ATOM_PROFILER_TIMEOUT
+        )
         return [resp.get("result", {}) for resp in responses]
 
     def print_mtp_statistics(self):

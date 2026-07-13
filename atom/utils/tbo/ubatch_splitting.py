@@ -14,6 +14,37 @@ from atom.utils.forward_context import AttentionMetaData
 logger = logging.getLogger("atom")
 
 
+def derive_prefill_lens_from_positions(
+    positions,
+    full_cu_seqlens_q,
+    ub_slice,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (extend_lens, seq_lens) for a prefill ubatch.
+
+    ``positions`` are the absolute positions for this ubatch's new tokens.
+    ``seq_lens`` are the total visible sequence lengths for sparse metadata,
+    preserving the absolute prefix length of a straddled request instead of
+    treating the ubatch as a standalone prompt.
+    """
+    rs = ub_slice.request_slice
+    ts = ub_slice.token_slice
+    ub_num_reqs = rs.stop - rs.start
+    positions_np = np.asarray(positions)
+    full_cu = np.asarray(full_cu_seqlens_q)
+
+    req_global_starts = full_cu[rs.start : rs.stop].astype(np.int64)
+    req_global_ends = full_cu[rs.start + 1 : rs.stop + 1].astype(np.int64)
+    clamped_starts = np.maximum(req_global_starts, ts.start)
+    clamped_ends = np.minimum(req_global_ends, ts.stop)
+    extend_lens = (clamped_ends - clamped_starts).astype(np.int32)
+
+    ub_cu = np.zeros(ub_num_reqs + 1, dtype=np.int32)
+    np.cumsum(extend_lens, dtype=np.int32, out=ub_cu[1:])
+    start_positions = positions_np[ub_cu[:ub_num_reqs]].astype(np.int32)
+    seq_lens = (start_positions + extend_lens).astype(np.int32)
+    return extend_lens, seq_lens
+
+
 @dataclass
 class UBatchSlice:
     """Describes which portion of a batch belongs to a micro-batch."""
@@ -27,7 +58,7 @@ def maybe_create_ubatch_slices(
     num_tokens: int,
     num_ubatches: int = 2,
     is_prefill: bool = False,
-    num_scheduled_tokens: Optional[list[int]] = None,
+    num_scheduled_tokens: Optional[np.ndarray] = None,
     max_tokens_per_ubatch: Optional[int] = None,
 ) -> Optional[list[UBatchSlice]]:
     """Split a batch into N micro-batch slices.
@@ -51,6 +82,12 @@ def maybe_create_ubatch_slices(
         return None
 
     if num_scheduled_tokens is not None:
+        # Skip TBO for small prefills
+        _min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
+        if _min_pref > 0:
+            _pref_total = int(num_scheduled_tokens[:num_reqs].sum())
+            if _pref_total < _min_pref:
+                return None
         # Prefill: token-balanced split
         if token_split:
             if num_tokens < num_ubatches:

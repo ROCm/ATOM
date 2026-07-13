@@ -1,0 +1,105 @@
+name: Notify Teams on CI failure
+
+# Posts a Teams message when a native nightly/release workflow fails.
+#
+# Design: a single workflow_run listener instead of a notify step in each
+# workflow — zero changes to the target workflows, one place to maintain.
+# Only scheduled (nightly) runs notify; PR/push failures are visible on the PR
+# and would be noisy. Note: workflow_run only fires for the copy of this file
+# on the default branch, so notifications start once this is merged to main.
+#
+# Setup: in Teams create a "Post to a channel when a webhook request is
+# received" workflow (Workflows app / Power Automate; classic Office 365
+# connector Incoming Webhooks were retired in 2026), copy its URL, and add it
+# as the repository secret TEAMS_WEBHOOK_URL. Until it is set, the job runs but
+# no-ops (it does not fail CI).
+#
+# `workflows` matches by the target workflow's `name:` field. "ATOM Test" is
+# shared by atom-test.yaml and atom-mmstar-ci.yaml, so both are covered.
+
+on:
+  workflow_run:
+    workflows:
+      - "ATOM Test"
+      - "ATOM Benchmark"
+      - "Atomesh Accuracy Validation"
+      - "Pre Checkin"
+      - "Nightly Docker Release"
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Post failure to Teams
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      # Passed via env (never interpolated into the shell) to avoid template
+      # injection from workflow/branch names.
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+      WF_NAME: ${{ github.event.workflow_run.name }}
+      WF_EVENT: ${{ github.event.workflow_run.event }}
+      WF_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      WF_SHA: ${{ github.event.workflow_run.head_sha }}
+      WF_URL: ${{ github.event.workflow_run.html_url }}
+    steps:
+      - name: Post to Teams
+        run: |
+          set -euo pipefail
+          if [ -z "${TEAMS_WEBHOOK_URL}" ]; then
+            echo "TEAMS_WEBHOOK_URL not configured; skipping notification."
+            exit 0
+          fi
+          # Adaptive Card wrapped in the message/attachments envelope that the
+          # Teams "Post to a channel when a webhook request is received"
+          # workflow expects. Classic Office 365 connector webhooks (MessageCard)
+          # were retired in 2026; Workflows webhooks render Adaptive Cards and do
+          # not show MessageCard buttons.
+          payload=$(jq -n \
+            --arg name "${WF_NAME}" \
+            --arg event "${WF_EVENT}" \
+            --arg branch "${WF_BRANCH}" \
+            --arg sha "${WF_SHA}" \
+            --arg url "${WF_URL}" \
+            '{
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  body: [
+                    {
+                      type: "TextBlock",
+                      size: "Large",
+                      weight: "Bolder",
+                      color: "Attention",
+                      text: ("❌ " + $name + " failed (" + $event + ")")
+                    },
+                    {
+                      type: "FactSet",
+                      facts: [
+                        {title: "Workflow", value: $name},
+                        {title: "Event", value: $event},
+                        {title: "Branch", value: $branch},
+                        {title: "Commit", value: $sha}
+                      ]
+                    }
+                  ],
+                  actions: [{
+                    type: "Action.OpenUrl",
+                    title: "View run",
+                    url: $url
+                  }]
+                }
+              }]
+            }')
+          curl -sS --fail-with-body -X POST \
+            -H "Content-Type: application/json" \
+            -d "${payload}" \
+            "${TEAMS_WEBHOOK_URL}"

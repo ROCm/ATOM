@@ -6,7 +6,13 @@ from dataclasses import dataclass
 import torch
 import logging
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
+
+# vLLM does not expose a stable prefill/decode flag for MORI launch-config
+# selection, so use a plugin-scoped token-count threshold instead
+VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
 
 
 @dataclass
@@ -122,6 +128,17 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     vllm_scheduler_config = config.scheduler_config
     vllm_cache_config = config.cache_config
     vllm_parallel_config = config.parallel_config
+    use_dp_ep = (
+        vllm_parallel_config.enable_expert_parallel
+        and vllm_parallel_config.data_parallel_size > 1
+    )
+
+    # TODO: support moe chunking in future
+    if use_dp_ep and envs.is_set("VLLM_MOE_DP_CHUNK_SIZE"):
+        logger.warning(
+            "vLLM-ATOM DP+EP ignores VLLM_MOE_DP_CHUNK_SIZE because the vLLM-ATOM path "
+            "does not currently implement MoE chunking"
+        )
 
     # here use the ATOM compilation config, as the ATOM compile policy is used
     # instead of vLLM one for torch compile, while for cuda graph capture,
@@ -164,6 +181,8 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         getattr(config, "speculative_config", None)
     )
 
+    vllm_enable_dbo = getattr(vllm_parallel_config, "enable_dbo", False)
+
     return Config(
         model=vllm_model_config.model,
         trust_remote_code=getattr(vllm_model_config, "trust_remote_code", False),
@@ -186,6 +205,11 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         enable_expert_parallel=vllm_parallel_config.enable_expert_parallel,
         master_addr=None,
         enable_dp_attention=False,
+        # vLLM EP shards MoE across the flattened DP x TP device space (and
+        # therefore disables fused shared experts); native uses per-DP MoE.
+        moe_ep_flatten_tp_across_dp=vllm_parallel_config.enable_expert_parallel,
+        enable_tbo=vllm_enable_dbo,
+        enable_tbo_decode=vllm_enable_dbo,
         plugin_config=plugin_config,
         speculative_config=atom_speculative_config,
         online_quant_config=(getattr(config, "additional_config", None) or {}).get(
@@ -409,7 +433,7 @@ def _generate_atom_config_from_rtpllm_config(config: Any):
 
     return Config(
         model=rtpllm_model_config.ckpt_path,
-        max_num_batched_tokens=max(16384, max_generate_batch_size),
+        max_num_batched_tokens=max(max_model_len, max_generate_batch_size),
         max_num_seqs=max_generate_batch_size,
         max_model_len=max_model_len,
         gpu_memory_utilization=0.9,

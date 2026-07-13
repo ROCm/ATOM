@@ -3,23 +3,25 @@ name: ATOM SGLang Test
 on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
-    types: [opened, synchronize, reopened, ready_for_review, closed]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
       - 'atom/plugin/vllm/**'
       - 'atom/mesh/**'
+      - '.github/benchmark/models_atomesh.yaml'
+      - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-*.yaml'
-      - '.github/scripts/atomesh_*.sh'
-      - '.github/dashboard/atomesh_*.html'
       - '.github/workflows/atom-vllm-*.yaml'
       - '.github/benchmark/oot_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
+  pull_request_review:
+    types: [submitted]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'pull_request_review' && github.event.review.state == 'approved') }}
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
@@ -31,8 +33,42 @@ env:
 
 jobs:
   # ---------- SGLANG CI path (pull_request only) ----------
+  ci-gate:
+    name: Check Heavy CI Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Check approval and label gate
+        id: gate
+        env:
+          CI_GATE_LABELS: ci:full,ci:sglang
+          CI_GATE_PATHS_IGNORE: |
+            **/*.md
+            docs/**
+            atom/plugin/vllm/**
+            atom/mesh/**
+            .github/workflows/atomesh-*.yaml
+            .github/scripts/atomesh_*.sh
+            .github/dashboard/atomesh_*.html
+            .github/workflows/atom-vllm-*.yaml
+            .github/benchmark/oot_models_accuracy.json
+            LICENSE
+            .gitignore
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash ./.github/scripts/check_heavy_ci_gate.sh
+
   check-signal:
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    needs: [ci-gate]
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
     permissions:
@@ -47,10 +83,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
+          CHECK_SIGNAL_EVENT_NAME: pull_request
+          CHECK_SIGNAL_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha }}
 
   download_aiter_wheel:
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
-    needs: [check-signal]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' }}
+    needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
     outputs:
@@ -226,15 +265,15 @@ jobs:
           echo "aiter_wheel_name=$(basename "$AITER_WHL")" >> "$GITHUB_OUTPUT"
 
       - name: Upload aiter wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
           retention-days: 7
 
   atom-sglang-accuracy:
-    needs: [check-signal, download_aiter_wheel]
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
+    needs: [ci-gate, check-signal, download_aiter_wheel]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' && needs.download_aiter_wheel.result == 'success' }}
     name: Accuracy (${{ matrix.model_name }})
     strategy:
       fail-fast: false
@@ -252,7 +291,7 @@ jobs:
               SGLANG_ENABLE_TORCH_COMPILE=1
               TORCHINDUCTOR_COMPILE_THREADS=128
             accuracy_test_threshold: 0.91
-            runner: linux-atom-mi35x-4
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - model_name: "DeepSeek-R1-FP4 TP4"
             model_path: "amd/DeepSeek-R1-0528-MXFP4-v2"
             extra_args: "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache"
@@ -265,7 +304,7 @@ jobs:
               SGLANG_ENABLE_TORCH_COMPILE=1
               TORCHINDUCTOR_COMPILE_THREADS=128
             accuracy_test_threshold: 0.91
-            runner: linux-atom-mi35x-4
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - model_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
             extra_args: "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
@@ -274,7 +313,7 @@ jobs:
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
             accuracy_test_threshold: 0.76
-            runner: linux-atom-mi35x-4
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - model_name: "DeepSeek-V4-Pro TP8"
             model_path: "deepseek-ai/DeepSeek-V4-Pro"
             extra_args: "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4"
@@ -291,7 +330,7 @@ jobs:
             lm_eval_num_fewshot: 5
             lm_eval_num_concurrent: 8
             accuracy_test_threshold: 0.94
-            runner: atom-mi355-8gpu.predownload
+            runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -350,7 +389,7 @@ jobs:
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Download aiter wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiter-whl
           path: aiter-whl
@@ -464,8 +503,20 @@ jobs:
           if [ -d "/models" ]; then
             MODEL_CACHE_MOUNT="-v /models:/models"
             MODEL_CACHE_DESC="/models (host mount)"
+          elif [ -d "/it-share/models" ]; then
+            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
+            MODEL_CACHE_DESC="/it-share/models (host path)"
+          elif [ -d "/mnt/dcgpuval/models" ]; then
+            MODEL_CACHE_MOUNT="-v /mnt/dcgpuval/models:/models"
+            MODEL_CACHE_DESC="/mnt/dcgpuval/models (host path)"
+          elif [ -d "/shareddata/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
+            MODEL_CACHE_DESC="/shareddata/models (host path)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (host path)"
           else
-            echo "Warning: /models directory not found on runner; using container-local /models."
+            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models and /data/models directory not found on runner; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -487,7 +538,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host --network=host --group-add video \
             --shm-size=16G \
             --privileged \
             --cap-add=SYS_PTRACE \
@@ -585,7 +636,15 @@ jobs:
           fi
 
           echo "RESULT_FILE: $result_file"
-          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
+          flexible_extract_value=$(python3 - "$result_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              data = json.load(f)
+          print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
+          PY
+          )
           echo "Flexible extract value: $flexible_extract_value"
           echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
 
@@ -613,7 +672,7 @@ jobs:
 
       - name: Upload SGLANG artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sglang-${{ matrix.model_name }}-artifacts
           path: |
