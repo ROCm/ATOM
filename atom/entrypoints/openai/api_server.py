@@ -832,8 +832,6 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     engine.io_processor.requests.pop(seq_id, None)
 
 
-
-
 class _ClientDisconnected(Exception):
     """Raised when a non-streaming client hangs up mid-generation."""
 
@@ -909,9 +907,7 @@ async def _race_disconnect(coro, raw_request, request_id):
     if handler_task in done:
         return handler_task.result()
 
-    logger.info(
-        f"Client disconnected (non-stream), aborting request {request_id}"
-    )
+    logger.info(f"Client disconnected (non-stream), aborting request {request_id}")
     raise _ClientDisconnected(request_id)
 
 
