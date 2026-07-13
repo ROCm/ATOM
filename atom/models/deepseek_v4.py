@@ -1370,9 +1370,11 @@ class Indexer(nn.Module):
             # Stash q_scale for the opaque dispatch op (read synchronously by
             # `indexer_score_topk` on this same module); q_fp4 rides the q arg.
             self._q_scale_fp4 = q_scale
-            return torch.ops.aiter.indexer_score_topk(
-                q_fp4, weights, self.prefix, self.index_topk
-            )  # [total_tokens, index_topk] int32
+            # Return (q, weights) like the FP8 path below; the paged dispatch
+            # (`score_topk_from` -> `torch.ops.aiter.indexer_score_topk`) routes
+            # to the FP4 kernels via its uint8 kv_cache check and reads the
+            # stashed `_q_scale_fp4`. q_fp4 (uint8) rides the q_fp8 arg.
+            return q_fp4, weights
 
         q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
         q_scale = torch.empty(
