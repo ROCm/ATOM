@@ -14,6 +14,7 @@ from .protocol import (
     TEXT_COMPLETION_OBJECT,
     CompletionResponse,
 )
+from .streaming_utils import coalesce_ready_chunks, get_chunk_text
 
 logger = logging.getLogger("atom")
 
@@ -66,12 +67,19 @@ async def stream_completion_response(
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
     """
+    # Lazy import to avoid a circular import (api_server imports this module).
+    from atom.entrypoints.openai import api_server
+
+    tokenizer = api_server.tokenizer
+
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
 
     while True:
         chunk_data = await stream_queue.get()
-        new_text = chunk_data["text"]
+        # Drain any already-queued backlog and decode the batch once.
+        chunk_data = coalesce_ready_chunks(chunk_data, stream_queue)
+        new_text = get_chunk_text(chunk_data, tokenizer)
         num_tokens_output += len(chunk_data.get("token_ids", []))
 
         extra_fields: Dict[str, Any] = {}
@@ -208,6 +216,11 @@ async def stream_completion_response_fanout(
     siblings; reusing it avoids re-tokenizing on the event loop at stream
     start.
     """
+    # Lazy import to avoid a circular import (api_server imports this module).
+    from atom.entrypoints.openai import api_server
+
+    tokenizer = api_server.tokenizer
+
     n = len(seq_ids)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
@@ -217,7 +230,8 @@ async def stream_completion_response_fanout(
         idx, chunk_data = await shared_queue.get()
         if finished[idx]:
             continue
-        new_text = chunk_data["text"]
+        # Siblings interleave on one queue, so decode per message (no coalesce).
+        new_text = get_chunk_text(chunk_data, tokenizer)
         num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
 
         extra_fields: Dict[str, Any] = {}
