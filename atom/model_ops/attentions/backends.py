@@ -167,6 +167,28 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return 0
 
+    # ------------------------------------------------------------------ #
+    # Paged sliding-window (SWA) pool — a separate, window-freed KV pool  #
+    # some attention types carve out of the main KV budget.              #
+    # ------------------------------------------------------------------ #
+    # ModelRunner queries these at startup to decide, model-agnostically,
+    # whether to reserve a `num_swa_blocks`-sized SWA pool and deduct its
+    # bytes from the main (compressed) KV pool. A builder that returns >0
+    # from `swa_pool_block_bytes()` opts into the pool; the default 0 means
+    # no separate SWA pool (standard attentions keep all KV in one pool).
+    # This keeps the arch-specific decision inside the builder, not in the
+    # runner.
+
+    def swa_pool_block_bytes(self) -> int:
+        """Bytes of ONE physical SWA-pool block across all attention layers,
+        or 0 (default) if this attention type has no separate paged-SWA pool."""
+        return 0
+
+    def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
+        """Number of blocks to reserve for the paged-SWA pool, or 0 (default).
+        Only consulted when `swa_pool_block_bytes()` > 0."""
+        return 0
+
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict[str, Any]:
@@ -265,6 +287,20 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         for i, block_table in enumerate(batch.block_tables):
             block_tables[i] = 0
             block_tables[i, : len(block_table)] = block_table
+        # paged-SWA: fill the parallel SWA block table in lockstep (decode
+        # path). -1 sentinels (window-freed) are copied verbatim but never
+        # indexed by the SWA kernels.
+        swa_buf = var.get("swa_block_tables")
+        swa_tables = getattr(batch, "swa_block_tables", None)
+        if swa_buf is not None and swa_tables is not None:
+            swa_np = swa_buf.np
+            for i, swa_table in enumerate(swa_tables):
+                swa_np[i] = 0
+                if len(swa_table):
+                    # Clamp window-freed sentinels (-1) to 0: those blocks are
+                    # out of window and never indexed by the SWA kernels, but a
+                    # raw -1 phys would compute a negative paged offset → OOB.
+                    swa_np[i, : len(swa_table)] = [max(0, b) for b in swa_table]
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (

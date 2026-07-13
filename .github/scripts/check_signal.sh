@@ -10,8 +10,16 @@ CHECKS_WORKFLOW_NAME="${CHECKS_WORKFLOW_NAME:-Pre Checkin}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
 RETRY_INTERVAL_SECONDS="${RETRY_INTERVAL_SECONDS:-30}"
 REPO="${GITHUB_REPOSITORY:-}"
+SIGNAL_EVENT_NAME="${CHECK_SIGNAL_EVENT_NAME:-${GITHUB_EVENT_NAME:-}}"
+SIGNAL_HEAD_REF="${CHECK_SIGNAL_HEAD_REF:-}"
+SIGNAL_HEAD_SHA="${CHECK_SIGNAL_SHA:-}"
 
 get_target_branch() {
+  if [ -n "${SIGNAL_HEAD_REF}" ]; then
+    printf '%s\n' "${SIGNAL_HEAD_REF}"
+    return
+  fi
+
   if [ -n "${GITHUB_HEAD_REF:-}" ]; then
     printf '%s\n' "${GITHUB_HEAD_REF}"
     return
@@ -37,8 +45,13 @@ PY
 }
 
 get_target_head_sha() {
-  case "${GITHUB_EVENT_NAME:-}" in
-    pull_request|pull_request_target)
+  if [ -n "${SIGNAL_HEAD_SHA}" ]; then
+    printf '%s\n' "${SIGNAL_HEAD_SHA}"
+    return
+  fi
+
+  case "${SIGNAL_EVENT_NAME}" in
+    pull_request|pull_request_target|pull_request_review)
       python3 - <<'PY'
 import json
 import os
@@ -87,10 +100,10 @@ find_checks_run_id() {
 
   # Nightly and reusable workflows reuse the Pre Checkin result from the
   # original push or pull_request run on the same SHA.
-  if [ -n "${GITHUB_EVENT_NAME:-}" ] \
-    && [ "${GITHUB_EVENT_NAME}" != "schedule" ] \
-    && [ "${GITHUB_EVENT_NAME}" != "workflow_call" ]; then
-    gh_args+=(--event "${GITHUB_EVENT_NAME}")
+  if [ -n "${SIGNAL_EVENT_NAME}" ] \
+    && [ "${SIGNAL_EVENT_NAME}" != "schedule" ] \
+    && [ "${SIGNAL_EVENT_NAME}" != "workflow_call" ]; then
+    gh_args+=(--event "${SIGNAL_EVENT_NAME}")
   fi
 
   gh "${gh_args[@]}" \

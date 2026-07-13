@@ -324,6 +324,8 @@ def qk_norm_rope_maybe_quant(
     swa_cu_seqlens_q: Optional[torch.Tensor] = None,
     swa_cache_size: Optional[int] = None,
     swa_write_per_batch: Optional[int] = None,
+    swa_block_tables: Optional[torch.Tensor] = None,
+    swa_block_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
 
@@ -442,6 +444,8 @@ def qk_norm_rope_maybe_quant(
             swa_kv=swa_kv,
             state_slot_mapping=state_slot_mapping,
             batch_id_per_token=batch_id_per_token,
+            swa_block_tables=swa_block_tables,
+            swa_block_size=swa_block_size,
         )
 
     q_scale = (
@@ -515,24 +519,38 @@ def qk_norm_rope_maybe_quant(
     # requested it (swa_kv provided) AND supplied the fallback's cu_seqlens_q
     # path args.
     if swa_kv is not None:
-        if (
-            swa_cu_seqlens_q is None
-            or swa_cache_size is None
-            or swa_write_per_batch is None
-        ):
+        if swa_cu_seqlens_q is None or swa_write_per_batch is None:
             raise ValueError(
                 "swa_kv requested on the Triton fallback path requires "
-                "swa_cu_seqlens_q, swa_cache_size, and swa_write_per_batch"
+                "swa_cu_seqlens_q and swa_write_per_batch"
             )
-        swa_write(
-            kv_out,
-            positions,
-            swa_cu_seqlens_q,
-            state_slot_mapping,
-            swa_kv,
-            swa_cache_size,
-            swa_write_per_batch,
-        )
+        if swa_block_tables is not None:
+            # paged / content-addressed: same standalone swa_write the caller
+            # would otherwise run, but here so the bridge owns the write on
+            # both backends. block_tables + block_size instead of ring slot.
+            if swa_block_size is None:
+                raise ValueError("paged swa_kv fallback requires swa_block_size")
+            swa_write(
+                kv_out,
+                positions,
+                swa_cu_seqlens_q,
+                swa_block_tables,
+                swa_kv,
+                swa_block_size,
+                swa_write_per_batch,
+            )
+        else:
+            if swa_cache_size is None:
+                raise ValueError("ring swa_kv fallback requires swa_cache_size")
+            swa_write(
+                kv_out,
+                positions,
+                swa_cu_seqlens_q,
+                state_slot_mapping,
+                swa_kv,
+                swa_cache_size,
+                swa_write_per_batch,
+            )
 
     return q_out, kv_out, q_scale, kv_scale
 

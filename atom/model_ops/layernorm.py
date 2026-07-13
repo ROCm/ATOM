@@ -224,6 +224,7 @@ class RMSNorm(nn.Module):
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
         fused_quant: bool = False,
+        fused_quant_emit_bf16: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -234,6 +235,12 @@ class RMSNorm(nn.Module):
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
+        # When the fused AllReduce+RMSNorm+quant path is active AND a downstream
+        # consumer also needs the unquantized (bf16) normed activation (e.g. the
+        # GLM-5.2 DSA indexer, whose wk/weights_proj GEMMs run in BF16), the
+        # kernel additionally emits that bf16 mirror. forward() then returns
+        # ((fp8, scale, bf16), residual) instead of ((fp8, scale), residual).
+        self.fused_quant_emit_bf16 = fused_quant_emit_bf16
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.prefix = prefix
@@ -340,6 +347,44 @@ class RMSNorm(nn.Module):
             assert (
                 residual is not None
             ), "fused_allreduce_rmsnorm requires residual input!"
+            if self.use_fused_quant and self.quant_type.value in (
+                _QV_PER_1X128,
+                _QV_PER_TOKEN,
+            ):
+                # Combined AllReduce + RMSNorm + FP8 quant: the downstream GEMM
+                # (e.g. fused_qkv_a_proj) consumes the (fp8, scale) output
+                # directly, dropping a standalone per-token/per-group quant kernel
+                # from the hot path. `_aiter_transpose_scale` (resolved at init)
+                # selects the scale layout for that GEMM. The fused kernel does
+                # not support non-contiguous input.
+                if self.fused_quant_emit_bf16:
+                    # Also emit the pre-quant bf16 normed activation for a
+                    # co-consumer that runs in BF16 (GLM-5.2 DSA indexer).
+                    x, residual, x_scale, x_bf16 = (
+                        tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                            x.contiguous(),
+                            residual,
+                            self.weight,
+                            self.eps,
+                            quant_type=self.quant_type,
+                            group_size=128,
+                            transpose_scale=self._aiter_transpose_scale,
+                            emit_bf16=True,
+                        )
+                    )
+                    return (x, x_scale, x_bf16), residual
+                x, residual, x_scale = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                        x.contiguous(),
+                        residual,
+                        self.weight,
+                        self.eps,
+                        quant_type=self.quant_type,
+                        group_size=128,
+                        transpose_scale=self._aiter_transpose_scale,
+                    )
+                )
+                return (x, x_scale), residual
             # tensor_model_parallel_fused_allreduce_rmsnorm does not support non-contiguous input
             x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x.contiguous(),
