@@ -204,7 +204,7 @@ _DSML = "｜DSML｜"
 # The model often DROPS the ``｜DSML｜`` marker and emits bare
 # ``<invoke name=...>``/``<parameter ...>``/``<tool_calls>`` tags, so the marker
 # is matched OPTIONALLY everywhere.
-_OPT = r"(?:" + re.escape(_DSML) + r")?"      # optional ｜DSML｜ prefix
+_OPT = r"(?:" + re.escape(_DSML) + r")?"  # optional ｜DSML｜ prefix
 _DSML_PARAM_RE = re.compile(
     r"<" + _OPT + r'parameter\s+name="(.*?)"(?:\s+string="(true|false)")?\s*>'
     r"(.*?)</" + _OPT + r"parameter>",
@@ -219,10 +219,10 @@ _DSML_INVOKE_RE = re.compile(
 )
 # Region-start markers, both marked and marker-less variants.
 _DSML_STARTS = (
-    "<" + _DSML + "tool_call",   # marked (covers tool_call / tool_calls)
-    "<" + _DSML + "invoke",      # marked invoke
-    "<invoke name=",             # marker-less invoke (common malform)
-    "<tool_calls>",              # marker-less section open
+    "<" + _DSML + "tool_call",  # marked (covers tool_call / tool_calls)
+    "<" + _DSML + "invoke",  # marked invoke
+    "<invoke name=",  # marker-less invoke (common malform)
+    "<tool_calls>",  # marker-less section open
 )
 
 
@@ -248,7 +248,7 @@ def _unwrap_wrapper_args(args: Any, allowed: set) -> Any:
     for _ in range(4):  # bounded against pathological nesting
         if not (isinstance(args, dict) and len(args) == 1):
             break
-        (k, v), = args.items()
+        ((k, v),) = args.items()
         if k not in ("arguments", "input"):
             break
         if allowed and k in allowed:
@@ -304,7 +304,9 @@ def _dsml_coerce(value: str, string_attr: Optional[str], ptype: Any) -> Any:
         return v
 
 
-def _infer_dsml_name(arg_names: set, param_types: Dict[str, Dict[str, Any]]) -> Optional[str]:
+def _infer_dsml_name(
+    arg_names: set, param_types: Dict[str, Dict[str, Any]]
+) -> Optional[str]:
     """Pick the request tool whose parameter set best matches ``arg_names``."""
     best, best_score = None, -1e9
     for name, props in param_types.items():
@@ -334,7 +336,9 @@ def _parse_dsml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
             body = m.group(2) or ""  # None for self-closing <invoke .../>
             types = param_types.get(name, {})
             args: Dict[str, Any] = {
-                pm.group(1): _dsml_coerce(pm.group(3), pm.group(2), types.get(pm.group(1)))
+                pm.group(1): _dsml_coerce(
+                    pm.group(3), pm.group(2), types.get(pm.group(1))
+                )
                 for pm in _DSML_PARAM_RE.finditer(body)
             }
             # Direct-JSON parameter body (DSML "Format 2", also accepted by
@@ -354,7 +358,10 @@ def _parse_dsml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
             calls.append((name, args))
     else:
         # malformed: no complete invoke wrapper -> collect params, infer tool name
-        raw = {pm.group(1): (pm.group(3), pm.group(2)) for pm in _DSML_PARAM_RE.finditer(region)}
+        raw = {
+            pm.group(1): (pm.group(3), pm.group(2))
+            for pm in _DSML_PARAM_RE.finditer(region)
+        }
         if raw:
             name = _infer_dsml_name(set(raw), param_types) or "unknown"
             types = param_types.get(name, {})
@@ -496,7 +503,9 @@ def _minimax_coerce(value: str, ptype: Any) -> Any:
         return v
 
 
-def _parse_minimax(text: str, tools: Optional[list] = None) -> Tuple[str, List[ToolCall]]:
+def _parse_minimax(
+    text: str, tools: Optional[list] = None
+) -> Tuple[str, List[ToolCall]]:
     """Parse MiniMax-M3 tool calls; return (leading_content, tool_calls)."""
     param_types = _build_param_types(tools)
     clean = text.replace(_MINIMAX_NS, "")

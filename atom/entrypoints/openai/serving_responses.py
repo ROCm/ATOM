@@ -11,6 +11,7 @@ reasoning models — the same path claude-local uses via ``/v1/messages``.
 This makes the external ``codex_responses_proxy.py`` unnecessary: Codex can point
 straight at ATOM's ``:9700/v1``.
 """
+
 import itertools
 import json
 import time
@@ -42,9 +43,7 @@ def _text_of(content: Any) -> str:
     return ""
 
 
-def responses_input_to_messages(
-    instructions: Any, inp: Any
-) -> List[Dict[str, Any]]:
+def responses_input_to_messages(instructions: Any, inp: Any) -> List[Dict[str, Any]]:
     """Translate Responses ``instructions`` + ``input`` into OpenAI chat messages.
 
     ``input`` may be a plain string or a list of items: ``message`` /
@@ -92,9 +91,7 @@ def responses_input_to_messages(
                     {
                         "role": "tool",
                         "tool_call_id": item.get("call_id") or item.get("id") or "",
-                        "content": out
-                        if isinstance(out, str)
-                        else json.dumps(out),
+                        "content": out if isinstance(out, str) else json.dumps(out),
                     }
                 )
             elif t == "reasoning":
@@ -109,8 +106,8 @@ _DSML_TOOL_INSTRUCTION = (
     "<exec_command> tags, no prose. Use EXACTLY this syntax (the \uff5c characters "
     "are U+FF5C fullwidth vertical bars, not ASCII '|'):\n"
     "<\uff5cDSML\uff5ctool_calls>\n"
-    "<\uff5cDSML\uff5cinvoke name=\"TOOL_NAME\">\n"
-    "<\uff5cDSML\uff5cparameter name=\"PARAM_NAME\" string=\"true\">VALUE"
+    '<\uff5cDSML\uff5cinvoke name="TOOL_NAME">\n'
+    '<\uff5cDSML\uff5cparameter name="PARAM_NAME" string="true">VALUE'
     "</\uff5cDSML\uff5cparameter>\n"
     "</\uff5cDSML\uff5cinvoke>\n"
     "</\uff5cDSML\uff5ctool_calls>\n"
@@ -130,7 +127,9 @@ def inject_tool_format_instruction(messages):
             if "\uff5cDSML\uff5ctool_calls" not in base:
                 m["content"] = _text_of(base) + _DSML_TOOL_INSTRUCTION
             return messages
-    return [{"role": "system", "content": _DSML_TOOL_INSTRUCTION.strip()}] + list(messages)
+    return [{"role": "system", "content": _DSML_TOOL_INSTRUCTION.strip()}] + list(
+        messages
+    )
 
 
 def responses_tools_to_openai(tools: Any) -> List[Dict[str, Any]]:
@@ -172,17 +171,40 @@ def responses_tools_to_openai(tools: Any) -> List[Dict[str, Any]]:
 # is wrong. So remap known shell-exec aliases onto whatever shell tool the
 # client actually registered this turn. Pure rename; arguments untouched.
 _SHELL_ALIASES = {
-    "exec", "exec_run", "exec_command", "execute_command", "shell", "bash",
-    "sh", "run", "run_command", "run_shell", "execute", "command",
-    "container.exec", "local_shell", "shell_command", "shell_exec",
-    "run_bash", "execute_shell", "bash_command", "run_terminal_cmd",
-    "terminal", "console", "run_shell_command", "runshell",
+    "exec",
+    "exec_run",
+    "exec_command",
+    "execute_command",
+    "shell",
+    "bash",
+    "sh",
+    "run",
+    "run_command",
+    "run_shell",
+    "execute",
+    "command",
+    "container.exec",
+    "local_shell",
+    "shell_command",
+    "shell_exec",
+    "run_bash",
+    "execute_shell",
+    "bash_command",
+    "run_terminal_cmd",
+    "terminal",
+    "console",
+    "run_shell_command",
+    "runshell",
 }
 # Substrings that mark an unknown tool name as a shell/exec call (Codex's
 # non-shell tools contain none of these).
 _SHELL_NAME_TOKENS = ("shell", "exec", "bash", "cmd", "command", "termin", "console")
 _SHELL_TOOL_PREFERENCE = (
-    "exec_command", "shell", "local_shell", "bash", "container.exec",
+    "exec_command",
+    "shell",
+    "local_shell",
+    "bash",
+    "container.exec",
 )
 
 
@@ -226,6 +248,7 @@ def remap_tool_name(name: str, valid: set, shell_tool: Optional[str]) -> str:
 # to /v1/messages, where read/grep ARE native tools).
 def _q(s: Any) -> str:
     import shlex
+
     return shlex.quote(str(s))
 
 
@@ -261,13 +284,32 @@ def _claude_tool_to_shell(
     name: str, a: Dict[str, Any], cwd: Optional[str] = None
 ) -> Optional[str]:
     n = (name or "").lower()
-    fp = (a.get("file_path") or a.get("path") or a.get("filePath")
-          or a.get("filename") or a.get("target_file") or a.get("file"))
+    fp = (
+        a.get("file_path")
+        or a.get("path")
+        or a.get("filePath")
+        or a.get("filename")
+        or a.get("target_file")
+        or a.get("file")
+    )
     pattern = a.get("pattern") or a.get("query") or a.get("regex")
-    path = (a.get("path") or a.get("directory") or a.get("target_directory")
-            or a.get("dir") or ".")
-    if n in ("read", "cat", "view", "view_file", "open", "read_file",
-             "readfile", "openfile"):
+    path = (
+        a.get("path")
+        or a.get("directory")
+        or a.get("target_directory")
+        or a.get("dir")
+        or "."
+    )
+    if n in (
+        "read",
+        "cat",
+        "view",
+        "view_file",
+        "open",
+        "read_file",
+        "readfile",
+        "openfile",
+    ):
         if not fp:
             return None
         off, lim = a.get("offset"), a.get("limit")
@@ -277,8 +319,15 @@ def _claude_tool_to_shell(
         else:
             start, end = 1, 400
         return _read_cmd(str(fp), cwd, start, end)
-    if n in ("grep", "search", "search_file", "ripgrep", "rg", "grep_search",
-             "codebase_search"):
+    if n in (
+        "grep",
+        "search",
+        "search_file",
+        "ripgrep",
+        "rg",
+        "grep_search",
+        "codebase_search",
+    ):
         if not pattern:
             return None
         return f"grep -rn -- {_q(pattern)} {_q(_resolve_dir(path, cwd))}"
@@ -293,8 +342,19 @@ def _claude_tool_to_shell(
 
 
 _SHELL_ARG_ALIASES = (
-    "cmd", "command", "commandline", "command_line", "script", "bash", "sh",
-    "shell", "shell_command", "code", "input", "run", "cmd_string",
+    "cmd",
+    "command",
+    "commandline",
+    "command_line",
+    "script",
+    "bash",
+    "sh",
+    "shell",
+    "shell_command",
+    "code",
+    "input",
+    "run",
+    "cmd_string",
 )
 
 
@@ -309,7 +369,7 @@ def shell_arg_key(openai_tools, shell_tool):
             continue
         params = fn.get("parameters") or {}
         props = params.get("properties") or {}
-        for r in (params.get("required") or []):
+        for r in params.get("required") or []:
             if props.get(r, {}).get("type") in (None, "string"):
                 return r
         if props:
@@ -341,8 +401,12 @@ def _normalize_shell_args(args_json, req):
 
 
 def translate_client_tool(
-    name: str, args_json: str, valid: set, shell_tool: Optional[str],
-    cwd: Optional[str] = None, shell_param: Optional[str] = None,
+    name: str,
+    args_json: str,
+    valid: set,
+    shell_tool: Optional[str],
+    cwd: Optional[str] = None,
+    shell_param: Optional[str] = None,
 ):
     """Return (name, args_json) with Claude read-only tools rewritten to the
     registered shell tool. exec_command's own calls and any already-valid tool
@@ -375,6 +439,7 @@ def extract_cwd(body: Dict[str, Any]) -> Optional[str]:
     """Pull the working directory from Codex's <cwd>...</cwd> environment_context
     (sent in instructions/input), so path fix-ups target the real directory."""
     import re
+
     global _CWD_RE
     if _CWD_RE is None:
         _CWD_RE = re.compile(r"<cwd>\s*([^<\s]+)\s*</cwd>")
@@ -441,33 +506,53 @@ class ResponsesStreamEmitter:
         if o["kind"] == "message":
             mid, cur, txt = o["id"], o["index"], o["text"]
             item = {
-                "id": mid, "type": "message", "role": "assistant",
+                "id": mid,
+                "type": "message",
+                "role": "assistant",
                 "status": "completed",
                 "content": [{"type": "output_text", "text": txt}],
             }
             self.final_output.append(item)
             return [
-                self._ev("response.output_text.done", {
-                    "item_id": mid, "output_index": cur,
-                    "content_index": 0, "text": txt}),
-                self._ev("response.content_part.done", {
-                    "item_id": mid, "output_index": cur, "content_index": 0,
-                    "part": {"type": "output_text", "text": txt}}),
-                self._ev("response.output_item.done", {
-                    "output_index": cur, "item": item}),
+                self._ev(
+                    "response.output_text.done",
+                    {
+                        "item_id": mid,
+                        "output_index": cur,
+                        "content_index": 0,
+                        "text": txt,
+                    },
+                ),
+                self._ev(
+                    "response.content_part.done",
+                    {
+                        "item_id": mid,
+                        "output_index": cur,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": txt},
+                    },
+                ),
+                self._ev(
+                    "response.output_item.done", {"output_index": cur, "item": item}
+                ),
             ]
         # function_call
         fid, cur = o["id"], o["index"]
         item = {
-            "id": fid, "type": "function_call", "status": "completed",
-            "call_id": o["call_id"], "name": o["name"], "arguments": o["args"],
+            "id": fid,
+            "type": "function_call",
+            "status": "completed",
+            "call_id": o["call_id"],
+            "name": o["name"],
+            "arguments": o["args"],
         }
         self.final_output.append(item)
         return [
-            self._ev("response.function_call_arguments.done", {
-                "item_id": fid, "output_index": cur, "arguments": o["args"]}),
-            self._ev("response.output_item.done", {
-                "output_index": cur, "item": item}),
+            self._ev(
+                "response.function_call_arguments.done",
+                {"item_id": fid, "output_index": cur, "arguments": o["args"]},
+            ),
+            self._ev("response.output_item.done", {"output_index": cur, "item": item}),
         ]
 
     def text_delta(self, delta: str) -> List[str]:
@@ -478,17 +563,44 @@ class ResponsesStreamEmitter:
             mid, cur = _rid("msg"), self.out_index
             self.out_index += 1
             self._open = {"kind": "message", "id": mid, "index": cur, "text": ""}
-            out.append(self._ev("response.output_item.added", {
-                "output_index": cur,
-                "item": {"id": mid, "type": "message", "role": "assistant",
-                         "status": "in_progress", "content": []}}))
-            out.append(self._ev("response.content_part.added", {
-                "item_id": mid, "output_index": cur, "content_index": 0,
-                "part": {"type": "output_text", "text": ""}}))
+            out.append(
+                self._ev(
+                    "response.output_item.added",
+                    {
+                        "output_index": cur,
+                        "item": {
+                            "id": mid,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
+                    },
+                )
+            )
+            out.append(
+                self._ev(
+                    "response.content_part.added",
+                    {
+                        "item_id": mid,
+                        "output_index": cur,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    },
+                )
+            )
         self._open["text"] += delta
-        out.append(self._ev("response.output_text.delta", {
-            "item_id": self._open["id"], "output_index": self._open["index"],
-            "content_index": 0, "delta": delta}))
+        out.append(
+            self._ev(
+                "response.output_text.delta",
+                {
+                    "item_id": self._open["id"],
+                    "output_index": self._open["index"],
+                    "content_index": 0,
+                    "delta": delta,
+                },
+            )
+        )
         return out
 
     def tool_start(self, call_id: str, name: str) -> List[str]:
@@ -496,23 +608,45 @@ class ResponsesStreamEmitter:
         fid, cur = _rid("fc"), self.out_index
         self.out_index += 1
         self._open = {
-            "kind": "fc", "id": fid, "index": cur,
-            "call_id": call_id or _rid("call"), "name": name, "args": "",
+            "kind": "fc",
+            "id": fid,
+            "index": cur,
+            "call_id": call_id or _rid("call"),
+            "name": name,
+            "args": "",
         }
-        out.append(self._ev("response.output_item.added", {
-            "output_index": cur,
-            "item": {"id": fid, "type": "function_call", "status": "in_progress",
-                     "call_id": self._open["call_id"], "name": name,
-                     "arguments": ""}}))
+        out.append(
+            self._ev(
+                "response.output_item.added",
+                {
+                    "output_index": cur,
+                    "item": {
+                        "id": fid,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": self._open["call_id"],
+                        "name": name,
+                        "arguments": "",
+                    },
+                },
+            )
+        )
         return out
 
     def tool_args(self, delta: str) -> List[str]:
         if not self._open or self._open["kind"] != "fc" or not delta:
             return []
         self._open["args"] += delta
-        return [self._ev("response.function_call_arguments.delta", {
-            "item_id": self._open["id"], "output_index": self._open["index"],
-            "delta": delta})]
+        return [
+            self._ev(
+                "response.function_call_arguments.delta",
+                {
+                    "item_id": self._open["id"],
+                    "output_index": self._open["index"],
+                    "delta": delta,
+                },
+            )
+        ]
 
     def tool_end(self) -> List[str]:
         return self._close_open()
@@ -546,24 +680,36 @@ def build_responses_object(
     ``tool_calls`` are ATOM ``ToolCall`` objects (``.id``, ``.function`` dict)."""
     output: List[Dict[str, Any]] = []
     if content_text:
-        output.append({
-            "id": _rid("msg"), "type": "message", "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": content_text}],
-        })
+        output.append(
+            {
+                "id": _rid("msg"),
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": content_text}],
+            }
+        )
     for tc in tool_calls or []:
         fn = getattr(tc, "function", None) or {}
         name, args = translate_client_tool(
             fn.get("name", ""), fn.get("arguments", "") or "", valid, shell_tool, cwd
         )
-        output.append({
-            "id": _rid("fc"), "type": "function_call", "status": "completed",
-            "call_id": getattr(tc, "id", None) or _rid("call"),
-            "name": name, "arguments": args,
-        })
+        output.append(
+            {
+                "id": _rid("fc"),
+                "type": "function_call",
+                "status": "completed",
+                "call_id": getattr(tc, "id", None) or _rid("call"),
+                "name": name,
+                "arguments": args,
+            }
+        )
     return {
-        "id": resp_id, "object": "response", "status": "completed",
-        "model": model, "output": output,
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": output,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
