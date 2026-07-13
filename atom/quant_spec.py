@@ -314,6 +314,13 @@ class GenericParser(QuantConfigParser):
 
         quant_dtype = self._infer_dtype(hf_quant_config, config_str)
         quant_type = self._infer_qtype(hf_quant_config, config_str)
+        if quant_method == "fbgemm_fp8":
+            # HF fbgemm_fp8 checkpoints store FP8 weights plus per-tensor
+            # weight_scale tensors, while activations are dynamically quantized.
+            # The config does not spell out a qscheme, so text heuristics would
+            # otherwise leave dense linears as QuantType.No and run GEMM on raw
+            # FP8 weights without scales.
+            quant_type = QuantType.per_Tensor
         # MXFP4 (fp4x2) uses microscaling with 1x32 block scaling by definition
         if quant_dtype == d_dtypes.get("fp4x2") and quant_type not in (
             QuantType.per_1x32,

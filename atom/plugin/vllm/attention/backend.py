@@ -270,9 +270,9 @@ class AiterSparseMlaBackendForVllm(AiterMlaBackendForVllm):
 
     @staticmethod
     def get_impl_cls():
-        from atom.plugin.vllm.attention.layer import AttentionForVllmMLA
+        from atom.plugin.vllm.attention.layer import AttentionForVllmSparseMLA
 
-        return AttentionForVllmMLA
+        return AttentionForVllmSparseMLA
 
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:

@@ -25,11 +25,14 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from atom.utils import envs
 
-if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
+if (
+    envs.ATOM_USE_TRITON_GEMM
+    or envs.ATOM_USE_TRITON_MOE
+    or envs.ATOM_USE_TRITON_MOE_DECODE
+):
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
-        swizzle_scales as swizzle_scales_a8w4,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
@@ -37,25 +40,12 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
         moe_gemm_a4w4,
         mxfp4_quant,
-        swizzle_scales as swizzle_scales_cdna4,
     )
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 from atom.model_ops.moe import MoEActivationQuant
-
-
-def _swizzle_scales_for_kernel(scale, act_quant: MoEActivationQuant):
-    """Swizzle MoE weight scales for the kernel that act_quant selects.
-
-    FP8 (a8w4): arch-agnostic swizzle (CDNA4 on gfx950, GFX1250 on gfx1250).
-    BF16/FP4 (a16w4/a4w4): CDNA4 swizzle on gfx942/gfx950, no swizzle elsewhere.
-    """
-    if act_quant == MoEActivationQuant.FP8:
-        return swizzle_scales_a8w4(scale)
-    # TODO: move arch dispatch into aiter's a4w4/a16w4 swizzle_scales (like a8w4)
-    if get_arch() in ("gfx942", "gfx950"):
-        return swizzle_scales_cdna4(scale), "CDNA4_SCALE"
-    return scale, None
 
 
 def _swizzle_mxfp4(
@@ -69,9 +59,12 @@ def _swizzle_mxfp4(
     N_2,
     K_2,
     TP=1,
-    act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
 ):
-    """Weight swizzle for mxfp4 moe, used for aiter triton mxfp4 moe kernels."""
+    """Weight swizzle for mxfp4 moe, used for aiter triton mxfp4 moe kernels.
+
+    The arch -> SWIZZLE_MX_SCALE label decision lives in aiter
+    (``shuffle_scale_moe(..., return_layout=True)``), so this stays arch-agnostic.
+    """
     assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
 
     # Transposing for expected layout of aiter triton kernels
@@ -81,15 +74,15 @@ def _swizzle_mxfp4(
     w2_scale_triton_layout = w2_scale.transpose(-2, -1)
 
     if N_1 % 32 == 0 and K_1 % (32 * 8) == 0:
-        w1_scale_triton_layout, w1_swizzle_layout = _swizzle_scales_for_kernel(
-            w1_scale_triton_layout, act_quant
+        w1_scale_triton_layout, w1_swizzle_layout = shuffle_scale_moe(
+            w1_scale_triton_layout, return_layout=True
         )
     else:
         w1_swizzle_layout = None
 
     if N_2 % 32 == 0 and K_2 % (32 * 8) == 0:
-        w2_scale_triton_layout, w2_swizzle_layout = _swizzle_scales_for_kernel(
-            w2_scale_triton_layout, act_quant
+        w2_scale_triton_layout, w2_swizzle_layout = shuffle_scale_moe(
+            w2_scale_triton_layout, return_layout=True
         )
     else:
         w2_swizzle_layout = None
@@ -386,4 +379,87 @@ def triton_kernel_fused_experts(
         return output_tensor
 
     output_tensor = output_tensor.view(M, K)
+    return output_tensor
+
+
+def triton_kernel_fused_experts_a8w4_silu_gguu(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_swizzle_layout,
+    w2_swizzle_layout,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 10.0,
+    apply_router_weight_on_input: bool = False,
+) -> torch.Tensor:
+    """Decode-only A8W4 MoE for SiLU models, GGUU (separated ``[gate|up]``).
+
+    GGUU keeps gate and up as contiguous halves, so the per-block SiLU cannot be
+    fused into GEMM1's write-back (a tile spans only gate *or* only up). The
+    activation and quant therefore run as a separate step:
+
+        MXFP8 quant -> GEMM1(a8w4, no swiglu, bf16 [gate|up]) ->
+        fused_clamp_act_mul(SiLU(gate)*up on the halves) ->
+        MXFP8 quant -> GEMM2(a8w4).
+
+    The intermediate is re-quantized with ``downcast_to_mxfp`` (same op as the x
+    path) so GEMM2 sees the identical activation-scale format. Weights are in the
+    preshuffled a8w4 layout with w13 gate/up separated.
+    """
+    assert hidden_states.ndim == 2
+    assert hidden_states.dtype == torch.bfloat16
+
+    gammas = routing_data.gate_scal if routing_data else None
+
+    x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+
+    # GEMM1: raw bf16 [gate|up] output; no fused activation for the separated layout.
+    interm = moe_gemm_a8w4(
+        x_fp8,
+        w1,
+        x_scale,
+        w13_scale,
+        a13_scale,
+        None,
+        w1_bias,
+        routing_data,
+        gather_indx=gather_indx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=w13_swizzle_layout,
+        apply_swiglu=False,
+        out_dtype=torch.bfloat16,
+        preshuffled=True,
+    )
+
+    # Standalone SiLU(gate)*up over the contiguous halves, then MXFP8 quant.
+    interm_act = fused_clamp_act_mul(
+        interm, swiglu_limit=swiglu_limit, activation="silu"
+    )
+    interm_fp8, interm_scale = downcast_to_mxfp(
+        interm_act, torch.float8_e4m3fn, axis=-1
+    )
+
+    output_tensor = moe_gemm_a8w4(
+        interm_fp8,
+        w2,
+        interm_scale,
+        w2_scale,
+        a2_scale,
+        None,
+        w2_bias,
+        routing_data,
+        scatter_indx=scatter_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=w2_swizzle_layout,
+        preshuffled=True,
+    )
+
     return output_tensor

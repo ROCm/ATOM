@@ -516,7 +516,7 @@ const DASHBOARD_MODES = ['Aggregated', 'Disaggregated'];
 const ATOMESH_DATA = {
   updatedAt: Date.UTC(2026, 6, 3, 7, 9, 0),
   backend: 'ATOMesh',
-  hardware: 'MI355X',
+  hardware: window.ATOMESH_HARDWARE || 'MI355X',
   gpuCount: 16,
   rocmVersion: '7.2.4',
   dockerImage: 'rocm/atom-dev:nightly_202607030204',
@@ -536,6 +536,13 @@ function atomeshSummaryHeaderKey(header) {
   return String(header || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+function atomeshHardwareKey(value) {
+  const text = String(value || ATOMESH_DATA.hardware || '').toLowerCase();
+  if (text.includes('mi350')) return 'mi350x';
+  if (text.includes('mi355')) return 'mi355x';
+  return text || 'unknown';
+}
+
 function parseAtomeshSummaryRows(markdown) {
   const lines = String(markdown || '').split(/\r?\n/).filter(line => line.trim().startsWith('|'));
   if (lines.length < 3) return [];
@@ -551,7 +558,7 @@ function parseAtomeshSummaryRows(markdown) {
     return {
       id: `atomesh-summary-${idx}`,
       backend: ATOMESH_DATA.backend,
-      hardware: ATOMESH_DATA.hardware.toLowerCase(),
+      hardware: atomeshHardwareKey(raw.hardware),
       model: raw.model || 'unknown',
       topology: raw.topology || 'unknown',
       islOsl: raw.islosl || '--',
@@ -575,7 +582,154 @@ function parseAtomeshSummaryRows(markdown) {
     };
   }).filter(row => row.model !== 'unknown' || row.topology !== 'unknown');
 }
-const atomeshSummaryRows = parseAtomeshSummaryRows(ATOMESH_DATA.summaryMarkdown);
+
+function parseAtomeshPerfPointExtra(extra) {
+  if (typeof extra !== 'string' || !extra) return null;
+  const meta = {};
+  let point = null;
+  for (const rawPart of extra.split(' | ')) {
+    const part = rawPart.trim();
+    if (part.startsWith('Run: ')) {
+      meta.runUrl = part.slice(5).trim();
+    } else if (part.startsWith('perf_point=')) {
+      try {
+        point = JSON.parse(decodeURIComponent(part.slice('perf_point='.length)));
+      } catch (_) {
+        point = null;
+      }
+    } else {
+      const eq = part.indexOf('=');
+      if (eq > 0) meta[part.slice(0, eq)] = part.slice(eq + 1);
+    }
+  }
+  return point ? { point, meta } : null;
+}
+
+function atomeshPointNumber(point, key) {
+  const value = point?.[key];
+  return Number.isFinite(value) ? value : parseAtomeshNumber(value);
+}
+
+function atomeshPointRow(point, meta, idx) {
+  const isl = atomeshPointNumber(point, 'isl');
+  const osl = atomeshPointNumber(point, 'osl');
+  const concurrency = atomeshPointNumber(point, 'concurrency');
+  const interactivity = atomeshPointNumber(point, 'interactivity');
+  const totalTputPerGpu = atomeshPointNumber(point, 'tput_per_gpu');
+  const outputTputPerGpu = atomeshPointNumber(point, 'output_tput_per_gpu');
+  const gsm8k = atomeshPointNumber(point, 'gsm8k');
+  return {
+    id: point.run_id || `atomesh-point-${idx}`,
+    backend: ATOMESH_DATA.backend,
+    hardware: atomeshHardwareKey(point.hardware || meta.hardware || ATOMESH_DATA.hardware),
+    model: point.model || 'unknown',
+    topology: meta.display_topology || point.config_label || 'unknown',
+    islOsl: Number.isFinite(isl) && Number.isFinite(osl) ? `${isl}/${osl}` : '--',
+    isl,
+    osl,
+    concurrency,
+    interactivity,
+    totalTput: atomeshPointNumber(point, 'total_tput'),
+    inputTput: atomeshPointNumber(point, 'input_tput'),
+    outputTput: atomeshPointNumber(point, 'output_tput'),
+    totalTputPerGpu,
+    inputTputPerGpu: atomeshPointNumber(point, 'input_tput_per_gpu'),
+    outputTputPerGpu,
+    ttftMs: atomeshPointNumber(point, 'ttft_ms'),
+    tpotMs: atomeshPointNumber(point, 'tpot_ms'),
+    e2eMs: atomeshPointNumber(point, 'e2el_ms'),
+    gsm8k,
+    gsm8kRaw: Number.isFinite(gsm8k) ? gsm8k.toFixed(4) : '--',
+    runUrl: point.run_url || meta.runUrl || '',
+    date: point.timestamp || 0,
+    image: point.image || meta.docker_image || '',
+    rocm: point.rocm || meta.rocm_version || '',
+    precision: point.precision || meta.precision || '',
+    totalGpu: atomeshPointNumber(point, 'total_gpu'),
+    prefillTp: atomeshPointNumber(point, 'prefill_tp'),
+    decodeTp: atomeshPointNumber(point, 'decode_tp'),
+    prefillWorkers: atomeshPointNumber(point, 'prefill_workers'),
+    decodeWorkers: atomeshPointNumber(point, 'decode_workers'),
+    numPrefillGpu: atomeshPointNumber(point, 'num_prefill_gpu'),
+    numDecodeGpu: atomeshPointNumber(point, 'num_decode_gpu'),
+    prefillDpa: Boolean(point.prefill_dpa),
+    decodeDpa: Boolean(point.decode_dpa),
+    configLabel: point.config_label || '',
+    rocmVersion: point.rocm || meta.rocm_version || '',
+    dockerImage: point.image || meta.docker_image || '',
+    status: Number.isFinite(interactivity) && Number.isFinite(totalTputPerGpu ?? outputTputPerGpu) ? 'completed' : 'incomplete',
+  };
+}
+
+function buildAtomeshBenchmarkRows(data) {
+  const runs = Object.values(data?.entries || {}).flat().sort((a, b) => (b.date || 0) - (a.date || 0));
+  const rowsByKey = {};
+  let idx = 0;
+  for (const run of runs) {
+    for (const bench of run.benches || []) {
+      const parsed = parseAtomeshPerfPointExtra(bench.extra);
+      if (!parsed?.point || parsed.point.source !== 'ATOMesh') continue;
+      const row = atomeshPointRow(parsed.point, parsed.meta, idx++);
+      const key = `${row.backend}|${row.hardware}|${row.model}|${row.topology}|${row.islOsl}|${row.concurrency}`;
+      if (!rowsByKey[key]) rowsByKey[key] = row;
+    }
+  }
+  return Object.values(rowsByKey).sort((a, b) => {
+    const modelOrder = String(a.model).localeCompare(String(b.model));
+    if (modelOrder) return modelOrder;
+    const topologyOrder = String(a.topology).localeCompare(String(b.topology));
+    return topologyOrder || (a.concurrency || 0) - (b.concurrency || 0);
+  });
+}
+
+const atomeshBenchmarkRows = buildAtomeshBenchmarkRows(rawData);
+
+function atomeshMergedModelName(row) {
+  const text = `${row.model || ''} ${row.topology || ''} ${row.id || ''}`.toLowerCase();
+  if (text.includes('eagle3') && !String(row.model || '').toLowerCase().includes('eagle3')) {
+    return `${row.model}-Eagle3`;
+  }
+  return row.model || 'unknown';
+}
+
+function atomeshMergeScore(row) {
+  return parseAtomeshNumber(row.totalTput);
+}
+
+function mergeAtomeshTopologyRows(rows) {
+  const merged = {};
+  for (const row of rows) {
+    const model = atomeshMergedModelName(row);
+    const normalized = {
+      ...row,
+      sourceModel: row.sourceModel || row.model,
+      sourceTopology: row.sourceTopology || row.topology,
+      model,
+    };
+    const key = `${normalized.backend}|${normalized.hardware}|${normalized.model}|${normalized.islOsl}|${normalized.concurrency}`;
+    const current = merged[key];
+    const nextScore = atomeshMergeScore(normalized);
+    if (!current) {
+      merged[key] = normalized;
+      continue;
+    }
+    const currentScore = atomeshMergeScore(current);
+    if (
+      (Number.isFinite(nextScore) && (!Number.isFinite(currentScore) || nextScore > currentScore))
+      || (nextScore === currentScore && (normalized.date || 0) > (current.date || 0))
+    ) {
+      merged[key] = normalized;
+    }
+  }
+  return Object.values(merged).sort((a, b) => {
+    const modelOrder = String(a.model).localeCompare(String(b.model));
+    if (modelOrder) return modelOrder;
+    return (a.concurrency || 0) - (b.concurrency || 0);
+  });
+}
+
+const atomeshRawRows = atomeshBenchmarkRows.length ? atomeshBenchmarkRows : parseAtomeshSummaryRows(ATOMESH_DATA.summaryMarkdown);
+const atomeshSummaryRows = mergeAtomeshTopologyRows(atomeshRawRows);
 
 // Normalize legacy model names using HF-path->display mapping from models_map.js
 const _displayMap = window.MODELS_DISPLAY_MAP || {};
@@ -626,6 +780,7 @@ const allRuns = Object.values(rawData.entries).flat().sort((a, b) => b.date - a.
 
 function hardwareFromGpuName(name) {
   const text = String(name || '').toLowerCase();
+  if (text.includes('mi350')) return 'mi350x';
   if (text.includes('mi355') || text.includes('mi35x')) return 'mi355x';
   if (text.includes('mi325')) return 'mi325x';
   if (text.includes('mi308')) return 'mi308x';
@@ -1209,7 +1364,7 @@ function updateHeaderGpuMeta() {
   const span = document.getElementById('header-gpu-meta');
   if (!span) return;
   if (state.dashboardMode === 'Disaggregated') {
-    span.textContent = ` · ${ATOMESH_DATA.hardware} · ROCm ${ATOMESH_DATA.rocmVersion}`;
+    span.textContent = ` · ${fmtHardware(selectedHardware())} · ROCm ${ATOMESH_DATA.rocmVersion}`;
     return;
   }
   const entries = Object.values(filteredConfigs());
@@ -2766,6 +2921,62 @@ function showAccuracyPopover(key, acc, prevOverride) {
     hidePopover();
   });
 }
+function atomeshDetailValue(value, formatter = null) {
+  if (value == null || value === '' || (typeof value === 'number' && !Number.isFinite(value))) return '—';
+  return formatter ? formatter(value) : escHTML(String(value));
+}
+function atomeshTpLabel(row) {
+  if (row.prefillTp != null && row.decodeTp != null && row.prefillTp !== row.decodeTp) {
+    return `P${row.prefillTp}/D${row.decodeTp}`;
+  }
+  return row.prefillTp ?? row.decodeTp ?? '—';
+}
+function atomeshDpAttentionLabel(row) {
+  if (row.prefillDpa && row.decodeDpa) return 'True';
+  if (row.prefillDpa) return 'Prefill only';
+  if (row.decodeDpa) return 'Decode only';
+  return 'False';
+}
+function showAtomeshPopover(row) {
+  const runHref = safeHref(row.runUrl);
+  const hardware = fmtHardware(row.hardware || ATOMESH_DATA.hardware);
+  const backendLabel = row.backend || ATOMESH_DATA.backend;
+  const dateValue = row.date || ATOMESH_DATA.updatedAt;
+  const pop = document.getElementById('popover');
+  pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
+    <h3>${escHTML(row.model)} ${escHTML(fmtIslOsl(row.islOsl || '--'))} c=${atomeshDetailValue(row.concurrency)}</h3>
+    <div class="pop-row"><span class="pop-key">Hardware</span><span class="pop-val" style="font-family:inherit">${escHTML(hardware)} (${escHTML(backendLabel)})</span></div>
+    <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${dateValue ? fmtDate(dateValue) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Image</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(row.image || row.dockerImage || '—')}</span></div>
+    <div class="pop-section">
+      <div class="pop-row"><span class="pop-key">Interactivity (tok/s/user)</span><span class="pop-val">${atomeshDetailValue(row.interactivity, v => fmtNum(v, 3))}</span></div>
+      <div class="pop-row"><span class="pop-key">Token Throughput per GPU (tok/s/gpu)</span><span class="pop-val">${atomeshDetailValue(row.totalTputPerGpu, v => fmtNum(v, 3))}</span></div>
+      <div class="pop-row"><span class="pop-key">Input Token Throughput per GPU</span><span class="pop-val">${atomeshDetailValue(row.inputTputPerGpu, v => fmtNum(v, 3))}</span></div>
+      <div class="pop-row"><span class="pop-key">Output Token Throughput per GPU</span><span class="pop-val">${atomeshDetailValue(row.outputTputPerGpu, v => fmtNum(v, 3))}</span></div>
+      <div class="pop-row"><span class="pop-key">Total tok/s</span><span class="pop-val">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 3))}</span></div>
+      <div class="pop-row"><span class="pop-key">TTFT / TPOT / E2E</span><span class="pop-val">${[row.ttftMs, row.tpotMs, row.e2eMs].map(v => v != null ? fmtNum(v, 2) : '—').join(' / ')} ms</span></div>
+    </div>
+    <div class="pop-section">
+      <div class="pop-row"><span class="pop-key">Source Topology</span><span class="pop-val" style="font-family:inherit">${escHTML(row.sourceTopology || row.topology || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Total GPUs</span><span class="pop-val">${atomeshDetailValue(row.totalGpu)}</span></div>
+      <div class="pop-row"><span class="pop-key">Tensor Parallelism</span><span class="pop-val">${escHTML(String(atomeshTpLabel(row)))}</span></div>
+      <div class="pop-row"><span class="pop-key">Prefill/Decode Workers</span><span class="pop-val">${row.prefillWorkers ?? '—'} / ${row.decodeWorkers ?? '—'}</span></div>
+      <div class="pop-row"><span class="pop-key">Prefill/Decode GPUs</span><span class="pop-val">${row.numPrefillGpu ?? '—'} / ${row.numDecodeGpu ?? '—'}</span></div>
+      <div class="pop-row"><span class="pop-key">Expert Parallelism</span><span class="pop-val">${atomeshDetailValue(row.expertParallelism ?? 1)}</span></div>
+      <div class="pop-row"><span class="pop-key">DP Attention</span><span class="pop-val">${atomeshDpAttentionLabel(row)}</span></div>
+      <div class="pop-row"><span class="pop-key">Concurrency</span><span class="pop-val">${atomeshDetailValue(row.concurrency)}</span></div>
+      <div class="pop-row"><span class="pop-key">Precision</span><span class="pop-val">${escHTML(String(row.precision || '—').toUpperCase())}</span></div>
+      <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(row.rocm || row.rocmVersion || '—')}</span></div>
+    </div>
+    <div class="action-row">
+      ${runHref ? `<a class="action-btn" href="${escHTML(runHref)}" target="_blank" rel="noopener noreferrer">GitHub Actions Run ↗</a>` : ''}
+    </div>`;
+  document.getElementById('popover-overlay').classList.add('open');
+  document.getElementById('pop-close-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    hidePopover();
+  });
+}
 function hidePopover() { document.getElementById('popover-overlay').classList.remove('open'); }
 document.getElementById('popover-overlay').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) hidePopover();
@@ -3272,14 +3483,14 @@ function renderAtomeshKPICards() {
     </div>
     <div class="kpi-group">
       <div class="kpi-card">
-        <div class="kpi-label">Markdown Rows</div>
+        <div class="kpi-label">Benchmark Rows</div>
         <div class="kpi-value">${completed.length}/${rows.length} <span class="kpi-unit">cases</span></div>
         <div class="kpi-sub">${rows.length === totalRows.length ? 'All ATOMesh rows' : `${rows.length}/${totalRows.length} selected`}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Hardware</div>
         <div class="kpi-value">${ATOMESH_DATA.gpuCount} <span class="kpi-unit">GPUs</span></div>
-        <div class="kpi-sub">${ATOMESH_DATA.hardware} · ROCm ${ATOMESH_DATA.rocmVersion}</div>
+        <div class="kpi-sub">${fmtHardware(selectedHardware())} · ROCm ${ATOMESH_DATA.rocmVersion}</div>
       </div>
       <div class="kpi-card clickable" id="atomesh-acc-card" title="Click to view accuracy">
         <div class="kpi-label">Accuracy</div>
@@ -3308,7 +3519,7 @@ function renderAtomeshPerformanceTab() {
   }
   const groups = {};
   for (const c of completed) {
-    const key = `${c.model}|${c.topology}|${c.islOsl}`;
+    const key = `${c.model}|${c.islOsl}`;
     if (!groups[key]) groups[key] = [];
     groups[key].push(c);
   }
@@ -3317,20 +3528,22 @@ function renderAtomeshPerformanceTab() {
     const first = groupRows[0];
     const color = getModelColor(ATOMESH_DATA.backend, first.model);
     return {
-      label: `${first.model} ${first.topology} ${first.islOsl}`,
+      label: `${first.model} ${first.islOsl}`,
       data: groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c })),
       borderColor: color.border,
-      backgroundColor: color.bg,
+      backgroundColor: color.border,
       borderWidth: 2,
-      pointRadius: 6,
-      pointHoverRadius: 8,
+      pointRadius: 4,
+      pointHoverRadius: 6,
+      pointBorderWidth: 0,
+      pointHoverBorderWidth: 0,
       showLine: groupRows.length > 1,
     };
   });
 
   let html = `<div class="section-container"><div class="section-header">
     <span class="section-title">ATOMesh Token Throughput per GPU vs. Interactivity</span>
-    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">${completed.length}/${atomeshRows().length} selected rows · source: atomesh-benchmark-summary.md</span>
+    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">${completed.length}/${atomeshRows().length} selected rows · source: benchmark-action data.js</span>
   </div>
   <div class="chart-card hero"><h3>${ATOMESH_DATA.backend} · ${datasets.length} selected series</h3><div class="chart-wrap"><canvas id="atomesh-tradeoff"></canvas></div></div></div>`;
 
@@ -3341,11 +3554,11 @@ function renderAtomeshPerformanceTab() {
     <th class="num">Total tok/s/GPU</th><th class="num">Input tok/s/GPU</th><th class="num">Output tok/s/GPU</th>
     <th class="num">TTFT ms</th><th class="num">TPOT ms</th><th class="num">E2E ms</th><th class="num">GSM8K</th><th>Run</th>
   </tr></thead><tbody>`;
-  for (const c of rows) {
-    html += `<tr>
+  rows.forEach((c, idx) => {
+    html += `<tr data-atomesh-row="${idx}" style="cursor:pointer">
       <td style="white-space:nowrap;font-weight:600">${escHTML(ATOMESH_DATA.backend)}</td>
       <td class="model-name" style="color:${getModelColor(ATOMESH_DATA.backend, c.model).text}">${escHTML(c.model)}</td>
-      <td>${escHTML(c.topology)}</td>
+      <td>${escHTML(c.sourceTopology || c.topology)}</td>
       <td>${escHTML(c.islOsl)}</td>
       <td class="num">${c.concurrency}</td>
       <td class="num">${c.interactivity != null ? fmtNum(c.interactivity, 2) : '—'}</td>
@@ -3361,9 +3574,16 @@ function renderAtomeshPerformanceTab() {
       <td class="num">${escHTML(c.gsm8kRaw || '—')}</td>
       <td>${atomeshRunCell(c)}</td>
     </tr>`;
-  }
+  });
   html += '</tbody></table></div></div></div>';
   container.innerHTML = html;
+  container.querySelectorAll('tr[data-atomesh-row]').forEach(rowEl => {
+    rowEl.addEventListener('click', (e) => {
+      if (e.target.closest('a') || e.target.closest('button')) return;
+      const row = rows[Number(rowEl.dataset.atomeshRow)];
+      if (row) showAtomeshPopover(row);
+    });
+  });
 
   new Chart(document.getElementById('atomesh-tradeoff'), {
     type: 'scatter',
@@ -3377,19 +3597,26 @@ function renderAtomeshPerformanceTab() {
         tooltip: { ...chartTooltipOpts(), callbacks: {
           title: items => {
             const c = items[0].raw.row;
-            return `${c.model} ${c.topology} ${c.islOsl} · c=${c.concurrency}`;
+            return `${c.model} ${c.islOsl} · c=${c.concurrency} · ${c.sourceTopology || c.topology}`;
           },
           label: item => [
             ` Interactivity: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
             ` Total tok/s/GPU: ${fmtNum(item.parsed.y, 2)}`,
             ` GSM8K: ${item.raw.row.gsm8kRaw || '—'}`,
           ],
+          afterBody: () => '\nClick for details',
         }},
         datalabels: { display: true, color: C_LEGEND, align: 'top', formatter: value => 'c' + value.row.concurrency },
       },
       scales: {
         x: { grid: chartGridOpts(), title: { display: true, text: 'Interactivity (tok/s/user)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
         y: { grid: chartGridOpts(), title: { display: true, text: 'Token Throughput per GPU (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+      },
+      onClick: (_e, elems) => {
+        if (!elems.length) return;
+        const item = elems[0];
+        const row = datasets[item.datasetIndex]?.data?.[item.index]?.row;
+        if (row) showAtomeshPopover(row);
       },
     },
   });
@@ -3407,7 +3634,7 @@ function renderAtomeshAccuracyTab() {
   }
   let html = `<div class="section-container"><div class="section-header">
     <span class="section-title">ATOMesh Accuracy (GSM8K)</span>
-    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">source: atomesh-benchmark-summary.md</span>
+    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">source: benchmark-action data.js</span>
   </div>
   <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
     <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
@@ -3419,7 +3646,7 @@ function renderAtomeshAccuracyTab() {
     html += `<tr>
       <td style="white-space:nowrap;font-weight:600">${escHTML(ATOMESH_DATA.backend)}</td>
       <td class="model-name" style="color:${getModelColor(ATOMESH_DATA.backend, c.model).text}">${escHTML(c.model)}</td>
-      <td>${escHTML(c.topology)}</td>
+      <td>${escHTML(c.sourceTopology || c.topology)}</td>
       <td>${escHTML(c.islOsl)}</td>
       <td class="num">${c.concurrency}</td>
       <td class="num"><strong>${escHTML(c.gsm8kRaw || '—')}</strong></td>
@@ -3430,7 +3657,7 @@ function renderAtomeshAccuracyTab() {
       <td class="num">--</td>
       <td class="num">--</td>
       <td class="num">--</td>
-      <td>${fmtDate(ATOMESH_DATA.updatedAt)}</td>
+      <td>${fmtDate(c.date || ATOMESH_DATA.updatedAt)}</td>
       <td>${atomeshRunCell(c)}</td>
     </tr>`;
   }
