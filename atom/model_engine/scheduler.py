@@ -1207,7 +1207,13 @@ class Scheduler:
         self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
     ) -> Optional[int]:
         if self.enable_chunked_prefill:
-            return min(num_new_tokens, budget_remaining)
+            chunk = min(num_new_tokens, budget_remaining)
+            if chunk < num_new_tokens:
+                align = max(self.block_manager.block_size, 64)
+                aligned = (chunk // align) * align
+                if aligned > 0:
+                    chunk = aligned
+            return chunk
         if num_new_tokens > budget_remaining and num_batched_tokens > 0:
             return None
         return num_new_tokens
