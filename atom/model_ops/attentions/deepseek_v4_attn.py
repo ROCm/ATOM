@@ -273,6 +273,14 @@ class _MixedDecodeView:
         self._np = n_prefill_seqs
         self.context_lens = batch.context_lens[n_prefill_seqs:]
         self.block_tables = batch.block_tables[n_prefill_seqs:]
+        # paged-SWA: swa_block_tables is a per-seq array built with the SAME
+        # [prefill | decode] order and filter as block_tables (scheduler.py), so
+        # it MUST be sliced identically. Missing this slice made prepare_block_tables
+        # read the FULL batch's SWA tables and hand the decode segment the PREFILL
+        # rows' SWA blocks → V4 decode SWA attention read the wrong blocks → garbage
+        # (R1/dense has no SWA so its mixed path was unaffected).
+        _swa = getattr(batch, "swa_block_tables", None)
+        self.swa_block_tables = _swa[n_prefill_seqs:] if _swa is not None else _swa
         # per_req_cache_groups holds only seqs with a per-req cache, in batch
         # order; for V4 every seq has one, so the decode rows are the tail.
         self.per_req_cache_groups = batch.per_req_cache_groups[n_prefill_seqs:]
