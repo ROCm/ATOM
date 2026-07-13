@@ -1462,6 +1462,77 @@ class Indexer(nn.Module):
             q_fp8, weights, block_tables, indexer_meta, topk
         )  # [total_tokens, topk] int32
 
+    def _prefill_chunked_topk(
+        self,
+        *,
+        total_tokens: int,
+        row_width: int,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        topk: int,
+        device: torch.device,
+        score_chunk,
+    ) -> torch.Tensor:
+        """Chunk query rows so each per-chunk ``[chunk_rows, row_width]`` fp32
+        logits buffer stays within ``ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB``, then
+        run ``top_k_per_row_prefill`` per chunk. Shared by the FP8 (GLOBAL-output)
+        and FP4 (SEQ-LOCAL-output) indexer prefill paths.
+
+        ``score_chunk(chunk_start, chunk_end, rs, re) -> logits[chunk_rows,
+        row_width]`` fills each row's scores over its window ``[rs, re)``. Each
+        chunk scores the FULL KV for its rows, so the result is exact with no
+        cross-chunk merge; any GLOBAL->seq-local remap is done by the caller on
+        the returned top-k.
+
+        The dense logits column dim (``row_width`` = ``total_committed`` for FP8,
+        ``_max_model_len_idx`` for FP4) is unbounded by ``max_num_batched_tokens``,
+        so a burst of long-context requests can push a single un-chunked
+        allocation to tens of GiB (#1376). ``chunk_tokens`` shrinks as
+        ``row_width`` grows. When the budget is disabled (0) or a single chunk
+        already fits, the loop runs once (``chunk_start==0`` and
+        ``chunk_end==total_tokens``) and matches the single-shot path — callers
+        can detect that to reuse a schedule precomputed outside the fwd.
+
+        Returns ``[total_tokens, topk]`` int32 (raw kernel output; caller remaps).
+        """
+        topk_out = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
+        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
+        if (
+            budget_bytes > 0
+            and row_width > 0
+            and budget_bytes // (row_width * 4) < total_tokens
+        ):
+            # 4 bytes per fp32 logit; row_width * 4 is one row's footprint. Round
+            # the budget-derived row count DOWN: a multiple of 128 (aligned to the
+            # kernel's row tiling) in the normal regime, avoiding coarse power-of-2
+            # doubling. Below 128 rows (extreme row_width), fall back to a
+            # power-of-2 floor so it degrades 64/32/.../1 instead of collapsing to 1.
+            budget_rows = budget_bytes // (row_width * 4)
+            if budget_rows >= 128:
+                chunk_tokens = (budget_rows // 128) * 128
+            else:
+                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
+        else:
+            # Budget disabled, or a single chunk already fits all rows.
+            chunk_tokens = total_tokens
+        for chunk_start in range(0, total_tokens, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, total_tokens)
+            rs = row_starts[chunk_start:chunk_end]
+            re = row_ends[chunk_start:chunk_end]
+            logits = score_chunk(chunk_start, chunk_end, rs, re)
+            top_k_per_row_prefill(
+                logits,
+                rs,
+                re,
+                topk_out[chunk_start:chunk_end],
+                None,  # values not needed, only indices
+                chunk_end - chunk_start,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
+        return topk_out
+
     def _score_topk_prefill(
         self,
         q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
@@ -1510,71 +1581,32 @@ class Indexer(nn.Module):
         # subtract `seq_base_per_token` to produce the raw seq-local layout
         # `csa_translate_pack` expects. The -1 sentinels are preserved via
         # `torch.where`.
-        # [total_tokens, topk] int32 — eager-only path so per-fwd alloc
-        # is fine (prefill total_tokens is dynamic; no CG capture here).
-        topk_global = torch.empty(
-            (total_tokens, topk), dtype=torch.int32, device=device
-        )
-        # The dense `fp8_mqa_logits` buffer is [total_tokens, total_committed]
-        # fp32. total_committed is the sum of all co-scheduled prefill contexts
-        # and is unbounded by max_num_batched_tokens, so a burst of long-context
-        # requests can push a single allocation to tens of GiB (#1376). Under
-        # chunked prefill total_tokens is already capped by
-        # max_num_batched_tokens, so the OOM is driven by total_committed (the
-        # column dim). Chunk along the Q (query-row) dimension with q_chunk sized
-        # so the buffer [q_chunk, total_committed] fp32 stays within the memory
-        # budget — q_chunk shrinks as total_committed grows. Each chunk still
-        # scores the FULL KV, so every row's top-k is computed completely in one
-        # shot: the result is exact with no cross-chunk merge, and the kernel's
-        # global column indices need no remapping (the seq_base subtraction below
-        # is per-token). When the budget is disabled (0) or a single chunk fits,
-        # the loop runs exactly once and matches the original single-shot path.
-        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if (
-            budget_bytes > 0
-            and total_committed > 0
-            and budget_bytes // (total_committed * 4) < total_tokens
-        ):
-            # 4 bytes per fp32 logit; total_committed * 4 is one row's footprint.
-            # Round the budget-derived row count DOWN to keep the buffer within
-            # budget: a multiple of 128 (aligned to the kernel's row tiling) in
-            # the normal regime, avoiding the coarse power-of-2 doubling. When
-            # the budget affords < 128 rows (extreme total_committed), fall back
-            # to a power-of-2 floor so it degrades to 64/32/.../1 instead of
-            # collapsing straight to 1.
-            budget_rows = budget_bytes // (total_committed * 4)
-            if budget_rows >= 128:
-                chunk_tokens = (budget_rows // 128) * 128
-            else:
-                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
-        else:
-            # Budget disabled, or a single chunk already fits all rows.
-            chunk_tokens = total_tokens
-        for chunk_start in range(0, total_tokens, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, total_tokens)
-            # Per-row window bounds slice 1:1 with this chunk's rows.
-            row_starts = cu_starts[chunk_start:chunk_end]
-            row_ends = cu_ends[chunk_start:chunk_end]
-            logits = fp8_mqa_logits(
+        # eager-only path so per-fwd alloc is fine (prefill total_tokens is
+        # dynamic; no CG capture here).
+        def _score(chunk_start, chunk_end, rs, re):
+            # Dense fp8_mqa_logits over the FULL committed KV for this row slice;
+            # cells outside [rs, re) are -inf. GLOBAL column indices.
+            return fp8_mqa_logits(
                 Q=q_fp8[chunk_start:chunk_end],
                 KV=k_fp8,
                 kv_scales=k_scale,
                 weights=weights[chunk_start:chunk_end],
-                cu_starts=row_starts,
-                cu_ends=row_ends,
+                cu_starts=rs,
+                cu_ends=re,
                 clean_logits=False,
             )  # [chunk, total_committed] fp32; outside [start,end) is -inf
-            top_k_per_row_prefill(
-                logits,
-                row_starts,
-                row_ends,
-                topk_global[chunk_start:chunk_end],
-                None,  # values not needed, only indices
-                chunk_end - chunk_start,
-                logits.stride(0),
-                logits.stride(1),
-                k=topk,
-            )
+
+        # Chunk on the Q (query-row) dim so [chunk, total_committed] fp32 stays
+        # within budget (total_committed is the OOM driver — see helper).
+        topk_global = self._prefill_chunked_topk(
+            total_tokens=total_tokens,
+            row_width=total_committed,
+            row_starts=cu_starts,
+            row_ends=cu_ends,
+            topk=topk,
+            device=device,
+            score_chunk=_score,
+        )
         seq_base = indexer_meta["seq_base_per_token_gpu"].unsqueeze(
             1
         )  # [total_tokens, 1] int32
@@ -1684,13 +1716,18 @@ class Indexer(nn.Module):
         """Ragged-prefill FP4: `flydsl_pa_mqa_logits_fp4_prefill` reads the
         paged FP4 cache per query row over its seq-local window
         `[0, visible_end)`. Output logits are seq-local, so the prefill top-k
-        indices are returned directly. Eager-only (dynamic total_tokens).
+        indices are returned directly (no `seq_base` subtraction, unlike the FP8
+        GLOBAL-output path). Eager-only (dynamic total_tokens).
 
-        The persistent-grid schedule (cta_info/n_ctas) is precomputed by the
-        metadata builder (`_build_v4_indexer_meta`) and passed in, so the kernel
-        call is a pure launch — block_k/parallel_unit_num here MUST match the
-        values the schedule was built with (`_V4_FP4_DECODE_*`)."""
+        The dense `[chunk_rows, max_model_len_idx]` fp32 logits is chunked on the
+        Q dim via `_prefill_chunked_topk` (same OOM guard as FP8). In the common
+        SINGLE-chunk case the schedule (cta_info/n_ctas) precomputed ONCE outside
+        the fwd by the metadata builder is reused as-is (no schedule work in the
+        fwd). Only when the buffer would exceed budget and the loop actually
+        splits does each chunk rebuild the schedule for its rows (cta_info
+        encodes absolute row ids, so a slice of the full schedule won't do)."""
         from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+            compute_prefill_schedule,
             flydsl_pa_mqa_logits_fp4_prefill,
         )
 
@@ -1699,9 +1736,16 @@ class Indexer(nn.Module):
         row_to_batch = indexer_meta["batch_id_per_token_gpu"].to(torch.int32)
         local_ends = indexer_meta["visible_end_gpu"]  # [total_tokens] int32
         local_starts = indexer_meta["fp4_prefill_local_starts"]
-        cta_info = indexer_meta["fp4_prefill_cta_info"]
-        n_ctas = indexer_meta["fp4_prefill_n_ctas"]
-        max_seq_len = self._max_model_len_idx
+        # Full-batch schedule precomputed once (outside the fwd) in the metadata
+        # builder; reused directly on the single-chunk path.
+        full_cta_info = indexer_meta["fp4_prefill_cta_info"]
+        full_n_ctas = indexer_meta["fp4_prefill_n_ctas"]
+        # Seq-local logits width = this batch's ACTUAL max committed index length
+        # (right-sized in the metadata builder, CPU-derived), NOT the model max
+        # `_max_model_len_idx`. Keeps the [total_tokens, W] fp32 buffer small so
+        # budget-chunking (below) rarely fires. Must match the width the
+        # precomputed schedule (full_cta_info) was built with.
+        max_seq_len = indexer_meta["fp4_prefill_max_seq_len"]
         kv_block_size = self.kv_cache.size(3)  # k1_csa = 64
         # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
         # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64
@@ -1714,50 +1758,68 @@ class Indexer(nn.Module):
             f"block_size=256 (k1_csa=block_size//4)."
         )
 
-        # Write-once GPU scratch, NOT -inf-filled. The kernel writes every
-        # column in `[local_start, local_end)` for each row, and
-        # `top_k_per_row_prefill` scans only `[rowStarts, rowEnds)` =
-        # `[0, visible_end)` per row — exactly the written range. Cells past
-        # `local_end` are never read, so a `torch.full(-inf)` pre-fill (the
-        # kernel's default when `out=None`) is pure waste: at width
-        # `max_model_len_idx` it was ~290μs × (#CSA layers) of FillFunc before
-        # a ~6μs mqa kernel. Mirrors the FP8 decode path's `torch.empty` logits.
-        logits = torch.empty(
-            total_tokens, max_seq_len, dtype=torch.float32, device=device
-        )
-        flydsl_pa_mqa_logits_fp4_prefill(
-            q_fp4,
-            q_scale,
-            self.kv_cache,
-            self.kv_scale,
-            block_tables,
-            weights,
-            row_to_batch,
-            local_starts,
-            local_ends,
-            max_seq_len,
-            weight_scale=self._weights_scale,
-            block_k=_V4_FP4_DECODE_BLOCK_K,
-            kv_block_size=kv_block_size,
-            parallel_unit_num=_V4_FP4_DECODE_PARALLEL_UNIT_NUM,
-            out=logits,
-            cta_info=cta_info,
-            n_ctas=n_ctas,
-        )  # [total_tokens, max_seq_len] fp32, seq-local; only [0,end) written
+        def _score(chunk_start, chunk_end, rs, re):
+            # Prefill has one row per query token, so the schedule's
+            # parallel_unit_num MUST be >= chunk rows (plus the decode CTA floor)
+            # or compute_prefill_schedule drops surplus rows (logits stay -inf ->
+            # wrong top-k). NOTE: this only governs the schedule BUILD; the kernel
+            # ignores its `parallel_unit_num` kwarg whenever cta_info/n_ctas are
+            # passed (it skips the internal compute_prefill_schedule).
+            p = max(_V4_FP4_DECODE_PARALLEL_UNIT_NUM, chunk_end - chunk_start)
+            if chunk_start == 0 and chunk_end == total_tokens:
+                # Single chunk (common case): reuse the schedule precomputed once
+                # outside the fwd (metadata builder, sized to the full
+                # prefill_rows) — no compute_prefill_schedule here.
+                cta_info, n_ctas = full_cta_info, full_n_ctas
+            else:
+                # Multi-chunk (logits would exceed budget): rebuild the schedule
+                # for this chunk's rows.
+                _, cta_info, n_ctas = compute_prefill_schedule(
+                    row_to_batch[chunk_start:chunk_end],
+                    rs,
+                    re,
+                    _V4_FP4_DECODE_BLOCK_K,
+                    p,
+                    max_seq_len,
+                )
+            # Write-once, NOT -inf-filled: the kernel writes every column in
+            # `[rs, re)` per row and `top_k_per_row_prefill` scans only that
+            # range, so a `torch.full(-inf)` pre-fill would be pure waste (~290μs
+            # FillFunc at max_model_len_idx width vs a ~6μs mqa kernel).
+            logits = torch.empty(
+                chunk_end - chunk_start, max_seq_len, dtype=torch.float32, device=device
+            )
+            flydsl_pa_mqa_logits_fp4_prefill(
+                q_fp4[chunk_start:chunk_end],
+                q_scale[chunk_start:chunk_end],
+                self.kv_cache,
+                self.kv_scale,
+                block_tables,
+                weights[chunk_start:chunk_end],
+                row_to_batch[chunk_start:chunk_end],
+                rs,
+                re,
+                max_seq_len,
+                weight_scale=self._weights_scale,
+                block_k=_V4_FP4_DECODE_BLOCK_K,
+                kv_block_size=kv_block_size,
+                parallel_unit_num=p,
+                out=logits,
+                cta_info=cta_info,
+                n_ctas=n_ctas,
+            )  # [chunk_rows, max_seq_len] fp32, seq-local; only [rs,re) written
+            return logits
 
-        topk_local = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
-        top_k_per_row_prefill(
-            logits,
-            local_starts,
-            local_ends,
-            topk_local,
-            None,
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
-        return topk_local  # [total_tokens, topk] int32, raw seq-local
+        # Seq-local output → return the top-k directly (no seq_base subtraction).
+        return self._prefill_chunked_topk(
+            total_tokens=total_tokens,
+            row_width=max_seq_len,
+            row_starts=local_starts,
+            row_ends=local_ends,
+            topk=topk,
+            device=device,
+            score_chunk=_score,
+        )  # [total_tokens, topk] int32, raw seq-local
 
     def _score_topk_decode_fp4(
         self,

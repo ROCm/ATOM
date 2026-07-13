@@ -822,7 +822,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     head_dim = self.index_head_dim
                     assert (
                         k1 * aligned_dim
-                    ) % 4 == 0, f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
+                    ) % 4 == 0, (
+                        f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
+                    )
                     block_fp32_stride = (k1 * aligned_dim) // 4
                     scale_fp32_offset = (k1 * head_dim) // 4
                     # `as_strided(storage_offset=...)` is ABSOLUTE in the underlying
@@ -1189,6 +1191,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 compute_prefill_schedule,
             )
 
+            # Size the seq-local logits width to this batch's ACTUAL max
+            # committed index length (max over seqs of n_committed_csa), NOT the
+            # model max (`max_model_len_idx`). Every query row's visible_end is
+            # bounded by its seq's committed count, so this covers all writes.
+            # Pure CPU (n_committed_csa_per_seq_cpu already host-side) — no new
+            # sync. This right-sizes the `[total_tokens, W]` fp32 buffer (e.g.
+            # 16k ctx -> W~4096 -> ~268MB, vs ~17GB at the fixed 262144 width),
+            # so `_score_topk_prefill_fp4`'s budget-chunking rarely triggers and
+            # the schedule is used as a single precomputed launch in the common
+            # case. Decode keeps the fixed `max_model_len_idx` (CG needs a
+            # static shape); prefill is eager so a per-fwd width is fine.
+            fp4_prefill_max_seq_len = max(int(n_committed_per_seq.max()), 1)
+
             local_starts = torch.zeros_like(visible_end_gpu)
             # parallel_unit_num is the persistent-grid CTA-count CAP; the
             # schedule uses as many CTAs as it can up to this P (smaller P ->
@@ -1212,11 +1227,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 visible_end_gpu,
                 self._fp4_decode_block_k,
                 prefill_parallel_unit_num,
-                self.max_model_len_idx,
+                fp4_prefill_max_seq_len,
             )
             meta["fp4_prefill_cta_info"] = prefill_cta_info
             meta["fp4_prefill_n_ctas"] = prefill_n_ctas
             meta["fp4_prefill_local_starts"] = local_starts
+            meta["fp4_prefill_max_seq_len"] = fp4_prefill_max_seq_len
 
         return meta
 
