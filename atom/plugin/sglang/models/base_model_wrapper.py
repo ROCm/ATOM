@@ -270,18 +270,36 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                         )
 
                 hidden_states = runtime.trim_output(hidden_states)
+                logits_input_ids = input_ids
+                try:
+                    mode = getattr(forward_batch, "forward_mode", None)
+                    spec_info = getattr(forward_batch, "spec_info", None)
+                    draft_token_num = int(getattr(spec_info, "draft_token_num", 0) or 0)
+                    target_verify_rows = int(forward_batch.batch_size) * draft_token_num
+                    if (
+                        mode is not None
+                        and bool(getattr(mode, "is_target_verify", lambda: False)())
+                        and target_verify_rows > 0
+                        and torch.is_tensor(hidden_states)
+                        and hidden_states.shape[0] != target_verify_rows
+                    ):
+                        hidden_states = hidden_states[:target_verify_rows]
+                        if torch.is_tensor(logits_input_ids):
+                            logits_input_ids = logits_input_ids[:target_verify_rows]
+                except Exception:
+                    logger.exception("Failed to trim target-verify outputs for logits")
 
                 if self.pp_group.is_last_rank:
                     if self.model_arch == "DeepseekV4ForCausalLM":
                         return self.logits_processor(
-                            input_ids,
+                            logits_input_ids,
                             hidden_states,
                             self.logits_head,
                             forward_batch,
                             hidden_states_before_norm=hidden_states,
                         )
                     return self.logits_processor(
-                        input_ids,
+                        logits_input_ids,
                         hidden_states,
                         self.logits_head,
                         forward_batch,

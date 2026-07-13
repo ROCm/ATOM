@@ -131,6 +131,31 @@ def _build_sglang_query_ranges(forward_batch) -> tuple[torch.Tensor, torch.Tenso
         ends = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
         return starts, ends
 
+    if forward_batch.forward_mode.is_target_verify():
+        bs = int(forward_batch.batch_size)
+        draft_token_num = int(
+            getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0)
+            or 0
+        )
+        if draft_token_num <= 0:
+            raise RuntimeError("TARGET_VERIFY sparse MLA requires draft_token_num")
+        seq_lens = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
+        kv_lens = seq_lens + draft_token_num
+        base_offsets = torch.cumsum(
+            torch.cat([torch.zeros(1, dtype=torch.int32, device=device), kv_lens[:-1]]),
+            dim=0,
+        )
+        starts = torch.repeat_interleave(base_offsets, draft_token_num)
+        per_req_end_base = torch.repeat_interleave(
+            base_offsets + seq_lens, draft_token_num
+        )
+        draft_offsets = torch.arange(
+            1, draft_token_num + 1, dtype=torch.int32, device=device
+        ).repeat(bs)
+        return starts.to(dtype=torch.int32), (per_req_end_base + draft_offsets).to(
+            dtype=torch.int32
+        )
+
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
         query_lens = forward_batch.seq_lens
@@ -164,28 +189,54 @@ def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
     token_table = req_to_token[req_pool_indices, :]
     if not forward_batch.forward_mode.is_decode_or_idle():
         token_table = token_table.clone()
-        query_lens = getattr(forward_batch, "extend_seq_lens", None)
-        if query_lens is None:
-            query_lens = forward_batch.seq_lens
-        prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
-        if prefix_lens is None:
-            prefix_lens = forward_batch.seq_lens - query_lens
-        query_lens_cpu = query_lens[: int(forward_batch.batch_size)].detach().cpu()
-        prefix_lens_cpu = prefix_lens[: int(forward_batch.batch_size)].detach().cpu()
+        bs = int(forward_batch.batch_size)
+        if forward_batch.forward_mode.is_target_verify():
+            draft_token_num = int(
+                getattr(
+                    getattr(forward_batch, "spec_info", None), "draft_token_num", 0
+                )
+                or 0
+            )
+            if draft_token_num <= 0:
+                raise RuntimeError("TARGET_VERIFY sparse MLA requires draft_token_num")
+            query_lens_cpu = [draft_token_num] * bs
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                seq_lens_cpu = forward_batch.seq_lens[:bs].detach().cpu()
+            prefix_lens_cpu = [int(x) for x in seq_lens_cpu[:bs]]
+        else:
+            query_lens = getattr(forward_batch, "extend_seq_lens", None)
+            if query_lens is None:
+                query_lens = forward_batch.seq_lens
+            prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+            if prefix_lens is None:
+                prefix_lens = forward_batch.seq_lens - query_lens
+            query_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if query_lens_cpu is None:
+                query_lens_cpu = query_lens[:bs].detach().cpu()
+            else:
+                query_lens_cpu = query_lens_cpu[:bs]
+            prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            if prefix_lens_cpu is None:
+                prefix_lens_cpu = prefix_lens[:bs].detach().cpu()
+            else:
+                prefix_lens_cpu = prefix_lens_cpu[:bs]
         offset = 0
         for req_idx, (prefix_len_raw, query_len_raw) in enumerate(
             zip(prefix_lens_cpu, query_lens_cpu)
         ):
             prefix_len = int(prefix_len_raw)
             query_len = int(query_len_raw)
+            remaining = int(forward_batch.out_cache_loc.shape[0]) - offset
+            query_len = min(query_len, max(remaining, 0))
             if query_len > 0:
                 token_table[req_idx, prefix_len : prefix_len + query_len] = (
                     forward_batch.out_cache_loc[offset : offset + query_len]
                 )
             offset += query_len
     if page_size == 1:
-        return token_table
-    return token_table[:, ::page_size] // page_size
+        return token_table.to(dtype=torch.int32).contiguous()
+    return (token_table[:, ::page_size] // page_size).to(dtype=torch.int32).contiguous()
 
 
 def _build_sparse_req_id_per_token_for_sglang(
@@ -196,6 +247,14 @@ def _build_sparse_req_id_per_token_for_sglang(
     req_ids = torch.arange(bs, dtype=torch.int32, device=device)
     if forward_batch.forward_mode.is_decode_or_idle():
         return req_ids
+    if forward_batch.forward_mode.is_target_verify():
+        draft_token_num = int(
+            getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0)
+            or 0
+        )
+        if draft_token_num <= 0:
+            raise RuntimeError("TARGET_VERIFY sparse MLA requires draft_token_num")
+        return torch.repeat_interleave(req_ids, draft_token_num)
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
         query_lens = forward_batch.seq_lens
