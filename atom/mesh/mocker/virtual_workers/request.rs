@@ -6,12 +6,13 @@
 //! or a real HTTP POST for the standalone mocker CLI.
 
 use std::{
+    future,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{body::Body, extract::Request, http::header::CONTENT_TYPE};
@@ -235,6 +236,7 @@ pub struct VirtualRequestPipelineConfig {
     pub host_header: Option<String>,
     pub tls_ca_cert_path: Option<PathBuf>,
     pub tls_accept_invalid_certs: bool,
+    pub duration: Option<Duration>,
     pub producer_threads: usize,
     pub consumer_threads: usize,
     pub queue_capacity: usize,
@@ -248,6 +250,7 @@ impl VirtualRequestPipelineConfig {
             host_header: None,
             tls_ca_cert_path: None,
             tls_accept_invalid_certs: false,
+            duration: None,
             producer_threads: 1,
             consumer_threads: 1,
             queue_capacity: 64,
@@ -266,6 +269,11 @@ impl VirtualRequestPipelineConfig {
 
     pub fn tls_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
         self.tls_accept_invalid_certs = accept_invalid_certs;
+        self
+    }
+
+    pub fn duration(mut self, duration: Option<Duration>) -> Self {
+        self.duration = duration;
         self
     }
 
@@ -394,9 +402,23 @@ impl VirtualRequestPipeline {
         let results = Vec::new();
         let mut first_error = None;
         let mut shutdown_requested = false;
+        let duration = self.config.duration;
+        let duration_sleep = async move {
+            if let Some(duration) = duration {
+                tokio::time::sleep(duration).await;
+            } else {
+                future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(duration_sleep);
         loop {
             tokio::select! {
                 biased;
+                _ = &mut duration_sleep => {
+                    running.store(false, Ordering::Relaxed);
+                    shutdown_requested = true;
+                    break;
+                }
                 _ = tokio::signal::ctrl_c() => {
                     running.store(false, Ordering::Relaxed);
                     shutdown_requested = true;

@@ -545,6 +545,13 @@ class ForwardContext:
     # forward, so it ignores the flag entirely.
     in_hipgraph: bool = False
 
+    # Piecewise-cudagraph dispatch, read per forward by CUDAGraphWrapper:
+    # cudagraph_runtime_mode picks the capture/replay mode, batch_descriptor is
+    # the key (num_tokens). None defaults keep wrappers inert until model_runner
+    # sets them. Typed Any to dodge a CUDAGraphMode circular import.
+    cudagraph_runtime_mode: Any = None
+    batch_descriptor: Optional[Any] = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
