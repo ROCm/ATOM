@@ -88,7 +88,9 @@ def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoder]:
 def _content_str(c: Any) -> str:
     if isinstance(c, list):
         return "\n".join(
-            b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"
+            b.get("text", "")
+            for b in c
+            if isinstance(b, dict) and b.get("type") == "text"
         )
     return c or ""
 
@@ -115,9 +117,11 @@ def _normalize_for_v4(messages: List[dict], tools: Optional[List[dict]]) -> List
     if not sys_parts and not tools:
         return [dict(m) for m in messages]
 
-    merged = "\n\n".join(s for s in (_content_str(m.get("content")) for m in sys_parts) if s)
+    merged = "\n\n".join(
+        s for s in (_content_str(m.get("content")) for m in sys_parts) if s
+    )
     sys_msg: dict = {"role": "system", "content": merged}
-    for m in sys_parts:                      # preserve any pre-attached tools
+    for m in sys_parts:  # preserve any pre-attached tools
         if m.get("tools"):
             sys_msg["tools"] = m["tools"]
     if tools:

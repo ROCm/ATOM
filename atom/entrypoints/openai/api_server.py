@@ -408,27 +408,29 @@ def flush_stream_batch() -> None:
     # Incremental per-request detokenization: correct UTF-8 at token
     # boundaries (see _stream_detok_state). Emits only fully-formed chars;
     # a trailing partial multi-byte char is held until the next step.
-    for (_loop, _q, chunk) in buf:
+    for _loop, _q, chunk in buf:
         rid = chunk.get("request_id")
         st = _stream_detok_state.get(rid)
         if st is None:
             st = _stream_detok_state[rid] = {
-                "tokens": [], "prefix_offset": 0, "read_offset": 0,
+                "tokens": [],
+                "prefix_offset": 0,
+                "read_offset": 0,
             }
         toks = st["tokens"]
         toks.extend(chunk["token_ids"])
         prefix_text = tokenizer.decode(
-            toks[st["prefix_offset"]:st["read_offset"]], skip_special_tokens=True
+            toks[st["prefix_offset"] : st["read_offset"]], skip_special_tokens=True
         )
         new_text = tokenizer.decode(
-            toks[st["prefix_offset"]:], skip_special_tokens=True
+            toks[st["prefix_offset"] :], skip_special_tokens=True
         )
         if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
-            chunk["text"] = new_text[len(prefix_text):]
+            chunk["text"] = new_text[len(prefix_text) :]
             st["prefix_offset"] = st["read_offset"]
             st["read_offset"] = len(toks)
         elif chunk["finished"]:
-            chunk["text"] = new_text[len(prefix_text):]
+            chunk["text"] = new_text[len(prefix_text) :]
         else:
             chunk["text"] = ""
         if chunk["finished"]:
@@ -1694,7 +1696,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         raw_text = final_output["text"]
         reasoning_content, content_with_tools = separate_reasoning(raw_text)
-        content_text, tool_calls = parse_tool_calls(content_with_tools, anthropic_to_openai_tools(request.tools))
+        content_text, tool_calls = parse_tool_calls(
+            content_with_tools, anthropic_to_openai_tools(request.tools)
+        )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         if not getattr(request, "thinking", None):
@@ -1768,7 +1772,9 @@ async def responses_endpoint(raw_request: Request):
 
         max_out = int(body.get("max_output_tokens") or 32768)
         sampling_params = _build_sampling_params(
-            temperature=body.get("temperature") if body.get("temperature") is not None else 1.0,
+            temperature=(
+                body.get("temperature") if body.get("temperature") is not None else 1.0
+            ),
             max_tokens=max_out,
             stop_strings=None,
             ignore_eos=False,
@@ -1832,7 +1838,12 @@ async def responses_endpoint(raw_request: Request):
                         return []
                     _pending["tc"] = None
                     name, args = translate_client_tool(
-                        tc["name"], tc["args"], valid_names, shell_tool, req_cwd, shell_param
+                        tc["name"],
+                        tc["args"],
+                        valid_names,
+                        shell_tool,
+                        req_cwd,
+                        shell_param,
                     )
                     out = emitter.tool_start(tc["id"], name)
                     if args:
@@ -1914,7 +1925,9 @@ async def responses_endpoint(raw_request: Request):
 
         raw_text = final_output["text"]
         _reasoning, content_with_tools = separate_reasoning(raw_text)
-        content_text, tool_calls = parse_tool_calls(content_with_tools, openai_tools or None)
+        content_text, tool_calls = parse_tool_calls(
+            content_with_tools, openai_tools or None
+        )
         output_tokens = len(tokenizer.encode(raw_text))
 
         return JSONResponse(
