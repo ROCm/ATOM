@@ -1238,9 +1238,10 @@ class Indexer(nn.Module):
                 self.rotary_emb.sin_cache,
                 positions,
                 rd,
-                scale=q_scale,
+                out_scale=q_scale,
                 group_size=32,
                 shuffle_scale=True,
+                do_rotate_act=False,
             )
             # weights_proj output (bf16) goes straight to the MQA-logits kernel:
             # it loads weights as bf16 and applies the static `_weights_scale`
@@ -1268,8 +1269,9 @@ class Indexer(nn.Module):
             self.rotary_emb.sin_cache,
             positions,
             rd,
-            scale=q_scale,
+            out_scale=q_scale,
             group_size=self._q_quant_group,
+            do_rotate_act=False,
         )
         q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
         q_scale = q_scale.view(total_tokens, self.n_heads, 1)
@@ -1578,9 +1580,7 @@ class Indexer(nn.Module):
             n_ctas=n_ctas,
         )  # [total_tokens, max_seq_len] fp32, seq-local; only [0,end) written
 
-        topk_local = torch.empty(
-            (total_tokens, topk), dtype=torch.int32, device=device
-        )
+        topk_local = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
         top_k_per_row_prefill(
             logits,
             local_starts,
