@@ -39,26 +39,6 @@ export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path(
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 ```
 
-## Online Quant Config Reference
-
-Kimi-K2.5 MXFP4 uses a **layer-level** online quant config targeting only the
-MLA attention linear weights (attention projections are quantized to PTPC FP8 at
-load time; MoE expert weights are already in MXFP4 format):
-
-```json
-{
-  "global_quant_config": "",
-  "layer_quant_config": {
-    "model.layers.*.self_attn.fused_qkv_a_proj": "ptpc_fp8",
-    "model.layers.*.self_attn.q_b_proj": "ptpc_fp8",
-    "model.layers.*.self_attn.kv_b_proj": "ptpc_fp8",
-    "model.layers.*.self_attn.o_proj": "ptpc_fp8"
-  }
-}
-```
-
----
-
 ## 1P+1D — Single-Node (MXFP4)
 
 Prefill on GPU 0-3, decode on GPU 4-7, router on port 8000.
@@ -79,7 +59,6 @@ HSA_NO_SCRATCH_RECLAIM=1 python3 -m atom.entrypoints.openai_server \
     --max-model-len 32768 \
     --max-num-seqs 256 \
     --max-num-batched-tokens 32768 \
-    --online_quant_config '{"global_quant_config": "", "layer_quant_config": {"model.layers.*.self_attn.fused_qkv_a_proj": "ptpc_fp8", "model.layers.*.self_attn.q_b_proj": "ptpc_fp8", "model.layers.*.self_attn.kv_b_proj": "ptpc_fp8", "model.layers.*.self_attn.o_proj": "ptpc_fp8"}}' \
     --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}' \
     --no-enable_prefix_caching \
     2>&1 | tee prefill.log
@@ -101,9 +80,8 @@ HSA_NO_SCRATCH_RECLAIM=1 python3 -m atom.entrypoints.openai_server \
     --max-model-len 32768 \
     --max-num-seqs 256 \
     --max-num-batched-tokens 32768 \
-    --online_quant_config '{"global_quant_config": "", "layer_quant_config": {"model.layers.*.self_attn.fused_qkv_a_proj": "ptpc_fp8", "model.layers.*.self_attn.q_b_proj": "ptpc_fp8", "model.layers.*.self_attn.kv_b_proj": "ptpc_fp8", "model.layers.*.self_attn.o_proj": "ptpc_fp8"}}' \
     --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
-    --cudagraph-capture-sizes "[8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
+    --cudagraph-capture-sizes "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,256]" \
     --no-enable_prefix_caching \
     2>&1 | tee decode.log
 ```
