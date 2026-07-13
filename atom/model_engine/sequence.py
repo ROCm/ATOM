@@ -14,6 +14,11 @@ class SequenceStatus(Enum):
     WAITING_FOR_REMOTE_KVS = auto()
     WAITING = auto()
     RUNNING = auto()
+    # Client disconnected: the seq is still live (its KV must be freed via the
+    # normal stop path). The scheduler finishes it at the next step (running) or
+    # drops it when popped from `waiting`. Distinct from FINISHED so it still
+    # rides one cleanup pass; is_finished() stays False until then.
+    ABORTED = auto()
     FINISHED = auto()
     EXIT_ENGINE = auto()
 
@@ -86,9 +91,6 @@ class Sequence:
         # out-of-window SWA blocks can be freed while compressed blocks persist).
         # Empty / unused for non-SWA models.
         self.swa_block_table = []
-        # Set True when the client disconnected; the scheduler finishes the seq
-        # at the next step via the normal stop path (frees KV, emits finished).
-        self.aborted = False
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).
