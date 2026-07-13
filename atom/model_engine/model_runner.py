@@ -632,6 +632,7 @@ class ModelRunner:
 
         self.use_aux_hidden_state_outputs = False
         self._aux_hidden_states = None
+        self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
@@ -2183,9 +2184,11 @@ class ModelRunner:
                 pp_group = get_pp_group()
                 pp_enabled = pp_group.world_size > 1
 
-                # Pipeline parallel (serial, ring=1): non-first stages receive
-                # hidden_states/residual from upstream; non-last stages forward
-                # their IntermediateTensors downstream and produce no logits.
+                if pp_enabled and self._pp_pending_send:
+                    from atom.distributed.pp_comm import commit_pp_send_work
+
+                    commit_pp_send_work(self._pp_pending_send)
+
                 intermediate_tensors = None
                 if pp_enabled and not pp_group.is_first_rank:
                     from atom.distributed.pp_comm import recv_intermediate_tensors
@@ -2207,9 +2210,13 @@ class ModelRunner:
                     )
 
                 if pp_enabled and not pp_group.is_last_rank:
-                    from atom.distributed.pp_comm import send_intermediate_tensors
+                    from atom.distributed.pp_comm import (
+                        async_send_intermediate_tensors,
+                    )
 
-                    send_intermediate_tensors(model_output)
+                    self._pp_pending_send = async_send_intermediate_tensors(
+                        model_output
+                    )
                     hidden_states = None
                     self._aux_hidden_states = None
                     logits = None
@@ -2290,6 +2297,17 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
 
         return logits, hidden_states
+
+    def flush_pp_send(self) -> None:
+        """Commit any outstanding async PP send work.
+
+        Called during shutdown to ensure in-flight isend operations complete
+        before process teardown.
+        """
+        if self._pp_pending_send:
+            from atom.distributed.pp_comm import commit_pp_send_work
+
+            commit_pp_send_work(self._pp_pending_send)
 
     def postprocess(
         self,
