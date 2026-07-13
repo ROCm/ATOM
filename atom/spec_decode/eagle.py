@@ -494,6 +494,18 @@ class EagleProposer:
                         if target_uses_mla:
                             kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
                             attn_metadata.kv_last_page_lens = kv_last_page_lens
+                            # Sparse (DSA) MLA decode packs KV per token at
+                            # page_size=1, so it reads the all-1s
+                            # sparse_kv_last_page_lens (NOT the dense per-block
+                            # buffer, which makes the asm kernel over-read past
+                            # the written sparse-index region -> illegal access).
+                            # The draft reuses the target's attn_metadata but
+                            # drops to max_seqlen_q=1, so it must re-point this to
+                            # the per-seq all-1s slice itself.
+                            if "sparse_kv_last_page_lens" in var:
+                                attn_metadata.sparse_kv_last_page_lens = var[
+                                    "sparse_kv_last_page_lens"
+                                ].gpu[:bs]
                         # block_tables, context_lens, and sparse_kv_indptr are
                         # needed by both MHA and MLA+sparse attention
                         attn_metadata.block_tables = var["block_tables"].gpu[:bs]
