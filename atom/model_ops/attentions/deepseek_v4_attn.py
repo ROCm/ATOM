@@ -1933,6 +1933,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub.n_committed_csa_per_seq_cpu = src.n_committed_csa_per_seq_cpu[rs0:rs1]
         if src.n_committed_hca_per_seq_cpu is not None:
             ub.n_committed_hca_per_seq_cpu = src.n_committed_hca_per_seq_cpu[rs0:rs1]
+        # paged-SWA block tables (added by #1423): per-request [bs, MB], required
+        # by swa_write in prefill. split_attn_metadata does not carry this DSV4
+        # field, so slice it to the group's requests explicitly (else None -> crash).
+        if src.swa_block_tables is not None:
+            ub.swa_block_tables = src.swa_block_tables[rs0:rs1].contiguous()
 
         # ---- per-token DSV4 fields sliced by the GLOBAL token range [gts,gte) ----
         owned = torch.arange(gts, gte, device=device)
