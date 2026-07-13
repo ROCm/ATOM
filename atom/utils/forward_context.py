@@ -377,11 +377,9 @@ class AttentionMetaData:
     cu_seqlen_ks: Optional[torch.Tensor] = None
     cu_seqlen_ke: Optional[torch.Tensor] = None
     sparse_kv_indptr: Optional[torch.Tensor] = None
-    # Per-query-token last-page lens for sparse (DSA) attention. Set on the
-    # instance by prepare_decode/prepare_prefill; class default None so reads
-    # are safe before assignment. Held separately from kv_last_page_lens so the
-    # has_cached prefix path (which rebinds kv_last_page_lens to the dense
-    # per-seq buffer) cannot clobber the per-token sparse buffer.
+    # Last-page lens for sparse (DSA) attention: all 1s, one per query token in
+    # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
+    # (the dense per-seq buffer) so the two never clobber each other.
     sparse_kv_last_page_lens: Optional[torch.Tensor] = None
 
     work_meta_data: Optional[torch.Tensor] = None

@@ -901,15 +901,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : sum_scheduled_tokens + 1
             ]
-            # Per-token last-page lens for sparse (DSA) attention: one entry per
-            # query token (all 1s, page_size=1). Kept on a dedicated attr so the
-            # has_cached block below — which sets the DENSE per-seq
-            # kv_last_page_lens of length bs — cannot clobber it. The sparse
-            # prefill attention reads sparse_kv_last_page_lens, matching decode.
-            attn_metadata.kv_last_page_lens = var["sparse_kv_last_page_lens"].gpu[
-                :sum_scheduled_tokens
-            ]
-            attn_metadata.sparse_kv_last_page_lens = attn_metadata.kv_last_page_lens
+            # Sparse (DSA) attention: one last-page len per query token (all 1s,
+            # page_size=1). Lives only on sparse_kv_last_page_lens; kv_last_page_lens
+            # stays the dense per-seq buffer set by the has_cached block below.
+            attn_metadata.sparse_kv_last_page_lens = var[
+                "sparse_kv_last_page_lens"
+            ].gpu[:sum_scheduled_tokens]
 
             # Per-query req_id: token_id 0..sum_scheduled_tokens-1 maps to batch id.
             # Use counts (new tokens per batch), not context_lens (full seq len).
@@ -928,7 +925,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             get_mla_metadata_v1(
                 attn_metadata.sparse_cu_seqlens_q,
                 attn_metadata.sparse_kv_indptr,
-                attn_metadata.kv_last_page_lens,
+                attn_metadata.sparse_kv_last_page_lens,
                 self.padded_num_attention_heads,
                 1,  # nhead_kv
                 True,
@@ -1625,11 +1622,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if attn_metadata.slot_mapping is not None
             else 0
         )
+        # Sparse prefill: sparse_kv_last_page_lens is per query TOKEN, so slice it
+        # by the token slice. (The dense kv_last_page_lens is per-seq and is sliced
+        # by request in split_attn_metadata.)
         if (
-            attn_metadata.kv_last_page_lens is not None
-            and attn_metadata.kv_last_page_lens.shape[0] == total_tokens
+            attn_metadata.sparse_kv_last_page_lens is not None
+            and attn_metadata.sparse_kv_last_page_lens.shape[0] == total_tokens
         ):
-            ub_attn.kv_last_page_lens = attn_metadata.kv_last_page_lens[ts]
+            ub_attn.sparse_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[
+                ts
+            ]
 
         if (
             attn_metadata.sparse_kv_indptr is not None
