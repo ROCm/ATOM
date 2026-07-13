@@ -50,6 +50,7 @@ on:
           - MI308 Qwen3.5-397B-A17B-FP8 TP4
           - MI308 Qwen3.5-397B-A17B-FP8 TP8
           - MI308 Qwen3.5-35B-A3B-FP8 TP1
+          - MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1
           - MI308 Qwen3-32B-FP8 TP1
           - MI308 Qwen3-32B-FP8 TP8
           - MI308 GLM-5.1-FP8 TP8
@@ -234,6 +235,10 @@ jobs:
                   "model_name": "MiniMax-M3-MXFP4 TP4",
                   "model_path": "amd/MiniMax-M3-MXFP4",
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --page-size 128 --mem-fraction-static 0.8 --max-running-requests 128 --disable-radix-cache",
+                  "lm_eval_num_fewshot": 5,
+                  "lm_eval_num_concurrent": 32,
+                  "lm_eval_use_chat_completions": "1",
+                  "lm_eval_extra_model_args": "max_gen_toks=16384",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models",
                   "runner": "atom-plugin-acc-validation-runner",
@@ -379,6 +384,14 @@ jobs:
               {
                   "model_name": "MI308 Qwen3.5-35B-A3B-FP8 TP1",
                   "model_path": "Qwen/Qwen3.5-35B-A3B-FP8",
+                  "extra_args": "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+                  "accuracy_test_threshold": 0.76,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
+              },
+              {
+                  "model_name": "MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1",
+                  "model_path": "amd/Qwen3.5-35B-A3B-PTPC-FP8",
                   "extra_args": "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.76,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",

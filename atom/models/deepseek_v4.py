@@ -2075,7 +2075,10 @@ class DeepseekV4Attention(nn.Module):
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return x.new_zeros((x.shape[0], self.n_local_heads * self.head_dim))
         num_tokens = x.size(0)
-        cache_size = self.swa_kv.shape[1]
+        # paged-SWA: swa_kv is now the flat [num_blocks*block_size, head_dim]
+        # content-addressed region; block_size (not a ring cache_size) is the
+        # paging stride.
+        swa_block_size = self.swa_block_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
@@ -2088,6 +2091,9 @@ class DeepseekV4Attention(nn.Module):
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
         block_tables_gpu = attn_md.block_tables
+        # paged-SWA: swa_write targets the separate SWA pool via
+        # swa_block_tables (always populated for V4).
+        swa_block_tables_gpu = attn_md.swa_block_tables
         state_slot_mapping = attn_md.state_slot_mapping
         plan_for_layer = compress_plans[ratio] if ratio else None
 
@@ -2123,6 +2129,23 @@ class DeepseekV4Attention(nn.Module):
         # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
         # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
         # covers exactly the tokens the old standalone swa_write did.
+        # paged-SWA: do NOT fuse the SWA write into qk_norm_rope_maybe_quant.
+        # The fused (flydsl, aiter) path scatters into a per-request ring
+        # (swa_kv[slot, pos%cache]); paged content-addressing needs the
+        # block_tables-based swa_write below instead. Pass swa_kv=None so neither
+        # the flydsl nor the Triton-fallback fused write fires.
+        # Decode FUSES the paged (content-addressed) SWA cache-write into the
+        # qk_norm_rope launch via swa_block_tables — this drops a separate
+        # _swa_write_kernel launch per layer (profiling showed the standalone
+        # write + its 11k launches were the paged-SWA decode overhead vs the
+        # old ring-fused path). The flydsl kernel writes
+        #   swa_kv[block_tables[bid, pos//bs]*bs + pos%bs] = kv_out[t]
+        # for every token (gated on batch_id>=0), matching the standalone
+        # swa_write exactly. Decode has no ordering hazard (unlike prefill,
+        # which writes its in-chunk SWA tail AFTER sparse_attn so chunked
+        # prefix reads see prior-chunk contents), so writing here (before the
+        # decode attention reads the window) is safe. Prefill → swa_kv=None,
+        # separate post-attn swa_write below.
         q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
@@ -2137,13 +2160,11 @@ class DeepseekV4Attention(nn.Module):
             quant_q=False,
             quant_k=False,
             swa_kv=self.swa_kv if is_decode else None,
-            state_slot_mapping=state_slot_mapping if is_decode else None,
             batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            swa_block_tables=swa_block_tables_gpu if is_decode else None,
+            swa_block_size=swa_block_size if is_decode else None,
             swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
-            swa_cache_size=cache_size if is_decode else None,
-            swa_write_per_batch=(
-                min(attn_md.max_seqlen_q, cache_size) if is_decode else None
-            ),
+            swa_write_per_batch=attn_md.max_seqlen_q if is_decode else None,
         )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
@@ -2258,19 +2279,26 @@ class DeepseekV4Attention(nn.Module):
                 # after this call and this avoids an extra empty_like allocation.
                 out=q_sa,
             )  # [S, H, head_dim]
-            # swa_write AFTER attn so chunked-prefill prefix SWA reads see
-            # prior-chunk's ring contents (current swa_write would overwrite
-            # ring slots `pos % cache_size` for positions in this chunk's tail).
-            # PCP: write the FULL sequence SWA ring from the gathered kv_full +
-            # full positions/cu_seqlens_q (full-KV scheme — every rank holds it).
+            # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
+            # prior chunk's contents (not this chunk's just-computed tail).
+            # OPT (window-only prefill write): only write each seq's trailing
+            # `window_size` tokens (not the whole chunk). SWA decode only ever
+            # reads the last `window` tokens, so this is correct for the seq's
+            # own decode; it drops cross-request prefix reuse of the middle SWA
+            # blocks. Cuts prefill scatter-writes ~ chunk_len/window (e.g. 64x
+            # at in8192) — kills the uncoalesced block_tables scatter that made
+            # concurrent prefill slow. Correct for single- AND multi-chunk:
+            # window(128) <= chunk size, so any token's window reaches back at
+            # most 127 tokens = within the prior chunk's written last-128;
+            # free_after_prefill_chunk keeps that trailing block until read.
             swa_write(
                 kv_full,
                 positions_full,
                 attn_md.cu_seqlens_q,
-                state_slot_mapping,
+                swa_block_tables_gpu,
                 self.swa_kv,
-                cache_size,
-                min(attn_md.max_seqlen_q, cache_size),
+                swa_block_size,
+                min(self.window_size, attn_md.max_seqlen_q),
             )
 
         # Inverse RoPE on output's rope dims to remove absolute-position

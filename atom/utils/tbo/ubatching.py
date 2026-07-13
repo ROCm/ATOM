@@ -98,7 +98,13 @@ def local_tbo_precompute(
     if not config.enable_tbo_decode or batch.is_dummy_run:
         return False, 0, 0
     scheduled_bs = batch.total_seqs_num_decode
-    if scheduled_bs < 2:
+    # Eligibility must be at least as strict as the strictest backend's
+    # per-ubatch metadata / CUDAGraph-capture threshold, or a rank can report
+    # "eligible" for a batch size that has no captured graph / no prepared
+    # ubatch meta, tripping build_ubatch_metadata's assert. Decode ubatch
+    # graphs are captured only for bs > 2 (model_runner) and V4 prepares meta
+    # only for scheduled_bs > 2, so gate on > 2 here too.
+    if scheduled_bs <= 2:
         return False, 0, 0
     num_tokens = batch.total_tokens_num
     tokens_per_req = num_tokens // scheduled_bs if scheduled_bs else 1

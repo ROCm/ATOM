@@ -1427,7 +1427,47 @@ class ModelRunner:
         )
         self.max_per_req_cache_slots = max_per_req_cache_slots
 
-        num_kvcache_blocks = available_for_pool // block_bytes
+        # paged-SWA: some attention backends carve a SEPARATE windowed/prefix-
+        # cached SWA pool out of the KV budget. The SWA bytes that
+        # `compute_block_bytes` charges per compressed block move into a
+        # `num_swa_blocks`-sized pool (window-freed, so far smaller than the
+        # compressed pool), and the freed budget grows `num_kvcache_blocks`.
+        # Whether this applies is a builder capability — `swa_pool_block_bytes()`
+        # returns >0 only for backends with a separate SWA pool — so the runner
+        # stays model-agnostic (no architecture check here). Under
+        # PD/disaggregation the SWA pool is transferred per-request by
+        # seq.swa_block_table (only the live window, i.e. the last ~128-token
+        # block); see get_kv_transfer_tensors.
+        b = self.attn_metadata_builder
+        swa_block_bytes = b.swa_pool_block_bytes()
+        if swa_block_bytes > 0:
+            num_swa_blocks = b.swa_pool_num_blocks(
+                config.max_num_seqs, config.max_model_len
+            )
+            swa_reserved = num_swa_blocks * swa_block_bytes
+            # block_bytes (from _compute_block_bytes) currently includes the SWA
+            # term; strip it so the compressed pool is sized on compressed bytes.
+            compressed_block_bytes = block_bytes - swa_block_bytes
+            num_kvcache_blocks = max(
+                0, (available_for_pool - swa_reserved) // compressed_block_bytes
+            )
+            config.num_swa_blocks = int(num_swa_blocks)
+            config.swa_window_size = int(
+                getattr(hf_config, "sliding_window", 128) or 128
+            )
+            self.num_swa_blocks = int(num_swa_blocks)
+            logger.info(
+                f"paged-SWA pool: num_swa_blocks={num_swa_blocks}, "
+                f"swa_block_bytes={swa_block_bytes}, "
+                f"swa_reserved={swa_reserved / (1 << 30):.2f}GB, "
+                f"compressed_block_bytes={compressed_block_bytes}, "
+                f"num_kvcache_blocks={num_kvcache_blocks}"
+            )
+        else:
+            config.num_swa_blocks = 0
+            config.swa_window_size = 0
+            self.num_swa_blocks = 0
+            num_kvcache_blocks = available_for_pool // block_bytes
 
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
@@ -1500,6 +1540,13 @@ class ModelRunner:
             "num_per_req_cache_groups": (
                 config.max_num_seqs if per_req_cache_bytes > 0 else 0
             ),
+            # paged-SWA: get_num_blocks runs in the RUNNER subprocess, so its
+            # config.num_swa_blocks isn't visible to the engine process that
+            # builds BlockManager. Propagate via block_info (mirrors the
+            # per_req_cache fields) so BlockManager.swa_enabled matches the
+            # attn builder's SWA pool.
+            "num_swa_blocks": int(getattr(config, "num_swa_blocks", 0)),
+            "swa_window_size": int(getattr(config, "swa_window_size", 0)),
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
@@ -1670,8 +1717,19 @@ class ModelRunner:
         # backend with non-zero `compute_per_req_cache_bytes()` (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
+        # paged-SWA: SWA moved to its own num_swa_blocks pool, so the
+        # compressed pool is sized on (block_bytes - swa_block_bytes); add the
+        # SWA pool separately. (non-V4 → num_swa_blocks=0, reduces to the
+        # original formula.)
+        _nswa = getattr(self, "num_swa_blocks", 0)
+        _swa_bb = (
+            self.attn_metadata_builder.swa_pool_block_bytes()
+            if _nswa > 0 and hasattr(self.attn_metadata_builder, "swa_pool_block_bytes")
+            else 0
+        )
         expected_kv_bytes = (
-            self._compute_block_bytes() * num_kvcache_blocks
+            (self._compute_block_bytes() - _swa_bb) * num_kvcache_blocks
+            + _swa_bb * _nswa
             + self.attn_metadata_builder.compute_per_req_cache_bytes()
             * self.max_per_req_cache_slots
         )
