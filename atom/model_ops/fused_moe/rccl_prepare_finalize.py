@@ -1122,6 +1122,7 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         self._ht = RcclHTPrepareAndFinalize(**common)
         self._ll = RcclLLPrepareAndFinalize(**common)
+        self._impl_stack = []
 
     def _impl(self):
         from atom.utils import envs
@@ -1132,9 +1133,14 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if envs.ATOM_ALL2ALL_FORCE_HT:
             return self._ht
         ctx = get_forward_context().context
-        if (not ctx.is_prefill) and getattr(ctx, "dp_uniform_decode", True):
-            return self._ll
-        return self._ht
+        if ctx.is_prefill or not getattr(ctx, "dp_uniform_decode", True):
+            return self._ht
+
+        forward_mode = getattr(ctx, "forward_mode", None)
+        if forward_mode is not None and not forward_mode.use_cudagraph:
+            return self._ht
+
+        return self._ll
 
     # ---- interface passthroughs (identical on both impls) ----------------- #
 
@@ -1156,7 +1162,10 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     # ---- routed calls ----------------------------------------------------- #
 
     def prepare(self, *args, **kwargs):
-        return self._impl().prepare(*args, **kwargs)
+        impl = self._impl()
+        self._impl_stack.append(impl)
+        return impl.prepare(*args, **kwargs)
 
     def finalize(self, *args, **kwargs):
-        return self._impl().finalize(*args, **kwargs)
+        impl = self._impl_stack.pop() if self._impl_stack else self._impl()
+        return impl.finalize(*args, **kwargs)
