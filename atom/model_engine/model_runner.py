@@ -2936,6 +2936,10 @@ class ModelRunner:
                     hidden_states = None
                     self._aux_hidden_states = None
                     logits = None
+                elif self._is_pure_middle_chunk(batch):
+                    hidden_states = None
+                    self._aux_hidden_states = None
+                    logits = None
                 else:
                     if _pcp_tbo_balanced:
                         if self.use_aux_hidden_state_outputs:
@@ -3194,6 +3198,16 @@ class ModelRunner:
                 draft_token_ids=None,
             )
 
+        if self._is_pure_middle_chunk(batch):
+            reset_forward_context()
+            return ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            )
+
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -3208,6 +3222,17 @@ class ModelRunner:
         reset_forward_context()
 
         return fwd_output
+
+    @staticmethod
+    def _is_pure_middle_chunk(batch) -> bool:
+        if batch is None:
+            return False
+        if batch.total_seqs_num_decode > 0:
+            return False
+        final = batch.is_final_chunk
+        if final is None:
+            return False
+        return not any(final)
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
