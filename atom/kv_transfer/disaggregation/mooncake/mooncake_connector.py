@@ -542,7 +542,7 @@ class MooncakeConnector(KVConnectorBase):
         # --- Consumer: pending receive tracking ---
         self._pending_recv: set[ReqId] = set()
         self._pending_recv_blocks: dict[ReqId, list[int]] = {}
-        self._pending_recv_slots: dict[ReqId, int] = {}
+        self._pending_recv_slots: dict[ReqId, tuple[int, int]] = {}
         # Write-done notifications still expected per request. Under PP-prefill a
         # request is served by one producer stage per port, so the consumer must
         # collect ``remote_pp_size`` notifications before the receive is complete.
@@ -890,20 +890,13 @@ class MooncakeConnector(KVConnectorBase):
                     # stage-0 owns the block manager; it must not reuse the shared
                     # page table until all stages finished writing (see
                     # _record_release / _record_write_done).
-                    self._release_targets[req_id] = (
-                        remote_addr,
-                        meta.transfer_id,
-                        self.tp_size,
-                    )
-                with self._notify_sockets_lock:
-                    sock = self._notify_sockets.get(remote_addr)
-                    if sock is None:
-                        sock = self.zmq_context.socket(zmq.DEALER)
-                        sock.setsockopt(zmq.LINGER, 5000)
-                        sock.setsockopt(zmq.SNDHWM, 0)
-                        sock.connect(remote_addr)
-                        self._notify_sockets[remote_addr] = sock
-                    sock.send_multipart([MSG_WRITE_REQUEST, write_request])
+                    with self._completion_lock:
+                        self._release_targets[req_id] = (
+                            remote_addr,
+                            meta.transfer_id,
+                            self.tp_size,
+                        )
+                self._send_on_socket(remote_addr, [MSG_WRITE_REQUEST, write_request])
                 logger.info(
                     "[CONSUMER] write_request sent for req %s (transfer_id=%s) "
                     "to stage %d/%d at %s, dst_block_ids=%s",
@@ -1460,6 +1453,25 @@ class MooncakeConnector(KVConnectorBase):
                     return False
         return True
 
+    def _send_on_socket(self, addr: str, parts: list, repeat: int = 1) -> None:
+        """Send ``parts`` on a cached DEALER socket to ``addr``.
+
+        The socket is created and connected on first use. All sends share
+        ``_notify_sockets`` across the listener and executor threads, so the
+        whole get-or-create-and-send runs under ``_notify_sockets_lock``
+        because ZMQ sockets are not thread-safe.
+        """
+        with self._notify_sockets_lock:
+            sock = self._notify_sockets.get(addr)
+            if sock is None:
+                sock = self.zmq_context.socket(zmq.DEALER)
+                sock.setsockopt(zmq.LINGER, 5000)
+                sock.setsockopt(zmq.SNDHWM, 0)
+                sock.connect(addr)
+                self._notify_sockets[addr] = sock
+            for _ in range(repeat):
+                sock.send_multipart(parts)
+
     def _send_write_done(self, host: str, port: int, req_id: str, pp_rank: int) -> None:
         """Send write-done notification to consumer via persistent socket.
 
@@ -1469,16 +1481,7 @@ class MooncakeConnector(KVConnectorBase):
         """
         path = make_zmq_path("tcp", host, port)
         notification = msgpack.dumps({"request_id": req_id, "pp_rank": pp_rank})
-        with self._notify_sockets_lock:
-            sock = self._notify_sockets.get(path)
-            if sock is None:
-                sock = self.zmq_context.socket(zmq.DEALER)
-                sock.setsockopt(zmq.LINGER, 5000)
-                sock.setsockopt(zmq.SNDHWM, 0)
-                sock.connect(path)
-                self._notify_sockets[path] = sock
-            for _ in range(3):
-                sock.send_multipart([MSG_WRITE_DONE, notification])
+        self._send_on_socket(path, [MSG_WRITE_DONE, notification], repeat=3)
         logger.info("[PRODUCER] write-done sent for req %s", req_id)
 
     # -----------------------------------------------------------------
@@ -1507,22 +1510,15 @@ class MooncakeConnector(KVConnectorBase):
         PP-prefill only. stage-0 defers reusing the shared page table until it
         has one release per decode rank (all stage×rank writes complete).
         """
-        target = self._release_targets.pop(req_id, None)
+        with self._completion_lock:
+            target = self._release_targets.pop(req_id, None)
         if target is None:
             return
         remote_addr, transfer_id, consumer_tp_size = target
         payload = msgpack.dumps(
             {"transfer_id": transfer_id, "consumer_tp_size": consumer_tp_size}
         )
-        with self._notify_sockets_lock:
-            sock = self._notify_sockets.get(remote_addr)
-            if sock is None:
-                sock = self.zmq_context.socket(zmq.DEALER)
-                sock.setsockopt(zmq.LINGER, 5000)
-                sock.setsockopt(zmq.SNDHWM, 0)
-                sock.connect(remote_addr)
-                self._notify_sockets[remote_addr] = sock
-            sock.send_multipart([MSG_RELEASE, payload])
+        self._send_on_socket(remote_addr, [MSG_RELEASE, payload])
 
     def _record_write_done(self, req_id: str, pp_rank: int) -> bool:
         """Register producer stage ``pp_rank``'s write-done for ``req_id``.
