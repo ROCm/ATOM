@@ -992,6 +992,12 @@ def _sparse_attn_v4_paged_decode_asm(
     output = torch.empty(
         (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
     )
+    # Debug (strategy #4.1): ATOM_MLA_DECODE_ASM_FORCE_NOSPLIT=1 forces a single
+    # KV split + direct bf16 write so the stage2 cross-split LSE merge is bypassed
+    # entirely — isolates whether the asm accuracy gap lives in stage1 (single-pass
+    # attention) or stage2 (merge). Default (unset/0) uses the auto split heuristic.
+    if os.environ.get("ATOM_MLA_DECODE_ASM_FORCE_NOSPLIT", "0") == "1":
+        num_kv_splits = 1
     out_16_nosplit = 1 if num_kv_splits == 1 else 0
 
     logits, _ = aiter.mla.mla_decode_fwd_v4_nm(

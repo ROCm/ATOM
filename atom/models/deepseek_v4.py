@@ -2107,10 +2107,11 @@ class DeepseekV4Attention(nn.Module):
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_hca
             else:
                 raise ValueError(f"Unsupported compress_ratio {ratio}")
-            if self.kv_fp8:
+            if self.kv_fp8 and get_gfx() == "gfx950":
                 # Native fp8 prefill (op4): feed the 2buff fp8 prefix pool
                 # directly (nope-fp8 + rope-bf16) plus op1-quantized fp8 Q and
-                # extend K. No dequant of the prefix, no torch quant. gfx950.
+                # extend K. No dequant of the prefix, no torch quant. gfx950-only
+                # (hand-written MFMA / wave64 OPUS kernel).
                 from aiter.ops.pa_sparse_prefill_opus import (
                     pa_sparse_prefill_fp8_opus,
                 )
@@ -2128,6 +2129,40 @@ class DeepseekV4Attention(nn.Module):
                     attn_md.kv_indptr_extend,
                     self.attn_sink,
                     self.softmax_scale,
+                )  # [S, H, head_dim] bf16
+            elif self.kv_fp8:
+                # No native fp8 sparse-prefill kernel exists off gfx950 (the
+                # OPUS op4 kernel is gfx950 MFMA/wave64 only). On other archs
+                # (e.g. gfx1250) dequantize the 2buff MXFP8 inputs (NoPE fp8 +
+                # inline 1x64 e8m0 tile scales, RoPE bf16) back to combined bf16
+                # [., 512] rows and run the arch-agnostic Triton sparse prefill.
+                # The KV cache stays fp8 in memory (memory savings preserved);
+                # only the prefill compute runs in bf16. NOTE: this dequantizes
+                # the full unified_kv pool per layer — correctness-first bridge,
+                # not a perf-tuned path.
+                from atom.model_ops.v4_kernels.v4_quant import (
+                    dequantize_v4_2buff_to_bf16,
+                )
+
+                q_bf16 = dequantize_v4_2buff_to_bf16(q_packed, q_rope_q)
+                unified_kv_bf16 = dequantize_v4_2buff_to_bf16(
+                    self.unified_kv, self.unified_kv_rope
+                )
+                kv_extend_bf16 = dequantize_v4_2buff_to_bf16(
+                    k_packed.view(k_packed.shape[0], -1),
+                    k_rope.view(k_rope.shape[0], -1),
+                )
+                o = sparse_attn_v4_paged_prefill(
+                    q_bf16,
+                    unified_kv_bf16,
+                    kv_indices_prefix,
+                    kv_indptr_prefix,
+                    kv_extend_bf16,
+                    attn_md.kv_indices_extend,
+                    attn_md.kv_indptr_extend,
+                    self.attn_sink,
+                    self.softmax_scale,
+                    out=q_bf16,
                 )  # [S, H, head_dim] bf16
             else:
                 o = sparse_attn_v4_paged_prefill(
