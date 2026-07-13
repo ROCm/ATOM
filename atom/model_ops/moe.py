@@ -1501,7 +1501,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
             from aiter.ops.triton.moe.moe_op_gemm_a4w4 import mxfp4_quant
 
+        # Both aiter FP4 dense GEMMs (gemm_a16wfp4 and gemm_afp4wfp4) are
+        # numerically broken on gfx1250 (~11% error vs a dequant reference even
+        # with losslessly-representable fp4 weights), which corrupts the always-on
+        # shared expert every MoE layer and garbles decode (never emits EOS).
+        # Until the aiter kernels are fixed, dequant the MXFP4 shared weights to
+        # bf16 and use a correct bf16 matmul on gfx1250 (both act-quant flavours).
+        _gfx1250 = get_gfx() == "gfx1250"
+        if _gfx1250:
+            from aiter.ops.triton.moe.quant_moe import upcast_from_mxfp
+
         def _shared_expert_gemm(act, weight, weight_scale):
+            if _gfx1250:
+                w_bf16 = upcast_from_mxfp(weight, weight_scale, act.dtype, axis=-1)
+                return torch.matmul(act, w_bf16.transpose(-2, -1))
             if use_a4w4:
                 act_fp4, act_mx_scale = mxfp4_quant(act)
                 return gemm_afp4wfp4(act_fp4, weight, act_mx_scale, weight_scale)
