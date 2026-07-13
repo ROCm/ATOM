@@ -14,6 +14,11 @@ class SequenceStatus(Enum):
     WAITING_FOR_REMOTE_KVS = auto()
     WAITING = auto()
     RUNNING = auto()
+    # Client disconnected: the seq is still live (its KV must be freed via the
+    # normal stop path). The scheduler finishes it at the next step (running) or
+    # drops it when popped from `waiting`. Distinct from FINISHED so it still
+    # rides one cleanup pass; is_finished() stays False until then.
+    ABORTED = auto()
     FINISHED = auto()
     EXIT_ENGINE = auto()
 
@@ -120,9 +125,6 @@ class Sequence:
         self.first_token_time = 0.0
         self.leave_time = 0.0
         self.leave_reason = ""
-        # Set True when the client disconnected; the scheduler finishes the seq
-        # at the next step via the normal stop path (frees KV, emits finished).
-        self.aborted = False
 
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
