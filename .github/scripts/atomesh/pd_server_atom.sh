@@ -413,6 +413,21 @@ start_decode() {
 
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
+  case "${ATOM_PD_RANK_MAPPING_POLICY}" in
+    none|idx2idx) ;;
+    *)
+      echo "[router][FAIL] invalid ATOM_PD_RANK_MAPPING_POLICY=${ATOM_PD_RANK_MAPPING_POLICY}" >&2
+      exit 1
+      ;;
+  esac
+
+  local -a router_rank_mapping_args=()
+  if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]]; then
+    router_rank_mapping_args=(
+      --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"
+      --dp-aware
+    )
+  fi
   local -a router_cmd=(
     /usr/local/bin/atomesh launch
     --host 0.0.0.0
@@ -421,6 +436,7 @@ start_router() {
     "${prefill_args[@]}"
     "${decode_args[@]}"
     --policy "${ROUTER_POLICY}"
+    "${router_rank_mapping_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker

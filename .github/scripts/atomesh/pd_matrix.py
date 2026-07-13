@@ -81,9 +81,15 @@ def resolve_model_path(model_name: str, model_cfg: dict[str, Any]) -> str:
     return resolve_env_refs(model_path) if "${" in model_path else model_path
 
 
-def resolve_env_refs(value: str) -> str:
+def resolve_env_refs(
+    value: str, preserve_names: set[str] | None = None
+) -> str:
+    preserve_names = preserve_names or set()
+
     def expand_env(match: re.Match[str]) -> str:
         name = match.group(1)
+        if name in preserve_names:
+            return match.group(0)
         if name not in os.environ:
             raise ValueError(f"Environment variable {name} is not set")
         return os.environ[name].strip()
@@ -91,13 +97,18 @@ def resolve_env_refs(value: str) -> str:
     return ENV_REF_RE.sub(expand_env, value)
 
 
-def resolve_env_refs_in_value(value: Any) -> Any:
+def resolve_env_refs_in_value(
+    value: Any, preserve_names: set[str] | None = None
+) -> Any:
     if isinstance(value, str) and "${" in value:
-        return resolve_env_refs(value)
+        return resolve_env_refs(value, preserve_names)
     if isinstance(value, list):
-        return [resolve_env_refs_in_value(item) for item in value]
+        return [resolve_env_refs_in_value(item, preserve_names) for item in value]
     if isinstance(value, dict):
-        return {key: resolve_env_refs_in_value(item) for key, item in value.items()}
+        return {
+            key: resolve_env_refs_in_value(item, preserve_names)
+            for key, item in value.items()
+        }
     return value
 
 
@@ -183,6 +194,7 @@ def role_env(
         model_cfg.get("env", {}).get(role, {}),
         suite_cfg.get("env", {}).get(role, {}),
     )
+    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP"})
     return {str(key): str(value) for key, value in env.items()}
 
 
