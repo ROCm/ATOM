@@ -19,6 +19,7 @@ DRY_RUN=0
 JOB_ID=""
 SLURM_JOB_ACTIVE=0
 SCANCEL_SENT=0
+declare -A SPUR_SHARED_LOG_LINES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -151,12 +152,21 @@ exports = {
     "EVAL_CONCURRENCY": csv_value(
         accuracy.get("concurrency") or cell.get("concurrency", [])
     ),
+    "SLURM_SUBMIT_RUNNER": runner.get("slurm_submit_runner", "atomesh-cicd"),
     "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
     "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
     "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
+    "SPUR_CONTROLLER_ADDR": runner.get(
+        "spur_controller_addr",
+        os.environ.get("SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"),
+    ),
+    "SPUR_ACCOUNTING_ADDR": runner.get(
+        "spur_accounting_addr",
+        os.environ.get("SPUR_ACCOUNTING_ADDR", "http://134.199.196.72:6819"),
+    ),
 }
 
 for key, value in exports.items():
@@ -172,9 +182,17 @@ PY
 )"
 
 export RESULT_DIR
+CURRENT_USER="$(id -un)"
+SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$\{USER\}/${CURRENT_USER}}"
+SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$USER/${CURRENT_USER}}"
 export LOG_ROOT="${SLURM_LOG_ROOT%/}/${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-$(date +%Y%m%d%H%M%S)"
-export SLURM_OUTPUT="${LOG_ROOT}/slurm-%j.out"
-export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+  export SLURM_OUTPUT="/tmp/atomesh-%j.out"
+  export SLURM_ERROR="/tmp/atomesh-%j.err"
+else
+  export SLURM_OUTPUT="${LOG_ROOT}/slurm-%j.out"
+  export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
+fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 
 echo "=== ATOMesh benchmark cell ==="
@@ -184,6 +202,10 @@ echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
 echo "isl=${ISL_LIST} osl=${OSL} concurrency=${CONC_LIST}"
 echo "log_root=${LOG_ROOT}"
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+  echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
+  echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
+fi
 
 mkdir -p "${RESULT_DIR}"
 
@@ -227,10 +249,32 @@ scancel_slurm_job() {
   SCANCEL_SENT=1
   echo "=== cancelling Slurm job ${JOB_ID}: ${reason} ===" >&2
   if command -v scancel >/dev/null 2>&1; then
-    scancel "${JOB_ID}" || true
+    if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+      scancel --controller "${SPUR_CONTROLLER_ADDR}" "${JOB_ID}" || true
+    else
+      scancel "${JOB_ID}" || true
+    fi
   else
     echo "WARNING: scancel not found; unable to cancel Slurm job ${JOB_ID}" >&2
   fi
+}
+
+parse_sbatch_job_id() {
+  local output="$1"
+  output="${output//$'\r'/}"
+
+  if [[ "${output}" =~ ^[[:space:]]*([0-9]+)(\;.*)?[[:space:]]*$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  if [[ "${output}" =~ Submitted[[:space:]]+batch[[:space:]]+job[[:space:]]+([0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  echo "ERROR: unable to parse Slurm job id from sbatch output: ${output}" >&2
+  return 1
 }
 
 on_cancel() {
@@ -261,6 +305,30 @@ set_slurm_job_log_paths() {
   echo "slurm_error=${SLURM_JOB_ERROR}"
 }
 
+write_slurm_cancel_helper() {
+  local job_id="$1"
+  local helper="${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-cancel.sh"
+
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    cat > "${helper}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v scancel >/dev/null 2>&1; then
+  scancel --controller "${SPUR_CONTROLLER_ADDR}" "${job_id}" || true
+fi
+EOF
+  else
+    cat > "${helper}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v scancel >/dev/null 2>&1; then
+  scancel "${job_id}" || true
+fi
+EOF
+  fi
+  chmod +x "${helper}"
+}
+
 stream_file_lines() {
   local file="$1"
   local prefix="$2"
@@ -284,19 +352,47 @@ stream_slurm_logs_once() {
   ERR_LINE="$(stream_file_lines "${SLURM_JOB_ERROR}" "[slurm.err] " "${ERR_LINE}")"
 }
 
+stream_spur_shared_logs_once() {
+  local job_id="$1"
+  local run_dir="${LOG_ROOT}/slurm_job-${job_id}"
+  local log_file rel_path current_line
+
+  [[ -d "${run_dir}" ]] || return 0
+
+  shopt -s nullglob
+  for log_file in "${run_dir}"/rank-*/container.log "${run_dir}"/logs/*.log; do
+    rel_path="${log_file#"${run_dir}/"}"
+    current_line="${SPUR_SHARED_LOG_LINES[${log_file}]:-0}"
+    SPUR_SHARED_LOG_LINES["${log_file}"]="$(stream_file_lines "${log_file}" "[spur:${rel_path}] " "${current_line}")"
+  done
+  shopt -u nullglob
+}
+
 monitor_slurm_job() {
   local job_id="$1"
+  local squeue_cmd=(squeue)
   OUT_LINE=0
   ERR_LINE=0
+  SPUR_SHARED_LOG_LINES=()
+
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    squeue_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
 
   echo "=== monitoring Slurm job ${job_id} ==="
-  while squeue -h -j "${job_id}" >/dev/null 2>&1 && [[ -n "$(squeue -h -j "${job_id}" 2>/dev/null)" ]]; do
-    squeue -h -j "${job_id}" -o "[slurm] job=%i state=%T elapsed=%M nodes=%D reason=%R" || true
+  while "${squeue_cmd[@]}" -h -j "${job_id}" >/dev/null 2>&1 && [[ -n "$("${squeue_cmd[@]}" -h -j "${job_id}" 2>/dev/null)" ]]; do
+    "${squeue_cmd[@]}" -h -j "${job_id}" -o "[slurm] job=%i state=%T elapsed=%M nodes=%D reason=%R" || true
     stream_slurm_logs_once
+    if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+      stream_spur_shared_logs_once "${job_id}"
+    fi
     sleep "${SLURM_LOG_POLL_INTERVAL}"
   done
 
   stream_slurm_logs_once
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    stream_spur_shared_logs_once "${job_id}"
+  fi
 }
 
 read_slurm_exit_code() {
@@ -312,7 +408,11 @@ read_slurm_exit_code() {
     return 0
   fi
 
-  sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+  else
+    sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+  fi
   if [[ -z "${sacct_line}" ]]; then
     return 0
   fi
@@ -330,45 +430,74 @@ read_slurm_exit_code() {
     SLURM_JOB_RC="${exit_status}"
   fi
 
-  if [[ "${SLURM_STATE}" != COMPLETED && "${SLURM_JOB_RC}" -eq 0 ]]; then
+  if [[ "${SLURM_STATE}" != COMPLETE && "${SLURM_STATE}" != COMPLETED && "${SLURM_JOB_RC}" -eq 0 ]]; then
     SLURM_JOB_RC=1
   fi
 }
 
 IFS=',' read -r -a NODE_ARRAY <<< "${NODE_LIST}"
-SBATCH_CMD=(
-  sbatch
-  --parsable
-  --exclusive
-  --account "${SLURM_ACCOUNT}"
-  --partition "${SLURM_PARTITION}"
-  --nodes "${NUM_NODES}"
-  --ntasks "${NUM_NODES}"
-  --ntasks-per-node 1
-  --cpus-per-task "${SLURM_CPUS_PER_TASK}"
-  --gres "gpu:${SLURM_GPUS_PER_NODE}"
-  --time "${SLURM_TIME_LIMIT}"
-  --nodelist "${NODE_LIST}"
-  --output "${SLURM_OUTPUT}"
-  --error "${SLURM_ERROR}"
-  "${JOB_SCRIPT}"
-)
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+  SUBMIT_SCRIPT="${LOG_ROOT}/submit-${ATOMESH_CELL_ID}.sbatch.sh"
+  cat > "${SUBMIT_SCRIPT}" <<EOF
+#!/usr/bin/env bash
+#SBATCH --job-name=${ATOMESH_CELL_ID}
+#SBATCH --nodes=${NUM_NODES}
+#SBATCH --ntasks-per-node=1
+#SBATCH --exclusive
+#SBATCH --time=${SLURM_TIME_LIMIT}
+#SBATCH --chdir=/tmp
+EOF
+  if [[ -n "${NODE_LIST}" ]]; then
+    printf '#SBATCH --nodelist=%s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"
+  fi
+  cat >> "${SUBMIT_SCRIPT}" <<EOF
+#SBATCH --output=${SLURM_OUTPUT}
+#SBATCH --error=${SLURM_ERROR}
+EOF
+  {
+    printf 'export %q=%q\n' GITHUB_WORKSPACE "${REPO_ROOT}"
+    printf 'exec %q\n' "${JOB_SCRIPT}"
+  } >> "${SUBMIT_SCRIPT}"
+  chmod +x "${SUBMIT_SCRIPT}"
+  SBATCH_CMD=(sbatch --controller "${SPUR_CONTROLLER_ADDR}" "${SUBMIT_SCRIPT}")
+else
+  SBATCH_CMD=(
+    sbatch
+    --parsable
+    --exclusive
+    --account "${SLURM_ACCOUNT}"
+    --partition "${SLURM_PARTITION}"
+    --nodes "${NUM_NODES}"
+    --ntasks "${NUM_NODES}"
+    --ntasks-per-node 1
+    --cpus-per-task "${SLURM_CPUS_PER_TASK}"
+    --gres "gpu:${SLURM_GPUS_PER_NODE}"
+    --time "${SLURM_TIME_LIMIT}"
+    --nodelist "${NODE_LIST}"
+    --output "${SLURM_OUTPUT}"
+    --error "${SLURM_ERROR}"
+    "${JOB_SCRIPT}"
+  )
+fi
 
 echo "=== submitting Slurm job ==="
 printf ' %q' "${SBATCH_CMD[@]}"
 echo
 
 set +e
-JOB_ID="$("${SBATCH_CMD[@]}")"
+SBATCH_OUTPUT="$("${SBATCH_CMD[@]}")"
 SBATCH_RC=$?
 set -e
-JOB_ID="${JOB_ID%%;*}"
-echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
+echo "${SBATCH_OUTPUT}"
 
 if [[ "${SBATCH_RC}" -ne 0 ]]; then
   echo "sbatch submit exit code: ${SBATCH_RC}"
   exit "${SBATCH_RC}"
 fi
+
+JOB_ID="$(parse_sbatch_job_id "${SBATCH_OUTPUT}")"
+echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
+write_slurm_cancel_helper "${JOB_ID}"
 
 SLURM_JOB_ACTIVE=1
 set_slurm_job_log_paths "${JOB_ID}"
@@ -382,7 +511,21 @@ echo "slurm job exit code: ${SBATCH_RC}"
 
 if [[ -d "${LOG_ROOT}" ]]; then
   mkdir -p "${RESULT_DIR}/${ATOMESH_CELL_ID}"
-  cp -a "${LOG_ROOT}/." "${RESULT_DIR}/${ATOMESH_CELL_ID}/" || true
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    tar \
+      --exclude='.cache' \
+      --exclude='./.cache' \
+      --exclude='.aiter' \
+      --exclude='./.aiter' \
+      -C "${LOG_ROOT}" \
+      -cf - . | tar \
+      --no-same-owner \
+      --no-same-permissions \
+      -C "${RESULT_DIR}/${ATOMESH_CELL_ID}" \
+      -xf - || true
+  else
+    cp -a "${LOG_ROOT}/." "${RESULT_DIR}/${ATOMESH_CELL_ID}/" || true
+  fi
 fi
 
 exit "${SBATCH_RC}"
