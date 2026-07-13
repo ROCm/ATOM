@@ -14,7 +14,11 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import (
+    interleave_gate_up_rows,
+    moe_shuffle_scale,
+    moe_shuffle_weight,
+)
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -824,13 +828,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         gfx = get_gfx()
         self.is_gfx1250 = gfx == "gfx1250"
-        # gfx1250 grouped a8w4 MoE kernel only supports the non-interleaved
-        # (gate|up separated) scale layout; reject is_guinterleave up front.
-        if self.is_gfx1250 and self.is_guinterleave:
-            raise NotImplementedError(
-                "gfx1250 MoE only supports is_guinterleave=False; "
-                "unset ATOM_MOE_GU_ITLV."
-            )
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             self.use_triton = envs.ATOM_USE_TRITON_MOE
         else:
@@ -838,6 +835,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
             )
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
+        if envs.is_set("ATOM_USE_TRITON_MOE_DECODE") and not self.is_guinterleave:
+            self.use_triton_decode = envs.ATOM_USE_TRITON_MOE_DECODE
+        else:
+            self.use_triton_decode = False
 
     def create_weights(
         self,
@@ -1032,7 +1033,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.hidden_size,  # N_2,
                 self.intermediate_size,  # K_2,
                 atom_config.tensor_parallel_size,
-                act_quant=self.act_quant,
             )
             del layer.w13_weight
             del layer.w2_weight
@@ -1046,19 +1046,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_swizzle_layout = w2_swizzle_layout
             return
 
-        # shuffle weight
-        layer.w13_weight.data = shuffle_weight(
+        if self.use_triton_decode:
+            # Triton decode is GGUU-only (gate/up separated). Snapshot only the
+            # raw SCALES (small) before the FlyDSL shuffle overwrites them — the
+            # decode WEIGHTS are a zero-copy view of the FlyDSL-shuffled weight
+            # (built below), so they share storage and don't double weight memory.
+            orig_w13_weight_scale = layer.w13_weight_scale.data.clone()
+            orig_w2_weight_scale = layer.w2_weight_scale.data.clone()
+
+        # shuffle weight (arch-aware: gfx1250 does the GUGU row interleave +
+        # WMMA tile shuffle internally, other archs use the lane-level path)
+        layer.w13_weight.data = moe_shuffle_weight(
             layer.w13_weight,
+            experts_cnt=self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=True,
         )
-        layer.w2_weight.data = shuffle_weight(
+        layer.w2_weight.data = moe_shuffle_weight(
             layer.w2_weight,
+            experts_cnt=self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=False,
         )
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
+
+        # GUGU (is_guinterleave) reorders the stage1 output rows to
+        # [g0, u0, g1, u1, ...]; moe_shuffle_weight interleaves the weight rows
+        # but not the bias, so interleave w13_bias to match. w2_bias (stage2,
+        # single N=hidden GEMM) has no gate/up concept and is left as-is.
+        if self.is_guinterleave and layer.w13_bias is not None:
+            layer.w13_bias.data = interleave_gate_up_rows(layer.w13_bias.data)
 
         # shuffle scale
         w13_scale_2d = layer.w13_weight_scale.reshape(
@@ -1080,6 +1098,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+
+        if self.use_triton_decode:
+            from aiter.ops.triton.utils.shuffle import (
+                moe_weight_decode_view,
+                shuffle_scale_moe,
+            )
+
+            # Decode weights: zero-copy view of the FlyDSL-shuffled weight into
+            # the gfx1250 a8w4 decode layout. Shares storage with layer.w{13,2}
+            # _weight (no second weight copy); scales differ, so the *_a8w4 scale
+            # tensors below are separate (scale duplication is acceptable).
+            layer.w13_weight_preshuffled = moe_weight_decode_view(layer.w13_weight.data)
+            layer.w2_weight_preshuffled = moe_weight_decode_view(layer.w2_weight.data)
+
+            w13_scale_for_a8w4 = orig_w13_weight_scale.transpose(-2, -1)
+            w2_scale_for_a8w4 = orig_w2_weight_scale.transpose(-2, -1)
+
+            # Arch -> SWIZZLE_MX_SCALE label decision lives in aiter, not here.
+            # GGUU keeps gate/up separated, so no interleave on the decode scales.
+            (
+                layer.w13_weight_scale_a8w4,
+                layer.w13_swizzle_layout_a8w4,
+            ) = shuffle_scale_moe(w13_scale_for_a8w4, return_layout=True)
+            (
+                layer.w2_weight_scale_a8w4,
+                layer.w2_swizzle_layout_a8w4,
+            ) = shuffle_scale_moe(w2_scale_for_a8w4, return_layout=True)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1124,6 +1169,49 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        if self.use_triton_decode and not get_forward_context().context.is_prefill:
+            # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
+            from atom.model_ops.fused_moe_triton import (
+                triton_kernel_fused_experts_a8w4_silu_gguu,
+            )
+            from aiter.ops.triton.moe.moe_routing.routing import routing
+
+            n_expts_act = top_k
+
+            routing_data, gather_idx, scatter_idx = routing(
+                router_logits,
+                n_expts_act,
+                score_mode=scoring_func,
+                bias=(
+                    e_score_correction_bias.to(torch.float32)
+                    if e_score_correction_bias is not None
+                    else None
+                ),
+                renorm=renormalize,
+                routed_scaling_factor=layer.routed_scaling_factor,
+                use_grouped_topk=use_grouped_topk,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+            )
+            return triton_kernel_fused_experts_a8w4_silu_gguu(
+                x,
+                layer.w13_weight_preshuffled,
+                layer.w2_weight_preshuffled,
+                routing_data,
+                gather_idx,
+                scatter_idx,
+                w13_scale=layer.w13_weight_scale_a8w4,
+                w2_scale=layer.w2_weight_scale_a8w4,
+                w13_swizzle_layout=layer.w13_swizzle_layout_a8w4,
+                w2_swizzle_layout=layer.w2_swizzle_layout_a8w4,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts,
@@ -1986,13 +2074,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # aiter's MXFP8 MoE kernels consume the same gate/up interleaved
             # layout used by their 1x32 shuffle helpers. Keep this branch
             # isolated so the existing 1x128 FP8 path still uses shuffle_weights.
-            layer.w13_weight.data = shuffle_weight(
+            # moe_shuffle_weight mirrors moe_shuffle_scale: arch-aware GUGU
+            # handling (row interleave + WMMA tile shuffle on gfx1250).
+            layer.w13_weight.data = moe_shuffle_weight(
                 layer.w13_weight,
+                experts_cnt=self.num_experts,
                 is_guinterleave=True,
                 gate_up=True,
             )
-            layer.w2_weight.data = shuffle_weight(
+            layer.w2_weight.data = moe_shuffle_weight(
                 layer.w2_weight,
+                experts_cnt=self.num_experts,
                 is_guinterleave=True,
                 gate_up=False,
             )

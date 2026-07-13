@@ -480,6 +480,22 @@
       "env_vars": "qwen_common"
     },
     {
+      "display": "Qwen3.5-35B-A3B-PTPC-FP8 TP1 MI308",
+      "dashboard_model": "Qwen3.5-35B-A3B-PTPC-FP8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "amd/Qwen3.5-35B-A3B-PTPC-FP8",
+      "path": "amd/Qwen3.5-35B-A3B-PTPC-FP8",
+      "prefix": "qwen3-5-35b-a3b-ptpc-fp8-tp1-mi308",
+      "extra_args": [
+        "--tensor-parallel-size 1",
+        "qwen_reasoning"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "env_vars": "qwen_common"
+    },
+    {
       "display": "Qwen3-32B-FP8 TP1 MI308",
       "dashboard_model": "Qwen3-32B-FP8 MI308",
       "workload_label": "SGLang-OOB",

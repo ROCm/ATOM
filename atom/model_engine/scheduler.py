@@ -318,6 +318,11 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
+        # paged-SWA: parallel SWA block table (independent physical pool;
+        # -1 sentinels for window-freed blocks). Same filter as block_tables.
+        self.swa_block_tables = [
+            seq.swa_block_table for seq in seqs.values() if seq.block_table
+        ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
@@ -455,42 +460,13 @@ class Scheduler:
             CacheStats() if config.enable_prefix_caching else None
         )
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        # V4 SWA correctness on a prefix-cache hit. V4's sliding-window state is
-        # a per-request ring (NOT shared across blocks), so on a hit the new
-        # request's ring is empty and a tail token whose SWA window reaches back
-        # into the cached region would read garbage. Fix: pull the forward start
-        # back by enough whole blocks that the last `window` cached tokens are
-        # re-forwarded, repopulating the ring. The compressed-KV hit (n_committed
-        # = context_len // ratio) is UNAFFECTED because context_lens =
-        # num_cached + num_scheduled is invariant under this shift. Only V4 needs
-        # this; 0 disables (e.g. once SWA gets per-block shared storage, "fix C").
-        # See docs / plan: V4 prefix cache fix B'.
-        # NOTE: V4 detection must use `architectures`, not `model_type` — the
-        # config registry maps "deepseek_v4" -> "deepseek_v3" so model_type
-        # reads as v3 (same reason config.py:1118 uses architectures).
-        self._v4_swa_warmup_blocks = 0
-        _hf = getattr(config, "hf_config", None)
-        _arches = getattr(_hf, "architectures", None) or []
-        _is_v4 = any("DeepseekV4" in str(a) for a in _arches)
-        if config.enable_prefix_caching and _is_v4:
-            import math as _math
-
-            window = int(getattr(_hf, "sliding_window", 128) or 128)
-            # The SWA ring's physical stride is `win_with_spec = window + mtp_k`
-            # (MTP draft tokens get their own ring slots). A tail token's window
-            # can reach back `win_with_spec - 1` ring slots, so the re-forwarded
-            # region must cover that many tokens — not just `window`. Verified:
-            # with mtp_k=1, rolling back only `window`(128) leaves the deepest
-            # reach-back (r=4) reading one stale slot -> DIVERGE.
-            mtp_k = (
-                config.speculative_config.num_speculative_tokens
-                if config.speculative_config is not None
-                else 0
-            )
-            win_with_spec = window + int(mtp_k or 0)
-            self._v4_swa_warmup_blocks = _math.ceil(
-                win_with_spec / self.block_manager.block_size
-            )
+        # V4 SWA correctness on a prefix-cache hit is now handled entirely in
+        # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
+        # trailing window is SWA-present, and `allocate` marks out-of-window
+        # blocks -1. The old `_v4_swa_warmup_blocks` (re-forward the tail to
+        # repopulate the per-request ring) was a pre-paged-ring workaround and is
+        # removed — the paged content-addressed SWA pool reuses the tail window
+        # directly. See PLAN_swa_prefix_cache_tail_gate.md.
         # Number of running seqs currently mid-prefill (per-seq state lives in
         # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
         # of `schedule()` can skip the running-queue scan entirely on
@@ -848,21 +824,13 @@ class Scheduler:
                 continue
 
             # Probe cache hits FIRST so budget check sees the real
-            # (post-prefix-cache) remaining token count.
+            # (post-prefix-cache) remaining token count. V4 SWA correctness is
+            # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
+            # where the trailing-window SWA is present); no post-hoc warmup trim.
             num_cached_blocks = self.block_manager.can_allocate(seq)
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
-
-            # V4 SWA fix (B'): drop the last `_v4_swa_warmup_blocks` hit blocks so
-            # those tokens are re-forwarded, repopulating the per-request SWA
-            # ring (see __init__). Compressed-KV n_committed is unaffected
-            # (context_lens = cached + scheduled stays = prompt length). Only
-            # fires on a real hit (>0); a full miss is untouched.
-            if self._v4_swa_warmup_blocks and num_cached_blocks > 0:
-                num_cached_blocks = max(
-                    0, num_cached_blocks - self._v4_swa_warmup_blocks
-                )
 
             # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
             # their decoded tokens — preempt() frees their KV blocks but keeps
@@ -901,6 +869,12 @@ class Scheduler:
             )
 
             if needs_remote_load:
+                # PD: the consumer runs no prefill forward (so ensure_swa is
+                # never called) and its first may_append is skipped. Materialize
+                # the trailing-window SWA blocks now — matching the producer's
+                # post-free swa_block_table positions — so the RDMA transfer has
+                # real dst slots to write the sliding-window KV into.
+                self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
@@ -926,6 +900,17 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
+            # chunked-prefill: materialize the SWA pool blocks this chunk's
+            # tokens touch BEFORE the forward writes SWA. allocate() left uncached
+            # SWA slots as -1 placeholders; fill the current chunk's logical
+            # range in-place (out-of-window blocks are freed in postprocess after
+            # num_cached_tokens advances). scheduled_seqs / num_scheduled_tokens
+            # are index-aligned; all seqs here are PREFILL.
+            if self.block_manager.swa_enabled:
+                for seq, chunk in zip(scheduled_seqs.values(), num_scheduled_tokens):
+                    self.block_manager.swa.ensure_for_tokens(
+                        seq, seq.num_cached_tokens, chunk
+                    )
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
@@ -1286,6 +1271,11 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
+                # chunked-prefill: reclaim SWA blocks that just fell out of
+                # the window, using the computed-so-far length
+                # (num_cached_tokens). Bounds peak SWA to ~window during prefill
+                # instead of waiting for the first decode step's may_append.
+                self.block_manager.swa.free_after_prefill_chunk(seq)
                 # Prefill is partial until the whole PROMPT's KV is computed.
                 # Compare against num_prompt_tokens, not num_tokens: once a
                 # completion token is appended (this step's sampled token, or an

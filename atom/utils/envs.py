@@ -44,6 +44,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
+    == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
@@ -88,6 +90,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 to disable chunking (always single-shot).
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
+    ),
+    # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
+    # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
+    # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
+    # identical to V3.2, so the fusion is math-equivalent to the unfused path. Set to
+    # "0" to fall back to the per-op Python path if a regression is suspected.
+    "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
+        os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
     ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
@@ -255,6 +265,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default on; set "0" to fall back to the request-boundary balanced split.
     "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
         os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
+    ),
+    # Minimum prefill tokens (per rank) required to TBO-split.
+    "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
