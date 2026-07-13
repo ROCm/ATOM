@@ -666,12 +666,28 @@ function buildAtomeshBenchmarkRows(data) {
   const rowsByKey = {};
   let idx = 0;
   for (const run of runs) {
+    const runDay = localDay(run.date || Date.now());
+    const commitId = run.commit?.id || '';
+    const cid7 = commitId.slice(0, 7);
     for (const bench of run.benches || []) {
       const parsed = parseAtomeshPerfPointExtra(bench.extra);
       if (!parsed?.point || parsed.point.source !== 'ATOMesh') continue;
       const row = atomeshPointRow(parsed.point, parsed.meta, idx++);
       const key = `${row.backend}|${row.hardware}|${row.model}|${row.topology}|${row.islOsl}|${row.concurrency}`;
-      if (!rowsByKey[key]) rowsByKey[key] = row;
+      const current = rowsByKey[key];
+      if (!current) {
+        rowsByKey[key] = { ...row, runDay, cid7 };
+        continue;
+      }
+      if (current.runDay !== runDay || current.cid7 !== cid7) continue;
+      const currentScore = atomeshPointScore(current);
+      const nextScore = atomeshPointScore(row);
+      if (
+        (Number.isFinite(nextScore) && (!Number.isFinite(currentScore) || nextScore > currentScore))
+        || (nextScore === currentScore && (row.date || 0) > (current.date || 0))
+      ) {
+        rowsByKey[key] = { ...row, runDay, cid7 };
+      }
     }
   }
   return Object.values(rowsByKey).sort((a, b) => {
@@ -690,6 +706,14 @@ function atomeshMergedModelName(row) {
     return `${row.model}-Eagle3`;
   }
   return row.model || 'unknown';
+}
+
+function atomeshBaseModelName(model) {
+  return String(model || 'unknown').replace(/-Eagle3$/i, '');
+}
+
+function atomeshPointScore(row) {
+  return parseAtomeshNumber(row.totalTputPerGpu);
 }
 
 function atomeshMergeScore(row) {
@@ -3517,27 +3541,43 @@ function renderAtomeshPerformanceTab() {
     container.innerHTML = '<div class="chart-empty">No completed ATOMesh performance row matches the current filters.</div>';
     return;
   }
-  const groups = {};
+  const chartGroups = {};
   for (const c of completed) {
-    const key = `${c.model}|${c.islOsl}`;
-    if (!groups[key]) groups[key] = [];
-    groups[key].push(c);
+    const chartKey = atomeshBaseModelName(c.model);
+    if (!chartGroups[chartKey]) chartGroups[chartKey] = [];
+    chartGroups[chartKey].push(c);
   }
-  const datasets = Object.values(groups).map(groupRows => {
-    groupRows.sort((a, b) => a.concurrency - b.concurrency);
-    const first = groupRows[0];
-    const color = getModelColor(ATOMESH_DATA.backend, first.model);
+  const chartSpecs = Object.entries(chartGroups).sort(([a], [b]) => _lc(a, b)).map(([model, modelRows], chartIdx) => {
+    const seriesGroups = {};
+    for (const row of modelRows) {
+      const topology = row.sourceTopology || row.topology || 'unknown';
+      const key = `${row.model}|${topology}|${row.islOsl}`;
+      if (!seriesGroups[key]) seriesGroups[key] = [];
+      seriesGroups[key].push(row);
+    }
+    const datasets = Object.values(seriesGroups).map(groupRows => {
+      groupRows.sort((a, b) => a.concurrency - b.concurrency);
+      const first = groupRows[0];
+      const color = getModelColor(ATOMESH_DATA.backend, first.model);
+      const topology = first.sourceTopology || first.topology || 'unknown';
+      return {
+        label: `${first.model} ${topology} ${first.islOsl}`,
+        data: groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c })),
+        borderColor: color.border,
+        backgroundColor: color.border,
+        borderWidth: 2,
+        pointRadius: 4,
+        pointHoverRadius: 6,
+        pointBorderWidth: 0,
+        pointHoverBorderWidth: 0,
+        showLine: groupRows.length > 1,
+      };
+    });
     return {
-      label: `${first.model} ${first.islOsl}`,
-      data: groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c })),
-      borderColor: color.border,
-      backgroundColor: color.border,
-      borderWidth: 2,
-      pointRadius: 4,
-      pointHoverRadius: 6,
-      pointBorderWidth: 0,
-      pointHoverBorderWidth: 0,
-      showLine: groupRows.length > 1,
+      id: `atomesh-tradeoff-${chartIdx}`,
+      model,
+      rows: modelRows,
+      datasets,
     };
   });
 
@@ -3545,7 +3585,11 @@ function renderAtomeshPerformanceTab() {
     <span class="section-title">ATOMesh Token Throughput per GPU vs. Interactivity</span>
     <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">${completed.length}/${atomeshRows().length} selected rows · source: benchmark-action data.js</span>
   </div>
-  <div class="chart-card hero"><h3>${ATOMESH_DATA.backend} · ${datasets.length} selected series</h3><div class="chart-wrap"><canvas id="atomesh-tradeoff"></canvas></div></div></div>`;
+  <div class="chart-grid">${chartSpecs.map(spec => `
+    <div class="chart-card ${chartSpecs.length === 1 ? 'hero' : 'half'}">
+      <h3>${escHTML(spec.model)} · ${spec.datasets.length} selected series</h3>
+      <div class="chart-wrap"><canvas id="${spec.id}"></canvas></div>
+    </div>`).join('')}</div></div>`;
 
   html += `<div class="section-container"><div class="section-header"><span class="section-title">Detail Table</span></div>
   <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
@@ -3585,41 +3629,43 @@ function renderAtomeshPerformanceTab() {
     });
   });
 
-  new Chart(document.getElementById('atomesh-tradeoff'), {
-    type: 'scatter',
-    data: { datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      layout: { padding: { top: 8, right: 16 } },
-      plugins: {
-        legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
-        tooltip: { ...chartTooltipOpts(), callbacks: {
-          title: items => {
-            const c = items[0].raw.row;
-            return `${c.model} ${c.islOsl} · c=${c.concurrency} · ${c.sourceTopology || c.topology}`;
-          },
-          label: item => [
-            ` Interactivity: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
-            ` Total tok/s/GPU: ${fmtNum(item.parsed.y, 2)}`,
-            ` GSM8K: ${item.raw.row.gsm8kRaw || '—'}`,
-          ],
-          afterBody: () => '\nClick for details',
-        }},
-        datalabels: { display: true, color: C_LEGEND, align: 'top', formatter: value => 'c' + value.row.concurrency },
+  for (const spec of chartSpecs) {
+    new Chart(document.getElementById(spec.id), {
+      type: 'scatter',
+      data: { datasets: spec.datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        layout: { padding: { top: 8, right: 16 } },
+        plugins: {
+          legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
+          tooltip: { ...chartTooltipOpts(), callbacks: {
+            title: items => {
+              const c = items[0].raw.row;
+              return `${c.model} ${c.islOsl} · c=${c.concurrency} · ${c.sourceTopology || c.topology}`;
+            },
+            label: item => [
+              ` Interactivity: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
+              ` Total tok/s/GPU: ${fmtNum(item.parsed.y, 2)}`,
+              ` GSM8K: ${item.raw.row.gsm8kRaw || '—'}`,
+            ],
+            afterBody: () => '\nClick for details',
+          }},
+          datalabels: { display: true, color: C_LEGEND, align: 'top', formatter: value => 'c' + value.row.concurrency },
+        },
+        scales: {
+          x: { grid: chartGridOpts(), title: { display: true, text: 'Interactivity (tok/s/user)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+          y: { grid: chartGridOpts(), title: { display: true, text: 'Token Throughput per GPU (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+        },
+        onClick: (_e, elems) => {
+          if (!elems.length) return;
+          const item = elems[0];
+          const row = spec.datasets[item.datasetIndex]?.data?.[item.index]?.row;
+          if (row) showAtomeshPopover(row);
+        },
       },
-      scales: {
-        x: { grid: chartGridOpts(), title: { display: true, text: 'Interactivity (tok/s/user)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
-        y: { grid: chartGridOpts(), title: { display: true, text: 'Token Throughput per GPU (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
-      },
-      onClick: (_e, elems) => {
-        if (!elems.length) return;
-        const item = elems[0];
-        const row = datasets[item.datasetIndex]?.data?.[item.index]?.row;
-        if (row) showAtomeshPopover(row);
-      },
-    },
-  });
+    });
+  }
   syncHeaderH();
   bindFixedThead(container);
 }
