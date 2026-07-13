@@ -1190,7 +1190,60 @@ def build_atom_v4_attention_metadata(
         _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
     else:
         _populate_prefill(md, common_attn_metadata, batch_np, pos_np, q_np, positions)
-    _populate_indexer(md, common_attn_metadata, batch_np, positions[:total], device)
+    # Decode/prefill split for the indexer. vLLM reorders rows with
+    # query_len <= (1 + num_spec_tokens) — i.e. decode / spec-verify / 1-token
+    # rows — to the FRONT of the batch (reorder_batch_threshold). Grouping by
+    # query length is exactly what the indexer needs: those rows only require
+    # committed K from the paged cache, so they take the fixed-shape paged
+    # `_score_topk_decode` path and are kept out of the dense prefill logits.
+    decode_q = 1 + max(0, int(num_spec_tokens))
+    if is_decode:
+        idx_num_decodes = num_reqs
+        idx_num_decode_tokens = total
+        idx_decode_next_n = int(lens[0]) if num_reqs > 0 else 1
+    else:
+        # The paged `_score_topk_decode` reshapes the decode tokens to
+        # `[num_decode_tokens // decode_next_n, decode_next_n]`, so the paged
+        # decode group must be a contiguous batch prefix that shares ONE query
+        # length (`decode_next_n`). vLLM usually reorders the short decode /
+        # spec-verify rows (query_len <= decode_q) ahead of the longer prefill
+        # rows, but that layout is NOT guaranteed under MTP + chunked prefill:
+        #   * the decode prefix is not uniform -- a steady-state verify row is
+        #     `1 + num_spec_tokens` long, but a request on its first decode step
+        #     (or one whose drafts were all rejected) contributes a shorter row,
+        #     e.g. `[4, 4, ..., 4, 1]`; and
+        #   * a prefill chunk can land AMONG the verify rows, e.g. `[4, 4, 10,
+        #     4]`, so decode-length rows are not always a clean leading prefix.
+        # Rather than assert a layout vLLM does not promise, take the paged
+        # decode group as the leading contiguous run of rows that share the
+        # FIRST row's length (only when that is a decode/verify length,
+        # `<= decode_q`), and end it at the first row that differs -- whether a
+        # short decode straggler or a longer prefill row. Everything from there
+        # flows to the dense prefill path below, which handles arbitrary per-row
+        # query lengths. This is memory-safe: the long-context verify rows are
+        # emitted first, so they stay on the paged path, and only the (few)
+        # rows after the first mismatch reach the dense `total_committed` -- so
+        # its `[total_tokens, total_committed]` logits never explode the way
+        # they would if every running seq were summed in. `lens` is a CPU numpy
+        # array (from `query_start_loc.cpu()`), so this adds no H2D/D2H sync.
+        if num_reqs > 0 and int(lens[0]) <= decode_q:
+            idx_decode_next_n = int(lens[0])
+            mismatch = np.nonzero(lens != idx_decode_next_n)[0]
+            idx_num_decodes = int(mismatch[0]) if mismatch.size else num_reqs
+        else:
+            idx_decode_next_n = 1
+            idx_num_decodes = 0
+        idx_num_decode_tokens = int(q_np[idx_num_decodes]) if idx_num_decodes > 0 else 0
+    _populate_indexer(
+        md,
+        common_attn_metadata,
+        batch_np,
+        positions[:total],
+        device,
+        num_decodes=idx_num_decodes,
+        num_decode_tokens=idx_num_decode_tokens,
+        decode_next_n=idx_decode_next_n,
+    )
     return md
 
 
@@ -1292,24 +1345,68 @@ def _populate_decode_persistent(
     md.swa_pages = swa_pages
 
 
-def _populate_indexer(md, common, batch_np, positions, device):
-    n_csa = md.n_committed_csa_per_seq_cpu
+def _populate_indexer(
+    md,
+    common,
+    batch_np,
+    positions,
+    device,
+    num_decodes=0,
+    num_decode_tokens=0,
+    decode_next_n=1,
+):
+    # In a MIXED (chunked-prefill + decode) batch vLLM orders the decode rows
+    # first (reorder threshold == 1[+spec]); only the prefill rows feed the
+    # dense `fp8_mqa_logits` indexer. Build the committed cumsum / per-token
+    # start-end offsets over the PREFILL SEQUENCES ONLY (seqs [num_decodes:],
+    # tokens [num_decode_tokens:]) so the long-context decode seqs do NOT get
+    # summed into `total_committed` (the O(total_tokens x total_committed) dense
+    # logits that OOMs at high concurrency). The decode rows are scored by the
+    # fixed-shape paged path (`_score_topk_decode`), which reads only the full
+    # per-seq committed tensor kept below. Pure prefill => num_decodes == 0, so
+    # this reduces to the whole batch (unchanged).
+    n_csa = md.n_committed_csa_per_seq_cpu[num_decodes:]
     cu = np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(n_csa, dtype=np.int32)])
     cu[-1] = max(int(cu[-1]), 1)
     cu_gpu = torch.from_numpy(cu).to(device)
-    bid = md.batch_id_per_token
+    # Per-prefill-token batch id, rebased to 0-based prefill-seq indexing.
+    bid = (md.batch_id_per_token[num_decode_tokens:] - num_decodes).to(
+        md.batch_id_per_token.dtype
+    )
+    n_committed_pref = md.n_committed_csa_per_seq[num_decodes:]
+    pos_pref = positions[num_decode_tokens:]
     base = cu_gpu[bid].to(torch.int32)
-    end = base + torch.minimum(
-        (positions + 1) // 4, md.n_committed_csa_per_seq[bid]
-    ).to(torch.int32)
+    end = base + torch.minimum((pos_pref + 1) // 4, n_committed_pref[bid]).to(
+        torch.int32
+    )
     md.indexer_meta = {
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,
+        # FULL per-seq committed (decode-first order): the decode sub-call
+        # slices [:num_decodes]; the pure-decode path reads it whole.
         "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_token_gpu": bid,
+        "batch_id_per_token_gpu": md.batch_id_per_token,
         "seq_base_per_token_gpu": base,
         "cu_starts_gpu": base,
         "cu_ends_gpu": end,
+        # Decode/prefill split (consumed by `indexer_score_topk` for mixed
+        # batches; harmless for pure prefill where num_decode_tokens == 0).
+        "num_decodes": int(num_decodes),
+        "num_decode_tokens": int(num_decode_tokens),
+        "decode_next_n": int(decode_next_n),
+        # Largest committed compressed-KV length among the DECODE sub-batch
+        # seqs (host int from the CPU committed array -- no D2H sync). The
+        # mixed-batch paged `_score_topk_decode` sizes its per-fwd logits width
+        # to this instead of the model-max `_max_model_len_idx` (= max_seq_len
+        # // compress_ratio). The deepgemm kernel guards every store by
+        # `col < max_model_len_arg` and only writes [0, n_committed) per row,
+        # so a width >= this max is exact, while the model-max width would
+        # allocate a ~GB transient per CSA layer and OOM at high concurrency.
+        "decode_max_committed": (
+            int(md.n_committed_csa_per_seq_cpu[:num_decodes].max())
+            if num_decodes > 0
+            else 0
+        ),
     }
 
 

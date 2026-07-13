@@ -81,6 +81,11 @@ class Sequence:
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
         self.block_table = []
+        # paged-SWA: separate physical block table for the sliding-window
+        # KV pool (independent lifetime from the compressed block_table so
+        # out-of-window SWA blocks can be freed while compressed blocks persist).
+        # Empty / unused for non-SWA models.
+        self.swa_block_table = []
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).

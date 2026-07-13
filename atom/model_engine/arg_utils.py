@@ -8,7 +8,7 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, SpeculativeConfig
+from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
 
 logger = logging.getLogger("atom")
 
@@ -47,6 +47,7 @@ class EngineArgs:
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
+    cudagraph_mode: str = "FULL"
     load_dummy: bool = False
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
@@ -137,6 +138,15 @@ class EngineArgs:
         )
         parser.add_argument(
             "--level", type=int, default=3, help="The level of compilation (0-3)."
+        )
+        parser.add_argument(
+            "--cudagraph-mode",
+            type=str,
+            default="FULL",
+            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+            help="CUDA graph runtime mode. FULL = manual whole-forward capture "
+            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
+            "attention eager (requires --level 3).",
         )
         parser.add_argument(
             "--load_dummy", action="store_true", help="Skip loading model weights."
@@ -319,6 +329,7 @@ class EngineArgs:
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
+            cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],
             cudagraph_capture_sizes=(
                 parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
                 if self.cudagraph_capture_sizes
