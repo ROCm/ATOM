@@ -452,10 +452,6 @@ class Scheduler:
             if config.prefill_batch_token_threshold > 0
             else self.max_num_batched_tokens
         )
-        self._prefill_hold_passes = 0
-        self._prefill_hold_max_passes = 30
-        _pc = getattr(config, "parallel_config", None)
-        self._prefill_gate_enabled = getattr(_pc, "data_parallel_size", 1) > 1
 
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
@@ -594,38 +590,6 @@ class Scheduler:
             if total >= cap:
                 return cap
         return total
-
-    def _prefill_batch_ready(self) -> bool:
-        """Gate for firing a NEW prefill step (dense-batch requirement).
-
-        The threshold is max_num_batched_tokens (a full prefill batch).
-
-        Returns True (allow prefill) when:
-          - the waiting queue can fill a dense batch (>= threshold tokens), or
-          - there is nothing left to decode (running empty) — tail escape so a
-            partial final batch still goes out, or
-          - we've suppressed prefill for too many consecutive passes
-            (_prefill_hold_max_passes) — starvation bound.
-
-        Otherwise returns False (keep decoding) and advances the hold counter.
-        The counter resets whenever prefill is allowed to fire.
-        """
-        # Gate only applies under DP (>1); otherwise never hold (legacy path).
-        if not self._prefill_gate_enabled:
-            return True
-        # Tail escape: no decode work left — never hold, or we'd deadlock.
-        if not self.running:
-            self._prefill_hold_passes = 0
-            return True
-        if self._waiting_prefill_tokens() >= self.prefill_batch_token_threshold:
-            self._prefill_hold_passes = 0
-            return True
-        # Under-full: hold prefill (keep decoding) up to the pass budget.
-        self._prefill_hold_passes += 1
-        if self._prefill_hold_passes >= self._prefill_hold_max_passes:
-            self._prefill_hold_passes = 0
-            return True
-        return False
 
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
@@ -810,7 +774,12 @@ class Scheduler:
         if not self.running and not self.waiting:
             return None
 
-        _new_prefill_allowed = _delayer_allows_prefill and self._prefill_batch_ready()
+        # PrefillDelayer's result is a cross-rank decision. Do not apply a
+        # second rank-local density gate here: ranks could otherwise disagree
+        # after negotiation and recreate the mixed prefill/decode step the
+        # delayer is meant to prevent. Without a delayer, preserve immediate
+        # prefill admission rather than holding decode behind a local gate.
+        _new_prefill_allowed = _delayer_allows_prefill
 
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `delayer_allows` so cross-DP alignment still holds when one

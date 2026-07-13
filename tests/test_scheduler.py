@@ -678,7 +678,7 @@ class TestScheduledBatchPDFirstDecodeMTP:
 # ── Prefill dense-batch gate ───────────────────────────────────────────────
 
 
-class TestPrefillBatchGate:
+class TestPrefillBatchThreshold:
     def test_threshold_defaults_to_batch_budget(self):
         cfg = MockConfig(max_num_batched_tokens=32)
         sched = Scheduler(cfg)
@@ -694,79 +694,20 @@ class TestPrefillBatchGate:
         )
         assert sched.prefill_batch_token_threshold == 20
 
-    def test_ready_when_waiting_fills_threshold(self, seq_factory):
+    def test_waiting_prefill_tokens_reaches_threshold(self, seq_factory):
         # chunked prefill on so a 40-token prompt is clamped to the 32 budget
         # (not rejected as oversized) and counts toward the threshold.
         cfg = MockConfig(max_num_batched_tokens=32, enable_chunked_prefill=True)
         sched = Scheduler(cfg)
-        # Keep a decode running so the tail-escape doesn't trivially allow.
-        r = seq_factory([1, 2, 3])
-        r.status = SequenceStatus.RUNNING
-        sched.block_manager.allocate(r, 0)
-        sched.running.append(r)
-        # 40 waiting tokens, clamped to 32 == threshold -> ready.
+        # 40 waiting tokens are clamped to the 32-token batch budget.
         sched.waiting.append(seq_factory(list(range(40))))
         assert sched._waiting_prefill_tokens() >= 32
-        assert sched._prefill_batch_ready() is True
 
-    def test_holds_when_under_full(self, seq_factory):
-        # gate only active under DP>1
-        cfg = MockConfig(max_num_batched_tokens=32, data_parallel_size=8)
-        sched = Scheduler(cfg)
-        r = seq_factory([1, 2, 3])
-        r.status = SequenceStatus.RUNNING
-        sched.block_manager.allocate(r, 0)
-        sched.running.append(r)
-        # Only 8 waiting tokens < 32 -> hold (keep decoding).
-        sched.waiting.append(seq_factory(list(range(8))))
-        assert sched._prefill_batch_ready() is False
-        assert sched._prefill_hold_passes == 1
-
-    def test_gate_disabled_without_dp(self, seq_factory):
-        # DP<=1 (default): gate off -> under-full prefill is NOT held.
-        cfg = MockConfig(max_num_batched_tokens=32)  # data_parallel_size=1
-        sched = Scheduler(cfg)
-        assert sched._prefill_gate_enabled is False
-        r = seq_factory([1, 2, 3])
-        r.status = SequenceStatus.RUNNING
-        sched.block_manager.allocate(r, 0)
-        sched.running.append(r)
-        sched.waiting.append(seq_factory(list(range(8))))  # under-full
-        # Gate off -> ready True (legacy behavior), no hold counter advance.
-        assert sched._prefill_batch_ready() is True
-        assert sched._prefill_hold_passes == 0
-
-    def test_tail_escape_when_no_decode_left(self, seq_factory):
-        cfg = MockConfig(max_num_batched_tokens=32)  # threshold = 32
-        sched = Scheduler(cfg)
-        # running empty -> even an under-full waiting batch must be allowed,
-        # else the final partial batch would deadlock.
-        sched.waiting.append(seq_factory(list(range(8))))
-        assert not sched.running
-        assert sched._prefill_batch_ready() is True
-
-    def test_hold_pass_budget_forces_fire(self, seq_factory):
-        cfg = MockConfig(max_num_batched_tokens=32, data_parallel_size=8)
-        sched = Scheduler(cfg)
-        sched._prefill_hold_max_passes = 3
-        r = seq_factory([1, 2, 3])
-        r.status = SequenceStatus.RUNNING
-        sched.block_manager.allocate(r, 0)
-        sched.running.append(r)
-        sched.waiting.append(seq_factory(list(range(8))))  # under-full
-        # First (max_passes - 1) calls hold, then it force-fires and resets.
-        assert sched._prefill_batch_ready() is False  # pass 1
-        assert sched._prefill_batch_ready() is False  # pass 2
-        assert sched._prefill_batch_ready() is True  # pass 3 -> force
-        assert sched._prefill_hold_passes == 0
-
-    def test_gate_holds_new_prefill_but_decodes(self, seq_factory):
-        """End-to-end: under-full waiting + running decode -> schedule() should
-        NOT start a new prefill; it should return a decode batch instead."""
+    def test_without_delayer_underfull_prefill_is_admitted(self, seq_factory):
         cfg = MockConfig(
-            max_num_batched_tokens=32,  # threshold = 32
+            max_num_batched_tokens=32,
             enable_chunked_prefill=False,
-            data_parallel_size=8,  # gate only active under DP>1
+            data_parallel_size=8,
         )
         sched = Scheduler(cfg)
         r = seq_factory([1, 2, 3])
@@ -774,8 +715,7 @@ class TestPrefillBatchGate:
         r.type = SequenceType.DECODE
         sched.block_manager.allocate(r, 0)
         sched.running.append(r)
-        sched.waiting.append(seq_factory(list(range(8))))  # under-full prefill
+        sched.waiting.append(seq_factory(list(range(8))))
         batch, _ = sched.schedule()
         assert batch is not None
-        assert batch.total_seqs_num_prefill == 0
-        assert batch.total_seqs_num_decode == 1
+        assert batch.total_seqs_num_prefill == 1
