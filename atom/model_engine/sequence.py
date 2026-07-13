@@ -86,6 +86,9 @@ class Sequence:
         # out-of-window SWA blocks can be freed while compressed blocks persist).
         # Empty / unused for non-SWA models.
         self.swa_block_table = []
+        # Set True when the client disconnected; the scheduler finishes the seq
+        # at the next step via the normal stop path (frees KV, emits finished).
+        self.aborted = False
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).

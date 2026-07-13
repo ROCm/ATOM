@@ -1430,6 +1430,11 @@ class Scheduler:
 
             num_tokens = seq.num_tokens - self.mtp_k - num_rejected
             leave_reason = None
+            # Client disconnected -> finish now via the normal stop path (frees
+            # KV blocks, emits a finished RequestOutput). A natural stop below
+            # may still overwrite the reason; either way the seq terminates.
+            if getattr(seq, "aborted", False):
+                leave_reason = "aborted"
             # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
             # only compares draft vs target_argmax for acceptance. So when
             # the verified token is EOS the kernel still emits 1+ accepted
