@@ -842,13 +842,22 @@ function parseRunConfigs(run) {
 }
 
 // All parsed configs from all runs, keyed by configKey, each holding array of values over time.
-// When multiple runs share the same commit, keep only the newest run per (configKey, commit)
+// When multiple runs share the same commit, keep only the best per-GPU throughput
+// run per (configKey, day, commit)
 // so that all consumers (table, trend chart, tooltip, detail panel) see consistent data.
 function localDay(ts) { const d = new Date(ts); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
 
 const historyMap = {}; // key -> [{date, commit, throughput, ...}, ...]
 const _seenDayCommit = {}; // key -> { "day|cid7": { cfg, benchCount } }
-const _benchCounts = new WeakMap(); // cfg -> run.benches.length (avoids polluting cfg objects)
+const _benchCounts = new WeakMap(); // cfg -> per-config metric count (avoids polluting cfg objects)
+function configBenchCount(cfg) {
+  return Object.keys(cfg).filter(k => !k.startsWith('_') && !['backend', 'model', 'islOsl', 'conc', 'hardware', 'commit', 'date', 'runUrl'].includes(k)).length;
+}
+function configTokenThroughputPerGpu(cfg) {
+  const totalTput = Number(cfg?.['Total Tput']);
+  const gpuCount = Number(cfg?._gpu_count || cfg?._tp || 1);
+  return Number.isFinite(totalTput) && Number.isFinite(gpuCount) && gpuCount > 0 ? totalTput / gpuCount : null;
+}
 // Use 7-char prefix for dedup: data.js may store the same commit as abbreviated
 // (e.g. "450f14b7") or full hash — both must be treated as the same commit.
 for (const run of allRuns) {
@@ -856,22 +865,28 @@ for (const run of allRuns) {
   for (const [key, cfg] of Object.entries(configs)) {
     if (!historyMap[key]) { historyMap[key] = []; _seenDayCommit[key] = {}; }
     const cid7 = cfg.commit.id.slice(0, 7);
-    // Dedup by day+commit — keep the entry from the run with most benches
+    const benchCount = configBenchCount(cfg);
+    const tputPerGpu = configTokenThroughputPerGpu(cfg);
+    // Dedup by day+commit for this config. Prefer the rerun with the highest
+    // token throughput per GPU, then newest timestamp, then metric completeness.
     const day = localDay(cfg.date);
     const dedupKey = day + '|' + cid7;
     const prev = _seenDayCommit[key][dedupKey];
     if (prev) {
-      // Replace if this run is from a larger batch (more complete nightly)
       const prevIdx = historyMap[key].indexOf(prev.cfg);
-      if (prevIdx >= 0 && run.benches.length > prev.benchCount) {
-        _benchCounts.set(cfg, run.benches.length);
+      const prevTputPerGpu = configTokenThroughputPerGpu(prev.cfg);
+      const shouldReplace =
+        (tputPerGpu != null && (prevTputPerGpu == null || tputPerGpu > prevTputPerGpu))
+        || (tputPerGpu === prevTputPerGpu && (cfg.date > prev.cfg.date || (cfg.date === prev.cfg.date && benchCount > prev.benchCount)));
+      if (prevIdx >= 0 && shouldReplace) {
+        _benchCounts.set(cfg, benchCount);
         historyMap[key][prevIdx] = cfg;
-        _seenDayCommit[key][dedupKey] = { cfg, benchCount: run.benches.length };
+        _seenDayCommit[key][dedupKey] = { cfg, benchCount };
       }
       continue;
     }
-    _benchCounts.set(cfg, run.benches.length);
-    _seenDayCommit[key][dedupKey] = { cfg, benchCount: run.benches.length };
+    _benchCounts.set(cfg, benchCount);
+    _seenDayCommit[key][dedupKey] = { cfg, benchCount };
     historyMap[key].push(cfg);
   }
 }
