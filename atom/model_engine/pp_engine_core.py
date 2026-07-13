@@ -35,6 +35,21 @@ from atom.model_engine.engine_core import EngineCore
 logger = logging.getLogger("atom")
 
 
+def _batch_needs_output(batch) -> bool:
+    """True if the batch produces tokens the head must consume.
+
+    A pure-prefill batch where every seq is a middle chunk (no final chunk)
+    produces no useful token — the last stage can skip sampling and the head
+    can skip recv_tokens.  Decode batches always need output.
+    """
+    if batch.total_seqs_num_decode > 0:
+        return True
+    final = batch.is_final_chunk
+    if final is None:
+        return True
+    return any(final)
+
+
 class PPEngineCoreProc(EngineCore):
     def __init__(self, config, input_address, output_address):
         pc = config.parallel_config
@@ -104,6 +119,7 @@ class PPEngineCoreProc(EngineCore):
             if scheduled_batch is None or len(scheduled_batch.req_ids) == 0:
                 break
 
+            needs_output = _batch_needs_output(scheduled_batch)
             # Hand the scheduled batch to every downstream stage (CPU/ZMQ), then
             # run this stage's layers; workers NCCL-send hidden downstream and
             # (non-last) produce no logits. The forward returns fast — it does
@@ -112,32 +128,40 @@ class PPEngineCoreProc(EngineCore):
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
             # Block re-decoding these seqs until their tokens come back.
             self.scheduler.mark_pp_inflight(scheduled_batch)
-            self._in_flight.append((scheduled_batch, seqs))
+            self._in_flight.append((scheduled_batch, seqs, needs_output))
 
-        # ---- Collect: block on the OLDEST in-flight batch's tokens (FIFO). ----
-        # The last stage samples batches in the same order the head launched
-        # them, so recv_tokens() returns the head of _in_flight.
+        # ---- Collect: drain completed batches from the FIFO head. ----
+        # Non-output batches (pure middle-chunk prefill) skip the ZMQ
+        # token round-trip entirely — the last stage never sampled, so
+        # there is nothing to receive. Drain all consecutive non-output
+        # entries, then block on the first output-producing batch.
         if not self._in_flight:
             return
-        fwd_out = self.pp_transport.recv_tokens()
-        scheduled_batch, seqs = self._in_flight.popleft()
-        self.scheduler.release_pp_inflight(scheduled_batch)
 
-        # Head owns the lifecycle: append tokens, detect finish, emit.
-        finished_seqs = self.scheduler.postprocess(
-            seqs.values(),
-            fwd_out,
-            stream_output_queue=self.stream_output_queue,
-            batch=scheduled_batch,
-        )
-        try:
-            while not self.stream_output_queue.empty():
-                stream_outputs = self.stream_output_queue.get_nowait()
-                self.output_queue.put_nowait(("STREAM", stream_outputs))
-        except queue.Empty:
-            pass
-        if finished_seqs:
-            self.output_queue.put_nowait(finished_seqs)
+        while self._in_flight:
+            scheduled_batch, seqs, needs_output = self._in_flight[0]
+            if needs_output:
+                fwd_out = self.pp_transport.recv_tokens()
+                self._in_flight.popleft()
+                self.scheduler.release_pp_inflight(scheduled_batch)
+                finished_seqs = self.scheduler.postprocess(
+                    seqs.values(),
+                    fwd_out,
+                    stream_output_queue=self.stream_output_queue,
+                    batch=scheduled_batch,
+                )
+                try:
+                    while not self.stream_output_queue.empty():
+                        stream_outputs = self.stream_output_queue.get_nowait()
+                        self.output_queue.put_nowait(("STREAM", stream_outputs))
+                except queue.Empty:
+                    pass
+                if finished_seqs:
+                    self.output_queue.put_nowait(finished_seqs)
+                break
+            else:
+                self._in_flight.popleft()
+                self.scheduler.release_pp_inflight(scheduled_batch)
 
     # ---- downstream / last stage -------------------------------------------
     def _downstream_busy_loop(self):
@@ -156,8 +180,7 @@ class PPEngineCoreProc(EngineCore):
                 if batch is None:
                     continue
                 fwd_out = self.runner_mgr.call_func("forward", batch, wait_out=True)
-                if self.is_last:
-                    # Feed the sampled tokens back to the head.
+                if self.is_last and _batch_needs_output(batch):
                     self.pp_transport.send_tokens(fwd_out)
         finally:
             try:
