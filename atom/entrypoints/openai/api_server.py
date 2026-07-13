@@ -324,31 +324,19 @@ def _prepare_multimodal_inputs(
     return inputs["input_ids"][0].tolist(), multimodal_data
 
 
-# ── Batched stream dispatch ──────────────────────────────────────────────
-# Per-seq `call_soon_threadsafe` floods the API event loop at high batch size
-# (one call per token). Instead the callback only buffers the raw chunk; the
-# mgr flushes a whole step with a single `tokenizer.batch_decode` (one
-# GIL-released call instead of one decode per seq) plus one scheduled call per
-# loop (see `flush_stream_batch`).
-import threading as _threading  # noqa: E402
-
-_stream_batch_tls = _threading.local()
-
-
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
 ) -> None:
-    """Buffer the chunk; decode + dispatch happen batched in flush_stream_batch.
+    """Send stream chunk directly to the queue."""
+    global tokenizer
 
-    ``text`` is intentionally left unset here — it is filled by a single
-    ``tokenizer.batch_decode`` over the whole step in :func:`flush_stream_batch`,
-    avoiding one decode call per seq on the output thread.
-    """
+    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     started_at = _request_start_times.get(request_id)
     chunk_data = {
+        "text": new_text,
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
@@ -358,47 +346,7 @@ def _send_stream_chunk_direct(
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-
-    buf = getattr(_stream_batch_tls, "buf", None)
-    if buf is None:
-        buf = _stream_batch_tls.buf = []
-    buf.append((loop, stream_queue, chunk_data))
-
-
-def _drain_batch_into_queues(items: list) -> None:
-    """Runs ON the event loop: push each chunk into its per-request queue.
-    One scheduled call handles a whole step's worth of chunks."""
-    for _loop, q, chunk in items:
-        q.put_nowait(chunk)
-
-
-def flush_stream_batch() -> None:
-    """Flush a step's buffered chunks: one ``batch_decode`` for the whole step,
-    then one call_soon_threadsafe per loop (normally one — all requests on a
-    rank share the API loop)."""
-    global tokenizer
-
-    buf = getattr(_stream_batch_tls, "buf", None)
-    if not buf:
-        return
-    _stream_batch_tls.buf = []
-    # Decode the whole step in a single call. batch_decode is element-wise
-    # identical to per-seq decode but acquires/releases the GIL once instead of
-    # once per seq, cutting GIL ping-pong against the other rank output threads
-    # and the API event loop at high batch size.
-    texts = tokenizer.batch_decode(
-        [chunk["token_ids"] for _loop, _q, chunk in buf],
-        skip_special_tokens=True,
-    )
-    for (_loop, _q, chunk), text in zip(buf, texts):
-        chunk["text"] = text
-    # Group by loop (normally a single loop). dict preserves insertion order
-    # so per-request chunk ordering within the step is maintained.
-    by_loop: Dict[AbstractEventLoop, list] = {}
-    for loop, q, chunk in buf:
-        by_loop.setdefault(loop, []).append((loop, q, chunk))
-    for loop, items in by_loop.items():
-        loop.call_soon_threadsafe(_drain_batch_into_queues, items)
+    loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
 
 
 def _send_stream_chunk_tagged(
@@ -413,11 +361,8 @@ def _send_stream_chunk_tagged(
     queue so the merge-stream consumer in :mod:`serving_chat` /
     :mod:`serving_completion` can demultiplex by index.
 
-    Unlike :func:`_send_stream_chunk_direct`, this fan-out path decodes and
-    dispatches immediately rather than going through the batched flush: it
-    serves ``SamplingParams.n > 1`` (a handful of siblings of one request),
-    not the many-concurrent-requests regime that motivates batch decoding, so
-    a separate per-step buffer here would add complexity for little gain.
+    This path serves ``SamplingParams.n > 1`` by tagging each sibling's chunks
+    so the shared stream consumer can merge them in order.
     """
     global tokenizer
 
@@ -438,6 +383,7 @@ async def generate_async(
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    data_parallel_rank: Optional[int] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     global engine, tokenizer
@@ -482,6 +428,11 @@ async def generate_async(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s pinned to data_parallel_rank=%s", seq.id, data_parallel_rank
+        )
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -624,6 +575,7 @@ async def generate_async_fanout(
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
     multimodal_data: Optional[Dict[str, Any]] = None,
+    data_parallel_rank: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
@@ -677,6 +629,15 @@ async def generate_async_fanout(
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        for seq in seqs:
+            seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s fanout pinned %d sequence(s) to data_parallel_rank=%s",
+            request_id,
+            len(seqs),
+            data_parallel_rank,
+        )
     try:
         _validate_sequence_context_length(seqs[0])
     except Exception:
@@ -1182,6 +1143,7 @@ async def completions(request: CompletionRequest):
                 sampling_params,
                 request_id,
                 kv_transfer_params=request.kv_transfer_params,
+                data_parallel_rank=request.data_parallel_rank,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -1193,6 +1155,7 @@ async def completions(request: CompletionRequest):
                 sampling_params,
                 request_id,
                 kv_transfer_params=request.kv_transfer_params,
+                data_parallel_rank=request.data_parallel_rank,
             ):
                 final_output = output
 
