@@ -46,6 +46,7 @@ This command follows the native ATOM benchmark configuration for `amd/Kimi-K2.7-
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 export AITER_AR_1STAGE_MAX_KB=512
+export AITER_MXFP4_INTERMEDIATE=1
 
 HSA_NO_SCRATCH_RECLAIM=1 python -m atom.entrypoints.openai_server \
     --model amd/Kimi-K2.7-Code-MXFP4 \
@@ -77,6 +78,7 @@ python -m atom.entrypoints.openai_server \
 - Kimi-K2.5 and Kimi-K2.7-Code use a DeepseekV3-style architecture with MLA attention, so they leverage the same optimized kernels (MLA, FP8 KV cache, etc.) as DeepSeek models.
 - For the MXFP4 variant, `HSA_NO_SCRATCH_RECLAIM=1` is recommended for stability.
 - Non-MoE layers (attention, shared experts, dense MLPs) remain in BF16 for all quantized variants.
+- For large concs, `--scheduler-delay-factor 1` is recommended for boost throughputs.
 
 ## Performance baseline
 

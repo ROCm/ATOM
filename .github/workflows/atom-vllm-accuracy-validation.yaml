@@ -53,6 +53,7 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-MXFP4 TP4
       model_slot_2:
         description: "Manual selection slot 2: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -97,6 +98,7 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-MXFP4 TP4
       model_slot_3:
         description: "Manual selection slot 3: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -141,6 +143,7 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-MXFP4 TP4
       model_slot_4:
         description: "Manual selection slot 4: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -185,6 +188,7 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-MXFP4 TP4
       model_slot_5:
         description: "Manual selection slot 5: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -229,6 +233,7 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-MXFP4 TP4
       model_slot_6:
         description: "Manual selection slot 6: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -273,6 +278,7 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-MXFP4 TP4
       model_slot_7:
         description: "Manual selection slot 7: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -317,6 +323,7 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-MXFP4 TP4
       model_slot_8:
         description: "Manual selection slot 8: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -361,6 +368,7 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-MXFP4 TP4
       oot_image:
         description: "Optional atom-vLLM image override. Leave empty to keep the existing nightly/manual build behavior."
         required: false
@@ -1101,6 +1109,11 @@ jobs:
                   "/models/zai-org/GLM-5.1-FP8",
                   "/models/GLM/GLM-5.1-FP8",
                   "/models/GLM-5.1-FP8",
+              ],
+              "amd/GLM-5.2-MXFP4": [
+                  "/models/amd/GLM-5.2-MXFP4",
+                  "/models/GLM/GLM-5.2-MXFP4",
+                  "/models/GLM-5.2-MXFP4",
               ],
           }
 

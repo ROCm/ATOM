@@ -1023,7 +1023,10 @@ class MergedColumnParallelLinear(LinearBase):
                 if param is getattr(self, "weight_scale", None) or param is getattr(
                     self, "input_scale", None
                 ):
-                    if self.quant_type != QuantType.per_1x32:
+                    if self.quant_type not in (
+                        QuantType.per_1x32,
+                        QuantType.per_Token,
+                    ):
                         shard_size //= 128
                 shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
                 self.weight_loader(param, shard, shard_id)

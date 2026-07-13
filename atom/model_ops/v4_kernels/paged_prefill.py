@@ -58,6 +58,8 @@ except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 
 # Fixed best-known Triton meta for DeepSeek-V4 TP=8 / local H=8 prefill.
 _BLOCK_H = 16
@@ -603,6 +605,18 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
+    if get_gfx() == "gfx1250":
+        return pa_prefill_sparse(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        )
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     if not envs.ATOM_FORCE_ATTN_TRITON and _HAS_OPUS:
