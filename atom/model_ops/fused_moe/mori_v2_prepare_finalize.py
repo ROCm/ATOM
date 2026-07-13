@@ -224,19 +224,20 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             return_routing=True,
         )
         self._routing = routing
-        total_recv = int(total_recv_t.item())
 
-        # aiter FlyDSL kernels must not read cco symmetric VMM memory: clone the
-        # dispatched tokens/routing out of the arena window before the GEMM.
-        dispatch_a1 = recv_x[:total_recv].clone()
-        dispatch_ids = recv_idx[:total_recv].clone()
-        dispatch_weights = recv_w[:total_recv].clone()
+        # Capture-safe: do NOT call total_recv_t.item() (a GPU->CPU sync that is
+        # illegal during cudagraph capture). Clone the FULL fixed-size arena
+        # buffers out of the cco symmetric VMM window (aiter FlyDSL kernels must
+        # not read it) so the shapes stay static across capture/replay.
+        dispatch_a1 = recv_x
+        dispatch_ids = recv_idx
+        dispatch_weights = recv_w
 
-        # num_local_tokens is left unset (expert_num_tokens=None): the grouped
-        # a8w4 path derives per-expert routing from the (already trimmed) global
-        # ids + expert_mask, exactly as test_moe_layer_ep.py does.
+        # Forward total_recv_t (a [1] int32 device tensor) to fused_moe as
+        # num_local_tokens: moe_sorting/stage kernels then process only the first
+        # total_recv rows of the full buffer, avoiding data-dependent slicing.
         expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=None, expert_num_tokens_cpu=None
+            expert_num_tokens=total_recv_t, expert_num_tokens_cpu=None
         )
         return (
             dispatch_a1,
