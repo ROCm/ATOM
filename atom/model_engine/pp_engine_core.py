@@ -80,6 +80,10 @@ class PPEngineCoreProc(EngineCore):
                     self._pp_head_step()
         finally:
             try:
+                self.runner_mgr.call_func("flush_pp_send", wait_out=True)
+            except Exception:
+                logger.exception("flush_pp_send during shutdown failed")
+            try:
                 self.scheduler.publish_kv_events()
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
@@ -156,6 +160,10 @@ class PPEngineCoreProc(EngineCore):
                     # Feed the sampled tokens back to the head.
                     self.pp_transport.send_tokens(fwd_out)
         finally:
+            try:
+                self.runner_mgr.call_func("flush_pp_send", wait_out=True)
+            except Exception:
+                logger.exception("flush_pp_send during shutdown failed")
             try:
                 self.scheduler.publish_kv_events()
             except Exception:

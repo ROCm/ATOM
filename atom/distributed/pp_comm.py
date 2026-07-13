@@ -16,9 +16,10 @@
 #   dp_idx  =  rank // (tp*pcp*pp)
 
 import logging
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
-
 
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -33,6 +34,15 @@ logger = logging.getLogger("atom")
 
 # Keys carried between pipeline stages.
 _PP_PROXY_KEYS = ("hidden_states", "residual")
+
+
+@dataclass
+class P2PWork:
+    """Handle for an in-flight isend; keeps the payload tensor alive until
+    the send completes so the underlying buffer is not GC'd or reused."""
+
+    work: Optional[torch.distributed.Work]
+    payload: Optional[torch.Tensor]
 
 
 def init_pp_aware_dist_env(
@@ -118,3 +128,70 @@ def recv_intermediate_tensors() -> IntermediateTensors:
     src = (pp.rank_in_group - 1) % pp.world_size
     tensors = pp.recv_tensor_dict(src=src)
     return IntermediateTensors(tensors)
+
+
+# ---------------------------------------------------------------------------
+# Async send — bypasses aiter's synchronous send_tensor_dict, using
+# torch.distributed.isend directly.  Wire protocol is identical to aiter's
+# send_object + per-tensor send, so the receiver's recv_tensor_dict (which
+# uses synchronous recv) works unchanged.
+# ---------------------------------------------------------------------------
+
+# Reuse aiter's internal helper that splits a dict into (metadata, tensors).
+from aiter.dist.parallel_state import _split_tensor_dict  # noqa: E402
+
+
+def _async_send_object(
+    obj: object, dst_global: int, cpu_group: torch.distributed.ProcessGroup
+) -> list[P2PWork]:
+    """Async version of aiter GroupCoordinator.send_object."""
+    import pickle
+
+    object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+    size_tensor = torch.tensor([object_tensor.numel()], dtype=torch.long, device="cpu")
+    works: list[P2PWork] = []
+    w = torch.distributed.isend(size_tensor, dst=dst_global, group=cpu_group)
+    works.append(P2PWork(w, size_tensor))
+    w = torch.distributed.isend(object_tensor, dst=dst_global, group=cpu_group)
+    works.append(P2PWork(w, object_tensor))
+    return works
+
+
+def async_send_intermediate_tensors(
+    it: IntermediateTensors,
+) -> list[P2PWork]:
+    """Non-blocking send of hidden_states/residual to the next PP stage.
+
+    Each tensor is cloned before isend so the model can immediately reuse
+    its forward buffers for the next micro-batch.  The returned P2PWork
+    list holds references to the cloned tensors (preventing GC) and must
+    be committed via ``commit_pp_send_work`` before the *next* async send.
+    """
+    pp = get_pp_group()
+    dst_local = (pp.rank_in_group + 1) % pp.world_size
+    dst_global = pp.ranks[dst_local]
+
+    tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
+    metadata_list, tensor_list = _split_tensor_dict(tensors)
+
+    works = _async_send_object(metadata_list, dst_global, pp.cpu_group)
+
+    for tensor in tensor_list:
+        if tensor.numel() == 0:
+            continue
+        buf = tensor.clone()
+        if buf.is_cpu:
+            w = torch.distributed.isend(buf, dst=dst_global, group=pp.cpu_group)
+        else:
+            w = torch.distributed.isend(buf, dst=dst_global, group=pp.device_group)
+        works.append(P2PWork(w, buf))
+
+    return works
+
+
+def commit_pp_send_work(works: list[P2PWork]) -> None:
+    """Block until all in-flight isend operations complete, then clear."""
+    for p2p in works:
+        if p2p.work is not None:
+            p2p.work.wait()
+    works.clear()
