@@ -99,9 +99,10 @@ python3 -m sglang.launch_server \
 For an 8-GPU run, set `TP=8` and expose the target GPUs with `CUDA_VISIBLE_DEVICES`.
 
 
-### GLM-5.2 MXFP4
+### GLM-5.2 MXFP4 with online quant
 
-Use this case with the Quark MXFP4 checkpoint.
+Use this case with the Quark MXFP4 checkpoint and online quantize the
+non-expert weights to `ptpc_fp8`.
 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
@@ -112,8 +113,9 @@ export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 MODEL_PATH=amd/GLM-5.2-MXFP4
 # Or use a local checkpoint path, for example:
 # MODEL_PATH=/shared/data/amd_int/models/GLM-5.2-MXFP4
-TP=8
+TP=4
 PORT=9000
+MODEL_LOADER_EXTRA_CONFIG='{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}}'
 
 TORCHINDUCTOR_COMPILE_THREADS=128 \
 python3 -m sglang.launch_server \
@@ -125,6 +127,7 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.8 \
     --disable-radix-cache \
     --kv-cache-dtype fp8_e4m3 \
+    --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}"
 ```
 
 ## Step 3: Performance Benchmark
@@ -163,7 +166,15 @@ python3 /tmp/bench_serving/benchmark_serving.py \
 
 ### Optional: Enable Profiling
 
-If you want to collect profiling trace, add `export SGLANG_PROFILE_RECORD_SHAPES=1`, `export SGLANG_PROFILE_WITH_STACK=1`, and `export SGLANG_TORCH_PROFILER_DIR=./profile_sglang/` to the selected launch command block before `TORCHINDUCTOR_COMPILE_THREADS=128`, then append `--profile` to the `benchmark_serving.py` command in Step 3.
+If you want to collect profiling trace, set the SGLang profiling environment variables before launching the server, and add `--profile` to the benchmark client command.
+
+```bash
+export SGLANG_PROFILE_RECORD_SHAPES=1
+export SGLANG_PROFILE_WITH_STACK=1
+export SGLANG_TORCH_PROFILER_DIR=./profile_sglang/
+```
+
+Then append `--profile` to the `benchmark_serving.py` command in Step 3.
 
 ## Step 4: Accuracy Validation
 
