@@ -643,9 +643,9 @@ is one of:</p>
 </ol>
 <section id="target-formats">
 <h3>2.1 Target formats<a class="headerlink" href="#target-formats" title="Link to this heading"></a></h3>
-<p>Only two target formats are currently supported. Any other string (for example
-<code class="docutils literal notranslate"><span class="pre">ptpc_i8</span></code>, <code class="docutils literal notranslate"><span class="pre">mxi4</span></code>, <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code>) will either be rejected by the JSON parser or
-trigger an assertion in the loader when the layer’s weight is quantized.</p>
+<p>The target formats below are currently supported. Any other string (for example
+<code class="docutils literal notranslate"><span class="pre">ptpc_i8</span></code>, <code class="docutils literal notranslate"><span class="pre">mxi4</span></code>, <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code>) will be rejected by the JSON parser or trigger an
+assertion in the loader when the layer’s weight is quantized.</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Format string</p></th>
@@ -658,12 +658,24 @@ trigger an assertion in the loader when the layer’s weight is quantized.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">QuantType.per_Token</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code></p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">per_block_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">QuantType.per_1x128</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code> (128×128 block scale)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">per_block128_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">QuantType.per_1x128</span></code></p></td>
+<td><p>alias of <code class="docutils literal notranslate"><span class="pre">per_block_fp8</span></code> (explicit 128 block)</p></td>
+</tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mxfp4</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">QuantType.per_1x32</span></code></p></td>
 <td><p>packed FP4 (<code class="docutils literal notranslate"><span class="pre">torch.float4_e2m1fn_x2</span></code>, group size 32)</p></td>
 </tr>
 </tbody>
 </table>
+<p><code class="docutils literal notranslate"><span class="pre">per_block_fp8</span></code> is DeepSeek-style block FP8: the weight uses a 128×128 block
+scale of shape <code class="docutils literal notranslate"><span class="pre">(N//128,</span> <span class="pre">K//128)</span></code> and the activation uses a 1×128 (along K)
+scale, consumed by the block-scale GEMM. <code class="docutils literal notranslate"><span class="pre">per_block_fp8</span></code> and <code class="docutils literal notranslate"><span class="pre">per_block128_fp8</span></code>
+are equivalent (128 is the default block size).</p>
 </section>
 <section id="picking-the-right-pattern">
 <h3>2.2 Picking the right pattern<a class="headerlink" href="#picking-the-right-pattern" title="Link to this heading"></a></h3>
@@ -773,10 +785,25 @@ decoding for ~2.5× lower TPOT.</p>
 quantization — it can be added to any of the recipes above without changing
 the <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> JSON.</p>
 </section>
+<section id="qwen3-30b-a3b-thinking-2507-full-per-block-fp8">
+<h3>3.5 Qwen3-30B-A3B-Thinking-2507 — full per-block FP8<a class="headerlink" href="#qwen3-30b-a3b-thinking-2507-full-per-block-fp8" title="Link to this heading"></a></h3>
+<p>BF16 source → every Linear and the fused expert module quantized to
+<code class="docutils literal notranslate"><span class="pre">per_block_fp8</span></code> (DeepSeek-style 128×128 block scale).</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>Qwen/Qwen3-30B-A3B-Thinking-2507<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-tp<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--online_quant_config<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;global_quant_config&quot;: &quot;per_block_fp8&quot;,</span>
+<span class="s1">    &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">  }&#39;</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">per_block_fp8</span></code> is the same block-FP8 format DeepSeek-V3/R1 ships natively, so
+it is a good drop-in when you want FP8 accuracy closer to the block-scaled
+checkpoint than per-token <code class="docutils literal notranslate"><span class="pre">ptpc_fp8</span></code>.</p>
 </section>
-<hr class="docutils" />
 <section id="plugin-mode-vllm-serve">
-<h2>3.5 Plugin mode (<code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>)<a class="headerlink" href="#plugin-mode-vllm-serve" title="Link to this heading"></a></h2>
+<h3>3.6 Plugin mode (<code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>)<a class="headerlink" href="#plugin-mode-vllm-serve" title="Link to this heading"></a></h3>
 <p>In the <a class="reference internal" href="vllm_plugin_backend_guide.html"><span class="std std-doc">vLLM out-of-tree plugin backend</span></a> you launch
 with <code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>, whose CLI does not understand ATOM’s <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code>
 flag. Instead, pass the <strong>same JSON object</strong> through vLLM’s official plugin
@@ -800,6 +827,7 @@ identical to the <code class="docutils literal notranslate"><span class="pre">--
 leaves weights at their source precision. As with the standalone flag, online
 quantization only activates when the source checkpoint’s <code class="docutils literal notranslate"><span class="pre">quant_method</span></code> is
 unquantized or per-block FP8 (see § 1).</p>
+</section>
 </section>
 <hr class="docutils" />
 <section id="verifying-the-result">
@@ -854,7 +882,11 @@ that pattern. The mapping is:</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">per_Token</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mxfp4</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">per_block_fp8</span></code> / <code class="docutils literal notranslate"><span class="pre">per_block128_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">per_1x128</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mxfp4</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">per_1x32</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch.uint8</span></code> (packed FP4x2)</p></td>
 </tr>
