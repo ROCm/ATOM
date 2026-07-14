@@ -1292,6 +1292,13 @@ class Config:
                 ),
             )
         )
+        # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
+        # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
+        # F.embedding vs masked-embedding + all-reduce), so it alters the compiled
+        # graph and MUST be part of its key. Without this, toggling the flag — or
+        # deploying it on top of a cache built with the other setting — reuses a
+        # stale artifact and trips assert_size_stride at runtime.
+        factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

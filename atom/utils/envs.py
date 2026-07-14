@@ -105,11 +105,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
-    # Replicate the EAGLE3 draft vocab embedding on every TP rank (full table per
-    # rank, local lookup) instead of sharding it — eliminates the post-embedding
-    # all-reduce. The draft embed is independent of the (sharded) lm_head.
-    "ATOM_EAGLE_REPLICATE_EMBED": lambda: (
-        os.getenv("ATOM_EAGLE_REPLICATE_EMBED", "1") == "1"
+    # Replicate the vocab embedding on every TP rank (full table per rank, purely
+    # local lookup) instead of TP-sharding it — eliminates the post-embedding
+    # all-reduce. Applies to BOTH the main/target model and the speculative draft
+    # (EAGLE3 head + MTP draft steps), so the collective is dropped on every embed
+    # on the critical path. Only used where the embedding is independent of the
+    # still TP-sharded lm_head (EAGLE3 draft; GLM-5.2 target+MTP, whose
+    # tie_word_embeddings=False), so the lookup is bit-identical to the sharded
+    # masked-embedding + all-reduce path. Trades (tp-1)/tp of the embedding's
+    # memory per rank for one fewer collective per embed. Default on; set "0" to
+    # fall back to the sharded VocabParallelEmbedding.
+    "ATOM_REPLICATE_VOCAB_EMBED": lambda: (
+        os.getenv("ATOM_REPLICATE_VOCAB_EMBED", "1") == "1"
     ),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"

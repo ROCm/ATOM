@@ -213,6 +213,64 @@ def kv_indices_generate_triton(
     return kv_indices_convert
 
 
+@triton.jit
+def mtp_prepare_decode_mla_kernel(
+    kv_indptr_ptr,  # int32 [bs+1] in/out: += cu_seqlens_q
+    cu_seqlens_q_ptr,  # int32 [bs+1] in
+    sparse_kv_indptr_ptr,  # int32 [bs+1] out (IS_SPARSE only)
+    positions_ptr,  # int64 [bs] in/out (UPDATE_POSITIONS only)
+    context_lens_ptr,  # int32 [bs] in/out (UPDATE_CONTEXT_LENS only)
+    bs,
+    index_topk,
+    position_stride,
+    IS_SPARSE: tl.constexpr,
+    UPDATE_POSITIONS: tl.constexpr,
+    UPDATE_CONTEXT_LENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Single-program fused per-draft-step MTP-decode metadata for MLA.
+
+    Collapses the elementwise chain that used to launch ~4 tiny kernels
+    (``kv_indptr += cu_seqlens_q``; ``counts = diff(kv_indptr)``;
+    ``clamp(index_topk)``; ``cumsum -> sparse_kv_indptr``) plus eagle's two
+    per-step bumps (``positions += 1``, ``context_lens += 1``) into one launch.
+    One program owns the whole batch so the sparse cumsum is a single in-register
+    ``tl.cumsum``; the caller guarantees ``bs + 1 <= BLOCK`` (bs <= max_bs). All
+    reads happen before any write, so the in-place ``kv_indptr`` update is
+    hazard-free. ``sparse_kv_indptr[0]`` is written on-device (no Python-scalar
+    H2D copy, which is what caused the original hot-path Host-Device sync).
+    """
+    offs = tl.arange(0, BLOCK)
+    mask_p1 = offs < (bs + 1)  # indptr arrays are length bs+1
+    mask_bs = offs < bs  # per-seq arrays are length bs
+
+    # Load originals first (into registers) so the kv_indptr store below cannot
+    # clobber the shifted [i+1] read used for per-seq counts.
+    kvi = tl.load(kv_indptr_ptr + offs, mask=mask_p1, other=0)
+    cuq = tl.load(cu_seqlens_q_ptr + offs, mask=mask_p1, other=0)
+    new_kvi = kvi + cuq
+
+    if IS_SPARSE:
+        kvi_next = tl.load(kv_indptr_ptr + offs + 1, mask=mask_bs, other=0)
+        cuq_next = tl.load(cu_seqlens_q_ptr + offs + 1, mask=mask_bs, other=0)
+        counts = tl.where(mask_bs, (kvi_next + cuq_next) - new_kvi, 0)
+        clamped = tl.minimum(counts, index_topk)
+        # inclusive scan: csum[i] == sparse_kv_indptr[i + 1]
+        csum = tl.cumsum(clamped, axis=0)
+        tl.store(sparse_kv_indptr_ptr + offs + 1, csum, mask=mask_bs)
+        tl.store(sparse_kv_indptr_ptr + offs, tl.zeros_like(csum), mask=(offs == 0))
+
+    tl.store(kv_indptr_ptr + offs, new_kvi, mask=mask_p1)
+
+    if UPDATE_POSITIONS:
+        pos = tl.load(positions_ptr + offs * position_stride, mask=mask_bs, other=0)
+        tl.store(positions_ptr + offs * position_stride, pos + 1, mask=mask_bs)
+
+    if UPDATE_CONTEXT_LENS:
+        ctx = tl.load(context_lens_ptr + offs, mask=mask_bs, other=0)
+        tl.store(context_lens_ptr + offs, ctx + 1, mask=mask_bs)
+
+
 if __name__ == "__main__":
     # Example usage and test
 

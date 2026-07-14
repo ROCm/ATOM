@@ -1810,13 +1810,27 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 )
         return shared_buffer
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+        *,
+        _req_id_per_token=None,
+        _drafting=False,
+    ):
         num_tokens = common_attn_metadata.num_actual_tokens
-        starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
-        seg_lengths = torch.diff(starts)
-        req_id_per_token = torch.repeat_interleave(
-            torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
-        )
+        if _req_id_per_token is not None:
+            # Draft path (see build_for_drafting): req_id_per_token was already
+            # produced on-GPU, so the copy_ below is device-to-device and the
+            # per-step pageable H2D sync is avoided.
+            req_id_per_token = _req_id_per_token
+        else:
+            starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
+            seg_lengths = torch.diff(starts)
+            req_id_per_token = torch.repeat_interleave(
+                torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
+            )
         # Shrink-tail-only zeroing instead of three full-buffer fill_(0) every
         # step (the buffers are persistent across decode steps and zeros-init):
         #   - req_id_per_token_buffer / paged_kv_indices: the kernel only reads
@@ -1899,7 +1913,9 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         # adds no extra CPU work.
         num_reqs = common_attn_metadata.num_reqs
         decode_only = (
-            int(common_attn_metadata.max_query_len) == 1 and num_tokens == num_reqs
+            not _drafting
+            and int(common_attn_metadata.max_query_len) == 1
+            and num_tokens == num_reqs
         )
         metadata_key = None
         if decode_only:
@@ -1970,6 +1986,45 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
 
         return attn_metadata
 
+    def build_for_drafting(self, common_attn_metadata, draft_index):
+        """Sync-free per-draft-step build for sparse MLA main attention.
+
+        vLLM's EagleProposer rebuilds attention metadata for every MTP draft
+        step. The inherited build_for_drafting just calls build(), which
+        constructs ``req_id_per_token`` on the host and copies it into a GPU
+        buffer -- a pageable, synchronous H2D copy that stalls the draft
+        model's kernel dispatch right at the target->draft boundary (this is
+        the H2D sync visible between the main and draft models in the trace).
+
+        During MTP/EAGLE drafting every request contributes exactly one decode
+        token, so ``req_id_per_token`` is simply ``arange(num_reqs)`` and can be
+        built on-GPU (device-to-device copy, no sync). We also pass
+        ``_drafting=True`` so build() skips the decode-only work-split
+        fingerprint (whose ``seq_lens.cpu()`` fallback would be another sync and
+        which MTP/spec batches invalidate anyway). Non-uniform batches (any
+        prefill or padding) fall back to the regular build().
+        """
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        if not (
+            num_tokens == num_reqs and int(common_attn_metadata.max_query_len) == 1
+        ):
+            return self.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+            )
+        req_id_per_token = torch.arange(
+            num_tokens, dtype=torch.int32, device=self.device
+        )
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=True,
+            _req_id_per_token=req_id_per_token,
+            _drafting=True,
+        )
+
 
 class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
@@ -2037,8 +2092,20 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        # ``arange_buffer`` is sliced to ``actual_expanded`` (the flattened
+        # multi-token decode count) in ``_build_indexer``. During MTP drafting a
+        # decode request carries up to ``1 + num_speculative_tokens`` tokens, so
+        # the expansion can reach ``num_decode_tokens`` (bounded by
+        # ``max_num_batched_tokens``) -- larger than ``max_num_seqs`` for a draft
+        # builder whose ``num_speculative_tokens`` is forced to 0. Guard with
+        # ``max_num_batched_tokens`` exactly as upstream vLLM's indexer does so
+        # the buffer always covers ``actual_expanded``.
         self.arange_buffer = torch.arange(
-            config.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
+            max(
+                config.scheduler_config.max_num_seqs
+                * (1 + self.num_speculative_tokens),
+                max_num_batched_tokens,
+            ),
             dtype=torch.int32,
             device=self.device,
         )
@@ -2155,14 +2222,31 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata = None
         if num_decodes > 0:
-            torch.diff(
-                common_attn_metadata.query_start_loc[: num_decodes + 1],
-                out=self.decode_lens_buffer[:num_decodes],
-            )
-            decode_lens = self.decode_lens_buffer[:num_decodes]
+            # Single-source the decode lengths from query_start_loc_cpu.
+            #
+            # `decode_lens` is used below as the `repeats` argument of
+            # torch.repeat_interleave, while `actual_expanded` (derived from
+            # decode_lens_cpu.sum()) is passed as its `output_size`. When
+            # output_size is given, repeat_interleave SKIPS the device sync and
+            # trusts that `output_size == repeats.sum()`; if that contract is
+            # violated it emits an internal gather index past the source rows and
+            # the underlying index_select over-reads -> random illegal memory
+            # access.
+            #
+            # Previously `decode_lens` was diffed from the GPU `query_start_loc`
+            # while `output_size` came from the CPU `query_start_loc_cpu`. Under
+            # async scheduling the GPU and CPU copies of query_start_loc can
+            # momentarily disagree, so `repeats` and `output_size` came from two
+            # different sources and could mismatch. Deriving `decode_lens` from
+            # the SAME CPU tensor (copied into the persistent GPU buffer) makes
+            # `decode_lens.sum() == actual_expanded` hold by construction.
             decode_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
+            self.decode_lens_buffer[:num_decodes].copy_(
+                decode_lens_cpu, non_blocking=True
+            )
+            decode_lens = self.decode_lens_buffer[:num_decodes]
 
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
