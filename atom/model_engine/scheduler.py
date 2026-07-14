@@ -368,6 +368,19 @@ class ScheduledBatch:
         # logger.info(f"{[len(blk)*16 for blk in self.block_tables]=}")
         # logger.info(f"{self.block_tables=}")
 
+    def produces_output(self) -> bool:
+        """True if this batch yields a token the head must consume.
+
+        Decode batches always do. A pure-prefill batch yields a token only
+        when at least one seq is on its final chunk; a batch of middle chunks
+        produces nothing.
+        """
+        if self.total_seqs_num_decode > 0:
+            return True
+        if self.is_final_chunk is None:
+            return True
+        return any(self.is_final_chunk)
+
 
 class ScheduledBatchOutput:
     """Token-level results from a single forward pass.
