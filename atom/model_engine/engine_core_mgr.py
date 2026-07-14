@@ -407,28 +407,16 @@ class CoreManager:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
         if self.pp_size > 1:
-            # Pipeline parallel: requests enter only at stage 0 (the head) of
-            # each dp group; the head drives the pipeline downstream. Round-robin
-            # across dp-group heads (single head when dp=1).
-            num_dp = self.local_engine_count // self.pp_size
-            heads = [d * self.pp_size for d in range(num_dp)]
-            head_seqs = {h: [] for h in heads}
-            for seq in seqs:
-                h = heads[self._rr_counter % len(heads)]
-                head_seqs[h].append(seq)
-                self._rr_counter += 1
-            for h, rank_seqs in head_seqs.items():
-                if rank_seqs:
-                    logger.debug(
-                        f"{self.label}: Add {len(rank_seqs)} requests to PP head {h}"
-                    )
-                    self.input_sockets[h].send_multipart(
-                        [
-                            self.engine_core_identities[h],
-                            pickle.dumps((EngineCoreRequestType.ADD, rank_seqs)),
-                        ],
-                        copy=False,
-                    )
+            # Pipeline parallel (dp=1): requests enter only at stage 0, which
+            # drives the pipeline downstream.
+            logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
+            self.input_sockets[0].send_multipart(
+                [
+                    self.engine_core_identities[0],
+                    pickle.dumps((EngineCoreRequestType.ADD, seqs)),
+                ],
+                copy=False,
+            )
         elif self.local_engine_count == 1:
             # Single DP rank, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
