@@ -81,9 +81,7 @@ def resolve_model_path(model_name: str, model_cfg: dict[str, Any]) -> str:
     return resolve_env_refs(model_path) if "${" in model_path else model_path
 
 
-def resolve_env_refs(
-    value: str, preserve_names: set[str] | None = None
-) -> str:
+def resolve_env_refs(value: str, preserve_names: set[str] | None = None) -> str:
     preserve_names = preserve_names or set()
 
     def expand_env(match: re.Match[str]) -> str:
