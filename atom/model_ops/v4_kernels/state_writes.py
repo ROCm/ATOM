@@ -564,14 +564,14 @@ def update_compressor_states_reference(
 
 @triton.jit
 def _dspark_paged_window_gather_kernel(
-    swa_region_ptr,        # [num_pages, head_dim] flat SWA pool slice
+    swa_region_ptr,  # [num_pages, head_dim] flat SWA pool slice
     swa_region_row_stride,  # = head_dim
-    block_tables_ptr,      # [B, max_blocks] int32 logical->physical
-    block_tables_stride,   # row stride = max_blocks
-    anchor_pos_ptr,        # [B] int — per-seq anchor absolute position
-    out_ptr,               # [B, W, head_dim] dense window output
-    out_seq_stride,        # = W * head_dim
-    out_slot_stride,       # = head_dim
+    block_tables_ptr,  # [B, max_blocks] int32 logical->physical
+    block_tables_stride,  # row stride = max_blocks
+    anchor_pos_ptr,  # [B] int — per-seq anchor absolute position
+    out_ptr,  # [B, W, head_dim] dense window output
+    out_seq_stride,  # = W * head_dim
+    out_slot_stride,  # = head_dim
     head_dim,
     block_size,
     W: tl.constexpr,
@@ -591,7 +591,11 @@ def _dspark_paged_window_gather_kernel(
 
     if p < 0:
         # Unfilled slot: zero it (valid_target masks it out in attention anyway).
-        tl.store(out_base + d_offsets, tl.zeros([BLOCK_D], dtype=out_ptr.dtype.element_ty), mask=d_mask)
+        tl.store(
+            out_base + d_offsets,
+            tl.zeros([BLOCK_D], dtype=out_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
         return
 
     blk = p // block_size
@@ -605,24 +609,28 @@ def _dspark_paged_window_gather_kernel(
 
 
 def dspark_paged_window_gather(
-    swa_region: torch.Tensor,     # [num_pages, head_dim] pool slice (attn.swa_kv)
-    block_tables: torch.Tensor,   # [B, max_blocks] int32
-    anchor_pos: torch.Tensor,     # [B] int — anchor absolute position per seq
+    swa_region: torch.Tensor,  # [num_pages, head_dim] pool slice (attn.swa_kv)
+    block_tables: torch.Tensor,  # [B, max_blocks] int32
+    anchor_pos: torch.Tensor,  # [B] int — anchor absolute position per seq
     window: int,
     block_size: int,
-) -> torch.Tensor:                # [B, window, head_dim]
+) -> torch.Tensor:  # [B, window, head_dim]
     """Materialise the dense `[B, W, head_dim]` rolling window from the paged
     SWA pool, addressed by `block_tables` (mirrors `swa_write`). Slot `s` holds
     absolute position `anchor_pos[b] - (W-1) + s`; `p < 0` slots are zeroed.
     """
     assert swa_region.dim() == 2, f"swa_region must be [P, D], got {swa_region.shape}"
-    assert block_tables.dim() == 2, f"block_tables must be [B, MB], got {block_tables.shape}"
+    assert (
+        block_tables.dim() == 2
+    ), f"block_tables must be [B, MB], got {block_tables.shape}"
     B = block_tables.shape[0]
     num_pages, head_dim = swa_region.shape
     assert anchor_pos.shape[0] >= B
     assert swa_region.is_contiguous()
 
-    out = torch.zeros(B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype)
+    out = torch.zeros(
+        B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype
+    )
     if B == 0 or window == 0:
         return out
     BLOCK_D = triton.next_power_of_2(head_dim)
@@ -654,7 +662,9 @@ def dspark_paged_window_gather_reference(
     """Pure-torch reference for `dspark_paged_window_gather` (unit tests)."""
     B = block_tables.shape[0]
     _, head_dim = swa_region.shape
-    out = torch.zeros(B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype)
+    out = torch.zeros(
+        B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype
+    )
     for b in range(B):
         anchor = int(anchor_pos[b].item())
         for s in range(window):

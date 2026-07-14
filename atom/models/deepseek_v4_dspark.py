@@ -41,10 +41,13 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
   (embed + lm_head are shared with the target via share_with_target)
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from atom.config import Config
 
 
 class DSparkMarkovHead(nn.Module):
@@ -220,11 +223,19 @@ def _forward_rope_gptj_kernel_impl():
 
     @triton.jit
     def _kernel(
-        x_ptr, cos_ptr, sin_ptr, pos_ptr,
-        stride_x_s, stride_x_h, stride_x_d,
-        stride_cos_s, stride_cos_d,
+        x_ptr,
+        cos_ptr,
+        sin_ptr,
+        pos_ptr,
+        stride_x_s,
+        stride_x_h,
+        stride_x_d,
+        stride_cos_s,
+        stride_cos_d,
         S,
-        BLOCK_S: tl.constexpr, BLOCK_RD: tl.constexpr, BLOCK_RD_HALF: tl.constexpr,
+        BLOCK_S: tl.constexpr,
+        BLOCK_RD: tl.constexpr,
+        BLOCK_RD_HALF: tl.constexpr,
     ):
         pid_h = tl.program_id(0)
         pid_s = tl.program_id(1)
@@ -373,12 +384,12 @@ def _dspark_block_topk_idxs(
 
 
 def _dspark_block_sparse_attention_torch(
-    q: torch.Tensor,           # [B, T, H, D]
-    kv: torch.Tensor,          # [B, W + T, D]  (window target-KV ++ draft-block KV)
-    attn_sink: torch.Tensor,   # [H]
+    q: torch.Tensor,  # [B, T, H, D]
+    kv: torch.Tensor,  # [B, W + T, D]  (window target-KV ++ draft-block KV)
+    attn_sink: torch.Tensor,  # [H]
     valid_target: torch.Tensor,  # [B, W] bool: which window slots hold real KV
     scale: float,
-) -> torch.Tensor:             # [B, T, H, D]
+) -> torch.Tensor:  # [B, T, H, D]
     """Plain-torch reference: dense block attention over (window ++ draft block).
 
     Kept as a kernel-free, inspectable reference. The production path
@@ -395,7 +406,7 @@ def _dspark_block_sparse_attention_torch(
     # Draft-block slots: block-causal, position t attends to draft cols <= t.
     # block_causal[t, s] = (s <= t).
     draft_cols = torch.arange(T, device=q.device)
-    block_causal = (draft_cols.view(1, T) <= draft_cols.view(T, 1))  # [T, T]
+    block_causal = draft_cols.view(1, T) <= draft_cols.view(T, 1)  # [T, T]
     block_mask = block_causal.view(1, 1, T, T).expand(B, 1, T, T)
     full_mask = torch.cat([win_mask.expand(B, 1, T, W), block_mask], dim=-1)
     scores = scores.masked_fill(~full_mask, neg_inf)
@@ -409,12 +420,12 @@ def _dspark_block_sparse_attention_torch(
 
 
 def _dspark_block_sparse_attention(
-    q: torch.Tensor,           # [B, T, H, D]
-    kv: torch.Tensor,          # [B, W + T, D]  (window target-KV ++ draft-block KV)
-    attn_sink: torch.Tensor,   # [H]
+    q: torch.Tensor,  # [B, T, H, D]
+    kv: torch.Tensor,  # [B, W + T, D]  (window target-KV ++ draft-block KV)
+    attn_sink: torch.Tensor,  # [H]
     valid_target: torch.Tensor,  # [B, W] bool: which window slots hold real KV
     scale: float,
-) -> torch.Tensor:             # [B, T, H, D]
+) -> torch.Tensor:  # [B, T, H, D]
     """Per-block attention over (rolling target window ++ draft block).
 
     DSpark is MQA: a single shared KV head broadcast to all H query heads. Each
@@ -514,7 +525,10 @@ class DSparkLayer(Block):  # type: ignore[misc]
         indexer_stream=None,
     ):
         super().__init__(
-            layer_id, args, prefix=prefix, alt_stream=alt_stream,
+            layer_id,
+            args,
+            prefix=prefix,
+            alt_stream=alt_stream,
             indexer_stream=indexer_stream,
         )
         self.stage_id = stage_id
@@ -545,9 +559,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             self.hc_head_base = atom_parameter(
                 torch.empty(hc_mult, dtype=torch.float32)
             )
-            self.hc_head_scale = atom_parameter(
-                torch.empty(1, dtype=torch.float32)
-            )
+            self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
         # PAGED-SWA: draft window KV lives in the shared paged pool
         # (`self.attn.swa_kv` slice of `unified_kv`, bound by
@@ -573,8 +585,12 @@ class DSparkLayer(Block):  # type: ignore[misc]
         _, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
         kv = a.kv_norm(kv).view(-1, 1, a.head_dim)
         kv = _apply_dspark_rope_hf(
-            kv, positions.reshape(-1),
-            torch.cat([a.rotary_emb.cos_cache.squeeze(), a.rotary_emb.sin_cache.squeeze()], dim=-1),
+            kv,
+            positions.reshape(-1),
+            torch.cat(
+                [a.rotary_emb.cos_cache.squeeze(), a.rotary_emb.sin_cache.squeeze()],
+                dim=-1,
+            ),
             a.rope_head_dim,
         )
         _apply_dspark_kv_qat_(kv, a.rope_head_dim)
@@ -582,8 +598,8 @@ class DSparkLayer(Block):  # type: ignore[misc]
 
     def precompute_context_kv(
         self,
-        main_x: torch.Tensor,       # [T, dim]  target hidden(s)
-        positions: torch.Tensor,    # [T]
+        main_x: torch.Tensor,  # [T, dim]  target hidden(s)
+        positions: torch.Tensor,  # [T]
         cache_indices: torch.Tensor,  # [B]  per-req state slot (unused: paged)
         cu_seqlens_q: torch.Tensor | None = None,  # [B+1]; None => one row/req
         write_per_batch: int = 1,
@@ -626,26 +642,24 @@ class DSparkLayer(Block):  # type: ignore[misc]
         main_kv = main_kv.to(self.attn.swa_kv.dtype).contiguous()
         if cu_seqlens_q is None:
             B = main_kv.shape[0]
-            cu_seqlens_q = torch.arange(
-                B + 1, device=main_kv.device, dtype=torch.int32
-            )
+            cu_seqlens_q = torch.arange(B + 1, device=main_kv.device, dtype=torch.int32)
         B = cu_seqlens_q.shape[0] - 1
         swa_write(
-            main_kv,                                       # [T, head_dim]
-            positions.to(torch.int32),                     # [T]
-            cu_seqlens_q.to(torch.int32),                  # [B+1] per-req spans
-            attn_md.swa_block_tables[:B],                  # [B, max_blocks]
-            self.attn.swa_kv,                              # [num_pages, head_dim]
+            main_kv,  # [T, head_dim]
+            positions.to(torch.int32),  # [T]
+            cu_seqlens_q.to(torch.int32),  # [B+1] per-req spans
+            attn_md.swa_block_tables[:B],  # [B, max_blocks]
+            self.attn.swa_kv,  # [num_pages, head_dim]
             self.attn.swa_block_size,
             write_per_batch,
         )
 
     def dspark_attention(
         self,
-        x: torch.Tensor,            # [B, T, dim]  per-block hidden (post attn_norm)
-        positions: torch.Tensor,    # [B]  anchor position per request
+        x: torch.Tensor,  # [B, T, dim]  per-block hidden (post attn_norm)
+        positions: torch.Tensor,  # [B]  anchor position per request
         cache_indices: torch.Tensor,  # [B]
-    ) -> torch.Tensor:              # [B, T, dim]
+    ) -> torch.Tensor:  # [B, T, dim]
         """Block attention over (rolling target window ++ draft block KV)."""
         a = self.attn
         B, T, _ = x.shape
@@ -662,7 +676,9 @@ class DSparkLayer(Block):  # type: ignore[misc]
             q = _linear_out(a.wq_b(qr_normed))
         q = q.view(B * T, a.n_local_heads, a.head_dim)
         # Per-head Q RMSNorm (weightless), matching the V4 reference.
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + a.eps).to(q.dtype)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + a.eps).to(
+            q.dtype
+        )
         kv = a.kv_norm(kv).view(B * T, 1, a.head_dim)
 
         # Draft positions: anchor+1 .. anchor+T.
@@ -697,9 +713,9 @@ class DSparkLayer(Block):  # type: ignore[misc]
         else:
             attn_md = fc.attn_metadata
             window_kv = dspark_paged_window_gather(
-                self.attn.swa_kv,              # [num_pages, head_dim]
+                self.attn.swa_kv,  # [num_pages, head_dim]
                 attn_md.swa_block_tables[:B],  # [B, max_blocks]
-                positions,                     # [B] anchor positions
+                positions,  # [B] anchor positions
                 W,
                 self.attn.swa_block_size,
             )  # [B, W, head_dim]
@@ -728,8 +744,8 @@ class DSparkLayer(Block):  # type: ignore[misc]
 
     def forward_block(
         self,
-        x: torch.Tensor,            # [B, T, hc, dim] (stage 0) or [B, T, dim]
-        positions: torch.Tensor,    # [B]
+        x: torch.Tensor,  # [B, T, hc, dim] (stage 0) or [B, T, dim]
+        positions: torch.Tensor,  # [B]
         cache_indices: torch.Tensor,  # [B]
         hc_state: "HCState | None",
     ):
@@ -743,18 +759,28 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # ----- Attention sub-layer with mHC mixing -----
         if hc_state is None:
             residual = x.reshape(B * T, self.hc_mult, x.shape[-1])
-            hc_state = HCState(residual=residual, post_mix=None, comb_mix=None, x_prev=None)
+            hc_state = HCState(
+                residual=residual, post_mix=None, comb_mix=None, x_prev=None
+            )
         hc_state = self.fuse_hc(
-            hc_state, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-            self.attn_norm.weight, self.norm_eps,
+            hc_state,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            self.attn_norm.weight,
+            self.norm_eps,
         )
         attn_in = hc_state.x_prev.view(B, T, -1)
         attn_out = self.dspark_attention(attn_in, positions, cache_indices)
         hc_state.x_prev = attn_out.reshape(B * T, -1)
         # ----- FFN sub-layer with mHC mixing -----
         hc_state = self.fuse_hc(
-            hc_state, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
-            self.ffn_norm.weight, self.norm_eps,
+            hc_state,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.ffn_norm.weight,
+            self.norm_eps,
         )
         hc_state.x_prev = self.ffn(hc_state.x_prev)
         return hc_state
@@ -890,9 +916,9 @@ class DeepseekV4DSpark(nn.Module):
 
     def forward_spec(
         self,
-        input_ids: torch.Tensor,    # [B]  anchor token per request (x0)
+        input_ids: torch.Tensor,  # [B]  anchor token per request (x0)
         main_hidden: torch.Tensor,  # [B, dim*len(target_layers)] concat target hidden
-        positions: torch.Tensor,    # [B]  anchor position per request
+        positions: torch.Tensor,  # [B]  anchor position per request
         cache_indices: torch.Tensor,  # [B] rows into the rolling KV cache
         num_draft: "int | None" = None,  # draft width (defaults to block_size)
     ):
@@ -1009,9 +1035,9 @@ class _DSparkInner(nn.Module):
             reduced, last.hc_head_fn, last.hc_head_scale, last.hc_head_base
         )
         hidden = last.norm(hidden).view(B, T, -1)  # [B, T, dim]
-        base_logits = self.head.get_logits(
-            hidden.reshape(B * T, -1)
-        ).view(B, T, -1)  # [B, T, vocab]
+        base_logits = self.head.get_logits(hidden.reshape(B * T, -1)).view(
+            B, T, -1
+        )  # [B, T, vocab]
 
         # ----- Sequential Markov head: sample the block left-to-right ---------
         return self.forward_head(base_logits, hidden, input_ids)
@@ -1030,7 +1056,9 @@ class _DSparkInner(nn.Module):
         for k in range(T):
             bias, m_embed = last.markov_head(out_ids[:, k])  # [B, V], [B, r]
             logits_k = base_logits[:, k].float() + bias
-            out_ids[:, k + 1] = logits_k.argmax(dim=-1)  # greedy (temp handled upstream)
+            out_ids[:, k + 1] = logits_k.argmax(
+                dim=-1
+            )  # greedy (temp handled upstream)
             markov_embeds.append(m_embed)
         confidence = last.confidence_head(
             hidden, torch.stack(markov_embeds, dim=1)

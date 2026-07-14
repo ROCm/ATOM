@@ -42,7 +42,9 @@ def survival_probabilities(confidence: torch.Tensor) -> torch.Tensor:
         along the block axis.
     """
     if confidence.ndim != 2:
-        raise ValueError(f"confidence must be [R, gamma], got {tuple(confidence.shape)}")
+        raise ValueError(
+            f"confidence must be [R, gamma], got {tuple(confidence.shape)}"
+        )
     return confidence.float().cumprod(dim=1)
 
 
@@ -72,7 +74,9 @@ def calibrate_confidence(
             f"sts_temperatures length {t.numel()} != block size {c.shape[1]}"
         )
     if torch.any(t <= 0):
-        raise ValueError("STS temperatures must be strictly positive (order-preserving).")
+        raise ValueError(
+            "STS temperatures must be strictly positive (order-preserving)."
+        )
     logit = torch.log(c) - torch.log1p(-c)  # logit(c)
     return torch.sigmoid(logit / t)
 
@@ -220,7 +224,9 @@ def schedule_prefix_lengths_tensor(
     Returns: int64 tensor [R] of verification lengths in 0..gamma.
     """
     if confidence.ndim != 2:
-        raise ValueError(f"confidence must be [R, gamma], got {tuple(confidence.shape)}")
+        raise ValueError(
+            f"confidence must be [R, gamma], got {tuple(confidence.shape)}"
+        )
     R, gamma = confidence.shape
     device = confidence.device
     if R == 0:
@@ -232,10 +238,7 @@ def schedule_prefix_lengths_tensor(
 
     flat = a.reshape(-1)  # [N]
     req = (
-        torch.arange(R, device=device)
-        .view(R, 1)
-        .expand(R, gamma)
-        .reshape(-1)
+        torch.arange(R, device=device).view(R, 1).expand(R, gamma).reshape(-1)
     )  # [N] request id per flat position
 
     sorted_vals, sort_idx = torch.sort(flat, descending=True)  # [N]

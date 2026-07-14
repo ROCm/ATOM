@@ -8,14 +8,15 @@ paper's §3.5 early-stop losslessness counterexample.
 
 import numpy as np
 import torch
+import torch as _torch
 
 from atom.spec_decode.dspark_scheduler import (
+    build_sps_table,
     calibrate_confidence,
     expected_throughput,
     schedule_prefix_lengths,
     survival_probabilities,
 )
-
 
 # ----------------------------------------------------------------------------
 # survival_probabilities
@@ -45,7 +46,9 @@ def test_survival_requires_2d():
 
 def test_sts_none_is_identity():
     conf = torch.tensor([[0.7, 0.6]])
-    torch.testing.assert_close(calibrate_confidence(conf, None), conf.float(), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        calibrate_confidence(conf, None), conf.float(), atol=1e-6, rtol=1e-6
+    )
 
 
 def test_sts_is_order_preserving():
@@ -154,7 +157,9 @@ def test_paper_counterexample_early_stop_returns_zero():
     # Early-stop must halt BEFORE evaluating c_2 (which depends on x_1),
     # returning ell=0 — this is what preserves the target distribution.
     conf = torch.tensor([[0.8, 0.9]])
-    sps = torch.tensor([1.0, 1.0, 0.5, 0.45])  # index by B: SPS(1)=1,SPS(2)=.5,SPS(3)=.45
+    sps = torch.tensor(
+        [1.0, 1.0, 0.5, 0.45]
+    )  # index by B: SPS(1)=1,SPS(2)=.5,SPS(3)=.45
     ell = schedule_prefix_lengths(conf, sps, early_stop=True)
     assert ell == [0], f"early-stop should return ell=0, got {ell}"
 
@@ -169,8 +174,8 @@ def test_disabling_early_stop_can_cross_the_dip():
     sps = torch.tensor([1.0, 1.0, 0.5, 0.65])
     greedy = schedule_prefix_lengths(conf, sps, early_stop=True)
     glob = schedule_prefix_lengths(conf, sps, early_stop=False)
-    assert greedy == [0]      # early-stop halts at the dip (lossless)
-    assert glob == [2]        # global search crosses it (needs async barrier)
+    assert greedy == [0]  # early-stop halts at the dip (lossless)
+    assert glob == [2]  # global search crosses it (needs async barrier)
 
 
 # ----------------------------------------------------------------------------
@@ -214,8 +219,6 @@ def test_mask_full_block_when_sps_flat():
 # ----------------------------------------------------------------------------
 # build_sps_table (SPS calibration densification, GPU-free)
 # ----------------------------------------------------------------------------
-
-from atom.spec_decode.dspark_scheduler import build_sps_table
 
 
 def test_sps_table_hits_measured_points_exactly():
@@ -319,8 +322,6 @@ def test_level_b_variable_metadata_shapes():
 
 # ---- ell req_id re-mapping + batch-level uniform L (Level B source alignment) ----
 
-import torch as _torch
-
 
 class _StubProposer:
     """Mirrors EagleProposer.record_dspark_ell + the q-bucket max-ell logic.
@@ -397,8 +398,10 @@ def test_ell_remap_clamps_to_valid_range():
 
 # ---- CUDA-graph query-length buckets (plan Y, §17) ----
 
+
 def test_resolve_q_buckets_parses_and_clamps():
     from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+
     # mtp_k=5 -> max_q=6
     assert resolve_q_buckets("1,3,6", 6) == [1, 3, 6]
     # out-of-range dropped, max_q always present
@@ -413,13 +416,14 @@ def test_resolve_q_buckets_parses_and_clamps():
 
 def test_quantize_to_bucket_rounds_up():
     from atom.spec_decode.dspark_scheduler import quantize_to_bucket
+
     b = [1, 3, 6]
     assert quantize_to_bucket(1, b) == 1
-    assert quantize_to_bucket(2, b) == 3   # round up
+    assert quantize_to_bucket(2, b) == 3  # round up
     assert quantize_to_bucket(3, b) == 3
-    assert quantize_to_bucket(4, b) == 6   # round up
+    assert quantize_to_bucket(4, b) == 6  # round up
     assert quantize_to_bucket(6, b) == 6
-    assert quantize_to_bucket(7, b) == 6   # cap at max
+    assert quantize_to_bucket(7, b) == 6  # cap at max
 
 
 def test_ragged_positions_construction():

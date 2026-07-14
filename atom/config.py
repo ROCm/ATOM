@@ -921,9 +921,7 @@ class SpeculativeConfig:
         a wrong fallback loads cleanly but measures the wrong algorithm.
         """
         cfg = self.draft_model_hf_config
-        return self.method == "dspark" or bool(
-            getattr(cfg, "dspark_block_size", None)
-        )
+        return self.method == "dspark" or bool(getattr(cfg, "dspark_block_size", None))
 
     def __post_init__(self):
         if self.draft_model_hf_config is None:
@@ -1268,14 +1266,10 @@ class Config:
             # positions past block_size RoPE-extrapolated. The real ceiling is the
             # rolling target-KV window (sliding_window=128), beyond which the
             # [window ++ draft] block attention no longer fits its context.
-            is_dspark = getattr(
-                self.speculative_config, "use_dspark", lambda: False
-            )()
+            is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
             max_spec = (
-                int(getattr(draft_cfg, "sliding_window", 128))
-                if is_dspark
-                else 4
+                int(getattr(draft_cfg, "sliding_window", 128)) if is_dspark else 4
             )
             if num_spec is None or num_spec < 1 or num_spec > max_spec:
                 raise ValueError(

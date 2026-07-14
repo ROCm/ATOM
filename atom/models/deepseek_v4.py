@@ -1577,8 +1577,13 @@ class Indexer(nn.Module):
         is_ragged = ragged_lens is not None and attn_md.dspark_full_q > 0
         if is_ragged:
             return self._score_topk_decode_ragged(
-                q_fp8, weights, block_tables, n_committed_per_seq_gpu,
-                ragged_lens, int(attn_md.dspark_full_q), topk,
+                q_fp8,
+                weights,
+                block_tables,
+                n_committed_per_seq_gpu,
+                ragged_lens,
+                int(attn_md.dspark_full_q),
+                topk,
             )
 
         # NOTE: derive the query batch size from the ACTUAL number of query

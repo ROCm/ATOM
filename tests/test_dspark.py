@@ -25,7 +25,7 @@ def test_markov_head_shapes_and_factorization():
     # bias must equal W1[x] @ W2^T exactly (low-rank factorization, paper Eq.5).
     w1 = head.markov_w1.weight  # [V, r]
     w2 = head.markov_w2.weight  # [V, r]
-    expected = (w1[tokens].float() @ w2.float().t())
+    expected = w1[tokens].float() @ w2.float().t()
     torch.testing.assert_close(bias, expected, rtol=1e-5, atol=1e-5)
 
 
@@ -48,9 +48,7 @@ def test_confidence_head_range_and_input_concat():
     assert c.shape == (5,)
     assert torch.all(c > 0) and torch.all(c < 1)
     # Matches sigmoid(proj([h; m])).
-    expected = torch.sigmoid(
-        head.proj(torch.cat([h, m], dim=-1).float()).squeeze(-1)
-    )
+    expected = torch.sigmoid(head.proj(torch.cat([h, m], dim=-1).float()).squeeze(-1))
     torch.testing.assert_close(c, expected, rtol=1e-5, atol=1e-5)
 
 
@@ -214,8 +212,10 @@ def test_dspark_rope_is_norm_preserving_on_rope_lanes():
 
 # ---- Phase 2: confidence-scheduled verification (Hardware-Aware Scheduler) ----
 
+
 def test_survival_probabilities_monotone_cumprod():
     from atom.spec_decode.dspark_scheduler import survival_probabilities
+
     c = torch.tensor([[0.9, 0.8, 0.5], [1.0, 0.5, 0.5]])
     a = survival_probabilities(c)
     # cumulative product
@@ -226,6 +226,7 @@ def test_survival_probabilities_monotone_cumprod():
 
 def test_sts_calibration_is_order_preserving():
     from atom.spec_decode.dspark_scheduler import calibrate_confidence
+
     c = torch.tensor([[0.6, 0.9, 0.3, 0.95]])
     T = torch.tensor([2.0, 2.0, 2.0, 2.0])
     cal = calibrate_confidence(c, T)
@@ -239,6 +240,7 @@ def test_scheduler_flat_sps_keeps_all_high_confidence():
     # With a FLAT sps (no batch penalty) and high confidence, throughput keeps
     # rising as we admit tokens, so the scheduler verifies the whole block.
     from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths
+
     conf = torch.tensor([[0.99, 0.99, 0.99, 0.99, 0.99]])
     sps = torch.ones(64)  # flat → admitting always raises tau*SPS
     ell = schedule_prefix_lengths(conf, sps, early_stop=True)
@@ -249,6 +251,7 @@ def test_scheduler_prunes_low_confidence_suffix():
     # High prefix, collapsing suffix: cumulative survival of late positions ~0,
     # so admitting them past the SPS penalty stops helping → truncated.
     from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths
+
     conf = torch.tensor([[0.95, 0.9, 0.05, 0.05, 0.05]])
     # Steeply decreasing SPS so each extra verified token costs throughput.
     sps = torch.linspace(1.0, 0.1, steps=16)
@@ -260,6 +263,7 @@ def test_scheduler_heavy_load_shrinks_budget():
     # Same confidence, but a sharper SPS dropoff (heavier load) must verify
     # fewer or equal tokens than a gentle dropoff (load-adaptive behavior).
     from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths
+
     conf = torch.tensor([[0.9, 0.85, 0.8, 0.75, 0.7]])
     gentle = torch.linspace(1.0, 0.9, steps=16)
     sharp = torch.linspace(1.0, 0.2, steps=16)
@@ -272,10 +276,13 @@ def test_scheduler_multi_request_global_topk():
     # Two requests: one confident, one weak. Under a batch penalty the scheduler
     # should give the confident request more verify budget than the weak one.
     from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths
-    conf = torch.tensor([
-        [0.97, 0.95, 0.93, 0.9, 0.88],   # strong
-        [0.4, 0.2, 0.1, 0.05, 0.02],     # weak
-    ])
+
+    conf = torch.tensor(
+        [
+            [0.97, 0.95, 0.93, 0.9, 0.88],  # strong
+            [0.4, 0.2, 0.1, 0.05, 0.02],  # weak
+        ]
+    )
     sps = torch.linspace(1.0, 0.3, steps=32)
     ell = schedule_prefix_lengths(conf, sps, early_stop=True)
     assert ell[0] >= ell[1]
