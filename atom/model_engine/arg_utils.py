@@ -83,6 +83,7 @@ class EngineArgs:
     eplb_rebalance_min_balancedness: float = 0.8
     eplb_rebalance_balancedness_agg: str = "min"
     eplb_p2p_batch_chunk_size: int = 32
+    eplb_placement_policy: str = "naive"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -412,6 +413,14 @@ class EngineArgs:
             help="Extra physical expert slots per MoE layer for EPLB replicas.",
         )
         eplb_group.add_argument(
+            "--eplb-placement-policy",
+            type=str,
+            default="naive",
+            choices=["naive", "biased"],
+            help="How to spend the redundant budget: 'naive' (spread) or "
+            "'biased' (fully replicate top-K hottest experts to all GPUs).",
+        )
+        eplb_group.add_argument(
             "--eplb-rebalance-min-balancedness",
             type=float,
             default=0.8,
@@ -503,6 +512,7 @@ class EngineArgs:
             rebalance_min_balancedness=kwargs.pop("eplb_rebalance_min_balancedness"),
             rebalance_balancedness_agg=kwargs.pop("eplb_rebalance_balancedness_agg"),
             p2p_batch_chunk_size=kwargs.pop("eplb_p2p_batch_chunk_size"),
+            placement_policy=kwargs.pop("eplb_placement_policy"),
         )
 
         logger.info(f"Engine kwargs: {kwargs}")

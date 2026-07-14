@@ -1108,6 +1108,11 @@ class EPLBConfig:
     rebalance_min_balancedness: float = 0.8
     rebalance_balancedness_agg: str = "min"
     p2p_batch_chunk_size: int = 32
+    # Placement policy for spending the redundant-expert budget:
+    #   "naive"  -> greedy replicate + balanced_packing (spread thinly)
+    #   "biased" -> fully replicate top-K hottest experts to all GPUs
+    #               (K = num_redundant // num_gpus, per-node in multi-node)
+    placement_policy: str = "naive"
 
     def __post_init__(self):
         self.load_window_size = int(self.load_window_size)
@@ -1135,6 +1140,11 @@ class EPLBConfig:
         }, "eplb.rebalance_balancedness_agg must be one of {'min','mean'}"
         self.p2p_batch_chunk_size = int(self.p2p_batch_chunk_size)
         assert self.p2p_batch_chunk_size > 0, "eplb.p2p_batch_chunk_size must be > 0"
+        self.placement_policy = str(self.placement_policy).lower().strip()
+        assert self.placement_policy in {
+            "naive",
+            "biased",
+        }, "eplb.placement_policy must be one of {'naive','biased'}"
 
 
 @dataclass
