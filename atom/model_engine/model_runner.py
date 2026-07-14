@@ -31,7 +31,6 @@ from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.eplb import (
     initialize_eplb_runtime,
-    trigger_eplb_profile_rearrange,
     with_eplb_forward_monitor,
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
@@ -852,13 +851,9 @@ class ModelRunner:
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
-        initialize_eplb_runtime(self, strict=True)
+        initialize_eplb_runtime(self)
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
-        # First EPLB rearrange while the GPU is idle (post-warmup, pre-serving),
-        # mirroring vllm's profile rearrange, so it never collides with a live
-        # warmup traffic burst.
-        trigger_eplb_profile_rearrange()
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)

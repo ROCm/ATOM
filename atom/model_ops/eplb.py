@@ -190,7 +190,9 @@ def _placement_biased(
     force_n = (num_physical - num_logical) // num_gpus
     if force_n <= 0:
         return _placement_naive(weight_l, num_physical, num_gpus)
-    assert 0 < force_n <= phy_per_gpu, f"force_n={force_n} must be in (0, {phy_per_gpu}]"
+    assert (
+        0 < force_n <= phy_per_gpu
+    ), f"force_n={force_n} must be in (0, {phy_per_gpu}]"
     w = weight_l.to(torch.float32).cpu().tolist()
     order = sorted(range(num_logical), key=lambda e: (-w[e], e))
     hot = order[:force_n]
@@ -200,7 +202,9 @@ def _placement_biased(
     cnt = [0] * num_logical
     for e in hot:
         cnt[e] = num_gpus
-    cold_slots_total = num_physical - force_n * num_gpus  # = num_gpus*(phy_per_gpu-force_n)
+    cold_slots_total = (
+        num_physical - force_n * num_gpus
+    )  # = num_gpus*(phy_per_gpu-force_n)
     assert cold_slots_total >= len(cold), (
         f"not enough slots for cold experts: {cold_slots_total} < {len(cold)} "
         f"(reduce force_n or raise num_redundant)"
@@ -730,14 +734,15 @@ def _assign_sender_for_receiver(
     n_send = len(ranks_to_send)
     n_recv = len(ranks_to_recv)
     base = n_recv // n_send
-    rem = n_recv % n_send
     recv_pos = ranks_to_recv.index(recv_rank)
     if base > 0:
+        # Block-assign the first base*n_send receivers (base each), then hand the
+        # remaining receivers to senders 0, 1, ... one apiece (max-min <= 1).
         cut = base * n_send
         if recv_pos < cut:
             return ranks_to_send[recv_pos // base]
         return ranks_to_send[recv_pos - cut]
-    # n_recv < n_send: first `rem` senders each serves one receiver.
+    # n_recv < n_send: each receiver takes a distinct sender.
     return ranks_to_send[recv_pos]
 
 
@@ -977,7 +982,6 @@ def _plan_single_layer_migration(
                 )
             )
 
-    _ = num_gpu_per_node  # reserved for future same-node/cross-node policy tuning
     return buffer_copy_plan, local_copy_actions, send_actions, recv_actions
 
 
@@ -1113,7 +1117,6 @@ def move_from_buffer(
     expert_weights: list[torch.Tensor],
     cuda_stream: Optional[torch.cuda.Stream] = None,
 ) -> None:
-    """Module-E step-1: apply temp->weight copies in-place."""
     assert len(temp_buffers) == len(expert_weights)
     if len(temp_buffers) == 0:
         return
@@ -1397,6 +1400,17 @@ class ExpertLoadMonitor:
         return local
 
     def dump_global_logical_load(self) -> Optional[torch.Tensor]:
+        """Fold the observed physical load into per-logical-expert load.
+
+        Single source of truth for the physical -> logical folding: both the
+        rebalance path (``EPLBManager._execute_runtime_rebalance``) and external
+        observers call this. Returns ``None`` when no load has been recorded
+        yet. Before runtime metadata exists it returns the raw physical load as
+        a compatibility fallback (shape ``[layers, physical]``) with a one-time
+        warning. The physical/live-placement shapes are fixed at startup and can
+        only agree, so a mismatch is asserted (not pad/truncated) to surface any
+        future divergence instead of silently corrupting the statistics.
+        """
         physical = self.dump_global_physical_load()
         if physical is None:
             return None
@@ -1409,16 +1423,10 @@ class ExpertLoadMonitor:
                     "available; returning physical load as a compatibility fallback"
                 )
             return physical
-        if physical.shape != meta.physical_to_logical_map.shape:
-            target = torch.zeros(
-                meta.physical_to_logical_map.shape,
-                dtype=physical.dtype,
-                device=physical.device,
-            )
-            layers = min(target.shape[0], physical.shape[0])
-            physical_slots = min(target.shape[1], physical.shape[1])
-            target[:layers, :physical_slots].copy_(physical[:layers, :physical_slots])
-            physical = target
+        assert tuple(physical.shape) == tuple(meta.physical_to_logical_map.shape), (
+            f"EPLB physical_load shape {tuple(physical.shape)} != live placement "
+            f"shape {tuple(meta.physical_to_logical_map.shape)}"
+        )
         return physical_load_to_logical_load(
             physical,
             meta.physical_to_logical_map,
@@ -1481,7 +1489,6 @@ class EPLBManager:
         self._gen = self._entrypoint()
         self._rebalance_count = 0
         self._last_balancedness: Optional[float] = None
-        self._runtime_owner: Optional[Any] = None
         self.live_metadata: Optional[ExpertLocationMetadata] = None
         self._moe_layers: dict[int, Any] = {}
         self._expert_weights_of_layer: dict[int, list[torch.Tensor]] = {}
@@ -1492,31 +1499,27 @@ class EPLBManager:
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
         self._p2p_batch_chunk_size: int = 32
-        self._logged_runtime_owner_without_model: bool = False
-        self._logged_no_moe_layers: bool = False
-        self._logged_missing_ep_group: bool = False
 
-    def bind_runtime_owner(self, owner: Any, *, strict: bool = False) -> bool:
-        """Bind upper-layer runtime owner used by default rebalance execution."""
-        self._runtime_owner = owner
-        return self._maybe_initialize_runtime(owner, strict=strict)
+    def bind_runtime_owner(self, owner: Any) -> None:
+        """Scan the owner's model for EP MoE layers and build runtime metadata.
 
-    def _maybe_initialize_runtime(self, owner: Any, *, strict: bool = False) -> bool:
+        Idempotent: once ``live_metadata`` is built the call is a no-op, so it is
+        safe to invoke once at model-runner init. Fail-loud on misconfiguration
+        (missing model / EP MoE layers / EP group) — EPLB is only reached when
+        explicitly enabled, so a broken wiring should crash at startup rather
+        than silently no-op through the whole run.
+        """
+        self._maybe_initialize_runtime(owner)
+
+    def _maybe_initialize_runtime(self, owner: Any) -> None:
         if self.live_metadata is not None:
-            return True
+            return
         model = getattr(owner, "model", None)
         if model is None or not hasattr(model, "modules"):
-            if strict:
-                raise RuntimeError(
-                    "EPLB is enabled but the runtime owner has no model.modules(); "
-                    "cannot initialize manager-owned ExpertLocationMetadata"
-                )
-            if not self._logged_runtime_owner_without_model:
-                self._logged_runtime_owner_without_model = True
-                logger.warning(
-                    "EPLB runtime owner has no model.modules(); manager metadata is not initialized"
-                )
-            return False
+            raise RuntimeError(
+                "EPLB is enabled but the runtime owner has no model.modules(); "
+                "cannot initialize manager-owned ExpertLocationMetadata"
+            )
 
         layers: dict[int, Any] = {}
         for module in model.modules():
@@ -1529,18 +1532,10 @@ class EPLBManager:
                 continue
             layers[layer_id] = module
         if not layers:
-            if strict:
-                raise RuntimeError(
-                    "EPLB is enabled but no EP MoE layers with expert weights "
-                    "were found; check enable_expert_parallel and model wiring"
-                )
-            if not self._logged_no_moe_layers:
-                self._logged_no_moe_layers = True
-                logger.warning(
-                    "EPLB runtime initialization found no EP MoE layers; "
-                    "manager metadata is not initialized"
-                )
-            return False
+            raise RuntimeError(
+                "EPLB is enabled but no EP MoE layers with expert weights "
+                "were found; check enable_expert_parallel and model wiring"
+            )
 
         first_layer = layers[min(layers)]
         num_logical = int(
@@ -1595,6 +1590,9 @@ class EPLBManager:
         self._reusable_temp_buffers = [
             torch.empty_like(w) for w in self._expert_weights_of_layer[first_id]
         ]
+        # Guard the trivial placement against the checkpoint loader BEFORE
+        # _bind_layer_expert_maps overwrites layer.expert_map with our copy.
+        self._assert_placement_matches_loaded()
         self._bind_layer_expert_maps()
 
         try:
@@ -1605,18 +1603,10 @@ class EPLBManager:
             self._ep_group = ep.device_group
             self._ep_rank = int(ep.rank_in_group)
         except Exception as exc:
-            self._ep_group = None
-            self._ep_rank = ep_rank
-            if not self._logged_missing_ep_group:
-                self._logged_missing_ep_group = True
-                logger.warning(
-                    "EPLB EP process group is unavailable; runtime rebalance will be skipped"
-                )
-            if strict:
-                raise RuntimeError(
-                    "EPLB is enabled but EP process group is unavailable; "
-                    "manager-owned runtime metadata cannot safely rebalance"
-                ) from exc
+            raise RuntimeError(
+                "EPLB is enabled but EP process group is unavailable; "
+                "manager-owned runtime metadata cannot safely rebalance"
+            ) from exc
 
         try:
             from atom.config import get_current_atom_config
@@ -1640,7 +1630,10 @@ class EPLBManager:
             ep_rank,
         )
         self.monitor.initialize_for_metadata(self.live_metadata)
-        return True
+        # Initialize redundant physical slots the checkpoint loader left empty.
+        # At init the weights are loaded, the EP group is up, and no forward has
+        # run yet -- an idle window for the one-time trivial copy.
+        self.fill_redundant()
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
@@ -1733,15 +1726,101 @@ class EPLBManager:
         if getattr(layer, "expert_mask", None) is not None:
             layer.expert_mask.copy_((layer.expert_map > -1).to(torch.int32))
 
-    def _run_bound_rebalance(
-        self, cuda_stream: Optional[torch.cuda.Stream]
-    ) -> Optional[Any]:
-        """Manager-owned rebalance dispatch for C/D/E execution."""
-        if self._runtime_owner is not None:
-            run_rebalance = getattr(self._runtime_owner, "run_eplb_rebalance", None)
-            if callable(run_rebalance):
-                return run_rebalance(cuda_stream)
-        return None
+    def _assert_placement_matches_loaded(self) -> None:
+        """Sanity-check the trivial placement against the checkpoint loader.
+
+        `from_trivial` declares the initial physical->logical placement and
+        derives expert_map independently; the model loader (determine_expert_map +
+        weight_loader) established its own. They MUST agree, else migration and
+        dispatch operate on a wrong picture. Both are layer-invariant, so checking
+        one representative MoE layer suffices. Assert instead of trusting blindly:
+          - base p2l is identity (loader convention: logical e -> physical slot e);
+          - our expert_map equals the loader's layer.expert_map.
+        """
+        assert self.live_metadata is not None
+        m = self.live_metadata
+        num_logical = m.num_logical_experts
+        num_physical = m.num_physical_experts
+        layer_id = min(self._moe_layers)
+        base = m.physical_to_logical_map[layer_id, :num_logical]
+        expected = torch.arange(num_logical, dtype=base.dtype, device=base.device)
+        assert torch.equal(base, expected), (
+            "EPLB initial placement base p2l is not identity; incompatible with "
+            "the checkpoint loader (logical e must load into physical slot e)"
+        )
+        loaded = getattr(self._moe_layers[layer_id], "expert_map", None)
+        if isinstance(loaded, torch.Tensor):
+            ours = m.expert_map[layer_id].to(loaded.device)
+            assert torch.equal(ours, loaded[:num_physical]), (
+                "EPLB expert_map disagrees with the loader's determine_expert_map; "
+                "per-rank physical->local ownership mismatch"
+            )
+
+    def _base_only_metadata(self) -> "ExpertLocationMetadata":
+        """Copy of the live placement with redundant slots emptied (-1).
+
+        Used as the `old` side of fill_redundant's migration: its only diff vs
+        the live (trivial) placement is the redundant slots, so migrating old->new
+        copies each logical expert into its redundant replicas.
+        """
+        assert self.live_metadata is not None
+        m = self.live_metadata
+        num_layers = m.num_layers
+        num_logical = m.num_logical_experts
+        num_physical = m.num_physical_experts
+        dev = m.physical_to_logical_map.device
+        ident = torch.arange(num_logical, dtype=torch.int32, device=dev)
+        p2l = torch.full((num_layers, num_physical), -1, dtype=torch.int32, device=dev)
+        p2l[:, :num_logical] = ident.unsqueeze(0).expand(num_layers, -1)
+        logcnt = torch.ones((num_layers, num_logical), dtype=torch.int32, device=dev)
+        l2p = torch.full((num_layers, num_logical, 1), -1, dtype=torch.int32, device=dev)
+        l2p[:, :, 0] = ident.unsqueeze(0).expand(num_layers, -1)
+        return ExpertLocationMetadata.from_rebalance_result(
+            physical_to_logical_map=p2l,
+            logical_to_physical_map=l2p,
+            logical_replica_count=logcnt,
+            ep_size=m.ep_size,
+            ep_rank=m.ep_rank,
+            max_num_replicas=1,
+        )
+
+    def fill_redundant(self) -> None:
+        """One-time init copy of each logical expert into its redundant physical
+        replica slots.
+
+        The checkpoint loader only fills base slots (physical id < num_logical);
+        the redundant slots declared by `from_trivial` are uninitialized after
+        load, so dispatch to them before the first rebalance would read garbage.
+        This makes the loaded weights match the trivial placement by reusing the
+        migrate+commit path (old = base-only, new = live) -- a plain P2P copy from
+        the base holders. No-op when there are no redundant experts.
+        """
+        assert self.live_metadata is not None
+        if self._ep_group is None or not self._moe_layers:
+            return
+        m = self.live_metadata
+        if m.num_physical_experts <= m.num_logical_experts:
+            return  # no redundant slots to fill
+        layer_ids = sorted(self._moe_layers)
+        migrate_and_commit_chunk(
+            layer_ids=layer_ids,
+            old_meta=self._base_only_metadata(),
+            new_meta=m,
+            expert_weights_of_layer=self._expert_weights_of_layer,
+            temp_buffers=self._reusable_temp_buffers,
+            ep_group=self._ep_group,
+            nnodes=self._nnodes,
+            rank=self._ep_rank,
+            live_meta=m,
+            p2p_batch_chunk_size=self._p2p_batch_chunk_size,
+            cuda_stream=None,
+        )
+        logger.info(
+            "EPLB fill_redundant: initialized %d redundant slots/layer across "
+            "%d layers",
+            m.num_physical_experts - m.num_logical_experts,
+            len(layer_ids),
+        )
 
     @property
     def rebalance_count(self) -> int:
@@ -1773,9 +1852,8 @@ class EPLBManager:
         # vllm-style warm start: the first LIVE rebalance fires after a quarter
         # of the interval (equivalent to vllm initializing its rearrangement
         # step counter to 3/4 of the interval), so balancing on real traffic
-        # kicks in early. The pre-serving profile rearrange
-        # (trigger_eplb_profile_rearrange) already reserved buffers and did the
-        # initial placement on idle GPU; this is the first real-load rebalance.
+        # kicks in early. Initial placement stays trivial (round-robin) until
+        # this first real-load rebalance
         first_window = max(1, self.rebalance_interval // 4)
         for _ in range(first_window):
             yield
@@ -1803,37 +1881,20 @@ class EPLBManager:
         yield from self._execute_rebalance()
 
     def _execute_rebalance(self):
-        """Generator: the actual rebalance work, chunked across forwards.
+        """Generator: run one rebalance (rearrange + chunked migrate/commit),
+        yielding between chunks so a forward pass can run in between.
 
-        For the integrated path, runtime owner should implement:
-            plans = migrate_experts_chunk(...)
-            commit_experts_chunk(..., plans=plans)
-        with the same cuda stream and eager window.
+        Migration runs on the default/current stream (aligned with SGLang &
+        vllm). A dedicated stream would run the P2P + weight copies CONCURRENTLY
+        with the just-submitted (but not yet GPU-complete) forward pass on the
+        default stream, overwriting expert weights mid-read → HSA hardware
+        exception. Same-stream ordering makes migration naturally queue after
+        the last forward pass's kernels, no synchronize needed.
         """
         self._rebalance_count += 1
-        # Run migration on the default/current stream (aligned with SGLang &
-        # vllm). A dedicated stream would run the P2P + weight copies CONCURRENTLY
-        # with the just-submitted (but not yet GPU-complete) forward pass on the
-        # default stream, overwriting expert weights mid-read → HSA hardware
-        # exception. Same-stream ordering makes migration naturally queue after
-        # the last forward pass's kernels, no synchronize needed.
-        cuda_stream = None
-        if self.live_metadata is not None and self._moe_layers:
-            yield from self._execute_runtime_rebalance(cuda_stream)
-        else:
-            work = self._run_bound_rebalance(cuda_stream)
-            # Backward-compatible test/debug hook when no model runtime exists.
-            if work is not None and hasattr(work, "__next__"):
-                yield from work
-        if cuda_stream is not None:
-            # Preserve eager-window atomicity: subsequent forward work must
-            # observe all migration/commit effects from this rebalance.
-            torch.cuda.current_stream().wait_stream(cuda_stream)
-        # Keep this a generator even if owner path is one-shot.
-        if False:  # pragma: no cover
-            yield
+        yield from self._execute_runtime_rebalance()
 
-    def _execute_runtime_rebalance(self, cuda_stream: Optional[torch.cuda.Stream]):
+    def _execute_runtime_rebalance(self):
         import time as _time
 
         assert self.live_metadata is not None
@@ -1841,15 +1902,9 @@ class EPLBManager:
             logger.warning("EPLB rebalance skipped: EP process group is unavailable")
             return
 
-        physical_load = self.monitor.dump_global_physical_load()
-        if physical_load is None:
+        logical_load = self.monitor.dump_global_logical_load()
+        if logical_load is None:
             return
-        physical_load = self._align_physical_load(physical_load)
-        logical_load = physical_load_to_logical_load(
-            physical_load,
-            self.live_metadata.physical_to_logical_map,
-            self.live_metadata.num_logical_experts,
-        )
 
         first_layer = self._moe_layers[min(self._moe_layers)]
         num_groups = int(getattr(first_layer, "num_expert_group", None) or 1)
@@ -1882,30 +1937,6 @@ class EPLBManager:
         num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
         _t_rearrange_ms = (_time.perf_counter() - _t0) * 1000.0
 
-        # TEMP DEBUG: quantify how much traffic actually flows to replicated
-        # (num_redundant>0) logical experts -- this bounds the ceiling of any
-        # locality-first dispatch benefit, since non-replicated experts have
-        # no dispatch choice at all. Remove after investigation.
-        if _ep_rank == 0:
-            try:
-                _ll_cpu = logical_load.detach().to("cpu", torch.float32)
-                _logcnt_cpu = logcnt.detach().to("cpu")
-                _redundant_mask = _logcnt_cpu > 1
-                _total = float(_ll_cpu.sum().item())
-                _redundant_traffic = float(_ll_cpu[_redundant_mask].sum().item())
-                _num_redundant_experts = int(_redundant_mask.sum().item())
-                _frac = _redundant_traffic / _total if _total > 0 else 0.0
-                logger.info(
-                    "EPLB DEBUG rebalance #%d: num_replicated_logical_experts=%d/%d "
-                    "(%.1f avg per layer), traffic_to_replicated=%.4f of total",
-                    _rc,
-                    _num_redundant_experts,
-                    _logcnt_cpu.numel(),
-                    _num_redundant_experts / _logcnt_cpu.shape[0],
-                    _frac,
-                )
-            except Exception as _e:  # pragma: no cover - diagnostic only
-                logger.warning("EPLB DEBUG traffic-share calc failed: %s", _e)
         logger.info(
             "EPLB rebalance #%d ep_rank=%d: rearrange=%.1fms; migrating %d layers "
             "in %d chunks (size=%d)",
@@ -1917,39 +1948,7 @@ class EPLBManager:
             chunk_size,
         )
 
-        # Diagnostic: relocation's benefit is per-GPU total-load balance (not per-
-        # expert). per-GPU balancedness = per-layer (mean/max over ranks), mean over
-        # layers -- the textbook metric.
-        #
-        # `realized`: the LIVE placement (installed at the *previous* rebalance)
-        # scored on THIS window's actual traffic. This is what EPLB truly achieved
-        # on real load, and is directly comparable to vllm's per-window balancedness.
-        try:
-            _ep = int(self.live_metadata.ep_size)
-            _ll = logical_load.detach().to("cpu", torch.float32)
-
-            def _pergpu_bal(_p2l_map: torch.Tensor) -> float:
-                _pm = _p2l_map.detach().to("cpu")
-                _safe = _pm.clamp(min=0).to(torch.int64)
-                _slot = torch.gather(_ll, 1, _safe)
-                _slot = torch.where(_pm >= 0, _slot, torch.zeros_like(_slot))
-                _Ln, _P = _pm.shape
-                _perg = _slot.view(_Ln, _ep, _P // _ep).sum(dim=2)
-                _mx = _perg.max(dim=1).values
-                _mn = _perg.mean(dim=1)
-                _b = torch.where(_mx > 0, _mn / _mx, torch.ones_like(_mn))
-                return float(_b.mean().item())
-
-            _realized_b = _pergpu_bal(self.live_metadata.physical_to_logical_map)
-            logger.info(
-                "EPLB rebalance #%d ep_rank=%d per-GPU balancedness: "
-                "realized(live placement, this window)=%.3f",
-                _rc,
-                _ep_rank,
-                _realized_b,
-            )
-        except Exception as _e:  # pragma: no cover - diagnostic only
-            logger.warning("EPLB per-GPU balancedness diag failed: %s", _e)
+        self._log_rebalance_metrics(rc=_rc, logical_load=logical_load, logcnt=logcnt)
 
         for start in range(0, len(layer_ids), chunk_size):
             chunk = layer_ids[start : start + chunk_size]
@@ -1972,11 +1971,9 @@ class EPLBManager:
                     rank=self._ep_rank,
                     live_meta=self.live_metadata,
                     p2p_batch_chunk_size=self._p2p_batch_chunk_size,
-                    cuda_stream=cuda_stream,
+                    cuda_stream=None,
                 )
                 self._refresh_layer_expert_map(layer_id)
-            if cuda_stream is not None:
-                torch.cuda.current_stream().wait_stream(cuda_stream)
             _chunk_ms = (_time.perf_counter() - _tc) * 1000.0
             logger.info(
                 "EPLB rebalance #%d ep_rank=%d chunk %d/%d layers=%s migrate=%.1fms",
@@ -1988,20 +1985,62 @@ class EPLBManager:
                 _chunk_ms,
             )
 
-    def _align_physical_load(self, physical_load: torch.Tensor) -> torch.Tensor:
+    def _log_rebalance_metrics(
+        self, *, rc: int, logical_load: torch.Tensor, logcnt: torch.Tensor
+    ) -> None:
+        """Log per-rebalance tuning metrics (ep_rank 0 only; both are identical
+        across ranks). Two signals for sizing num_redundant / choosing placement
+        policy:
+          - traffic_to_replicated: fraction of load hitting replicated (logcnt>1)
+            experts. The CEILING of any locality-first dispatch benefit, since
+            non-replicated experts have a single slot and no dispatch choice.
+          - realized: the LIVE placement (installed at the *previous* rebalance)
+            scored on THIS window's traffic = per-GPU balancedness, i.e. per-layer
+            mean/max total load over ranks, averaged over layers; comparable to
+            vllm's per-window metric.
+
+        Diagnostic only: never raises into the rebalance path.
+        """
         assert self.live_metadata is not None
-        target = torch.zeros(
-            (
-                self.live_metadata.num_layers,
-                self.live_metadata.num_physical_experts,
-            ),
-            dtype=physical_load.dtype,
-            device=physical_load.device,
-        )
-        layers = min(target.shape[0], physical_load.shape[0])
-        physical = min(target.shape[1], physical_load.shape[1])
-        target[:layers, :physical].copy_(physical_load[:layers, :physical])
-        return target
+        if self.live_metadata.ep_rank != 0:
+            return
+        try:
+            ll = logical_load.detach().to("cpu", torch.float32)
+            logcnt_cpu = logcnt.detach().to("cpu")
+            redundant_mask = logcnt_cpu > 1
+            total = float(ll.sum().item())
+            frac = (
+                float(ll[redundant_mask].sum().item()) / total if total > 0 else 0.0
+            )
+            num_redundant = int(redundant_mask.sum().item())
+
+            ep = int(self.live_metadata.ep_size)
+
+            def _pergpu_bal(p2l_map: torch.Tensor) -> float:
+                pm = p2l_map.detach().to("cpu")
+                safe = pm.clamp(min=0).to(torch.int64)
+                slot = torch.gather(ll, 1, safe)
+                slot = torch.where(pm >= 0, slot, torch.zeros_like(slot))
+                num_l, num_p = pm.shape
+                perg = slot.view(num_l, ep, num_p // ep).sum(dim=2)
+                mx = perg.max(dim=1).values
+                mn = perg.mean(dim=1)
+                b = torch.where(mx > 0, mn / mx, torch.ones_like(mn))
+                return float(b.mean().item())
+
+            realized = _pergpu_bal(self.live_metadata.physical_to_logical_map)
+            logger.info(
+                "EPLB rebalance #%d metrics: replicated_experts=%d/%d "
+                "(%.1f/layer), traffic_to_replicated=%.4f, realized=%.3f",
+                rc,
+                num_redundant,
+                logcnt_cpu.numel(),
+                num_redundant / logcnt_cpu.shape[0],
+                frac,
+                realized,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            logger.warning("EPLB rebalance #%d metrics calc failed: %s", rc, exc)
 
     def _need_rebalance(self, physical_load: torch.Tensor) -> bool:
         balancedness = self._compute_balancedness_and_update(physical_load)
@@ -2088,25 +2127,27 @@ def _get_configured_eplb_manager() -> Optional[EPLBManager]:
     )
 
 
-def initialize_eplb_runtime(
-    owner: Any, *, strict: bool = True
-) -> Optional[EPLBManager]:
-    """Initialize manager-owned EPLB runtime state before warmup/capture."""
+def initialize_eplb_runtime(owner: Any) -> Optional[EPLBManager]:
+    """Initialize manager-owned EPLB runtime state before warmup/capture.
+
+    Returns None when EPLB is disabled. When enabled, binds the runtime owner
+    and builds ExpertLocationMetadata fail-loud: a misconfiguration (no EP MoE
+    layers / no EP group) raises here at startup rather than silently no-op'ing.
+    """
     manager = _get_configured_eplb_manager()
     if manager is None:
         return None
-    manager.bind_runtime_owner(owner, strict=strict)
+    manager.bind_runtime_owner(owner)
     return manager
 
 
 def trigger_eplb_profile_rearrange() -> None:
-    """Run the first expert rearrange once, before serving live traffic.
+    """Force one full rebalance (migrate + commit) immediately, off the periodic
+    schedule and ignoring the balancedness gate.
 
-    Called after model warmup / cudagraph capture while the GPU is idle, so the
-    migration's default-stream GPU syncs don't have to drain a live forward
-    backlog. This mirrors vllm's pre-serving profile rearrange and prevents the
-    first rebalance from colliding with a warmup traffic burst (which otherwise
-    inflates migration from ~1.6s to tens of seconds and can deadlock).
+    NOTE: This is NOT wired into the serving path anymore (see model_runner).
+    Kept for manual/debug use only; real load-aware
+    balancing happens at the first live rebalance (interval/4 forwards in).
     """
     manager = _get_configured_eplb_manager()
     if manager is None:
@@ -2117,8 +2158,9 @@ def trigger_eplb_profile_rearrange() -> None:
 def with_eplb_forward_monitor(fn):
     # Resolve once on the first call: if EPLB is disabled at that point the
     # inner function is replaced with a direct pass-through so subsequent calls
-    # pay no overhead. _MANAGER is set by initialize_eplb_runtime() during
-    # model runner init, which always precedes the first forward pass.
+    # pay no overhead. _MANAGER and its live_metadata are set by
+    # initialize_eplb_runtime() during model runner init, which always precedes
+    # the first forward pass, so the hot path never re-binds the owner.
     resolved_manager: list[EPLBManager | None] = []
 
     @wraps(fn)
@@ -2126,9 +2168,10 @@ def with_eplb_forward_monitor(fn):
         if not resolved_manager:
             resolved_manager.append(_MANAGER)
         manager = resolved_manager[0]
-        if manager is None:
+        # Pass through when EPLB is off, or defensively if init never bound
+        # metadata (should not happen — init is fail-loud).
+        if manager is None or manager.live_metadata is None:
             return fn(self, batch, *args, **kwargs)
-        manager.bind_runtime_owner(self, strict=False)
         monitor = manager.monitor
         monitor.on_forward_start()
         try:
