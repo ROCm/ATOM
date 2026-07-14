@@ -65,9 +65,65 @@ class MoRIIOAgentMetadata(
     attn_backend_name: str = "aiter"
 
 
+class MoRIIOWriteRegion(
+    msgspec.Struct,
+    omit_defaults=True,
+    dict=True,
+    kw_only=True,
+):
+    """One unit-addressed RDMA region advertised for write-mode transfer."""
+
+    kind: str
+    chunks: list[bytes]
+    unit_bytes: int
+    units_per_chunk: int
+    total_units: int
+
+
+class MoRIIOWriteRequest(
+    msgspec.Struct,
+    omit_defaults=True,
+    dict=True,
+    kw_only=True,
+):
+    """Consumer-to-producer write-mode transfer request."""
+
+    decode_req_id: str | int
+    transfer_id: str | int
+    consumer_engine_desc: bytes
+    consumer_regions: list[MoRIIOWriteRegion]
+    dst_block_ids: list[int]
+    dst_slot_index: int = -1
+    dst_staging_pool_idx: int = -1
+    notify_host: str
+    notify_port: int
+    consumer_tp_size: int
+    consumer_dp_rank: int = 0
+
+
+class MoRIIOWriteDone(
+    msgspec.Struct,
+    omit_defaults=True,
+    dict=True,
+    kw_only=True,
+):
+    """Producer-to-consumer write-mode completion notification."""
+
+    decode_req_id: str | int
+    status: str
+    reason: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Enums & role management
 # ---------------------------------------------------------------------------
+
+
+class TransferMode(str, Enum):
+    """MoRIIO transfer direction."""
+
+    READ_PULL = "read"
+    WRITE_PUSH = "write"
 
 
 class Role(Enum):
@@ -159,6 +215,8 @@ class MoRIIOConstants:
     # ZMQ handshake message types
     GET_META_MSG = b"get_meta_msg"
     POP_DONE_RECV = b"pop_done_recv"
+    WRITE_REQUEST = b"write_request"
+    WRITE_DONE = b"write_done"
     OVER = b"OVER"
     COMPLETION_PREFIX = "cmpl"
 

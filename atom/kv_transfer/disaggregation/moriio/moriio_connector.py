@@ -11,10 +11,13 @@ KV cache migration between producer (prefill) and consumer (decode) nodes.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
-from collections import defaultdict
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -31,7 +34,12 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.moriio.moriio_common import (
     MoRIIOAgentMetadata,
     MoRIIOConstants,
+    MoRIIOWriteDone,
+    MoRIIOWriteRegion,
+    MoRIIOWriteRequest,
+    TransferMode,
     _MORIIO_AVAILABLE,
+    MAX_RDMA_CHUNK_BYTES,
     get_port_offset,
 )
 from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
@@ -39,6 +47,9 @@ from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     EngineId,
+    KVConnectorOutput,
+    KVTransferRegion,
+    KVTransferTensors,
     ReqId,
     ReqMeta,
     TransferId,
@@ -55,13 +66,21 @@ from aiter.dist.parallel_state import get_dp_group, get_tp_group
 if _MORIIO_AVAILABLE:
     from mori.io import (
         BackendType,
+        EngineDesc,
         IOEngine,
         IOEngineConfig,
         PollCqMode,
         RdmaBackendConfig,
+        StatusCode,
     )
 
 logger = logging.getLogger("atom")
+
+
+@dataclass(frozen=True)
+class _WriteTask:
+    request: MoRIIOWriteRequest
+    remote_engine_key: str
 
 
 # ===================================================================
@@ -94,6 +113,9 @@ class MoRIIOConnector(KVConnectorBase):
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
+        self.transfer_mode = TransferMode(
+            kv_transfer_config.get("transfer_mode", TransferMode.WRITE_PUSH.value)
+        )
         self.http_port = kv_transfer_config.get("http_port", 8000)
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.base_handshake_port = kv_transfer_config.get(
@@ -103,7 +125,7 @@ class MoRIIOConnector(KVConnectorBase):
         # Compute unique side-channel port for this (dp, tp) rank
         handshake_port = self.base_handshake_port
         self.side_channel_port = handshake_port + get_port_offset(
-            self.dp_rank, self.tp_rank
+            self.dp_rank, self.tp_rank, self.tp_size
         )
         self.engine_id = f"{self.local_ip}:{handshake_port}"
 
@@ -115,8 +137,13 @@ class MoRIIOConnector(KVConnectorBase):
         self.kv_caches_base_addr: dict[EngineId, list[int]] = {}
 
         # RDMA engine and wrapper
+        kv_role = "producer" if self.is_producer else "consumer"
+        self.moriio_engine_key = (
+            f"atom-{kv_role}-dp{self.dp_rank}-tp{self.tp_rank}-"
+            f"pid{os.getpid()}-{self.local_ip}-{uuid.uuid4().hex[:8]}"
+        )
         self.moriio_engine = IOEngine(
-            f"atom:ip:{self.local_ip}+tp:{self.tp_rank}+dp:{self.dp_rank}",
+            self.moriio_engine_key,
             IOEngineConfig(host=str(self.local_ip), port=0),
         )
         self.moriio_wrapper = MoRIIOWrapper(moriio_engine=self.moriio_engine)
@@ -124,8 +151,32 @@ class MoRIIOConnector(KVConnectorBase):
         qp_per_transfer = kv_transfer_config.get("qp_per_transfer", 4)
         post_batch_size = kv_transfer_config.get("post_batch_size", -1)
         num_worker_threads = kv_transfer_config.get("num_worker_threads", 4)
+        write_transfer_workers = kv_transfer_config.get(
+            "write_transfer_workers", num_worker_threads
+        )
         poll_mode = PollCqMode.POLLING
         enable_notification = kv_transfer_config.get("enable_notification", False)
+        self._write_prefill_timeout_s = float(
+            kv_transfer_config.get(
+                "write_prefill_timeout", MoRIIOConstants.ABORT_REQUEST_TIMEOUT
+            )
+        )
+        self._write_prefill_orphan_timeout_s = float(
+            kv_transfer_config.get(
+                "write_prefill_orphan_timeout", self._write_prefill_timeout_s
+            )
+        )
+        self._write_recv_timeout_s = float(
+            kv_transfer_config.get(
+                "write_recv_timeout", MoRIIOConstants.ABORT_REQUEST_TIMEOUT
+            )
+        )
+        self._write_transfer_timeout_ms = int(
+            kv_transfer_config.get(
+                "write_transfer_timeout_ms",
+                MoRIIOConstants.ABORT_REQUEST_TIMEOUT * 1000,
+            )
+        )
 
         rdma_cfg = RdmaBackendConfig(
             qp_per_transfer,
@@ -179,10 +230,62 @@ class MoRIIOConnector(KVConnectorBase):
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str]] = {}
 
         # Completed send-side transfers (populated by handshake listener)
-        self.done_sending: set[int] = set()
+        self.done_sending: set[ReqId] = set()
 
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+
+        # Write-mode local region metadata and transfer state.
+        self._write_local_regions: list[MoRIIOWriteRegion] = []
+        self._write_gather_slot = None
+        self._write_scatter_slot = None
+        self._write_has_slot_regions = False
+        self._write_has_staging_region = False
+        self._write_session_cache: dict[tuple[str, int, int, int], Any] = {}
+        self._write_session_lock = threading.Lock()
+        self._write_remote_engine_keys: set[str] = set()
+        self._write_remote_engine_lock = threading.Lock()
+
+        self._completed_prefills: dict[ReqId, dict[str, Any]] = {}
+        self._completed_prefill_deadlines: dict[ReqId, float] = {}
+        self._inflight_write_transfers: set[ReqId] = set()
+        self._completed_prefills_lock = threading.Lock()
+        self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
+        self._terminal_write_transfers: set[ReqId] = set()
+        self._terminal_write_transfer_order: deque[ReqId] = deque()
+
+        self.done_recving: set[ReqId] = set()
+        self.failed_recving: set[ReqId] = set()
+        self._deferred_write_recvs: dict[ReqId, ReqMeta] = {}
+        self._deferred_write_recv_deadlines: dict[ReqId, float] = {}
+        self._pending_write_recv: set[ReqId] = set()
+        self._pending_write_recv_blocks: dict[ReqId, list[int]] = {}
+        self._pending_write_recv_slots: dict[ReqId, tuple[int, int]] = {}
+        self._pending_write_recv_deadlines: dict[ReqId, float] = {}
+        self._blocks_pending_fence: list[int] = []
+        self._fence_lock = threading.Lock()
+
+        self._staging_free: list[int] = []
+        self._staging_cv = threading.Condition(threading.Lock())
+
+        self._write_request_sockets: dict[str, zmq.Socket] = {}
+        self._write_request_sockets_lock = threading.Lock()
+        self._write_notify_queue: queue.Queue[tuple[str, int, MoRIIOWriteDone]] = (
+            queue.Queue()
+        )
+        self._write_notify_thread: threading.Thread | None = None
+        self._write_executor: ThreadPoolExecutor | None = None
+        if self.transfer_mode == TransferMode.WRITE_PUSH and self.is_producer:
+            self._write_executor = ThreadPoolExecutor(
+                max_workers=max(1, int(write_transfer_workers)),
+                thread_name_prefix="atom-moriio-write-worker",
+            )
+            self._write_notify_thread = threading.Thread(
+                target=self._write_notify_loop,
+                daemon=True,
+                name="moriio-write-notify",
+            )
+            self._write_notify_thread.start()
 
     def register_kv_caches(
         self,
@@ -203,6 +306,25 @@ class MoRIIOConnector(KVConnectorBase):
         ``self.num_k_chunks`` marks the K/V boundary.
         """
         self.kv_caches = kv_caches
+
+        if self.transfer_mode == TransferMode.WRITE_PUSH:
+            if transfer_tensors is None:
+                raise RuntimeError(
+                    "MoRIIO transfer_mode='write' requires KVTransferTensors from "
+                    "the attention backend."
+                )
+            self._register_write_regions(transfer_tensors)
+            metadata = MoRIIOAgentMetadata(
+                engine_id=self.engine_id,
+                agent_metadata=self.moriio_wrapper.get_agent_metadata(),
+                kv_caches_base_addr=None,
+                num_blocks=self.num_blocks,
+                block_len=self.block_len,
+                attn_backend_name="aiter",
+            )
+            self._start_handshake_listener(metadata, {})
+            return
+
         cache_tensor = None
 
         for layer_name, kv_cache in kv_caches.items():
@@ -271,6 +393,15 @@ class MoRIIOConnector(KVConnectorBase):
             block_len=self.block_len,
             attn_backend_name="aiter",
         )
+        self._start_handshake_listener(
+            metadata, self.layer_name_to_local_kv_cache_metadata
+        )
+
+    def _start_handshake_listener(
+        self,
+        metadata: MoRIIOAgentMetadata,
+        layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]],
+    ) -> None:
         ready_event = threading.Event()
         self._handshake_listener_thread = threading.Thread(
             target=self._handshake_listener,
@@ -280,12 +411,186 @@ class MoRIIOConnector(KVConnectorBase):
                 self.side_channel_port,
                 self.tp_rank,
                 self.dp_rank,
-                self.layer_name_to_local_kv_cache_metadata,
+                layer_name_to_local_kv_cache_metadata,
             ),
             daemon=True,
             name="moriio-handshake-listener",
         )
         self._handshake_listener_thread.start()
+
+    def _current_gpu_device_id(self) -> int:
+        """Return the current CUDA/HIP device id, or -1 when no GPU is active."""
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return int(torch.cuda.current_device())
+        except Exception:
+            logger.debug("Unable to query current GPU device", exc_info=True)
+        return -1
+
+    def _assert_region_on_device(
+        self, region: KVTransferRegion, device_id: int
+    ) -> None:
+        """Best-effort validation that a transfer region belongs to device_id."""
+        if device_id < 0:
+            return
+        try:
+            import torch
+
+            cudart = torch.cuda.cudart()
+            result = cudart.cudaPointerGetAttributes(region.base_addr)
+            attrs = result[1] if isinstance(result, tuple) else result
+            pointer_device = getattr(attrs, "device", None)
+            if pointer_device is not None and int(pointer_device) != device_id:
+                raise AssertionError(
+                    f"KVTransferRegion pointer 0x{region.base_addr:x} is on "
+                    f"device {pointer_device}, expected {device_id}"
+                )
+        except AssertionError:
+            raise
+        except Exception:
+            # Some HIP/PyTorch builds do not expose pointer attributes through
+            # cudart. Registration still uses current_device(); log only to avoid
+            # false negatives on supported deployments.
+            logger.debug(
+                "Could not validate device for KVTransferRegion at 0x%x",
+                region.base_addr,
+                exc_info=True,
+            )
+
+    def _register_write_regions(self, transfer_tensors: Any) -> None:
+        """Register unit-addressed KVTransferTensors for write-mode RDMA."""
+        tt: KVTransferTensors = transfer_tensors
+        device_id = self._current_gpu_device_id()
+
+        self.num_blocks = tt.num_blocks
+        self.block_len = self.kv_cache_block_size
+        self._write_gather_slot = tt.gather_slot
+        self._write_scatter_slot = tt.scatter_slot
+        self._write_has_slot_regions = bool(tt.slot_regions)
+        self._write_has_staging_region = tt.staging_region is not None
+
+        self._write_local_regions = []
+        for region in tt.block_regions:
+            packed = self._pack_write_region("block", region, device_id)
+            if packed is not None:
+                self._write_local_regions.append(packed)
+        for region in tt.slot_regions:
+            packed = self._pack_write_region("slot", region, device_id)
+            if packed is not None:
+                self._write_local_regions.append(packed)
+        if tt.staging_region is not None:
+            packed = self._pack_write_region("staging", tt.staging_region, device_id)
+            if packed is not None:
+                self._write_local_regions.append(packed)
+                self._staging_free = list(range(packed.total_units))
+
+        logger.info(
+            "MoRIIO write-mode registration complete: role=%s, regions=%d "
+            "(block=%d, slot=%d, staging=%s), num_blocks=%d, device=%d",
+            "PRODUCER" if self.is_producer else "CONSUMER",
+            len(self._write_local_regions),
+            len(tt.block_regions),
+            len(tt.slot_regions),
+            tt.staging_region is not None,
+            tt.num_blocks,
+            device_id,
+        )
+
+    def _pack_write_region(
+        self,
+        kind: str,
+        region: KVTransferRegion,
+        device_id: int,
+    ) -> MoRIIOWriteRegion | None:
+        if region.total_bytes == 0:
+            return None
+        if region.unit_bytes <= 0:
+            raise ValueError(
+                f"{kind} region has invalid unit_bytes={region.unit_bytes}"
+            )
+        if region.total_bytes % region.unit_bytes != 0:
+            raise ValueError(
+                f"{kind} region total_bytes={region.total_bytes} is not a "
+                f"multiple of unit_bytes={region.unit_bytes}"
+            )
+        if region.unit_bytes > MAX_RDMA_CHUNK_BYTES:
+            raise ValueError(
+                f"{kind} region unit_bytes={region.unit_bytes} exceeds "
+                f"MAX_RDMA_CHUNK_BYTES={MAX_RDMA_CHUNK_BYTES}"
+            )
+
+        self._assert_region_on_device(region, device_id)
+
+        total_units = region.total_bytes // region.unit_bytes
+        units_per_chunk = max(1, MAX_RDMA_CHUNK_BYTES // region.unit_bytes)
+        chunks: list[bytes] = []
+        for unit_start in range(0, total_units, units_per_chunk):
+            units = min(units_per_chunk, total_units - unit_start)
+            chunk_bytes = units * region.unit_bytes
+            ptr = region.base_addr + unit_start * region.unit_bytes
+            chunks.append(
+                self.moriio_wrapper.register_local_buffer(ptr, chunk_bytes, device_id)
+            )
+
+        return MoRIIOWriteRegion(
+            kind=kind,
+            chunks=chunks,
+            unit_bytes=region.unit_bytes,
+            units_per_chunk=units_per_chunk,
+            total_units=total_units,
+        )
+
+    def _acquire_staging_slot(self) -> int:
+        with self._staging_cv:
+            ready = self._staging_cv.wait_for(
+                lambda: bool(self._staging_free),
+                timeout=self._write_prefill_timeout_s,
+            )
+            if not ready:
+                raise TimeoutError("Timed out waiting for a MoRIIO staging slot")
+            return self._staging_free.pop()
+
+    def _try_acquire_staging_slot(self) -> int | None:
+        with self._staging_cv:
+            if not self._staging_free:
+                return None
+            return self._staging_free.pop()
+
+    def _release_staging_slot(self, idx: int) -> None:
+        if idx < 0:
+            return
+        with self._staging_cv:
+            self._staging_free.append(idx)
+            self._staging_cv.notify()
+
+    def _write_notify_loop(self) -> None:
+        """Single-threaded WRITE_DONE sender; owns all notification sockets."""
+        encoder = msgspec.msgpack.Encoder()
+        sockets: dict[str, zmq.Socket] = {}
+        while True:
+            host, port, done = self._write_notify_queue.get()
+            path = make_zmq_path("tcp", host, port)
+            try:
+                sock = sockets.get(path)
+                if sock is None:
+                    sock = self.zmq_context.socket(zmq.DEALER)
+                    sock.setsockopt(zmq.LINGER, 5000)
+                    sock.setsockopt(zmq.SNDHWM, 0)
+                    sock.connect(path)
+                    sockets[path] = sock
+                payload = encoder.encode(done)
+                sock.send_multipart([MoRIIOConstants.WRITE_DONE, payload])
+            except Exception:
+                logger.exception(
+                    "Failed to send MoRIIO WRITE_DONE for req %s to %s",
+                    done.decode_req_id,
+                    path,
+                )
+                bad_sock = sockets.pop(path, None)
+                if bad_sock is not None:
+                    bad_sock.close(linger=0)
 
     @staticmethod
     def _engine_name_with_dp(engine_name: str, dp_rank: int) -> str:
@@ -300,6 +605,15 @@ class MoRIIOConnector(KVConnectorBase):
         with the remote engine (if first contact) or issues RDMA reads
         immediately.
         """
+        if self.transfer_mode == TransferMode.WRITE_PUSH:
+            if metadata is None:
+                metadata = ConnectorMetadata()
+            self._start_write_mode(metadata)
+            return
+
+        if metadata is None:
+            return
+
         if self.is_producer:
             return
 
@@ -343,6 +657,150 @@ class MoRIIOConnector(KVConnectorBase):
             else:
                 break
 
+    def _start_write_mode(self, metadata: ConnectorMetadata) -> None:
+        self.request_id_to_transfer_id = metadata.request_id_to_transfer_id
+
+        if self.is_producer:
+            for req_id, meta in metadata.reqs_to_save.items():
+                transfer_id: ReqId = (
+                    req_id if meta.transfer_id is None else meta.transfer_id
+                )
+                with self.moriio_wrapper.lock:
+                    if transfer_id in self._terminal_write_transfers:
+                        continue
+                with self._completed_prefills_cv:
+                    self._completed_prefills[transfer_id] = {
+                        "block_ids": list(meta.local_block_ids),
+                        "slot_index": meta.local_slot_index,
+                    }
+                    self._completed_prefill_deadlines[transfer_id] = (
+                        time.monotonic() + self._write_prefill_orphan_timeout_s
+                    )
+                    self._completed_prefills_cv.notify_all()
+                logger.debug(
+                    "MoRIIO write producer cached prefill: transfer_id=%s "
+                    "blocks=%d slot=%d",
+                    transfer_id,
+                    len(meta.local_block_ids),
+                    meta.local_slot_index,
+                )
+            return
+
+        for req_id, meta in metadata.reqs_to_recv.items():
+            if req_id in self._pending_write_recv:
+                continue
+            self._deferred_write_recvs[req_id] = meta
+            self._deferred_write_recv_deadlines.setdefault(
+                req_id, time.monotonic() + self._write_recv_timeout_s
+            )
+
+        self._retry_deferred_write_recvs()
+
+    def _retry_deferred_write_recvs(self) -> None:
+        if not self._deferred_write_recvs:
+            return
+
+        self._sweep_expired_write_recvs()
+        for req_id, meta in list(self._deferred_write_recvs.items()):
+            sent_or_terminal = self._send_write_request_for_req(req_id, meta)
+            if sent_or_terminal:
+                self._deferred_write_recvs.pop(req_id, None)
+                self._deferred_write_recv_deadlines.pop(req_id, None)
+
+    def _send_write_request_for_req(self, req_id: ReqId, meta: ReqMeta) -> bool:
+        if not self._write_local_regions:
+            raise RuntimeError("MoRIIO write mode has no registered local regions")
+
+        with self.moriio_wrapper.lock:
+            if req_id in self._pending_write_recv:
+                return True
+
+        remote_tp_size = int(meta.tp_size or 1)
+        remote_tp_rank = self.tp_rank % remote_tp_size
+        remote_port = int(meta.remote_handshake_port) + get_port_offset(
+            int(meta.remote_dp_rank), remote_tp_rank, remote_tp_size
+        )
+        remote_addr = make_zmq_path("tcp", meta.remote_host, remote_port)
+
+        staging_pool_idx = -1
+        if self._write_has_staging_region and meta.local_slot_index >= 0:
+            staging_pool_idx = self._try_acquire_staging_slot()
+            if staging_pool_idx is None:
+                logger.debug(
+                    "MoRIIO write request deferred: req=%s has no free staging slot",
+                    req_id,
+                )
+                return False
+
+        try:
+            request = MoRIIOWriteRequest(
+                decode_req_id=req_id,
+                transfer_id=req_id if meta.transfer_id is None else meta.transfer_id,
+                consumer_engine_desc=self.moriio_wrapper.get_agent_metadata(),
+                consumer_regions=self._write_local_regions,
+                dst_block_ids=list(meta.local_block_ids),
+                dst_slot_index=meta.local_slot_index,
+                dst_staging_pool_idx=staging_pool_idx,
+                notify_host=self.local_ip,
+                notify_port=self.side_channel_port,
+                consumer_tp_size=self.tp_size,
+                consumer_dp_rank=self.dp_rank,
+            )
+        except Exception:
+            self._release_staging_slot(staging_pool_idx)
+            with self.moriio_wrapper.lock:
+                self.failed_recving.add(req_id)
+            logger.exception("Failed to build MoRIIO WRITE_REQUEST for req %s", req_id)
+            return True
+
+        with self.moriio_wrapper.lock:
+            self._pending_write_recv.add(req_id)
+            self._pending_write_recv_blocks[req_id] = list(meta.local_block_ids)
+            self._pending_write_recv_deadlines[req_id] = (
+                time.monotonic() + self._write_recv_timeout_s
+            )
+            if meta.local_slot_index >= 0:
+                self._pending_write_recv_slots[req_id] = (
+                    meta.local_slot_index,
+                    staging_pool_idx,
+                )
+
+        encoder = msgspec.msgpack.Encoder()
+        try:
+            with self._write_request_sockets_lock:
+                sock = self._write_request_sockets.get(remote_addr)
+                if sock is None:
+                    sock = self.zmq_context.socket(zmq.DEALER)
+                    sock.setsockopt(zmq.LINGER, 5000)
+                    sock.setsockopt(zmq.SNDHWM, 0)
+                    sock.connect(remote_addr)
+                    self._write_request_sockets[remote_addr] = sock
+                sock.send_multipart(
+                    [MoRIIOConstants.WRITE_REQUEST, encoder.encode(request)]
+                )
+        except Exception:
+            logger.exception("Failed to send MoRIIO WRITE_REQUEST to %s", remote_addr)
+            self._handle_write_done(
+                MoRIIOWriteDone(
+                    decode_req_id=req_id,
+                    status="failed",
+                    reason=f"failed to send WRITE_REQUEST to {remote_addr}",
+                )
+            )
+            return True
+
+        logger.info(
+            "MoRIIO write request sent: req=%s transfer_id=%s dst_blocks=%d "
+            "slot=%d staging=%d remote=%s",
+            req_id,
+            request.transfer_id,
+            len(request.dst_block_ids),
+            request.dst_slot_index,
+            request.dst_staging_pool_idx,
+            remote_addr,
+        )
+        return True
+
     def _issue_read_for_req(self, req_id: str, meta: ReqMeta) -> None:
         """Issue RDMA reads for a single request."""
         logger.debug(
@@ -360,6 +818,7 @@ class MoRIIOConnector(KVConnectorBase):
             remote_host=meta.remote_host,
             remote_handshake_port=meta.remote_handshake_port,
             remote_dp_rank=meta.remote_dp_rank,
+            remote_tp_size=meta.tp_size,
         )
 
     def merge_contiguous_blocks(
@@ -541,6 +1000,7 @@ class MoRIIOConnector(KVConnectorBase):
         remote_host: str,
         remote_handshake_port: int,
         remote_dp_rank: int = 0,
+        remote_tp_size: int = 1,
     ) -> None:
         """Issue RDMA reads for all layers of a single request.
 
@@ -589,8 +1049,9 @@ class MoRIIOConnector(KVConnectorBase):
             groups[key][2].append(per_block_bytes)
 
         # Notify port = base handshake port + offset(remote_dp_rank, local_tp_rank)
+        remote_tp_rank = self.tp_rank % int(remote_tp_size or 1)
         notify_port = remote_handshake_port + get_port_offset(
-            remote_dp_rank, self.tp_rank
+            remote_dp_rank, remote_tp_rank, int(remote_tp_size or 1)
         )
 
         layer_names = list(self.layer_name_to_local_kv_cache_metadata.keys())
@@ -642,9 +1103,13 @@ class MoRIIOConnector(KVConnectorBase):
         Handles two message types:
         - ``GET_META_MSG``: Responds with engine + per-layer KV cache metadata.
         - ``POP_DONE_RECV``: Records that the consumer finished reading the request.
+        - ``WRITE_REQUEST``: Enqueues a write-mode transfer task.
+        - ``WRITE_DONE``: Records a write-mode receive completion.
         """
         encoder = msgspec.msgpack.Encoder()
         encoded_data = encoder.encode(metadata)
+        write_request_decoder = msgspec.msgpack.Decoder(MoRIIOWriteRequest)
+        write_done_decoder = msgspec.msgpack.Decoder(MoRIIOWriteDone)
         logger.info("Handshake listener ready (%d bytes metadata)", len(encoded_data))
 
         path = make_zmq_path("tcp", "*", base_port)
@@ -667,15 +1132,495 @@ class MoRIIOConnector(KVConnectorBase):
                 elif msg == MoRIIOConstants.POP_DONE_RECV:
                     if len(parts) < 3:
                         raise ValueError("POP_DONE_RECV missing request ID")
-                    req_id = int(parts[2])
-                    self.done_sending.add(req_id)
+                    req_text = parts[2].decode("utf-8")
+                    try:
+                        req_id: ReqId = int(req_text)
+                    except ValueError:
+                        req_id = req_text
+                    with self.moriio_wrapper.lock:
+                        self.done_sending.add(req_id)
                     logger.debug(
-                        "Handshake listener: consumer finished reading req %d", req_id
+                        "Handshake listener: consumer finished reading req %s", req_id
                     )
+
+                elif msg == MoRIIOConstants.WRITE_REQUEST:
+                    if len(parts) < 3:
+                        raise ValueError("WRITE_REQUEST missing payload")
+                    request = write_request_decoder.decode(parts[2])
+                    if not self.is_producer:
+                        logger.error(
+                            "Consumer received unexpected WRITE_REQUEST for req %s",
+                            request.decode_req_id,
+                        )
+                        continue
+                    try:
+                        remote_engine_key = self._register_write_remote_engine(
+                            request.consumer_engine_desc
+                        )
+                        if self._write_executor is None:
+                            raise RuntimeError("MoRIIO write executor is not running")
+                        self._write_executor.submit(
+                            self._execute_write_task,
+                            _WriteTask(request, remote_engine_key),
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "Failed to enqueue MoRIIO WRITE_REQUEST for req %s",
+                            request.decode_req_id,
+                        )
+                        self._enqueue_write_done(
+                            request,
+                            "failed",
+                            f"failed to enqueue write request: {exc}",
+                        )
+
+                elif msg == MoRIIOConstants.WRITE_DONE:
+                    if len(parts) < 3:
+                        raise ValueError("WRITE_DONE missing payload")
+                    self._handle_write_done(write_done_decoder.decode(parts[2]))
 
                 else:
                     logger.error("Unexpected handshake message type: %s", msg)
                     raise ValueError(f"Unexpected handshake message: {msg!r}")
+
+    def _register_write_remote_engine(self, packed_engine_desc: bytes) -> str:
+        with self._write_remote_engine_lock:
+            remote_key: str | None = None
+            try:
+                remote_key = EngineDesc.unpack(packed_engine_desc).key
+            except Exception:
+                logger.debug(
+                    "Could not pre-decode remote EngineDesc key", exc_info=True
+                )
+
+            if remote_key is not None and remote_key in self._write_remote_engine_keys:
+                return remote_key
+
+            registered_key = self.moriio_wrapper.register_remote_engine(
+                packed_engine_desc
+            )
+            self._write_remote_engine_keys.add(registered_key)
+            return registered_key
+
+    def _enqueue_write_done(
+        self,
+        request: MoRIIOWriteRequest,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        self._write_notify_queue.put(
+            (
+                request.notify_host,
+                request.notify_port,
+                MoRIIOWriteDone(
+                    decode_req_id=request.decode_req_id,
+                    status=status,
+                    reason=reason,
+                ),
+            )
+        )
+
+    def _handle_write_done(self, done: MoRIIOWriteDone) -> None:
+        req_id = done.decode_req_id
+        ok = done.status == "ok"
+
+        with self.moriio_wrapper.lock:
+            was_pending = req_id in self._pending_write_recv
+            if not was_pending:
+                logger.info("Ignoring stale MoRIIO WRITE_DONE for req %s", req_id)
+                return
+            slot_info = self._pending_write_recv_slots.pop(req_id, None)
+            block_ids = self._pending_write_recv_blocks.pop(req_id, [])
+            self._pending_write_recv_deadlines.pop(req_id, None)
+            self._pending_write_recv.discard(req_id)
+
+        if slot_info is not None:
+            compute_slot, pool_idx = slot_info
+            try:
+                if ok and pool_idx >= 0 and self._write_scatter_slot is not None:
+                    self._write_scatter_slot(compute_slot, pool_idx)
+            finally:
+                self._release_staging_slot(pool_idx)
+
+        if ok:
+            if block_ids:
+                with self._fence_lock:
+                    self._blocks_pending_fence.extend(block_ids)
+            with self.moriio_wrapper.lock:
+                self.done_recving.add(req_id)
+            logger.info("MoRIIO WRITE_DONE ok for req %s", req_id)
+        else:
+            with self.moriio_wrapper.lock:
+                self.failed_recving.add(req_id)
+            logger.warning(
+                "MoRIIO WRITE_DONE failed for req %s: %s", req_id, done.reason
+            )
+
+    def _sweep_expired_write_recvs(self) -> None:
+        if self.is_producer:
+            return
+
+        now = time.monotonic()
+        expired: list[ReqId] = []
+        slots_to_release: list[int] = []
+
+        with self.moriio_wrapper.lock:
+            for req_id, deadline in list(self._pending_write_recv_deadlines.items()):
+                if deadline > now:
+                    continue
+                self._pending_write_recv_deadlines.pop(req_id, None)
+                self._pending_write_recv.discard(req_id)
+                self._pending_write_recv_blocks.pop(req_id, None)
+                slot_info = self._pending_write_recv_slots.pop(req_id, None)
+                if slot_info is not None:
+                    _, pool_idx = slot_info
+                    if pool_idx >= 0:
+                        slots_to_release.append(pool_idx)
+                expired.append(req_id)
+
+            for req_id, deadline in list(self._deferred_write_recv_deadlines.items()):
+                if deadline > now:
+                    continue
+                self._deferred_write_recv_deadlines.pop(req_id, None)
+                self._deferred_write_recvs.pop(req_id, None)
+                expired.append(req_id)
+
+            if expired:
+                self.failed_recving.update(expired)
+
+        for pool_idx in slots_to_release:
+            self._release_staging_slot(pool_idx)
+
+        if expired:
+            logger.warning(
+                "MoRIIO write receive timed out for %d request(s): %s",
+                len(expired),
+                expired,
+            )
+
+    def _sweep_orphaned_completed_prefills(self) -> None:
+        if not self.is_producer:
+            return
+
+        now = time.monotonic()
+        expired: list[ReqId] = []
+        with self._completed_prefills_cv:
+            for transfer_id, deadline in list(
+                self._completed_prefill_deadlines.items()
+            ):
+                if deadline > now or transfer_id in self._inflight_write_transfers:
+                    continue
+                self._completed_prefill_deadlines.pop(transfer_id, None)
+                self._completed_prefills.pop(transfer_id, None)
+                expired.append(transfer_id)
+            if expired:
+                self._completed_prefills_cv.notify_all()
+
+        for transfer_id in expired:
+            self._mark_write_transfer_terminal(transfer_id)
+
+        if expired:
+            logger.warning(
+                "MoRIIO producer expired %d orphaned prefill transfer(s): %s",
+                len(expired),
+                expired,
+            )
+
+    def _execute_write_task(self, task: _WriteTask) -> None:
+        request = task.request
+        status = "failed"
+        reason: str | None = None
+        prefill_data: dict[str, Any] | None = None
+        try:
+            if request.consumer_tp_size != self.tp_size:
+                raise ValueError(
+                    f"TP mismatch: producer_tp_size={self.tp_size}, "
+                    f"consumer_tp_size={request.consumer_tp_size}"
+                )
+
+            prefill_data = self._wait_for_prefill_data(request.transfer_id)
+            if prefill_data is None:
+                raise TimeoutError(
+                    f"Timed out waiting for prefill data for transfer_id="
+                    f"{request.transfer_id}"
+                )
+
+            transfer_ok = self._write_blocks(
+                request=request,
+                remote_engine_key=task.remote_engine_key,
+                src_block_ids=prefill_data["block_ids"],
+                src_slot_index=prefill_data["slot_index"],
+            )
+            if not transfer_ok:
+                raise RuntimeError("RDMA write did not complete successfully")
+            status = "ok"
+        except Exception as exc:
+            reason = str(exc)
+            logger.exception(
+                "MoRIIO write transfer failed: req=%s transfer_id=%s",
+                request.decode_req_id,
+                request.transfer_id,
+            )
+        finally:
+            self._enqueue_write_done(request, status, reason)
+            self._mark_write_transfer_terminal(request.transfer_id)
+
+    def _mark_write_transfer_terminal(self, transfer_id: ReqId) -> None:
+        with self.moriio_wrapper.lock:
+            if transfer_id in self._terminal_write_transfers:
+                return
+            self._terminal_write_transfers.add(transfer_id)
+            self._terminal_write_transfer_order.append(transfer_id)
+            while len(self._terminal_write_transfer_order) > 65536:
+                old_transfer_id = self._terminal_write_transfer_order.popleft()
+                self._terminal_write_transfers.discard(old_transfer_id)
+            self.done_sending.add(transfer_id)
+
+        with self._completed_prefills_cv:
+            self._completed_prefills.pop(transfer_id, None)
+            self._completed_prefill_deadlines.pop(transfer_id, None)
+            self._inflight_write_transfers.discard(transfer_id)
+            self._completed_prefills_cv.notify_all()
+
+    def _wait_for_prefill_data(self, transfer_id: ReqId) -> dict[str, Any] | None:
+        with self._completed_prefills_cv:
+            ready = self._completed_prefills_cv.wait_for(
+                lambda: transfer_id in self._completed_prefills,
+                timeout=self._write_prefill_timeout_s,
+            )
+            if not ready:
+                return None
+            self._inflight_write_transfers.add(transfer_id)
+            return self._completed_prefills[transfer_id]
+
+    def _write_blocks(
+        self,
+        request: MoRIIOWriteRequest,
+        remote_engine_key: str,
+        src_block_ids: list[int],
+        src_slot_index: int,
+    ) -> bool:
+        if len(src_block_ids) != len(request.dst_block_ids):
+            raise ValueError(
+                f"src/dst block count mismatch: {len(src_block_ids)} vs "
+                f"{len(request.dst_block_ids)}"
+            )
+        if len(self._write_local_regions) != len(request.consumer_regions):
+            raise ValueError(
+                "write region count mismatch: "
+                f"local={len(self._write_local_regions)}, "
+                f"remote={len(request.consumer_regions)}"
+            )
+
+        block_statuses = self._submit_write_region_units(
+            remote_engine_key,
+            request.consumer_regions,
+            kind="block",
+            src_units=src_block_ids,
+            dst_units=request.dst_block_ids,
+        )
+        if not self._wait_for_write_statuses(block_statuses):
+            return False
+
+        if src_slot_index < 0 or request.dst_slot_index < 0:
+            return True
+
+        slot_statuses = self._submit_write_region_units(
+            remote_engine_key,
+            request.consumer_regions,
+            kind="slot",
+            src_units=[src_slot_index],
+            dst_units=[request.dst_slot_index],
+        )
+
+        producer_staging_pool_idx = -1
+        try:
+            if (
+                self._write_gather_slot is not None
+                and self._write_has_staging_region
+                and request.dst_staging_pool_idx >= 0
+            ):
+                producer_staging_pool_idx = self._acquire_staging_slot()
+                self._write_gather_slot(src_slot_index, producer_staging_pool_idx)
+                import torch
+
+                torch.cuda.current_stream().synchronize()
+                slot_statuses.extend(
+                    self._submit_write_region_units(
+                        remote_engine_key,
+                        request.consumer_regions,
+                        kind="staging",
+                        src_units=[producer_staging_pool_idx],
+                        dst_units=[request.dst_staging_pool_idx],
+                    )
+                )
+
+            return self._wait_for_write_statuses(slot_statuses)
+        finally:
+            self._release_staging_slot(producer_staging_pool_idx)
+
+    def _submit_write_region_units(
+        self,
+        remote_engine_key: str,
+        remote_regions: list[MoRIIOWriteRegion],
+        kind: str,
+        src_units: list[int],
+        dst_units: list[int],
+    ) -> list[Any]:
+        statuses: list[Any] = []
+        if not src_units:
+            return statuses
+        if len(src_units) != len(dst_units):
+            raise ValueError(f"{kind} src/dst unit count mismatch")
+
+        for region_idx, local_region in enumerate(self._write_local_regions):
+            if local_region.kind != kind:
+                continue
+            remote_region = remote_regions[region_idx]
+            self._validate_write_region_pair(region_idx, local_region, remote_region)
+
+            groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
+            for src_unit, dst_unit in zip(src_units, dst_units):
+                l_chunk, l_off = self._unit_chunk_offset(local_region, src_unit)
+                r_chunk, r_off = self._unit_chunk_offset(remote_region, dst_unit)
+                key = (l_chunk, r_chunk)
+                if key not in groups:
+                    groups[key] = ([], [], [])
+                groups[key][0].append(l_off)
+                groups[key][1].append(r_off)
+                groups[key][2].append(local_region.unit_bytes)
+
+            for (l_chunk, r_chunk), (
+                local_offsets,
+                remote_offsets,
+                sizes,
+            ) in groups.items():
+                session = self._get_or_build_write_session(
+                    remote_engine_key,
+                    region_idx,
+                    l_chunk,
+                    r_chunk,
+                    local_region,
+                    remote_region,
+                )
+                merged_local, merged_remote, merged_sizes = (
+                    self.merge_contiguous_blocks(local_offsets, remote_offsets, sizes)
+                )
+                status = session.batch_write(
+                    merged_local,
+                    merged_remote,
+                    merged_sizes,
+                    self.moriio_engine.allocate_transfer_uid(),
+                )
+                statuses.append(status)
+
+        return statuses
+
+    def _validate_write_region_pair(
+        self,
+        region_idx: int,
+        local_region: MoRIIOWriteRegion,
+        remote_region: MoRIIOWriteRegion,
+    ) -> None:
+        if local_region.kind != remote_region.kind:
+            raise ValueError(
+                f"region {region_idx} kind mismatch: local={local_region.kind}, "
+                f"remote={remote_region.kind}"
+            )
+        if local_region.unit_bytes != remote_region.unit_bytes:
+            raise ValueError(
+                f"region {region_idx} unit size mismatch: "
+                f"local={local_region.unit_bytes}, remote={remote_region.unit_bytes}"
+            )
+
+    def _unit_chunk_offset(
+        self,
+        region: MoRIIOWriteRegion,
+        unit_id: int,
+    ) -> tuple[int, int]:
+        if unit_id < 0 or unit_id >= region.total_units:
+            raise ValueError(
+                f"{region.kind} unit {unit_id} out of bounds "
+                f"(total_units={region.total_units})"
+            )
+        chunk_idx = unit_id // region.units_per_chunk
+        offset = (unit_id % region.units_per_chunk) * region.unit_bytes
+        if chunk_idx >= len(region.chunks):
+            raise ValueError(
+                f"{region.kind} chunk {chunk_idx} out of bounds "
+                f"(chunks={len(region.chunks)})"
+            )
+        return chunk_idx, offset
+
+    def _get_or_build_write_session(
+        self,
+        remote_engine_key: str,
+        region_idx: int,
+        local_chunk_idx: int,
+        remote_chunk_idx: int,
+        local_region: MoRIIOWriteRegion,
+        remote_region: MoRIIOWriteRegion,
+    ) -> Any:
+        cache_key = (
+            remote_engine_key,
+            region_idx,
+            local_chunk_idx,
+            remote_chunk_idx,
+        )
+        session = self._write_session_cache.get(cache_key)
+        if session is not None:
+            return session
+
+        with self._write_session_lock:
+            session = self._write_session_cache.get(cache_key)
+            if session is None:
+                local_md = self.moriio_wrapper.get_unpack_memory_metadata(
+                    local_region.chunks[local_chunk_idx]
+                )
+                remote_md = self.moriio_wrapper.get_unpack_memory_metadata(
+                    remote_region.chunks[remote_chunk_idx]
+                )
+                session = self.moriio_wrapper.build_session(local_md, remote_md)
+                self._write_session_cache[cache_key] = session
+            return session
+
+    def _wait_for_write_statuses(self, statuses: list[Any]) -> bool:
+        if not statuses:
+            return True
+
+        try:
+            result = self.moriio_engine.wait_all(
+                statuses, timeout_ms=self._write_transfer_timeout_ms
+            )
+        except TypeError:
+            result = self.moriio_engine.wait_all(statuses)
+        except Exception:
+            logger.exception("MoRIIO wait_all failed")
+            return False
+
+        if not self._wait_result_succeeded(result):
+            logger.error("MoRIIO wait_all returned non-success status: %s", result)
+            return False
+
+        for status in statuses:
+            succeeded = getattr(status, "Succeeded", None)
+            if succeeded is not None and not succeeded():
+                message = getattr(status, "Message", lambda: "<unknown>")()
+                code = getattr(status, "Code", lambda: "<unknown>")()
+                logger.error("MoRIIO write status failed: %s (code=%s)", message, code)
+                return False
+        return True
+
+    def _wait_result_succeeded(self, result: Any) -> bool:
+        if _MORIIO_AVAILABLE:
+            try:
+                return result == StatusCode.SUCCESS
+            except Exception:
+                pass
+        succeeded = getattr(result, "Succeeded", None)
+        if succeeded is not None:
+            return bool(succeeded())
+        return result in (0, True, None)
 
     def _execute_handshake(
         self,
@@ -696,7 +1641,10 @@ class MoRIIOConnector(KVConnectorBase):
         start_time = time.perf_counter()
 
         # Each (dp, tp) rank uses a unique port offset
-        port_offset = get_port_offset(remote_dp_rank, self.tp_rank)
+        remote_tp_rank = self.tp_rank % int(remote_tp_size or 1)
+        port_offset = get_port_offset(
+            remote_dp_rank, remote_tp_rank, int(remote_tp_size or 1)
+        )
         path = make_zmq_path("tcp", host, port + port_offset)
         logger.info("Initiating handshake on %s", path)
 
@@ -836,7 +1784,7 @@ class MoRIIOConnector(KVConnectorBase):
 
             return done_req_ids
 
-    def get_finished(self) -> tuple[set[int], set[str]]:
+    def get_finished(self) -> tuple[set[int], set[str]] | KVConnectorOutput:
         """Return the sets of finished sending and receiving request IDs.
 
         Called by the worker each step via ``async_proc_aggregation``.
@@ -844,21 +1792,47 @@ class MoRIIOConnector(KVConnectorBase):
         Returns:
             ``(done_sending, done_recving)`` tuple.
         """
+        if self.transfer_mode == TransferMode.WRITE_PUSH:
+            if self.is_producer:
+                self._sweep_orphaned_completed_prefills()
+            else:
+                self._sweep_expired_write_recvs()
+            with self.moriio_wrapper.lock:
+                done_sending = set(self.done_sending)
+                done_recving = set(self.done_recving)
+                failed_recving = set(self.failed_recving)
+                self.done_sending.clear()
+                self.done_recving.clear()
+                self.failed_recving.clear()
+            return KVConnectorOutput(
+                finished_sending=done_sending,
+                finished_recving=done_recving,
+                failed_recving=failed_recving,
+            )
+
         done_recving = self._pop_done_transfers()
         if self.is_producer:
-            done_sending = self.done_sending.copy()
-            self.done_sending.clear()
-        else:
-            if self.done_sending:
-                logger.warning(
-                    "Consumer received %d stale done_sending notifications "
-                    "(single-machine port collision?) — discarding: %s",
-                    len(self.done_sending),
-                    self.done_sending,
-                )
+            with self.moriio_wrapper.lock:
+                done_sending = self.done_sending.copy()
                 self.done_sending.clear()
+        else:
+            with self.moriio_wrapper.lock:
+                if self.done_sending:
+                    logger.warning(
+                        "Consumer received %d stale done_sending notifications "
+                        "(single-machine port collision?) — discarding: %s",
+                        len(self.done_sending),
+                        self.done_sending,
+                    )
+                    self.done_sending.clear()
             done_sending = set()
         return done_sending, done_recving
+
+    def get_finished_recv_blocks(self) -> list[int]:
+        with self._fence_lock:
+            blocks = self._blocks_pending_fence
+            self._blocks_pending_fence = []
+        return blocks
 
 
 # ===================================================================
@@ -883,6 +1857,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
+        self.transfer_mode = TransferMode(
+            kv_transfer_config.get("transfer_mode", TransferMode.WRITE_PUSH.value)
+        )
         self.handshake_port = get_open_port()
         self.base_handshake_port = kv_transfer_config.get(
             "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
@@ -893,9 +1870,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.host_ip = get_ip()
 
-        # Pending receive requests: req_id -> (Sequence, block_table)
-        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Any, list[int]]] = {}
+        # Pending requests: req_id -> (Sequence, block_table, local_slot_index)
+        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int], int]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Any, list[int], int]] = {}
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -925,19 +1902,34 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         meta = ConnectorMetadata()
         meta.request_id_to_transfer_id = self.request_id_to_transfer_id
 
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
+        for req_id, (req, block_ids, slot_idx) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
+            req.kv_transfer_params["local_slot_index"] = slot_idx
             meta.add_new_req_to_recv(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
             )
+
+        if self.transfer_mode == TransferMode.WRITE_PUSH:
+            for req_id, (req, block_ids, slot_idx) in self._reqs_need_save.items():
+                assert req.kv_transfer_params is not None
+                req.kv_transfer_params["local_slot_index"] = slot_idx
+                if req.kv_transfer_params.get("transfer_id") is None:
+                    req.kv_transfer_params["transfer_id"] = req_id
+                meta.add_new_req_to_save(
+                    request_id=req_id,
+                    local_block_ids=block_ids,
+                    kv_transfer_params=req.kv_transfer_params,
+                )
         logger.debug(
-            "Built connector metadata with %d recv requests: %s",
+            "Built connector metadata with %d recv and %d save requests: %s",
             len(self._reqs_need_recv),
+            len(self._reqs_need_save),
             list(self._reqs_need_recv.keys()),
         )
         self._reqs_need_recv.clear()
+        self._reqs_need_save.clear()
         return meta
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
@@ -954,17 +1946,36 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id[transfer_id] = seq.id
                 self.request_id_to_transfer_id[seq.id] = transfer_id
 
+        slot_index = getattr(seq, "per_req_cache_group", -1)
+
         # Decode side: queue for remote KV loading
         if params.get("do_remote_prefill"):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
-            self._reqs_need_recv[seq.id] = (seq, seq.block_table)
+            self._reqs_need_recv[seq.id] = (seq, seq.block_table, slot_index)
             params["do_remote_prefill"] = False
+            params["local_slot_index"] = slot_index
             logger.debug(
-                "Queued req %s for remote KV loading (%d blocks)",
+                "Queued req %s for remote KV loading (%d blocks, slot=%d)",
                 seq.id,
                 len(seq.block_table),
+                slot_index,
+            )
+
+        if self.transfer_mode == TransferMode.WRITE_PUSH and params.get(
+            "do_remote_decode"
+        ):
+            assert self.is_producer, "Only the producer side handles do_remote_decode"
+            if params.get("transfer_id") is None:
+                params["transfer_id"] = seq.id
+            params["local_slot_index"] = slot_index
+            self._reqs_need_save[seq.id] = (seq, seq.block_table, slot_index)
+            logger.debug(
+                "Queued req %s for MoRIIO write save (%d blocks, slot=%d)",
+                seq.id,
+                len(seq.block_table),
+                slot_index,
             )
 
     def request_finished(self, seq: Sequence) -> None:
@@ -993,6 +2004,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
+            "local_slot_index": getattr(seq, "per_req_cache_group", -1),
         }
 
         # Clean up transfer ID mapping on the consumer side
