@@ -70,6 +70,23 @@ from transformers import PretrainedConfig
 logger = logging.getLogger("atom")
 
 
+def use_triton_moe() -> bool:
+    """Whether the triton MoE path is selected for the current arch/env.
+
+    Single source of truth shared with ``fused_moe_triton.py``'s module-level
+    kernel imports and the ``_swizzle_mxfp4`` assert, so that "the triton
+    kernels are imported" always matches "moe.py routes through them". On gfx94x
+    this path is the default even when ATOM_USE_TRITON_MOE / ATOM_USE_TRITON_GEMM
+    are unset.
+    """
+    if envs.is_set("ATOM_USE_TRITON_MOE"):
+        return envs.ATOM_USE_TRITON_MOE
+    gfx = get_gfx()
+    return gfx.startswith("gfx94") or (
+        gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
+    )
+
+
 class MoEActivationQuant(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
@@ -804,12 +821,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         gfx = get_gfx()
         self.is_gfx1250 = gfx == "gfx1250"
-        if envs.is_set("ATOM_USE_TRITON_MOE"):
-            self.use_triton = envs.ATOM_USE_TRITON_MOE
-        else:
-            self.use_triton = gfx.startswith("gfx94") or (
-                gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
-            )
+        self.use_triton = use_triton_moe()
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
         if envs.is_set("ATOM_USE_TRITON_MOE_DECODE") and not self.is_guinterleave:
             self.use_triton_decode = envs.ATOM_USE_TRITON_MOE_DECODE

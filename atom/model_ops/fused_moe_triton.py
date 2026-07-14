@@ -24,12 +24,14 @@ from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from atom.utils import envs
+from atom.model_ops.moe import MoEActivationQuant, use_triton_moe
 
-if (
-    envs.ATOM_USE_TRITON_GEMM
-    or envs.ATOM_USE_TRITON_MOE
-    or envs.ATOM_USE_TRITON_MOE_DECODE
-):
+# Import the triton kernels whenever the triton MoE path can be selected.
+# use_triton_moe() is the same predicate moe.py uses to route through this
+# module (True by default on gfx94x), so the imports here stay consistent with
+# actual usage; ATOM_USE_TRITON_MOE_DECODE additionally enables the triton
+# decode kernels.
+if use_triton_moe() or envs.ATOM_USE_TRITON_MOE_DECODE:
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
@@ -44,8 +46,6 @@ if (
     from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
     from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-
-from atom.model_ops.moe import MoEActivationQuant
 
 
 def _swizzle_mxfp4(
@@ -65,7 +65,7 @@ def _swizzle_mxfp4(
     The arch -> SWIZZLE_MX_SCALE label decision lives in aiter
     (``shuffle_scale_moe(..., return_layout=True)``), so this stays arch-agnostic.
     """
-    assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
+    assert use_triton_moe()
 
     # Transposing for expected layout of aiter triton kernels
     w1_triton_layout = w1.transpose(-2, -1)
