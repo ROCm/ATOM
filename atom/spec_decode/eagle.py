@@ -40,6 +40,21 @@ support_eagle_model_arch_dict = {
 }
 
 
+def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
+    # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
+    from atom.models.deepseek_v2 import _pcp_active
+
+    if _pcp_active():
+        return True
+
+    if draft_model.__class__.__name__ != "DeepseekV4MTP":
+        return False
+
+    from atom.models.deepseek_v4 import _pcp_active as _pcp_active_v4
+
+    return _pcp_active_v4()
+
+
 class Eagle3DraftBuilder:
     """KV cache subsystem for an Eagle3 MHA draft alongside a non-MHA target.
 
@@ -444,10 +459,6 @@ class EagleProposer:
         # every iteration (used at i>=1 too, even though i==0 sets it).
         has_flat_kv = "kv_indices" in var
 
-        # Same PCP gate the draft's attention modules use (import lazily to avoid
-        # any import-order coupling with the model module).
-        from atom.models.deepseek_v2 import _pcp_active
-
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
                 # Re-sync DP token
@@ -462,7 +473,7 @@ class EagleProposer:
                 # `input_ids` / `positions` / `hidden_states` themselves stay full
                 # so the post-i==0 decode-metadata setup (which indexes with the
                 # full `last_token_indices`) is unchanged.
-                pcp_draft_prefill = i == 0 and _pcp_active()
+                pcp_draft_prefill = i == 0 and _pcp_active_for_draft_model(self.model)
                 if pcp_draft_prefill:
                     pcp_ws = get_pcp_world_size()
                     n_global_draft = input_ids.shape[0]

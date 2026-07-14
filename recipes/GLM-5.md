@@ -212,20 +212,14 @@ pass is split and gathered the same way.
 ### Serving on 4 GPUs (TP2 × PCP2)
 
 ```bash
-#!/bin/bash
-
-model_path=/shared/data/amd_int/models/GLM-5.2-FP8
-
-rm -rf /root/.cache/atom/*
+model_path=amd/GLM-5.2-MXFP4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
   --server-port 8000 \
   --kv_cache_dtype fp8 \
-  --no-enable_prefix_caching \
-  --no-enable_chunked_prefill \
+  --max-num-batched-tokens 32768 \
   -tp 2 -pcp 2 2>&1 | tee server_pcp.log &
 ```
-
-Pure context parallel (`TP1 × PCP4`) is also valid on 4 GPUs — swap `-tp 2 -pcp 2`
-for `-tp 1 -pcp 4`.
