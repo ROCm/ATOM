@@ -94,6 +94,38 @@ python3 -m sglang.launch_server \
     --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}"
 ```
 
+### GLM-5.2 FP8 with online quant on MI308
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export SGLANG_AITER_FP8_PREFILL_ATTN=0
+export SGLANG_ENABLE_TORCH_COMPILE=1
+export SGLANG_USE_AITER=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+
+MODEL_PATH=zai-org/GLM-5.2-FP8
+# Or use a local checkpoint path, for example:
+# MODEL_PATH=/shared/data/amd_int/models/GLM-5.2-FP8
+TP=8
+PORT=9000
+MODEL_LOADER_EXTRA_CONFIG='{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate"]}}'
+
+TORCHINDUCTOR_COMPILE_THREADS=128 \
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --host localhost \
+    --port "${PORT}" \
+    --trust-remote-code \
+    --tp-size "${TP}" \
+    --mem-fraction-static 0.8 \
+    --page-size 1 \
+    --disable-radix-cache \
+    --kv-cache-dtype fp8_e4m3 \
+    --attention-backend aiter \
+    --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}"
+```
+
 `online_quant_config` must be nested under `model_loader_extra_config`. The ATOM plugin consumes this nested key before SGLang's default model loader validates the remaining loader config. Putting `global_quant_config`, `layer_quant_config`, or `exclude_layer` at the top level will make SGLang reject the config.
 
 For an 8-GPU run, set `TP=8` and expose the target GPUs with `CUDA_VISIBLE_DEVICES`.
