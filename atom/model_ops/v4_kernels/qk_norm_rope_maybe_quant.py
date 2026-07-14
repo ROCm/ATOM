@@ -639,3 +639,60 @@ def qk_norm_rope_maybe_quant_reference(
         kv_scale = None
 
     return q_out, kv_out, q_scale, kv_scale
+
+
+def qk_norm_rope_maybe_quant_fp8_2buff(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compile-safe Triton fp8 2buff Q/K: per-head weightless Q RMSNorm +
+    weighted KV RMSNorm + GPT-J RoPE (bf16), then per-64-elt-tile e8m0 fp8 quant
+    of the NoPE half + 2buff pack (RoPE tail kept bf16).
+
+    Composed from two already-tuned Triton pieces (kept separate for reuse and
+    independent testability rather than fused into one launch):
+
+    1. :func:`qk_norm_rope_maybe_quant` (bf16, quant off) — per-head weightless
+       Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE.
+    2. :func:`quantize_bf16_to_v4_2buff_triton` — per-64-elt-tile e8m0 fp8 quant
+       of the NoPE half + 2buff pack, RoPE tail kept bf16.
+
+    Compute-only: it does NOT perform a fused SWA scatter. Callers on the decode
+    path must additionally call ``swa_write_2buff_prepacked`` on the returned
+    ``k_packed``/``k_rope`` (the prefill call site scatters its tail post-attn).
+
+    Returns ``(q_packed [T, H, 512] fp8, q_rope [T, H, 64] bf16,
+    k_packed [T, 1, 512] fp8, k_rope [T, 1, 64] bf16)``.
+    """
+    from atom.model_ops.v4_kernels.v4_quant import quantize_bf16_to_v4_2buff_triton
+
+    # bf16 norm+rope (existing Triton/flydsl kernel, no quant, no SWA scatter).
+    q_bf16, kv_bf16, _, _ = qk_norm_rope_maybe_quant(
+        q,
+        kv,
+        kv_weight,
+        cos_cache,
+        sin_cache,
+        positions,
+        n_local_heads,
+        head_dim,
+        rope_head_dim,
+        eps,
+        quant_q=False,
+        quant_k=False,
+    )
+
+    # q_bf16: [T, H, D]; kv_bf16: [T, D] -> [T, 1, D] (single KV head).
+    T = q_bf16.shape[0]
+    q_packed, q_rope = quantize_bf16_to_v4_2buff_triton(q_bf16)
+    k_packed, k_rope = quantize_bf16_to_v4_2buff_triton(kv_bf16.view(T, 1, head_dim))
+
+    return q_packed, q_rope, k_packed, k_rope

@@ -222,6 +222,71 @@ def swa_write_reference(
         swa_region[dst_row] = src_kv
 
 
+def swa_write_2buff_prepacked(
+    k_packed: torch.Tensor,
+    k_rope: torch.Tensor,
+    positions: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    swa_block_tables: torch.Tensor,
+    swa_region_nope: torch.Tensor,
+    swa_region_rope: torch.Tensor,
+    block_size: int,
+    write_per_batch: int,
+) -> None:
+    """Native 2buff fp8 paged SWA write: content-addressed scatter of the LAST
+    ``min(tok_n_b, write_per_batch)`` tokens of every seq into the two paged
+    SWA pools (fp8 NoPE + bf16 RoPE). The K is ALREADY in the 2buff layout
+    (nope-fp8 ``[T,512]`` + rope-bf16 ``[T,64]``), produced upstream by the
+    compute-only 2buff quant (:func:`qk_norm_rope_maybe_quant_fp8_2buff`). This
+    is a pure dtype-agnostic scatter (reuses the paged :func:`swa_write` once per
+    pool); NO torch quantization happens here.
+
+    Both pools are the flat content-addressed regions of ``unified_kv`` /
+    ``unified_kv_rope`` (``[num_pages, D]``), addressed by ``swa_block_tables``:
+    ``swa_region[block_tables[b, pos//block_size] * block_size + pos%block_size]``.
+    Replaces the pre-paged per-request ring variant (matches the paged bf16
+    :func:`swa_write` semantics; issue #1417).
+
+    Args:
+        k_packed:        [T, 512] fp8 — quantized K nope + inline e8m0 scale + pad.
+        k_rope:          [T, 64]  bf16 — rotated K-PE (not quantized).
+        swa_block_tables:[bs, max_blocks] int32 — paged-SWA logical→physical map.
+        swa_region_nope: [num_pages, 512] fp8 paged pool (2buff nope).
+        swa_region_rope: [num_pages, 64]  bf16 paged pool (rope).
+        block_size:      paging stride of both pools.
+        (other args as :func:`swa_write`.)
+    """
+    from atom.model_ops.v4_kernels.v4_quant import V4_DIM_QK_PACKED, V4_DIM_ROPE
+
+    assert (
+        k_packed.dim() == 2 and k_packed.shape[1] == V4_DIM_QK_PACKED
+    ), f"k_packed must be [T,{V4_DIM_QK_PACKED}] fp8, got {tuple(k_packed.shape)}"
+    assert (
+        k_rope.dim() == 2 and k_rope.shape[1] == V4_DIM_ROPE
+    ), f"k_rope must be [T,{V4_DIM_ROPE}] bf16, got {tuple(k_rope.shape)}"
+    assert swa_region_nope.dim() == 2 and swa_region_nope.shape[1] == V4_DIM_QK_PACKED
+    assert swa_region_rope.dim() == 2 and swa_region_rope.shape[1] == V4_DIM_ROPE
+
+    swa_write(
+        k_packed.contiguous(),
+        positions,
+        cu_seqlens_q,
+        swa_block_tables,
+        swa_region_nope,
+        block_size,
+        write_per_batch,
+    )
+    swa_write(
+        k_rope.contiguous(),
+        positions,
+        cu_seqlens_q,
+        swa_block_tables,
+        swa_region_rope,
+        block_size,
+        write_per_batch,
+    )
+
+
 # === Unified Compressor state save (plan path) ==========================
 # Paper §3.6.1: per-request fixed-size state cache for "uncompressed tail
 # tokens + previous block as overlap context (B-side, eq 11)". ATOM keeps
