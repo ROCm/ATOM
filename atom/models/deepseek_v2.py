@@ -58,6 +58,7 @@ from atom.model_ops.attention_mla import (
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
     triton_gather_kv_indices_sparse,
+    sparse_indexer_decode_topk_rows_per_launch,
 )
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import (
@@ -1351,32 +1352,69 @@ def sparse_attn_indexer(
         assert batch_size == context.batch_size
         num_padded_tokens = batch_size * next_n
         batch_size, next_n, heads, _ = padded_q_fp8_decode_tokens.shape
-        logits = torch.empty(
-            [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
-        )
-        deepgemm_fp8_paged_mqa_logits(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
-            logits,
-            decode_metadata.context_lens,
-            attn_metadata.block_tables,
-            max_model_len,
-            KVBlockSize=runner_block_size,
-            Preshuffle=True,
-        )
-        num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.context_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-        )
+        # aiter.top_k_per_row_decode uses the one-block decode path. Keep each
+        # launch within the CU wave capacity so rows beyond the effective kernel
+        # coverage cannot leave stale sparse indices in the persistent buffer.
+        max_indexer_rows = sparse_indexer_decode_topk_rows_per_launch()
+        if num_padded_tokens > max_indexer_rows:
+            chunk_reqs = max(1, max_indexer_rows // next_n)
+            for req_start in range(0, batch_size, chunk_reqs):
+                req_end = min(req_start + chunk_reqs, batch_size)
+                row_start = req_start * next_n
+                row_end = req_end * next_n
+                logits = torch.empty(
+                    [row_end - row_start, max_model_len],
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                deepgemm_fp8_paged_mqa_logits(
+                    padded_q_fp8_decode_tokens[req_start:req_end],
+                    kv_cache,
+                    weights[row_start:row_end],
+                    logits,
+                    decode_metadata.context_lens[req_start:req_end],
+                    attn_metadata.block_tables[req_start:req_end],
+                    max_model_len,
+                    KVBlockSize=runner_block_size,
+                    Preshuffle=True,
+                )
+                top_k_per_row_decode(
+                    logits,
+                    next_n,
+                    decode_metadata.context_lens[req_start:req_end],
+                    topk_indices_decode[row_start:row_end],
+                    row_end - row_start,
+                    logits.stride(0),
+                    logits.stride(1),
+                )
+        else:
+            logits = torch.empty(
+                [num_padded_tokens, max_model_len],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            deepgemm_fp8_paged_mqa_logits(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                logits,
+                decode_metadata.context_lens,
+                attn_metadata.block_tables,
+                max_model_len,
+                KVBlockSize=runner_block_size,
+                Preshuffle=True,
+            )
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.context_lens,
+                topk_indices_decode,
+                num_padded_tokens,
+                logits.stride(0),
+                logits.stride(1),
+            )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,

@@ -17,6 +17,7 @@ from aiter import (
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
 )
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 # The segmented (page_size>1) MLA cache kernels only exist in newer aiter
 # builds. Import them lazily so that the default page_size=1 path keeps working
@@ -1631,14 +1632,17 @@ def triton_gather_kv_indices_sparse(
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
 
-    # MTP decode can carry metadata tensors padded to a larger query layout
-    # than the number of rows produced by the current indexer call. Keep all
-    # per-token inputs aligned to the actual valid intersection before launch;
-    # otherwise the kernel may read past topk_indices.
-    num_tokens = min(
-        token_to_seq_idxs.shape[0],
-        topk_indices.shape[0],
-        sparse_kv_indptr.shape[0] - 1,
+    # token_to_seq_idxs is the authoritative output row count. Do not silently
+    # truncate if the sparse indexer produced fewer top-k rows; that would leave
+    # stale values in the persistent sparse-KV index buffer.
+    num_tokens = token_to_seq_idxs.shape[0]
+    assert topk_indices.shape[0] >= num_tokens, (
+        "sparse indexer under-produced top-k rows: "
+        f"topk_rows={topk_indices.shape[0]} expected_rows={num_tokens}"
+    )
+    assert sparse_kv_indptr.shape[0] >= num_tokens + 1, (
+        "sparse_kv_indptr is shorter than sparse token metadata: "
+        f"indptr_rows={sparse_kv_indptr.shape[0] - 1} expected_rows={num_tokens}"
     )
     sparse_kv_indptr = sparse_kv_indptr[: num_tokens + 1]
     token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
@@ -1667,3 +1671,10 @@ def triton_gather_kv_indices_sparse(
         ti_stride1,
     )
     return out_buf
+
+
+def sparse_indexer_decode_topk_rows_per_launch(wave_per_eu: int = 2) -> int:
+    # aiter.top_k_per_row_decode always uses the one-block decode kernel.
+    # Keep each launch within the CU wave capacity to avoid rows beyond the
+    # kernel's effective coverage retaining stale sparse indices.
+    return max(1, get_num_sms() * wave_per_eu)

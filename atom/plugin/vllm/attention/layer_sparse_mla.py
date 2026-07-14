@@ -24,6 +24,7 @@ from aiter import (
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
+from atom.model_ops.attention_mla import sparse_indexer_decode_topk_rows_per_launch
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -458,35 +459,81 @@ def sparse_attn_indexer_plugin_mode(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
-        logits = torch.empty(
-            [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
-        )
-        deepgemm_fp8_paged_mqa_logits(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
-            logits,
-            decode_metadata.seq_lens,
-            decode_metadata.block_table,
-            max_model_len,
-            ChunkK=256,
-            KVBlockSize=kv_block_size,
-            Preshuffle=preshuffle_cache,
-            WavePerEU=2,
-        )
-
-        num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.seq_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-        )
+        if decode_metadata.requires_padding:
+            padded_weights_decode = pack_seq_triton(
+                weights[:num_decode_tokens], decode_lens
+            ).reshape(num_padded_tokens, *weights.shape[1:])
+            topk_indices_decode = torch.empty(
+                [num_padded_tokens, topk_tokens],
+                dtype=torch.int32,
+                device=topk_indices.device,
+            )
+        else:
+            padded_weights_decode = weights[:num_padded_tokens]
+            topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
+        max_indexer_rows = sparse_indexer_decode_topk_rows_per_launch()
+        if num_padded_tokens > max_indexer_rows:
+            chunk_reqs = max(1, max_indexer_rows // next_n)
+            for req_start in range(0, batch_size, chunk_reqs):
+                req_end = min(req_start + chunk_reqs, batch_size)
+                row_start = req_start * next_n
+                row_end = req_end * next_n
+                logits = torch.empty(
+                    [row_end - row_start, max_model_len],
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                deepgemm_fp8_paged_mqa_logits(
+                    padded_q_fp8_decode_tokens[req_start:req_end],
+                    kv_cache,
+                    padded_weights_decode[row_start:row_end],
+                    logits,
+                    decode_metadata.seq_lens[req_start:req_end],
+                    decode_metadata.block_table[req_start:req_end],
+                    max_model_len,
+                    ChunkK=256,
+                    KVBlockSize=kv_block_size,
+                    Preshuffle=preshuffle_cache,
+                    WavePerEU=2,
+                )
+                top_k_per_row_decode(
+                    logits,
+                    next_n,
+                    decode_metadata.seq_lens[req_start:req_end],
+                    topk_indices_decode[row_start:row_end],
+                    row_end - row_start,
+                    logits.stride(0),
+                    logits.stride(1),
+                )
+        else:
+            logits = torch.empty(
+                [num_padded_tokens, max_model_len],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            deepgemm_fp8_paged_mqa_logits(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                padded_weights_decode,
+                logits,
+                decode_metadata.seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+                ChunkK=256,
+                KVBlockSize=kv_block_size,
+                Preshuffle=preshuffle_cache,
+                WavePerEU=2,
+            )
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices_decode,
+                num_padded_tokens,
+                logits.stride(0),
+                logits.stride(1),
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
