@@ -18,7 +18,7 @@ import os
 
 import torch
 
-__all__ = ["supported", "VmmBuffer"]
+__all__ = ["supported", "supported_fabric", "VmmBuffer"]
 
 
 @functools.lru_cache(maxsize=1)
@@ -41,6 +41,16 @@ def supported(device: int = 0) -> bool:
     return bool(_ext().vmm_supported(device))
 
 
+def supported_fabric(device: int = 0) -> bool:
+    """Whether the device can export VMM buffers as *fabric* handles.
+
+    Fabric handles are node-independent (shared over TCP) and enable the
+    cross-node / scale-out (IFOE) path on gfx1250. False on scale-up-only parts
+    (e.g. gfx950), where only the POSIX-fd / XGMI path is used.
+    """
+    return bool(_ext().vmm_supported_fabric(device))
+
+
 def copy(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
     """Device-to-device copy between raw device pointers (peer-mapped ok)."""
     _ext().vmm_copy(dst_ptr, src_ptr, nbytes)
@@ -59,8 +69,13 @@ class VmmBuffer:
         self.device = device
 
     @classmethod
-    def alloc(cls, nbytes: int, device: int) -> "VmmBuffer":
-        return cls(_ext().vmm_alloc(nbytes, device), nbytes, device)
+    def alloc(cls, nbytes: int, device: int, fabric: bool = False) -> "VmmBuffer":
+        """Allocate an exportable VMM buffer.
+
+        ``fabric=True`` requests a node-independent fabric handle (scale-out /
+        IFOE, gfx1250); the default POSIX-fd handle is scale-up / XGMI.
+        """
+        return cls(_ext().vmm_alloc(nbytes, device, fabric), nbytes, device)
 
     @classmethod
     def import_fd(cls, fd: int, nbytes: int, device: int) -> "VmmBuffer":
@@ -70,9 +85,18 @@ class VmmBuffer:
         """
         return cls(_ext().vmm_import(fd, nbytes, device), nbytes, device)
 
+    @classmethod
+    def import_fabric(cls, handle: bytes, nbytes: int, device: int) -> "VmmBuffer":
+        """Import a producer's 64-byte fabric handle (received over TCP)."""
+        return cls(_ext().vmm_import_fabric(handle, nbytes, device), nbytes, device)
+
     def export_fd(self) -> int:
         """POSIX fd to send to a peer (e.g. via ``socket.send_fds``)."""
         return _ext().vmm_export_fd(self._id)
+
+    def export_fabric(self) -> bytes:
+        """64-byte fabric handle to send to a remote node (e.g. over TCP)."""
+        return _ext().vmm_export_fabric(self._id)
 
     @property
     def data_ptr(self) -> int:

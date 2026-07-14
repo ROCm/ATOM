@@ -1,25 +1,33 @@
 # Native KV connector (`kv_connector="native"`)
 
-A fully in-tree prefill/decode (P/D) KV-cache connector for the **single-node
-(scale-up / XGMI)** case. It depends only on the HIP Virtual Memory Management
-(VMM) API — **no third-party transport** (no MoRI, no Mooncake).
+A fully in-tree prefill/decode (P/D) KV-cache connector built only on the HIP
+Virtual Memory Management (VMM) API — **no third-party transport** (no MoRI, no
+Mooncake). It covers **both**:
+
+- **scale-up (single node / XGMI):** VMM buffers shared as **POSIX fd** handles
+  over a UNIX socket; KV moved GPU→GPU with `hipMemcpy` peer over XGMI.
+- **scale-out (cross node / IFOE, gfx1250):** the same VMM buffers shared as
+  node-independent **fabric** handles over TCP; KV moved over the IFOE fabric.
 
 ## When to use it
 
 | Scenario | Connector |
 |---|---|
-| Single node, P/D split across GPUs on the same box (XGMI fabric) | **`native`** |
-| Cross-node P/D (RDMA NICs) | `moriio` |
+| Single node, P/D split across GPUs on the same box (XGMI) | **`native`** |
+| Cross node, P/D over the IFOE fabric (gfx1250) | **`native`** |
+| Cross node over RDMA NICs | `moriio` |
 
-The `native` connector moves KV directly GPU→GPU over the fabric with
-`hipMemcpy` peer copies (via HIP VMM shareable handles). It requires GPUs with
-VMM support (queried per device); it raises a clear error otherwise.
+Requires GPUs with VMM support (queried per device); the fabric/scale-out path
+additionally requires fabric-handle support (gfx1250) — on parts without it
+(e.g. gfx950) only the same-node fd/XGMI path is used.
 
 ## How to select it
 
-Pass `"kv_connector": "native"` in `--kv-transfer-config`. There is **no
-`protocol` field** (the transport is always single-node XGMI), and GPUs use
-**natural placement** (`device == rank`) — no visibility reorder is needed.
+Pass `"kv_connector": "native"` in `--kv-transfer-config`. The transport is
+**auto-selected by topology**: a producer on the same node → fd + UNIX socket +
+XGMI; a producer on a different node (and fabric supported) → fabric handle +
+TCP + IFOE. No `protocol` field; natural placement (`device == rank`), no
+visibility reorder.
 
 ## Launch (4 prefill GPUs + 4 decode GPUs on one node)
 

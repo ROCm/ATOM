@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import struct
 import threading
 import time
 from typing import Any
@@ -41,6 +42,17 @@ TransferId = int
 _MSG_WRITE_REQUEST = b"\x01"
 _MSG_WRITE_DONE = b"\x02"
 _PREFILL_WAIT_S = 30.0
+
+
+def _recvn(conn: socket.socket, n: int) -> bytes:
+    """Read exactly ``n`` bytes from a stream socket (or b'' on EOF)."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+    return bytes(buf)
 
 
 def _port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
@@ -133,10 +145,10 @@ class NativeConnector(KVConnectorBase):
         self.is_producer = kv_cfg.get("kv_role", "kv_producer") == "kv_producer"
         self.device = torch.cuda.current_device()
         if not vmm.supported(self.device):
-            raise RuntimeError(
-                "kv_connector='native' requires HIP VMM (single-node scale-up); "
-                "use 'moriio' for cross-node RDMA."
-            )
+            raise RuntimeError("kv_connector='native' requires HIP VMM support")
+        # fabric handles (gfx1250) enable the cross-node / scale-out (IFOE) path;
+        # without them (e.g. gfx950) only the same-node fd / XGMI path is used.
+        self._fabric = vmm.supported_fabric(self.device)
         self.tp_rank = get_tp_group().rank_in_group
         self.tp_size = get_tp_group().world_size
         self.dp_rank = get_dp_group().rank_in_group
@@ -271,7 +283,14 @@ class NativeConnector(KVConnectorBase):
 
     def _recv_request(self, req_id: ReqId, meta: ReqMeta) -> None:
         nblocks = len(meta.local_block_ids)
-        staging = vmm.VmmBuffer.alloc(self._req_bytes(nblocks), self.device)
+        # scale-out (fabric/IFOE) when the producer is on another node and the
+        # device supports fabric handles; else scale-up (fd/XGMI, same node).
+        use_fabric = bool(
+            self._fabric and meta.remote_host and meta.remote_host != self.local_ip
+        )
+        staging = vmm.VmmBuffer.alloc(
+            self._req_bytes(nblocks), self.device, fabric=use_fabric
+        )
         payload = msgpack.dumps(
             {
                 "req_id": req_id,
@@ -280,21 +299,40 @@ class NativeConnector(KVConnectorBase):
                 "dst_slot": meta.local_slot_index,
             }
         )
-        target = _sock_path(
-            meta.remote_handshake_port
-            + _port_offset(meta.remote_dp_rank, self.tp_rank, meta.tp_size)
+        port = meta.remote_handshake_port + _port_offset(
+            meta.remote_dp_rank, self.tp_rank, meta.tp_size
         )
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(target)
-        socket.send_fds(s, [_MSG_WRITE_REQUEST + payload], [staging.export_fd()])
-        resp = s.recv(4096)
-        s.close()
-        if resp[:1] != _MSG_WRITE_DONE:
+        if use_fabric:
+            ok = self._send_fabric(meta.remote_host, port, payload, staging)
+        else:
+            ok = self._send_posix(port, payload, staging)
+        if not ok:
             logger.error("[native] no WRITE_DONE for req %s", req_id)
             return
         self._scatter(staging, meta.local_block_ids, meta.local_slot_index)
         with self._lock:
             self.done_recving.add(req_id)
+
+    def _send_posix(self, port: int, payload: bytes, staging) -> bool:
+        """Same-node: send the payload + VMM fd over a UNIX socket (SCM_RIGHTS)."""
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(_sock_path(port))
+        socket.send_fds(s, [_MSG_WRITE_REQUEST + payload], [staging.export_fd()])
+        resp = s.recv(4096)
+        s.close()
+        return resp[:1] == _MSG_WRITE_DONE
+
+    def _send_fabric(self, host: str, port: int, payload: bytes, staging) -> bool:
+        """Cross-node: send [len][payload][64B fabric handle] over TCP."""
+        handle = staging.export_fabric()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.connect((host, port))
+        body = _MSG_WRITE_REQUEST + struct.pack("<I", len(payload)) + payload + handle
+        s.sendall(body)
+        resp = s.recv(4096)
+        s.close()
+        return resp[:1] == _MSG_WRITE_DONE
 
     def _scatter(self, staging, dst_block_ids, dst_slot) -> None:
         off = 0
@@ -321,6 +359,14 @@ class NativeConnector(KVConnectorBase):
     # -- producer -----------------------------------------------------------
 
     def _serve(self) -> None:
+        # Same-node consumers reach us over a UNIX socket (fd/SCM_RIGHTS); when
+        # fabric is available, cross-node consumers reach us over TCP (fabric
+        # handle). Both feed the same gather path.
+        threading.Thread(target=self._serve_unix, daemon=True).start()
+        if self._fabric:
+            threading.Thread(target=self._serve_tcp, daemon=True).start()
+
+    def _serve_unix(self) -> None:
         path = _sock_path(self._port)
         if os.path.exists(path):
             os.unlink(path)
@@ -329,9 +375,20 @@ class NativeConnector(KVConnectorBase):
         srv.listen(64)
         while True:
             conn, _ = srv.accept()
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            threading.Thread(
+                target=self._handle_unix, args=(conn,), daemon=True
+            ).start()
 
-    def _handle(self, conn: socket.socket) -> None:
+    def _serve_tcp(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self._port))
+        srv.listen(64)
+        while True:
+            conn, _ = srv.accept()
+            threading.Thread(target=self._handle_tcp, args=(conn,), daemon=True).start()
+
+    def _handle_unix(self, conn: socket.socket) -> None:
         try:
             msg, fds, _, _ = socket.recv_fds(conn, 1 << 16, 1)
             if not msg or msg[:1] != _MSG_WRITE_REQUEST:
@@ -344,14 +401,37 @@ class NativeConnector(KVConnectorBase):
                     fds[0], self._req_bytes(nblocks), self.device
                 )
                 self._imported[fds[0]] = dst
-            self._gather(dst, req["transfer_id"])
-            conn.sendall(_MSG_WRITE_DONE + msgpack.dumps({"req_id": req["req_id"]}))
-            with self._lock:
-                self.done_sending.add(req["req_id"])
+            self._process(conn, req, dst)
         except Exception:
-            logger.exception("[native] producer handler error")
+            logger.exception("[native] producer unix handler error")
         finally:
             conn.close()
+
+    def _handle_tcp(self, conn: socket.socket) -> None:
+        try:
+            hdr = _recvn(conn, 1 + 4)
+            if not hdr or hdr[:1] != _MSG_WRITE_REQUEST:
+                return
+            plen = struct.unpack("<I", hdr[1:5])[0]
+            payload = _recvn(conn, plen)
+            handle = _recvn(conn, 64)  # sizeof(hipMemFabricHandle_t)
+            req = msgpack.loads(payload)
+            nblocks = len(req["dst_block_ids"])
+            # each request stages a fresh buffer; import lives for this request
+            dst = vmm.VmmBuffer.import_fabric(
+                handle, self._req_bytes(nblocks), self.device
+            )
+            self._process(conn, req, dst)
+        except Exception:
+            logger.exception("[native] producer tcp handler error")
+        finally:
+            conn.close()
+
+    def _process(self, conn: socket.socket, req: dict, dst) -> None:
+        self._gather(dst, req["transfer_id"])
+        conn.sendall(_MSG_WRITE_DONE + msgpack.dumps({"req_id": req["req_id"]}))
+        with self._lock:
+            self.done_sending.add(req["req_id"])
 
     def _gather(self, staging, transfer_id: int) -> None:
         with self._prefills_cv:
