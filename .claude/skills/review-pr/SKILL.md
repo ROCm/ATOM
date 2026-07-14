@@ -60,6 +60,15 @@ for c in comments:
 " 2>/dev/null
 ```
 
+Read the diff and PR body before proceeding.
+
+**Cross-file verification — before reporting any kernel/dispatch finding.** The diff shows changed lines, not the whole story. Grep the entire symbol family (`.cu` + `.cuh` + `.h`, or the whole module), not just files in the diff — sync/fence/atomics or the "other half" of a scatter often live in a header, and dispatch/else-branch completeness must be read in the full function, not the hunk. A "no synchronization" or "missing branch" finding based only on the diff is how false positives happen.
+
+**Classify every CI failure before blaming the PR.** A red check is not automatically the PR's fault:
+- Read the failed step/service. An external `docs/readthedocs.com` build failing on a `.claude/`-only or code-only change is unrelated infra (those files do not feed the RTD sphinx docs) — do not treat it as a content failure (ATOM#1549).
+- Compare against main: if main fails the same job in the same window, it is baseline/flaky, not a regression introduced here.
+- Expired CI logs (`HTTP 410 Gone`) on old runs mean the failure is months-stale and meaningless against today's main — ask for a rebase + fresh run instead of quoting it.
+
 ---
 
 ## Step 2 — Semantic Understanding (answer before rules)
@@ -518,6 +527,11 @@ Each finding must have **three parts**:
 1. **Problem** — what exactly is wrong, with file/line if relevant
 2. **Impact** — what goes wrong at runtime if this is not fixed (wrong output / crash / OOM / perf regression)
 3. **Action** — end with a verb phrase: "**Author must** [do X]" or "**Reviewer should ask** [Y]" — no verb = incomplete finding, do not include
+
+**Tag every finding [verified] or [inferred], and never ship a root cause you only inferred.**
+- `[verified]` — traced to the actual code/evidence chain.
+- `[inferred]` — plausible but unconfirmed; say so and downgrade to "worth checking," do not assert it as the cause.
+A finding that stops at "likely / probably the root cause" without an evidence chain is not shippable — either trace it to [verified] or label it [inferred] and frame it as a question.
 
 Do NOT use rule codes (P1, D2, A1…) in output — they are internal labels only.
 
