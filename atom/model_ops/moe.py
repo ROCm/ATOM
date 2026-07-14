@@ -2906,12 +2906,16 @@ class FusedMoE(torch.nn.Module):
                 load_full=load_full,
             )
         else:
-            # The Aiter FP4 quantization function returns a value of type FP4*2
+            # mxfp4 (per_1x32) returns a byte-encoded FP4x2 / e8m0 scale that
+            # must be byte-viewed before loading. Other schemes (e.g. per_1x128
+            # 128x128 block FP8) carry a float32 scale that is copied as-is.
+            if quant_type == QuantType.per_1x32:
+                loaded_weight = loaded_weight.view(torch.uint8)
             self._load_model_weight_or_group_weight_scale(
                 shard_dim=shard_dim,
                 expert_data=expert_data,
                 shard_id=shard_id,
-                loaded_weight=loaded_weight.view(torch.uint8),
+                loaded_weight=loaded_weight,
                 tp_rank=tp_rank,
                 load_full=load_full,
             )

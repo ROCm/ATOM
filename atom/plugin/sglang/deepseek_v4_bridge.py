@@ -456,7 +456,14 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
         attn = block.attn
         ratio = int(attn.compress_ratio)
         attn.unified_kv = proxy_pool.views["unified"][local_layer_id]
-        attn.swa_kv = proxy_pool.views["swa"][local_layer_id]
+        # paged SWA ABI (#1423): the shared _attn_core / swa_write treat swa_kv as
+        # a flat [pages, head_dim] region content-addressed by swa_block_tables.
+        # Plugin keeps the ring pool but exposes it flat with block_size = cs, so
+        # `swa_block_tables[bid,*] = slot` reduces the paged offset to the ring
+        # `slot*cs + pos%cs`. See _build_swa_ring_block_tables.
+        swa_view = proxy_pool.views["swa"][local_layer_id]
+        attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
+        attn.swa_block_size = proxy_pool.swa_cache_size
         if ratio == 4:
             _bind_compressor_state(
                 attn.compressor,
@@ -678,6 +685,10 @@ class _V4SGLangDecodeGraphBuffers:
         self.n_hca = i32(s)
         self.batch_id = CpuGpuBuffer(t, dtype=torch.int32, device=device)
         self.block_tables = i32(s, self.max_blocks)
+        # Ring-emulating SWA block table (project 024): [s, max_blocks], every
+        # column = the request's ring slot; paged block_size = cs. Persistent so
+        # its address is stable across CUDA-graph replay.
+        self.swa_block_tables = i32(s, self.max_blocks)
         self.indptr_swa = i32(t + 1)
         self.indptr_csa = i32(t + 1)
         self.indptr_hca = i32(t + 1)
@@ -752,6 +763,10 @@ class _V4SGLangVerifyGraphBuffers:
         self.n_hca = i32(s)
         self.batch_id = i32(t)
         self.block_tables = i32(s, self.max_blocks)
+        # Ring-emulating SWA block table (project 024): [s, max_blocks], every
+        # column = the request's ring slot; paged block_size = cs. Persistent so
+        # its address is stable across CUDA-graph replay.
+        self.swa_block_tables = i32(s, self.max_blocks)
 
         self.indptr_extend = i32(t + 1)
         self.indptr_prefix_swa = i32(t + 1)
@@ -968,6 +983,35 @@ def _build_block_tables(
     ).to(torch.int32)
 
 
+def _build_swa_ring_block_tables(
+    state_slot_gpu: torch.Tensor,
+    max_blocks: int,
+    out_gpu: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Ring-emulating SWA block table for the paged SWA ABI (project 024).
+
+    ATOM #1423 rewrote the shared V4 SWA path (index kernels, ``swa_write`` and
+    the model ``_attn_core``) to content-address SWA via ``swa_block_tables``:
+    ``swa_kv[swa_block_tables[bid, pos // block_size] * block_size + pos % block_size]``.
+    The sglang/vllm plugins keep the original per-request **ring** pool (a small
+    ``[num_slots, cs]`` buffer, correct without radix cache). To speak the new
+    paged ABI without changing any shared kernel, map every logical block of a
+    request to that request's single ring slot and pass ``block_size = cs``:
+    the paged offset then collapses to the exact ring ``slot * cs + pos % cs``.
+
+    Returns an ``[bs, max_blocks]`` int32 table with every column equal to the
+    request's ``state_slot``. ``out_gpu`` (a persistent buffer) is filled in
+    place for CUDA-graph capture safety; otherwise a contiguous tensor is
+    allocated (eager path).
+    """
+    bs = int(state_slot_gpu.shape[0])
+    src = state_slot_gpu.view(bs, 1).expand(bs, max_blocks)
+    if out_gpu is not None:
+        out_gpu[:bs, :max_blocks].copy_(src)
+        return out_gpu[:bs, :max_blocks]
+    return src.contiguous()
+
+
 def build_atom_v4_decode_graph_metadata_from_sglang(
     forward_batch,
     positions: torch.Tensor,
@@ -1102,6 +1146,11 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.reset_slots = set()
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr, bs)
+    # Ring-emulating SWA block table (paged ABI, block_size = cs). Filled into
+    # the persistent buffer so the captured decode graph replays a stable addr.
+    md.swa_block_tables = _build_swa_ring_block_tables(
+        md.state_slot_mapping, bufs.max_blocks, out_gpu=bufs.swa_block_tables.gpu
+    )
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_pad, t_pad)
     n_csa = (seq_np // 4).astype(np.int32)
@@ -1140,7 +1189,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
 
     positions_gpu = positions[:t_pad]
     write_v4_paged_decode_indices(
-        state_slot_per_seq=md.state_slot_mapping,
+        block_tables=md.swa_block_tables,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
@@ -1151,7 +1200,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         hca_indices=bufs.idx_hca.gpu,
         T=t_pad,
         win=win,
-        cs=int(md.swa_cs),
+        block_size=int(md.swa_cs),
     )
     write_v4_decode_hca_compress_tail(
         batch_id_per_token=md.batch_id_per_token,
@@ -1357,6 +1406,9 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.reset_slots = set()
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = bufs.state_slot.gpu[:bs]
+    md.swa_block_tables = _build_swa_ring_block_tables(
+        md.state_slot_mapping, bufs.max_blocks, out_gpu=bufs.swa_block_tables.gpu
+    )
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_np, total)
 
@@ -1410,6 +1462,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         state_slot_per_seq=md.state_slot_mapping,
         n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=block_tables,
+        swa_block_tables=md.swa_block_tables,
         extend_indptr=ext_indptr,
         prefix_swa_indptr=swa_indptr,
         prefix_csa_indptr=csa_indptr,
@@ -1420,7 +1473,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         prefix_hca_indices=bufs.idx_prefix_hca.gpu,
         T=total,
         win=win,
-        cs=cs,
+        block_size=cs,
         swa_pages=int(md.swa_pages),
     )
     md.kv_indices_extend = bufs.idx_extend.gpu
@@ -1591,6 +1644,10 @@ def build_atom_v4_attention_metadata_from_sglang(
         )
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device=device)
+    # Ring-emulating SWA block table for the paged ABI (eager path: alloc ok).
+    md.swa_block_tables = _build_swa_ring_block_tables(
+        md.state_slot_mapping, int(block_tables.shape[1])
+    )
     md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
     md.n_committed_hca_per_seq_cpu = (seq_np // 128).astype(np.int32)
     md.n_committed_csa_per_seq = torch.from_numpy(md.n_committed_csa_per_seq_cpu).to(
@@ -1650,7 +1707,7 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device
     )
     write_v4_paged_decode_indices(
-        state_slot_per_seq=md.state_slot_mapping,
+        block_tables=md.swa_block_tables,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
@@ -1661,7 +1718,7 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         hca_indices=hca_indices,
         T=len(batch_np),
         win=win,
-        cs=cs,
+        block_size=cs,
     )
     # Fill HCA compressed section on CPU for the first-cut eager bridge.
     # `write_v4_paged_decode_indices` writes the SWA prefix at the TAIL of each
@@ -1752,6 +1809,7 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         state_slot_per_seq=md.state_slot_mapping,
         n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=block_tables,
+        swa_block_tables=md.swa_block_tables,
         extend_indptr=t(ext_indptr_np),
         prefix_swa_indptr=t(swa_indptr_np),
         prefix_csa_indptr=t(csa_indptr_np),
@@ -1762,7 +1820,7 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        cs=cs,
+        block_size=cs,
         swa_pages=int(md.swa_pages),
     )
     md.kv_indices_extend = ext_indices[: int(ext_indptr_np[-1])]

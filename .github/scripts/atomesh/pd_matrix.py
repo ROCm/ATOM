@@ -59,6 +59,17 @@ def parse_model_filter(value: str | None) -> set[str] | None:
     return models or None
 
 
+def parse_case_filter(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    cases = {
+        item.strip()
+        for item in value.split(",")
+        if item.strip() and item.strip().lower() != "all"
+    }
+    return cases or None
+
+
 def model_path_env_key(model_name: str) -> str:
     suffix = re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_").upper()
     return f"ATOMESH_MODEL_PATH_{suffix}"
@@ -70,9 +81,13 @@ def resolve_model_path(model_name: str, model_cfg: dict[str, Any]) -> str:
     return resolve_env_refs(model_path) if "${" in model_path else model_path
 
 
-def resolve_env_refs(value: str) -> str:
+def resolve_env_refs(value: str, preserve_names: set[str] | None = None) -> str:
+    preserve_names = preserve_names or set()
+
     def expand_env(match: re.Match[str]) -> str:
         name = match.group(1)
+        if name in preserve_names:
+            return match.group(0)
         if name not in os.environ:
             raise ValueError(f"Environment variable {name} is not set")
         return os.environ[name].strip()
@@ -80,13 +95,18 @@ def resolve_env_refs(value: str) -> str:
     return ENV_REF_RE.sub(expand_env, value)
 
 
-def resolve_env_refs_in_value(value: Any) -> Any:
+def resolve_env_refs_in_value(
+    value: Any, preserve_names: set[str] | None = None
+) -> Any:
     if isinstance(value, str) and "${" in value:
-        return resolve_env_refs(value)
+        return resolve_env_refs(value, preserve_names)
     if isinstance(value, list):
-        return [resolve_env_refs_in_value(item) for item in value]
+        return [resolve_env_refs_in_value(item, preserve_names) for item in value]
     if isinstance(value, dict):
-        return {key: resolve_env_refs_in_value(item) for key, item in value.items()}
+        return {
+            key: resolve_env_refs_in_value(item, preserve_names)
+            for key, item in value.items()
+        }
     return value
 
 
@@ -172,6 +192,7 @@ def role_env(
         model_cfg.get("env", {}).get(role, {}),
         suite_cfg.get("env", {}).get(role, {}),
     )
+    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP"})
     return {str(key): str(value) for key, value in env.items()}
 
 
@@ -348,6 +369,7 @@ def build_cells(
     *,
     suite: str,
     model_filter: set[str] | None,
+    case_filter: set[str] | None,
     override_image: str | None,
     override_benchmark_concurrency: list[int] | None,
     override_eval_concurrency: list[int] | None,
@@ -358,6 +380,8 @@ def build_cells(
             continue
         suites = model_cfg.get("suites", {})
         for suite_cfg in normalize_list(suites.get(suite)):
+            if case_filter and str(suite_cfg.get("name", "")) not in case_filter:
+                continue
             cells.append(
                 build_cell(
                     cfg=cfg,
@@ -392,6 +416,11 @@ def main() -> int:
         default=os.environ.get("MODEL_NAME") or None,
         help="Optional model filter: one model name, comma-separated model names, or all",
     )
+    parser.add_argument(
+        "--case",
+        default=os.environ.get("ATOMESH_CASE_NAME") or None,
+        help="Optional case filter: one case name, comma-separated case names, or all",
+    )
     parser.add_argument("--image", default=os.environ.get("ATOMESH_IMAGE") or None)
     parser.add_argument(
         "--benchmark-concurrency",
@@ -416,6 +445,7 @@ def main() -> int:
         config,
         suite=args.suite,
         model_filter=parse_model_filter(args.model),
+        case_filter=parse_case_filter(args.case),
         override_image=args.image,
         override_benchmark_concurrency=benchmark_concurrency or None,
         override_eval_concurrency=eval_concurrency or None,

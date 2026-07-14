@@ -767,6 +767,18 @@ class Scheduler:
         ):
             seq = self.waiting.popleft()
 
+            # Client disconnected before this seq ever ran: it holds no KV yet
+            # and needs no forward pass, so finish it outright and route via
+            # `_rejected` (emits a finished RequestOutput through the same
+            # output_queue). Must intercept here BEFORE the waiting->running
+            # promotion below, which would overwrite ABORTED with RUNNING and
+            # lose the abort intent.
+            if seq.status == SequenceStatus.ABORTED:
+                seq.status = SequenceStatus.FINISHED
+                seq.leave_reason = "aborted"
+                self._rejected.append(seq)
+                continue
+
             # Drop seqs the static-capacity check at submit-time flagged as
             # permanently unschedulable (oversized prompt, exhausted pool,
             # etc.). They've already been warned; mark FINISHED + record the
@@ -1430,6 +1442,11 @@ class Scheduler:
 
             num_tokens = seq.num_tokens - self.mtp_k - num_rejected
             leave_reason = None
+            # Client disconnected -> finish now via the normal stop path (frees
+            # KV blocks, emits a finished RequestOutput). A natural stop below
+            # may still overwrite the reason; either way the seq terminates.
+            if seq.status == SequenceStatus.ABORTED:
+                leave_reason = "aborted"
             # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
             # only compares draft vs target_argmax for acceptance. So when
             # the verified token is EOS the kernel still emits 1+ accepted
