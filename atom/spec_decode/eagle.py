@@ -902,9 +902,11 @@ class EagleProposer:
         # corrupts the verified/target output — losslessness is preserved), so
         # clamping is safe and avoids an index_select GPU fault. No-op on the
         # normal path where indices are already in range.
-        total_tokens = int(cu_seqlens_q[-1])
-        if total_tokens > 0:
-            token_indices = token_indices.clamp_(0, total_tokens - 1)
+
+        if self.use_dspark:
+            total_tokens = int(cu_seqlens_q[-1])
+            if total_tokens > 0:
+                token_indices = token_indices.clamp_(0, total_tokens - 1)
 
         return token_indices
 

@@ -2434,7 +2434,8 @@ class ModelRunner:
         """
         if self.config.parallel_config.data_parallel_size <= 1:
             return
-        if not hasattr(self, "drafter"):
+        drafter = getattr(self, "drafter", None)
+        if drafter is None or not getattr(drafter, "use_dspark", False):
             return
         import torch.distributed as dist
 
