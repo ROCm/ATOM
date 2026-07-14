@@ -34,20 +34,9 @@ from atom.model_engine.engine_core import EngineCore
 
 logger = logging.getLogger("atom")
 
-
-def _batch_needs_output(batch) -> bool:
-    """True if the batch produces tokens the head must consume.
-
-    A pure-prefill batch where every seq is a middle chunk (no final chunk)
-    produces no useful token — the last stage can skip sampling and the head
-    can skip recv_tokens.  Decode batches always need output.
-    """
-    if batch.total_seqs_num_decode > 0:
-        return True
-    final = batch.is_final_chunk
-    if final is None:
-        return True
-    return any(final)
+# Collect poll timeout when the step made no other progress: bounds both
+# new-request admission latency and busy-spinning while batches are in flight.
+_PP_HEAD_IDLE_POLL_MS = 1
 
 
 class PPEngineCoreProc(EngineCore):
@@ -106,6 +95,7 @@ class PPEngineCoreProc(EngineCore):
 
     def _pp_head_step(self):
         # ---- Launch: fill the pipeline up to pp_size in-flight batches. ----
+        launched = 0
         while len(self._in_flight) < self.pp_size:
             result = self.scheduler.schedule()
 
@@ -119,7 +109,7 @@ class PPEngineCoreProc(EngineCore):
             if scheduled_batch is None or len(scheduled_batch.req_ids) == 0:
                 break
 
-            needs_output = _batch_needs_output(scheduled_batch)
+            needs_output = scheduled_batch.produces_output()
             # Hand the scheduled batch to every downstream stage (CPU/ZMQ), then
             # run this stage's layers; workers NCCL-send hidden downstream and
             # (non-last) produce no logits. The forward returns fast — it does
@@ -129,39 +119,49 @@ class PPEngineCoreProc(EngineCore):
             # Block re-decoding these seqs until their tokens come back.
             self.scheduler.mark_pp_inflight(scheduled_batch)
             self._in_flight.append((scheduled_batch, seqs, needs_output))
+            launched += 1
 
-        # ---- Collect: drain completed batches from the FIFO head. ----
-        # Non-output batches (pure middle-chunk prefill) skip the ZMQ
-        # token round-trip entirely — the last stage never sampled, so
-        # there is nothing to receive. Drain all consecutive non-output
-        # entries, then block on the first output-producing batch.
-        if not self._in_flight:
-            return
-
+        # ---- Collect: drain the FIFO head without blocking the stage. ----
+        # Non-output batches (middle-chunk prefill) never produce tokens, so
+        # release them immediately. For output batches, poll rather than block:
+        # if the oldest isn't ready, return to the outer loop to pull input and
+        # launch more, keeping admission decoupled from collection.
+        poll_ms = 0 if launched else _PP_HEAD_IDLE_POLL_MS
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
-            if needs_output:
-                fwd_out = self.pp_transport.recv_tokens()
+            if not needs_output:
                 self._in_flight.popleft()
                 self.scheduler.release_pp_inflight(scheduled_batch)
-                finished_seqs = self.scheduler.postprocess(
-                    seqs.values(),
-                    fwd_out,
-                    stream_output_queue=self.stream_output_queue,
-                    batch=scheduled_batch,
-                )
-                try:
-                    while not self.stream_output_queue.empty():
-                        stream_outputs = self.stream_output_queue.get_nowait()
-                        self.output_queue.put_nowait(("STREAM", stream_outputs))
-                except queue.Empty:
-                    pass
-                if finished_seqs:
-                    self.output_queue.put_nowait(finished_seqs)
+                continue
+
+            fwd_out = self.pp_transport.recv_tokens(timeout_ms=poll_ms)
+            if fwd_out is None:
                 break
-            else:
-                self._in_flight.popleft()
-                self.scheduler.release_pp_inflight(scheduled_batch)
+            poll_ms = 0
+
+            # Tokens return in launch order (single FIFO PULL socket), so the
+            # output must match the FIFO head; fail fast if that ever breaks.
+            assert list(fwd_out.req_ids) == list(scheduled_batch.req_ids), (
+                f"PP token ordering violated: received {list(fwd_out.req_ids)}, "
+                f"expected FIFO head {list(scheduled_batch.req_ids)}"
+            )
+
+            self._in_flight.popleft()
+            self.scheduler.release_pp_inflight(scheduled_batch)
+            finished_seqs = self.scheduler.postprocess(
+                seqs.values(),
+                fwd_out,
+                stream_output_queue=self.stream_output_queue,
+                batch=scheduled_batch,
+            )
+            try:
+                while not self.stream_output_queue.empty():
+                    stream_outputs = self.stream_output_queue.get_nowait()
+                    self.output_queue.put_nowait(("STREAM", stream_outputs))
+            except queue.Empty:
+                pass
+            if finished_seqs:
+                self.output_queue.put_nowait(finished_seqs)
 
     # ---- downstream / last stage -------------------------------------------
     def _downstream_busy_loop(self):
@@ -180,7 +180,7 @@ class PPEngineCoreProc(EngineCore):
                 if batch is None:
                     continue
                 fwd_out = self.runner_mgr.call_func("forward", batch, wait_out=True)
-                if self.is_last and _batch_needs_output(batch):
+                if self.is_last and batch.produces_output():
                     self.pp_transport.send_tokens(fwd_out)
         finally:
             try:
