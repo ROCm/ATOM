@@ -185,6 +185,90 @@ def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
     attention.process_weights_after_loading = wrapped
 
 
+def _patch_vllm_harmony_parser_manager() -> None:
+    """Keep GPT-OSS harmony parsing enabled on vLLM builds with parser manager.
+
+    Some vLLM versions route chat-completions parsing through
+    ``ParserManager.get_parser``. Its contract says ``is_harmony=True`` should
+    always return ``HarmonyParser``, but the implementation can return ``None``
+    first when no explicit tool/reasoning parser is configured. That exposes
+    raw GPT-OSS analysis/final channel text as ``message.content`` and breaks
+    accuracy evaluation.
+    """
+    try:
+        from vllm.parser import ParserManager
+        from vllm.parser.harmony import HarmonyParser
+    except ImportError:
+        return
+
+    original = ParserManager.get_parser.__func__
+    if getattr(original, "_atom_harmony_parser_patched", False):
+        return
+
+    def get_parser(
+        cls,
+        tool_parser_name=None,
+        reasoning_parser_name=None,
+        enable_auto_tools=False,
+        model_name=None,
+        is_harmony=False,
+    ):
+        if is_harmony and not tool_parser_name and not reasoning_parser_name:
+            from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
+
+            HarmonyParser.reasoning_parser_cls = GptOssReasoningParser
+            HarmonyParser.tool_parser_cls = None
+            return HarmonyParser
+        return original(
+            cls,
+            tool_parser_name=tool_parser_name,
+            reasoning_parser_name=reasoning_parser_name,
+            enable_auto_tools=enable_auto_tools,
+            model_name=model_name,
+            is_harmony=is_harmony,
+        )
+
+    setattr(get_parser, "_atom_harmony_parser_patched", True)
+    ParserManager.get_parser = classmethod(get_parser)
+
+    original_parse = HarmonyParser.parse
+    if getattr(original_parse, "_atom_harmony_parse_fallback_patched", False):
+        return
+
+    def parse_with_raw_content_fallback(
+        self,
+        model_output,
+        request,
+        enable_auto_tools=False,
+        model_output_token_ids=(),
+    ):
+        try:
+            reasoning, content, tool_calls = original_parse(
+                self,
+                model_output,
+                request,
+                enable_auto_tools=enable_auto_tools,
+                model_output_token_ids=model_output_token_ids,
+            )
+        except Exception as exc:
+            if exc.__class__.__name__ != "HarmonyError":
+                raise
+            return None, model_output or None, None
+
+        if reasoning:
+            return reasoning, reasoning, tool_calls
+        if content is None and model_output:
+            return reasoning, model_output, tool_calls
+        return reasoning, content, tool_calls
+
+    setattr(
+        parse_with_raw_content_fallback,
+        "_atom_harmony_parse_fallback_patched",
+        True,
+    )
+    HarmonyParser.parse = parse_with_raw_content_fallback
+
+
 def register_model() -> None:
     if disable_vllm_plugin:
         logger.info("Disable ATOM model register")
@@ -195,6 +279,7 @@ def register_model() -> None:
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
+    _patch_vllm_harmony_parser_manager()
 
     import vllm.model_executor.models.registry as vllm_model_registry
 
