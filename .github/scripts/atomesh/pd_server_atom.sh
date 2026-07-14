@@ -66,6 +66,12 @@ if [[ -n "${DECODE_EXTRA_SERVER_ARGS}" ]]; then
   DECODE_SERVER_ARGS="${DECODE_SERVER_ARGS:+${DECODE_SERVER_ARGS} }${DECODE_EXTRA_SERVER_ARGS}"
 fi
 
+has_cli_flag() {
+  local args="$1"
+  local flag="$2"
+  [[ " ${args} " == *" ${flag} "* ]]
+}
+
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
 CONC_LIST="${CONC_LIST:-4,8}"
@@ -422,7 +428,9 @@ start_router() {
   esac
 
   local -a router_rank_mapping_args=()
-  if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]]; then
+  if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]] \
+    && has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
+    && has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"; then
     router_rank_mapping_args=(
       --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"
       --dp-aware
