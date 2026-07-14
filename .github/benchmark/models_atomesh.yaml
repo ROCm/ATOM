@@ -171,29 +171,6 @@ models:
           run_eval: true
           eval_concurrency: [65]
 
-        #- name: glm-52-mxfp4-2p1d-dpa-tp4
-        #  topology: 2p1d_dpa
-        #  pd_worker_layout: multi_node
-        #  nodes: "${ATOMESH_2P1D_NODES}"
-        #  isl: [8192]
-        #  osl: 1024
-        #  concurrency: [256, 512, 768, 1024]
-        #  server:
-        #    common_args:
-        #      decode_max_num_seqs: 1024
-        #  prefill:
-        #    workers: 2
-        #    tp: 4
-        #    extra_args: "--enable-dp-attention --enable-tbo prefill"
-        #  decode:
-        #    workers: 1
-        #    tp: 4
-        #    extra_args: "--enable-dp-attention"
-        #  benchmark:
-        #    wait_server_timeout: 1800
-        #  run_eval: true
-        #  eval_concurrency: [65]
-
     accuracy:
       task: gsm8k
       fewshot: 20
