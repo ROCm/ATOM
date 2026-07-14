@@ -58,6 +58,18 @@ def normalize_e4m3fn_to_e4m3fnuz(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def _double_scale(scale: torch.Tensor) -> torch.Tensor:
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0_dtype is not None and scale.dtype == e8m0_dtype:
+            scale_u8 = scale.view(torch.uint8)
+            doubled = torch.where(
+                (scale_u8 == 0) | (scale_u8 == 0xFF),
+                scale_u8,
+                torch.clamp(scale_u8.to(torch.int16) + 1, max=0xFE).to(torch.uint8),
+            )
+            return doubled.view(e8m0_dtype)
+        return scale * 2.0
+
     # assert weight.dtype == torch.float8_e4m3fn
     # The bits pattern 10000000(-128) represents zero in e4m3fn
     # but NaN in e4m3fnuz. So here we set it to 0.
@@ -71,9 +83,9 @@ def normalize_e4m3fn_to_e4m3fnuz(
     # the e4m3fn value, so we should double the scaling factor to
     # get the same dequantized value.
     # https://onnx.ai/onnx/technical/float8.html
-    weight_scale = weight_scale * 2.0
+    weight_scale = _double_scale(weight_scale)
     if input_scale is not None:
-        input_scale = input_scale * 2.0
+        input_scale = _double_scale(input_scale)
     return weight, weight_scale, input_scale
 
 
