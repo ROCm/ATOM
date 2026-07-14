@@ -766,9 +766,7 @@ class ParallelConfig:
     """ZMQ endpoint where the head receives sampled tokens back from the last
     stage. Populated by CoreManager for pp_size > 1."""
     world_size: int = field(init=False)
-    """Vestigial: never assigned or read. Worker count is derived directly in
-    engine_core from tensor_parallel_size x pipeline_parallel_size x
-    prefill_context_parallel_size, not from this field."""
+    """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 

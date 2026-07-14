@@ -1359,15 +1359,13 @@ class Scheduler:
         # generated token. Keep the old partial state so we can drop that stale
         # token later in this loop.
         prev_partial_ids: set[int] = set()
-        # Pipeline-parallel: middle-chunk req_ids whose sampled token must be
-        # dropped. Frozen from batch.is_final_chunk, not the live
-        # seq.is_partial_prefill (which a later schedule() may already have
-        # flipped while this batch was in flight).
+        # Middle-chunk req_ids whose sampled token must be dropped, frozen from
+        # batch.is_final_chunk (a later schedule() may have already flipped the
+        # live seq.is_partial_prefill while this batch was in flight).
         pp_middle_chunk_ids: set[int] = set()
         if batch is not None and self.advance_on_schedule:
-            # Progress already advanced at schedule time; here we only publish
-            # prefix-cache hashes (KV now computed) using the chunk's pre-advance
-            # offset, and record which chunks were non-final.
+            # Progress already advanced at schedule time; publish prefix-cache
+            # hashes at the chunk's pre-advance offset and record non-final chunks.
             running_by_id = {seq.id: seq for seq in self.running}
             final = batch.is_final_chunk
             for i, req_id in enumerate(batch.req_ids):

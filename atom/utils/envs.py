@@ -284,12 +284,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
-    # --- Pipeline-parallel send-allgather ---
-    # At a PP boundary the hidden_states/residual are TP-replicated, so each of
-    # the tp_size sender ranks otherwise transmits an identical full copy. When
-    # enabled, each rank sends only its 1/tp_size slice and the receiver rebuilds
-    # the full tensor via a TP-group all-gather, cutting PP link traffic by
-    # tp_size. Default on; set "0" to fall back to full-tensor sends.
+    # PP-boundary hidden_states/residual are TP-replicated; when on, each rank
+    # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
+    # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
 }
 
