@@ -286,13 +286,6 @@ class ScheduledBatch:
             else [seq.num_cached_tokens for seq in seqs.values()]
         )
 
-        # Per-seq flag (prefill batches only): True if this chunk finishes the
-        # prompt (produces the real first token), False if it is a middle chunk
-        # whose sampled token must be discarded. Under pipeline-parallel
-        # schedule-time advancement the live seq.is_partial_prefill may already
-        # have been flipped by a later schedule() before this batch's output is
-        # postprocessed, so the decision is frozen here. None on decode/pp=1
-        # batches (legacy postprocess path).
         self.is_final_chunk = is_final_chunk
 
         # context_lens: for prefill seqs, use num_cached_tokens + num_scheduled_tokens
@@ -496,20 +489,15 @@ class Scheduler:
         # pure-decode steps (the common case).
         self._partial_prefill_count: int = 0
 
-        # Pipeline-parallel (CPP P2) schedule-time advancement. When True, the
-        # head EngineCore keeps up to pp_size batches in flight, so schedule()
-        # must advance chunked-prefill progress (num_cached_tokens /
-        # is_partial_prefill) itself instead of deferring it to postprocess —
-        # otherwise back-to-back schedule() calls would re-issue the same chunk.
-        # pp=1 leaves this False → byte-identical legacy path.
+        # Under PP the head keeps pp_size batches in flight, so schedule() must
+        # advance chunked-prefill progress itself rather than defer it to
+        # postprocess, else back-to-back schedules re-issue the same chunk.
         self.advance_on_schedule: bool = (
             getattr(config, "pipeline_parallel_size", 1) > 1
         )
-        # Seq ids whose sampled token is in flight (a decode step, or a final
-        # prefill chunk producing the first token). The decode scheduler skips
+        # Seq ids whose sampled token is in flight; the decode scheduler skips
         # them until the head releases the id after postprocess, so a seq is
-        # never decoded against a token that has not been appended yet. Mirrors
-        # vLLM's `next_decode_eligible_step = step + pp_size` guard.
+        # never decoded against a token not yet appended.
         self._pp_inflight_token_block: set[int] = set()
 
         from atom.utils.forward_context import get_kvconnector
