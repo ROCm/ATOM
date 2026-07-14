@@ -246,7 +246,12 @@ def build_cell(
 
     nodes = resolve_nodes(suite_cfg.get("nodes"))
     if allow_auto_nodes:
-        if nodes and len(nodes) < required_nodes:
+        if not nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs a non-empty "
+                "Spur nodelist"
+            )
+        if len(nodes) < required_nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs at least "
                 f"{required_nodes} node(s)"
