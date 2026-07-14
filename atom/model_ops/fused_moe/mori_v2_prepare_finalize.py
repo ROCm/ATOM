@@ -30,7 +30,9 @@ import torch.distributed as dist
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.utils.forward_context import get_forward_context
 from aiter import QuantType
+from aiter.dist.parallel_state import get_dp_group
 
 try:
     import mori
@@ -264,9 +266,29 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
 
 class MoriV2ModularKernel(mk.FusedMoEModularKernel):
-    """Modular kernel for the v2 path: prepare() already trims to the exact
-    received-token count, so skip the graph_bs-based dead-tail trim (which would
-    otherwise cut valid rows)."""
+    """Modular kernel for the v2 path.
+
+    Direction-1 grid shrink: the v2 dispatch arena (recv_x) is padded to a huge
+    static token_num (ws * max_num_inp_token_per_rank), but the received tokens
+    occupy only the first ``total_recv`` rows. Under a uniform all-ranks-decode
+    batch we trim the buffer to the static ``graph_bs * topk * dp`` bound (the
+    V1/base policy). This shrinks token_num -> the grid-bound aiter kernels
+    (route-ksplit preshuffle, gather-reduce) launch a small grid sized to the
+    decode bucket instead of the full arena, and the single-block route/psum
+    kernels shrink too.
+
+    Correctness / capture-safety:
+      * ``graph_bs`` is a python int, constant per captured cudagraph, so the
+        sliced shape is static across capture/replay and no GPU->CPU sync is
+        needed (unlike reading the device ``total_recv``).
+      * Under uniform decode each of ``dp`` ranks holds ``graph_bs`` tokens, each
+        routed to ``topk`` experts; worst case every route lands on this rank, so
+        ``total_recv <= graph_bs * topk * dp``. The trim therefore never drops a
+        valid row, and the aiter kernels' device-side ``num_valid_routes`` guard
+        (direction 2) still skips the exact within-buffer tail [total_recv, bound).
+      * Only fires when ``all_ranks_decode`` (mixed/prefill batches keep the full
+        buffer), matching the base-class guard.
+    """
 
     def _maybe_trim_dispatch_output(
         self,
@@ -277,6 +299,23 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         topk_ids: torch.Tensor,
         expert_tokens_meta,
     ):
+        context = get_forward_context().context
+        if context is None:
+            return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
+        dp_size = get_dp_group().world_size
+        topk = topk_ids.shape[1]
+        # graph_bs keeps the trimmed shape consistent during capture/replay.
+        total_valid_tokens = context.graph_bs * topk * dp_size
+        all_ranks_decode = getattr(
+            context, "dp_uniform_decode", not context.is_prefill
+        )
+        if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
+            dispatch_a1 = dispatch_a1[:total_valid_tokens]
+            dispatch_ids = dispatch_ids[:total_valid_tokens]
+            dispatch_weights = dispatch_weights[:total_valid_tokens]
+            if dispatch_scale is not None:
+                dispatch_scale = dispatch_scale[:total_valid_tokens]
         return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
 
