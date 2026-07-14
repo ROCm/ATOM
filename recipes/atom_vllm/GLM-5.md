@@ -12,28 +12,6 @@ Use the latest image for all the recipes below.
 docker pull rocm/atom-dev:vllm-latest
 ```
 
-## GLM-5.1-FP8 Recipe
-The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
-
-```bash
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-
-vllm serve zai-org/GLM-5.1-FP8 \
-    --host localhost \
-    --port 8000 \
-    --async-scheduling \
-    --load-format fastsafetensors \
-    --trust-remote-code \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-    --kv-cache-dtype fp8 \
-    --tensor-parallel-size 8 \
-    --default-chat-template-kwargs '{"enable_thinking":false}' \
-    --max-num-batched-tokens 16384 \
-    --max-model-len 16384 \
-    --gpu-memory-utilization 0.9 \
-    --no-enable-prefix-caching
-```
-
 ## GLM-5.2-FP8 Recipe
 GLM-5.2-FP8 is supported on both MI350X and MI300X GPUs. The recipes may vary between the two GPU platforms due to differences in their capabilities. Check recipes below for more details.
 ### Deployment on MI350X GPUs
@@ -130,9 +108,29 @@ vllm serve amd/GLM-5.2-MXFP4 \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 ```
 
+## GLM-5.1-FP8 Recipe
+The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
-## Step 3: Performance Benchmark
+vllm serve zai-org/GLM-5.1-FP8 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 8 \
+    --default-chat-template-kwargs '{"enable_thinking":false}' \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching
+```
+
+## Performance Benchmark
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash
 ISL=1000
@@ -168,7 +166,7 @@ profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_p
     "${your-profiler-dir}")
 ```
 
-## Step 4: Accuracy Validation
+## Accuracy Validation
 
 The sparse MLA mechanism contains an indexer that selects the top-k tokens it deems most relevant for each query from the KV cache. For GLM-5, the top-2048 tokens are selected from the context by the indexer. To evaluate its accuracy, it is recommended to use requests with context longer than 2048 so that the indexer can be tested. In `lm_eval`, this can be set by increasing the `num_fewshot=20` to increase the context length.
 
