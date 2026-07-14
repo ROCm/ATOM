@@ -175,12 +175,19 @@ torch::Tensor vmm_tensor(int64_t id, int64_t nbytes, int device) {
 }
 
 // Device-to-device copy between two raw device pointers (peer-mapped ok). Used
-// by the connector to gather/scatter KV blocks to/from the VMM staging region.
+// by the connector to gather/scatter KV blocks over XGMI (scale-up / fd path).
+// NOTE: hipMemcpy is unsafe on a *fabric* mapping (it can livelock and wedge the
+// GPU/vPOD on gfx1250) -- use vmm_copy_kernel for the fabric / scale-out path.
 void vmm_copy(int64_t dst_ptr, int64_t src_ptr, int64_t nbytes) {
   HIPCK(hipMemcpy(reinterpret_cast<void *>(dst_ptr),
                   reinterpret_cast<void *>(src_ptr),
                   static_cast<size_t>(nbytes), hipMemcpyDeviceToDevice));
 }
+
+// Explicit copy kernel (no hipMemcpy) for copying to/from a *fabric* mapping.
+// A shader-driven copy resolves the fabric peer where hipMemcpy/SDMA does not.
+// Defined in _vmm_kernels.cu (device code -> compiled by hipcc, not g++).
+void vmm_copy_kernel(int64_t dst_ptr, int64_t src_ptr, int64_t nbytes);
 
 void vmm_free(int64_t id) {
   auto it = g_regions.find(id);
@@ -205,5 +212,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("vmm_ptr", &vmm_ptr);
   m.def("vmm_tensor", &vmm_tensor);
   m.def("vmm_copy", &vmm_copy);
+  m.def("vmm_copy_kernel", &vmm_copy_kernel);
   m.def("vmm_free", &vmm_free);
 }

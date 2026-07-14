@@ -26,10 +26,12 @@ def _ext():
     from torch.utils.cpp_extension import load
 
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
-    src = os.path.join(os.path.dirname(__file__), "_vmm_ext.cpp")
+    here = os.path.dirname(__file__)
+    # _vmm_ext.cpp is host code (g++); _vmm_kernels.cu is device code (hipcc).
+    srcs = [os.path.join(here, "_vmm_ext.cpp"), os.path.join(here, "_vmm_kernels.cu")]
     return load(
         name="atom_vmm_ext",
-        sources=[src],
+        sources=srcs,
         extra_include_paths=[os.path.join(rocm, "include")],
         extra_ldflags=[f"-L{os.path.join(rocm, 'lib')}", "-lamdhip64"],
         verbose=False,
@@ -52,8 +54,15 @@ def supported_fabric(device: int = 0) -> bool:
 
 
 def copy(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
-    """Device-to-device copy between raw device pointers (peer-mapped ok)."""
+    """D2D copy over XGMI (scale-up). Uses hipMemcpy; do NOT use on a fabric
+    mapping (can livelock/wedge the GPU on gfx1250) -- use ``copy_kernel``."""
     _ext().vmm_copy(dst_ptr, src_ptr, nbytes)
+
+
+def copy_kernel(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Shader-copy for a *fabric* mapping (scale-out / IFOE). A kernel resolves
+    the fabric peer where hipMemcpy/SDMA livelocks."""
+    _ext().vmm_copy_kernel(dst_ptr, src_ptr, nbytes)
 
 
 class VmmBuffer:

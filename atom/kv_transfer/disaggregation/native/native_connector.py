@@ -309,7 +309,9 @@ class NativeConnector(KVConnectorBase):
         if not ok:
             logger.error("[native] no WRITE_DONE for req %s", req_id)
             return
-        self._scatter(staging, meta.local_block_ids, meta.local_slot_index)
+        # fabric mappings must be copied with a kernel, never hipMemcpy
+        copy = vmm.copy_kernel if use_fabric else vmm.copy
+        self._scatter(staging, meta.local_block_ids, meta.local_slot_index, copy)
         with self._lock:
             self.done_recving.add(req_id)
 
@@ -334,20 +336,20 @@ class NativeConnector(KVConnectorBase):
         s.close()
         return resp[:1] == _MSG_WRITE_DONE
 
-    def _scatter(self, staging, dst_block_ids, dst_slot) -> None:
+    def _scatter(self, staging, dst_block_ids, dst_slot, copy) -> None:
         off = 0
         for base, bpb in self._block_regions:
             for db in dst_block_ids:
-                vmm.copy(base + db * bpb, staging.data_ptr + off, bpb)
+                copy(base + db * bpb, staging.data_ptr + off, bpb)
                 off += bpb
         for base, bps in self._slot_regions:
             if dst_slot >= 0:
-                vmm.copy(base + dst_slot * bps, staging.data_ptr + off, bps)
+                copy(base + dst_slot * bps, staging.data_ptr + off, bps)
             off += bps
         if self._state_slot_bytes and dst_slot >= 0 and self._scatter_slot is not None:
             pool_idx = self._acquire_state_slot()
             if pool_idx >= 0:
-                vmm.copy(
+                copy(
                     self._state_base + pool_idx * self._state_slot_bytes,
                     staging.data_ptr + off,
                     self._state_slot_bytes,
@@ -401,7 +403,7 @@ class NativeConnector(KVConnectorBase):
                     fds[0], self._req_bytes(nblocks), self.device
                 )
                 self._imported[fds[0]] = dst
-            self._process(conn, req, dst)
+            self._process(conn, req, dst, vmm.copy)  # XGMI: hipMemcpy
         except Exception:
             logger.exception("[native] producer unix handler error")
         finally:
@@ -421,19 +423,19 @@ class NativeConnector(KVConnectorBase):
             dst = vmm.VmmBuffer.import_fabric(
                 handle, self._req_bytes(nblocks), self.device
             )
-            self._process(conn, req, dst)
+            self._process(conn, req, dst, vmm.copy_kernel)  # fabric: kernel copy
         except Exception:
             logger.exception("[native] producer tcp handler error")
         finally:
             conn.close()
 
-    def _process(self, conn: socket.socket, req: dict, dst) -> None:
-        self._gather(dst, req["transfer_id"])
+    def _process(self, conn: socket.socket, req: dict, dst, copy) -> None:
+        self._gather(dst, req["transfer_id"], copy)
         conn.sendall(_MSG_WRITE_DONE + msgpack.dumps({"req_id": req["req_id"]}))
         with self._lock:
             self.done_sending.add(req["req_id"])
 
-    def _gather(self, staging, transfer_id: int) -> None:
+    def _gather(self, staging, transfer_id: int, copy) -> None:
         with self._prefills_cv:
             self._prefills_cv.wait_for(
                 lambda: transfer_id in self._prefills, timeout=_PREFILL_WAIT_S
@@ -442,18 +444,18 @@ class NativeConnector(KVConnectorBase):
         off = 0
         for base, bpb in self._block_regions:
             for sb in src_block_ids:
-                vmm.copy(staging.data_ptr + off, base + sb * bpb, bpb)
+                copy(staging.data_ptr + off, base + sb * bpb, bpb)
                 off += bpb
         for base, bps in self._slot_regions:
             if src_slot >= 0:
-                vmm.copy(staging.data_ptr + off, base + src_slot * bps, bps)
+                copy(staging.data_ptr + off, base + src_slot * bps, bps)
             off += bps
         if self._state_slot_bytes and src_slot >= 0 and self._gather_slot is not None:
             pool_idx = self._acquire_state_slot()
             if pool_idx >= 0:
                 self._gather_slot(src_slot, pool_idx)
                 torch.cuda.current_stream().synchronize()
-                vmm.copy(
+                copy(
                     staging.data_ptr + off,
                     self._state_base + pool_idx * self._state_slot_bytes,
                     self._state_slot_bytes,

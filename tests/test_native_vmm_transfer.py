@@ -122,6 +122,7 @@ def _producer_fabric(port, device, ready):
 
 def _consumer_fabric(port, device, ready, result):
     from atom.kv_transfer.disaggregation.native import VmmBuffer
+    from atom.kv_transfer.disaggregation.native import vmm
 
     torch.cuda.set_device(device)
     ready.wait(60)
@@ -131,17 +132,13 @@ def _consumer_fabric(port, device, ready, result):
     while len(handle) < 64:
         handle += s.recv(64 - len(handle))
 
-    peer = VmmBuffer.import_fabric(handle, NBYTES, device).tensor(
-        torch.bfloat16, (NB, BE)
-    )
+    peer_buf = VmmBuffer.import_fabric(handle, NBYTES, device)
     local = torch.empty(NB, BE, dtype=torch.bfloat16, device=device)
-    for i in range(NCOPY):
-        local[i % NB].copy_(peer[(i * 7) % NB])
+    # kernel copy off the fabric mapping (NOT hipMemcpy, which can wedge)
+    vmm.copy_kernel(local.data_ptr(), peer_buf.data_ptr, NBYTES)
     torch.cuda.synchronize()
 
-    ok = all(
-        local[i % NB][0].item() == float(((i * 7) % NB) % 128) for i in range(NCOPY)
-    )
+    ok = all(local[i][0].item() == float(i % 128) for i in range(NB))
     result.put(bool(ok))
     s.send(b"d")
     s.close()
