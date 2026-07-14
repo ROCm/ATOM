@@ -170,10 +170,94 @@ def _build_logical_to_physical_map(
     return torch.tensor(out_rows, dtype=torch.int32, device=physical_to_logical.device)
 
 
-def _rebalance_single_layer_global(
+def _placement_biased(
     weight_l: torch.Tensor, num_physical: int, num_gpus: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return (physical_to_logical[num_physical], phyrank[num_physical], logcnt[num_logical])."""
+    """Biased placement policy: spend the whole redundant-expert budget on FULLY
+    replicating the top-K hottest logical experts onto ALL `num_gpus` GPUs (one
+    replica per GPU), then fill remaining slots with cold experts via greedy LPT
+    packing. K is derived from the redundant budget of THIS call context:
+        K = (num_physical - num_logical) // num_gpus
+    so the hierarchical path (called per-node with phy_per_node/gpus_per_node)
+    naturally does WITHIN-NODE full replication (intra-node locality; inter-node
+    traffic for hot experts unchanged). K<=0 (no budget) -> naive fallback.
+    Top-K is read from the live per-layer load `weight_l` (online, no history).
+    Returns (p2l[num_physical], phyrank[num_physical], logcnt[num_logical]).
+    """
+    num_logical = weight_l.numel()
+    assert num_physical % num_gpus == 0
+    phy_per_gpu = num_physical // num_gpus
+    force_n = (num_physical - num_logical) // num_gpus
+    if force_n <= 0:
+        return _placement_naive(weight_l, num_physical, num_gpus)
+    assert 0 < force_n <= phy_per_gpu, f"force_n={force_n} must be in (0, {phy_per_gpu}]"
+    w = weight_l.to(torch.float32).cpu().tolist()
+    order = sorted(range(num_logical), key=lambda e: (-w[e], e))
+    hot = order[:force_n]
+    hot_set = set(hot)
+    cold = [e for e in range(num_logical) if e not in hot_set]
+
+    cnt = [0] * num_logical
+    for e in hot:
+        cnt[e] = num_gpus
+    cold_slots_total = num_physical - force_n * num_gpus  # = num_gpus*(phy_per_gpu-force_n)
+    assert cold_slots_total >= len(cold), (
+        f"not enough slots for cold experts: {cold_slots_total} < {len(cold)} "
+        f"(reduce force_n or raise num_redundant)"
+    )
+    for e in cold:
+        cnt[e] = 1
+    extra = cold_slots_total - len(cold)
+    for _ in range(extra):
+        target = max(cold, key=lambda e: w[e] / cnt[e])
+        cnt[target] += 1
+
+    # Greedy LPT pack cold replicas onto GPUs, capacity = phy_per_gpu - force_n each.
+    cap_cold = phy_per_gpu - force_n
+    cold_items = []  # (per_replica_load, expert, replica_rank)
+    for e in cold:
+        per = w[e] / cnt[e] if cnt[e] > 0 else 0.0
+        for r in range(cnt[e]):
+            cold_items.append((per, e, r))
+    cold_items.sort(key=lambda x: (-x[0], x[1], x[2]))
+    gpu_load = [0.0] * num_gpus
+    gpu_cnt = [0] * num_gpus
+    gpu_cold: list[list[tuple[int, int]]] = [[] for _ in range(num_gpus)]
+    for load, e, r in cold_items:
+        best = min(
+            (g for g in range(num_gpus) if gpu_cnt[g] < cap_cold),
+            key=lambda g: (gpu_load[g], gpu_cnt[g], g),
+        )
+        gpu_cold[best].append((e, r))
+        gpu_load[best] += load
+        gpu_cnt[best] += 1
+
+    p2l = [0] * num_physical
+    prank = [0] * num_physical
+    for g in range(num_gpus):
+        base = g * phy_per_gpu
+        for i, e in enumerate(hot):
+            p2l[base + i] = e
+            prank[base + i] = g  # g-th replica; cnt[e]=num_gpus so rank in [0,8)
+        for j, (e, r) in enumerate(gpu_cold[g]):
+            p2l[base + force_n + j] = e
+            prank[base + force_n + j] = r
+
+    dev = weight_l.device
+    return (
+        torch.tensor(p2l, dtype=torch.int32, device=dev),
+        torch.tensor(prank, dtype=torch.int32, device=dev),
+        torch.tensor(cnt, dtype=torch.int32, device=dev),
+    )
+
+
+def _placement_naive(
+    weight_l: torch.Tensor, num_physical: int, num_gpus: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Naive placement policy (default): greedy per-replica-load replication
+    (replicate_experts) + balanced_packing spread across GPUs — i.e. the same
+    redundant budget spread thinly over the hottest experts. Contrast with
+    `_placement_biased`. Returns (p2l, phyrank, logcnt)."""
     num_logical = weight_l.numel()
     phy2log, phyrank, logcnt = replicate_experts(
         weight_l.view(1, num_logical), num_physical
@@ -197,6 +281,35 @@ def _rebalance_single_layer_global(
     return reordered, reordered_rank, logcnt_l
 
 
+# Pluggable per-layer placement policies. A policy is a callable
+#   (weight_l[num_logical], num_physical, num_gpus) -> (p2l, phyrank, logcnt).
+# Policy name comes from EPLBConfig; `biased` derives its top-K from the
+# redundant budget (num_redundant // num_gpus), no extra param.
+_PLACEMENT_POLICIES = {"naive": _placement_naive, "biased": _placement_biased}
+
+
+def resolve_placement_policy(name: Optional[str]):
+    """Return the per-layer placement callable for `name` (default naive)."""
+    key = (name or "naive").lower().strip()
+    if key not in _PLACEMENT_POLICIES:
+        raise ValueError(
+            f"unknown eplb placement_policy={name!r}; "
+            f"choices={sorted(_PLACEMENT_POLICIES)}"
+        )
+    return _PLACEMENT_POLICIES[key]
+
+
+def _rebalance_single_layer_global(
+    weight_l: torch.Tensor,
+    num_physical: int,
+    num_gpus: int,
+    policy=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (physical_to_logical, physical_rank, logcnt) for one layer via the
+    given placement policy callable (default: naive)."""
+    return (policy or _placement_naive)(weight_l, num_physical, num_gpus)
+
+
 def rebalance_experts(
     weight: torch.Tensor,
     *,
@@ -205,8 +318,11 @@ def rebalance_experts(
     num_nodes: int,
     num_gpus: int,
     enable_hierarchical: bool,
+    policy=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Module-C entrypoint.
+    """Module-C entrypoint. `policy` is the per-layer placement callable
+    (default naive); in the hierarchical path it is applied per-node so `biased`
+    replicates within-node.
 
     Returns:
         physical_to_logical_map: [num_layers, num_physical] int32
@@ -236,7 +352,7 @@ def rebalance_experts(
     if not enable_hierarchical or num_groups == 1 or num_nodes == 1:
         for l in range(num_layers):
             p2l_l, rank_l, cnt_l = _rebalance_single_layer_global(
-                weight[l], num_physical, num_gpus
+                weight[l], num_physical, num_gpus, policy=policy
             )
             p2l[l] = p2l_l
             phyrank[l] = rank_l
@@ -280,7 +396,9 @@ def rebalance_experts(
             node_logical_ids = logical_ids_per_node[node_id]
             node_weight = weight[l, node_logical_ids]
             node_p2l_local, node_rank_local, node_cnt_local = (
-                _rebalance_single_layer_global(node_weight, phy_per_node, gpus_per_node)
+                _rebalance_single_layer_global(
+                    node_weight, phy_per_node, gpus_per_node, policy=policy
+                )
             )
             node_global_logical = torch.tensor(
                 node_logical_ids, dtype=torch.int64, device=weight.device
@@ -1344,12 +1462,14 @@ class EPLBManager:
         rebalance_interval: int,
         rebalance_min_balancedness: float,
         rebalance_balancedness_agg: str,
+        placement_policy: str = "naive",
     ):
         self.enabled = enabled
         self.monitor = monitor
         self.rebalance_interval = int(rebalance_interval)
         self.rebalance_min_balancedness = float(rebalance_min_balancedness)
         self.rebalance_balancedness_agg = str(rebalance_balancedness_agg).lower()
+        self.placement_policy = str(placement_policy).lower().strip()
         assert self.rebalance_interval > 0, "eplb_rebalance_interval must be > 0"
         assert (
             self.rebalance_interval >= self.monitor.window_size
@@ -1746,6 +1866,7 @@ class EPLBManager:
             num_nodes=num_nodes,
             num_gpus=ep_size,
             enable_hierarchical=(num_groups > 1 and num_nodes > 1),
+            policy=resolve_placement_policy(self.placement_policy),
         )
         new_meta = ExpertLocationMetadata.from_rebalance_result(
             physical_to_logical_map=p2l,
@@ -1923,6 +2044,7 @@ def get_eplb_manager(
     rebalance_interval: int,
     rebalance_min_balancedness: float,
     rebalance_balancedness_agg: str,
+    placement_policy: str = "naive",
 ) -> EPLBManager:
     global _MANAGER
     if (
@@ -1934,6 +2056,7 @@ def get_eplb_manager(
         or _MANAGER.rebalance_min_balancedness != float(rebalance_min_balancedness)
         or _MANAGER.rebalance_balancedness_agg
         != str(rebalance_balancedness_agg).lower()
+        or _MANAGER.placement_policy != str(placement_policy).lower().strip()
     ):
         _MANAGER = EPLBManager(
             enabled=enabled,
@@ -1941,6 +2064,7 @@ def get_eplb_manager(
             rebalance_interval=rebalance_interval,
             rebalance_min_balancedness=rebalance_min_balancedness,
             rebalance_balancedness_agg=rebalance_balancedness_agg,
+            placement_policy=placement_policy,
         )
     return _MANAGER
 
@@ -1960,6 +2084,7 @@ def _get_configured_eplb_manager() -> Optional[EPLBManager]:
         rebalance_interval=cfg.eplb_config.rebalance_interval,
         rebalance_min_balancedness=cfg.eplb_config.rebalance_min_balancedness,
         rebalance_balancedness_agg=cfg.eplb_config.rebalance_balancedness_agg,
+        placement_policy=cfg.eplb_config.placement_policy,
     )
 
 
