@@ -31,7 +31,27 @@ if _atom_config_stub is not None:
             {"NONE": 0, "PIECEWISE": 1, "FULL": 2, "FULL_AND_PIECEWISE": 3},
         )
 
+import argparse  # noqa: E402
+
 from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
+
+
+class TestKVCacheDtypeCliAlias:
+    """--kv-cache-dtype and --kv_cache_dtype must both set kv_cache_dtype."""
+
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        return parser.parse_args(argv)
+
+    def test_dashed_form(self):
+        assert self._parse(["--kv-cache-dtype", "fp8"]).kv_cache_dtype == "fp8"
+
+    def test_underscore_form(self):
+        assert self._parse(["--kv_cache_dtype", "fp8"]).kv_cache_dtype == "fp8"
+
+    def test_default(self):
+        assert self._parse([]).kv_cache_dtype == "bf16"
 
 
 class TestEngineArgsSpeculativeValidation:
