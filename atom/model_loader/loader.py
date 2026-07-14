@@ -71,6 +71,9 @@ class WeightsMapper:
             orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
         )
 
+    def get_unstacked_mapper(self) -> "WeightsMapper":
+        return self
+
     def _map_name(self, key: str) -> str | None:
         for substr, new_key in self.orig_to_new_substr.items():
             if substr in key:

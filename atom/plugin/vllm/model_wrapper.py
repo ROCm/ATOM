@@ -910,6 +910,11 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
+        if self.model_arch == "DeepSeekMTPModel":
+            # vLLM 0.25.x expects DeepSeek MTP draft forwards to return
+            # (logit_hidden, recycle_hidden). ATOM uses the same tensor for both.
+            return hidden_states, hidden_states
+
         return hidden_states
 
     def load_weights(
