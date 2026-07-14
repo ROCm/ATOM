@@ -808,12 +808,21 @@ async def setup_streaming_request(
     return seq_id, stream_queue, seq.num_prompt_tokens
 
 
-def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
+def cleanup_streaming_request(
+    request_id: str, seq_id: int, aborted: bool = False
+) -> None:
     """Clean up resources for a streaming request.
 
     Safe to call multiple times for the same ``request_id`` with different
     ``seq_id`` values (as happens in fan-out cleanup): the per-request
     dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
+
+    ``aborted`` says the stream did NOT reach its normal end (client disconnect
+    or abnormal generator teardown), so the seq is likely still running in the
+    engine and must be stopped. On normal completion pass False (the default):
+    the engine has already dropped the seq, so an abort would be a guaranteed
+    no-op that just floods the control path (one broadcast per engine core, per
+    request).
     """
     global engine, _stream_queues, _seq_id_to_request_id
     global _stream_loops, _request_start_times
@@ -822,13 +831,11 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
-    # If the stream ended early (client disconnected) the seq may still be
-    # generating in the engine core -> tell it to stop so it doesn't run to
-    # max_tokens and pile up. No-op if the seq already finished.
-    try:
-        engine.core_mgr.abort_request(seq_id)
-    except Exception:
-        pass
+    if aborted:
+        try:
+            engine.core_mgr.abort_request(seq_id)
+        except Exception:
+            pass
     engine.io_processor.requests.pop(seq_id, None)
 
 
@@ -1435,6 +1442,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                 message_started = False
                 _thinking_enabled = bool(getattr(request, "thinking", None))
+                # Assume abort until we reach the normal end of the stream. If
+                # the client disconnects, GeneratorExit unwinds through the
+                # yields and the finally runs with this still True -> abort.
+                aborted = True
 
                 try:
                     while True:
@@ -1573,9 +1584,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 yield stream_content_block_stop(block_index)
                             yield stream_message_delta(stop_reason, output_tokens)
                             yield stream_message_stop()
+                            aborted = False
                             break
                 finally:
-                    cleanup_streaming_request(request_id, seq_id)
+                    cleanup_streaming_request(request_id, seq_id, aborted=aborted)
 
             return StreamingResponse(
                 generate_anthropic_stream(),
