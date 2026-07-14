@@ -16,6 +16,7 @@ from aiter import (
     gemm_a8w8_blockscale,
     get_hip_quant,
 )
+from aiter.ops.quant import quant_mxfp4_hip
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
@@ -42,6 +43,37 @@ from torch import nn
 logger = logging.getLogger("atom")
 
 
+def _resolve_mxfp4_act_round_mode(quant_config=None) -> int:
+    """Return the HIP quant_mxfp4_hip round_mode matching offline calibration.
+
+    Reads quantization_config.global_quant_config.input_tensors
+    .scale_calculation_mode from the model checkpoint (set by Quark).
+    Defaults to Even, which is Quark's standard rounding mode.
+    Override with ATOM_ACT_QUANT_HIP_ROUNDUP=1 for legacy RoundUp.
+    """
+    import os
+    from aiter.utility.mx_types import MxScaleRoundModeInt
+
+    if os.environ.get("ATOM_ACT_QUANT_HIP_ROUNDUP", "0") == "1":
+        return int(MxScaleRoundModeInt.RoundUp)
+    scale_mode = "even"
+    if quant_config is not None:
+        try:
+            gq = quant_config.global_quant_config
+            if isinstance(gq, dict):
+                scale_mode = gq.get("input_tensors", {}).get(
+                    "scale_calculation_mode", "even"
+                )
+        except Exception:
+            pass
+    return {
+        "even": int(MxScaleRoundModeInt.Even),
+        "floor": int(MxScaleRoundModeInt.RoundDown),
+        "ceil": int(MxScaleRoundModeInt.Ceil),
+        "round_up": int(MxScaleRoundModeInt.RoundUp),
+    }.get(scale_mode.lower(), int(MxScaleRoundModeInt.Even))
+
+
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
@@ -62,12 +94,22 @@ else:
 
 if use_triton_gemm():
     try:
+        # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
         from aiter.ops.triton.gemm_afp4wfp4 import (
             gemm_afp4wfp4_preshuffle,
         )  # noqa: E402
     except ImportError as e:
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
+
+    # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton w8a8 GEMM not available: {e}")
+        gemm_a8w8_blockscale_bpreshuffle_triton = None
 
     # Plain (non-preshuffle) Triton blockscale GEMM. Consumes an unshuffled
     # (N, K) weight with row-major x_scale (M, scale_k) and w_scale
@@ -90,6 +132,7 @@ if use_triton_gemm():
         gemm_a8w8_triton = None
 else:
     gemm_afp4wfp4_preshuffle = None
+    gemm_a8w8_blockscale_bpreshuffle_triton = None
     gemm_a8w8_blockscale_triton = None
     gemm_a8w8_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
@@ -111,6 +154,7 @@ def gemm_a4w4_quant_fake(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    act_round_mode: int = 2,  # 2 = Even (matches Quark default)
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
 
@@ -126,6 +170,7 @@ def gemm_a4w4_quant(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    act_round_mode: int = 2,  # 2 = Even (matches Quark default)
 ) -> torch.Tensor:
     # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
     # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
@@ -135,7 +180,7 @@ def gemm_a4w4_quant(
                 "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 requires aiter.ops.triton.gemm_afp4wfp4"
             )
         if x_scale is None:
-            quant_func = get_hip_quant(QuantType.per_1x32)
+            quant_func = functools_partial(quant_mxfp4_hip, round_mode=act_round_mode)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
@@ -186,7 +231,7 @@ def gemm_a4w4_quant(
             device=x.device,
         )
         if x_scale is None:
-            quant_func = get_hip_quant(QuantType.per_1x32)
+            quant_func = functools_partial(quant_mxfp4_hip, round_mode=act_round_mode)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
@@ -216,7 +261,7 @@ def gemm_a4w4_quant(
     # and use the backend ASM implementation.
     else:
         if x_scale is None:
-            quant_func = get_hip_quant(QuantType.per_1x32)
+            quant_func = functools_partial(quant_mxfp4_hip, round_mode=act_round_mode)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
@@ -270,7 +315,14 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
 ) -> torch.Tensor:
-    return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+    if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
+        weight_shuffled = weight.reshape(weight.shape[0] // 16, weight.shape[1] * 16)
+        y = gemm_a8w8_blockscale_bpreshuffle_triton(
+            x, weight_shuffled, x_scale, w_scale, dtype
+        )
+    else:
+        y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+    return y
 
 
 def gemm_a8w8_blockscale_triton_fake(
@@ -458,16 +510,11 @@ class LinearBase(nn.Module):
                     torch.empty(self.output_size, 1, dtype=dtypes.fp32)
                 )
             elif quant_type == QuantType.per_1x128:
-                scale_dtype = (
-                    dtypes.fp8_e8m0
-                    if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
-                    else dtypes.fp32
-                )
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
-                        dtype=scale_dtype,
+                        dtype=dtypes.fp32,
                     )
                 )
             elif quant_type == QuantType.per_1x32:
@@ -490,6 +537,9 @@ class LinearBase(nn.Module):
             self.weight_scale.weight_loader = self.weight_loader
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
+        # Resolve activation quant round_mode once at init, matching
+        # the checkpoint's scale_calculation_mode (Quark convention).
+        self.mxfp4_act_round_mode = _resolve_mxfp4_act_round_mode(quant_config)
 
     @staticmethod
     def weight_loader_process(
@@ -584,7 +634,6 @@ class LinearBase(nn.Module):
 
         assert online_quant_dtype in [
             torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
             torch.float4_e2m1fn_x2,
         ], (
             f"Unsupported online quant: "
@@ -666,7 +715,6 @@ class LinearBase(nn.Module):
         self.quant_func = get_hip_quant(online_quant_type)
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
-            and q_weight.dtype != torch.float8_e4m3fnuz
         )
         # A dynamic online target (e.g. ptpc per_Token) quantizes activations at
         # runtime. Drop any static input_scale inherited from a static per_Tensor
@@ -799,11 +847,6 @@ class LinearBase(nn.Module):
                     quant_func = functools_partial(
                         self.quant_func,
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
-                        **(
-                            {"scale_type": dtypes.fp8_e8m0}
-                            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
-                            else {}
-                        ),
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(
@@ -899,6 +942,7 @@ class LinearBase(nn.Module):
                     self.params_dtype,
                     getattr(self, "input_scale", None),
                     self.output_size,
+                    self.mxfp4_act_round_mode,
                 )
                 if self.bias is not None:
                     y += self.bias
