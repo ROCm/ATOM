@@ -1288,6 +1288,7 @@ class Config:
                 ),
             )
         )
+        factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

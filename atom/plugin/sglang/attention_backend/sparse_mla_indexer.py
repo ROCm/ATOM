@@ -27,6 +27,26 @@ import triton.language as tl
 
 from atom.utils.custom_register import direct_register_custom_op
 
+_static_i32_cache: dict[tuple[str, str, int], torch.Tensor] = {}
+
+
+def _get_cached_i32_arange(n: int, device: torch.device) -> torch.Tensor:
+    key = (str(device), "arange", int(n))
+    value = _static_i32_cache.get(key)
+    if value is None:
+        value = torch.arange(n, dtype=torch.int32, device=device)
+        _static_i32_cache[key] = value
+    return value
+
+
+def _get_cached_i32_ones(n: int, device: torch.device) -> torch.Tensor:
+    key = (str(device), "ones", int(n))
+    value = _static_i32_cache.get(key)
+    if value is None:
+        value = torch.ones(n, dtype=torch.int32, device=device)
+        _static_i32_cache[key] = value
+    return value
+
 
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
@@ -114,6 +134,135 @@ def triton_convert_req_index_to_global_index(
     )
 
 
+@triton.jit
+def _target_verify_query_ranges_kernel(
+    seq_lens_ptr,
+    starts_ptr,
+    ends_ptr,
+    bs,
+    draft_token_num: tl.constexpr,
+    BLOCK_BS: tl.constexpr,
+    BLOCK_DRAFT: tl.constexpr,
+):
+    req = tl.arange(0, BLOCK_BS)
+    valid_req = req < bs
+    seq = tl.load(seq_lens_ptr + req, mask=valid_req, other=0).to(tl.int32)
+    kv_lens = seq + draft_token_num
+    base = tl.cumsum(kv_lens, axis=0) - kv_lens
+
+    draft = tl.arange(0, BLOCK_DRAFT)
+    valid_draft = draft < draft_token_num
+    row = req[:, None] * draft_token_num + draft[None, :]
+    mask = valid_req[:, None] & valid_draft[None, :]
+    tl.store(starts_ptr + row, base[:, None], mask=mask)
+    tl.store(ends_ptr + row, base[:, None] + seq[:, None] + draft[None, :] + 1, mask=mask)
+
+
+def _build_target_verify_query_ranges_triton(
+    seq_lens: torch.Tensor,
+    bs: int,
+    draft_token_num: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = seq_lens.device
+    num_tokens = bs * draft_token_num
+    starts = torch.empty(num_tokens, dtype=torch.int32, device=device)
+    ends = torch.empty(num_tokens, dtype=torch.int32, device=device)
+    block_bs = triton.next_power_of_2(bs)
+    block_draft = triton.next_power_of_2(draft_token_num)
+    _target_verify_query_ranges_kernel[(1,)](
+        seq_lens,
+        starts,
+        ends,
+        bs,
+        draft_token_num,
+        BLOCK_BS=block_bs,
+        BLOCK_DRAFT=block_draft,
+    )
+    return starts, ends
+
+
+@triton.jit
+def _target_verify_req_indptr_kernel(
+    seq_lens_ptr,
+    req_id_ptr,
+    indptr_ptr,
+    bs,
+    draft_token_num: tl.constexpr,
+    topk_tokens: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK_TOKENS)
+    total = bs * draft_token_num
+    mask = offs < total
+    req = offs // draft_token_num
+    draft = offs - req * draft_token_num
+    seq = tl.load(seq_lens_ptr + req, mask=mask, other=0).to(tl.int32)
+    counts = tl.minimum(seq + draft + 1, topk_tokens)
+    counts = tl.where(mask, counts, 0)
+    csum = tl.cumsum(counts, axis=0)
+    tl.store(req_id_ptr + offs, req, mask=mask)
+    tl.store(indptr_ptr + offs + 1, csum, mask=mask)
+    tl.store(indptr_ptr, tl.full((), 0, tl.int32))
+
+
+def _build_target_verify_req_indptr_triton(
+    seq_lens: torch.Tensor,
+    bs: int,
+    draft_token_num: int,
+    topk_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = seq_lens.device
+    num_tokens = bs * draft_token_num
+    req_id = torch.empty(num_tokens, dtype=torch.int32, device=device)
+    indptr = torch.empty(num_tokens + 1, dtype=torch.int32, device=device)
+    block_tokens = triton.next_power_of_2(num_tokens)
+    _target_verify_req_indptr_kernel[(1,)](
+        seq_lens,
+        req_id,
+        indptr,
+        bs,
+        draft_token_num,
+        topk_tokens,
+        BLOCK_TOKENS=block_tokens,
+    )
+    return req_id, indptr
+
+
+@triton.jit
+def _localize_topk_indices_kernel(
+    topk_ptr,
+    starts_ptr,
+    num_rows,
+    topk_tokens: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (row < num_rows) & (offs < topk_tokens)
+    ptr = topk_ptr + row * topk_tokens + offs
+    vals = tl.load(ptr, mask=mask, other=-1)
+    start = tl.load(starts_ptr + row, mask=row < num_rows, other=0)
+    vals = tl.where(vals >= 0, vals - start, vals)
+    tl.store(ptr, vals, mask=mask)
+
+
+def _localize_topk_indices_triton(
+    topk_indices: torch.Tensor,
+    cu_starts: torch.Tensor,
+) -> None:
+    num_rows, topk_tokens = topk_indices.shape
+    block_n = 256
+    grid = (num_rows, triton.cdiv(topk_tokens, block_n))
+    _localize_topk_indices_kernel[grid](
+        topk_indices,
+        cu_starts,
+        num_rows,
+        topk_tokens,
+        BLOCK_N=block_n,
+    )
+
+
 def _parse_layer_id_from_indexer_prefix(prefix: str) -> int:
     match = re.search(r"\.layers\.(\d+)\.", prefix)
     if match is None:
@@ -139,21 +288,10 @@ def _build_sglang_query_ranges(forward_batch) -> tuple[torch.Tensor, torch.Tenso
         )
         if draft_token_num <= 0:
             raise RuntimeError("TARGET_VERIFY sparse MLA requires draft_token_num")
-        seq_lens = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
-        kv_lens = seq_lens + draft_token_num
-        base_offsets = torch.cumsum(
-            torch.cat([torch.zeros(1, dtype=torch.int32, device=device), kv_lens[:-1]]),
-            dim=0,
-        )
-        starts = torch.repeat_interleave(base_offsets, draft_token_num)
-        per_req_end_base = torch.repeat_interleave(
-            base_offsets + seq_lens, draft_token_num
-        )
-        draft_offsets = torch.arange(
-            1, draft_token_num + 1, dtype=torch.int32, device=device
-        ).repeat(bs)
-        return starts.to(dtype=torch.int32), (per_req_end_base + draft_offsets).to(
-            dtype=torch.int32
+        return _build_target_verify_query_ranges_triton(
+            forward_batch.seq_lens[:bs].to(dtype=torch.int32),
+            bs,
+            draft_token_num,
         )
 
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
@@ -305,9 +443,24 @@ def forward_sparse_mla_for_sglang(
     topk_tokens = topk_indices.shape[1]
     page_size = int(getattr(forward_batch.token_to_kv_pool, "page_size", 1))
 
-    req_id_per_token = _build_sparse_req_id_per_token_for_sglang(
-        forward_batch, q.device
-    )
+    target_verify = forward_batch.forward_mode.is_target_verify()
+    if target_verify:
+        bs = int(forward_batch.batch_size)
+        draft_token_num = int(
+            getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0)
+            or 0
+        )
+        req_id_per_token, paged_kv_indptr = _build_target_verify_req_indptr_triton(
+            forward_batch.seq_lens[:bs].to(dtype=torch.int32),
+            bs,
+            draft_token_num,
+            topk_indices.shape[1],
+        )
+    else:
+        req_id_per_token = _build_sparse_req_id_per_token_for_sglang(
+            forward_batch, q.device
+        )
+        paged_kv_indptr = None
     block_table = _build_sglang_block_table(forward_batch, page_size).to(
         dtype=torch.int32
     )
@@ -324,10 +477,13 @@ def forward_sparse_mla_for_sglang(
     )
     fp8_sparse_mla = q.dtype == dtypes.fp8 or k_buffer.dtype == dtypes.fp8
 
-    seq_len = (topk_indices != -1).sum(dim=-1).to(dtype=torch.int32)
-    paged_kv_indptr = torch.empty((num_tokens + 1,), dtype=torch.int32, device=q.device)
-    paged_kv_indptr[0].zero_()
-    torch.cumsum(seq_len, dim=0, out=paged_kv_indptr[1:])
+    if paged_kv_indptr is None:
+        seq_len = (topk_indices != -1).sum(dim=-1).to(dtype=torch.int32)
+        paged_kv_indptr = torch.empty(
+            (num_tokens + 1,), dtype=torch.int32, device=q.device
+        )
+        paged_kv_indptr[0].zero_()
+        torch.cumsum(seq_len, dim=0, out=paged_kv_indptr[1:])
     paged_kv_indices = torch.empty(
         (num_tokens * topk_tokens,), dtype=torch.int32, device=q.device
     )
@@ -341,8 +497,8 @@ def forward_sparse_mla_for_sglang(
         NUM_TOPK_TOKENS=topk_tokens,
     )
 
-    qo_indptr = torch.arange(num_tokens + 1, dtype=torch.int32, device=q.device)
-    last_page_len = torch.ones(num_tokens, dtype=torch.int32, device=q.device)
+    qo_indptr = _get_cached_i32_arange(num_tokens + 1, q.device)
+    last_page_len = _get_cached_i32_ones(num_tokens, q.device)
 
     work_metadata = None
     work_indptr = None
@@ -598,9 +754,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
         stride0=logits.stride(0),
         stride1=logits.stride(1),
     )
-    topk_indices.copy_(
-        torch.where(topk_indices >= 0, topk_indices - cu_starts[:, None], topk_indices)
-    )
+    _localize_topk_indices_triton(topk_indices, cu_starts)
     return weights
 
 

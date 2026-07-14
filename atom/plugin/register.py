@@ -695,6 +695,132 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         EagleDraftWorker._atom_dsv4_init_cuda_graphs_patched = True
 
 
+def _patch_sglang_eagle_v2_draft_argmax() -> None:
+    """Use ATOM draft distributed argmax for SGLang EAGLE topk=1 drafting."""
+    if os.getenv("ATOM_SGLANG_DRAFT_ARGMAX", "1").lower() in ("0", "false", "no"):
+        return
+    try:
+        import torch
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+        from sglang.srt.speculative.spec_utils import (
+            maybe_detect_nan,
+            maybe_detect_oob,
+            select_top_k_tokens,
+        )
+    except Exception as exc:
+        logger.debug("Skip patching SGLang EAGLE draft argmax: %s", exc)
+        return
+
+    if getattr(EagleDraftWorker, "_atom_sglang_draft_argmax_patched", False):
+        return
+
+    def draft_forward(self, forward_batch):
+        spec_info = forward_batch.spec_info
+        out_cache_loc = forward_batch.out_cache_loc
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+
+        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        out_cache_loc = out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
+
+        score_list = []
+        token_list = []
+        parents_list = []
+        scores = None
+
+        use_argmax = self.topk == 1
+        for i in range(self.speculative_num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+
+            if i == self.speculative_num_steps - 1:
+                break
+
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            forward_batch._atom_use_draft_argmax = use_argmax
+            spec_info.hidden_states = hidden_states
+
+            logits_output = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+
+            draft_token_ids = None
+            customized_info = getattr(logits_output, "customized_info", None) or {}
+            if use_argmax:
+                draft_token_ids = customized_info.get("draft_token_ids")
+
+            if draft_token_ids is not None:
+                topk_index = draft_token_ids.reshape(-1, 1)
+                topk_p = torch.ones(
+                    (topk_index.shape[0], 1),
+                    dtype=torch.float32,
+                    device=topk_index.device,
+                )
+            else:
+                maybe_detect_nan(
+                    logits_output.next_token_logits, f"draft_forward step {i}"
+                )
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                from sglang.srt.utils.common import fast_topk
+
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                )
+
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+            forward_batch.positions.add_(1)
+
+        score_list = torch.cat(score_list, dim=1).flatten(1)
+        ss_token_list = torch.cat(token_list, dim=1)
+        top_scores = torch.topk(
+            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        )
+        top_scores_index = torch.sort(top_scores.indices).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            ss_token_list.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
+        )
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            batch_size = parents_list[0].shape[0]
+            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+
+        return parent_list, top_scores_index, draft_tokens
+
+    EagleDraftWorker.draft_forward = draft_forward
+    EagleDraftWorker._atom_sglang_draft_argmax_patched = True
+    logger.info("Patched SGLang EAGLE draft_forward for ATOM distributed argmax")
+
+
 def register_ops_to_sglang(atom_config: Config) -> None:
     """
     Register custom ops to sglang, including attention
@@ -702,6 +828,7 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     _register_custom_attention_to_sglang()
     _patch_sglang_dsv4_draft_backends()
     _patch_sglang_dsv4_spec_cuda_graph()
+    _patch_sglang_eagle_v2_draft_argmax()
 
 
 def set_attn_cls() -> None:

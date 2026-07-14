@@ -100,9 +100,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
-    # Replicate the EAGLE3 draft vocab embedding on every TP rank (full table per
-    # rank, local lookup) instead of sharding it — eliminates the post-embedding
-    # all-reduce. The draft embed is independent of the (sharded) lm_head.
+    # Replicate eligible vocab embeddings on every TP rank (full table per rank,
+    # local lookup) instead of sharding them. This removes post-embedding
+    # all-reduce for untied embeddings such as GLM-5.2 target/MTP and EAGLE3.
+    "ATOM_REPLICATE_VOCAB_EMBED": lambda: (
+        os.getenv("ATOM_REPLICATE_VOCAB_EMBED", "1") == "1"
+    ),
     "ATOM_EAGLE_REPLICATE_EMBED": lambda: (
         os.getenv("ATOM_EAGLE_REPLICATE_EMBED", "1") == "1"
     ),

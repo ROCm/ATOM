@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -376,6 +376,16 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
 
             if self.pp_group.is_last_rank:
                 hidden_states = runtime.trim_output(hidden_states)
+                if (
+                    getattr(forward_batch, "_atom_use_draft_argmax", False)
+                    and hasattr(self.model, "compute_draft_token")
+                ):
+                    draft_token_ids = self.model.compute_draft_token(hidden_states)
+                    return LogitsProcessorOutput(
+                        next_token_logits=None,
+                        hidden_states=hidden_states,
+                        customized_info={"draft_token_ids": draft_token_ids},
+                    )
                 return self.logits_processor(
                     input_ids,
                     hidden_states,

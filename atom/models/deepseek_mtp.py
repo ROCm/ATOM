@@ -6,8 +6,12 @@ import torch
 import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
+from atom.model_ops.layernorm import RMSNorm, fused_dual_rmsnorm_cat
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import IntermediateTensors
@@ -15,7 +19,11 @@ from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
-from .deepseek_v2 import DeepseekV2DecoderLayer, _can_fuse_indexer_wk_weights_proj
+from .deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    _can_fuse_indexer_wk_weights_proj,
+    use_replicated_vocab_embed,
+)
 from .utils import ckpt_has_tensor_suffix, maybe_prefix
 
 
@@ -87,13 +95,14 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        masked_inputs_embeds = inputs_embeds
-        inputs_embeds = self.enorm(masked_inputs_embeds)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
-
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        eh_input = fused_dual_rmsnorm_cat(
+            inputs_embeds,
+            self.enorm.weight,
+            previous_hidden_states,
+            self.hnorm.weight,
+            self.enorm.eps,
         )
+        hidden_states = self.eh_proj(eh_input)
 
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
@@ -136,10 +145,16 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 )
             }
         )
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+        if use_replicated_vocab_embed(config):
+            self.embed_tokens = ReplicatedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
 
     def forward(
         self,
@@ -169,6 +184,16 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         logits = mtp_layer.shared_head.head(mtp_layer.shared_head(hidden_states))
         return logits
+
+    def compute_draft_token(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        normed = mtp_layer.shared_head(hidden_states)
+        return mtp_layer.shared_head.head.compute_argmax_token(normed)
 
 
 @support_torch_compile
@@ -258,6 +283,13 @@ class DeepSeekMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def compute_draft_token(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.model.compute_draft_token(hidden_states, spec_step_idx)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
