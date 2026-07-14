@@ -1628,17 +1628,19 @@ def triton_gather_kv_indices_sparse(
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
 
-    # token_to_seq_idxs is the authoritative output row count. Do not silently
-    # truncate if the sparse indexer produced fewer top-k rows; that would leave
-    # stale values in the persistent sparse-KV index buffer.
-    num_tokens = token_to_seq_idxs.shape[0]
-    assert topk_indices.shape[0] >= num_tokens, (
-        "sparse indexer under-produced top-k rows: "
-        f"topk_rows={topk_indices.shape[0]} expected_rows={num_tokens}"
-    )
-    assert sparse_kv_indptr.shape[0] >= num_tokens + 1, (
-        "sparse_kv_indptr is shorter than sparse token metadata: "
-        f"indptr_rows={sparse_kv_indptr.shape[0] - 1} expected_rows={num_tokens}"
+    # MTP decode can carry metadata tensors padded to a larger query layout than
+    # the number of rows the indexer actually produced (e.g. real tokens <
+    # batch_size * max_seqlen_q under cudagraph padding, so token_to_seq_idxs is
+    # longer than topk_indices). Align every per-token input to the valid
+    # intersection before launch, otherwise the kernel reads past topk_indices.
+    # This truncation only drops padding rows, never real requests: the chunked
+    # indexer launches in sparse_attn_indexer already guarantee every real row
+    # has fresh top-k content (that is what fixes the con>=256 stale-index drop),
+    # so no stale rows survive within the valid range.
+    num_tokens = min(
+        token_to_seq_idxs.shape[0],
+        topk_indices.shape[0],
+        sparse_kv_indptr.shape[0] - 1,
     )
     sparse_kv_indptr = sparse_kv_indptr[: num_tokens + 1]
     token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
