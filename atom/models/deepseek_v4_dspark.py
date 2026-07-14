@@ -473,7 +473,10 @@ try:
     )
     from atom.model_ops.layernorm import RMSNorm  # noqa: E402
     from atom.model_ops.linear import ReplicatedLinear  # noqa: E402
-    from atom.model_ops.v4_kernels.state_writes import swa_write  # noqa: E402
+    from atom.model_ops.v4_kernels.state_writes import (  # noqa: E402
+        dspark_paged_window_gather,
+        swa_write,
+    )
 
     _ATOM_V4_AVAILABLE = True
 except Exception:  # pragma: no cover - exercised only in the stubbed test sandbox
@@ -546,24 +549,17 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 torch.empty(1, dtype=torch.float32)
             )
 
-        # Private rolling target-KV window: [max_seqs, window, head_dim]. MQA, so
-        # a single shared KV head. Bound lazily (max_seqs known at runtime); the
-        # 1-slot buffer is a placeholder until reset_kv_cache(max_seqs) is called.
-        self.register_buffer(
-            "dspark_kv_cache",
-            torch.zeros(1, args.window_size, self.attn.head_dim),
-            persistent=False,
-        )
+        # PAGED-SWA: draft window KV lives in the shared paged pool
+        # (`self.attn.swa_kv` slice of `unified_kv`, bound by
+        # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor at
+        # allocate_kv_cache) — aligned with the V4 target / MTP. No private
+        # buffer here; see precompute_context_kv / dspark_attention.
 
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
-        """(Re)allocate the private rolling target-KV window."""
-        self.dspark_kv_cache = torch.zeros(
-            max_num_seqs,
-            self.window_size,
-            self.attn.head_dim,
-            device=device,
-            dtype=dtype,
-        )
+        """No-op: draft KV is paged into the shared pool (bound at
+        allocate_kv_cache), not a private per-layer ring. Kept for eagle.py's
+        `hasattr(model, "reset_kv_cache")` call contract."""
+        return
 
     # ---- DSpark attention path (replaces Block.attn's paged sparse attn) -----
 
@@ -588,7 +584,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         main_x: torch.Tensor,       # [T, dim]  target hidden(s)
         positions: torch.Tensor,    # [T]
-        cache_indices: torch.Tensor,  # [B]  rows into dspark_kv_cache
+        cache_indices: torch.Tensor,  # [B]  per-req state slot (unused: paged)
         cu_seqlens_q: torch.Tensor | None = None,  # [B+1]; None => one row/req
         write_per_batch: int = 1,
     ) -> None:
@@ -605,30 +601,43 @@ class DSparkLayer(Block):  # type: ignore[misc]
             almost-empty window and rejects early; warming it lifts first-block
             acceptance to the steady-state level.
 
-        Uses the cudagraph-safe ``swa_write`` Triton ring-buffer kernel (the same
-        primitive the V4 target uses for its SWA cache). A plain advanced-index
-        write (``cache[rows, slots] = kv``) is NOT cudagraph-safe: it modifies an
-        nn.Module buffer with runtime indices during forward, which trips the
-        compiler's buffer-mutation guard and cannot be safely graph-replayed.
-        ``swa_write`` derives all indices inside the kernel from static-shaped
-        inputs (it picks the last ``min(tok_n_b, write_per_batch)`` rows of each
-        seq via ``cu_seqlens_q`` diff), so it replays correctly.
+        PAGED-SWA: the draft window KV now lives in the shared paged pool
+        (``self.attn.swa_kv``, this draft layer's slice of ``unified_kv``),
+        content-addressed by ``swa_block_tables`` exactly like the V4 target SWA
+        (#1417). ``swa_write`` is the same cudagraph-safe Triton kernel the target
+        uses: it derives all indices in-kernel from ``cu_seqlens_q`` +
+        ``positions`` (no advanced-index buffer-mutation, no ``.item()`` sync), so
+        it graph-replays correctly. ``cache_indices`` (the per-req state slot) is
+        no longer used for the write — the physical destination comes from
+        ``swa_block_tables`` — but is kept in the signature for the read side /
+        callers that still pass it.
         """
+        from atom.utils.forward_context import get_forward_context
+
+        fc = get_forward_context()
+        # warmup_model runs BEFORE allocate_kv_cache, so `self.attn.swa_kv` /
+        # `swa_block_size` are unbound and `swa_block_tables` is absent. Same
+        # short-circuit as the V4 target (deepseek_v4.py is_dummy_run guard):
+        # skip the paged SWA write on dummy runs — warmup discards draft output.
+        if fc.context.is_dummy_run:
+            return
+        attn_md = fc.attn_metadata
         main_kv = self._compute_main_kv(main_x, positions)  # [T, head_dim]
-        main_kv = main_kv.to(self.dspark_kv_cache.dtype).contiguous()
+        main_kv = main_kv.to(self.attn.swa_kv.dtype).contiguous()
         if cu_seqlens_q is None:
             B = main_kv.shape[0]
             cu_seqlens_q = torch.arange(
                 B + 1, device=main_kv.device, dtype=torch.int32
             )
+        B = cu_seqlens_q.shape[0] - 1
         swa_write(
-            kv=main_kv,                                   # [T, head_dim]
-            positions=positions.to(torch.int32),          # [T]
-            cu_seqlens_q=cu_seqlens_q.to(torch.int32),    # [B+1] per-req spans
-            state_slot_per_seq=cache_indices.to(torch.int32),  # [B] cache rows
-            swa_kv=self.dspark_kv_cache,                   # [num_slots, window, D]
-            cache_size=self.window_size,
-            write_per_batch=write_per_batch,
+            main_kv,                                       # [T, head_dim]
+            positions.to(torch.int32),                     # [T]
+            cu_seqlens_q.to(torch.int32),                  # [B+1] per-req spans
+            attn_md.swa_block_tables[:B],                  # [B, max_blocks]
+            self.attn.swa_kv,                              # [num_pages, head_dim]
+            self.attn.swa_block_size,
+            write_per_batch,
         )
 
     def dspark_attention(
@@ -670,12 +679,34 @@ class DSparkLayer(Block):  # type: ignore[misc]
         kv = kv.view(B, T, a.head_dim)
 
         # Assemble [window ++ draft block] KV and the window-validity mask.
-        rows = cache_indices.long()
-        window_kv = self.dspark_kv_cache[rows]  # [B, W, head_dim]
-        all_kv = torch.cat([window_kv, kv], dim=1)  # [B, W+T, head_dim]
+        # PAGED-SWA: gather the dense [B, W, head_dim] rolling window from the
+        # shared paged pool (this draft layer's swa_kv slice), addressed by
+        # swa_block_tables — the same content-addressing the write used. Window
+        # slot s holds absolute position (anchor-(W-1)+s); slots with p < 0 are
+        # unfilled and masked out.
+        from atom.utils.forward_context import get_forward_context
+
+        fc = get_forward_context()
         W = self.window_size
-        slot_ids = torch.arange(W, device=x.device).view(1, W)
-        valid_target = slot_ids <= positions.view(B, 1)  # filled slots only
+        if fc.context.is_dummy_run:
+            # warmup runs BEFORE allocate_kv_cache → swa_kv / swa_block_tables
+            # unbound. All-zero, all-invalid window so the forward still
+            # compiles at shape (draft output is discarded).
+            window_kv = kv.new_zeros(B, W, a.head_dim)
+            valid_target = torch.zeros(B, W, dtype=torch.bool, device=x.device)
+        else:
+            attn_md = fc.attn_metadata
+            window_kv = dspark_paged_window_gather(
+                self.attn.swa_kv,              # [num_pages, head_dim]
+                attn_md.swa_block_tables[:B],  # [B, max_blocks]
+                positions,                     # [B] anchor positions
+                W,
+                self.attn.swa_block_size,
+            )  # [B, W, head_dim]
+            # slot s valid iff abs position (anchor-(W-1)+s) >= 0.
+            slot_ids = torch.arange(W, device=x.device).view(1, W)
+            valid_target = slot_ids >= (W - 1) - positions.view(B, 1)
+        all_kv = torch.cat([window_kv, kv], dim=1)  # [B, W+T, head_dim]
 
         out = _dspark_block_sparse_attention(
             q, all_kv, a.attn_sink[: a.n_local_heads], valid_target, a.softmax_scale

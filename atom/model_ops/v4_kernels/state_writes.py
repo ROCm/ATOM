@@ -542,3 +542,127 @@ def update_compressor_states_reference(
         dst = position % state_size
         kv_state[slot, dst] = kv[ragged_id]
         score_state[slot, dst] = score[ragged_id] + ape[position % ratio]
+
+
+# === DSpark paged window gather (read side of paged-SWA migration) =======
+# DSpark's block drafter attends `[rolling target window ++ draft block]`. The
+# window KV now lives in the shared paged pool (`unified_kv`, draft layer slice
+# bound as `attn.swa_kv`), content-addressed by `swa_block_tables` exactly like
+# the V4 target SWA. The block-sparse attention still wants a DENSE `[B, W, D]`
+# window tensor (it concatenates the in-forward draft KV and runs `sparse_attn`),
+# so this kernel materialises that window from the pool.
+#
+# Window slot `s ∈ [0, W)` for seq `b` holds the target token at absolute
+# position `p = anchor_pos[b] - (W - 1) + s`. Slots with `p < 0` are unfilled
+# (the caller's `valid_target` mask drops them; we zero them here so a stray read
+# is harmless). Filled slots map to the pool via the same addressing as the
+# paged write:
+#     blk     = p // block_size
+#     phys    = swa_block_tables[b, blk]
+#     src_row = phys * block_size + (p % block_size)
+
+
+@triton.jit
+def _dspark_paged_window_gather_kernel(
+    swa_region_ptr,        # [num_pages, head_dim] flat SWA pool slice
+    swa_region_row_stride,  # = head_dim
+    block_tables_ptr,      # [B, max_blocks] int32 logical->physical
+    block_tables_stride,   # row stride = max_blocks
+    anchor_pos_ptr,        # [B] int — per-seq anchor absolute position
+    out_ptr,               # [B, W, head_dim] dense window output
+    out_seq_stride,        # = W * head_dim
+    out_slot_stride,       # = head_dim
+    head_dim,
+    block_size,
+    W: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """2D grid `(B, W)`. Program `(b, s)` gathers window slot `s` of seq `b`
+    from the paged pool into `out[b, s, :]`. Unfilled slots (`p < 0`) write 0."""
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+
+    anchor = tl.load(anchor_pos_ptr + b)
+    p = anchor - (W - 1) + s
+
+    d_offsets = tl.arange(0, BLOCK_D)
+    d_mask = d_offsets < head_dim
+    out_base = out_ptr + b * out_seq_stride + s * out_slot_stride
+
+    if p < 0:
+        # Unfilled slot: zero it (valid_target masks it out in attention anyway).
+        tl.store(out_base + d_offsets, tl.zeros([BLOCK_D], dtype=out_ptr.dtype.element_ty), mask=d_mask)
+        return
+
+    blk = p // block_size
+    phys = tl.load(block_tables_ptr + b * block_tables_stride + blk)
+    src_row = phys * block_size + (p % block_size)
+    src = tl.load(
+        swa_region_ptr + src_row * swa_region_row_stride + d_offsets,
+        mask=d_mask,
+    )
+    tl.store(out_base + d_offsets, src, mask=d_mask)
+
+
+def dspark_paged_window_gather(
+    swa_region: torch.Tensor,     # [num_pages, head_dim] pool slice (attn.swa_kv)
+    block_tables: torch.Tensor,   # [B, max_blocks] int32
+    anchor_pos: torch.Tensor,     # [B] int — anchor absolute position per seq
+    window: int,
+    block_size: int,
+) -> torch.Tensor:                # [B, window, head_dim]
+    """Materialise the dense `[B, W, head_dim]` rolling window from the paged
+    SWA pool, addressed by `block_tables` (mirrors `swa_write`). Slot `s` holds
+    absolute position `anchor_pos[b] - (W-1) + s`; `p < 0` slots are zeroed.
+    """
+    assert swa_region.dim() == 2, f"swa_region must be [P, D], got {swa_region.shape}"
+    assert block_tables.dim() == 2, f"block_tables must be [B, MB], got {block_tables.shape}"
+    B = block_tables.shape[0]
+    num_pages, head_dim = swa_region.shape
+    assert anchor_pos.shape[0] >= B
+    assert swa_region.is_contiguous()
+
+    out = torch.zeros(B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype)
+    if B == 0 or window == 0:
+        return out
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    grid = (B, window)
+    _dspark_paged_window_gather_kernel[grid](
+        swa_region,
+        swa_region.stride(0),
+        block_tables,
+        block_tables.stride(0),
+        anchor_pos.to(torch.int32),
+        out,
+        out.stride(0),
+        out.stride(1),
+        head_dim,
+        block_size,
+        W=window,
+        BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
+def dspark_paged_window_gather_reference(
+    swa_region: torch.Tensor,
+    block_tables: torch.Tensor,
+    anchor_pos: torch.Tensor,
+    window: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Pure-torch reference for `dspark_paged_window_gather` (unit tests)."""
+    B = block_tables.shape[0]
+    _, head_dim = swa_region.shape
+    out = torch.zeros(B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype)
+    for b in range(B):
+        anchor = int(anchor_pos[b].item())
+        for s in range(window):
+            p = anchor - (window - 1) + s
+            if p < 0:
+                continue
+            blk = p // block_size
+            phys = int(block_tables[b, blk].item())
+            src_row = phys * block_size + (p % block_size)
+            out[b, s] = swa_region[src_row]
+    return out
