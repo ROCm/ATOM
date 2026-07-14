@@ -21,6 +21,7 @@ allow = (
     "ATOMESH_",
     "MODEL_",
     "BACKEND",
+    "DOCKER_IMAGE",
     "PRECISION",
     "TOPOLOGY",
     "DISPLAY_TOPOLOGY",
@@ -337,6 +338,10 @@ cleanup() {
   done
 }
 trap cleanup EXIT
+
+echo "=== docker.env (passed to container) ==="
+cat "${ENV_FILE}"
+echo "=== end docker.env ==="
 
 srun \
   --nodes="${NUM_NODES}" \

@@ -36,13 +36,15 @@ def _install_draft_extend_fused_swa_patch() -> None:
         if ctx is not None and kwargs.get("swa_kv") is None:
             attn = ctx["attn"]
             attn_md = ctx["attn_md"]
-            cache_size = int(attn.swa_kv.shape[1])
+            # swa_kv is now the flat [pages, head_dim] paged pool (project 024);
+            # the ring stride (== swa_cache_size == cs) lives on attn.swa_block_size.
+            cache_size = int(attn.swa_block_size)
             kwargs.update(
                 swa_kv=attn.swa_kv,
-                state_slot_mapping=attn_md.state_slot_mapping,
+                swa_block_tables=attn_md.swa_block_tables,
+                swa_block_size=cache_size,
                 batch_id_per_token=attn_md.batch_id_per_token,
                 swa_cu_seqlens_q=attn_md.cu_seqlens_q,
-                swa_cache_size=cache_size,
                 swa_write_per_batch=min(int(attn_md.max_seqlen_q), cache_size),
             )
         return original_qk_norm_rope_maybe_quant(*args, **kwargs)
