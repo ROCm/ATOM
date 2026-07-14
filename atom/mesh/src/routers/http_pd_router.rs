@@ -477,6 +477,22 @@ impl PDRouter {
         None
     }
 
+    fn inject_data_parallel_rank(
+        request_json: &mut Value,
+        worker: &dyn Worker,
+    ) -> Result<(), Response> {
+        if let Some(dp_rank) = worker.dp_rank() {
+            let Some(obj) = request_json.as_object_mut() else {
+                return Err(error::bad_request(
+                    "dp_rank_insertion_failed",
+                    "Failed to insert the data_parallel_rank field into the request body",
+                ));
+            };
+            obj.insert("data_parallel_rank".to_string(), json!(dp_rank));
+        }
+        Ok(())
+    }
+
     /// Dispatch a request based on backend type. SGLang uses dual-dispatch+bootstrap;
     /// vLLM uses Mooncake fire-and-forget P + streamed D with kv_transfer_params.
     async fn dispatch_pd<T: Serialize + Clone>(
@@ -904,6 +920,18 @@ impl PDRouter {
                             .inject_decode_fields(&mut decode_request_json, &ctx)
                         {
                             return Self::handle_serialization_error(e);
+                        }
+                        if let Err(resp) = Self::inject_data_parallel_rank(
+                            &mut prefill_request_json,
+                            prefill.as_ref(),
+                        ) {
+                            return resp;
+                        }
+                        if let Err(resp) = Self::inject_data_parallel_rank(
+                            &mut decode_request_json,
+                            decode.as_ref(),
+                        ) {
+                            return resp;
                         }
                         let correlation_id = self.adapter.correlation_id(&ctx);
 
