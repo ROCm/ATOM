@@ -229,6 +229,28 @@ decode_cudagraph_args=()
 build_cudagraph_args "${PREFILL_CUDAGRAPH:-}" prefill_cudagraph_args
 build_cudagraph_args "${DECODE_CUDAGRAPH:-}" decode_cudagraph_args
 
+build_server_cache_env() {
+  local role="$1"
+  local server_port="$2"
+  local -n out="$3"
+  local cache_base cache_root
+
+  cache_base="${ATOMESH_WORKER_CACHE_BASE:-${XDG_CACHE_HOME:-/tmp/atomesh-cache-${SLURM_JOB_ID:-local}-${NODE_RANK}}/workers}"
+  cache_root="${cache_base}/${role}-${server_port}"
+  mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
+
+  out=(
+    "HOME=${cache_root}/home"
+    "XDG_CACHE_HOME=${cache_root}/xdg"
+    "TORCHINDUCTOR_CACHE_DIR=${cache_root}/torchinductor"
+    "TRITON_CACHE_DIR=${cache_root}/triton"
+    "AITER_CACHE_DIR=${cache_root}/aiter"
+    "AITER_JIT_DIR=${cache_root}/aiter/jit"
+    "FLYDSL_RUNTIME_CACHE_DIR=${cache_root}/flydsl"
+  )
+  echo "[runtime] ${role} cache root=${cache_root} (port=${server_port})"
+}
+
 server_common=(
   --model "${MODEL_PATH}"
   --host 0.0.0.0
@@ -340,6 +362,8 @@ start_prefill() {
   local server_port="${2:-${PREFILL_PORT}}"
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  local -a prefill_cache_env=()
+  build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -352,7 +376,7 @@ start_prefill() {
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  "${prefill_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
+  env "${prefill_cache_env[@]}" "${prefill_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
   server_pid=$!
 }
 
@@ -369,6 +393,8 @@ start_decode() {
   if [[ "${ISL_LIST}" == "1024" && "${OSL}" == "1024" ]]; then
     decode_max_num_seqs="${max_conc}"
   fi
+  local -a decode_cache_env=()
+  build_server_cache_env "decode" "${server_port}" decode_cache_env
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} cudagraph=${DECODE_CUDAGRAPH:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -381,12 +407,27 @@ start_decode() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
-  "${decode_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
+  env "${decode_cache_env[@]}" "${decode_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
   server_pid=$!
 }
 
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
+  case "${ATOM_PD_RANK_MAPPING_POLICY}" in
+    none|idx2idx) ;;
+    *)
+      echo "[router][FAIL] invalid ATOM_PD_RANK_MAPPING_POLICY=${ATOM_PD_RANK_MAPPING_POLICY}" >&2
+      exit 1
+      ;;
+  esac
+
+  local -a router_rank_mapping_args=()
+  if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]]; then
+    router_rank_mapping_args=(
+      --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"
+      --dp-aware
+    )
+  fi
   local -a router_cmd=(
     /usr/local/bin/atomesh launch
     --host 0.0.0.0
@@ -395,6 +436,7 @@ start_router() {
     "${prefill_args[@]}"
     "${decode_args[@]}"
     --policy "${ROUTER_POLICY}"
+    "${router_rank_mapping_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker

@@ -21,6 +21,7 @@ allow = (
     "ATOMESH_",
     "MODEL_",
     "BACKEND",
+    "DOCKER_IMAGE",
     "PRECISION",
     "TOPOLOGY",
     "DISPLAY_TOPOLOGY",
