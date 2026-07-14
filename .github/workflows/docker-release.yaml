@@ -98,8 +98,8 @@ jobs:
       VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
       VLLM_VERSION: "0.22.0"
       SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
-      SGLANG_REF: "v0.5.12"
-      SGLANG_VERSION: "0.5.12"
+      SGLANG_REF: "v0.5.15"
+      SGLANG_VERSION: "0.5.15"
 
     steps:
       - name: Set HF_TOKEN

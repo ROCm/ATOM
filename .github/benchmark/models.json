@@ -194,7 +194,7 @@
       "config": {
         "tp": 4,
         "kv_cache_dtype": "fp8",
-        "extra_args": "--no-enable_prefix_caching"
+        "extra_args": "--no-enable_prefix_caching --page-size 16"
       },
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },
