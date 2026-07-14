@@ -59,6 +59,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),
+    # Restore the legacy HIP RoundUp rounding for MXFP4 activation quant.
+    # Default (0) uses Even, matching Quark's offline weight calibration and
+    # every other ATOM MXFP4 quant path. Debug/comparison escape hatch only.
+    "ATOM_ACT_QUANT_HIP_ROUNDUP": lambda: (
+        os.getenv("ATOM_ACT_QUANT_HIP_ROUNDUP", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
