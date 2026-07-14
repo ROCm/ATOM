@@ -159,10 +159,20 @@ def quant_mxfp4_online_even(
     from aiter.ops.quant import quant_mxfp4_hip
     from aiter.utility.mx_types import MxScaleRoundModeInt
 
+    orig_shape = weight.shape
     q_in = weight.contiguous()
     if q_in.dtype not in (torch.float16, torch.bfloat16):
         q_in = q_in.to(torch.bfloat16)
+    # quant_mxfp4_hip requires 2D input; reshape higher-rank tensors
+    # (e.g. fused MoE expert weights [num_experts, N, K]) before the call
+    # and restore the leading dimensions on the outputs.
+    if q_in.dim() > 2:
+        q_in = q_in.reshape(-1, q_in.shape[-1])
     q_weight, weight_scale = quant_mxfp4_hip(q_in, round_mode=MxScaleRoundModeInt.Even)
+    if len(orig_shape) > 2:
+        leading = orig_shape[:-1]
+        q_weight = q_weight.reshape(*leading, q_weight.shape[-1])
+        weight_scale = weight_scale.reshape(*leading, weight_scale.shape[-1])
     return q_weight.view(dtypes.fp4x2), weight_scale.view(_mx_block_scale_dtype())
 
 

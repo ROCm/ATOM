@@ -16,6 +16,7 @@ from aiter import (
     gemm_a8w8_blockscale,
     get_hip_quant,
 )
+from aiter.ops.quant import quant_mxfp4_hip
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
@@ -40,6 +41,21 @@ from atom.quantization.quark.utils import (
 from torch import nn
 
 logger = logging.getLogger("atom")
+
+
+def _resolve_mxfp4_act_round_mode() -> int:
+    """Return the HIP quant_mxfp4_hip round_mode for activation quant.
+
+    Every other ATOM MXFP4 quant path (weights, MoE, fused SiLU/RMSNorm)
+    already produces Even scales, so we hardcode Even here for consistency.
+    Set ATOM_ACT_QUANT_HIP_ROUNDUP=1 to restore the legacy RoundUp path.
+    """
+    import os
+    from aiter.utility.mx_types import MxScaleRoundModeInt
+
+    if os.environ.get("ATOM_ACT_QUANT_HIP_ROUNDUP", "0") == "1":
+        return int(MxScaleRoundModeInt.RoundUp)
+    return int(MxScaleRoundModeInt.Even)
 
 
 def use_triton_gemm() -> bool:
@@ -111,6 +127,7 @@ def gemm_a4w4_quant_fake(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    act_round_mode: int = 2,  # 2 = Even
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
 
@@ -126,6 +143,7 @@ def gemm_a4w4_quant(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    act_round_mode: int = 2,  # 2 = Even
 ) -> torch.Tensor:
     # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
     # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
@@ -135,7 +153,7 @@ def gemm_a4w4_quant(
                 "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 requires aiter.ops.triton.gemm_afp4wfp4"
             )
         if x_scale is None:
-            quant_func = get_hip_quant(QuantType.per_1x32)
+            quant_func = functools_partial(quant_mxfp4_hip, round_mode=act_round_mode)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
@@ -186,7 +204,7 @@ def gemm_a4w4_quant(
             device=x.device,
         )
         if x_scale is None:
-            quant_func = get_hip_quant(QuantType.per_1x32)
+            quant_func = functools_partial(quant_mxfp4_hip, round_mode=act_round_mode)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
@@ -216,7 +234,7 @@ def gemm_a4w4_quant(
     # and use the backend ASM implementation.
     else:
         if x_scale is None:
-            quant_func = get_hip_quant(QuantType.per_1x32)
+            quant_func = functools_partial(quant_mxfp4_hip, round_mode=act_round_mode)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
@@ -486,6 +504,9 @@ class LinearBase(nn.Module):
             self.weight_scale.weight_loader = self.weight_loader
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
+        # Activation quant rounding = Even, matching all other ATOM MXFP4
+        # paths; ATOM_ACT_QUANT_HIP_ROUNDUP=1 forces legacy RoundUp.
+        self.mxfp4_act_round_mode = _resolve_mxfp4_act_round_mode()
 
     @staticmethod
     def weight_loader_process(
@@ -915,6 +936,7 @@ class LinearBase(nn.Module):
                     self.params_dtype,
                     getattr(self, "input_scale", None),
                     self.output_size,
+                    self.mxfp4_act_round_mode,
                 )
                 if self.bias is not None:
                     y += self.bias
