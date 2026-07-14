@@ -15,7 +15,6 @@ from .protocol import (
     ChatCompletionResponse,
 )
 from .reasoning import ReasoningFilter, separate_reasoning
-from .streaming_utils import coalesce_ready_chunks, get_chunk_text
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger("atom")
@@ -73,17 +72,11 @@ async def stream_chat_response(
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
     """
-    # Lazy import to avoid a circular import (api_server imports this module).
-    from atom.entrypoints.openai import api_server
-
-    tokenizer = api_server.tokenizer
-
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
     reasoning_filter = ReasoningFilter()
-    # Only pay the stateful tool-call parser cost when tools were requested.
-    tool_parser = ToolCallStreamParser(tools=tools) if tools else None
+    tool_parser = ToolCallStreamParser(tools=tools)
     has_tool_calls = False
 
     # Send initial role chunk
@@ -93,9 +86,7 @@ async def stream_chat_response(
 
     while True:
         chunk_data = await stream_queue.get()
-        # Drain any already-queued backlog and decode/parse the batch once.
-        chunk_data = coalesce_ready_chunks(chunk_data, stream_queue)
-        new_text = get_chunk_text(chunk_data, tokenizer)
+        new_text = chunk_data["text"]
         num_tokens_output += len(chunk_data.get("token_ids", []))
         _ct = chunk_data.get("num_cached_tokens", 0)
         if _ct:
@@ -117,14 +108,6 @@ async def stream_chat_response(
                         request_id, model, delta={"reasoning_content": text}
                     )
             elif field == "content":
-                # Fast path: no tools requested -> emit content directly and
-                # skip the stateful tool-call parser entirely.
-                if tool_parser is None:
-                    if text:
-                        yield create_chat_chunk(
-                            request_id, model, delta={"content": text}
-                        )
-                    continue
                 # Run through tool parser
                 events = tool_parser.process(text)
                 for event_type, data in events:
@@ -147,22 +130,19 @@ async def stream_chat_response(
                         )
 
         if chunk_data.get("finished", False):
-            # Flush tool parser (only if one is active)
-            if tool_parser is not None:
-                for event_type, data in tool_parser.flush():
-                    if event_type == "content":
-                        yield create_chat_chunk(
-                            request_id, model, delta={"content": data}
-                        )
-                    elif event_type == "tool_call_start":
-                        has_tool_calls = True
-                        yield create_chat_chunk(
-                            request_id, model, delta={"tool_calls": [data]}
-                        )
-                    elif event_type == "tool_call_args":
-                        yield create_chat_chunk(
-                            request_id, model, delta={"tool_calls": [data]}
-                        )
+            # Flush tool parser
+            for event_type, data in tool_parser.flush():
+                if event_type == "content":
+                    yield create_chat_chunk(request_id, model, delta={"content": data})
+                elif event_type == "tool_call_start":
+                    has_tool_calls = True
+                    yield create_chat_chunk(
+                        request_id, model, delta={"tool_calls": [data]}
+                    )
+                elif event_type == "tool_call_args":
+                    yield create_chat_chunk(
+                        request_id, model, delta={"tool_calls": [data]}
+                    )
             break
 
     cleanup_fn(request_id, seq_id)
@@ -330,11 +310,6 @@ async def stream_chat_response_fanout(
     re-tokenizing on the event loop at stream start.
     """
     n = len(seq_ids)
-    # Lazy import to avoid a circular import (api_server imports this module).
-    from atom.entrypoints.openai import api_server
-
-    tokenizer = api_server.tokenizer
-
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     reasoning_filters = [ReasoningFilter() for _ in range(n)]
@@ -352,8 +327,7 @@ async def stream_chat_response_fanout(
         if finished[idx]:
             # Defensive: should not happen, engine emits finished once per seq.
             continue
-        # Siblings interleave on one queue, so decode per message (no coalesce).
-        new_text = get_chunk_text(chunk_data, tokenizer)
+        new_text = chunk_data["text"]
         num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
         _ct = chunk_data.get("num_cached_tokens", 0)
         if _ct:

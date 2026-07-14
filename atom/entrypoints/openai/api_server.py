@@ -68,7 +68,6 @@ from .serving_completion import (
     stream_completion_response,
     stream_completion_response_fanout,
 )
-from .streaming_utils import coalesce_ready_chunks, get_chunk_text
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -331,15 +330,13 @@ def _send_stream_chunk_direct(
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
 ) -> None:
-    """Enqueue a stream chunk for the async consumer.
+    """Send stream chunk directly to the queue."""
+    global tokenizer
 
-    Runs on engine_core_mgr's single ZMQ output-recv thread, so it must stay
-    trivial: enqueue token ids + bookkeeping only. Detokenization happens in
-    the per-request asyncio consumer (see streaming_utils) — keeping decode off
-    this thread stops it from back-pressuring the IPC socket for all streams.
-    """
+    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     started_at = _request_start_times.get(request_id)
     chunk_data = {
+        "text": new_text,
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
@@ -366,12 +363,12 @@ def _send_stream_chunk_tagged(
 
     This path serves ``SamplingParams.n > 1`` by tagging each sibling's chunks
     so the shared stream consumer can merge them in order.
-
-    Like :func:`_send_stream_chunk_direct`, this runs on the ZMQ output-recv
-    thread and only enqueues token ids; the fan-out consumer decodes per
-    sibling.
     """
+    global tokenizer
+
+    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     chunk_data = {
+        "text": new_text,
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
@@ -1271,15 +1268,13 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 try:
                     while True:
                         chunk_data = await stream_queue.get()
-                        # Drain any already-queued backlog and decode once.
-                        chunk_data = coalesce_ready_chunks(chunk_data, stream_queue)
                         if not message_started:
                             cache_read = chunk_data.get("num_cached_tokens", 0)
                             yield stream_message_start(
                                 request_id, model_name, input_tokens, cache_read
                             )
                             message_started = True
-                        new_text = get_chunk_text(chunk_data, tokenizer)
+                        new_text = chunk_data["text"]
                         output_tokens += len(chunk_data.get("token_ids", []))
                         finished = chunk_data.get("finished", False)
 
