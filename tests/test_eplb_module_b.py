@@ -36,6 +36,24 @@ def _record_single_pass(monitor, *, counts):
     monitor.on_forward_end(is_dummy_run=False)
 
 
+def _spy_rebalance(mgr, fired):
+    """Replace the runtime rebalance with a 0-yield spy that records each fire.
+
+    The scheduler drives `_execute_rebalance`, which yields-from
+    `_execute_runtime_rebalance`. Recording a fire without yielding mirrors the
+    real migration's synchronous, per-call behaviour and keeps the exact
+    call-count semantics these scheduler tests assert -- without needing real
+    `live_metadata` / EP MoE layers / weight movement.
+    """
+
+    def _fake():
+        fired.append(1)
+        return
+        yield  # pragma: no cover - marks this a generator (never reached)
+
+    mgr._execute_runtime_rebalance = _fake
+
+
 def test_manager_steps_with_dummy_and_triggers_by_interval(monkeypatch):
     monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
 
@@ -43,16 +61,7 @@ def test_manager_steps_with_dummy_and_triggers_by_interval(monkeypatch):
     # Make load imbalanced so balancedness < 0.8 and gate passes.
     _record_single_pass(monitor, counts=[4, 0])
 
-    triggered = {"n": 0}
-    owner = type(
-        "Owner",
-        (),
-        {
-            "run_eplb_rebalance": lambda self, s: triggered.__setitem__(
-                "n", triggered["n"] + 1
-            )
-        },
-    )()
+    fired = []
     manager = eplb.EPLBManager(
         enabled=True,
         monitor=monitor,
@@ -60,23 +69,23 @@ def test_manager_steps_with_dummy_and_triggers_by_interval(monkeypatch):
         rebalance_min_balancedness=0.8,
         rebalance_balancedness_agg="min",
     )
-    manager.bind_runtime_owner(owner)
+    _spy_rebalance(manager, fired)
 
     # vllm-style warm start: first window = interval//4 = 2, so the first LIVE
     # rebalance fires on call 3; steady state then uses the full interval (8).
     manager.on_forward_pass_end(is_dummy_run=False)  # 1 (first window)
     manager.on_forward_pass_end(is_dummy_run=True)  # 2 (first window)
-    assert triggered["n"] == 0
+    assert fired == []
     manager.on_forward_pass_end(is_dummy_run=False)  # 3 -> first rebalance
-    assert triggered["n"] == 1
+    assert fired == [1]
     assert manager.rebalance_count == 1
 
     # Steady state: the next rebalance is a full interval (8 calls) later.
     for _ in range(7):
         manager.on_forward_pass_end(is_dummy_run=False)
-    assert triggered["n"] == 1
+    assert fired == [1]
     manager.on_forward_pass_end(is_dummy_run=False)  # 8th steady call -> fire
-    assert triggered["n"] == 2
+    assert fired == [1, 1]
     assert manager.rebalance_count == 2
 
 
@@ -87,16 +96,7 @@ def test_manager_balancedness_gate_skips_when_balanced(monkeypatch):
     # Perfectly balanced.
     _record_single_pass(monitor, counts=[3, 3])
 
-    triggered = {"n": 0}
-    owner = type(
-        "Owner",
-        (),
-        {
-            "run_eplb_rebalance": lambda self, s: triggered.__setitem__(
-                "n", triggered["n"] + 1
-            )
-        },
-    )()
+    fired = []
     manager = eplb.EPLBManager(
         enabled=True,
         monitor=monitor,
@@ -104,10 +104,10 @@ def test_manager_balancedness_gate_skips_when_balanced(monkeypatch):
         rebalance_min_balancedness=0.8,
         rebalance_balancedness_agg="min",
     )
-    manager.bind_runtime_owner(owner)
+    _spy_rebalance(manager, fired)
     manager.on_forward_pass_end(is_dummy_run=False)  # consumes interval yield
     manager.on_forward_pass_end(is_dummy_run=False)  # enters _rebalance, gate skips
-    assert triggered["n"] == 0
+    assert fired == []
     assert manager.rebalance_count == 0
     assert manager.last_balancedness == pytest.approx(1.0)
 
@@ -119,16 +119,7 @@ def test_manager_min_vs_mean_aggregation(monkeypatch):
     fake_load = torch.tensor([[10, 2], [6, 6]], dtype=torch.int32)
     monkeypatch.setattr(monitor, "dump_global_physical_load", lambda: fake_load)
 
-    min_hit = {"n": 0}
-    min_owner = type(
-        "Owner",
-        (),
-        {
-            "run_eplb_rebalance": lambda self, s: min_hit.__setitem__(
-                "n", min_hit["n"] + 1
-            )
-        },
-    )()
+    fired_min = []
     mgr_min = eplb.EPLBManager(
         enabled=True,
         monitor=monitor,
@@ -136,21 +127,12 @@ def test_manager_min_vs_mean_aggregation(monkeypatch):
         rebalance_min_balancedness=0.7,
         rebalance_balancedness_agg="min",
     )
-    mgr_min.bind_runtime_owner(min_owner)
+    _spy_rebalance(mgr_min, fired_min)
     mgr_min.on_forward_pass_end(is_dummy_run=False)
     mgr_min.on_forward_pass_end(is_dummy_run=False)
-    assert min_hit["n"] == 1
+    assert fired_min == [1]  # min=0.5 < 0.7 -> rebalance
 
-    mean_hit = {"n": 0}
-    mean_owner = type(
-        "Owner",
-        (),
-        {
-            "run_eplb_rebalance": lambda self, s: mean_hit.__setitem__(
-                "n", mean_hit["n"] + 1
-            )
-        },
-    )()
+    fired_mean = []
     mgr_mean = eplb.EPLBManager(
         enabled=True,
         monitor=monitor,
@@ -158,10 +140,10 @@ def test_manager_min_vs_mean_aggregation(monkeypatch):
         rebalance_min_balancedness=0.7,
         rebalance_balancedness_agg="mean",
     )
-    mgr_mean.bind_runtime_owner(mean_owner)
+    _spy_rebalance(mgr_mean, fired_mean)
     mgr_mean.on_forward_pass_end(is_dummy_run=False)
     mgr_mean.on_forward_pass_end(is_dummy_run=False)
-    assert mean_hit["n"] == 0
+    assert fired_mean == []  # mean=0.75 >= 0.7 -> skip
 
 
 def test_manager_interval_must_cover_window():
@@ -176,49 +158,30 @@ def test_manager_interval_must_cover_window():
         )
 
 
-def test_manager_runs_bound_owner_rebalance(monkeypatch):
+def test_manager_trigger_offline_rebalance(monkeypatch):
+    # Offline trigger bypasses the interval schedule AND the balancedness gate.
     monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
     monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
     _record_single_pass(monitor, counts=[4, 0])
 
-    seen = {"n": 0}
-
-    class _Owner:
-        def run_eplb_rebalance(self, stream):
-            _ = stream
-            seen["n"] += 1
-
+    fired = []
     mgr = eplb.EPLBManager(
         enabled=True,
         monitor=monitor,
-        rebalance_interval=1,
-        rebalance_min_balancedness=0.9,
+        rebalance_interval=100,  # would never fire periodically
+        rebalance_min_balancedness=0.0,
         rebalance_balancedness_agg="min",
     )
-    mgr.bind_runtime_owner(_Owner())
-    mgr.on_forward_pass_end(is_dummy_run=False)  # consumes interval yield
-    mgr.on_forward_pass_end(is_dummy_run=False)  # triggers rebalance
-    assert seen["n"] == 1
+    _spy_rebalance(mgr, fired)
+    mgr.trigger_offline_rebalance(reason="test")
+    assert fired == [1]
+    assert mgr.rebalance_count == 1
 
 
-def test_with_eplb_forward_monitor_allows_missing_runtime_owner_hook(monkeypatch):
-    class _Cfg:
-        eplb_enable = True
-        eplb_config = type(
-            "ECfg",
-            (),
-            {
-                "load_window_size": 1,
-                "rebalance_interval": 1,
-                "rebalance_min_balancedness": 0.8,
-                "rebalance_balancedness_agg": "min",
-            },
-        )()
-
-    monkeypatch.setattr(
-        "atom.config.get_current_atom_config",
-        lambda: _Cfg(),
-    )
+def test_with_eplb_forward_monitor_passthrough_when_disabled(monkeypatch):
+    # When no manager is configured (EPLB off), the decorator is a transparent
+    # pass-through and must not touch the monitor/scheduler.
+    monkeypatch.setattr(eplb, "_MANAGER", None)
 
     @eplb.with_eplb_forward_monitor
     def _forward(self, batch):
@@ -227,55 +190,10 @@ def test_with_eplb_forward_monitor_allows_missing_runtime_owner_hook(monkeypatch
     assert _forward(object(), object()) == 1
 
 
-def test_with_eplb_forward_monitor_uses_runner_rebalance_hook(monkeypatch):
-    class _Cfg:
-        eplb_enable = True
-        eplb_config = type(
-            "ECfg",
-            (),
-            {
-                "load_window_size": 1,
-                "rebalance_interval": 1,
-                "rebalance_min_balancedness": 0.8,
-                "rebalance_balancedness_agg": "min",
-            },
-        )()
-
-    monkeypatch.setattr(
-        "atom.config.get_current_atom_config",
-        lambda: _Cfg(),
-    )
-    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
-    # Ensure the rebalance gate passes.
-    monkeypatch.setattr(
-        eplb.ExpertLoadMonitor,
-        "dump_global_physical_load",
-        lambda self: torch.tensor([[4, 0]], dtype=torch.int32),
-    )
-
-    seen = {"n": 0, "stream": None}
-
-    class _Runner:
-        def run_eplb_rebalance(self, stream):
-            seen["n"] += 1
-            seen["stream"] = stream
-
-    @eplb.with_eplb_forward_monitor
-    def _forward(self, batch):
-        return 1
-
-    runner = _Runner()
-    _forward(runner, object())
-    _forward(runner, object())
-    assert seen["n"] == 1
-
-
 def test_execute_rebalance_uses_default_stream_no_explicit_wait(monkeypatch):
-    """cuda_stream=None (default stream) means no explicit wait_stream call.
-
-    Migration is enqueued on the default stream which is the same stream
-    as the forward pass, so FIFO ordering is guaranteed without synchronize
-    or wait_stream — aligned with SGLang/vllm.
+    """Migration is enqueued on the default stream (same stream as the forward
+    pass), so FIFO ordering holds without an explicit wait_stream/synchronize --
+    aligned with SGLang/vllm. _execute_rebalance must never call wait_stream.
     """
     monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
     manager = eplb.EPLBManager(
@@ -285,9 +203,12 @@ def test_execute_rebalance_uses_default_stream_no_explicit_wait(monkeypatch):
         rebalance_min_balancedness=0.8,
         rebalance_balancedness_agg="min",
     )
-    manager.bind_runtime_owner(
-        type("Owner", (), {"run_eplb_rebalance": lambda self, s: None})()
-    )
+
+    def _fake():
+        return
+        yield  # pragma: no cover - marks this a generator
+
+    manager._execute_runtime_rebalance = _fake
 
     waited = {"called": False}
 
@@ -302,7 +223,10 @@ def test_execute_rebalance_uses_default_stream_no_explicit_wait(monkeypatch):
     assert not waited["called"]
 
 
-def test_execute_rebalance_drains_owner_generator(monkeypatch):
+def test_execute_rebalance_drains_runtime_generator():
+    """_execute_rebalance must yield-from the chunked runtime rebalance so a
+    forward pass can run between migration chunks.
+    """
     monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
     manager = eplb.EPLBManager(
         enabled=True,
@@ -313,19 +237,12 @@ def test_execute_rebalance_drains_owner_generator(monkeypatch):
     )
     steps = []
 
-    class _Owner:
-        def run_eplb_rebalance(self, stream):
-            _ = stream
+    def _fake():
+        steps.append("chunk0")
+        yield
+        steps.append("chunk1")
 
-            def _gen():
-                steps.append("chunk0")
-                yield
-                steps.append("chunk1")
-
-            return _gen()
-
-    manager.bind_runtime_owner(_Owner())
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    manager._execute_runtime_rebalance = _fake
 
     gen = manager._execute_rebalance()
     next(gen)
