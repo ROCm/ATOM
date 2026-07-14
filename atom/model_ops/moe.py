@@ -653,6 +653,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 expert_map=expert_map,
                 expert_mask=layer.expert_mask,
             )
+        from atom.utils.arch import aiter_hip_kernels_supported
+
+        if not aiter_hip_kernels_supported():
+            # aiter asm fused_moe is gfx9-only; use the portable Triton MoE.
+            from atom.model_ops.fused_moe_triton import triton_kernel_moe_forward
+
+            return triton_kernel_moe_forward(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+            )
         return fused_moe(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -1833,6 +1850,132 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             )
 
 
+class Int8MoEMethod(FusedMoEMethodBase):
+    """Online INT8 W8A8 MoE (per-token activation + per-channel weight).
+
+    Used by online quantization on archs without the gfx9 asm/CK MoE kernels
+    (e.g. gfx1151 RDNA3.5). Expert weights are stored int8 per-output-channel;
+    activations are dynamically int8-quantized per token at apply time, and the
+    routed grouped GEMMs run via aiter's triton int8 smoothquant kernel.
+    """
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(moe)
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        # Stored in [E, out, in] (vLLM convention) so the per-expert online-quant
+        # loader can reuse the per_Token shard path; transposed to the kernel's
+        # [E, in, out] layout in process_weights_after_loading.
+        w13_weight = atom_parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=torch.int8,
+            )
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = atom_parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=torch.int8,
+            )
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # Per-output-channel scales: [E, 2*I] and [E, hidden]. This is exactly the
+        # w_scale [E, N] layout the int8 smoothquant kernel expects.
+        w13_weight_scale = atom_parameter(
+            torch.ones(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                dtype=torch.float32,
+            )
+        )
+        w2_weight_scale = atom_parameter(
+            torch.ones(num_experts, hidden_size, dtype=torch.float32)
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # [E, out, in] -> kernel layout [E, in, out]; scales already [E, out].
+        w13 = layer.w13_weight.data.transpose(1, 2).contiguous()  # [E, H, 2I]
+        # Interleave the concatenated [gate(:I) | up(I:)] output columns into
+        # (g0,u0,g1,u1,...) so the kernel's fused _swiglu (which splits adjacent
+        # pairs) computes silu(gate)*up. Scales follow the same permutation.
+        half = w13.shape[2] // 2
+        g, u = w13[:, :, :half], w13[:, :, half:]
+        w13 = torch.stack([g, u], dim=-1).reshape(w13.shape[0], w13.shape[1], 2 * half)
+        layer.w13_weight = atom_parameter(w13.contiguous())
+        s = layer.w13_weight_scale.data  # [E, 2I]
+        gs, us = s[:, :half], s[:, half:]
+        s = torch.stack([gs, us], dim=-1).reshape(s.shape[0], 2 * half)
+        layer.w13_weight_scale = atom_parameter(s.contiguous())
+        layer.w2_weight = atom_parameter(
+            layer.w2_weight.data.transpose(1, 2).contiguous()
+        )
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        return None
+
+    @mark_trace(prefix="int8_moe", torch_compile=False)
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        fused_shared_experts_scoring_func: Optional[str] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: ActivationType = ActivationType.Silu,
+    ) -> torch.Tensor:
+        assert (
+            activation == ActivationType.Silu
+        ), "Int8MoEMethod only supports SiLU-gated experts"
+        from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
+            fused_moe_int8_smoothquant,
+        )
+
+        return fused_moe_int8_smoothquant(
+            hidden_states=x,
+            w13=layer.w13_weight,
+            w2=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            gating_output=router_logits,
+            topk=top_k,
+            renormalize=renormalize,
+        )
+
+
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
     Supports three quantization strategies:
@@ -2671,6 +2814,8 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = Fp8MoEMethod(online_quant_config, self.moe_config)
         elif online_quant_dtype == dtypes.fp4x2:
             self.quant_method = Mxfp4MoEMethod(online_quant_config, self.moe_config)
+        elif online_quant_dtype == torch.int8:
+            self.quant_method = Int8MoEMethod(online_quant_config, self.moe_config)
         else:
             raise ValueError(
                 f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"

@@ -195,13 +195,55 @@ class Qwen3_5MTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
+    def detect_fused_expert_format(self, weight_name: str) -> bool:
+        # The draft checkpoint stores experts fused (experts.gate_up_proj /
+        # experts.down_proj) exactly like the target; reuse the target's detector
+        # so the loader maps them into w13_weight/w2_weight instead of dropping.
+        from atom.models.qwen3_5 import detect_fused_expert_format
+
+        return detect_fused_expert_format(weight_name)
+
+    def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
+        from atom.models.qwen3_5 import get_fused_expert_mapping
+
+        return get_fused_expert_mapping()
+
+    def load_fused_expert_weights(
+        self,
+        original_name: str,
+        name: str,
+        params_dict: dict,
+        loaded_weight,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
+        from atom.models.qwen3_5 import load_fused_expert_weights
+
+        return load_fused_expert_weights(
+            original_name, name, params_dict, loaded_weight, shard_id, num_experts
+        )
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:  # noqa: D401
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        # Dense models (e.g. Qwen3.6-27B) have no routed experts -> nothing to map.
+        # MoE models (e.g. 35B-A3B) expose the count as `num_experts`; the main
+        # model only sets `n_routed_experts` late, so don't rely on it being
+        # present on the MTP config view (else expert weights go unmapped and the
+        # draft produces garbage -> 0% acceptance).
+        n_routed = getattr(self.config, "n_routed_experts", 0) or getattr(
+            self.config, "num_experts", 0
+        )
+        if not n_routed:
+            return []
+        n_shared = (
+            getattr(self.config, "n_shared_experts", 0)
+            or getattr(self.config, "num_shared_experts", 0)
+            or 0
+        )
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts
-            + (self.config.n_shared_experts or 0),
+            num_experts=n_routed + n_shared,
         )
