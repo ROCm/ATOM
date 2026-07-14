@@ -14,10 +14,10 @@ black . && ruff check .                   # format + lint (CI enforced)
 
 ```bash
 # OpenAI-compatible serving
-python -m atom.entrypoints.openai_server --model <model> --kv_cache_dtype fp8 -tp 8
+python -m atom.entrypoints.openai_server --model <model> --kv-cache-dtype fp8 -tp 8
 
 # Offline inference
-python -m atom.examples.simple_inference --model <model> --kv_cache_dtype fp8
+python -m atom.examples.simple_inference --model <model> --kv-cache-dtype fp8
 ```
 
 - Accuracy validation: see `/ci-pr-guide` for `lm_eval` setup and CI thresholds
