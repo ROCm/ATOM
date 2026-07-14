@@ -53,7 +53,7 @@ vllm serve zai-org/GLM-5.2-FP8 \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
-    --additional-config '{"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}'
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
 ```
 Note:
 - Quick allreduce is used to accelerate the communication and flydsl sort enabled for MOE layers.
@@ -61,7 +61,7 @@ Note:
 - Online quantization is used to convert the original FP8 weights to kernel-friendly formats, i.e., attention linear weights in PTPC-FP8 and expert weights in MXFP8, enabling optimal hardware performance.
 - The MTP feature is also supported. To enable it, add `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` to the command above.
 
-### Deployment on MI300X GPUs
+### Deployment on MI300X/MI308X GPUs
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
