@@ -117,6 +117,8 @@ models:
     env:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: "INT4"
+        # PR #1566: enable MXFP4 intermediate output for INT4 quick reduce.
+        AITER_MXFP4_INTERMEDIATE: "1"
       prefill: {}
       decode: {}
     server:

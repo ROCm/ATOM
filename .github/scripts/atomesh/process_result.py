@@ -259,6 +259,7 @@ def enrich_payload(
     enriched.setdefault("max_concurrency", fields["conc"])
     enriched.setdefault("random_range_ratio", fields["ratio"])
     enriched.setdefault("precision", env.get("PRECISION", ""))
+    enriched.setdefault("docker_image", env.get("DOCKER_IMAGE", ""))
     enriched.setdefault("prefill_workers", env.get("PREFILL_WORKERS"))
     enriched.setdefault("decode_workers", env.get("DECODE_WORKERS"))
     enriched.setdefault("prefill_tp", env.get("PREFILL_TP"))
