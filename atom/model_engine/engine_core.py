@@ -17,7 +17,12 @@ from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import envs, init_exit_handler, make_zmq_socket
+from atom.utils import (
+    envs,
+    init_exit_handler,
+    make_zmq_socket,
+    set_process_title,
+)
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -110,6 +115,11 @@ class EngineCore:
             config.num_per_req_cache_groups = block_info.get(
                 "num_per_req_cache_groups", 0
             )
+            # paged-SWA: propagate SWA pool sizing from the runner subprocess
+            # so BlockManager (built in Scheduler below) sees the same value as
+            # the runner's attn builder (else swa_enabled=False vs the SWA pool).
+            config.num_swa_blocks = block_info.get("num_swa_blocks", 0)
+            config.swa_window_size = block_info.get("swa_window_size", 0)
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -184,11 +194,25 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        # Bind this EngineCore's lifetime to its parent (the server /
+        # CoreManager): if the parent exits, have the kernel reap this process —
+        # and, transitively, the ModelRunner workers it spawns — instead of
+        # leaving them orphaned. Orphans keep pinning GPU VRAM + the custom
+        # all-reduce IPC handles / rendezvous TCPStore, which makes the next
+        # restart reuse a stale hipIpc handle and crash. See
+        # atom.utils.enable_orphan_reaping for the full rationale.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
         engine: EngineCore = None
         try:
             if config.parallel_config.data_parallel_size > 1:
+                set_process_title(
+                    f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
+                )
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
+                set_process_title("EngineCore")
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:

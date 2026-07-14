@@ -324,31 +324,19 @@ def _prepare_multimodal_inputs(
     return inputs["input_ids"][0].tolist(), multimodal_data
 
 
-# ── Batched stream dispatch ──────────────────────────────────────────────
-# Per-seq `call_soon_threadsafe` floods the API event loop at high batch size
-# (one call per token). Instead the callback only buffers the raw chunk; the
-# mgr flushes a whole step with a single `tokenizer.batch_decode` (one
-# GIL-released call instead of one decode per seq) plus one scheduled call per
-# loop (see `flush_stream_batch`).
-import threading as _threading  # noqa: E402
-
-_stream_batch_tls = _threading.local()
-
-
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
 ) -> None:
-    """Buffer the chunk; decode + dispatch happen batched in flush_stream_batch.
+    """Send stream chunk directly to the queue."""
+    global tokenizer
 
-    ``text`` is intentionally left unset here — it is filled by a single
-    ``tokenizer.batch_decode`` over the whole step in :func:`flush_stream_batch`,
-    avoiding one decode call per seq on the output thread.
-    """
+    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     started_at = _request_start_times.get(request_id)
     chunk_data = {
+        "text": new_text,
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
@@ -358,47 +346,7 @@ def _send_stream_chunk_direct(
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-
-    buf = getattr(_stream_batch_tls, "buf", None)
-    if buf is None:
-        buf = _stream_batch_tls.buf = []
-    buf.append((loop, stream_queue, chunk_data))
-
-
-def _drain_batch_into_queues(items: list) -> None:
-    """Runs ON the event loop: push each chunk into its per-request queue.
-    One scheduled call handles a whole step's worth of chunks."""
-    for _loop, q, chunk in items:
-        q.put_nowait(chunk)
-
-
-def flush_stream_batch() -> None:
-    """Flush a step's buffered chunks: one ``batch_decode`` for the whole step,
-    then one call_soon_threadsafe per loop (normally one — all requests on a
-    rank share the API loop)."""
-    global tokenizer
-
-    buf = getattr(_stream_batch_tls, "buf", None)
-    if not buf:
-        return
-    _stream_batch_tls.buf = []
-    # Decode the whole step in a single call. batch_decode is element-wise
-    # identical to per-seq decode but acquires/releases the GIL once instead of
-    # once per seq, cutting GIL ping-pong against the other rank output threads
-    # and the API event loop at high batch size.
-    texts = tokenizer.batch_decode(
-        [chunk["token_ids"] for _loop, _q, chunk in buf],
-        skip_special_tokens=True,
-    )
-    for (_loop, _q, chunk), text in zip(buf, texts):
-        chunk["text"] = text
-    # Group by loop (normally a single loop). dict preserves insertion order
-    # so per-request chunk ordering within the step is maintained.
-    by_loop: Dict[AbstractEventLoop, list] = {}
-    for loop, q, chunk in buf:
-        by_loop.setdefault(loop, []).append((loop, q, chunk))
-    for loop, items in by_loop.items():
-        loop.call_soon_threadsafe(_drain_batch_into_queues, items)
+    loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
 
 
 def _send_stream_chunk_tagged(
@@ -413,11 +361,8 @@ def _send_stream_chunk_tagged(
     queue so the merge-stream consumer in :mod:`serving_chat` /
     :mod:`serving_completion` can demultiplex by index.
 
-    Unlike :func:`_send_stream_chunk_direct`, this fan-out path decodes and
-    dispatches immediately rather than going through the batched flush: it
-    serves ``SamplingParams.n > 1`` (a handful of siblings of one request),
-    not the many-concurrent-requests regime that motivates batch decoding, so
-    a separate per-step buffer here would add complexity for little gain.
+    This path serves ``SamplingParams.n > 1`` by tagging each sibling's chunks
+    so the shared stream consumer can merge them in order.
     """
     global tokenizer
 
@@ -438,6 +383,7 @@ async def generate_async(
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    data_parallel_rank: Optional[int] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     global engine, tokenizer
@@ -482,6 +428,11 @@ async def generate_async(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s pinned to data_parallel_rank=%s", seq.id, data_parallel_rank
+        )
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -489,17 +440,36 @@ async def generate_async(
         raise
     engine.core_mgr.add_request([seq])
 
-    while True:
-        item = await token_queue.get()
-        token_ids = item.get("token_ids") or []
-        if token_ids:
-            if first_token_at is None:
-                first_token_at = item.get("ts", time.time())
-            last_token_at = item.get("ts", time.time())
-            all_token_ids.extend(token_ids)
-        if item.get("finished", False):
-            finish_reason = item.get("finish_reason")
-            break
+    _finished_ok = False
+    try:
+        while True:
+            item = await token_queue.get()
+            token_ids = item.get("token_ids") or []
+            if token_ids:
+                if first_token_at is None:
+                    first_token_at = item.get("ts", time.time())
+                last_token_at = item.get("ts", time.time())
+                all_token_ids.extend(token_ids)
+            if item.get("finished", False):
+                finish_reason = item.get("finish_reason")
+                _finished_ok = True
+                break
+    finally:
+        # Two responsibilities, on EVERY exit path:
+        #   1) If we didn't finish (client disconnected / cancelled), tell the
+        #      engine to stop so the seq doesn't run to max_tokens and burn GPU.
+        #   2) Always drop the seq from io_processor.requests. The engine frees
+        #      its own KV on finish, but this dict is only cleaned up here for
+        #      non-stream requests -- without an unconditional pop, every
+        #      completed non-stream request leaks a Sequence (pending grows
+        #      forever). Streaming pops via cleanup_streaming_request instead.
+        if seq is not None:
+            if not _finished_ok:
+                try:
+                    engine.core_mgr.abort_request(seq.id)
+                except Exception:
+                    pass
+            engine.io_processor.requests.pop(seq.id, None)
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
     num_tokens_input = (
@@ -580,17 +550,29 @@ async def generate_async_multimodal(
         raise
     engine.core_mgr.add_request([seq])
 
-    while True:
-        item = await token_queue.get()
-        token_ids_out = item.get("token_ids") or []
-        if token_ids_out:
-            if first_token_at is None:
-                first_token_at = item.get("ts", time.time())
-            last_token_at = item.get("ts", time.time())
-            all_token_ids.extend(token_ids_out)
-        if item.get("finished", False):
-            finish_reason = item.get("finish_reason")
-            break
+    _finished_ok = False
+    try:
+        while True:
+            item = await token_queue.get()
+            token_ids_out = item.get("token_ids") or []
+            if token_ids_out:
+                if first_token_at is None:
+                    first_token_at = item.get("ts", time.time())
+                last_token_at = item.get("ts", time.time())
+                all_token_ids.extend(token_ids_out)
+            if item.get("finished", False):
+                finish_reason = item.get("finish_reason")
+                _finished_ok = True
+                break
+    finally:
+        # See generate_async: abort on early exit, always pop to avoid leak.
+        if seq is not None:
+            if not _finished_ok:
+                try:
+                    engine.core_mgr.abort_request(seq.id)
+                except Exception:
+                    pass
+            engine.io_processor.requests.pop(seq.id, None)
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
     num_tokens_output = len(all_token_ids)
@@ -624,6 +606,7 @@ async def generate_async_fanout(
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
     multimodal_data: Optional[Dict[str, Any]] = None,
+    data_parallel_rank: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
@@ -677,6 +660,15 @@ async def generate_async_fanout(
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        for seq in seqs:
+            seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s fanout pinned %d sequence(s) to data_parallel_rank=%s",
+            request_id,
+            len(seqs),
+            data_parallel_rank,
+        )
     try:
         _validate_sequence_context_length(seqs[0])
     except Exception:
@@ -686,19 +678,31 @@ async def generate_async_fanout(
     engine.core_mgr.add_request(seqs)
     num_tokens_input = seqs[0].num_prompt_tokens
 
-    while not all(finished):
-        idx, item = await shared_queue.get()
-        if finished[idx]:
-            continue
-        tokens = item.get("token_ids") or []
-        if tokens:
-            if per_first_token_at[idx] is None:
-                per_first_token_at[idx] = item.get("ts", time.time())
-            per_last_token_at[idx] = item.get("ts", time.time())
-            per_tokens[idx].extend(tokens)
-        if item.get("finished", False):
-            per_finish_reason[idx] = item.get("finish_reason")
-            finished[idx] = True
+    _all_finished = False
+    try:
+        while not all(finished):
+            idx, item = await shared_queue.get()
+            if finished[idx]:
+                continue
+            tokens = item.get("token_ids") or []
+            if tokens:
+                if per_first_token_at[idx] is None:
+                    per_first_token_at[idx] = item.get("ts", time.time())
+                per_last_token_at[idx] = item.get("ts", time.time())
+                per_tokens[idx].extend(tokens)
+            if item.get("finished", False):
+                per_finish_reason[idx] = item.get("finish_reason")
+                finished[idx] = True
+        _all_finished = True
+    finally:
+        # Abort any sibling still running on early exit; always pop all seqs.
+        for _seq in seqs:
+            if not _all_finished:
+                try:
+                    engine.core_mgr.abort_request(_seq.id)
+                except Exception:
+                    pass
+            engine.io_processor.requests.pop(_seq.id, None)
 
     finished_at = time.time()
     outputs: List[Dict[str, Any]] = []
@@ -804,12 +808,21 @@ async def setup_streaming_request(
     return seq_id, stream_queue, seq.num_prompt_tokens
 
 
-def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
+def cleanup_streaming_request(
+    request_id: str, seq_id: int, aborted: bool = False
+) -> None:
     """Clean up resources for a streaming request.
 
     Safe to call multiple times for the same ``request_id`` with different
     ``seq_id`` values (as happens in fan-out cleanup): the per-request
     dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
+
+    ``aborted`` says the stream did NOT reach its normal end (client disconnect
+    or abnormal generator teardown), so the seq is likely still running in the
+    engine and must be stopped. On normal completion pass False (the default):
+    the engine has already dropped the seq, so an abort would be a guaranteed
+    no-op that just floods the control path (one broadcast per engine core, per
+    request).
     """
     global engine, _stream_queues, _seq_id_to_request_id
     global _stream_loops, _request_start_times
@@ -818,7 +831,109 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    if aborted:
+        try:
+            engine.core_mgr.abort_request(seq_id)
+        except Exception:
+            pass
     engine.io_processor.requests.pop(seq_id, None)
+
+
+class _ClientDisconnected(Exception):
+    """Raised when a non-streaming client hangs up mid-generation."""
+
+    def __init__(self, request_id: str):
+        super().__init__(request_id)
+        self.request_id = request_id
+
+
+async def _listen_for_disconnect(request) -> None:
+    """Block until the client sends an ``http.disconnect`` ASGI event.
+
+    Unlike polling ``request.is_disconnected()`` on a timer, this awaits the
+    disconnect event directly, so detection is immediate and costs nothing while
+    the client stays connected.
+    """
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            break
+
+
+async def _race_disconnect(coro, raw_request, request_id):
+    """Race an awaitable against client disconnect (vLLM ``with_cancellation``
+    style).
+
+    Starlette does NOT cancel a *non-streaming* request handler when the client
+    goes away (unlike StreamingResponse, which is cancelled on http.disconnect).
+    Without this, an abandoned non-stream request keeps ``await``-ing the engine
+    until it hits ``max_tokens`` -- burning GPU on output nobody will read AND
+    leaking the seq(s) in ``io_processor.requests`` (their finally never fires).
+
+    We run ``coro`` (which produces the final result) as a task alongside a task
+    that awaits the ASGI ``http.disconnect`` event. Whichever finishes first
+    wins; the loser is cancelled. On disconnect, the coro's cancellation
+    propagates into its ``await`` points so its own ``try/finally`` runs ->
+    ``abort_request`` + ``io_processor.requests.pop`` (for fan-out, this aborts
+    every sibling). We then raise ``_ClientDisconnected``.
+
+    ``request.receive()`` is safe here because FastAPI has already parsed the
+    request body into a pydantic model before this handler runs, so there is no
+    unread body for ``receive()`` to race against.
+    """
+    handler_task = asyncio.ensure_future(coro)
+
+    # No ASGI request object (e.g. internal call) -> just await the coro.
+    if raw_request is None:
+        return await handler_task
+
+    disconnect_task = asyncio.ensure_future(_listen_for_disconnect(raw_request))
+
+    done, pending = await asyncio.wait(
+        [handler_task, disconnect_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    # Cancel the loser and let its cancellation settle (drives the coro's own
+    # finally -> abort_request when the handler is the loser). Only swallow the
+    # expected CancelledError; log anything else, and let BaseException
+    # (KeyboardInterrupt/SystemExit) propagate.
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning(
+                f"Error tearing down cancelled task for request {request_id}",
+                exc_info=True,
+            )
+
+    if handler_task in done:
+        return handler_task.result()
+
+    logger.info(f"Client disconnected (non-stream), aborting request {request_id}")
+    raise _ClientDisconnected(request_id)
+
+
+async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
+    """Drive a non-stream ``generate_async*`` async-*generator* while watching
+    for client disconnect.
+
+    Thin wrapper over :func:`_race_disconnect` that collects the generator's
+    last yielded output. Use :func:`_race_disconnect` directly for the fan-out
+    path, whose ``generate_async_fanout`` is a coroutine returning a list.
+    """
+
+    async def _collect():
+        final_output = None
+        async for output in agen:
+            final_output = output
+        return final_output
+
+    return await _race_disconnect(_collect(), raw_request, request_id)
 
 
 async def setup_streaming_request_fanout(
@@ -947,7 +1062,7 @@ async def general_error_handler(request: Request, exc: Exception):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
     global engine, tokenizer, model_name
 
@@ -1042,12 +1157,16 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Non-streaming
         if is_multimodal and effective_n > 1:
-            outputs = await generate_async_fanout(
-                token_ids,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    token_ids,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
+                ),
+                raw_request,
                 request_id,
-                multimodal_data=multimodal_data,
-                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -1055,14 +1174,16 @@ async def chat_completions(request: ChatCompletionRequest):
                 request_id, model_name, outputs, tools=request.tools
             )
         elif is_multimodal:
-            final_output = None
-            async for output in generate_async_multimodal(
-                token_ids,
-                multimodal_data,
-                sampling_params,
+            final_output = await _run_nonstream_with_disconnect(
+                generate_async_multimodal(
+                    token_ids,
+                    multimodal_data,
+                    sampling_params,
+                    request_id,
+                ),
+                raw_request,
                 request_id,
-            ):
-                final_output = output
+            )
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
@@ -1073,11 +1194,15 @@ async def chat_completions(request: ChatCompletionRequest):
                 tools=request.tools,
             )
         elif effective_n > 1:
-            outputs = await generate_async_fanout(
-                prompt,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -1085,14 +1210,16 @@ async def chat_completions(request: ChatCompletionRequest):
                 request_id, model_name, outputs, tools=request.tools
             )
         else:
-            final_output = None
-            async for output in generate_async(
-                prompt,
-                sampling_params,
+            final_output = await _run_nonstream_with_disconnect(
+                generate_async(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
-            ):
-                final_output = output
+            )
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
@@ -1105,6 +1232,9 @@ async def chat_completions(request: ChatCompletionRequest):
         _log_request_event("response", request_id, resp.model_dump())
         return resp
 
+    except _ClientDisconnected:
+        # Client hung up; seq already aborted + popped. Nothing to return.
+        return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as e:
         logger.error(f"Validation error in chat_completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -1114,7 +1244,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
 
 @app.post("/v1/completions")
-async def completions(request: CompletionRequest):
+async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
     global engine, tokenizer, model_name
 
@@ -1177,24 +1307,32 @@ async def completions(request: CompletionRequest):
 
         # Non-streaming
         if effective_n > 1:
-            outputs = await generate_async_fanout(
-                request.prompt,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_completion_response_multi(request_id, model_name, outputs)
         else:
-            final_output = None
-            async for output in generate_async(
-                request.prompt,
-                sampling_params,
+            final_output = await _run_nonstream_with_disconnect(
+                generate_async(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
-            ):
-                final_output = output
+            )
 
             if final_output is None:
                 raise RuntimeError("No output generated")
@@ -1203,6 +1341,9 @@ async def completions(request: CompletionRequest):
         _log_request_event("response", request_id, resp.model_dump())
         return resp
 
+    except _ClientDisconnected:
+        # Client hung up; seq already aborted + popped. Nothing to return.
+        return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as e:
         logger.error(f"Validation error in completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -1301,6 +1442,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                 message_started = False
                 _thinking_enabled = bool(getattr(request, "thinking", None))
+                # Assume abort until we reach the normal end of the stream. If
+                # the client disconnects, GeneratorExit unwinds through the
+                # yields and the finally runs with this still True -> abort.
+                aborted = True
 
                 try:
                     while True:
@@ -1439,9 +1584,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 yield stream_content_block_stop(block_index)
                             yield stream_message_delta(stop_reason, output_tokens)
                             yield stream_message_stop()
+                            aborted = False
                             break
                 finally:
-                    cleanup_streaming_request(request_id, seq_id)
+                    cleanup_streaming_request(request_id, seq_id, aborted=aborted)
 
             return StreamingResponse(
                 generate_anthropic_stream(),

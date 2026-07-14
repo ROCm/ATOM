@@ -4,6 +4,8 @@
 import logging
 import queue
 
+from atom.model_engine.sequence import SequenceStatus
+
 logger = logging.getLogger("atom")
 
 
@@ -41,6 +43,7 @@ class EngineUtilityHandler:
         "stop_profile": "_handle_stop_profile",
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
+        "abort_request": "_handle_abort_request",
     }
 
     def __init__(
@@ -209,6 +212,19 @@ class EngineUtilityHandler:
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "clear_kv_cache", "result": result})
         )
+
+    def _handle_abort_request(self, args: dict):
+        """Mark a sequence ABORTED (client disconnected) so the scheduler finishes
+        it at the next step via the normal stop path (frees KV, drops it)."""
+        req_id = args.get("req_id") if isinstance(args, dict) else None
+        if req_id is None or self.scheduler is None:
+            return
+        found = False
+        for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
+            if seq.id == req_id:
+                seq.status = SequenceStatus.ABORTED
+                found = True
+        logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
 
     def _handle_configure_hidden_states(self, args: dict):
         """Configure hidden states extraction on all model runners (TorchSpec)."""

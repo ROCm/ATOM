@@ -69,14 +69,21 @@ Resolution order for a given layer name:
 
 ### 2.1 Target formats
 
-Only two target formats are currently supported. Any other string (for example
-`ptpc_i8`, `mxi4`, `mxfp8`) will either be rejected by the JSON parser or
-trigger an assertion in the loader when the layer's weight is quantized.
+The target formats below are currently supported. Any other string (for example
+`ptpc_i8`, `mxi4`, `mxfp8`) will be rejected by the JSON parser or trigger an
+assertion in the loader when the layer's weight is quantized.
 
 | Format string | Underlying `QuantType` | Weight dtype |
 |---|---|---|
 | `ptpc_fp8` | `QuantType.per_Token` | `torch.float8_e4m3fn` |
+| `per_block_fp8` | `QuantType.per_1x128` | `torch.float8_e4m3fn` (128×128 block scale) |
+| `per_block128_fp8` | `QuantType.per_1x128` | alias of `per_block_fp8` (explicit 128 block) |
 | `mxfp4` | `QuantType.per_1x32` | packed FP4 (`torch.float4_e2m1fn_x2`, group size 32) |
+
+`per_block_fp8` is DeepSeek-style block FP8: the weight uses a 128×128 block
+scale of shape `(N//128, K//128)` and the activation uses a 1×128 (along K)
+scale, consumed by the block-scale GEMM. `per_block_fp8` and `per_block128_fp8`
+are equivalent (128 is the default block size).
 
 ### 2.2 Picking the right pattern
 
@@ -175,9 +182,26 @@ python -m atom.entrypoints.openai_server \
 quantization — it can be added to any of the recipes above without changing
 the `--online_quant_config` JSON.
 
----
+### 3.5 Qwen3-30B-A3B-Thinking-2507 — full per-block FP8
 
-## 3.5 Plugin mode (`vllm serve`)
+BF16 source → every Linear and the fused expert module quantized to
+`per_block_fp8` (DeepSeek-style 128×128 block scale).
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model Qwen/Qwen3-30B-A3B-Thinking-2507 \
+  -tp 2 \
+  --online_quant_config '{
+    "global_quant_config": "per_block_fp8",
+    "exclude_layer": ["lm_head", "*.gate.*"]
+  }'
+```
+
+`per_block_fp8` is the same block-FP8 format DeepSeek-V3/R1 ships natively, so
+it is a good drop-in when you want FP8 accuracy closer to the block-scaled
+checkpoint than per-token `ptpc_fp8`.
+
+### 3.6 Plugin mode (`vllm serve`)
 
 In the [vLLM out-of-tree plugin backend](vllm_plugin_backend_guide.md) you launch
 with `vllm serve`, whose CLI does not understand ATOM's `--online_quant_config`
@@ -253,6 +277,7 @@ Things to check:
   | Format string | `quant_type` | `quant_dtype` |
   |---|---|---|
   | `ptpc_fp8` | `per_Token` | `torch.float8_e4m3fn` |
+  | `per_block_fp8` / `per_block128_fp8` | `per_1x128` | `torch.float8_e4m3fn` |
   | `mxfp4` | `per_1x32` | `torch.uint8` (packed FP4x2) |
 
 - `elapsed_seconds` indicates the post-loading processing time on rank 0. A

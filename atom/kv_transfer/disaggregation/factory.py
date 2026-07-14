@@ -135,6 +135,17 @@ KVConnectorFactory.register(
     scheduler_class="MooncakeConnectorScheduler",
 )
 
+# Composite backend: fans out to several sub-connectors listed under
+# kv_transfer_config["connectors"] (e.g. moriio P/D + lmcache_offload on one
+# prefill node). Lightweight import — no heavy deps until a sub is built.
+KVConnectorFactory.register(
+    "multi",
+    worker_module="atom.kv_transfer.disaggregation.multi.multi_connector",
+    worker_class="MultiConnector",
+    scheduler_module="atom.kv_transfer.disaggregation.multi.multi_connector",
+    scheduler_class="MultiConnectorScheduler",
+)
+
 
 # ATOM standalone CPU/NVMe KV offload backend (registers "lmcache_offload").
 # Import is lightweight (offload/__init__ only records module paths as strings;

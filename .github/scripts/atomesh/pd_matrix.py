@@ -59,6 +59,17 @@ def parse_model_filter(value: str | None) -> set[str] | None:
     return models or None
 
 
+def parse_case_filter(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    cases = {
+        item.strip()
+        for item in value.split(",")
+        if item.strip() and item.strip().lower() != "all"
+    }
+    return cases or None
+
+
 def model_path_env_key(model_name: str) -> str:
     suffix = re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_").upper()
     return f"ATOMESH_MODEL_PATH_{suffix}"
@@ -70,15 +81,33 @@ def resolve_model_path(model_name: str, model_cfg: dict[str, Any]) -> str:
     return resolve_env_refs(model_path) if "${" in model_path else model_path
 
 
-def resolve_env_refs(value: str) -> str:
+def resolve_env_refs(value: str, preserve_names: set[str] | None = None) -> str:
+    preserve_names = preserve_names or set()
+
     def expand_env(match: re.Match[str]) -> str:
         name = match.group(1)
-        env_value = os.environ.get(name, "").strip()
-        if not env_value:
+        if name in preserve_names:
+            return match.group(0)
+        if name not in os.environ:
             raise ValueError(f"Environment variable {name} is not set")
-        return env_value
+        return os.environ[name].strip()
 
     return ENV_REF_RE.sub(expand_env, value)
+
+
+def resolve_env_refs_in_value(
+    value: Any, preserve_names: set[str] | None = None
+) -> Any:
+    if isinstance(value, str) and "${" in value:
+        return resolve_env_refs(value, preserve_names)
+    if isinstance(value, list):
+        return [resolve_env_refs_in_value(item, preserve_names) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: resolve_env_refs_in_value(item, preserve_names)
+            for key, item in value.items()
+        }
+    return value
 
 
 def resolve_nodes(value: Any) -> list[str]:
@@ -96,7 +125,24 @@ def resolve_runner(runner_cfg: dict[str, Any]) -> dict[str, Any]:
         value = runner.get(key)
         if isinstance(value, str):
             runner[key] = resolve_env_refs(value)
+    if runner.get("slurm_submit_runner") == "atomesh-cicd-mi350":
+        runner["slurm_account"] = ""
+        runner["slurm_partition"] = ""
     return runner
+
+
+def required_node_count(
+    pd_worker_layout: str,
+    prefill_cfg: dict[str, Any],
+    decode_cfg: dict[str, Any],
+) -> int:
+    if pd_worker_layout == "single_node":
+        return 1
+    if pd_worker_layout == "prefill_single_node":
+        return 1 + int(decode_cfg.get("workers", 1))
+    if pd_worker_layout == "decode_single_node":
+        return int(prefill_cfg.get("workers", 1)) + 1
+    return int(prefill_cfg.get("workers", 1)) + int(decode_cfg.get("workers", 1))
 
 
 def slug(value: str) -> str:
@@ -146,6 +192,7 @@ def role_env(
         model_cfg.get("env", {}).get(role, {}),
         suite_cfg.get("env", {}).get(role, {}),
     )
+    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP"})
     return {str(key): str(value) for key, value in env.items()}
 
 
@@ -190,34 +237,60 @@ def build_cell(
     pd_worker_layout = str(suite_cfg.get("pd_worker_layout", "multi_node"))
     single_node_pd = pd_worker_layout == "single_node"
     prefill_single_node_pd = pd_worker_layout == "prefill_single_node"
+    runner_cfg = resolve_runner(
+        deep_merge(defaults.get("runner", {}), suite_cfg.get("runner", {}))
+    )
+    required_nodes = required_node_count(pd_worker_layout, prefill_cfg, decode_cfg)
+    slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
+    allow_auto_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
 
     nodes = resolve_nodes(suite_cfg.get("nodes"))
-    if single_node_pd:
+    if allow_auto_nodes:
         if not nodes:
             raise ValueError(
-                f"{suite_cfg.get('name', model_name)} needs at least one node"
+                f"{suite_cfg.get('name', model_name)} needs a non-empty "
+                "Spur nodelist"
             )
-        nodes = nodes[:1]
-    elif prefill_single_node_pd:
-        required_nodes = 1 + int(decode_cfg.get("workers", 1))
         if len(nodes) < required_nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs at least "
                 f"{required_nodes} node(s)"
             )
+    elif single_node_pd:
+        if not nodes and not allow_auto_nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs at least one node"
+            )
+        nodes = nodes[:1]
+    elif prefill_single_node_pd:
+        if nodes and len(nodes) < required_nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs at least "
+                f"{required_nodes} node(s)"
+            )
+        if not nodes and not allow_auto_nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs at least "
+                f"{required_nodes} node(s)"
+            )
         nodes = nodes[:required_nodes]
-    elif len(nodes) < 2:
+    elif nodes and len(nodes) < required_nodes:
         raise ValueError(
-            f"{suite_cfg.get('name', model_name)} needs at least two nodes"
+            f"{suite_cfg.get('name', model_name)} needs at least "
+            f"{required_nodes} node(s)"
         )
+    elif not nodes and not allow_auto_nodes:
+        raise ValueError(
+            f"{suite_cfg.get('name', model_name)} needs at least "
+            f"{required_nodes} node(s)"
+        )
+    num_nodes = required_nodes if allow_auto_nodes else len(nodes)
 
     server_args = deep_merge(
         model_cfg.get("server", {}).get("common_args", {}),
         suite_cfg.get("server", {}).get("common_args", {}),
     )
-    runner_cfg = resolve_runner(
-        deep_merge(defaults.get("runner", {}), suite_cfg.get("runner", {}))
-    )
+    server_args = resolve_env_refs_in_value(server_args)
     benchmark_cfg = deep_merge(
         defaults.get("benchmark", {}),
         suite_cfg.get("benchmark", {}),
@@ -261,7 +334,7 @@ def build_cell(
         "display_topology": display_topology,
         "pd_worker_layout": pd_worker_layout,
         "nodes": nodes,
-        "num_nodes": len(nodes),
+        "num_nodes": num_nodes,
         "isl": isl,
         "osl": int(suite_cfg["osl"]),
         "concurrency": concurrency,
@@ -307,6 +380,7 @@ def build_cells(
     *,
     suite: str,
     model_filter: set[str] | None,
+    case_filter: set[str] | None,
     override_image: str | None,
     override_benchmark_concurrency: list[int] | None,
     override_eval_concurrency: list[int] | None,
@@ -317,6 +391,8 @@ def build_cells(
             continue
         suites = model_cfg.get("suites", {})
         for suite_cfg in normalize_list(suites.get(suite)):
+            if case_filter and str(suite_cfg.get("name", "")) not in case_filter:
+                continue
             cells.append(
                 build_cell(
                     cfg=cfg,
@@ -351,6 +427,11 @@ def main() -> int:
         default=os.environ.get("MODEL_NAME") or None,
         help="Optional model filter: one model name, comma-separated model names, or all",
     )
+    parser.add_argument(
+        "--case",
+        default=os.environ.get("ATOMESH_CASE_NAME") or None,
+        help="Optional case filter: one case name, comma-separated case names, or all",
+    )
     parser.add_argument("--image", default=os.environ.get("ATOMESH_IMAGE") or None)
     parser.add_argument(
         "--benchmark-concurrency",
@@ -375,6 +456,7 @@ def main() -> int:
         config,
         suite=args.suite,
         model_filter=parse_model_filter(args.model),
+        case_filter=parse_case_filter(args.case),
         override_image=args.image,
         override_benchmark_concurrency=benchmark_concurrency or None,
         override_eval_concurrency=eval_concurrency or None,
