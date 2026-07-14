@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       benchmark_client:
-        description: "Benchmark client command. `InferenceMax bench` uses the repo benchmark script. `vLLM bench` uses the vLLM CLI benchmark command."
+        description: "Benchmark client command. Non-AW/MET/OOB cases always use InferenceMax bench."
         type: choice
         default: InferenceMax bench
         options:
@@ -24,9 +24,6 @@ on:
         default: none
         options:
           - none
-          - AW
-          - MET
-          - OOB
           - ALL
       model_slot_1:
         description: "Manual selection slot 1: choose a model + TP size candidate."
@@ -34,320 +31,112 @@ on:
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K2.7-MXFP4 TP4
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K2.7-MXFP4 TP4
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K2.7-MXFP4 TP4
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K2.7-MXFP4 TP4
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K2.7-MXFP4 TP4
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K2.7-MXFP4 TP4
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K2.7-MXFP4 TP4
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K2.7-MXFP4 TP4
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -880,49 +669,21 @@ jobs:
                   m for m in variants if str(m.get("display", "")) in displays
               ]
 
-          AW_DISPLAYS = {
-              "gpt-oss-120b TP1 (AW)",
-              "DeepSeek-V3.2 FP8 TP4 (AW)",
-              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
-              "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
-              "GLM-4.7-FP8 TP4 (AW)",
-              "GLM-4.7-FP8 MTP TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP4 (AW)",
-              "MiniMax-M2.5 TP2 (AW)",
-              "MiniMax-M2.5 TP4 (AW)",
-              "DeepSeek-V3.2 FP8 TP8 (AW)",
-              "gpt-oss-120b TP2 (AW)",
-              "gpt-oss-120b TP8 (AW)",
-              "GLM-4.7-FP8 MTP TP8 (AW)",
-              "GLM-4.7-FP8 TP8 (AW)",
-              "Kimi-K2.5-MXFP4 TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
+          BENCHMARK_DISPLAYS = {
+              "DeepSeek-V3.2 FP8 PTPC TP4",
+              "DeepSeek-V3.2 FP8 PTPC MTP TP4",
+              "DeepSeek-V4-Pro TP8",
+              "Kimi-K2.7-MXFP4 TP4",
+              "GLM-5.2-MXFP4 TP4",
+              "GLM-5.2-MXFP4-MTP TP4",
+              "Qwen3.5-397B-A17B-MXFP4 TP4",
+              "MiniMax-M3-MXFP4 TP4",
           }
-          MET_DISPLAYS = {
-              "Kimi-K2.5-MXFP4 TP4 (MET)",
-              "gpt-oss-120b TP1 (MET)",
-              "Kimi-K2-Thinking-MXFP4 TP4 (MET)",
-              "Kimi-K2-Thinking-MXFP4 TP8 (MET)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)",
-              "DeepSeek-R1 FP8 TP8 (MET)",
-              "DeepSeek-R1 MXFP4 TP8 (MET)",
-          }
-          OOB_DISPLAYS = {
-              str(m.get("display", ""))
-              for m in all_variants
-              if str(m.get("display", "")).endswith("(OOB)")
-          }
-          ALL_DISPLAYS = AW_DISPLAYS | MET_DISPLAYS | OOB_DISPLAYS
 
           if event == "schedule":
               selected_group = "ALL"
-              selected = select_by_display(all_variants, ALL_DISPLAYS)
-              missing = ALL_DISPLAYS - {
+              selected = select_by_display(all_variants, BENCHMARK_DISPLAYS)
+              missing = BENCHMARK_DISPLAYS - {
                   str(m.get("display", "")) for m in selected
               }
               if missing:
@@ -933,10 +694,7 @@ jobs:
                   )
           else:
               group_map = {
-                  "AW": AW_DISPLAYS,
-                  "MET": MET_DISPLAYS,
-                  "OOB": OOB_DISPLAYS,
-                  "ALL": ALL_DISPLAYS,
+                  "ALL": BENCHMARK_DISPLAYS,
               }
               requested_group = os.environ.get("BENCHMARK_GROUP", "").strip()
               if requested_group and requested_group != none_choice:
@@ -1043,22 +801,12 @@ jobs:
           params = json.loads(os.environ["PARAMS_JSON"])
 
           include = []
-          aw_skip_512_concurrency_displays = {
-              "gpt-oss-120b TP1 (AW)",
-              "DeepSeek-V3.2 FP8 TP4 (AW)",
-              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
-              "GLM-4.7-FP8 TP4 (AW)",
-              "GLM-4.7-FP8 MTP TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP4 (AW)",
-              "MiniMax-M2.5 TP2 (AW)",
-          }
+          skip_512_concurrency_displays = set()
           for model in models:
               prefix = str(model.get("prefix", ""))
               display = str(model.get("display", ""))
               is_aw_model = "-aw-" in prefix
-              should_skip_aw_512_concurrency = display in aw_skip_512_concurrency_displays
+              should_skip_512_concurrency = display in skip_512_concurrency_displays
               aw_pairs = (
                   (1000, 100),
                   (5000, 500),
@@ -1108,7 +856,7 @@ jobs:
                       continue
                   if pair in excluded_pairs:
                       continue
-                  if should_skip_aw_512_concurrency and int(param["concurrency"]) == 512:
+                  if should_skip_512_concurrency and int(param["concurrency"]) == 512:
                       continue
                   filtered_params.append(param)
 
@@ -1331,7 +1079,7 @@ jobs:
       VLLM_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
-      BENCHMARK_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vLLM bench' || needs.resolve-atom-source.outputs.benchmark_client }}
+      BENCHMARK_CLIENT: ${{ (!contains(matrix.model.display, '(AW)') && !contains(matrix.model.display, '(MET)') && !contains(matrix.model.display, '(OOB)')) && 'InferenceMax bench' || needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
       - name: Print runner user
         run: |
@@ -1582,11 +1330,7 @@ jobs:
           set -euo pipefail
           TRUST_REMOTE_CODE_ARG=""
           if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
-            if [[ "${BENCHMARK_CLIENT}" == "vLLM bench" ]]; then
               TRUST_REMOTE_CODE_ARG="--trust_remote_code"
-            else
-              TRUST_REMOTE_CODE_ARG="--trust-remote-code"
-            fi
           fi
 
           TEMPERATURE_ARG=""
