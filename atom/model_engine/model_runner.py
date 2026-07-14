@@ -22,12 +22,19 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.distributed.pp_comm import (
+    async_send_intermediate_tensors,
+    commit_pp_send_work,
+    init_pp_aware_dist_env,
+    recv_intermediate_tensors,
+)
 from atom.utils.cuda_graph import BatchDescriptor
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.models.utils import get_pp_indices
 from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
@@ -96,13 +103,6 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        # Deferred output keeps the sampled token on-GPU (prev_token_ids) and
-        # feeds it directly as the next decode's input_ids — a single-runner
-        # optimization. Under pipeline parallel this is INVALID: sampling runs on
-        # the last stage but the decode input_ids are consumed on the first
-        # stage, so the first stage's prev_token_ids is never populated (it would
-        # decode a stale/EOS token -> garbage). Disable it under PP so the decode
-        # input_ids come from the scheduled batch instead.
         self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
 
         self.runner = runner
@@ -849,12 +849,7 @@ class ModelRunner:
             config.parallel_config.data_parallel_base_port,
         )
         if config.pipeline_parallel_size > 1:
-            # aiter's init_dist_env pins pp=1; use the PP-aware equivalent that
-            # threads pipeline_parallel_size through to build the _PP group. Each
-            # stage is a separate EngineCore, so we pass the resolved GLOBAL rank
-            # (== local_device_rank on one node) and the full world size.
-            from atom.distributed.pp_comm import init_pp_aware_dist_env
-
+            # PP-aware init: builds the _PP group (aiter's init_dist_env pins pp=1).
             dp_size = config.parallel_config.data_parallel_size
             world_size = dp_size * pp_size * stage_span
             dp_rank = config.parallel_config.data_parallel_rank
@@ -1267,10 +1262,6 @@ class ModelRunner:
     def _get_total_num_layers(self):
         """Return total layer count including draft (MTP) layers.
 
-        Under pipeline parallelism each stage only owns a slice of the model
-        layers, so allocating KV for all num_hidden_layers wastes most of GPU
-        memory. Use get_pp_indices to resolve the actual layer count.
-
         Drafts that own an independent KV cache via their own builder
         (e.g. Eagle3 MHA draft on an MLA target) account for their layers
         through that builder, so they are NOT added here. Only MTP-style
@@ -1279,8 +1270,6 @@ class ModelRunner:
         num_hidden = self.config.hf_config.num_hidden_layers
         pp_group = get_pp_group()
         if pp_group.world_size > 1:
-            from atom.models.utils import get_pp_indices
-
             start, end = get_pp_indices(
                 num_hidden, pp_group.rank_in_group, pp_group.world_size
             )
@@ -1519,10 +1508,8 @@ class ModelRunner:
             self.num_swa_blocks = 0
             num_kvcache_blocks = available_for_pool // block_bytes
 
-        # Pipeline parallel: each stage has a different free-memory footprint
-        # (different layer counts), so stages compute different block counts. The
-        # scheduler (on the head) allocates block ids that must be valid on EVERY
-        # stage's KV tensor, so all ranks must agree on the global minimum.
+        # PP stages compute different block counts; block ids must be valid on
+        # every stage's KV tensor, so reduce to the global minimum.
         if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
@@ -1701,12 +1688,8 @@ class ModelRunner:
             models_to_bind.append(("draft", self.drafter.model))
 
         kv_cache_tensors = []
-        # Key each bound tensor by the attention module's own layer_num, which is
-        # exactly what it looks up at forward time (kv_cache_data[f"layer_{self.
-        # layer_num}"]). Under pipeline parallel a stage only holds layers
-        # start_layer..end_layer, so layer_num is the GLOBAL index (e.g. 39..77)
-        # while the local bind counter is 0-based — keying by the counter would
-        # KeyError. With pp=1 layer_num == the counter, so this is a no-op there.
+        # Key by the module's global layer_num (what it looks up at forward time),
+        # not the local bind counter — under PP a stage's layer_num is offset.
         kv_cache_keys = []
         layer_id = 0
         # Promote to self so the attention builder's build_kv_cache_tensor()
@@ -2185,14 +2168,10 @@ class ModelRunner:
                 pp_enabled = pp_group.world_size > 1
 
                 if pp_enabled and self._pp_pending_send:
-                    from atom.distributed.pp_comm import commit_pp_send_work
-
                     commit_pp_send_work(self._pp_pending_send)
 
                 intermediate_tensors = None
                 if pp_enabled and not pp_group.is_first_rank:
-                    from atom.distributed.pp_comm import recv_intermediate_tensors
-
                     intermediate_tensors = recv_intermediate_tensors()
 
                 if pp_enabled:
@@ -2210,10 +2189,6 @@ class ModelRunner:
                     )
 
                 if pp_enabled and not pp_group.is_last_rank:
-                    from atom.distributed.pp_comm import (
-                        async_send_intermediate_tensors,
-                    )
-
                     self._pp_pending_send = async_send_intermediate_tensors(
                         model_output
                     )
@@ -2309,8 +2284,6 @@ class ModelRunner:
         before process teardown.
         """
         if self._pp_pending_send:
-            from atom.distributed.pp_comm import commit_pp_send_work
-
             commit_pp_send_work(self._pp_pending_send)
 
     def postprocess(
@@ -2452,23 +2425,11 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
-        # Pipeline parallel: only the last stage has logits and samples. Non-last
-        # stages already forwarded their hidden states downstream inside
-        # run_model; they produce no tokens, so skip sampling and return an empty
-        # output (the head owns the request lifecycle via the last stage's tokens).
+        # No token to sample when this isn't the last PP stage (no logits here)
+        # or the batch is a pure middle prefill chunk (not done yet).
         pp_group = get_pp_group()
-        if pp_group.world_size > 1 and not pp_group.is_last_rank:
-            reset_forward_context()
-            return ScheduledBatchOutput(
-                req_ids=list(batch.req_ids),
-                token_ids=[],
-                num_rejected=None,
-                num_bonus=None,
-                draft_token_ids=None,
-            )
-        # Pure middle-chunk prefill: compute_logits was already skipped in
-        # run_model (logits is None). Skip sampling too — no useful token.
-        if self._is_pure_middle_chunk(batch):
+        pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
+        if pp_non_last or self._is_pure_middle_chunk(batch):
             reset_forward_context()
             return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
@@ -2492,14 +2453,7 @@ class ModelRunner:
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
-        if batch is None:
-            return False
-        if batch.total_seqs_num_decode > 0:
-            return False
-        final = batch.is_final_chunk
-        if final is None:
-            return False
-        return not any(final)
+        return batch is not None and not batch.produces_output()
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
