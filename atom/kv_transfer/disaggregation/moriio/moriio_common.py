@@ -12,9 +12,11 @@ submodules.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+from contextlib import nullcontext
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import msgspec
 
@@ -230,3 +232,42 @@ class MoRIIOConstants:
 
 def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return (dp_rank) * tp_size + tp_rank
+
+
+# ---------------------------------------------------------------------------
+# Fabric KV allocation pool (mem-pool provider for KVConnectorFactory)
+# ---------------------------------------------------------------------------
+
+_FABRIC_KV_MEM_POOL = None
+
+
+def _moriio_fabric_enabled(kv_transfer_config: Optional[dict]) -> bool:
+    """Whether the MoRIIO FABRIC backend is selected (env or kv config)."""
+    if os.environ.get("ATOM_MORIIO_FABRIC", "0") == "1":
+        return True
+    kv_cfg = kv_transfer_config or {}
+    return str(kv_cfg.get("moriio_backend", "")).lower() == "fabric"
+
+
+def maybe_fabric_kv_mem_pool_ctx(config: Any = None):
+    """Mem-pool provider for the MoRIIO connector (see KVConnectorFactory).
+
+    The mori-io FABRIC backend (UALink scale-up) can only register/transfer VMM
+    memory created with a fabric handle, so KV tensors must be allocated inside
+    a fabric-exportable MemPool. Returns ``torch.cuda.use_mem_pool(pool)`` when
+    the fabric backend is selected, else a ``nullcontext`` (RDMA registers
+    ordinary torch memory and needs no custom pool). The pool is created once
+    and cached at module scope, which also keeps it alive for the process
+    lifetime. Analogous to mooncake's ``init_mooncake_custom_mem_pool``.
+    """
+    kv_transfer_config = getattr(config, "kv_transfer_config", None)
+    if not _moriio_fabric_enabled(kv_transfer_config):
+        return nullcontext()
+
+    import torch
+    from mori.io import make_fabric_mem_pool
+
+    global _FABRIC_KV_MEM_POOL
+    if _FABRIC_KV_MEM_POOL is None:
+        _FABRIC_KV_MEM_POOL = make_fabric_mem_pool()
+    return torch.cuda.use_mem_pool(_FABRIC_KV_MEM_POOL)

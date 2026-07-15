@@ -76,6 +76,14 @@ if _MORIIO_AVAILABLE:
 
 logger = logging.getLogger("atom")
 
+if os.environ.get("MORIIO_TRACE", "0") == "1" and _MORIIO_AVAILABLE:
+    try:
+        from mori.io import set_log_level as _set_mori_log_level
+
+        _set_mori_log_level("trace")
+    except Exception:
+        pass
+
 
 @dataclass(frozen=True)
 class _WriteTask:
@@ -178,25 +186,47 @@ class MoRIIOConnector(KVConnectorBase):
             )
         )
 
-        rdma_cfg = RdmaBackendConfig(
-            qp_per_transfer,
-            post_batch_size,
-            num_worker_threads,
-            poll_mode,
-            enable_notification,
+        # Backend selection: FABRIC (UALink scale-up) when requested, else RDMA.
+        # Fabric needs KV in fabric-exportable VMM memory (see model_runner
+        # _moriio_fabric_alloc_ctx) and auto-loads the copy kernel on create.
+        self._moriio_use_fabric = (
+            str(kv_transfer_config.get("moriio_backend", "")).lower() == "fabric"
+            or os.environ.get("ATOM_MORIIO_FABRIC", "0") == "1"
         )
-        rdma_cfg.max_send_wr = kv_transfer_config.get("max_send_wr", 0)
-        rdma_cfg.max_cqe_num = kv_transfer_config.get("max_cqe_num", 0)
-        rdma_cfg.max_msg_sge = kv_transfer_config.get("max_msg_sge", 0)
-        logger.info(
-            "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
-            "poll_mode=%s, notification=%s",
-            qp_per_transfer,
-            num_worker_threads,
-            poll_mode.name,
-            enable_notification,
-        )
-        self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
+        if self._moriio_use_fabric:
+            # Lazy: fabric backend is absent on older mori-io builds.
+            from mori.io import FabricBackendConfig
+
+            fabric_cfg = FabricBackendConfig()
+            fabric_cfg.num_streams = kv_transfer_config.get("fabric_num_streams", 4)
+            fabric_cfg.num_events = kv_transfer_config.get("fabric_num_events", 16)
+            logger.info(
+                "MoRIIO using FABRIC backend (UALink scale-up): num_streams=%d, "
+                "num_events=%d",
+                fabric_cfg.num_streams,
+                fabric_cfg.num_events,
+            )
+            self.moriio_wrapper.set_backend_type(BackendType.FABRIC, fabric_cfg)
+        else:
+            rdma_cfg = RdmaBackendConfig(
+                qp_per_transfer,
+                post_batch_size,
+                num_worker_threads,
+                poll_mode,
+                enable_notification,
+            )
+            rdma_cfg.max_send_wr = kv_transfer_config.get("max_send_wr", 0)
+            rdma_cfg.max_cqe_num = kv_transfer_config.get("max_cqe_num", 0)
+            rdma_cfg.max_msg_sge = kv_transfer_config.get("max_msg_sge", 0)
+            logger.info(
+                "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
+                "poll_mode=%s, notification=%s",
+                qp_per_transfer,
+                num_worker_threads,
+                poll_mode.name,
+                enable_notification,
+            )
+            self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
 
         # Per-layer local metadata (populated in register_kv_caches)
         self.layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]] = {}
@@ -287,6 +317,19 @@ class MoRIIOConnector(KVConnectorBase):
             )
             self._write_notify_thread.start()
 
+    def _chunk_kv_tensor(self, tensor, block_size_in_dim0):
+        """Split a KV tensor for registration.
+
+        RDMA must stay under the ~2 GiB ibv_reg_mr limit (chunk_tensor_for_rdma).
+        FABRIC has no such limit and multi-chunk fabric import of one VMM
+        allocation stalls the transfer, so register each region as a single desc.
+        """
+        if not self._moriio_use_fabric:
+            return chunk_tensor_for_rdma(tensor, block_size_in_dim0)
+        per_block_bytes = block_size_in_dim0 * tensor.stride(0) * tensor.element_size()
+        total_blocks = tensor.shape[0] // block_size_in_dim0
+        return [(tensor.data_ptr(), total_blocks * per_block_bytes)], total_blocks
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -345,7 +388,7 @@ class MoRIIOConnector(KVConnectorBase):
             # equals the KV cache block_size (typically 16).
             # Non-MLA: dim 0 = num_blocks directly, so 1.
             bsd0 = self.kv_cache_block_size if is_mla else 1
-            k_chunks, bpc = chunk_tensor_for_rdma(cache_tensor, bsd0)
+            k_chunks, bpc = self._chunk_kv_tensor(cache_tensor, bsd0)
 
             if self.blocks_per_chunk is None:
                 self.blocks_per_chunk = bpc
@@ -361,7 +404,7 @@ class MoRIIOConnector(KVConnectorBase):
                 v_device_id = (
                     v_cache.device.index if v_cache.device.index is not None else -1
                 )
-                v_chunks, _ = chunk_tensor_for_rdma(v_cache, 1)
+                v_chunks, _ = self._chunk_kv_tensor(v_cache, 1)
                 for ptr, size in v_chunks:
                     meta_list.append(
                         self.moriio_wrapper.register_local_buffer(
@@ -515,7 +558,8 @@ class MoRIIOConnector(KVConnectorBase):
                 f"{kind} region total_bytes={region.total_bytes} is not a "
                 f"multiple of unit_bytes={region.unit_bytes}"
             )
-        if region.unit_bytes > MAX_RDMA_CHUNK_BYTES:
+        # RDMA-only: a unit must fit in one <2 GiB ibv_reg_mr chunk.
+        if not self._moriio_use_fabric and region.unit_bytes > MAX_RDMA_CHUNK_BYTES:
             raise ValueError(
                 f"{kind} region unit_bytes={region.unit_bytes} exceeds "
                 f"MAX_RDMA_CHUNK_BYTES={MAX_RDMA_CHUNK_BYTES}"
@@ -524,7 +568,11 @@ class MoRIIOConnector(KVConnectorBase):
         self._assert_region_on_device(region, device_id)
 
         total_units = region.total_bytes // region.unit_bytes
-        units_per_chunk = max(1, MAX_RDMA_CHUNK_BYTES // region.unit_bytes)
+        # Fabric registers each region as a single desc (see _chunk_kv_tensor).
+        if self._moriio_use_fabric:
+            units_per_chunk = total_units
+        else:
+            units_per_chunk = max(1, MAX_RDMA_CHUNK_BYTES // region.unit_bytes)
         chunks: list[bytes] = []
         for unit_start in range(0, total_units, units_per_chunk):
             units = min(units_per_chunk, total_units - unit_start)
@@ -1584,9 +1632,38 @@ class MoRIIOConnector(KVConnectorBase):
                 self._write_session_cache[cache_key] = session
             return session
 
+    @staticmethod
+    def _write_status_ok(status: Any) -> bool:
+        """Return whether one transfer status succeeded, logging on failure.
+
+        A status that does not expose ``Succeeded`` is treated as success
+        (matching the RDMA fast path, which relies on the aggregate wait_all
+        result for such objects).
+        """
+        succeeded = getattr(status, "Succeeded", None)
+        if succeeded is None or succeeded():
+            return True
+        message = getattr(status, "Message", lambda: "<unknown>")()
+        code = getattr(status, "Code", lambda: "<unknown>")()
+        logger.error("MoRIIO write status failed: %s (code=%s)", message, code)
+        return False
+
     def _wait_for_write_statuses(self, statuses: list[Any]) -> bool:
         if not statuses:
             return True
+
+        # FABRIC completion is driven by the status wait-callback
+        # (hipEventSynchronize). A bounded WaitAll timeout takes mori's
+        # cv_.wait_until path, which is never notified for fabric and blocks the
+        # full timeout. Use per-status blocking Wait() (as the mori benchmark
+        # does) so the callback fires and the transfer finalizes immediately.
+        if self._moriio_use_fabric:
+            ok = True
+            for status in statuses:
+                status.Wait()
+                # Evaluate first so every failing status is logged.
+                ok = self._write_status_ok(status) and ok
+            return ok
 
         try:
             result = self.moriio_engine.wait_all(
@@ -1602,14 +1679,7 @@ class MoRIIOConnector(KVConnectorBase):
             logger.error("MoRIIO wait_all returned non-success status: %s", result)
             return False
 
-        for status in statuses:
-            succeeded = getattr(status, "Succeeded", None)
-            if succeeded is not None and not succeeded():
-                message = getattr(status, "Message", lambda: "<unknown>")()
-                code = getattr(status, "Code", lambda: "<unknown>")()
-                logger.error("MoRIIO write status failed: %s (code=%s)", message, code)
-                return False
-        return True
+        return all(self._write_status_ok(status) for status in statuses)
 
     def _wait_result_succeeded(self, result: Any) -> bool:
         if _MORIIO_AVAILABLE:

@@ -35,7 +35,7 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import KVConnectorFactory, KVConnectorOutput
 from atom.utils.forward_context import get_kvconnector
 from atom.utils.tbo import (
     UBatchWrapper,
@@ -1511,9 +1511,10 @@ class ModelRunner:
         # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
         # _kv_layer_cache_store) so binding code and downstream consumers
         # find them where they expect.
-        main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
-            num_kv_heads, num_draft_layers
-        )
+        with KVConnectorFactory.get_kv_mem_pool_context(self.config):
+            main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
+                num_kv_heads, num_draft_layers
+            )
         for name, value in main_kv.items():
             setattr(self, name, value)
 
@@ -1521,9 +1522,10 @@ class ModelRunner:
         # its own KV pool through a sibling builder; same protocol as above,
         # tensors land under namespaced keys (eagle3_kv_cache, eagle3_kv_scale).
         if hasattr(self, "eagle3_draft_builder"):
-            draft_kv = self.eagle3_draft_builder.allocate_kv_cache_tensors(
-                num_kv_heads, num_draft_layers
-            )
+            with KVConnectorFactory.get_kv_mem_pool_context(self.config):
+                draft_kv = self.eagle3_draft_builder.allocate_kv_cache_tensors(
+                    num_kv_heads, num_draft_layers
+                )
             for name, value in draft_kv.items():
                 setattr(self, name, value)
 
@@ -1533,9 +1535,10 @@ class ModelRunner:
         # attentions it returns an empty dict (no-op). Tensors are setattr'd
         # on `self` so model layers can access them as `model_runner.<name>`.
         if self.max_per_req_cache_slots > 0:
-            per_req_tensors = self.attn_metadata_builder.allocate_per_req_cache(
-                self.max_per_req_cache_slots
-            )
+            with KVConnectorFactory.get_kv_mem_pool_context(self.config):
+                per_req_tensors = self.attn_metadata_builder.allocate_per_req_cache(
+                    self.max_per_req_cache_slots
+                )
             for name, tensor in per_req_tensors.items():
                 setattr(self, name, tensor)
 
