@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, ClassVar, Optional, Union
 
 import torch
@@ -1057,17 +1057,16 @@ class KVEventsConfig:
 class DSparkConfig:
     """Runtime configuration for DSpark speculative verification.
 
-    This is the single source of truth for the DSpark knobs that used to be read
-    directly from ``ATOM_DSPARK_*`` env vars scattered across the model runner,
-    the V4 attention op, and the Eagle proposer. It is constructed ONCE in the
-    parent process (see :meth:`from_env`, which preserves backward compatibility
-    with the old env vars) and then pickled into every engine-core worker
+    Single source of truth for the DSpark knobs read across the model runner,
+    the V4 attention op, and the Eagle proposer. It is built ONCE in the parent
+    process from the ``--dspark-config`` JSON dict (see :meth:`from_dict`) plus
+    the ``--dspark-debug`` flag, then pickled into every engine-core worker
     subprocess as part of :class:`Config`, so all read sites observe the same
-    resolved values without touching ``os.environ`` again.
+    resolved values via ``config.dspark.*`` (no ``os.environ`` lookups).
 
-    Fields (see ``atom/utils/envs.py`` for the paper references):
+    Fields:
       - confidence_schedule: use the DSpark confidence head to pick a per-request
-        verify length ell_r (Algorithm 1) + variable-length verification.
+        verify length ell_r (paper Algorithm 1) + variable-length verification.
       - ragged: per-request ragged verify (§5.2 avoid-padding); each decode seq
         forwards its own ell_r+1 tokens (no batch-level q padding).
       - ragged_graph_sizes: comma-separated per-seq CUDA-graph query-length
@@ -1088,21 +1087,21 @@ class DSparkConfig:
     debug_schedule: bool = False
 
     @classmethod
-    def from_env(cls) -> "DSparkConfig":
-        """Build a config from ``ATOM_DSPARK_*`` env vars (backward compat).
+    def from_dict(cls, cfg: Optional[dict], debug: bool = False) -> "DSparkConfig":
+        """Build from the ``--dspark-config`` JSON dict (+ ``--dspark-debug``).
 
-        Called once in the parent process. The ``--dspark-config`` /
-        ``--dspark-debug`` CLI options translate into these same env vars before
-        the engine starts, so this method captures both the CLI and the legacy
-        raw-env paths."""
-        return cls(
-            confidence_schedule=envs.ATOM_DSPARK_CONFIDENCE_SCHEDULE,
-            ragged=envs.ATOM_DSPARK_RAGGED,
-            ragged_graph_sizes=envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES,
-            q_buckets=envs.ATOM_DSPARK_Q_BUCKETS,
-            disable_sps_calib=envs.ATOM_DSPARK_DISABLE_SPS_CALIB,
-            debug_schedule=envs.ATOM_DSPARK_DEBUG_SCHEDULE,
-        )
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast. ``debug_schedule`` is driven by the standalone ``debug``
+        flag rather than a dict key (it is a diagnostics switch, not a knob)."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls) if f.name != "debug_schedule"}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --dspark-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(debug_schedule=bool(debug), **cfg)
 
 
 @dataclass
@@ -1162,11 +1161,10 @@ class Config:
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
-    # DSpark runtime knobs. Resolved once in the parent (from --dspark-config /
-    # --dspark-debug, which set ATOM_DSPARK_* env vars, or from raw env for
-    # backward compat) and pickled into every worker. Read sites use
-    # `config.dspark.*` instead of re-reading os.environ.
-    dspark: DSparkConfig = field(default_factory=DSparkConfig.from_env)
+    # DSpark runtime knobs. Built once in the parent from --dspark-config /
+    # --dspark-debug (see EngineArgs) and pickled into every worker. Read sites
+    # use `config.dspark.*` (no os.environ lookups). Defaults to all-off.
+    dspark: DSparkConfig = field(default_factory=DSparkConfig)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False

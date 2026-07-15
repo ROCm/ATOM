@@ -2203,12 +2203,12 @@ class ModelRunner:
 
         # ==== RAGGED path (paper §5.2 avoid-padding) — FULLY INDEPENDENT =====
         # This branch is hoisted ABOVE the q-bucket early-return so it never
-        # depends on ATOM_DSPARK_Q_BUCKETS. Each decode seq forwards its own
+        # depends on dspark.q_buckets. Each decode seq forwards its own
         # ell_r+1 tokens (no batch-level pad to a single q). num_scheduled_tokens
         # becomes a true ragged array; all V4 attn metadata/kernels are already
         # per-token + marker-driven, so this is the only construction change.
         # Graph replay picks a (bs, q_eff) graph captured from the independent
-        # ATOM_DSPARK_RAGGED_GRAPH_SIZES set. Anchor lower bound (q>=num_bonus+1)
+        # dspark.ragged_graph_sizes set. Anchor lower bound (q>=num_bonus+1)
         # is applied PER REQUEST so each seg can hold its own anchor.
         if self.config.dspark.ragged:
             self._dspark_apply_ragged(batch, scheduled_bs, full_q, by_req)
@@ -3083,21 +3083,15 @@ class ModelRunner:
         # (cu_seqlens_q[1:]), so offset = full_q - num_bonus = 1 + num_reject.
         last_token_offset = 1 + num_reject_tokens
 
-        # DSpark plan Y q-shrink: this step's cu_seqlens_q segments are length q
-        # (= batch.num_spec_query_tokens, < full_q = mtp_k+1), but
-        # `num_reject_tokens` is measured against the full mtp_k block (kept
-        # full-length on purpose — the scheduler uses it for KV rollback). So
-        # the END-relative offset over-counts by (full_q - q): it would index
-        # into the previous segment / go negative -> index_select OOB in the
-        # draft backbone. Subtract the shrink so the anchor lands at
-        # (segment_start + num_bonus), identical to Phase 1. No-op when not
-        # shrunk (q == full_q) or on prefill/mixed steps.
+        # DSpark q-shrink: cu_seqlens_q segments are length q (<full_q) but
+        # num_reject_tokens is measured against the full block, so the end-relative
+        # offset over-counts by (full_q-q) -> index_select OOB. Subtract the shrink
+        # so the anchor lands at segment_start+num_bonus. No-op when q==full_q or
+        # on prefill/mixed steps.
         ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
         if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
-            # RAGGED: each seg has its own length len_i; the anchor sits at
-            # segment offset num_bonus_i (= mtp_k - num_reject_i). prepare_inputs
-            # computes cu_seqlens_q[1:] (ragged seg ends) - offset, so the
-            # per-req offset to land on the anchor is len_i - num_bonus_i.
+            # RAGGED: each seg has its own len_i; anchor offset = len_i - num_bonus_i
+            # (num_bonus_i = mtp_k - num_reject_i), applied to cu_seqlens_q ends.
             sbs = batch.total_seqs_num_decode
             lens_t = torch.as_tensor(
                 np.asarray(ragged_lens)[:sbs],
@@ -3321,7 +3315,7 @@ class ModelRunner:
             from atom.spec_decode.dspark_scheduler import resolve_q_buckets
 
             # RAGGED path uses its own independent graph-size set; the older
-            # q-bucket path uses ATOM_DSPARK_Q_BUCKETS. Pick the right source so
+            # q-bucket path uses dspark.q_buckets. Pick the right source so
             # the smaller graphs that each path replays actually get captured.
             if self.config.dspark.ragged:
                 q_buckets = resolve_q_buckets(

@@ -244,12 +244,7 @@ def pad_for_all_gather(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
     padding_shape[0] = max_batch_size
     padded_x = torch.empty(padding_shape, device=x.device, dtype=x.dtype)
     padded_x[:original_batch_size, :].copy_(x)
-    # Pad rows MUST be zeroed (not left as torch.empty garbage): they are
-    # all-gathered and fed straight into the aiter fused-MoE expert GEMM, where
-    # uninitialized values leak into real tokens' outputs. The DSpark DP graph
-    # shape sync enlarges the pad region (each rank pads up to DP-max bs*q), so
-    # skipping this costs ~1pp GSM8K.
-    padded_x[original_batch_size:, :].zero_()
+    # padded_x[original_batch_size:, :].zero_()
     return padded_x, original_batch_size
 
 
@@ -262,7 +257,7 @@ def all_gather_with_padding(
     # (NCCL), whose WorkNCCL end-event recorded inside CUDAGraph capture is
     # later queried by the watchdog thread -> hipErrorCapturedEvent crash.
     gathered_hidden_states = get_dp_group().all_gather(
-        padded_x, use_custom=False, dim=0
+        padded_x, use_custom=use_cag, dim=0
     )
     return gathered_hidden_states, original_batch_size
 

@@ -65,7 +65,7 @@ Separate flag:
 
 | Flag | Meaning |
 |---|---|
-| `--dspark-debug` | Enable scheduler diagnostics (avg verify length / truncation rate / anchor OOB checks). Maps to `ATOM_DSPARK_DEBUG_SCHEDULE=1`. **Forces host syncs; keep OFF in perf runs.** |
+| `--dspark-debug` | Enable scheduler diagnostics (avg verify length / truncation rate / anchor OOB checks). **Forces host syncs; keep OFF in perf runs.** |
 
 Tips on server configuration:
 - **`--num-speculative-tokens 7`** sets the draft block; the max verify length is
@@ -73,11 +73,10 @@ Tips on server configuration:
 - **`ragged_graph_sizes`**: `"8"` == the full bucket, so graph capacity never
   shrinks (only attention saves via the `-1` marker bail). To actually free
   dense/MoE compute, capture smaller buckets, e.g. `"1,3,6,8"` or `"2,4,8"`.
-- **Backward compatible**: the legacy raw env form still works, e.g.
-  `ATOM_DSPARK_CONFIDENCE_SCHEDULE=1 ATOM_DSPARK_RAGGED=1
-  ATOM_DSPARK_RAGGED_GRAPH_SIZES=8 python -m atom.entrypoints.openai_server ...`.
-  `--dspark-config` simply translates into the same `ATOM_DSPARK_*` env vars
-  before the engine starts.
+- **No env vars**: DSpark is configured purely through `--dspark-config` /
+  `--dspark-debug`, parsed once into a `DSparkConfig` object (`atom/config.py`)
+  and carried on `Config.dspark` into every worker. The old `ATOM_DSPARK_*` env
+  vars have been removed.
 - Do **not** pass `--enforce-eager` with the ragged CUDA-graph path — ragged
   replays captured `(bs, q_eff)` graphs. Eager also works for correctness checks.
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`

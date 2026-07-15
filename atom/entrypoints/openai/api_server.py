@@ -19,7 +19,6 @@ import binascii
 import io
 import json
 import logging
-import os
 import time
 import urllib.request
 import uuid
@@ -1772,36 +1771,6 @@ def main():
         help="Path to JSONL file for logging all API requests and responses (debug)",
     )
     args = parser.parse_args()
-
-    # Translate DSpark CLI config into ATOM_DSPARK_* env vars BEFORE the engine
-    # (and the engine-core subprocesses it spawns) start, so the lazily-read
-    # env values in atom.utils.envs take effect everywhere. CLI overrides any
-    # pre-existing env value.
-    _DSPARK_CONFIG_KEY_MAP = {
-        "confidence_schedule": "ATOM_DSPARK_CONFIDENCE_SCHEDULE",
-        "ragged": "ATOM_DSPARK_RAGGED",
-        "ragged_graph_sizes": "ATOM_DSPARK_RAGGED_GRAPH_SIZES",
-        "q_buckets": "ATOM_DSPARK_Q_BUCKETS",
-        "disable_sps_calib": "ATOM_DSPARK_DISABLE_SPS_CALIB",
-    }
-    if getattr(args, "dspark_config", None):
-        if not isinstance(args.dspark_config, dict):
-            raise ValueError("--dspark-config must be a JSON object (dict).")
-        for key, value in args.dspark_config.items():
-            env_name = _DSPARK_CONFIG_KEY_MAP.get(key)
-            if env_name is None:
-                raise ValueError(
-                    f"Unknown --dspark-config key: {key!r}. "
-                    f"Supported keys: {sorted(_DSPARK_CONFIG_KEY_MAP)}"
-                )
-            if isinstance(value, bool):
-                os.environ[env_name] = "1" if value else "0"
-            else:
-                os.environ[env_name] = str(value)
-        logger.info(f"DSpark config applied: {args.dspark_config}")
-    if getattr(args, "dspark_debug", False):
-        os.environ["ATOM_DSPARK_DEBUG_SCHEDULE"] = "1"
-        logger.info("DSpark scheduler diagnostics enabled (host syncs; perf cost).")
 
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")

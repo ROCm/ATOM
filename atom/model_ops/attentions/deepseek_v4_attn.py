@@ -1342,21 +1342,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
                 context_lens_np = context_lens_np - num_rejected.astype(np.int32)
-        # DSpark plan Y q-shrink: the q tokens we actually forward are the FIRST
-        # q of the full (mtp_k+1)-wide draft span, so they must be anchored to
-        # the span's HEAD, not `context_lens - q` (the span's TAIL minus q).
-        # Anchoring to the head puts them at [ctx-full_q .. ctx-full_q+q-1] (all
-        # <= ctx-1, never OOB); the dropped tail slots [.. ctx-1] stay reserved
-        # and are re-drafted next step -> lossless. When q == full_q (Phase 1)
-        # the two anchors coincide, so this is a no-op for the unshrunk path.
+        # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
+        # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never
+        # OOB); dropped tail slots are re-drafted next step (lossless). No-op when
+        # q == full_q.
         full_q = batch.num_spec_step + 1
         ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
         if ragged_lens is not None:
-            # RAGGED (paper §5.2 avoid-padding): each seq forwards len_i tokens
-            # (no batch-level pad). Build positions via per-seq cumsum + in-seg
-            # arange instead of the rectangular np.tile. Anchor each seg to the
-            # full span HEAD (ctx-full_q), same losslessness argument as q-shrink:
-            # token j of seq i -> position (ctx_i - full_q) + j, j in [0,len_i).
+            # RAGGED (§5.2): each seq forwards len_i tokens (no batch pad); build
+            # positions via per-seq cumsum + in-seg arange, span-head anchored:
+            # token j of seq i -> (ctx_i - full_q) + j.
             lens = np.asarray(ragged_lens, dtype=np.int32)[:scheduled_bs]
             cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
             np.cumsum(lens, out=cu[1:])
@@ -1371,15 +1366,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ) + np.repeat(context_lens_np - full_q, max_seqlen_q)
         sum_scheduled_tokens = batch.total_tokens_num_decode
 
-        # DSpark FLAT graph tail-padding. Under CUDAGraph the captured grid is
-        # C = bs*max_seqlen_q tokens, but a ragged step has only Σ = total_tokens_
-        # num_decode real tokens (Σ ≤ C). The graph replays a fixed C-token grid,
-        # so the per-token buffers MUST be valid out to C — positions[Σ:C] left
-        # stale would feed garbage into rope/embedding/index kernels (GPU fault).
-        # Pad positions[Σ:C] = 0 (a valid position; these tokens are masked out
-        # by batch_id_per_token == -1 and kv_indptr len 0, so their attention
-        # output is discarded). C is derived from the graph bs passed in (bs) ×
-        # max_seqlen_q. Eager (bs == scheduled_bs, Σ == C) is a no-op.
+        # DSpark FLAT graph tail-padding: the graph replays a fixed C=bs*max_seqlen_q
+        # token grid but ragged has only Σ≤C real tokens, so pad positions[Σ:C]=0
+        # (valid; masked out via batch_id==-1). Eager (Σ==C) is a no-op.
         graph_cap_tokens = int(bs) * int(max_seqlen_q)
         if graph_cap_tokens > sum_scheduled_tokens:
             _pad_positions = np.zeros(graph_cap_tokens, dtype=positions_np.dtype)
@@ -1473,13 +1462,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_mapping_cpu = state_slot_np
         attn_metadata.compress_plans = compress_plans
         attn_metadata.swa_block_tables = swa_bt_gpu
-        # DSpark RAGGED: hand the per-seq verify lengths + full span width to the
-        # decode indexer so it can pad Q back to [bs, full_q] (the decode indexer
-        # kernel is rectangular-only). `_score_topk_decode` reads these; None on
-        # the regular rectangular path (kernel runs directly).
-        # EAGER-only (under graph, per_req is unset → rectangular indexer). The
-        # ragged pad-to-rectangle uses full_q = the real span (mtp_k+1) so the
-        # right-align causal bound matches the span-head-anchored positions.
+        # DSpark RAGGED: pass per-seq verify lengths + full_q to the (rectangular-
+        # only) decode indexer so it can pad Q back to [bs, full_q]. Eager-only;
+        # None on the regular rectangular path.
         if ragged_lens is not None:
             attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
                 extend_lens_np, device=positions.device
@@ -2903,15 +2888,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_mapping_cpu = state_slot_np
         attn_metadata.swa_block_tables = swa_bt_gpu
 
-        # DSpark TRUE-FLAT graph: replay takes the ragged indexer path
-        # (_score_topk_decode_ragged), so capture MUST take the same branch AND
-        # the same rect shape, else graph replay mismatches. The indexer rect is
-        # [bs, full_q] with full_q = REAL span (mtp_k+1) — consistent with replay
-        # (prepare_decode sets dspark_full_q=full_q) and wide enough to hold any
-        # per-seq len_i. Capture's synthetic layout: total_tokens = bs*max_q_len
-        # (this graph's token grid); give each seq max_q_len real tokens (dst
-        # right-aligned into the full_q-wide rect). Replay refreshes dst for the
-        # real ragged lens + tail padding.
+        # DSpark TRUE-FLAT graph: capture must take the same ragged indexer branch
+        # and rect shape [bs, full_q] as replay, else the graph mismatches. Synthetic
+        # capture gives each seq max_q_len tokens; replay refreshes dst for real lens.
         drafter = getattr(self.model_runner, "drafter", None)
         if (
             self.model_runner.config.dspark.ragged

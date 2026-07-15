@@ -8,7 +8,12 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
+from atom.config import (
+    CompilationConfig,
+    CUDAGraphMode,
+    DSparkConfig,
+    SpeculativeConfig,
+)
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
 logger = logging.getLogger("atom")
@@ -64,6 +69,8 @@ class EngineArgs:
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
+    dspark_config: Optional[dict] = None
+    dspark_debug: bool = False
 
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
@@ -348,9 +355,8 @@ class EngineArgs:
             type=json.loads,
             default=None,
             help=(
-                "DSpark dynamic config as a JSON dict; keys map to ATOM_DSPARK_* "
-                "env vars (applied before engine start, inherited by engine-core "
-                "subprocesses). Supported keys:\n"
+                "DSpark dynamic config as a JSON dict, parsed straight into a "
+                "DSparkConfig object (no env vars). Supported keys:\n"
                 '  - "confidence_schedule": bool, enable confidence-scheduled '
                 "verification (per-request verify length ell_r).\n"
                 '  - "ragged": bool, enable per-request ragged verify '
@@ -371,9 +377,8 @@ class EngineArgs:
             action="store_true",
             help=(
                 "Enable DSpark scheduler diagnostics (avg verify length / "
-                "truncation rate / anchor OOB checks). Maps to "
-                "ATOM_DSPARK_DEBUG_SCHEDULE=1. Forces host syncs; keep OFF in "
-                "perf runs."
+                "truncation rate / anchor OOB checks). Forces host syncs; keep "
+                "OFF in perf runs."
             ),
         )
 
@@ -438,6 +443,13 @@ class EngineArgs:
 
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+
+        # --dspark-config (JSON dict) + --dspark-debug → DSparkConfig object,
+        # passed through as Config.dspark (no env vars).
+        kwargs["dspark"] = DSparkConfig.from_dict(
+            kwargs.pop("dspark_config", None),
+            debug=kwargs.pop("dspark_debug", False),
+        )
 
         logger.info(f"Engine kwargs: {kwargs}")
 

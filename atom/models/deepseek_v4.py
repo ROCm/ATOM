@@ -1559,20 +1559,7 @@ class Indexer(nn.Module):
         # exactly next_n queries. Under per-request ragged verify each seq has
         # its own len_i (!= a shared next_n), so total_tokens != bs*next_n and a
         # plain `.view(bs, next_n, ...)` is impossible.
-        #
-        # Fix WITHOUT touching the kernel: scatter the ragged Q into a padded
-        # [bs, full_q] rectangle, keeping each token at its ORIGINAL in-span
-        # slot j (token t of seq i, the j-th of that seq, goes to [i, j]). This
-        # is required for correctness, not just shape: the kernel's causal bound
-        # is `col <= context_length - next_n + pid_next_n`, and ragged positions
-        # were built span-head-anchored as (ctx_i - full_q) + j (prepare_decode),
-        # so a token's causal window matches EXACTLY when its rectangle slot
-        # pid_next_n == j and next_n == full_q. Padding slots [i, len_i:full_q]
-        # hold zero Q (their logits are computed but never gathered back). After
-        # the kernel, gather each seq's first len_i rows back to the ragged
-        # [total_tokens, ...] layout. Numerically identical to a regular
-        # rectangular decode; only the indexer runs at bs*full_q (its compute is
-        # a small fraction of decode — MoE / main-attn keep the ragged saving).
+
         ragged_lens = getattr(attn_md, "dspark_ragged_lens_gpu", None)
         is_ragged = ragged_lens is not None and attn_md.dspark_full_q > 0
         if is_ragged:
@@ -1673,27 +1660,12 @@ class Indexer(nn.Module):
         H, D = self.n_heads, self.head_dim
         R = bs * full_q  # padded rectangle rows (fixed per (bs, full_q) graph)
 
-        # CUDAGraph-SAFE pad-to-rectangle. All working tensors are PREALLOCATED
-        # (fixed shape/address) and reused across replays; only their CONTENTS
-        # change per step. The scatter/gather index `dst` is likewise built into
-        # a preallocated buffer, so a captured graph records "scatter using the
-        # dst buffer" and replays correctly after prepare_decode refreshes dst.
-        #
-        # Layout (RIGHT-ALIGN, see below): token t of seq i (its j-th, 0<=j<len_i)
-        # goes to rectangle row  i*full_q + (full_q - len_i) + j. The decode
-        # indexer kernel's causal bound `col <= ctx - next_n + pid_next_n`
-        # assumes the LAST of next_n(=full_q) slots aligns to the KV end, so a
-        # len_i seq must occupy the TAIL slots [full_q-len_i .. full_q-1]; then
-        # token j sees `ctx - len_i + j`, identical to the rectangular path.
-        # Build the scatter/gather index `dst` WITHOUT any data-dependent-shape op
-        # (repeat_interleave is banned under CG). batch_id_per_token is already a
-        # graph-external buffer (per-token seq id, padded tail = -1); clamp -1→0
-        # so padding rows map to a valid slot (their scattered q is zeroed and
-        # never gathered back into a real token). All working tensors below use
-        # torch.empty/zeros — under CUDAGraph these allocate from the graph's
-        # private pool with stable replay addresses (same as the rectangular
-        # `_score_topk_decode`), so they are CG-safe AND non-resident (no per-
-        # layer permanent buffers — that caused 28×3GB OOM).
+        # CUDAGraph-SAFE pad-to-rectangle. RIGHT-ALIGN: token j of seq i goes to
+        # row i*full_q + (full_q-len_i) + j, so a len_i seq fills the TAIL slots
+        # [full_q-len_i .. full_q-1] and sees ctx-len_i+j (matches the indexer's
+        # causal bound, identical to the rectangular path). dst is built without
+        # data-dependent-shape ops (repeat_interleave banned under CG); clamp the
+        # -1 pad ids to 0 here (redirected to the dump row below).
         attn_md = get_forward_context().attn_metadata
         bid_raw = attn_md.batch_id_per_token[:total_tokens].to(torch.int64)
         bid = torch.clamp(bid_raw, min=0)  # [total_tokens]
@@ -1704,12 +1676,9 @@ class Indexer(nn.Module):
         j_in_seq = tok_arange - cu[bid]  # in-span slot 0..len_i-1 (real tokens)
         pad_i = full_q - lens_i64  # [bs] leading pad per seq (right-align)
         dst = bid * full_q + pad_i[bid] + j_in_seq  # [total_tokens]
-        # CG tail-padding tokens (original batch_id == -1, at flat positions
-        # [Σ:C]) got bid clamped to 0 → bogus dst. Redirect ALL of them to a
-        # dedicated DUMP row at index R (one past the real rect), so they never
-        # overwrite a real token's q. All ops keep FIXED shape (= total_tokens =
-        # C) → CG-safe (no data-dependent boolean masking). The rect is [R+1];
-        # only rows [0:R] feed the kernel (view to [bs, full_q]); row R is scratch.
+        # Redirect CG tail-padding tokens (bid == -1) to a dedicated DUMP row R
+        # (one past the real rect) so they never clobber a real token's q. Fixed
+        # shape (total_tokens) → CG-safe; only rows [0:R] feed the kernel.
         is_pad = bid_raw < 0
         dst = torch.where(is_pad, torch.full_like(dst, R), dst)  # pad → row R
         dst = torch.clamp(dst, 0, R)  # defensive: never OOB the [R+1] rect

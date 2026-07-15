@@ -255,60 +255,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
-    # --- DSpark confidence-scheduled verification (Phase 2) ---
-    # Enable the hardware-aware prefix scheduler: consume the DSpark confidence
-    # head to pick a per-request verify length ell_r (paper Algorithm 1), then
-    # apply variable-length verification (Level B) downstream so the freed batch
-    # capacity actually lifts throughput.
-    # Default off -> Phase-1 behavior (static verify length == block size).
-    "ATOM_DSPARK_CONFIDENCE_SCHEDULE": lambda: (
-        os.getenv("ATOM_DSPARK_CONFIDENCE_SCHEDULE", "0") == "1"
-    ),
-    # Throttled diagnostics for the DSpark scheduler (avg verify length /
-    # truncation rate). Forces a host sync; keep off in perf runs.
-    "ATOM_DSPARK_DEBUG_SCHEDULE": lambda: (
-        os.getenv("ATOM_DSPARK_DEBUG_SCHEDULE", "0") == "1"
-    ),
-    # Disable SPS calibration (replays captured graphs at warmup). Set "1" to
-    # skip it and fall back to the synthetic SPS stub.
-    "ATOM_DSPARK_DISABLE_SPS_CALIB": lambda: (
-        os.getenv("ATOM_DSPARK_DISABLE_SPS_CALIB", "0") == "1"
-    ),
-    # CUDA-graph query-length buckets for DSpark variable-length verify (plan Y).
-    # Comma-separated decode_query_len values (each = anchor + verified drafts,
-    # i.e. 1..mtp_k+1). The capture loop builds one graph per (bs, bucket); each
-    # step quantizes its verify length UP to the nearest bucket so the batch
-    # stays rectangular within a graph (no V4-attn variable-query changes).
-    # Empty -> single full bucket mtp_k+1 (Phase-1 capture behavior).
-    "ATOM_DSPARK_Q_BUCKETS": lambda: os.getenv("ATOM_DSPARK_Q_BUCKETS", ""),
-    # DSpark per-request RAGGED verification (paper §5.2 avoid-padding). When
-    # "1", each decode seq forwards its own ell_r+1 tokens (no batch-level
-    # padding to a single q). num_scheduled_tokens becomes a true ragged array;
-    # all V4 attn metadata/kernels are already per-token + marker-driven, so the
-    # only changes are the upstream metadata construction. Default off (uses the
-    # q-bucket path).
-    #
-    # CUDA-graph (plan B): ragged replays the (bs, q_eff) graph where q_eff =
-    # quantize_up(ceil(Σ(ell+1)/bs)) to an ATOM_DSPARK_RAGGED_GRAPH_SIZES bucket;
-    # real tokens fill [0:Σ], the tail to bs*q_eff is -1 padding (CTAs bail). So
-    # run WITHOUT --enforce-eager and set ATOM_DSPARK_RAGGED_GRAPH_SIZES to define
-    # the per-seq graph query-length sizes to capture (a smaller q_eff graph is
-    # what actually frees dense/MoE compute). Eager also works (--enforce-eager)
-    # for correctness checks (no graph needed there).
-    #
-    # This path is fully INDEPENDENT of ATOM_DSPARK_Q_BUCKETS (the older
-    # batch-uniform padding scheme): ragged never reads Q_BUCKETS.
-    "ATOM_DSPARK_RAGGED": lambda: (os.getenv("ATOM_DSPARK_RAGGED", "0") == "1"),
-    # Per-seq CUDA-graph query-length sizes to capture for the RAGGED path (e.g.
-    # "1,3,6"). Each is a q value; the capture loop builds one (bs, q) graph per
-    # size, and a ragged decode step replays the graph whose q_eff = quantize_up(
-    # ceil(Σ(ell+1)/bs)) covers its total tokens. Empty -> single full bucket
-    # mtp_k+1 (no smaller graph -> graph capacity never shrinks -> no dense/MoE
-    # saving; only attention saves via -1 marker bail). Independent of
-    # ATOM_DSPARK_Q_BUCKETS.
-    "ATOM_DSPARK_RAGGED_GRAPH_SIZES": lambda: os.getenv(
-        "ATOM_DSPARK_RAGGED_GRAPH_SIZES", ""
-    ),
+    # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
+    # ragged_graph_sizes, q_buckets, disable_sps_calib, debug_schedule) are no
+    # longer env vars. They are configured via --dspark-config (JSON dict) /
+    # --dspark-debug and carried in config.dspark (see atom/config.py
+    # DSparkConfig). See recipes/DeepSeek-V4-DSpark.md.
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under
