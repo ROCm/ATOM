@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from contextlib import AbstractContextManager
 from typing import Any, Callable, Optional
 
-
 GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
 
@@ -15,9 +14,10 @@ def is_glm52_dsa_config(config: Any) -> bool:
     """Return whether an HF config describes GLM-5.2 DSA."""
 
     archs = getattr(config, "architectures", None) or []
-    return any(GLM52_DSA_ARCH in str(arch) for arch in archs) or getattr(
-        config, "model_type", None
-    ) == GLM52_DSA_MODEL_TYPE
+    return (
+        any(GLM52_DSA_ARCH in str(arch) for arch in archs)
+        or getattr(config, "model_type", None) == GLM52_DSA_MODEL_TYPE
+    )
 
 
 @dataclass(frozen=True)
@@ -101,7 +101,9 @@ def _prepare_glm52_dsa_config(atom_config: Any, model_arch: str) -> None:
                 GlmMoeDsaForCausalLM, "quant_exclude_name_mapping", {}
             ),
         )
-        default_excludes = getattr(GlmMoeDsaForCausalLM, "quant_default_exclude_layers", [])
+        default_excludes = getattr(
+            GlmMoeDsaForCausalLM, "quant_default_exclude_layers", []
+        )
         if default_excludes:
             quant_config.apply_default_exclude_layers(default_excludes)
 

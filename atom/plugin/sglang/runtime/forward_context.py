@@ -235,17 +235,19 @@ def _build_glm52_dsa_metadata(
     forward_batch: ForwardBatch,
     positions: torch.Tensor,
 ):
-    if _is_dummy_forward(forward_batch) or getattr(atom_config, "hf_config", None) is None:
+    hf_config = getattr(atom_config, "hf_config", None)
+    if _is_dummy_forward(forward_batch) or hf_config is None:
+        return None
+
+    from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+    if not is_glm52_dsa_config(hf_config):
         return None
 
     from atom.plugin.sglang.glm52_dsa_bridge import (
         build_atom_glm52_attention_metadata_from_sglang,
-        is_glm52_dsa_arch,
         maybe_get_glm52_dsa_pools_from_sglang_backend,
     )
-
-    if not is_glm52_dsa_arch(atom_config.hf_config):
-        return None
 
     attn_metadata = getattr(forward_batch, "atom_glm52_graph_metadata", None)
     if attn_metadata is None:
@@ -302,10 +304,7 @@ def _build_deepseek_v4_metadata(forward_batch: ForwardBatch, positions: torch.Te
         backend_forward_batch = getattr(backend, "forward_metadata", None)
         attn_metadata = getattr(backend_forward_batch, "atom_v4_graph_metadata", None)
 
-    try:
-        proxy_pool, req_to_token_pool = maybe_get_proxy_pool_from_sglang_backend()
-    except Exception:
-        proxy_pool, req_to_token_pool = None, None
+    proxy_pool, req_to_token_pool = maybe_get_proxy_pool_from_sglang_backend()
 
     is_capture_batch = _is_current_stream_capturing()
     if attn_metadata is None and is_capture_batch:

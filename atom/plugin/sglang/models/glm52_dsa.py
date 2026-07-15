@@ -50,10 +50,9 @@ def setup_glm52_dsa_for_sglang(model: Any) -> None:
             )
 
         if getattr(module, "is_v32", False):
-            owns_active_indexer = (
-                getattr(module, "indexer", None) is not None
-                and not getattr(module, "skip_topk", False)
-            )
+            owns_active_indexer = getattr(
+                module, "indexer", None
+            ) is not None and not getattr(module, "skip_topk", False)
             if owns_active_indexer:
                 last_full_index_seen = True
             elif not last_full_index_seen:

@@ -128,9 +128,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
         seq_lens = kwargs.get("seq_lens", args[2] if len(args) > 2 else None)
         forward_mode = kwargs.get("forward_mode", args[5] if len(args) > 5 else None)
         seq_lens_cpu = kwargs.get("seq_lens_cpu", args[7] if len(args) > 7 else None)
-        out_cache_loc = kwargs.get(
-            "out_cache_loc", args[8] if len(args) > 8 else None
-        )
+        out_cache_loc = kwargs.get("out_cache_loc", args[8] if len(args) > 8 else None)
         replay_batch = getattr(self, "_replay_forward_batch", None)
         if out_cache_loc is None:
             out_cache_loc = getattr(replay_batch, "out_cache_loc", None)

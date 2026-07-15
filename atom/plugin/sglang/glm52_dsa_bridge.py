@@ -66,14 +66,14 @@ def _build_token_table(
     bs = int(forward_batch.batch_size)
     max_seq_len = int(seq_lens.max(initial=1))
     req_pool_indices = forward_batch.req_pool_indices[:bs]
-    token_table = req_to_token_pool.req_to_token[
-        req_pool_indices, : max_seq_len
-    ].clone()
+    token_table = req_to_token_pool.req_to_token[req_pool_indices, :max_seq_len].clone()
 
     if extend_lens is not None and not forward_batch.forward_mode.is_decode_or_idle():
         prefix_lens = seq_lens - extend_lens
         offset = 0
-        for req_idx, (prefix_len, query_len) in enumerate(zip(prefix_lens, extend_lens)):
+        for req_idx, (prefix_len, query_len) in enumerate(
+            zip(prefix_lens, extend_lens)
+        ):
             prefix_len = int(prefix_len)
             query_len = int(query_len)
             if query_len > 0:
@@ -243,7 +243,11 @@ class _GLM52DecodeGraphBuffers:
         self.index_topk = int(index_topk)
         self.device = device
 
-        max_blocks = max(1, (self.max_context_len + self.indexer_page_size - 1) // self.indexer_page_size)
+        max_blocks = max(
+            1,
+            (self.max_context_len + self.indexer_page_size - 1)
+            // self.indexer_page_size,
+        )
         self.cu_q = torch.arange(self.max_bs + 1, dtype=torch.int32, device=device)
         self.kv_indptr = torch.zeros(self.max_bs + 1, dtype=torch.int32, device=device)
         self.sparse_kv_indptr = torch.zeros(
@@ -677,9 +681,9 @@ def build_atom_glm52_attention_metadata_from_sglang(
             req_to_token_pool=req_to_token_pool,
             atom_config=atom_config,
         )
-    if getattr(
-        forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False
-    )(include_v2=True):
+    if getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
+        include_v2=True
+    ):
         raise RuntimeError(
             "GLM-5.2 native DSA SGLang bridge does not yet support draft extend/MTP."
         )

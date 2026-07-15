@@ -46,7 +46,9 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
 
     def __init__(self, *args: Any, prefix: str | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.layer_name = prefix if prefix is not None else f"GLM52_MLA_{self.layer_num}"
+        self.layer_name = (
+            prefix if prefix is not None else f"GLM52_MLA_{self.layer_num}"
+        )
         from atom.config import get_current_atom_config
 
         get_current_atom_config().compilation_config.static_forward_context[
