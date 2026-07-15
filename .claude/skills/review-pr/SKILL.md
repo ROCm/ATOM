@@ -111,6 +111,10 @@ _Answer:_
 - [ ] **Weight transform / new weight attr** → F1 (double HBM pin)
 - [ ] **Async / multi-stream / weight prep** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
+- [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
+- [ ] **Kernel launcher / buffer-offset or index arithmetic (long-context or large-batch path)** → D9 (int32 overflow at production scale)
+- [ ] **New aiter / C-extension kernel call** → D8 (contiguous check)
+- [ ] **Removes or reverses a zero-init / assert / `.contiguous()` / documented invariant** → D4 (invariant reversal cited?)
 
 ---
 
@@ -290,6 +294,7 @@ _"The constant is correct for gfx942/bf16; it silently breaks on gfx950 or fp8."
 
 **C1 — Dtype hardcoded without checking actual tensor** ⚠️
 Fixed `bf16`, `fp8_e8m0`, or similar in an attention backend, norm, or scale path that handles multiple configs.
+FP self-check first: search the unchanged lines of this file for the same hardcoded dtype — if it already appears pre-existing on the same path, this is not a new violation (do not fire as new). Fire only when the hardcode is newly introduced, or the path newly handles more than one dtype/config.
 Real examples: ATOM#1423 valarLip: "not always bf16"; ATOM#1458 valarLip: "hard code to fp8_e8m0?"
 → `⚠️ C1: dtype hardcoded to [type] — should derive from actual tensor/config dtype`
 
@@ -428,6 +433,7 @@ Description must have numbers with units (ms, tokens/s, TFLOPS, %). Accuracy tab
 **P2 — Benchmark covers only toy shapes** ⚠️
 Numbers exist but only for M≤256, only 1 token, or one model.
 Production: DSv4 (E=385/topk=7, TP=4/8), GPT-OSS 120B, Kimi-K2.5, GLM5; token range 1→16384 decode + prefill 1k/4k/32k.
+Staleness guard: the production config list is a snapshot — verify current E/topk/TP and the model roster from `atom/config.py` or a recent benchmark before asserting what counts as "production".
 → `⚠️ P2: benchmark missing production shapes — [what's absent]`
 
 **P3 — Perf claim not reproducible** ⚠️
