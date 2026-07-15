@@ -243,20 +243,33 @@ jobs:
           fi
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
           SLURM_CANCEL_HELPER="${RESULT_DIR}/${{ matrix.id }}.slurm-cancel.sh"
-          cancel_slurm_from_wrapper() {
+          PD_SUBMIT_PID=""
+          cleanup_slurm_from_wrapper() {
             local rc=$?
-            if [[ "${rc}" -ne 0 && -x "${SLURM_CANCEL_HELPER}" ]]; then
+            trap - EXIT HUP INT TERM
+            if [[ "${rc}" -ne 0 ]]; then
               echo "=== cancelling Slurm job from workflow wrapper rc=${rc} ==="
-              bash "${SLURM_CANCEL_HELPER}" || true
+              if [[ -x "${SLURM_CANCEL_HELPER}" ]]; then
+                bash "${SLURM_CANCEL_HELPER}" || true
+              else
+                echo "Slurm cancel helper is not available yet"
+              fi
+            fi
+            if [[ -n "${PD_SUBMIT_PID}" ]] && kill -0 "${PD_SUBMIT_PID}" 2>/dev/null; then
+              kill "${PD_SUBMIT_PID}" 2>/dev/null || true
+              wait "${PD_SUBMIT_PID}" 2>/dev/null || true
             fi
             exit "${rc}"
           }
-          trap cancel_slurm_from_wrapper EXIT
+          trap cleanup_slurm_from_wrapper EXIT
+          trap 'exit 129' HUP
           trap 'exit 130' INT
           trap 'exit 143' TERM
           bash .github/scripts/atomesh/pd_submit.sh \
             --cell-json "$CELL_JSON" \
-            --result-dir "$RESULT_DIR"
+            --result-dir "$RESULT_DIR" &
+          PD_SUBMIT_PID=$!
+          wait "${PD_SUBMIT_PID}"
 
       - name: Summarize ${{ matrix.id }} benchmark result
         if: always()
