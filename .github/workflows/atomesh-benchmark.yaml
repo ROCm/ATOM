@@ -130,6 +130,93 @@ jobs:
       - name: Install YAML parser
         run: python3 -m pip install pyyaml
 
+      - name: Find ATOMesh latest nightly image
+        id: image
+        env:
+          INPUT_ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          import yaml
+
+          cfg = yaml.safe_load(Path(".github/benchmark/models_atomesh.yaml").read_text(encoding="utf-8")) or {}
+          default_image = str(cfg.get("backends", {}).get("atom", {}).get("image", "")).strip()
+          image = os.environ.get("INPUT_ATOMESH_IMAGE", "").strip() or default_image
+
+          def docker_tags(prefix: str) -> list[dict]:
+              url = (
+                  "https://hub.docker.com/v2/repositories/rocm/atom-dev/tags?"
+                  + urllib.parse.urlencode({"page_size": 100, "name": prefix})
+              )
+              tags = []
+              while url:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      data = json.load(response)
+                  tags.extend(
+                      tag for tag in data.get("results", [])
+                      if str(tag.get("name", "")).startswith(prefix)
+                  )
+                  url = data.get("next")
+              return tags
+
+          def latest_nightly_for(day) -> str | None:
+              prefix = f"nightly_{day:%Y%m%d}"
+              tags = docker_tags(prefix)
+              if not tags:
+                  return None
+              tags.sort(
+                  key=lambda tag: (str(tag.get("last_updated", "")), str(tag.get("name", ""))),
+                  reverse=True,
+              )
+              return f"rocm/atom-dev:{tags[0]['name']}"
+
+          def docker_tag_digest(tag_name: str) -> str:
+              url = f"https://hub.docker.com/v2/repositories/rocm/atom-dev/tags/{urllib.parse.quote(tag_name)}"
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  data = json.load(response)
+              if data.get("digest"):
+                  return str(data["digest"])
+              for image_info in data.get("images", []):
+                  if image_info.get("digest"):
+                      return str(image_info["digest"])
+              return ""
+
+          resolved_image = image
+          if image == "rocm/atom-dev:latest":
+              beijing_tz = timezone(timedelta(hours=8))
+              today = datetime.now(beijing_tz).date()
+              resolved_image = latest_nightly_for(today)
+              if resolved_image is None:
+                  resolved_image = latest_nightly_for(today - timedelta(days=1))
+              if resolved_image is None:
+                  print("::warning::Cannot find rocm/atom-dev nightly tag for today or yesterday; falling back to rocm/atom-dev:latest.")
+                  resolved_image = image
+
+          image_digest = ""
+          if resolved_image == "rocm/atom-dev:latest":
+              image_digest = docker_tag_digest("latest")
+              if image_digest:
+                  print(f"ATOMesh image digest: {image_digest}")
+              else:
+                  print("::warning::Cannot resolve digest for rocm/atom-dev:latest.")
+
+          print(f"ATOMesh image: {image} -> {resolved_image}")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"image={resolved_image}\n")
+              output.write(f"image_digest={image_digest}\n")
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary and image_digest:
+              with Path(step_summary).open("a", encoding="utf-8") as summary:
+                  summary.write(f"ATOMesh image digest: `{image_digest}`\n")
+          PY
+
       - name: Build benchmark matrix
         id: matrix
         env:
@@ -137,7 +224,7 @@ jobs:
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
-          ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+          ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
         run: |
