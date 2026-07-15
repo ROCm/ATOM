@@ -136,7 +136,7 @@ def init_mori_v2_op(
 
     comm = _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
 
-    cfg = EpDispatchCombineConfig(
+    cfg = EpDispatchCombineConfig.tuned(
         rank=ep_rank,
         world_size=ep_size,
         hidden_dim=hidden_dim,
