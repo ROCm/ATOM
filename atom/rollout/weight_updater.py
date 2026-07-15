@@ -21,6 +21,59 @@ class WeightUpdaterMixin:
       - self.clear_kv_cache() — method
     """
 
+    def _refresh_cudagraphs_after_weight_update(self) -> None:
+        """Recapture CUDA graphs after online weight updates.
+
+        No-eager decode replays graphs captured before the trainer pushes new
+        weights.  FP8 online updates mutate both the packed weight and its scale
+        tensors in place, so replaying the old graph can use stale captured
+        kernel state and produce degenerate generations.  Recapturing here keeps
+        the next decode on the fast path while making the graph reflect the new
+        weights/scales.
+        """
+        if getattr(self, "enforce_eager", False):
+            return
+        capture_cudagraph = getattr(self, "capture_cudagraph", None)
+        if capture_cudagraph is None:
+            return
+
+        logger.info(f"{self.label}: Recapturing CUDA graphs after weight update")
+        try:
+            torch.cuda.synchronize()
+            if hasattr(self, "graphs"):
+                self.graphs.clear()
+            if hasattr(self, "graph_logits"):
+                self.graph_logits.clear()
+            if hasattr(self, "graph_aux_hidden"):
+                self.graph_aux_hidden.clear()
+            if hasattr(self, "graph_pool"):
+                self.graph_pool = None
+            tbo_graphs = getattr(getattr(self, "model", None), "tbo_graphs", None)
+            if tbo_graphs is not None:
+                tbo_graphs.clear()
+            torch.cuda.empty_cache()
+            capture_cudagraph()
+            torch.cuda.synchronize()
+            logger.info(
+                f"{self.label}: CUDA graph recapture after weight update completed"
+            )
+        except Exception as exc:
+            logger.error(
+                f"{self.label}: CUDA graph recapture after weight update failed: {exc}",
+                exc_info=True,
+            )
+            # Prefer a correct eager fallback over replaying stale graphs.
+            self.enforce_eager = True
+            if hasattr(self, "graphs"):
+                self.graphs = {}
+            if hasattr(self, "graph_logits"):
+                self.graph_logits = {}
+            if hasattr(self, "graph_aux_hidden"):
+                self.graph_aux_hidden = {}
+            if hasattr(self, "graph_pool"):
+                self.graph_pool = None
+            logger.warning(f"{self.label}: Falling back to enforce_eager=True")
+
     def _get_param_to_module_mapping(self) -> dict[str, tuple]:
         """
         Get or build the parameter name to module mapping.
@@ -420,6 +473,9 @@ class WeightUpdaterMixin:
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
 
+        if clear_kv_cache:
+            self._refresh_cudagraphs_after_weight_update()
+
         logger.info(
             f"{self.label}: Weight update complete - "
             f"updated={updated}, skipped={skipped}, "
@@ -542,6 +598,7 @@ class WeightUpdaterMixin:
                             f"{list(self._packed_weight_accum.keys())}"
                         )
                     self._packed_weight_accum.clear()
+                self._refresh_cudagraphs_after_weight_update()
 
             logger.info(
                 f"{self.label}: SHM weight update bucket done - "
@@ -706,6 +763,7 @@ class WeightUpdaterMixin:
                         f"{list(self._packed_weight_accum.keys())}"
                     )
                 self._packed_weight_accum.clear()
+            self._refresh_cudagraphs_after_weight_update()
 
         logger.info(
             f"{self.label}: IPC weight update bucket done - "
