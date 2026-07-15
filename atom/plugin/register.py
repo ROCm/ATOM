@@ -5,17 +5,26 @@ from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
-from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
-from atom.models.minimax_m3 import (
-    MiniMaxM3SparseForCausalLM,
-    MiniMaxM3SparseForConditionalGeneration,
-)
 from atom.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGenerationTextOnly,
     Qwen3_5ForConditionalGenerationTextOnly,
 )
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang, is_rtpllm
+
+try:
+    from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
+except ImportError:
+    MiniMaxM2ForCausalLM = None
+
+try:
+    from atom.models.minimax_m3 import (
+        MiniMaxM3SparseForCausalLM,
+        MiniMaxM3SparseForConditionalGeneration,
+    )
+except ImportError:
+    MiniMaxM3SparseForCausalLM = None
+    MiniMaxM3SparseForConditionalGeneration = None
 
 logger = logging.getLogger("atom")
 
@@ -26,37 +35,57 @@ _ATOM_SUPPORTED_MODELS = {
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
     "DeepseekV32ForCausalLM": DeepseekV3ForCausalLM,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
-    "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
-    "MiniMaxM3SparseForCausalLM": MiniMaxM3SparseForCausalLM,
-    "MiniMaxM3SparseForConditionalGeneration": MiniMaxM3SparseForConditionalGeneration,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
 }
+for model_name, model_cls in {
+    "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
+    "MiniMaxM3SparseForCausalLM": MiniMaxM3SparseForCausalLM,
+    "MiniMaxM3SparseForConditionalGeneration": MiniMaxM3SparseForConditionalGeneration,
+}.items():
+    if model_cls is not None:
+        _ATOM_SUPPORTED_MODELS[model_name] = model_cls
 
 if is_sglang():
-    from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
-    from atom.models.qwen3_next import Qwen3NextForCausalLM
-    from atom.models.qwen3_5 import (
-        Qwen3_5ForCausalLM,
-        Qwen3_5MoeForCausalLM,
-    )
-    from atom.models.kimi_k25 import KimiK25ForCausalLM
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
+    except ImportError:
+        DeepseekV4ForCausalLM = None
 
-    _ATOM_SUPPORTED_MODELS.update(
-        {
-            "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
-            "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
-            "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
-            "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
-            # ROCm/ATOM#1078: route Kimi-K2.x through ATOM's quant-aware model
-            # path (KimiK25ForCausalLM -> DeepseekV2ForCausalLM). The standalone
-            # engine already registers this in atom/model_engine/model_runner.py;
-            # the SGLang plugin path was missing it, so launches fell back to
-            # sglang's native model and failed weight loading on the excluded
-            # (BF16) attention projections.
-            "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
-        }
-    )
+    try:
+        from atom.models.qwen3_next import Qwen3NextForCausalLM
+    except ImportError:
+        Qwen3NextForCausalLM = None
+
+    try:
+        from atom.models.qwen3_5 import (
+            Qwen3_5ForCausalLM,
+            Qwen3_5MoeForCausalLM,
+        )
+    except ImportError:
+        Qwen3_5ForCausalLM = None
+        Qwen3_5MoeForCausalLM = None
+
+    try:
+        from atom.models.kimi_k25 import KimiK25ForCausalLM
+    except ImportError:
+        KimiK25ForCausalLM = None
+
+    for model_name, model_cls in {
+        "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
+        "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
+        "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
+        "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
+        # ROCm/ATOM#1078: route Kimi-K2.x through ATOM's quant-aware model
+        # path (KimiK25ForCausalLM -> DeepseekV2ForCausalLM). The standalone
+        # engine already registers this in atom/model_engine/model_runner.py;
+        # the SGLang plugin path was missing it, so launches fell back to
+        # sglang's native model and failed weight loading on the excluded
+        # (BF16) attention projections.
+        "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
+    }.items():
+        if model_cls is not None:
+            _ATOM_SUPPORTED_MODELS[model_name] = model_cls
 
 
 def _register_custom_attention_to_sglang() -> None:

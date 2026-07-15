@@ -14,11 +14,24 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import (
-    interleave_gate_up_rows,
-    moe_shuffle_scale,
-    moe_shuffle_weight,
-)
+try:
+    from aiter.ops.shuffle import (
+        interleave_gate_up_rows,
+        moe_shuffle_scale,
+        moe_shuffle_weight,
+    )
+except ImportError as exc:
+    _aiter_shuffle_import_error = exc
+
+    def _missing_aiter_shuffle_symbol(*args, **kwargs):
+        raise ImportError(
+            "The installed AITER does not provide MoE shuffle helpers required "
+            "by this quantized MoE path. Please upgrade amd-aiter."
+        ) from _aiter_shuffle_import_error
+
+    interleave_gate_up_rows = _missing_aiter_shuffle_symbol
+    moe_shuffle_scale = _missing_aiter_shuffle_symbol
+    moe_shuffle_weight = _missing_aiter_shuffle_symbol
 from atom.config import (
     Config,
     QuantizationConfig,
