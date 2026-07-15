@@ -487,7 +487,7 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
         cd /opt/aiperf && \
         git checkout "${SA_AIPERF_COMMIT}" && \
-        "${VENV_PYTHON}" -m pip install -e . && \
+        "${VENV_PYTHON}" -m pip install -e . --no-deps && \
         "${VENV_PYTHON}" -m pip show aiperf || true && \
         command -v aiperf && aiperf --help >/dev/null; \
     else \
