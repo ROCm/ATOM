@@ -763,7 +763,6 @@ def init_aiter_dist(config: Config) -> None:
             return
 
     # Fallback: create aiter's own groups (vLLM reuse failed or non-vLLM plugin)
-    import aiter.ops.communication as aiter_comm
     from aiter import init_dist_env
     from aiter.dist.utils import get_distributed_init_method
 
