@@ -42,7 +42,7 @@ def _is_indexed_sparse_attention(module) -> bool:
     return bool(getattr(impl, "is_indexed_sparse_attention", False))
 
 
-def _resolve_minimax_m3_index_cache_dtype(config) -> torch.dtype:
+def _resolve_index_cache_dtype(config) -> torch.dtype:
     from aiter import dtypes
 
     index_cache_dtype = getattr(config, "index_cache_dtype", "auto")
@@ -494,7 +494,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
             )
             index_dim = sparse_cfg["sparse_index_dim"]
-            index_cache_dtype = _resolve_minimax_m3_index_cache_dtype(config)
+            index_cache_dtype = _resolve_index_cache_dtype(config)
             block_bytes += (
                 sparse_layers
                 * runner.physical_block_size
@@ -555,7 +555,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             sparse_layers = sum(
                 1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
             )
-            index_cache_dtype = _resolve_minimax_m3_index_cache_dtype(config)
+            index_cache_dtype = _resolve_index_cache_dtype(config)
             tensors["sparse_attention_index_cache"] = torch.zeros(
                 sparse_layers,
                 runner.num_physical_kvcache_blocks,
