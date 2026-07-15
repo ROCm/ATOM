@@ -3,7 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import AbstractContextManager
 from typing import Any, Callable, Optional
+
+
+GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
+GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
+
+
+def is_glm52_dsa_config(config: Any) -> bool:
+    """Return whether an HF config describes GLM-5.2 DSA."""
+
+    archs = getattr(config, "architectures", None) or []
+    return any(GLM52_DSA_ARCH in str(arch) for arch in archs) or getattr(
+        config, "model_type", None
+    ) == GLM52_DSA_MODEL_TYPE
 
 
 @dataclass(frozen=True)
@@ -18,7 +32,9 @@ class SGLangModelAdapterSpec:
     wrapper_binds_gdn_context: bool = False
     uses_context_only_forward: bool = False
     prepare_config: Optional[Callable[[Any, str], None]] = None
+    construction_context: Optional[Callable[[], AbstractContextManager[Any]]] = None
     install_adapters: Optional[Callable[[Any], None]] = None
+    bind_cache_views: Optional[Callable[[Any, Any], None]] = None
 
 
 def _prepare_qwen35_config(atom_config: Any, model_arch: str) -> None:
@@ -70,10 +86,49 @@ def _prepare_minimax_m3_config(atom_config: Any, model_arch: str) -> None:
     )
 
 
+def _prepare_glm52_dsa_config(atom_config: Any, model_arch: str) -> None:
+    from atom.models.deepseek_v2 import GlmMoeDsaForCausalLM
+
+    quant_config = getattr(atom_config, "quant_config", None)
+    if quant_config is not None:
+        quant_config.remap_layer_name(
+            atom_config.hf_config,
+            packed_modules_mapping=getattr(
+                GlmMoeDsaForCausalLM, "packed_modules_mapping", {}
+            ),
+            weights_mapper=getattr(GlmMoeDsaForCausalLM, "hf_to_atom_mapper", {}),
+            quant_exclude_name_mapping=getattr(
+                GlmMoeDsaForCausalLM, "quant_exclude_name_mapping", {}
+            ),
+        )
+        default_excludes = getattr(GlmMoeDsaForCausalLM, "quant_default_exclude_layers", [])
+        if default_excludes:
+            quant_config.apply_default_exclude_layers(default_excludes)
+
+    # SGLang's DSA pool uses page64/preshuffle for GLM/DeepSeek-family DSA.
+    # Keep ATOM's config aligned for the native GLM indexer, while
+    # ATOM_MLA_PAGE_SIZE can remain 1 so sparse MLA reads selected physical ids.
+    atom_config.kv_cache_block_size = 64
+
+
 def _install_deepseek_mla_adapters(model: Any) -> None:
     from atom.plugin.sglang.models.deepseek_mla import setup_deepseek_for_sglang
 
     setup_deepseek_for_sglang(model)
+
+
+def _glm52_dsa_construction_context():
+    from atom.plugin.sglang.models.glm52_dsa_attention import (
+        glm52_native_mla_attention_construction,
+    )
+
+    return glm52_native_mla_attention_construction()
+
+
+def _install_glm52_dsa_native_adapters(model: Any) -> None:
+    from atom.plugin.sglang.models.glm52_dsa import setup_glm52_dsa_for_sglang
+
+    setup_glm52_dsa_for_sglang(model)
 
 
 def _install_deepseek_v4_adapters(model: Any) -> None:
@@ -91,6 +146,40 @@ def _install_deepseek_v4_adapters(model: Any) -> None:
             patch_deepseek_v4_attention_for_sglang(module)
 
 
+def _bind_deepseek_v4_cache_views(model: Any, runtime: Any) -> None:
+    del runtime
+    from atom.plugin.sglang.deepseek_v4_bridge import (
+        bind_deepseek_v4_proxy_cache_views,
+        maybe_get_proxy_pool_from_sglang_backend,
+        reset_deepseek_v4_state_slots,
+    )
+
+    proxy_pool, _ = maybe_get_proxy_pool_from_sglang_backend()
+    if not bind_deepseek_v4_proxy_cache_views(model, proxy_pool):
+        raise RuntimeError("DeepSeek-V4 SGLang proxy KV pool is not initialized")
+
+    from atom.utils.forward_context import get_forward_context
+
+    reset_slots = getattr(get_forward_context().attn_metadata, "reset_slots", None)
+    reset_deepseek_v4_state_slots(model, reset_slots)
+
+
+def _bind_glm52_dsa_cache_views(model: Any, runtime: Any) -> None:
+    if getattr(runtime.forward_batch.forward_mode, "is_idle", lambda: False)():
+        return
+
+    from atom.plugin.sglang.glm52_dsa_bridge import (
+        bind_glm52_dsa_cache_views,
+        maybe_get_glm52_dsa_pools_from_sglang_backend,
+    )
+
+    token_to_kv_pool, _ = maybe_get_glm52_dsa_pools_from_sglang_backend(
+        runtime.forward_batch
+    )
+    if not bind_glm52_dsa_cache_views(model, token_to_kv_pool):
+        raise RuntimeError("GLM-5.2 SGLang DSA KV pool is not initialized")
+
+
 def _install_minimax_m3_adapters(model: Any) -> None:
     from atom.plugin.sglang.models.minimax_m3 import setup_minimax_m3_for_sglang
 
@@ -106,8 +195,11 @@ MODEL_ADAPTER_SPECS = {
         install_adapters=_install_deepseek_mla_adapters,
         uses_context_only_forward=True,
     ),
-    "GlmMoeDsaForCausalLM": SGLangModelAdapterSpec(
-        install_adapters=_install_deepseek_mla_adapters,
+    GLM52_DSA_ARCH: SGLangModelAdapterSpec(
+        prepare_config=_prepare_glm52_dsa_config,
+        construction_context=_glm52_dsa_construction_context,
+        install_adapters=_install_glm52_dsa_native_adapters,
+        bind_cache_views=_bind_glm52_dsa_cache_views,
         uses_context_only_forward=True,
     ),
     "KimiK25ForConditionalGeneration": SGLangModelAdapterSpec(
@@ -131,6 +223,7 @@ MODEL_ADAPTER_SPECS = {
     ),
     "DeepseekV4ForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_v4_adapters,
+        bind_cache_views=_bind_deepseek_v4_cache_views,
     ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
@@ -152,7 +245,7 @@ MODEL_ARCH_SPECS = {
     for key in (
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
-        "GlmMoeDsaForCausalLM",
+        GLM52_DSA_ARCH,
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
