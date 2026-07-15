@@ -43,6 +43,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -83,6 +87,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -123,6 +131,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -163,6 +175,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -203,6 +219,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -243,6 +263,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -283,6 +307,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -323,6 +351,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -939,6 +971,10 @@ jobs:
               "DeepSeek-V4-Pro TP8 (OOB)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-5.2-FP8 TP4 (OOB)",
+              "GLM-5.2-FP8 MTP TP4 (OOB)",
+              "GLM-5.2-MXFP4 TP4 (OOB)",
+              "GLM-5.2-MXFP4 MTP TP4 (OOB)",
               "GLM-4.7-FP8 TP4 (AW)",
               "GLM-4.7-FP8 MTP TP4 (AW)",
               "Kimi-K2.5-MXFP4 TP4 (AW)",
