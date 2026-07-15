@@ -114,6 +114,19 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      - name: Compute push gates
+        # Single source of truth for which images get pushed. The build,
+        # re-login, and push steps below all read these outputs instead of each
+        # duplicating the same long boolean, so the conditions can't drift.
+        id: gates
+        run: |
+          set -euo pipefail
+          {
+            echo "main=${{ inputs.only_release_oot != true && inputs.only_release_sglang != true }}"
+            echo "oot=${{ inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true)) }}"
+            echo "sglang=${{ inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true)) }}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Echo environment variables
         run: |
           echo "ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}"
@@ -156,7 +169,7 @@ jobs:
           docker inspect atom_release:ci
 
       - name: Test Docker image
-        if: ${{ inputs.skip_tests != true && inputs.only_release_oot != true && inputs.only_release_sglang != true }}
+        if: ${{ success() && steps.gates.outputs.main == 'true' && inputs.skip_tests != true }}
         timeout-minutes: 60
         run: |
           echo "Clean up containers..."
@@ -204,8 +217,19 @@ jobs:
             echo "Output matches golden outputs."
           fi
 
+      - name: Re-login to Docker Hub before push
+        # The initial login happens before a ~1h image build, so its auth token
+        # is stale by the time this push finalizes (multi-GB push of a large
+        # image), causing "unauthorized: authentication required" on the manifest
+        # PUT. Re-authenticate immediately before pushing to get a fresh token.
+        if: ${{ success() && steps.gates.outputs.main == 'true' }}
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Push Docker image
-        if: ${{ success() && inputs.only_release_oot != true && inputs.only_release_sglang != true }}
+        if: ${{ success() && steps.gates.outputs.main == 'true' }}
         run: |
           CUSTOM_TAG="${{ inputs.custom_tag || '' }}"
           if [ -n "${CUSTOM_TAG}" ]; then
@@ -235,7 +259,7 @@ jobs:
           fi
 
       - name: Build OOT Docker image
-        if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
+        if: ${{ success() && steps.gates.outputs.oot == 'true' }}
         timeout-minutes: 180
         run: |
           OOT_BASE_IMAGE="atom_release:ci"
@@ -250,8 +274,17 @@ jobs:
             -f docker/Dockerfile .
           docker inspect atom_oot_release:ci
 
+      - name: Re-login to Docker Hub before OOT push
+        # Fresh token before this push: the OOT build above adds even more time
+        # since the initial login, so the auth token is stale by push time.
+        if: ${{ success() && steps.gates.outputs.oot == 'true' }}
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Push OOT Docker image
-        if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
+        if: ${{ success() && steps.gates.outputs.oot == 'true' }}
         run: |
           set -euo pipefail
           VLLM_VER="${{ env.VLLM_VERSION }}"
@@ -275,7 +308,7 @@ jobs:
           fi
 
       - name: Build SGLang Docker image
-        if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
+        if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
         timeout-minutes: 180
         run: |
           SGLANG_BASE_IMAGE="atom_release:ci"
@@ -289,8 +322,17 @@ jobs:
             -f docker/Dockerfile .
           docker inspect atom_sglang_release:ci
 
+      - name: Re-login to Docker Hub before SGLang push
+        # Fresh token before this push: the SGLang build above adds even more
+        # time since the initial login, so the auth token is stale by push time.
+        if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Push SGLang+ATOM Docker image
-        if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
+        if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
         run: |
           set -euo pipefail
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
