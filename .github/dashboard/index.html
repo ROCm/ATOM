@@ -237,6 +237,8 @@
     .popover .pop-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
     .popover .pop-key { color: var(--text-tertiary); }
     .popover .pop-val { color: var(--text-primary); font-family: "SF Mono", monospace; }
+    .popover .atomesh-popover-content .pop-val { font-family: inherit !important; font-size: 13px !important; font-weight: inherit; letter-spacing: normal; font-variant-numeric: normal; }
+    .popover .atomesh-popover-content .pop-val * { font-family: inherit !important; font-size: inherit !important; font-variant-numeric: inherit; }
     .popover .pop-section { margin-top: var(--gap-md); padding-top: var(--gap-sm); border-top: 1px solid var(--border); }
     /* pop-actions uses shared action-row + action-btn */
     .pop-close { position: absolute; top: 12px; right: 12px; background: none; border: none; color: var(--text-tertiary); font-size: 18px; cursor: pointer; }
@@ -2967,7 +2969,7 @@ function showAtomeshPopover(row) {
   const backendLabel = row.backend || ATOMESH_DATA.backend;
   const dateValue = row.date || ATOMESH_DATA.updatedAt;
   const pop = document.getElementById('popover');
-  pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
+  pop.innerHTML = `<div class="atomesh-popover-content"><button class="pop-close" id="pop-close-btn">&times;</button>
     <h3>${escHTML(row.model)} ${escHTML(fmtIslOsl(row.islOsl || '--'))} c=${atomeshDetailValue(row.concurrency)}</h3>
     <div class="pop-row"><span class="pop-key">Hardware</span><span class="pop-val" style="font-family:inherit">${escHTML(hardware)} (${escHTML(backendLabel)})</span></div>
     <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${dateValue ? fmtDate(dateValue) : '—'}</span></div>
@@ -2994,7 +2996,7 @@ function showAtomeshPopover(row) {
     </div>
     <div class="action-row">
       ${runHref ? `<a class="action-btn" href="${escHTML(runHref)}" target="_blank" rel="noopener noreferrer">GitHub Actions Run ↗</a>` : ''}
-    </div>`;
+    </div></div>`;
   document.getElementById('popover-overlay').classList.add('open');
   document.getElementById('pop-close-btn').addEventListener('click', (e) => {
     e.stopPropagation();
