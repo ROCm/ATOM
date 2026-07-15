@@ -258,7 +258,9 @@ class EagleProposer:
             # read next step (event already complete by then). See the
             # _dspark_ell_by_req property + record_dspark_ell.
             self._dspark_ell_map_cache: dict = {}
-            self._dspark_ell_pending: Optional[tuple] = None  # (event, cpu_buf, req_ids)
+            self._dspark_ell_pending: Optional[tuple] = (
+                None  # (event, cpu_buf, req_ids)
+            )
             # SPS(B) throughput profile + STS temperatures are bound later
             # (engine warmup / checkpoint). Until then: a synthetic monotone SPS
             # stub and T=1 (uncalibrated) keep the path lossless and testable.

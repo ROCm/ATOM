@@ -80,14 +80,13 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
 
-    # Create output buffer. Initialize to -1 (the truncation sentinel) rather
-    # than empty: with variable-length verification (DSpark Phase 2) a request
-    # may verify fewer than num_spec_steps tokens, so the kernel only writes
-    # positions [0 .. num_draft_tokens]; the unwritten tail must read as -1 so
-    # downstream first-`-1` truncation does not pick up uninitialized garbage.
-    output_token_ids = torch.full(
+    # Create output buffer. Each kernel program writes positions
+    # [0 .. num_draft_tokens] for its request and fills the unwritten tail
+    # [num_draft_tokens+1 .. num_spec_steps] with the -1 truncation sentinel
+    # itself (variable-length verification / DSpark Phase 2), so torch.empty is
+    # safe and avoids an extra full()/memset launch.
+    output_token_ids = torch.empty(
         (batch_size, num_spec_steps + 1),
-        -1,
         dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
         device=device,
     )
@@ -180,6 +179,14 @@ def rejection_greedy_sample_kernel(
         output_token_ids_ptr + req_idx * (num_spec_steps + 1) + num_draft_tokens,
         bonus_token_id,
     )
+    # Fill the unwritten tail [num_draft_tokens+1 .. num_spec_steps] with the
+    # -1 sentinel so downstream first-`-1` truncation is correct with
+    # variable-length verification (output buffer is torch.empty).
+    for pos in range(num_draft_tokens + 1, num_spec_steps + 1):
+        tl.store(
+            output_token_ids_ptr + req_idx * (num_spec_steps + 1) + pos,
+            INVALID_TOKEN,
+        )
     tl.store(num_bonus_tokens_ptr + req_idx, num_bonus_token)
 
 
@@ -244,4 +251,12 @@ def rejection_relaxed_sample_kernel(
         output_token_ids_ptr + req_idx * (num_spec_steps + 1) + num_draft_tokens,
         bonus_token_id,
     )
+    # Fill the unwritten tail [num_draft_tokens+1 .. num_spec_steps] with the
+    # -1 sentinel so downstream first-`-1` truncation is correct with
+    # variable-length verification (output buffer is torch.empty).
+    for pos in range(num_draft_tokens + 1, num_spec_steps + 1):
+        tl.store(
+            output_token_ids_ptr + req_idx * (num_spec_steps + 1) + pos,
+            INVALID_TOKEN,
+        )
     tl.store(num_bonus_tokens_ptr + req_idx, num_bonus_token)

@@ -1566,9 +1566,7 @@ class ModelRunner:
             # Match the capture loop's bucket source so we count the graphs
             # actually captured (ragged and q-bucket use independent size sets).
             _sizes_spec = (
-                _dspark.ragged_graph_sizes
-                if _dspark.ragged
-                else _dspark.q_buckets
+                _dspark.ragged_graph_sizes if _dspark.ragged else _dspark.q_buckets
             )
             buckets = resolve_q_buckets(_sizes_spec, full_q)
             n_buckets = len(buckets)
@@ -3386,9 +3384,7 @@ class ModelRunner:
                 )
                 logger.info("DSpark RAGGED CUDA-graph query sizes: %s", q_buckets)
             else:
-                q_buckets = resolve_q_buckets(
-                    self.config.dspark.q_buckets, full_q_len
-                )
+                q_buckets = resolve_q_buckets(self.config.dspark.q_buckets, full_q_len)
                 logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
 
         with pause_gc(), graph_capture() as capture_ctx:
