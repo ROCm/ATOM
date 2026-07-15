@@ -78,7 +78,6 @@ python -m atom.entrypoints.openai_server \
 model_path=amd/GLM-5.2-MXFP4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-export ATOM_ENABLE_RELAXED_MTP=1
 TP=4
 
 python -m atom.entrypoints.openai_server \
