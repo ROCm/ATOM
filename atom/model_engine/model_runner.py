@@ -44,7 +44,7 @@ from atom.utils.tbo import (
     UBatchWrapper,
     local_tbo_precompute,
     maybe_create_ubatch_slices,
-    sync_dp_for_tbo,
+    sync_dp_metadata,
 )
 from atom.utils.forward_context import (
     Context,
@@ -2083,16 +2083,23 @@ class ModelRunner:
         self,
         batch: ScheduledBatch,
         num_scheduled_tokens: Optional[np.ndarray] = None,
+        dspark_shape: Optional[tuple[int, int, int]] = None,
     ):
         """Per-step DP sync: token padding, prefill fan-out, TBO decision.
 
-        Thin wrapper over :func:`atom.utils.tbo.sync_dp_for_tbo` (the
+        Thin wrapper over :func:`atom.utils.tbo.sync_dp_metadata` (the
         actual collective) and :func:`atom.utils.tbo.local_tbo_precompute`
         (the rank-local TBO eligibility / per-ubatch token split).
 
+        ``dspark_shape`` (local q, decode_bs, sigma) folds DSpark's graph-shape
+        DP-MAX into this same all_gather so the two per-step collectives become
+        one; the reduced max is returned as the 7th tuple element for the caller
+        to apply via ``_apply_dspark_shape_max``.
+
         Returns:
             (num_input_tokens, num_tokens_across_dp, dp_uniform_decode,
-             max_tokens, tbo_collective_active, ub_max_tokens_across_dp)
+             max_tokens, tbo_collective_active, ub_max_tokens_across_dp,
+             dspark_shape_max)
         """
         num_input_tokens = batch.total_tokens_num
         is_prefill = batch.total_tokens_num_prefill > 0
@@ -2132,9 +2139,10 @@ class ModelRunner:
                 num_input_tokens,
                 local_meets_min_tokens and local_can_split,
                 None,
+                dspark_shape,
             )
 
-        sync = sync_dp_for_tbo(
+        sync = sync_dp_metadata(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
             num_input_tokens=num_input_tokens,
@@ -2143,6 +2151,7 @@ class ModelRunner:
             local_meets_min_tokens=local_meets_min_tokens,
             local_can_split=local_can_split,
             local_ub_tokens=(local_ub0, local_ub1),
+            dspark_shape=dspark_shape,
         )
 
         max_tokens = int(sync.num_tokens_across_dp.max())
@@ -2161,6 +2170,7 @@ class ModelRunner:
             max_tokens,
             sync.tbo_collective_active,
             sync.ub_max_tokens_across_dp,
+            sync.dspark_shape_max,
         )
 
     def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> None:
@@ -2431,14 +2441,40 @@ class ModelRunner:
         Called on every rank each step (real forward AND dummy_execution both go
         through prepare_model) so the collective itself never deadlocks. No-op
         for single-DP or non-spec runs.
+
+        NOTE: the actual cross-DP collective is now folded into the packed
+        ``sync_dp_metadata`` all_gather (see ``_dspark_local_shape`` /
+        ``_apply_dspark_shape_max`` and the ``dspark_shape`` arg of
+        ``_preprocess``) so DSpark no longer issues a separate per-step
+        all_reduce. This method is retained for the standalone (non-merged)
+        call path and simply computes + applies via that helper pair.
         """
-        if self.config.parallel_config.data_parallel_size <= 1:
-            return
-        drafter = getattr(self, "drafter", None)
-        if drafter is None or not getattr(drafter, "use_dspark", False):
+        shape = self._dspark_local_shape(batch)
+        if shape is None:
             return
         import torch.distributed as dist
 
+        shape_t = torch.tensor(list(shape), device="cpu", dtype=torch.int64)
+        dist.all_reduce(shape_t, op=dist.ReduceOp.MAX, group=get_dp_group().cpu_group)
+        self._apply_dspark_shape_max(
+            batch, (int(shape_t[0]), int(shape_t[1]), int(shape_t[2]))
+        )
+
+    def _dspark_local_shape(
+        self, batch: ScheduledBatch
+    ) -> Optional[tuple[int, int, int]]:
+        """Local (q, decode_bs, sigma) for the DSpark DP graph-shape sync, or
+        None when the sync does not apply (single-DP or non-DSpark).
+
+        Symmetric across ranks every step regardless of prefill/decode: on a
+        prefill step this returns (1, 0, 0) so the DP-MAX reduction still has a
+        well-defined identity contribution and every rank participates in the
+        same collective (matching the pre-merge all_reduce semantics)."""
+        if self.config.parallel_config.data_parallel_size <= 1:
+            return None
+        drafter = getattr(self, "drafter", None)
+        if drafter is None or not getattr(drafter, "use_dspark", False):
+            return None
         local_q = int(getattr(batch, "num_spec_query_tokens", 1))
         local_bs = int(getattr(batch, "total_seqs_num_decode", 0))
         # Also DP-max the ragged token sum Σ (total_tokens_num_decode). PIECEWISE
@@ -2446,21 +2482,42 @@ class ModelRunner:
         # all_gather row count identical across ranks (else RCCL deadlock) every
         # rank must pick the SAME bucket, so bisect on the DP-max Σ, not local Σ.
         local_sigma = int(getattr(batch, "total_tokens_num_decode", 0))
-        shape_t = torch.tensor(
-            [local_q, local_bs, local_sigma], device="cpu", dtype=torch.int64
-        )
-        dist.all_reduce(shape_t, op=dist.ReduceOp.MAX, group=get_dp_group().cpu_group)
-        batch.num_spec_query_tokens = int(shape_t[0].item())
-        batch._dspark_dp_bs = int(shape_t[1].item())
-        batch._dspark_dp_sigma = int(shape_t[2].item())
+        return local_q, local_bs, local_sigma
 
-    def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
+    def _apply_dspark_shape_max(
+        self, batch: ScheduledBatch, shape_max: Optional[tuple[int, int, int]]
+    ) -> None:
+        """Adopt the DP-MAX (q, decode_bs, sigma). Raising q/bs/sigma only
+        enlarges graph capacity (real tokens stay flat-packed in [0:Σ]), so it
+        is always lossless; see _dspark_sync_graph_shape_dp docstring."""
+        if shape_max is None:
+            return
+        batch.num_spec_query_tokens = int(shape_max[0])
+        batch._dspark_dp_bs = int(shape_max[1])
+        batch._dspark_dp_sigma = int(shape_max[2])
+
+    def prepare_inputs(
+        self,
+        batch: ScheduledBatch,
+        input_ids: torch.Tensor = None,
+        preprocessed: Optional[tuple] = None,
+    ):
         # NOTE: DSpark q-bucket shrink happens in prepare_model BEFORE
         # prepare_input_ids, so the batch is already reduced when we get here.
+        # ``preprocessed``: when prepare_model already ran the merged DP collective
+        # (to get the DSpark DP-max q before prepare_input_ids), it passes the
+        # cached _preprocess tuple here so we DON'T issue a second all_gather.
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        if preprocessed is None:
+            preprocessed = self._preprocess(
+                batch,
+                num_scheduled_tokens=num_scheduled_tokens,
+                dspark_shape=self._dspark_local_shape(batch),
+            )
+            self._apply_dspark_shape_max(batch, preprocessed[6])
         (
             num_input_tokens,
             num_tokens_across_dp,
@@ -2468,7 +2525,8 @@ class ModelRunner:
             max_tokens,
             tbo_collective_active,
             ub_max_tokens_across_dp,
-        ) = self._preprocess(batch, num_scheduled_tokens=num_scheduled_tokens)
+            _dspark_shape_max,
+        ) = preprocessed
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
 
         # mtp_step = per-seq decode token count, used by ForwardMode.decide to
@@ -2643,15 +2701,18 @@ class ModelRunner:
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
     def prepare_model(self, batch: ScheduledBatch):
-        # DSpark plan Y: shrink the batch to the chosen q-bucket FIRST, before
-        # anything reads it. prepare_input_ids (builds input_ids) and
-        # prepare_inputs (builds cu_seqlens / attn metadata) must both see the
-        # reduced per-seq token count, or input_ids stays full-length while the
-        # metadata is q -> "batch_id_per_token len < T" desync. (This call used
-        # to live inside prepare_inputs, which runs AFTER prepare_input_ids —
-        # too late, so the shrink never reached input_ids.)
         self._dspark_apply_q_bucket(batch)
-        self._dspark_sync_graph_shape_dp(batch)
+        # DSpark-only early DP sync: only DSpark under DP needs the DP-max q
+        # BEFORE prepare_input_ids
+        dspark_shape = self._dspark_local_shape(batch)
+        preprocessed = None
+        if dspark_shape is not None:
+            preprocessed = self._preprocess(
+                batch,
+                num_scheduled_tokens=np.asarray(batch.num_scheduled_tokens),
+                dspark_shape=dspark_shape,
+            )
+            self._apply_dspark_shape_max(batch, preprocessed[6])
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
@@ -2659,7 +2720,7 @@ class ModelRunner:
             self.prepare_sample(batch)
         )
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        self.prepare_inputs(batch, input_ids)
+        self.prepare_inputs(batch, input_ids, preprocessed=preprocessed)
         return (
             input_ids,
             temperatures,
