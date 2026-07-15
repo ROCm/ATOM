@@ -325,6 +325,16 @@ class EagleProposer:
                     "embed_tokens.weight",
                     "Eagle3 embed_tokens",
                 )
+            if (
+                "embed_tokens.weight" not in loaded
+                and getattr(self.model, "embed_tokens", None) is not target_embed
+            ):
+                raise RuntimeError(
+                    "Eagle3 draft checkpoint is missing embed_tokens.weight, but "
+                    "ATOM could not share the target embedding on this rank "
+                    "(requires PP=1 and matching embed_tokens shapes; for TP>1 you "
+                    "may need ATOM_EAGLE_REPLICATE_EMBED=0)."
+                )
             self._share_if_not_loaded(
                 self.model,
                 "lm_head",

@@ -59,8 +59,9 @@ Example draft models:
 - `nvidia/gpt-oss-120b-Eagle3-throughput` — throughput-optimized Eagle3 draft
 - `nvidia/gpt-oss-120b-Eagle3-short-context` — short-context Eagle3 draft
 
-The draft model shares the target tokenizer/embedding and uses the target's
-`lm_head` when those weights are not present in the draft checkpoint.
+When the draft checkpoint omits these weights, ATOM shares the target `lm_head`, and can
+share `embed_tokens` when running without pipeline parallelism and with compatible sharding
+(e.g. TP=1 or `ATOM_EAGLE_REPLICATE_EMBED=0`).
 
 ## Performance baseline
 
