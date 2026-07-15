@@ -248,7 +248,7 @@ class EagleProposer:
             # verify). propose() stores the scheduler-chosen ell here; the next
             # step's calc_spec_decode_metadata consumes it (eager-only for now).
             self.dspark_confidence_schedule = bool(
-                envs.ATOM_DSPARK_CONFIDENCE_SCHEDULE
+                self.config.dspark.confidence_schedule
             )
             self._dspark_last_ell: Optional[torch.Tensor] = None
             # req_id -> ell map from the PREVIOUS step's propose(), used to re-map
@@ -574,7 +574,7 @@ class EagleProposer:
             sps_table,
             sts_temperatures=self.dspark_sts_temperatures,
         )
-        if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+        if self.config.dspark.debug_schedule:
             self._dspark_dbg_step = getattr(self, "_dspark_dbg_step", 0) + 1
             if self._dspark_dbg_step % 50 == 1:
                 avg_ell = float(ell_t.float().mean())

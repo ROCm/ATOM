@@ -1054,6 +1054,58 @@ class KVEventsConfig:
 
 
 @dataclass
+class DSparkConfig:
+    """Runtime configuration for DSpark speculative verification.
+
+    This is the single source of truth for the DSpark knobs that used to be read
+    directly from ``ATOM_DSPARK_*`` env vars scattered across the model runner,
+    the V4 attention op, and the Eagle proposer. It is constructed ONCE in the
+    parent process (see :meth:`from_env`, which preserves backward compatibility
+    with the old env vars) and then pickled into every engine-core worker
+    subprocess as part of :class:`Config`, so all read sites observe the same
+    resolved values without touching ``os.environ`` again.
+
+    Fields (see ``atom/utils/envs.py`` for the paper references):
+      - confidence_schedule: use the DSpark confidence head to pick a per-request
+        verify length ell_r (Algorithm 1) + variable-length verification.
+      - ragged: per-request ragged verify (§5.2 avoid-padding); each decode seq
+        forwards its own ell_r+1 tokens (no batch-level q padding).
+      - ragged_graph_sizes: comma-separated per-seq CUDA-graph query-length
+        buckets to capture for the ragged path (e.g. "1,3,6" or "8").
+      - q_buckets: CUDA-graph query-length buckets for the (older) batch-uniform
+        q-bucket verify path (independent of the ragged path).
+      - disable_sps_calib: skip SPS calibration (replays captured graphs at
+        warmup); fall back to the synthetic SPS stub.
+      - debug_schedule: emit scheduler diagnostics (avg verify length /
+        truncation rate / anchor OOB checks). Forces host syncs; perf cost.
+    """
+
+    confidence_schedule: bool = False
+    ragged: bool = False
+    ragged_graph_sizes: str = ""
+    q_buckets: str = ""
+    disable_sps_calib: bool = False
+    debug_schedule: bool = False
+
+    @classmethod
+    def from_env(cls) -> "DSparkConfig":
+        """Build a config from ``ATOM_DSPARK_*`` env vars (backward compat).
+
+        Called once in the parent process. The ``--dspark-config`` /
+        ``--dspark-debug`` CLI options translate into these same env vars before
+        the engine starts, so this method captures both the CLI and the legacy
+        raw-env paths."""
+        return cls(
+            confidence_schedule=envs.ATOM_DSPARK_CONFIDENCE_SCHEDULE,
+            ragged=envs.ATOM_DSPARK_RAGGED,
+            ragged_graph_sizes=envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES,
+            q_buckets=envs.ATOM_DSPARK_Q_BUCKETS,
+            disable_sps_calib=envs.ATOM_DSPARK_DISABLE_SPS_CALIB,
+            debug_schedule=envs.ATOM_DSPARK_DEBUG_SCHEDULE,
+        )
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
@@ -1110,6 +1162,11 @@ class Config:
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
+    # DSpark runtime knobs. Resolved once in the parent (from --dspark-config /
+    # --dspark-debug, which set ATOM_DSPARK_* env vars, or from raw env for
+    # backward compat) and pickled into every worker. Read sites use
+    # `config.dspark.*` instead of re-reading os.environ.
+    dspark: DSparkConfig = field(default_factory=DSparkConfig.from_env)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False

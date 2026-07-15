@@ -1485,12 +1485,12 @@ class ModelRunner:
                 q_buckets = [full_q]
                 if getattr(self.drafter, "dspark_confidence_schedule", False):
                     from atom.spec_decode.dspark_scheduler import resolve_q_buckets
-                    from atom.utils import envs as _envs
 
+                    _dspark = self.config.dspark
                     _sizes_spec = (
-                        _envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES
-                        if _envs.ATOM_DSPARK_RAGGED
-                        else _envs.ATOM_DSPARK_Q_BUCKETS
+                        _dspark.ragged_graph_sizes
+                        if _dspark.ragged
+                        else _dspark.q_buckets
                     )
                     q_buckets = resolve_q_buckets(_sizes_spec, full_q)
                     if os.environ.get("ATOM_PIECEWISE_FINE_TOKENS", "0") == "1":
@@ -1560,15 +1560,15 @@ class ModelRunner:
             self.drafter, "dspark_confidence_schedule", False
         ):
             from atom.spec_decode.dspark_scheduler import resolve_q_buckets
-            from atom.utils import envs as _envs
 
+            _dspark = self.config.dspark
             full_q = self.drafter.mtp_k + 1
             # Match the capture loop's bucket source so we count the graphs
             # actually captured (ragged and q-bucket use independent size sets).
             _sizes_spec = (
-                _envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES
-                if _envs.ATOM_DSPARK_RAGGED
-                else _envs.ATOM_DSPARK_Q_BUCKETS
+                _dspark.ragged_graph_sizes
+                if _dspark.ragged
+                else _dspark.q_buckets
             )
             buckets = resolve_q_buckets(_sizes_spec, full_q)
             n_buckets = len(buckets)
@@ -2210,7 +2210,7 @@ class ModelRunner:
         # Graph replay picks a (bs, q_eff) graph captured from the independent
         # ATOM_DSPARK_RAGGED_GRAPH_SIZES set. Anchor lower bound (q>=num_bonus+1)
         # is applied PER REQUEST so each seg can hold its own anchor.
-        if envs.ATOM_DSPARK_RAGGED:
+        if self.config.dspark.ragged:
             self._dspark_apply_ragged(batch, scheduled_bs, full_q, by_req)
             return
         # ====================================================================
@@ -2221,7 +2221,7 @@ class ModelRunner:
             resolve_q_buckets,
         )
 
-        buckets = resolve_q_buckets(envs.ATOM_DSPARK_Q_BUCKETS, full_q)
+        buckets = resolve_q_buckets(self.config.dspark.q_buckets, full_q)
         if buckets == [full_q]:
             return  # no smaller buckets configured -> Phase-1 behavior
 
@@ -2278,7 +2278,7 @@ class ModelRunner:
         spec = batch.scheduled_spec_decode_tokens
         if spec is not None and getattr(spec, "size", 0) > 0:
             batch.scheduled_spec_decode_tokens = np.ascontiguousarray(spec[:, : q - 1])
-        if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+        if self.config.dspark.debug_schedule:
             logger.info(
                 "DSpark q-bucket: bs=%d q=%d (max_ell=%d, full=%d) "
                 "-> forward %d tok/req vs %d",
@@ -2372,7 +2372,7 @@ class ModelRunner:
         #     bucket). Graph replays a fixed C grid; tail [Σ:C] is -1-batch_id
         #     padding (kernels skip it). C tracks the SUM, not bs*max_len, so a
         #     long tail seq no longer inflates the whole batch (win over q-bucket).
-        buckets = resolve_q_buckets(envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES, full_q)
+        buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
         if self.enforce_eager:
             # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
             # real len (positions/attn bound); layout is pure flat Σ.
@@ -2389,7 +2389,7 @@ class ModelRunner:
         # from prev_token_ids (anchor) + draft_token_ids, which never consults
         # scheduled_spec_decode_tokens.)
 
-        if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+        if self.config.dspark.debug_schedule:
             logger.info(
                 "DSpark ragged: bs=%d Σ(ell+1)=%d vs full=%d (save %.1f%%) "
                 "len[min=%d,max=%d] | q_eff=%d graph_cap=%d "
@@ -3106,7 +3106,7 @@ class ModelRunner:
             )
             num_bonus = self.drafter.mtp_k - num_reject_tokens[:sbs]
             last_token_offset = lens_t - num_bonus
-            if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+            if self.config.dspark.debug_schedule:
                 # Anchor index = cu_seqlens_q[1:] - offset. It must land inside
                 # each seq's own [seg_start, seg_end) segment, i.e.
                 # 1 <= offset <= len_i. offset = len_i - num_bonus, so the guard
@@ -3149,7 +3149,7 @@ class ModelRunner:
             q_actual = batch.num_spec_query_tokens
             if 1 <= q_actual < full_q:
                 last_token_offset = last_token_offset - (full_q - q_actual)
-                if envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+                if self.config.dspark.debug_schedule:
                     logger.info(
                         "DSpark draft anchor q-shrink: bs=%d q=%d full_q=%d "
                         "offset-=%d",
@@ -3323,13 +3323,15 @@ class ModelRunner:
             # RAGGED path uses its own independent graph-size set; the older
             # q-bucket path uses ATOM_DSPARK_Q_BUCKETS. Pick the right source so
             # the smaller graphs that each path replays actually get captured.
-            if envs.ATOM_DSPARK_RAGGED:
+            if self.config.dspark.ragged:
                 q_buckets = resolve_q_buckets(
-                    envs.ATOM_DSPARK_RAGGED_GRAPH_SIZES, full_q_len
+                    self.config.dspark.ragged_graph_sizes, full_q_len
                 )
                 logger.info("DSpark RAGGED CUDA-graph query sizes: %s", q_buckets)
             else:
-                q_buckets = resolve_q_buckets(envs.ATOM_DSPARK_Q_BUCKETS, full_q_len)
+                q_buckets = resolve_q_buckets(
+                    self.config.dspark.q_buckets, full_q_len
+                )
                 logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
 
         with pause_gc(), graph_capture() as capture_ctx:
@@ -3665,7 +3667,7 @@ class ModelRunner:
             return
         if not getattr(self, "graphs", None):
             return
-        if envs.ATOM_DSPARK_DISABLE_SPS_CALIB:
+        if self.config.dspark.disable_sps_calib:
             logger.info("DSpark SPS calibration disabled; using synthetic stub.")
             return
 
@@ -3681,7 +3683,7 @@ class ModelRunner:
         # DISABLE_SPS_CALIB path that runs lossless at GSM8K 0.95). Timed
         # calibration for the ragged graph is a follow-up (needs a scratch KV
         # pool + buffer save/restore around the replays).
-        if envs.ATOM_DSPARK_RAGGED:
+        if self.config.dspark.ragged:
             logger.info(
                 "DSpark SPS calibration skipped under RAGGED graph "
                 "(replay would pollute KV cache); using synthetic stub."

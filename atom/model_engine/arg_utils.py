@@ -343,6 +343,39 @@ class EngineArgs:
                 '\'{"use_index_cache": true, "index_topk_freq": 4}\''
             ),
         )
+        parser.add_argument(
+            "--dspark-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "DSpark dynamic config as a JSON dict; keys map to ATOM_DSPARK_* "
+                "env vars (applied before engine start, inherited by engine-core "
+                "subprocesses). Supported keys:\n"
+                '  - "confidence_schedule": bool, enable confidence-scheduled '
+                "verification (per-request verify length ell_r).\n"
+                '  - "ragged": bool, enable per-request ragged verify '
+                "(no batch-level q padding).\n"
+                '  - "ragged_graph_sizes": str, comma-separated per-seq CUDA-graph '
+                'query-length buckets to capture, e.g. "1,3,6" or "8".\n'
+                '  - "q_buckets": str, CUDA-graph query-length buckets for the '
+                "older batch-uniform q-bucket verify path.\n"
+                '  - "disable_sps_calib": bool, skip SPS calibration and use the '
+                "synthetic stub.\n"
+                "Example:\n"
+                """  '{"confidence_schedule": true, "ragged": true, """
+                """"ragged_graph_sizes": "8"}'"""
+            ),
+        )
+        parser.add_argument(
+            "--dspark-debug",
+            action="store_true",
+            help=(
+                "Enable DSpark scheduler diagnostics (avg verify length / "
+                "truncation rate / anchor OOB checks). Maps to "
+                "ATOM_DSPARK_DEBUG_SCHEDULE=1. Forces host syncs; keep OFF in "
+                "perf runs."
+            ),
+        )
 
         return parser
 

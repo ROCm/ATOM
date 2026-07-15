@@ -1390,9 +1390,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             sum_scheduled_tokens_padded = sum_scheduled_tokens
 
         if max_seqlen_q < full_q:
-            from atom.utils import envs as _envs
-
-            if _envs.ATOM_DSPARK_DEBUG_SCHEDULE:
+            if self.model_runner.config.dspark.debug_schedule:
                 import logging
 
                 logging.getLogger("atom").info(
@@ -2914,11 +2912,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (this graph's token grid); give each seq max_q_len real tokens (dst
         # right-aligned into the full_q-wide rect). Replay refreshes dst for the
         # real ragged lens + tail padding.
-        from atom.utils import envs as _envs
-
         drafter = getattr(self.model_runner, "drafter", None)
         if (
-            _envs.ATOM_DSPARK_RAGGED
+            self.model_runner.config.dspark.ragged
             and drafter is not None
             and getattr(drafter, "dspark_confidence_schedule", False)
         ):
