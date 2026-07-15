@@ -161,9 +161,6 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     echo "sglang ref:" && \
     git rev-parse HEAD
 
-RUN echo "========== [SGLANG-ATOM 1.5/6] Patch SGLang compatibility ==========" && \
-    "${VENV_PYTHON}" -c "from pathlib import Path; p=Path('/app/sglang/python/sglang/srt/configs/cohere2_moe.py'); old='try:\n    from huggingface_hub.dataclasses import strict\nexcept ImportError:  # older huggingface_hub\n\n    def strict(cls):  # type: ignore[misc]\n        return cls\n'; new='\ndef strict(cls):  # type: ignore[misc]\n    return cls\n'; text=p.read_text(encoding='utf-8'); p.write_text(text.replace(old, new), encoding='utf-8') if new not in text else None"
-
 RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y sgl-kernel sglang-kernel sglang || true && \
     "${VENV_PYTHON}" -m pip install --upgrade pip setuptools wheel && \

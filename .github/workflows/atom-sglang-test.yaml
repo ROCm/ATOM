@@ -429,11 +429,6 @@ jobs:
               git checkout "${GITHUB_COMMIT_SHA}" && \
               pip install -e . --no-deps && \
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          RUN if [ -f /app/sglang/python/sglang/srt/configs/cohere2_moe.py ]; then \
-                python -c "from pathlib import Path; p=Path('/app/sglang/python/sglang/srt/configs/cohere2_moe.py'); old='try:\n    from huggingface_hub.dataclasses import strict\nexcept ImportError:  # older huggingface_hub\n\n    def strict(cls):  # type: ignore[misc]\n        return cls\n'; new='\ndef strict(cls):  # type: ignore[misc]\n    return cls\n'; text=p.read_text(encoding='utf-8'); p.write_text(text.replace(old, new), encoding='utf-8') if new not in text else None"; \
-              else \
-                echo "No SGLang Cohere2Moe config found; skip compatibility patch"; \
-              fi
           RUN pip show amd-aiter atom sglang torch triton mori || true
           EOF
 
