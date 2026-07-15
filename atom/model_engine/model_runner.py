@@ -3658,8 +3658,6 @@ class ModelRunner:
         (B, steps/sec) samples into ``sps_table[B]``. No-op unless a DSpark
         drafter with confidence scheduling enabled is present.
         """
-        from atom.utils import envs
-
         drafter = getattr(self, "drafter", None)
         if drafter is None or not getattr(drafter, "use_dspark", False):
             return
