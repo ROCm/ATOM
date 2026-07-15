@@ -101,6 +101,8 @@ def init_balance_router_logits(
     n_routed_experts: int,
     topk: int,
     ep_size: int = 1,
+    dp_size: int = 1,
+    dp_rank: int = 0,
     dtype: torch.dtype = torch.bfloat16,
     max_num_tokens: int = 32768,
 ):
@@ -114,6 +116,16 @@ def init_balance_router_logits(
     # ranks stay balanced as soon as T * topk is a multiple of ep_size -- which
     # holds far sooner than the per-row rotation would (small decode batches
     # included).
+    #
+    # router_logits is replaced per-device BEFORE the MoE gather, so the axis we
+    # must interleave on is the TOKEN-SHARD axis, i.e. DP (dp_size / dp_rank),
+    # NOT EP. With DP-attention each DP group owns a distinct token slice, while
+    # TP ranks inside a DP group share the same tokens -- so devices in the same
+    # DP group must use the SAME table (same dp_rank) and only different DP groups
+    # get offset via t = dp_rank + i * dp_size. This tiles the expert ring across
+    # DP groups so the aggregated all2all load covers dp_size * n token patterns
+    # instead of n. Pure TP-attn + EP has dp_size == 1, so every device shares one
+    # table and identical tokens route identically, as required.
     device = "cuda"
     E = n_routed_experts
     if ep_size <= 1:
@@ -127,8 +139,9 @@ def init_balance_router_logits(
 
     router_logits = torch.zeros((max_num_tokens, E), dtype=dtype, device=device)
     L = E // ep_size  # experts per rank (remainder experts are left unused)
-    t = torch.arange(max_num_tokens, device=device).unsqueeze(1)  # (T, 1)
+    i = torch.arange(max_num_tokens, device=device).unsqueeze(1)  # (T, 1)
     j = torch.arange(topk, device=device).unsqueeze(0)  # (1, topk)
+    t = dp_rank + i * dp_size  # this DP group's slice of the global token axis
     p = t * topk + j  # flat position on the expert ring
     rank = p % ep_size
     slot = (p // ep_size) % L
@@ -2617,11 +2630,17 @@ class FusedMoE(torch.nn.Module):
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+        # Interleave the synthetic logits across the token-shard (DP) axis only
+        # when DP-attention actually shards tokens per DP group; otherwise every
+        # device sees the same tokens and must share one table (dp_size=1).
+        _dp_shard = self.use_ep and atom_config.enable_dp_attention
         self.balance_router_logits = (
             init_balance_router_logits(
                 self.global_num_experts,
                 top_k,
                 self.ep_size if self.use_ep else 1,
+                self.dp_size if _dp_shard else 1,
+                self.dp_rank if _dp_shard else 0,
                 torch.get_default_dtype(),
                 atom_config.max_num_batched_tokens,
             )
