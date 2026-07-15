@@ -103,22 +103,6 @@ def masked_embedding(
     return _masked_embedding_launcher(x, weight, vocab_start_idx, vocab_end_idx)
 
 
-def _replicated_embedding_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return torch.empty(
-        x.numel(),
-        weight.shape[1],
-        dtype=weight.dtype,
-        device=weight.device,
-    )
-
-
-@torch_compile_guard(gen_fake=_replicated_embedding_fake)
-def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    # Keep replicated lookup opaque to torch.compile and mask transient invalid
-    # ids (for example -1 placeholders during async spec decode) to zero.
-    return _masked_embedding_launcher(x, weight, 0, weight.shape[0])
-
-
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -200,7 +184,7 @@ class ReplicatedEmbedding(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
-        return replicated_embedding(x, self.weight)
+        return F.embedding(x, self.weight)
 
 
 class ParallelLMHead(VocabParallelEmbedding):

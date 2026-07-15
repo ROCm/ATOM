@@ -213,49 +213,6 @@ def kv_indices_generate_triton(
     return kv_indices_convert
 
 
-@triton.jit
-def mtp_prepare_decode_mla_kernel(
-    kv_indptr_ptr,
-    cu_seqlens_q_ptr,
-    sparse_kv_indptr_ptr,
-    positions_ptr,
-    context_lens_ptr,
-    bs,
-    index_topk,
-    position_stride,
-    IS_SPARSE: tl.constexpr,
-    UPDATE_POSITIONS: tl.constexpr,
-    UPDATE_CONTEXT_LENS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    offs = tl.arange(0, BLOCK)
-    mask_p1 = offs < (bs + 1)
-    mask_bs = offs < bs
-
-    kvi = tl.load(kv_indptr_ptr + offs, mask=mask_p1, other=0)
-    cuq = tl.load(cu_seqlens_q_ptr + offs, mask=mask_p1, other=0)
-    new_kvi = kvi + cuq
-
-    if IS_SPARSE:
-        kvi_next = tl.load(kv_indptr_ptr + offs + 1, mask=mask_bs, other=0)
-        cuq_next = tl.load(cu_seqlens_q_ptr + offs + 1, mask=mask_bs, other=0)
-        counts = tl.where(mask_bs, (kvi_next + cuq_next) - new_kvi, 0)
-        sparse_counts = tl.minimum(counts, index_topk)
-        csum = tl.cumsum(sparse_counts, axis=0)
-        tl.store(sparse_kv_indptr_ptr + offs + 1, csum, mask=mask_bs)
-        tl.store(sparse_kv_indptr_ptr + offs, tl.zeros_like(csum), mask=(offs == 0))
-
-    tl.store(kv_indptr_ptr + offs, new_kvi, mask=mask_p1)
-
-    if UPDATE_POSITIONS:
-        pos = tl.load(positions_ptr + offs * position_stride, mask=mask_bs, other=0)
-        tl.store(positions_ptr + offs * position_stride, pos + 1, mask=mask_bs)
-
-    if UPDATE_CONTEXT_LENS:
-        ctx = tl.load(context_lens_ptr + offs, mask=mask_bs, other=0)
-        tl.store(context_lens_ptr + offs, ctx + 1, mask=mask_bs)
-
-
 if __name__ == "__main__":
     # Example usage and test
 

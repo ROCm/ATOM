@@ -5,8 +5,6 @@ from typing import Optional, Tuple
 
 import aiter
 import torch
-import triton
-import triton.language as tl
 from aiter import (
     QuantType,
     layernorm2d_fwd,
@@ -1099,90 +1097,6 @@ class DualRMSNorm:
             q.view(-1, self.num_q_heads * self.head_dim),
             k.view(-1, self.num_kv_heads * self.head_dim),
         )
-
-
-@triton.jit
-def _fused_dual_rmsnorm_cat_kernel(
-    xe_ptr,
-    xh_ptr,
-    we_ptr,
-    wh_ptr,
-    out_ptr,
-    H,
-    stride_xe_m,
-    stride_xh_m,
-    stride_out_m,
-    eps,
-    BLOCK_H: tl.constexpr,
-):
-    row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_H)
-    mask = cols < H
-
-    xe = tl.load(xe_ptr + row * stride_xe_m + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    we = tl.load(we_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    rstd_e = tl.rsqrt(tl.sum(xe * xe, axis=-1) / H + eps)
-    out_e = (xe * rstd_e * we).to(out_ptr.dtype.element_ty)
-    tl.store(out_ptr + row * stride_out_m + cols, out_e, mask=mask)
-
-    xh = tl.load(xh_ptr + row * stride_xh_m + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    wh = tl.load(wh_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    rstd_h = tl.rsqrt(tl.sum(xh * xh, axis=-1) / H + eps)
-    out_h = (xh * rstd_h * wh).to(out_ptr.dtype.element_ty)
-    tl.store(out_ptr + row * stride_out_m + H + cols, out_h, mask=mask)
-
-
-def _fused_dual_rmsnorm_cat_fake(
-    xe: torch.Tensor,
-    we: torch.Tensor,
-    xh: torch.Tensor,
-    wh: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    M, H = xe.shape
-    return torch.empty((M, 2 * H), dtype=xe.dtype, device=xe.device)
-
-
-@torch_compile_guard(gen_fake=_fused_dual_rmsnorm_cat_fake)
-def fused_dual_rmsnorm_cat(
-    xe: torch.Tensor,
-    we: torch.Tensor,
-    xh: torch.Tensor,
-    wh: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    """Compute cat([rmsnorm(xe, we), rmsnorm(xh, wh)], dim=-1)."""
-    assert xe.shape == xh.shape, f"shape mismatch {xe.shape} vs {xh.shape}"
-    assert xe.dim() == 2, f"expected 2-D inputs, got {xe.dim()}-D"
-    xe = xe.contiguous()
-    xh = xh.contiguous()
-    M, H = xe.shape
-    out = torch.empty((M, 2 * H), dtype=xe.dtype, device=xe.device)
-    if M == 0:
-        return out
-
-    block_h = triton.next_power_of_2(H)
-    num_warps = 8 if block_h >= 4096 else 4
-    _fused_dual_rmsnorm_cat_kernel[(M,)](
-        xe,
-        xh,
-        we,
-        wh,
-        out,
-        H,
-        xe.stride(0),
-        xh.stride(0),
-        out.stride(0),
-        eps,
-        BLOCK_H=block_h,
-        num_warps=num_warps,
-        num_stages=2,
-    )
-    return out
 
 
 @torch_compile_guard()

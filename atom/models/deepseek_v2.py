@@ -60,11 +60,7 @@ from atom.model_ops.attention_mla import (
     triton_gather_kv_indices_sparse,
 )
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.embed_head import (
-    ParallelLMHead,
-    ReplicatedEmbedding,
-    VocabParallelEmbedding,
-)
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -2402,16 +2398,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-def use_replicated_vocab_embed(config: PretrainedConfig) -> bool:
-    if not envs.ATOM_REPLICATE_VOCAB_EMBED:
-        return False
-    if getattr(config, "tie_word_embeddings", False):
-        return False
-    return getattr(config, "model_type", None) == "glm_moe_dsa" or bool(
-        getattr(config, "index_share_for_mtp_iteration", False)
-    )
-
-
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
     def __init__(
@@ -2432,20 +2418,10 @@ class DeepseekV2Model(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
 
         if get_pp_group().is_first_rank:
-            if use_replicated_vocab_embed(config):
-                logger.info(
-                    "Using replicated vocab embedding for %s",
-                    getattr(config, "model_type", None),
-                )
-                self.embed_tokens = ReplicatedEmbedding(
-                    config.vocab_size,
-                    config.hidden_size,
-                )
-            else:
-                self.embed_tokens = VocabParallelEmbedding(
-                    config.vocab_size,
-                    config.hidden_size,
-                )
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
         else:
             self.embed_tokens = PPMissingLayer()
 

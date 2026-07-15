@@ -324,18 +324,11 @@ class EagleProposer:
             self.model.share_with_target(target_base, loaded)
             return
 
-        # Share embed_tokens with the target model. Match logical vocab/hidden
-        # dim so replicated and sharded embedding modules can still share when
-        # they represent the same vocabulary.
-        draft_embed = self.model.model.embed_tokens
-        target_embed = target_base.model.embed_tokens
-        draft_vocab = getattr(draft_embed, "num_embeddings", None)
-        target_vocab = getattr(target_embed, "num_embeddings", None)
+        # Share embed_tokens with the target model
         if (
             get_pp_group().world_size == 1
-            and draft_vocab is not None
-            and draft_vocab == target_vocab
-            and draft_embed.weight.shape[1] == target_embed.weight.shape[1]
+            and self.model.model.embed_tokens.weight.shape
+            == target_base.model.embed_tokens.weight.shape
         ):
             logger.info(
                 "Assuming the EAGLE head shares the same vocab embedding"
