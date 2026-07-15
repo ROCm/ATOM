@@ -14,7 +14,12 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import (
+    interleave_gate_up_rows,
+    moe_shuffle_scale,
+    moe_shuffle_weight,
+    shuffle_weight,
+)
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -1022,19 +1027,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_swizzle_layout = w2_swizzle_layout
             return
 
-        # shuffle weight
-        layer.w13_weight.data = shuffle_weight(
+        # shuffle weight (arch-aware: gfx1250 does the GUGU row interleave +
+        # WMMA tile shuffle internally, other archs use the lane-level path)
+        layer.w13_weight.data = moe_shuffle_weight(
             layer.w13_weight,
+            experts_cnt=self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=True,
         )
-        layer.w2_weight.data = shuffle_weight(
+        layer.w2_weight.data = moe_shuffle_weight(
             layer.w2_weight,
+            experts_cnt=self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=False,
         )
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
+
+        # GUGU interleaves stage1 output rows; keep bias in the same layout.
+        if self.is_guinterleave and layer.w13_bias is not None:
+            layer.w13_bias.data = interleave_gate_up_rows(layer.w13_bias.data)
 
         # shuffle scale
         w13_scale_2d = layer.w13_weight_scale.reshape(
@@ -1962,13 +1974,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # aiter's MXFP8 MoE kernels consume the same gate/up interleaved
             # layout used by their 1x32 shuffle helpers. Keep this branch
             # isolated so the existing 1x128 FP8 path still uses shuffle_weights.
-            layer.w13_weight.data = shuffle_weight(
+            layer.w13_weight.data = moe_shuffle_weight(
                 layer.w13_weight,
+                experts_cnt=self.num_experts,
                 is_guinterleave=True,
                 gate_up=True,
             )
-            layer.w2_weight.data = shuffle_weight(
+            layer.w2_weight.data = moe_shuffle_weight(
                 layer.w2_weight,
+                experts_cnt=self.num_experts,
                 is_guinterleave=True,
                 gate_up=False,
             )
