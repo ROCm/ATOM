@@ -37,8 +37,6 @@ class LLMEngine:
     def __init__(self, model, tokenizer=None, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        data_parallel_size = kwargs.get("data_parallel_size", 1)
-        data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
         self.tokenizer = tokenizer or _load_tokenizer(
@@ -50,11 +48,30 @@ class LLMEngine:
         # separate eos_token_id from stop_token_ids
         stop_token_ids.discard(config.eos_token_id)
         config.stop_token_ids = list(stop_token_ids)
-        # Set data parallel size in config
-        config.parallel_config.data_parallel_size = data_parallel_size
-        if data_parallel_master_port is not None:
-            config.parallel_config.data_parallel_master_port = data_parallel_master_port
-        self.data_parallel_size = data_parallel_size
+        # Backward compatibility for callers that still pass DP topology as
+        # loose LLMEngine kwargs instead of a ParallelConfig.
+        if "parallel_config" not in config_kwargs:
+            if "data_parallel_size" in kwargs:
+                config.parallel_config.data_parallel_size = kwargs["data_parallel_size"]
+            if "data_parallel_size_local" in kwargs:
+                config.parallel_config.data_parallel_size_local = kwargs[
+                    "data_parallel_size_local"
+                ]
+            if "data_parallel_rank" in kwargs:
+                config.parallel_config.data_parallel_rank = kwargs["data_parallel_rank"]
+            if "data_parallel_rank_local" in kwargs:
+                config.parallel_config.data_parallel_rank_local = kwargs[
+                    "data_parallel_rank_local"
+                ]
+            if "data_parallel_master_ip" in kwargs:
+                config.parallel_config.data_parallel_master_ip = kwargs[
+                    "data_parallel_master_ip"
+                ]
+            if "data_parallel_master_port" in kwargs:
+                config.parallel_config.data_parallel_master_port = kwargs[
+                    "data_parallel_master_port"
+                ]
+        self.data_parallel_size = config.parallel_config.data_parallel_size
         # PCP and DP-attention are not yet compatible: PCP stripe-splits
         # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
         # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on

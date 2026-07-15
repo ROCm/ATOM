@@ -749,8 +749,8 @@ class ParallelConfig:
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
-    data_parallel_size_local: int = 1
-    """Number of local data parallel groups."""
+    data_parallel_size_local: Optional[int] = None
+    """Number of local data parallel groups. Defaults to the global size."""
     data_parallel_rank: int = 0
     """Rank of the data parallel group."""
     data_parallel_rank_local: Optional[int] = None
@@ -764,6 +764,13 @@ class ParallelConfig:
     data_parallel_base_port: int = get_open_port()
 
     data_parallel_master_ip: str = "127.0.0.1"
+
+    @property
+    def is_multinode_dp(self) -> bool:
+        return (
+            self.data_parallel_size_local < self.data_parallel_size
+            or self.data_parallel_rank > 0
+        )
 
     @property
     def world_size_across_dp(self) -> int:
@@ -825,6 +832,7 @@ class ParallelConfig:
         """
         factors: list[Any] = []
         factors.append(self.data_parallel_size)
+        factors.append(self.data_parallel_size_local)
         factors.append(self.data_parallel_rank)
         factors.append(self.data_parallel_rank_local)
         factors.append(self.data_parallel_master_ip)
@@ -836,12 +844,33 @@ class ParallelConfig:
         # This allows programmatic configuration to take precedence.
         if envs.is_set("ATOM_DP_SIZE"):
             self.data_parallel_size = envs.ATOM_DP_SIZE
+        if envs.is_set("ATOM_DP_SIZE_LOCAL"):
+            self.data_parallel_size_local = envs.ATOM_DP_SIZE_LOCAL
         if envs.is_set("ATOM_DP_RANK"):
             self.data_parallel_rank = envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
-        # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
-        # self.data_parallel_master_port = get_open_port()
+        if envs.is_set("ATOM_DP_MASTER_IP"):
+            self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
+        if envs.is_set("ATOM_DP_MASTER_PORT"):
+            self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
+
+        if self.data_parallel_size_local is None:
+            self.data_parallel_size_local = self.data_parallel_size
+        if self.data_parallel_size < 1:
+            raise ValueError("data_parallel_size must be at least 1")
+        if self.data_parallel_size_local < 1:
+            raise ValueError("data_parallel_size_local must be at least 1")
+        if self.data_parallel_rank < 0:
+            raise ValueError("data_parallel_rank must be non-negative")
+        if (
+            self.data_parallel_rank + self.data_parallel_size_local
+            > self.data_parallel_size
+        ):
+            raise ValueError(
+                "data_parallel_rank + data_parallel_size_local must not exceed "
+                "data_parallel_size"
+            )
 
 
 def _normalize_moe_config_fields(

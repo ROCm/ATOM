@@ -8,7 +8,12 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
+from atom.config import (
+    CompilationConfig,
+    CUDAGraphMode,
+    ParallelConfig,
+    SpeculativeConfig,
+)
 
 logger = logging.getLogger("atom")
 
@@ -32,6 +37,12 @@ class EngineArgs:
     tensor_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
+    data_parallel_size_local: Optional[int] = None
+    data_parallel_rank: int = 0
+    data_parallel_rank_local: Optional[int] = None
+    data_parallel_master_ip: str = "127.0.0.1"
+    data_parallel_master_port: int = 29500
+    data_parallel_base_port: Optional[int] = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
@@ -94,7 +105,49 @@ class EngineArgs:
             "-dp",
             type=int,
             default=1,
-            help="Data parallel size.",
+            help="Global data parallel size.",
+        )
+        parser.add_argument(
+            "--data-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of data-parallel ranks to spawn on this node. "
+                "Defaults to --data-parallel-size for single-node launches."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-rank",
+            type=int,
+            default=0,
+            help="First global data-parallel rank owned by this node.",
+        )
+        parser.add_argument(
+            "--data-parallel-rank-local",
+            type=int,
+            default=None,
+            help="Local data-parallel rank for a worker; normally assigned internally.",
+        )
+        parser.add_argument(
+            "--data-parallel-master-ip",
+            type=str,
+            default="127.0.0.1",
+            help="Rendezvous IP for data-parallel process groups.",
+        )
+        parser.add_argument(
+            "--data-parallel-master-port",
+            type=int,
+            default=29500,
+            help="Rendezvous port for data-parallel process groups.",
+        )
+        parser.add_argument(
+            "--data-parallel-base-port",
+            type=int,
+            default=None,
+            help=(
+                "Rendezvous port for model-runner distributed initialization. "
+                "Set this explicitly for multi-node launches."
+            ),
         )
         parser.add_argument(
             "--enforce-eager",
@@ -357,6 +410,29 @@ class EngineArgs:
             kwargs.pop("num_speculative_tokens")
             kwargs.pop("draft_model")
             kwargs["speculative_config"] = None
+
+        data_parallel_size = kwargs.pop("data_parallel_size")
+        data_parallel_size_local = kwargs.pop("data_parallel_size_local")
+        data_parallel_rank = kwargs.pop("data_parallel_rank")
+        data_parallel_rank_local = kwargs.pop("data_parallel_rank_local")
+        data_parallel_master_ip = kwargs.pop("data_parallel_master_ip")
+        data_parallel_master_port = kwargs.pop("data_parallel_master_port")
+        data_parallel_base_port = kwargs.pop("data_parallel_base_port")
+        parallel_config_kwargs = {
+            "data_parallel_size": data_parallel_size,
+            "data_parallel_size_local": (
+                data_parallel_size_local
+                if data_parallel_size_local is not None
+                else data_parallel_size
+            ),
+            "data_parallel_rank": data_parallel_rank,
+            "data_parallel_rank_local": data_parallel_rank_local,
+            "data_parallel_master_ip": data_parallel_master_ip,
+            "data_parallel_master_port": data_parallel_master_port,
+        }
+        if data_parallel_base_port is not None:
+            parallel_config_kwargs["data_parallel_base_port"] = data_parallel_base_port
+        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
         tbo_mode = kwargs.pop("enable_tbo", None)
