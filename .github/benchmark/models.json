@@ -15,25 +15,6 @@
   ],
   "models": [
     {
-      "display": "DeepSeek-R1-0528",
-      "path": "deepseek-ai/DeepSeek-R1-0528",
-      "prefix": "deepseek-r1-0528",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 8, "kv_cache_dtype": "fp8" },
-      "variants": [
-        { "label": "", "suffix": "", "conc_max": 256 },
-        {
-          "label": "MTP3",
-          "suffix": "-mtp3",
-          "extra_args": "--method mtp --num-speculative-tokens 3",
-          "bench_args": "--use-chat-template",
-          "conc_min": 4,
-          "conc_max": 256
-        }
-      ]
-    },
-    {
       "display": "DeepSeek-V4-Pro",
       "path": "deepseek-ai/DeepSeek-V4-Pro",
       "prefix": "deepseek-v4-pro",
