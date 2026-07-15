@@ -8,27 +8,34 @@ from collections import deque
 from unittest.mock import MagicMock, patch
 
 import msgspec
+import pytest
 
-from atom.kv_transfer.disaggregation.moriio import moriio_connector as mc
-from atom.kv_transfer.disaggregation.moriio.moriio_common import (
-    MoRIIOConstants,
-    MoRIIOWriteDone,
-    MoRIIOWriteRegion,
-    MoRIIOWriteRequest,
-    TransferMode,
-    get_port_offset,
-)
-from atom.kv_transfer.disaggregation.moriio.moriio_connector import (
-    MoRIIOConnector,
-    MoRIIOConnectorScheduler,
-)
-from atom.kv_transfer.disaggregation.types import (
-    ConnectorMetadata,
-    KVConnectorOutput,
-    KVTransferRegion,
-    ReqMeta,
-)
-from atom.model_engine.sequence import Sequence
+# The moriio connector imports disaggregation.utils, which hard-imports triton
+# (for the GPU fence kernel). The non-GPU CI image has no triton, so skip the
+# whole module there — matching the other triton-dependent tests.
+try:
+    from atom.kv_transfer.disaggregation.moriio import moriio_connector as mc
+    from atom.kv_transfer.disaggregation.moriio.moriio_common import (
+        MoRIIOConstants,
+        MoRIIOWriteDone,
+        MoRIIOWriteRegion,
+        MoRIIOWriteRequest,
+        TransferMode,
+        get_port_offset,
+    )
+    from atom.kv_transfer.disaggregation.moriio.moriio_connector import (
+        MoRIIOConnector,
+        MoRIIOConnectorScheduler,
+    )
+    from atom.kv_transfer.disaggregation.types import (
+        ConnectorMetadata,
+        KVConnectorOutput,
+        KVTransferRegion,
+        ReqMeta,
+    )
+    from atom.model_engine.sequence import Sequence
+except ImportError as exc:  # pragma: no cover - depends on CI image
+    pytest.skip(f"requires full atom import env: {exc}", allow_module_level=True)
 
 
 class _FakeWrapper:
@@ -68,6 +75,7 @@ def _bare_connector() -> MoRIIOConnector:
     conn._inflight_write_transfers = set()
     conn._completed_prefills_cv = threading.Condition(threading.Lock())
     conn.transfer_mode = TransferMode.WRITE_PUSH
+    conn._moriio_use_fabric = False
     conn.is_producer = False
     conn._write_recv_timeout_s = 60.0
     conn._write_prefill_orphan_timeout_s = 60.0
