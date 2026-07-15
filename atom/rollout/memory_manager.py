@@ -214,10 +214,6 @@ class MemoryManagerMixin:
                 f"{self.label}: CUDA graph recapture failed: {e}",
                 exc_info=True,
             )
-            # Fall back to eager mode rather than crashing
-            self.enforce_eager = True
-            self.graphs = {}
-            self.graph_pool = None
             if hasattr(self, "_graphs_backup_keys"):
                 del self._graphs_backup_keys
-            logger.warning(f"{self.label}: Falling back to enforce_eager=True")
+            raise
