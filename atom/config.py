@@ -1069,6 +1069,12 @@ class Config:
     # per-DP MoE layout and leave it False. Set by the frontend in
     # atom/plugin/config.py, not queried via is_vllm() at the call site.
     moe_ep_flatten_tp_across_dp: bool = False
+    # vLLM plugin: reuse the TP group as the Context-Parallel group (true
+    # sequence parallelism over tokens). Set by the frontend from
+    # ATOM_VLLM_ATTN_CP in atom/plugin/config.py; folded into compute_hash
+    # because it changes the compiled graph (full-head replicated attention,
+    # MoE all-gather/reduce-scatter, disabled fused-allreduce norms).
+    vllm_attn_cp: bool = False
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
@@ -1275,6 +1281,11 @@ class Config:
         # runtime — the same stale-artifact hazard documented for the vocab-embed
         # flag below.
         factors.append(self.prefill_context_parallel_size)
+        # Reuse-TP-as-CP (plugin) rebuilds attention as full-head replicated,
+        # swaps the MoE all-reduce for all-gather+reduce-scatter, and drops the
+        # fused-allreduce in the norms -- a different graph than the cp-off run
+        # over the same model+source, so it must key the compiled artifact.
+        factors.append(self.vllm_attn_cp)
         factors.append(self.enable_dp_attention)
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(

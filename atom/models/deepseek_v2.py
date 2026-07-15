@@ -39,7 +39,9 @@ from aiter import (
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -95,7 +97,10 @@ from atom.distributed.pcp_utils import (
     pcp_is_enabled,
     pcp_pad_dense,
     pcp_pad_len,
+    pcp_reduce_scatter_dim0,
     pcp_round_robin_split,
+    pcp_tp_all_gather_dim0,
+    plugin_attn_cp_enabled,
 )
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -169,17 +174,66 @@ def _pcp_active() -> bool:
     """
     if not pcp_is_enabled():
         return False
+    if plugin_attn_cp_enabled():
+        # vLLM plugin reuse-TP-as-CP: ATOM's own forward context is never
+        # populated in plugin mode (the plugin drives vLLM's forward context),
+        # so the native branch below would always read context=None. Defer to
+        # the builder-stamped decision instead.
+        return _plugin_pcp_active()
     ctx = get_forward_context()
     context = getattr(ctx, "context", None)
     attn_metadata = getattr(ctx, "attn_metadata", None)
     if context is None or attn_metadata is None:
         return False
-    if not bool(context.is_prefill) or bool(getattr(context, "is_dummy_run", False)):
+    if bool(getattr(context, "is_dummy_run", False)):
+        return False
+    # Native PCP reshapes only sparse *prefill* (decode stays on the full cached
+    # KV). The plugin reuse-TP-as-CP path returned above via _plugin_pcp_active();
+    # it likewise splits prefill-only (see _plugin_cp_should_split), so this
+    # prefill gate is the shared contract. The `max_seqlen_k > index_topk` check
+    # below still excludes the short dense-MHA fallback (not CP-wired).
+    if not bool(context.is_prefill):
         return False
     index_topk = getattr(get_current_atom_config().hf_config, "index_topk", None)
     if index_topk is None:
         return False
     return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(index_topk)
+
+
+def _plugin_pcp_active() -> bool:
+    """Plugin reuse-TP-as-CP round-robin split decision.
+
+    In vLLM plugin mode ATOM's own forward context is never populated, so the
+    native ``_pcp_active`` gate (which reads ``ctx.context`` / ``ctx.attn_metadata``)
+    can't be used. The plugin sparse-MLA metadata builders are the single source
+    of truth: they evaluate the SAME batch-global gate once per forward (real
+    build, ``max_seq_len > index_topk``) and stamp ``pcp_split`` on the metadata
+    they emit. Every model-side PCP call site (entry split, indexer full-KV
+    all-gather, FFN all-gather/reduce-scatter, exit gather) reads that stamp here
+    so they stay in lock-step with the metadata reindex within a forward.
+
+    Reading is via vLLM's forward context because that is where the built
+    metadata lives in plugin mode. The metadata is a dict keyed by layer name;
+    the split decision is batch-global, so any stamped sparse layer settles it.
+    """
+    try:
+        from vllm.forward_context import (
+            get_forward_context as _get_vllm_forward_context,
+            is_forward_context_available as _vllm_forward_context_available,
+        )
+    except Exception:
+        return False
+    if not _vllm_forward_context_available():
+        return False
+    md = _get_vllm_forward_context().attn_metadata
+    if md is None:
+        return False
+    if isinstance(md, dict):
+        for layer_md in md.values():
+            if bool(getattr(layer_md, "pcp_split", False)):
+                return True
+        return False
+    return bool(getattr(md, "pcp_split", False))
 
 
 def _install_increment_version_pcp_shim() -> None:
@@ -1687,7 +1741,6 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         super().process_weights_after_loading()
 
 
-@IndexerDecoratorForPluginMode
 def _indexer_with_output_fake(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
@@ -1767,6 +1820,7 @@ direct_register_custom_op(
 )
 
 
+@IndexerDecoratorForPluginMode
 class Indexer(nn.Module):
     def __init__(
         self,
@@ -2022,7 +2076,15 @@ class DeepseekV2MLAAttention(nn.Module):
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
+        # RFC ROCm/ATOM#196: when the vLLM plugin reuses the TP group as the CP
+        # group, attention is token-parallel with *full-head replicated* weights
+        # (each rank runs ALL heads on its 1/cp query shard against the full,
+        # gathered KV), so heads are NOT sharded across the group. The q/kv/o
+        # projections then load the full tensor and o_proj skips its all-reduce.
+        self._attn_cp_full_head = plugin_attn_cp_enabled() and tp_size > 1
+        self.num_local_heads = (
+            num_heads if self._attn_cp_full_head else num_heads // tp_size
+        )
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -2068,6 +2130,11 @@ class DeepseekV2MLAAttention(nn.Module):
             else:
                 base_quant_config = quant_config
 
+        # Head-parallel projections (q_b/q/kv_b) shard the head dim across TP by
+        # default; under reuse-TP-as-CP they become replicated (full heads).
+        HeadColParallel = (
+            ReplicatedLinear if self._attn_cp_full_head else ColumnParallelLinear
+        )
         if self.q_lora_rank is not None:
             # self.q_a_proj = ReplicatedLinear(self.hidden_size,
             #                                  self.q_lora_rank,
@@ -2088,7 +2155,7 @@ class DeepseekV2MLAAttention(nn.Module):
             # honors this flag in LinearBase.process_weights_after_loading.
             self.fused_qkv_a_proj.needs_preshuffled_weight = True
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
+            self.q_b_proj = HeadColParallel(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -2097,7 +2164,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype=source_quant_dtype,
             )
         else:
-            self.q_proj = ColumnParallelLinear(
+            self.q_proj = HeadColParallel(
                 self.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -2115,7 +2182,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype=source_quant_dtype,
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
+        self.kv_b_proj = HeadColParallel(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
@@ -2127,15 +2194,28 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype if is_rocm_aiter_fp4bmm_enabled() else None
             ),
         )
-        self.o_proj = RowParallelLinear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-            quant_config=base_quant_config,
-            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
-            prefix=f"{prefix}.o_proj",
-            source_quant_dtype=None,
-        )
+        if self._attn_cp_full_head:
+            # Full-head replicated output projection: each rank already holds the
+            # complete [num_heads * v_head_dim] attention output for its query
+            # shard, so o_proj is a local GEMM with no cross-rank all-reduce.
+            self.o_proj = ReplicatedLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=base_quant_config,
+                prefix=f"{prefix}.o_proj",
+                source_quant_dtype=None,
+            )
+        else:
+            self.o_proj = RowParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=base_quant_config,
+                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+                prefix=f"{prefix}.o_proj",
+                source_quant_dtype=None,
+            )
 
         rope_params = config.rope_parameters
         rope_theta = rope_params.get("rope_theta") or 10000
@@ -2408,6 +2488,82 @@ class DeepseekV2MLAAttention(nn.Module):
         )
 
 
+# Reuse-TP-as-CP FFN registry: layer_name -> DeepseekV2DecoderLayer. The opaque
+# `cp_ffn` custom op below recovers the weight-bearing layer from here (custom
+# ops can only take tensors / str / scalars, not module refs), mirroring how
+# `indexer_with_output` recovers its module from static_forward_context.
+_CP_FFN_MODULES: dict[str, nn.Module] = {}
+
+
+def cp_ffn(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
+    """Dynamo-opaque wrapper around the reuse-TP-as-CP FFN collective.
+
+    SHAPE-PRESERVING for BOTH runtime branches (input [N] -> output [N]), so it
+    is a clean leaf op for torch.compile:
+      * split   ([T/cp] shard): all-gather -> mlp -> reduce-scatter -> [T/cp]
+      * unsplit ([T] full):     mlp -> all-reduce -> [T]
+    Opacity — like `indexer_with_output` — is what defeats the bake: Dynamo never
+    traces the body, so the runtime `_pcp_active()` branch inside is evaluated
+    LIVE every forward instead of being frozen to its dummy-warmup value. Being a
+    leaf (not a graph *break*) it does not fragment the graph, so a pure-decode
+    batch (unsplit, no split anywhere) still captures as one FULL cudagraph.
+    Prefill is not cudagraph-captured, so the eager collectives inside run safely.
+    """
+    self = _CP_FFN_MODULES[layer_name]
+    return self._cp_ffn_impl(hidden_states)
+
+
+def _cp_ffn_fake(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="deepseek_v2_cp_ffn",
+    op_func=cp_ffn,
+    mutates_args=[],
+    fake_impl=_cp_ffn_fake,
+)
+
+
+# Reuse-TP-as-CP embedding registry: model_name -> DeepseekV2Model.
+_CP_EMBED_MODULES: dict[str, nn.Module] = {}
+
+
+def cp_embed(input_ids: torch.Tensor, model_name: str) -> torch.Tensor:
+    """Dynamo-opaque reuse-TP-as-CP token embedding.
+
+    LEADING-DIM-PRESERVING (input_ids [N] -> embeddings [N, H]), so the outer
+    compiled graph sees a deterministic shape and the runtime `_pcp_active()`
+    branch inside never bakes:
+      * split   ([T/cp] owned ids): all-gather the owned ids back to the full
+        replicated token set, run the vocab-parallel embedding there (so its
+        cross-rank all-reduce combines the SAME tokens on every rank), then
+        round-robin re-split to this rank's [T/cp] embeddings.
+      * unsplit ([T] ids, decode/mixed/dummy): plain vocab-parallel embedding.
+    Passing input_ids (not a pre-embedded inputs_embeds) keeps the arg pattern
+    identical to the non-CP path, so decode still embeds from its input_ids
+    cudagraph buffer and the single shared compiled graph serves both.
+    """
+    self = _CP_EMBED_MODULES[model_name]
+    return self._cp_embed_impl(input_ids)
+
+
+def _cp_embed_fake(input_ids: torch.Tensor, model_name: str) -> torch.Tensor:
+    self = _CP_EMBED_MODULES[model_name]
+    w = self.embed_tokens.weight
+    return torch.empty(
+        (input_ids.shape[0], w.shape[1]), dtype=w.dtype, device=input_ids.device
+    )
+
+
+direct_register_custom_op(
+    op_name="deepseek_v2_cp_embed",
+    op_func=cp_embed,
+    mutates_args=[],
+    fake_impl=_cp_embed_fake,
+)
+
+
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2494,6 +2650,20 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self.input_norm_quant_type = attn_input_quant_config.quant_type.value
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
+        # RFC ROCm/ATOM#196 (reuse-TP-as-CP): the residual stream is sequence
+        # parallel [T/cp]. Attention is full-head replicated (o_proj has no
+        # cross-rank partial) and the FFN is wrapped in all-gather/reduce-scatter
+        # at this layer (see forward), so NOTHING produces a plain TP partial to
+        # fold into a fused all-reduce norm. Disable AR fusion so the norms run
+        # as ordinary (local) RMSNorms on the [T/cp] shard.
+        self._attn_cp = (
+            plugin_attn_cp_enabled() and get_tensor_model_parallel_world_size() > 1
+        )
+        self._cp_ffn_layer_name = prefix
+        if self._attn_cp:
+            self.fuse_ar_input_norm = False
+            # Register for the opaque `cp_ffn` custom op (see module top).
+            _CP_FFN_MODULES[prefix] = self
         # DSA models (e.g., GLM-5/DeepSeek-V3.2): the indexer's wk/weights_proj GEMMs
         # run in BF16 and consume the same normed activation, so the RMSNorm(+quant)
         # must also emit the pre-quant bf16 mirror. Gate the mirror on this layer
@@ -2540,7 +2710,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
-                reduce_results=not self.fuse_ar_input_norm,
+                # Under CP the FFN must emit a TP *partial* so this layer's
+                # reduce-scatter can sum-and-scatter it back to [T/cp].
+                reduce_results=(not self.fuse_ar_input_norm) and not self._attn_cp,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
             )
@@ -2550,7 +2722,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=not self.fuse_ar_input_norm,
+                reduce_results=(not self.fuse_ar_input_norm) and not self._attn_cp,
                 prefix=f"{prefix}.mlp",
             )
         # Fuse activation quant into the AR+RMSNorm when the attention input
@@ -2583,9 +2755,40 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and not self._attn_cp,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
+
+    def _cp_ffn_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Reuse-TP-as-CP FFN reduce, run inside the opaque `cp_ffn` op.
+
+        The FFN emits a TP *partial* here (mlp built with reduce_results=False
+        under CP); how it is reduced depends on whether THIS forward was
+        round-robin split at model entry (`_pcp_active()` — evaluated LIVE here
+        because the enclosing op is Dynamo-opaque):
+          * split ([T/cp] shard): all-gather to the full [T] token set so the
+            TP-sharded experts see every token, run the FFN, then reduce-scatter
+            the partial back to this rank's [T/cp] shard. all-gather is rank-major
+            and reduce-scatter is its exact inverse, so each rank recovers its own
+            round-robin shard, fully reduced (the FFN is per-token).
+          * not split (decode / short-dense / mixed / dummy stay on the full
+            replicated [T] tokens): plain all-reduce, exactly like the non-CP path.
+        Output shape always equals input shape (net shape-preserving), which is
+        what lets the wrapper op be a clean leaf for torch.compile.
+        """
+        if _pcp_active():
+            # Capture-safe all-gather + reduce-scatter over the DEDICATED CP group
+            # (its own ca_comm / graph-buffer slot allocator), so the split-decode
+            # MoE round-trip is legal AND correct inside a full CUDA graph. Both
+            # legs share the CP slot allocator (isolated from TP all-reduce),
+            # which the registered custom all-gather needs to replay correctly.
+            hidden_states = pcp_tp_all_gather_dim0(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = pcp_reduce_scatter_dim0(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states
 
     def forward(
         self,
@@ -2686,7 +2889,15 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        if self._attn_cp:
+            # Reuse-TP-as-CP FFN boundary, routed through a Dynamo-opaque op so
+            # the runtime split branch (see `cp_ffn` / `_cp_ffn_impl`) is never
+            # baked to the dummy-warmup value under torch.compile.
+            hidden_states = torch.ops.aiter.deepseek_v2_cp_ffn(
+                hidden_states, self._cp_ffn_layer_name
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -2726,6 +2937,18 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Reuse-TP-as-CP: route embedding through the opaque `cp_embed` op so a
+        # round-robin-split rank still embeds its shard correctly (all-gather ->
+        # full vocab-parallel embed -> re-split). Process-constant gate.
+        self._cp_embed = (
+            plugin_attn_cp_enabled()
+            and get_tensor_model_parallel_world_size() > 1
+            and get_pp_group().is_first_rank
+        )
+        self._cp_embed_name = prefix or "deepseek_v2_model"
+        if self._cp_embed:
+            _CP_EMBED_MODULES[self._cp_embed_name] = self
+
         self.alt_stream: Optional[torch.cuda.Stream] = None
         if getattr(config, "n_shared_experts", None) is not None:
             self.alt_stream = torch.cuda.Stream()
@@ -2761,7 +2984,22 @@ class DeepseekV2Model(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+    def _cp_embed_impl(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Reuse-TP-as-CP embedding, run inside the opaque `cp_embed` op."""
+        if _pcp_active():
+            ws = get_pcp_world_size()
+            n_owned = input_ids.shape[0]
+            # Owned [T/cp] ids -> full replicated [T_pad] (exact inverse of the
+            # model-entry round-robin split), embed there so the vocab-parallel
+            # all-reduce sees the same tokens on every rank, then re-split.
+            full_ids = pcp_allgather_rerange(input_ids, ws)
+            full_emb = self.embed_tokens(full_ids)
+            return pcp_round_robin_split(full_emb, ws)[:n_owned]
+        return self.embed_tokens(input_ids)
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self._cp_embed:
+            return torch.ops.aiter.deepseek_v2_cp_embed(input_ids, self._cp_embed_name)
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -2897,18 +3135,31 @@ class DeepseekV2ForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         # ---- Prefill Context Parallel (PCP) query split ------------------
-        # During prefill with pcp_size > 1 the token sequence is round-robin
-        # split so each PCP rank runs the whole model (embed / norm / q-proj /
-        # MoE) on only 1/pcp of the tokens. The attention modules re-materialise
-        # the full KV internally (see DeepseekV2MLAAttention / Indexer /
-        # MLAAttention), so decode and the cache layout are untouched. When PCP
-        # is inactive (`pcp=1` or decode) this whole block is skipped and the
-        # forward is identical to the original path.
+        # With pcp_size > 1 the token sequence is round-robin split so each PCP
+        # rank runs the whole model (embed / norm / q-proj / MoE) on only 1/pcp
+        # of the tokens. The attention modules re-materialise the full KV
+        # internally (see DeepseekV2MLAAttention / Indexer / MLAAttention), so the
+        # cache layout is untouched. Under ATOM_VLLM_ATTN_CP this fires for EVERY
+        # batch type -- prefill, pure plain-decode, and mixed -- via one shared
+        # whole-batch round-robin partition (the metadata builders stamp pcp_split,
+        # which _pcp_active() reads). It is skipped (identical to the original path)
+        # only when PCP is inactive (`pcp=1`) or the batch is left unstamped (a
+        # short-context dense-fallback prefill or a spec/MTP verify batch).
         pcp = _pcp_active()
         n_global = positions.shape[0]
         if pcp:
             pcp_ws = get_pcp_world_size()
             n_pad = pcp_pad_len(n_global, pcp_ws) - n_global
+            # Round-robin split the RAW inputs (input_ids / positions), keeping the
+            # arg pattern identical to the non-split (decode) forward: input_ids is
+            # still input_ids, inputs_embeds still None. This is what lets the
+            # single compiled DeepseekV2Model graph serve both prefill (split) and
+            # decode (unsplit) — it just processes N tokens either way. The
+            # VocabParallelEmbedding all-reduce is made correct for this rank's
+            # DIFFERENT token shard by the Dynamo-opaque `cp_embed` op inside the
+            # model (all-gather owned ids -> embed the full replicated set ->
+            # re-split), never by embedding here (which would break decode's
+            # input_ids cudagraph and the shared-graph arg contract).
             positions = pcp_round_robin_split(pcp_pad_dense(positions, n_pad), pcp_ws)
             if input_ids is not None:
                 input_ids = pcp_round_robin_split(

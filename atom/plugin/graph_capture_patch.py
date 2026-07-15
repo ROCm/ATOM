@@ -13,36 +13,72 @@ so fused_allreduce_rmsnorm uses registered=True and avoids the extra hipMemcpyAs
 
 import functools
 import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 
 logger = logging.getLogger("atom")
 
 
-def _get_aiter_ca_capture_context():
-    """Lazily get aiter's ca_comm.capture() context, or nullcontext if unavailable."""
+def _ca_comm_of(group):
+    """Return a group's capturable aiter ca_comm, or None if unavailable."""
+    if group is None:
+        return None
+    device_communicator = getattr(group, "device_communicator", None)
+    if device_communicator is None:
+        return None
+    ca_comm = getattr(device_communicator, "ca_comm", None)
+    if ca_comm is None or getattr(ca_comm, "disabled", True):
+        return None
+    if getattr(ca_comm, "capture", None) is None:
+        return None
+    return ca_comm
+
+
+def _iter_aiter_capture_ca_comms():
+    """Yield the aiter ca_comm(s) that must enter capture mode during graph
+    capture: the TP group, plus the dedicated Context-Parallel (_PCP) group when
+    it has its OWN ca_comm (reuse-TP-as-CP with a dedicated CP group).
+
+    The model's custom collectives run on aiter's groups (TP all-reduce on TP;
+    CP all-gather / reduce-scatter on _PCP). Each ca_comm must be in capture
+    mode so its graph buffers register (flush_graph_buffers on exit); otherwise
+    its collectives take the non-registered / hipMemcpyAsync path. Deduped by
+    identity, so the aliased case (_PCP is TP) enters exactly once.
+    """
+    getters = []
     try:
         from aiter.dist.parallel_state import get_tp_group
 
-        aiter_tp = get_tp_group()
+        getters.append(get_tp_group)
     except Exception:
-        return nullcontext()
+        pass
+    try:
+        from aiter.dist.parallel_state import get_pcp_group
 
-    if aiter_tp is None:
-        return nullcontext()
+        getters.append(get_pcp_group)
+    except Exception:
+        pass
 
-    device_communicator = getattr(aiter_tp, "device_communicator", None)
-    if device_communicator is None:
-        return nullcontext()
+    seen = set()
+    for getter in getters:
+        try:
+            group = getter()
+        except Exception:
+            # get_pcp_group() asserts when _PCP is unset (non-CP runs): skip.
+            continue
+        ca_comm = _ca_comm_of(group)
+        if ca_comm is not None and id(ca_comm) not in seen:
+            seen.add(id(ca_comm))
+            yield ca_comm
 
-    aiter_ca_comm = getattr(device_communicator, "ca_comm", None)
-    if aiter_ca_comm is None or getattr(aiter_ca_comm, "disabled", True):
-        return nullcontext()
 
-    capture_method = getattr(aiter_ca_comm, "capture", None)
-    if capture_method is None:
-        return nullcontext()
-
-    return capture_method()
+@contextmanager
+def _get_aiter_ca_capture_context():
+    """Nest ca_comm.capture() for every aiter group that needs it (TP + CP)."""
+    ca_comms = list(_iter_aiter_capture_ca_comms())
+    with ExitStack() as stack:
+        for ca_comm in ca_comms:
+            stack.enter_context(ca_comm.capture())
+        yield
 
 
 def _patched_graph_capture(original_graph_capture):

@@ -208,6 +208,8 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         # vLLM EP shards MoE across the flattened DP x TP device space (and
         # therefore disables fused shared experts); native uses per-DP MoE.
         moe_ep_flatten_tp_across_dp=vllm_parallel_config.enable_expert_parallel,
+        # Reuse the TP group as the Context-Parallel group (RFC ROCm/ATOM#196).
+        vllm_attn_cp=envs.ATOM_VLLM_ATTN_CP,
         enable_tbo=vllm_enable_dbo,
         enable_tbo_decode=vllm_enable_dbo,
         plugin_config=plugin_config,

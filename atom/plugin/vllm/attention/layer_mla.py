@@ -5,7 +5,7 @@ import logging
 
 import aiter
 import torch
-from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
+from aiter import concat_and_cache_mla, dtypes, fused_qk_rope_concat_and_cache_mla
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton import (
     batched_gemm_a16wfp4 as _fp4_bmm_module,
@@ -1250,6 +1250,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         sparse_meta = attn_metadata
 
         num_actual_toks = sparse_meta.num_actual_tokens
+        # Plugin reuse-TP-as-CP: this rank holds 1/cp round-robin owned queries
+        # (num_actual_toks == n_owned) but still writes the FULL replicated KV.
+        # Mirrors native MLAAttention.forward_impl PCP block.
+        pcp = bool(getattr(sparse_meta, "pcp_split", False))
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
@@ -1270,7 +1274,35 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 "positions"
             ]
 
-        positions = positions[:num_actual_toks]
+        positions_full = None
+        k_c_normed_full = None
+        k_pe_full = None
+        if pcp:
+            from atom.distributed.pcp_utils import (
+                get_pcp_world_size,
+                pcp_allgather_rerange,
+                pcp_pad_dense,
+                pcp_pad_len,
+                pcp_round_robin_split,
+            )
+
+            pcp_ws = get_pcp_world_size()
+            n_real = sparse_meta.slot_mapping.shape[0]
+            positions_full = positions[:n_real]
+            n_pad = pcp_pad_len(n_real, pcp_ws) - n_real
+            # Owned (round-robin) positions rope the owned q and the throwaway
+            # owned-slot k write; positions_full ropes the full completion write.
+            positions = pcp_round_robin_split(
+                pcp_pad_dense(positions_full, n_pad), pcp_ws
+            )[:num_actual_toks]
+            # Gather raw (un-roped) owned k to full BEFORE the fused kernel ropes
+            # k_pe in place (k_pe is [n_owned, 1, rope]; k_c_normed [n_owned, lora]).
+            k_c_normed_full = pcp_allgather_rerange(k_c_normed, pcp_ws)[:n_real]
+            k_pe_full = pcp_allgather_rerange(k_pe, pcp_ws)[:n_real]
+            write_slot_mapping = sparse_meta.slot_mapping_owned
+        else:
+            positions = positions[:num_actual_toks]
+            write_slot_mapping = sparse_meta.slot_mapping
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
         if fp8_attention:
             from vllm.platforms import current_platform
@@ -1319,16 +1351,17 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             device=ql_nope.device,
         )
         if kv_cache.numel() > 0:
+            kv_cache_view = kv_cache.view(
+                kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+            )
             fused_qk_rope_concat_and_cache_mla(
                 ql_nope,
                 q_pe,
                 k_c_normed,
                 k_pe.squeeze(1),
-                kv_cache.view(
-                    kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                ),
+                kv_cache_view,
                 q_out,
-                sparse_meta.slot_mapping,
+                write_slot_mapping,
                 self._k_scale,
                 self._q_scale,
                 positions,
@@ -1337,6 +1370,21 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 is_neox=self.rotary_emb.is_neox_style,
                 is_nope_first=True,
             )
+            if pcp:
+                # Complete the FULL replicated k-cache: rope the gathered full k
+                # in place with full positions, then overwrite every real slot
+                # (the fused kernel's owned-slot write above is throwaway). The
+                # rope kernel is 2-component and needs a non-None partner, so pass
+                # a throwaway of matching length.
+                self.rotary_emb(positions_full, k_pe_full, torch.empty_like(k_pe_full))
+                concat_and_cache_mla(
+                    k_c_normed_full,
+                    k_pe_full.squeeze(1),
+                    kv_cache,
+                    sparse_meta.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
 
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)

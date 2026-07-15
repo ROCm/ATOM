@@ -722,6 +722,51 @@ def set_attn_cls() -> None:
         logger.info("Use Attention dispatcher for rtp-llm")
 
 
+def _validate_plugin_attn_cp(
+    config: Config, tensor_parallel_size: int, use_vllm_atom_owned_ep: bool
+) -> None:
+    """Fail fast on unsupported ATOM_VLLM_ATTN_CP (reuse-TP-as-CP) setups.
+
+    The reuse path (RFC ROCm/ATOM#196) repurposes the whole TP group as the CP
+    group, so it needs tp>1, a DSA (sparse-MLA) model, and must not collide with
+    a separate `-pcp` dimension, DP-attention, or the DP+EP aiter-owned-groups
+    path. `pcp=1` / cp-off stays a bit-exact no-op and never reaches here.
+    """
+    if not config.plugin_config.is_vllm:
+        raise ValueError(
+            "ATOM_VLLM_ATTN_CP is a vLLM-plugin-only feature; it is set but the "
+            "current plugin backend is not vLLM."
+        )
+    if tensor_parallel_size <= 1:
+        raise ValueError(
+            "ATOM_VLLM_ATTN_CP requires tensor_parallel_size > 1 (it reuses the "
+            f"TP group as the CP group), got tp={tensor_parallel_size}."
+        )
+    if getattr(config.hf_config, "index_topk", None) is None:
+        raise ValueError(
+            "ATOM_VLLM_ATTN_CP only supports DSA sparse-MLA models (configs with "
+            "`index_topk`, e.g. GLM-5.2 / DeepSeek-V3.2)."
+        )
+    if getattr(config, "prefill_context_parallel_size", 1) > 1:
+        raise ValueError(
+            "ATOM_VLLM_ATTN_CP reuses the TP group as the CP group and is "
+            "mutually exclusive with a separate `-pcp` "
+            f"(prefill_context_parallel_size={config.prefill_context_parallel_size})."
+        )
+    if getattr(config, "enable_dp_attention", False):
+        raise ValueError("ATOM_VLLM_ATTN_CP is not compatible with DP-attention.")
+    if use_vllm_atom_owned_ep:
+        raise ValueError(
+            "ATOM_VLLM_ATTN_CP is not compatible with the DP+EP aiter-owned-"
+            "groups path (it needs the reused vLLM TP group)."
+        )
+    logger.info(
+        "ATOM_VLLM_ATTN_CP validated: reuse-TP-as-CP over %d ranks for a DSA "
+        "sparse-MLA model.",
+        tensor_parallel_size,
+    )
+
+
 def init_aiter_dist(config: Config) -> None:
     """
     Initialize aiter dist for using aiter custom collective op.
@@ -756,11 +801,23 @@ def init_aiter_dist(config: Config) -> None:
             "Skip vLLM TP reuse for OOT DP+EP so aiter owns TP/PP/DP/EP groups."
         )
 
+    if getattr(config, "vllm_attn_cp", False):
+        _validate_plugin_attn_cp(config, tensor_parallel_size, use_vllm_atom_owned_ep)
+
     if config.plugin_config.is_vllm and not use_vllm_atom_owned_ep:
         from atom.plugin.vllm.tp_group_reuse import init_aiter_dist_from_vllm
 
         if init_aiter_dist_from_vllm(tensor_parallel_size):
             return
+        if getattr(config, "vllm_attn_cp", False):
+            # The reuse-TP-as-CP path aliases aiter `_PCP` inside
+            # init_aiter_dist_from_vllm; the init_dist_env fallback below does
+            # not, so CP would silently no-op. Fail loudly instead.
+            raise RuntimeError(
+                "ATOM_VLLM_ATTN_CP requires reusing vLLM's TP group, but "
+                "init_aiter_dist_from_vllm() failed. Check that vLLM's TP group "
+                "and aiter ca_comm are available."
+            )
 
     # Fallback: create aiter's own groups (vLLM reuse failed or non-vLLM plugin)
     from aiter import init_dist_env

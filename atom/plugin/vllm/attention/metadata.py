@@ -9,6 +9,17 @@ from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.chip_info import get_gfx
 from atom.config import get_current_atom_config
+from atom.distributed.pcp_utils import (
+    get_pcp_rank,
+    get_pcp_world_size,
+    pcp_is_enabled,
+    pcp_pad_dense,
+    pcp_pad_len,
+    pcp_reindex_decode,
+    pcp_round_robin_query_indices,
+    pcp_sparse_prefill_reindex,
+    plugin_attn_cp_enabled,
+)
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
@@ -289,6 +300,12 @@ class AiterMlaSparseIndexerMetadataForVllm:
     decode: AiterMlaSparseIndexerDecodeMetadataForVllm | None = None
     prefill: AiterMlaSparseIndexerPrefillMetadataForVllm | None = None
 
+    # See AiterMlaSparseMetadataForVllm.pcp_split. Stamped True when the indexer
+    # prefill chunks' query-indexed fields (cu_seqlen_ks/ke, token_to_seq, the
+    # token_start/token_end ranges) have been reduced to this rank's owned queries
+    # while the KV-gather fields (block_table, cu_seq_lens) stay FULL.
+    pcp_split: bool = False
+
 
 # TODO (zyongye) optimize this, this is now vibe coded
 def kv_spans_from_batches(
@@ -397,6 +414,14 @@ class AiterMlaSparseMetadataForVllm:
     reduce_indptr: torch.Tensor | None = None
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
+
+    # Plugin reuse-TP-as-CP (ATOM_VLLM_ATTN_CP): stamped True by the builder when
+    # the query-indexed fields above have been reduced to this rank's round-robin
+    # 1/cp owned queries. deepseek_v2._plugin_pcp_active() reads this so the model
+    # split/gather stays in lock-step with the metadata reindex. slot_mapping stays
+    # FULL (KV write); slot_mapping_owned is the owned-query subset for fused kernels.
+    pcp_split: bool = False
+    slot_mapping_owned: torch.Tensor | None = None
 
 
 @dataclass
@@ -1627,6 +1652,69 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         return attn_metadata
 
 
+def _plugin_cp_should_split(common_attn_metadata, topk_tokens, decode_threshold=1):
+    """Batch-global split gate shared by the plugin sparse builders (main
+    sparse-MLA and sparse indexer), mirrored by deepseek_v2._plugin_pcp_active().
+
+    UNIVERSAL query-dim split: when reuse-TP-as-CP is enabled (``ATOM_VLLM_ATTN_CP``)
+    and the aiter _PCP group is aliased to the TP group (world > 1), split EVERY
+    batch type -- pure prefill, pure plain-decode, and MIXED -- over the query dim
+    using ONE shared whole-batch round-robin partition. Each rank runs the whole
+    model forward on its ``T/cp`` query shard with full (replicated) KV; the single
+    exit all-gather restores the full token order before lm_head. This removes the
+    old replicated-attention fallback (full 64-head attention on every rank).
+
+    Correctness constraints:
+      * Any decode region must be single-token plain decode built by a non-spec
+        builder (``decode_threshold == 1``) so token index == request index for the
+        owned-decode slice. Spec/MTP verify batches (``decode_threshold > 1``) keep
+        decode replicated.
+      * PREFILL has NO seq_len gate. The plugin indexer has no dense-MHA fallback
+        (it always runs the sparse top-k, selecting all keys for short rows), and
+        every plugin CP call site keys off the pcp_split stamp with a length-
+        agnostic K all-gather + owned reindex, so short-context prefill splits
+        correctly. (The native path DOES have a dense fallback and keeps the gate;
+        this plugin gate no longer does.)
+      * PLAIN-DECODE has NO seq_len gate. The round-robin split is over the QUERY
+        dim with full replicated KV (mathematically correct at any seq_len) and the
+        decode path always runs the sparse indexer with a ``min(seq_len, topk)``
+        clamp (no dense fallback to desync). Matches native deepseek_v4._pcp_active.
+    """
+    if not (plugin_attn_cp_enabled() and pcp_is_enabled()):
+        return False
+    num_tokens = int(common_attn_metadata.num_actual_tokens)
+    if num_tokens <= 0:
+        return False
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    _, _, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
+        common_attn_metadata, decode_threshold=decode_threshold
+    )
+    # Any decode region present must be plain single-token decode built by a
+    # non-spec builder (decode_threshold == 1) so token index == request index for
+    # the owned-decode slice; spec/MTP verify batches -- whose multi-token-per-
+    # request decode layout is not wired for the round-robin split -- stay
+    # replicated (return False for pure- and mixed-decode spec batches).
+    if int(num_decode_tokens) > 0 and int(decode_threshold) != 1:
+        return False
+    if int(num_prefill_tokens) > 0:
+        # PREFILL-containing (pure prefill or MIXED): ALWAYS split over the query
+        # dim, at any seq_len. The plugin indexer (sparse_attn_indexer_plugin_mode)
+        # has NO dense-MHA fallback -- unlike the native indexer it never early-
+        # returns on max_seqlen_k <= index_topk; it always runs the sparse top-k,
+        # which selects all keys when the row is shorter than topk (dense-
+        # equivalent). Every plugin CP call site (entry split, indexer K all-gather
+        # + separate q/k rope, exit gather, sparse-MLA) keys off the pcp_split
+        # stamp, not seq_len, and the K all-gather + owned per-query reindex fire
+        # for any length, so short-context prefill splits correctly (topk_tokens is
+        # therefore no longer consulted here).
+        return True
+    # PURE plain-decode: always split under CP, no seq_len gate. The round-robin
+    # split is over the query dim with full replicated KV (correct at any seq_len)
+    # and the decode indexer clamps min(seq_len, topk) with no dense fallback.
+    return int(common_attn_metadata.max_query_len) == 1
+
+
 class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
     """vLLM-only metadata builder for sparse MLA main attention."""
 
@@ -1745,6 +1833,15 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self._prev_indices_extent = 0
         self._prev_metadata_key = None
 
+        # Persistent owned-slot buffer for the PCP decode-split path (see
+        # _build_pcp_split). FULL cudagraph bakes the address of every tensor a
+        # captured kernel reads; the reindex helper returns fresh per-step
+        # allocations, so the owned slot_mapping must be copied into this stable
+        # buffer that build() refreshes in place on every replay.
+        self._pcp_slot_mapping_owned = torch.empty(
+            (max_num_batched_tokens,), dtype=torch.int64, device=device
+        )
+
     def _bind_shared_sparse_kv_indices(self, layer_names, config, device, numel):
         # Resolve and bind a single shared paged_kv_indices buffer.
         # Reuse the buffer the other ubatch already bound if it exists, otherwise
@@ -1810,6 +1907,108 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 )
         return shared_buffer
 
+    def _pcp_should_split(self, common_attn_metadata, num_tokens) -> bool:
+        return _plugin_cp_should_split(
+            common_attn_metadata,
+            self.topk_tokens,
+            decode_threshold=self.reorder_batch_threshold,
+        )
+
+    def _build_pcp_split(self, common_attn_metadata, num_tokens, sparse_seqlen):
+        """Owned-query metadata for the plugin reuse-TP-as-CP sparse path.
+
+        Mirrors native ``AiterMLAImpl._apply_pcp_reindex``: query-indexed fields
+        (qo_indptr, paged_kv_indptr, paged_kv_last_page_len, req_id_per_token) are
+        reduced to the round-robin owned subset and the work-split schedule is
+        rebuilt for them; slot_mapping / block_table / seq_lens stay FULL for the
+        replicated full-KV write, with slot_mapping_owned carrying the owned subset
+        for the fused q_out kernel.
+        """
+        reindex = pcp_sparse_prefill_reindex(
+            sparse_seqlen,
+            self.req_id_per_token_buffer[:num_tokens],
+            common_attn_metadata.slot_mapping,
+            self.topk_tokens,
+        )
+        n_owned = reindex["n_owned"]
+        # FULL cudagraph safety: route the owned-query metadata through this
+        # builder's persistent buffers so captured kernels read stable device
+        # addresses that build() refreshes in place on every replay. The reindex
+        # helper returns freshly-allocated per-step tensors (it mirrors the native
+        # eager prefill path); handing those straight to a captured decode kernel
+        # freezes it on the capture-time allocation and replays read stale memory.
+        # qo_indptr is arange and paged_kv_last_page_len is all-ones by
+        # construction, so the persistent buffers already hold those exact values.
+        qo_indptr = self.qo_indptr[: n_owned + 1]
+        paged_kv_last_page_len = self.paged_kv_last_page_len[:n_owned]
+        self.paged_kv_indptr[: n_owned + 1].copy_(
+            reindex["paged_kv_indptr"], non_blocking=True
+        )
+        paged_kv_indptr = self.paged_kv_indptr[: n_owned + 1]
+        self.req_id_per_token_buffer[:n_owned].copy_(
+            reindex["req_id_per_token"], non_blocking=True
+        )
+        req_id_per_token = self.req_id_per_token_buffer[:n_owned]
+        self._pcp_slot_mapping_owned[:n_owned].copy_(
+            reindex["slot_mapping_owned"], non_blocking=True
+        )
+        slot_mapping_owned = self._pcp_slot_mapping_owned[:n_owned]
+        # The indexer writes owned queries' topk into the shared buffer; slice to
+        # the owned extent so sparse MLA reads exactly the owned rows.
+        paged_kv_indices = self.paged_kv_indices[: n_owned * self.topk_tokens]
+
+        get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            self.padded_num_heads,
+            1,
+            True,
+            self._mla_work_meta_data,
+            self._mla_work_info_set,
+            self._mla_work_indptr,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+            dtype_q=get_aiter_kv_cache_dtype(self.vllm_config),
+            dtype_kv=get_aiter_kv_cache_dtype(self.vllm_config),
+        )
+        # Owned qo/kv layout differs from the full-batch decode fast-path key, so
+        # invalidate it (the fast-path is only hit on the non-CP full path).
+        self._prev_metadata_key = None
+
+        return AiterMlaSparseMetadataForVllm(
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            num_actual_tokens=n_owned,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=common_attn_metadata.block_table_tensor,
+            req_id_per_token=req_id_per_token,
+            block_size=self.kv_cache_spec.block_size,
+            attn_out_dtype=self.model_dtype,
+            topk_tokens=self.topk_tokens,
+            qo_indptr=qo_indptr,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_indptr=paged_kv_indptr,
+            work_meta_data=self._mla_work_meta_data,
+            work_indptr=self._mla_work_indptr,
+            work_info_set=self._mla_work_info_set,
+            reduce_indptr=self._mla_reduce_indptr,
+            reduce_final_map=self._mla_reduce_final_map,
+            reduce_partial_map=self._mla_reduce_partial_map,
+            pcp_split=True,
+            slot_mapping_owned=slot_mapping_owned,
+        )
+
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         num_tokens = common_attn_metadata.num_actual_tokens
         starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
@@ -1861,6 +2060,16 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             num_tokens,
             common_attn_metadata.max_query_len,
         )
+
+        # Plugin reuse-TP-as-CP: reduce the query-indexed fields to this rank's
+        # round-robin 1/cp owned queries (KV columns stay full). Kept in
+        # lock-step with deepseek_v2._plugin_pcp_active(), which reads the
+        # pcp_split stamp set here.
+        if self._pcp_should_split(common_attn_metadata, num_tokens):
+            return self._build_pcp_split(
+                common_attn_metadata, num_tokens, sparse_seqlen
+            )
+
         torch.cumsum(
             sparse_seqlen,
             dim=0,
@@ -1974,6 +2183,10 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
 class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
+    # One-shot diagnostic: set True after the first decode-split build so we log
+    # that the PCP reuse-TP-as-CP decode split actually engaged (used to confirm
+    # FULL-cudagraph parity/accuracy runs exercise the split path).
+    _pcp_decode_split_logged = False
 
     def __init__(
         self,
@@ -2059,12 +2272,31 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        # Persistent owned-query buffers for the PCP decode-split path (see
+        # _build_indexer). pcp_reindex_decode returns fresh per-step tensors;
+        # under FULL cudagraph the captured indexer decode kernel bakes their
+        # addresses, so the owned seq_lens / block_table are copied into these
+        # stable buffers that build() refreshes in place on every replay.
+        self._pcp_seq_lens_owned = torch.empty(
+            (max_num_batched_tokens,), dtype=torch.int32, device=self.device
+        )
+        self._pcp_block_table_owned = torch.empty(
+            (max_num_batched_tokens, max_num_blocks_per_req),
+            dtype=torch.int32,
+            device=self.device,
+        )
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
 
     def _build_indexer_one_prefill_chunk(
-        self, reqs_start, reqs_end, query_start_loc_cpu, seq_lens_cpu, block_table
+        self,
+        reqs_start,
+        reqs_end,
+        query_start_loc_cpu,
+        seq_lens_cpu,
+        block_table,
+        owned_q=None,
     ):
         prefill_query_start_loc = (
             query_start_loc_cpu[reqs_start : reqs_end + 1]
@@ -2091,6 +2323,20 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             .to(torch.int32)
             .to(self.device)
         )
+        if owned_q is not None:
+            # Plugin reuse-TP-as-CP: keep only this rank's round-robin owned QUERY
+            # tokens of the chunk. cu_seqlen_ks/ke are per-local-query KV windows
+            # into the FULL KV -> select owned; token_start/token_end move into the
+            # compacted owned-q array space (q_fp8/weights/topk are [n_owned]).
+            # KV-gather fields (block_table, cu_seq_lens, token_to_seq,
+            # total_seq_lens) stay FULL so every rank still gathers the full KV.
+            os = int((owned_q < token_start).sum().item())
+            oe = int((owned_q < token_end).sum().item())
+            local = (owned_q[os:oe] - token_start).to(cu_seqlen_ks.device)
+            cu_seqlen_ks = cu_seqlen_ks[local].contiguous()
+            cu_seqlen_ke = cu_seqlen_ke[local].contiguous()
+            token_start = os
+            token_end = oe
         return AiterMlaSparseIndexerPrefillChunkMetadataForVllm(
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
@@ -2132,6 +2378,19 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
 
+        # Plugin reuse-TP-as-CP: same batch-global gate as the main sparse builder
+        # (prefill-only), so the pcp_split stamp and the query reindex stay in
+        # lock-step with deepseek_v2._plugin_pcp_active() and the model split.
+        topk_tokens = self.model_config.hf_config.index_topk
+        pcp_split = _plugin_cp_should_split(
+            common_attn_metadata, topk_tokens, self.reorder_batch_threshold
+        )
+        owned_q = None
+        if pcp_split:
+            owned_q = pcp_round_robin_query_indices(
+                pcp_pad_len(num_tokens, get_pcp_world_size()), get_pcp_world_size()
+            )
+
         prefill_metadata = None
         if num_prefills > 0:
             chunk_seq_ids = split_prefill_chunks(
@@ -2146,6 +2405,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                     query_start_loc_cpu,
                     common_attn_metadata.seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
+                    owned_q=owned_q,
                 )
                 for reqs_start, reqs_end in chunk_seq_ids
             ]
@@ -2153,25 +2413,106 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                 chunks=chunks,
             )
 
+        # Plugin reuse-TP-as-CP: decide this rank's owned decode queries UP FRONT
+        # so the decode-metadata block below is skipped entirely when this rank
+        # owns none. A MIXED batch restricts the shared whole-batch round-robin
+        # partition (owned_q) to the decode region, which can leave a rank with
+        # zero owned decode queries; pure decode pads to cp so every rank owns the
+        # same count. pcp_dec carries the owned (seq_lens, block_table) tensors.
+        pcp_dec = None
+        if pcp_split and num_decodes > 0:
+            seq_lens_full = common_attn_metadata.seq_lens[:num_decodes]
+            block_table_full = common_attn_metadata.block_table_tensor[
+                :num_decodes, ...
+            ]
+            # Padded CUDA graph requests have block_table entries of -1. Clamp to 0
+            # to prevent OOB access in the DeepGEMM kernel (padded rows have
+            # seq_len=0, so they produce no meaningful output).
+            block_table_full.clamp_(min=0)
+            if num_prefills > 0:
+                # MIXED: the owned decode queries MUST come from the SAME
+                # whole-batch round-robin partition (owned_q) that the prefill
+                # chunks and the sparse-MLA _build_pcp_split reindex use, restricted
+                # to the decode region [0, num_decode_tokens). The decode region is
+                # NOT padded separately (unlike pure decode) -- padding it would
+                # shift the prefill token_start offsets (os/oe are computed over the
+                # same owned_q in _build_indexer_one_prefill_chunk) and desync the
+                # topk rows from the owned paged_kv_indptr the sparse layer reads.
+                # Mixed batches run piecewise/eager, so per-rank-variable owned
+                # decode counts (differing by at most 1) are fine.
+                owned_dec_q = owned_q[owned_q < num_decode_tokens].to(
+                    seq_lens_full.device
+                )
+                n_owned_dec = int(owned_dec_q.shape[0])
+                seq_lens_owned = seq_lens_full.index_select(0, owned_dec_q).contiguous()
+                block_table_owned = block_table_full.index_select(
+                    0, owned_dec_q
+                ).contiguous()
+            else:
+                # PURE decode: pad the decode region to a multiple of cp so every
+                # rank runs the same owned count (FULL cudagraph uniform shape);
+                # dummy queries attend nothing and are dropped at the model exit
+                # all-gather. Same round-robin start/stride as the combined owned_q,
+                # so the owned decode set matches owned_q < num_decode_tokens.
+                seq_lens_owned, block_table_owned, _owned_dec_q, n_owned_dec = (
+                    pcp_reindex_decode(
+                        seq_lens_full, block_table_full, num_decode_tokens
+                    )
+                )
+            if not AiterMlaSparseIndexerMetadataBuilder._pcp_decode_split_logged:
+                AiterMlaSparseIndexerMetadataBuilder._pcp_decode_split_logged = True
+                logger.info(
+                    "[PCP] indexer DECODE-split ENGAGED (%s): pre_split_decode=%d "
+                    "n_owned=%d num_prefills=%d max_seq_len=%d topk=%d",
+                    "mixed" if num_prefills > 0 else "pure-decode",
+                    int(num_decode_tokens),
+                    int(n_owned_dec),
+                    int(num_prefills),
+                    int(common_attn_metadata.max_seq_len),
+                    int(topk_tokens),
+                )
+            num_decodes = n_owned_dec
+            num_decode_tokens = n_owned_dec
+            pcp_dec = (seq_lens_owned, block_table_owned)
+
         decode_metadata = None
         if num_decodes > 0:
-            torch.diff(
-                common_attn_metadata.query_start_loc[: num_decodes + 1],
-                out=self.decode_lens_buffer[:num_decodes],
-            )
-            decode_lens = self.decode_lens_buffer[:num_decodes]
-            decode_lens_cpu = torch.diff(
-                common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
-            )
+            if pcp_dec is not None:
+                # FULL cudagraph safety: route the owned tensors through persistent
+                # buffers so a captured indexer decode kernel reads stable addresses
+                # that are refreshed in place on every replay (see __init__). The
+                # sparse-MLA slot_mapping stays FULL for the replicated KV write.
+                seq_lens_owned, block_table_owned = pcp_dec
+                self._pcp_seq_lens_owned[:num_decodes].copy_(
+                    seq_lens_owned, non_blocking=True
+                )
+                seq_lens = self._pcp_seq_lens_owned[:num_decodes]
+                bw = block_table_owned.shape[1]
+                self._pcp_block_table_owned[:num_decodes, :bw].copy_(
+                    block_table_owned, non_blocking=True
+                )
+                block_table = self._pcp_block_table_owned[:num_decodes, :bw]
+                self.decode_lens_buffer[:num_decodes].fill_(1)
+                decode_lens = self.decode_lens_buffer[:num_decodes]
+                decode_lens_cpu = torch.ones(num_decodes, dtype=torch.int32)
+            else:
+                torch.diff(
+                    common_attn_metadata.query_start_loc[: num_decodes + 1],
+                    out=self.decode_lens_buffer[:num_decodes],
+                )
+                decode_lens = self.decode_lens_buffer[:num_decodes]
+                decode_lens_cpu = torch.diff(
+                    common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+                )
 
-            seq_lens = common_attn_metadata.seq_lens[:num_decodes]
-            block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
+                seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+                block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
 
-            # Padded CUDA graph requests have block_table entries of -1.
-            # Clamp to 0 to prevent OOB access in the DeepGEMM kernel.
-            # This is safe because padded requests have seq_lens=0, so the
-            # kernel produces no meaningful output for those rows.
-            block_table.clamp_(min=0)
+                # Padded CUDA graph requests have block_table entries of -1.
+                # Clamp to 0 to prevent OOB access in the DeepGEMM kernel.
+                # This is safe because padded requests have seq_lens=0, so the
+                # kernel produces no meaningful output for those rows.
+                block_table.clamp_(min=0)
 
             max_decode_len = int(decode_lens_cpu.max().item())
             if max_decode_len > 1:
@@ -2279,6 +2620,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            pcp_split=pcp_split,
         )
 
         return indexer_metadata

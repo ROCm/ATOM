@@ -150,6 +150,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
     ),
+    # vLLM plugin Prefill/Context Parallel by *reusing the TP group* as the CP
+    # group (RFC ROCm/ATOM#196). Unlike native ATOM's separate `-pcp` dimension
+    # (world = tp x pcp, KV replicated per PCP rank), this runs true sequence
+    # parallelism over tokens within the SAME TP group: residual/hidden are
+    # sharded [T/cp], attention runs full-head *replicated* weights on 1/cp of
+    # the queries against the full (gathered) KV, and MoE does all-gather +
+    # reduce-scatter around the TP-sharded experts. DSA (index_topk) models only
+    # (GLM-5.2 / DeepSeek-V3.2). `0` (default) is a bit-exact no-op.
+    "ATOM_VLLM_ATTN_CP": lambda: (os.getenv("ATOM_VLLM_ATTN_CP", "0").lower() == "1"),
+    # Extend reuse-TP-as-CP (ATOM_VLLM_ATTN_CP) to also round-robin split the
+    # DECODE token batch across the CP ranks (default off). With CP on but this
+    # off, decode runs full-head *replicated* attention on ALL tokens per rank
+    # (redundant attention + indexer compute, no token split). With this on, a
+    # PURE-decode batch is split 1/cp the same way prefill is: each rank runs
+    # q-proj / attention / indexer / MoE on its 1/cp owned decode queries against
+    # the full (all-gathered) KV, then the hidden states are all-gathered at the
+    # model exit. This trades an exit all-gather (+ per-layer KV all-gather) for
+    # cp x less attention/indexer/q-side compute, so it pays off at concurrency
+    # >> cp and can regress at low concurrency. Plain decode only (max_query_len
+    # == 1); mixed and spec/MTP batches stay replicated. `0` is a no-op.
+    "ATOM_VLLM_ATTN_CP_DECODE_SPLIT": lambda: (
+        os.getenv("ATOM_VLLM_ATTN_CP_DECODE_SPLIT", "0").lower() == "1"
+    ),
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
