@@ -1274,9 +1274,6 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 "positions"
             ]
 
-        positions_full = None
-        k_c_normed_full = None
-        k_pe_full = None
         if pcp:
             from atom.distributed.pcp_utils import (
                 get_pcp_world_size,
@@ -1290,15 +1287,12 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             n_real = sparse_meta.slot_mapping.shape[0]
             positions_full = positions[:n_real]
             n_pad = pcp_pad_len(n_real, pcp_ws) - n_real
-            # Owned (round-robin) positions rope the owned q and the throwaway
-            # owned-slot k write; positions_full ropes the full completion write.
+            # Owned (round-robin) positions rope the owned q and the owned k_pe;
+            # the full replicated k-cache is completed with a single all-gather
+            # after the fused kernel (see the `if pcp` write block below).
             positions = pcp_round_robin_split(
                 pcp_pad_dense(positions_full, n_pad), pcp_ws
             )[:num_actual_toks]
-            # Gather raw (un-roped) owned k to full BEFORE the fused kernel ropes
-            # k_pe in place (k_pe is [n_owned, 1, rope]; k_c_normed [n_owned, lora]).
-            k_c_normed_full = pcp_allgather_rerange(k_c_normed, pcp_ws)[:n_real]
-            k_pe_full = pcp_allgather_rerange(k_pe, pcp_ws)[:n_real]
             write_slot_mapping = sparse_meta.slot_mapping_owned
         else:
             positions = positions[:num_actual_toks]
@@ -1371,15 +1365,28 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 is_nope_first=True,
             )
             if pcp:
-                # Complete the FULL replicated k-cache: rope the gathered full k
-                # in place with full positions, then overwrite every real slot
-                # (the fused kernel's owned-slot write above is throwaway). The
-                # rope kernel is 2-component and needs a non-None partner, so pass
-                # a throwaway of matching length.
-                self.rotary_emb(positions_full, k_pe_full, torch.empty_like(k_pe_full))
+                # Complete the FULL replicated k-cache with a SINGLE all-gather.
+                # The fused kernel above read the RAW owned k as const inputs (it
+                # writes roped K to the owned cache slots + Q into q_out, never back
+                # to k_pe/kv_c), so k_pe is still un-roped here. Rope THIS rank's
+                # 1/cp owned k_pe in place (owned positions), pack it with the
+                # rope-free owned kv_c into one [n_owned, kv_lora + pe] tensor,
+                # all-gather+rerange to the full sequence, then write every real
+                # slot (overwriting the fused kernel's throwaway owned-slot write).
+                # Roping the owned shard before the gather (instead of the whole
+                # gathered sequence on every rank) keeps the rope at 1/cp, and
+                # merging kv_c + k_pe halves the collective count (one 576-wide
+                # all-gather vs two). concat_and_cache_mla consumes the gathered
+                # nope/pe as plain column slices: it honours stride(0) and the
+                # feature dim stays unit-stride, so no split/contiguous copy is
+                # needed on the write side.
+                self.rotary_emb(positions, k_pe, torch.empty_like(k_pe))
+                kv_full = pcp_allgather_rerange(
+                    torch.cat([k_c_normed, k_pe.squeeze(1)], dim=-1), pcp_ws
+                )[:n_real]
                 concat_and_cache_mla(
-                    k_c_normed_full,
-                    k_pe_full.squeeze(1),
+                    kv_full[:, : self.kv_lora_rank],
+                    kv_full[:, self.kv_lora_rank :],
                     kv_cache,
                     sparse_meta.slot_mapping.flatten(),
                     kv_cache_dtype=self.kv_cache_dtype,
