@@ -678,7 +678,7 @@ function buildAtomeshBenchmarkRows(data) {
       const key = `${row.backend}|${row.hardware}|${row.model}|${row.topology}|${row.islOsl}|${row.concurrency}`;
       const current = rowsByKey[key];
       if (!current) {
-        rowsByKey[key] = { ...row, runDay, cid7 };
+        rowsByKey[key] = { ...row, commit: run.commit, runDay, cid7 };
         continue;
       }
       if (current.runDay !== runDay || current.cid7 !== cid7) continue;
@@ -688,7 +688,7 @@ function buildAtomeshBenchmarkRows(data) {
         (Number.isFinite(nextScore) && (!Number.isFinite(currentScore) || nextScore > currentScore))
         || (nextScore === currentScore && (row.date || 0) > (current.date || 0))
       ) {
-        rowsByKey[key] = { ...row, runDay, cid7 };
+        rowsByKey[key] = { ...row, commit: run.commit, runDay, cid7 };
       }
     }
   }
@@ -2965,6 +2965,7 @@ function atomeshDpAttentionLabel(row) {
 }
 function showAtomeshPopover(row) {
   const runHref = safeHref(row.runUrl);
+  const commitHref = safeHref(row.commit?.url);
   const hardware = fmtHardware(row.hardware || ATOMESH_DATA.hardware);
   const backendLabel = row.backend || ATOMESH_DATA.backend;
   const dateValue = row.date || ATOMESH_DATA.updatedAt;
@@ -2983,7 +2984,7 @@ function showAtomeshPopover(row) {
       <div class="pop-row"><span class="pop-key">TTFT / TPOT / E2E</span><span class="pop-val">${[row.ttftMs, row.tpotMs, row.e2eMs].map(v => v != null ? fmtNum(v, 2) : '—').join(' / ')} ms</span></div>
     </div>
     <div class="pop-section">
-      <div class="pop-row"><span class="pop-key">Source Topology</span><span class="pop-val" style="font-family:inherit">${escHTML(row.sourceTopology || row.topology || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Topology</span><span class="pop-val" style="font-family:inherit">${escHTML(row.sourceTopology || row.topology || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Total GPUs</span><span class="pop-val">${atomeshDetailValue(row.totalGpu)}</span></div>
       <div class="pop-row"><span class="pop-key">Tensor Parallelism</span><span class="pop-val">${escHTML(String(atomeshTpLabel(row)))}</span></div>
       <div class="pop-row"><span class="pop-key">Prefill/Decode Workers</span><span class="pop-val">${row.prefillWorkers ?? '—'} / ${row.decodeWorkers ?? '—'}</span></div>
@@ -2995,7 +2996,8 @@ function showAtomeshPopover(row) {
       <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(row.rocm || row.rocmVersion || '—')}</span></div>
     </div>
     <div class="action-row">
-      ${runHref ? `<a class="action-btn" href="${escHTML(runHref)}" target="_blank" rel="noopener noreferrer">GitHub Actions Run ↗</a>` : ''}
+      ${runHref ? `<a class="action-btn" href="${escHTML(runHref)}" target="_blank" rel="noopener noreferrer">Open CI Run ↗</a>` : ''}
+      ${commitHref ? `<a class="action-btn" href="${escHTML(commitHref)}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
     </div></div>`;
   document.getElementById('popover-overlay').classList.add('open');
   document.getElementById('pop-close-btn').addEventListener('click', (e) => {
@@ -3552,8 +3554,7 @@ function renderAtomeshPerformanceTab() {
   const chartSpecs = Object.entries(chartGroups).sort(([a], [b]) => _lc(a, b)).map(([model, modelRows], chartIdx) => {
     const seriesGroups = {};
     for (const row of modelRows) {
-      const topology = row.sourceTopology || row.topology || 'unknown';
-      const key = `${row.model}|${topology}|${row.islOsl}`;
+      const key = `${row.model}|${row.islOsl}`;
       if (!seriesGroups[key]) seriesGroups[key] = [];
       seriesGroups[key].push(row);
     }
@@ -3561,9 +3562,8 @@ function renderAtomeshPerformanceTab() {
       groupRows.sort((a, b) => a.concurrency - b.concurrency);
       const first = groupRows[0];
       const color = getModelColor(ATOMESH_DATA.backend, first.model);
-      const topology = first.sourceTopology || first.topology || 'unknown';
       return {
-        label: `${first.model} ${topology} ${first.islOsl}`,
+        label: `${first.model} ${first.islOsl}`,
         data: groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c })),
         borderColor: color.border,
         backgroundColor: color.border,
@@ -3644,7 +3644,7 @@ function renderAtomeshPerformanceTab() {
           tooltip: { ...chartTooltipOpts(), callbacks: {
             title: items => {
               const c = items[0].raw.row;
-              return `${c.model} ${c.islOsl} · c=${c.concurrency} · ${c.sourceTopology || c.topology}`;
+              return `${c.model} ${c.islOsl} · c=${c.concurrency} · Topology: ${c.sourceTopology || c.topology || '—'}`;
             },
             label: item => [
               ` Interactivity: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
