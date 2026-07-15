@@ -2703,7 +2703,9 @@ class ModelRunner:
     def prepare_model(self, batch: ScheduledBatch):
         self._dspark_apply_q_bucket(batch)
         # DSpark-only early DP sync: only DSpark under DP needs the DP-max q
-        # BEFORE prepare_input_ids
+        # BEFORE prepare_input_ids (to size input_ids). Run the merged packed
+        # all_gather (TBO + DSpark [q, bs, sigma]) ONCE here and reuse it in
+        # prepare_inputs, so the step issues a single cross-DP collective.
         dspark_shape = self._dspark_local_shape(batch)
         preprocessed = None
         if dspark_shape is not None:
@@ -3059,7 +3061,7 @@ class ModelRunner:
         if getattr(self, "drafter", None) is not None and getattr(
             self.drafter, "dspark_confidence_schedule", False
         ):
-            dspark_ell = dict(getattr(self.drafter, "_dspark_ell_by_req", {}) or {})
+            dspark_ell = self.drafter.dspark_ell_nonblocking()
 
         return ScheduledBatchOutput(
             req_ids=req_ids_out,

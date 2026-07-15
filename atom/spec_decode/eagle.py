@@ -241,8 +241,7 @@ class EagleProposer:
             # num_speculative_tokens may be unset for DSpark; default to the
             # full block (Phase 1 uses a static verify length == block size).
             self.mtp_k: int = (
-                self.speculative_config.num_speculative_tokens
-                or self.dspark_block_size
+                self.speculative_config.num_speculative_tokens or self.dspark_block_size
             )
             # Phase 2: confidence-scheduled verification (Level B, variable-length
             # verify). propose() stores the scheduler-chosen ell here; the next
@@ -253,7 +252,13 @@ class EagleProposer:
             self._dspark_last_ell: Optional[torch.Tensor] = None
             # req_id -> ell map from the PREVIOUS step's propose(), used to re-map
             # ell onto the next step's (possibly reordered) batch by req_id.
-            self._dspark_ell_by_req: dict = {}
+            # Deferred resolution: record_dspark_ell fires an ASYNC D2H of ell to
+            # a pinned buffer (no sync -> keeps CPU ahead of GPU, preserving the
+            # deferred-output pipeline); the map is materialized lazily on first
+            # read next step (event already complete by then). See the
+            # _dspark_ell_by_req property + record_dspark_ell.
+            self._dspark_ell_map_cache: dict = {}
+            self._dspark_ell_pending: Optional[tuple] = None  # (event, cpu_buf, req_ids)
             # SPS(B) throughput profile + STS temperatures are bound later
             # (engine warmup / checkpoint). Until then: a synthetic monotone SPS
             # stub and T=1 (uncalibrated) keep the path lossless and testable.
@@ -448,10 +453,10 @@ class EagleProposer:
     def _propose_dspark(
         self,
         *,
-        target_token_ids: torch.Tensor,   # [num_tokens]
-        target_positions: torch.Tensor,   # [num_tokens]
+        target_token_ids: torch.Tensor,  # [num_tokens]
+        target_positions: torch.Tensor,  # [num_tokens]
         num_reject_tokens: torch.Tensor,  # [batch]
-        next_token_ids: torch.Tensor,     # [batch] verified anchor token x0
+        next_token_ids: torch.Tensor,  # [batch] verified anchor token x0
         last_token_indices: torch.Tensor,  # [batch] flat index of each anchor row
         aux_hidden_states: Optional[list[torch.Tensor]],
     ) -> torch.Tensor:
@@ -483,17 +488,13 @@ class EagleProposer:
         # Anchor token x0 per request = the just-verified target token, located
         # at last_token_indices in the flat batch.
         anchor_ids = next_token_ids
-        anchor_positions = torch.index_select(
-            target_positions, 0, last_token_indices
-        )
+        anchor_positions = torch.index_select(target_positions, 0, last_token_indices)
         main_hidden = torch.index_select(main_hidden_all, 0, last_token_indices)
         state_slot = getattr(attn_metadata, "state_slot_mapping", None)
         if state_slot is not None:
             cache_indices = state_slot[:bs].to(torch.long)
         else:
-            cache_indices = torch.arange(
-                bs, device=anchor_ids.device, dtype=torch.long
-            )
+            cache_indices = torch.arange(bs, device=anchor_ids.device, dtype=torch.long)
 
         # Prefill warmup: seed each request's rolling window with the last
         # min(seq_len, window) target tokens BEFORE drafting. Right after
@@ -518,9 +519,7 @@ class EagleProposer:
 
         # Refresh the rolling target-KV window with the new anchor row, then
         # draft the block in a single backbone pass.
-        self.model.precompute_context_kv(
-            main_hidden, anchor_positions, cache_indices
-        )
+        self.model.precompute_context_kv(main_hidden, anchor_positions, cache_indices)
         # Draft width = the verify horizon mtp_k (num_speculative_tokens). This
         # may exceed dspark_block_size (the training default); DSpark weights are
         # draft-width-agnostic so the wider block is drafted in one pass, with
@@ -530,7 +529,10 @@ class EagleProposer:
         num_draft = min(self.mtp_k, window)
         self._refresh_dp_metadata(forward_context, bs * num_draft)
         draft_token_ids, confidence = self.model.forward_spec(
-            anchor_ids, main_hidden, anchor_positions, cache_indices,
+            anchor_ids,
+            main_hidden,
+            anchor_positions,
+            cache_indices,
             num_draft=num_draft,
         )
         draft_token_ids = draft_token_ids[:, : self.mtp_k]
@@ -582,9 +584,14 @@ class EagleProposer:
                 logger.info(
                     "DSpark schedule[step %d]: bs=%d L=%d avg_ell=%.2f "
                     "trunc_rate=%.1f%%",
-                    self._dspark_dbg_step, bs, L, avg_ell, trunc * 100.0,
+                    self._dspark_dbg_step,
+                    bs,
+                    L,
+                    avg_ell,
+                    trunc * 100.0,
                 )
-        self._record_dspark_shadow_savings(ell_t, bs, L)
+        if self.config.dspark.debug_schedule:
+            self._record_dspark_shadow_savings(ell_t, bs, L)
         return ell_t
 
     def _record_dspark_shadow_savings(
@@ -633,7 +640,8 @@ class EagleProposer:
                     "DSpark shadow-savings bs=%d: steps=%d | per-request saves "
                     "%.1f%% of verify | batch-uniform-L saves %.1f%% | "
                     "uniform keeps %.1f%% of the per-request win",
-                    cbs, steps,
+                    cbs,
+                    steps,
                     100.0 * pr / base,
                     100.0 * uni / base,
                     (100.0 * uni / pr) if pr > 0 else 0.0,
@@ -911,7 +919,7 @@ class EagleProposer:
         return token_indices
 
     def record_dspark_ell(self, req_ids: Sequence) -> None:
-        """Stash this step's ell keyed by req_id (called after propose()).
+        """Fire an ASYNC copy of this step's ell, keyed later by req_id.
 
         ell was computed in propose() ordered by THIS step's decode batch. We
         save {req_id: ell} so the NEXT step can re-map it onto its own (possibly
@@ -920,11 +928,74 @@ class EagleProposer:
         """
         ell = getattr(self, "_dspark_last_ell", None)
         if ell is None:
-            self._dspark_ell_by_req = {}
+            self._dspark_ell_pending = None
+            self._dspark_ell_map_cache = {}
             return
-        ell_np = ell.detach().to("cpu").numpy().astype(np.int32)
+        ell = ell.detach()
+        # Reuse the runner's shared async D2H stream
+        copy_stream = self.runner.tokenID_processor.async_copy_stream
+        default_stream = torch.cuda.current_stream()
+        event = torch.cuda.Event()
+        with torch.cuda.stream(copy_stream):
+            copy_stream.wait_stream(default_stream)
+            cpu_buf = ell.to("cpu", non_blocking=True)
+            event.record(copy_stream)
+        # Keep req_ids as a plain list snapshot (CPU-only, order-safe).
+        self._dspark_ell_pending = (event, cpu_buf, list(req_ids))
+        # Invalidate last step's resolved map; recomputed lazily on first read.
+        self._dspark_ell_map_cache = None
+
+    @property
+    def _dspark_ell_by_req(self) -> dict:
+        """Lazily materialize {req_id: ell} from the async D2H fired by
+        record_dspark_ell. Syncs the (already-complete) event on first read,
+        then caches so repeated reads within a step are free."""
+        cache = getattr(self, "_dspark_ell_map_cache", {})
+        if cache is not None:
+            return cache
+        pending = self._dspark_ell_pending
+        if pending is None:
+            self._dspark_ell_map_cache = {}
+            return self._dspark_ell_map_cache
+        event, cpu_buf, req_ids = pending
+        event.synchronize()  # long done by next step; no hot-path stall
+        ell_np = cpu_buf.numpy().astype(np.int32)
         n = min(len(req_ids), ell_np.shape[0])
-        self._dspark_ell_by_req = {req_ids[i]: int(ell_np[i]) for i in range(n)}
+        self._dspark_ell_map_cache = {req_ids[i]: int(ell_np[i]) for i in range(n)}
+        return self._dspark_ell_map_cache
+
+    @_dspark_ell_by_req.setter
+    def _dspark_ell_by_req(self, value: dict) -> None:
+        # Direct assignment (e.g. reset to {}) bypasses the pending copy.
+        self._dspark_ell_map_cache = value
+        self._dspark_ell_pending = None
+
+    def dspark_ell_nonblocking(self) -> dict:
+        """Non-blocking read of the ell map for the SAME-step postprocess path
+        (carried back to the scheduler as fwd_output.dspark_ell). Must NOT sync:
+        record_dspark_ell just fired this step's async D2H, and forcing it here
+        would re-serialize CPU on GPU — the exact stall we removed. If the copy
+        is already resolved (cache present) return it; if it's still pending
+        (this step's fresh copy) query without waiting; else fall back to {}.
+
+        Correctness: the scheduler only uses this to set seq.dspark_next_ell for
+        NEXT-step sizing, and the worker's own _dspark_apply_q_bucket reads the
+        (fully resolved) property next step regardless — so a same-step empty
+        here never under-verifies."""
+        cache = getattr(self, "_dspark_ell_map_cache", None)
+        if cache:
+            return dict(cache)
+        pending = self._dspark_ell_pending
+        if pending is None:
+            return {}
+        event, cpu_buf, req_ids = pending
+        if not event.query():  # not done yet — do NOT stall the hot path
+            return {}
+        ell_np = cpu_buf.numpy().astype(np.int32)
+        n = min(len(req_ids), ell_np.shape[0])
+        resolved = {req_ids[i]: int(ell_np[i]) for i in range(n)}
+        self._dspark_ell_map_cache = resolved
+        return dict(resolved)
 
     def calc_spec_decode_metadata(
         self,
@@ -940,7 +1011,7 @@ class EagleProposer:
         # q (uniform), so deriving num_draft from num_sampled keeps draft / target
         # / bonus indices consistent with the actual forward layout — no separate
         # mtp_k constant that could desync (the A-bug: 98%->52%).
-        num_draft_tokens = (np.asarray(num_sampled_tokens, dtype=np.int32) - 1)
+        num_draft_tokens = np.asarray(num_sampled_tokens, dtype=np.int32) - 1
         np.clip(num_draft_tokens, 0, self.mtp_k, out=num_draft_tokens)
         sum_drafted_tokens = int(num_draft_tokens.sum())
 
