@@ -99,7 +99,8 @@ _Answer:_
 ## Step 3 — PR Type Classification
 
 - [ ] **Performance optimization** → P1 (benchmark numbers), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
-- [ ] **New aiter op usage / aiter API change** → E1 (aiter dep), B6 (new kwarg unhandled by all ATOM dispatch branches?), E3 (dead param)
+- [ ] **New aiter op usage / aiter API change** → E1 (aiter dep), B5 (param added/removed/renamed propagation), B6 (new kwarg unhandled by all ATOM dispatch branches?), E3 (dead param)
+- [ ] **API signature change** (param added / removed / renamed in an ATOM function or base class, default or return type changed) → B5 (propagation to all receivers), E1 (aiter dep if aiter-side), E2 (plugin bridge sync)
 - [ ] **New constexpr / routing flag / new attribute key added** → B6 (do ALL dispatch branches handle the new value, or assert on it?), C3 (new arch string literal?)
 - [ ] **Model integration** (`atom/models/*.py`) → A2 (shared backbone coverage), Step 4 risk
 - [ ] **Dispatch logic change** → B1 (silent bypass), B2 (phase proxy), B6 (new value unhandled?), A3 (scope too broad)
@@ -268,12 +269,13 @@ When an API surface changes in dimension X, all downstream receivers (Y) must be
 | Sub-type | X (what changed) | Y (downstream not updated) | Z (failure) | Sev |
 |----------|-----------------|---------------------------|-------------|-----|
 | param-discard | new param in signature | function body | value accepted but never used | ⚠️/🔴 |
-| param-removed | param removed from call | same-file call sites | TypeError at call time | 🔴 |
+| param-removed | param removed from signature | all call sites (subclasses/bridges if public) | TypeError at call time | 🔴 |
 | attr-missing | new `getattr` attribute key | all call paths without the attr | silent zero/None fallback | ⚠️/🔴 |
 | dispatch-silent | multi-backend fallback | caller logging | backend switch with no diagnostic | ⚠️ |
-| rename | public symbol renamed | all importers | AttributeError at import time | 🔴 |
+| rename | public symbol renamed | all importers (subclasses/bridges if public) | AttributeError at import/call time | 🔴 |
 
 Severity (param-discard): 🔴 if param controls output correctness (`expert_mask`, `q_scale`, `expert_mapping`); ⚠️ for performance knobs or optional features with working defaults.
+**Public/base-class scope:** if the changed symbol is a base-class method (`deepseek_v2.py` is the base for DSv2/V3/V3-0324/Kimi) or a signature read by a plugin bridge, param-removed and rename break all subclasses and bridges, not just same-file call sites — also apply E2 (plugin bridge sync).
 Exception: method override where base class forces the signature but subclass legitimately ignores the param — flag as 📝 (structural discard, not a bug). E.g., `needs_independent_noise` structurally `del`-ed inside `ATOM_USE_TORCH_SAMPLER` override → 📝.
 Real examples (param-discard): `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `needs_independent_noise` dropped in `prefill_forward` — first token uses wrong sampling mode (ATOM#860).
 Real example (attr-missing): `getattr(self.args,'n_shared_experts',0)` silent zero fallback — shared expert slots silently dropped from mapping with no warning if attribute absent (ATOM#1548).
