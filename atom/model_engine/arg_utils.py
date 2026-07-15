@@ -50,6 +50,7 @@ class EngineArgs:
     cudagraph_mode: str = "FULL"
     load_dummy: bool = False
     enable_expert_parallel: bool = False
+    fake_eplb: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
     enable_tbo: Optional[str] = None
@@ -155,6 +156,13 @@ class EngineArgs:
             "--enable-expert-parallel",
             action="store_true",
             help="Enable expert parallel(EP MoE).",
+        )
+        parser.add_argument(
+            "--fake-eplb",
+            action="store_true",
+            help="Replace MoE router logits with a synthetic uniform "
+            "distribution so every expert is selected equally. For "
+            "benchmarking the balanced-load upper bound only.",
         )
         parser.add_argument(
             "--torch-profiler-dir",
