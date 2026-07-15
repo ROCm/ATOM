@@ -96,6 +96,47 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
+@lru_cache(maxsize=1)
+def init_balance_router_logits(
+    n_routed_experts: int,
+    topk: int,
+    ep_size: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    max_num_tokens: int = 32768,
+):
+    # Build synthetic router logits whose argmax-topk is balanced BOTH across
+    # experts and across EP ranks. ATOM uses contiguous expert->rank sharding
+    # (rank r owns experts [r*L, (r+1)*L), L = E // ep_size). We lay every
+    # (token, choice) pair onto a single flat position p = t * topk + j and walk
+    # the expert ring with no gaps: rank = p % ep_size, slot = (p // ep_size) % L.
+    # Because successive positions advance the rank by one with no overlap, each
+    # token's topk experts land on distinct ranks (and distinct experts), and the
+    # ranks stay balanced as soon as T * topk is a multiple of ep_size -- which
+    # holds far sooner than the per-row rotation would (small decode batches
+    # included).
+    device = "cuda"
+    E = n_routed_experts
+    if ep_size <= 1:
+        # No EP: rank-balance is trivial; keep pure expert-balance via a rolling
+        # window of topk consecutive experts per token.
+        stride = E + topk
+        max_num_tokens_pad = (max_num_tokens + stride - 1) // stride * stride
+        padded = torch.zeros((max_num_tokens_pad, E), dtype=dtype, device=device)
+        padded.view(-1, stride)[:, :topk] = 1.0
+        return padded[:max_num_tokens].contiguous()
+
+    router_logits = torch.zeros((max_num_tokens, E), dtype=dtype, device=device)
+    L = E // ep_size  # experts per rank (remainder experts are left unused)
+    t = torch.arange(max_num_tokens, device=device).unsqueeze(1)  # (T, 1)
+    j = torch.arange(topk, device=device).unsqueeze(0)  # (1, topk)
+    p = t * topk + j  # flat position on the expert ring
+    rank = p % ep_size
+    slot = (p // ep_size) % L
+    expert_ids = rank * L + slot  # (T, topk)
+    router_logits.scatter_(1, expert_ids, 1.0)
+    return router_logits
+
+
 @dataclass
 class FusedMoEParallelConfig:
     tp_size: int
@@ -2576,6 +2617,17 @@ class FusedMoE(torch.nn.Module):
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+        self.balance_router_logits = (
+            init_balance_router_logits(
+                self.global_num_experts,
+                top_k,
+                self.ep_size if self.use_ep else 1,
+                torch.get_default_dtype(),
+                atom_config.max_num_batched_tokens,
+            )
+            if atom_config.fake_eplb
+            else None
+        )
 
     def process_weights_after_loading(self):
         self._online_quant()
@@ -3448,6 +3500,8 @@ class FusedMoE(torch.nn.Module):
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        if self.balance_router_logits is not None:
+            router_logits = self.balance_router_logits[: hidden_states.shape[0]]
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )
