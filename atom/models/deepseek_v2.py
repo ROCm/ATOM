@@ -1562,17 +1562,15 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         super().weight_loader(param, loaded_weight, loaded_shard_id)
 
     def process_weights_after_loading(self):
-        if self._wk_pending_weight is not None or (
-            self._wk_pending_scale is not None and not self._wk_loaded
-        ):
-            raise RuntimeError(
-                "Incomplete FP8 indexer.wk load: both weight and weight_scale "
-                "are required before building wk_weights_proj."
-            )
         if not self._wk_loaded:
-            raise RuntimeError(
-                "Missing indexer.wk load before building wk_weights_proj."
-            )
+            if self._wk_pending_weight is not None or (
+                self._wk_pending_scale is not None
+            ):
+                raise RuntimeError(
+                    "Incomplete FP8 indexer.wk load: both weight and weight_scale "
+                    "are required before building wk_weights_proj."
+                )
+            return
         super().process_weights_after_loading()
 
 
