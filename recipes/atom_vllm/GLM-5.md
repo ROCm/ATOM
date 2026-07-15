@@ -4,7 +4,7 @@ This recipe shows how to run `GLM-5` (including `GLM-5.1` and `GLM-5.2`) models 
 
 GLM-5 features sparse MLA, and is architecturally similar to DeepSeek-V3.2. Its architecture is exposed through `GlmMoeDsaForCausalLM` to be picked up by ATOM OOT. GLM-5.2 is the pivot version of GLM-5 family that additionally uses IndexShare: `"shared"` layers reuse the preceding `"full"` layer's DSA indexer.
 
-Refer to the [GLM-5.2-FP8 Recipe](#glm-52-fp8-recipe) and [GLM-5.2-MXFP4 Recipe](#glm-52-mxfp4-recipe) for deployment details of the latest GLM-5.2 model.
+Refer to the [GLM-5.2 Recipes by Hardware](#glm-52-recipes-by-hardware) for deployment details of the latest GLM-5.2 model.
 
 ## Pull the Docker Image
 Use the latest image for all the recipes below.
@@ -12,62 +12,14 @@ Use the latest image for all the recipes below.
 docker pull rocm/atom-dev:vllm-latest
 ```
 
-## GLM-5.2-FP8 Recipe
-GLM-5.2-FP8 is supported on both MI350X and MI300X GPUs. The recipes may vary between the two GPU platforms due to differences in their capabilities. Check recipes below for more details.
-### Deployment on MI350X GPUs
-```bash
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_USE_FLYDSL_MOE_SORTING=1
+## GLM-5.2 Recipes by Hardware
 
-vllm serve zai-org/GLM-5.2-FP8 \
-    --host localhost \
-    --port 8000 \
-    --async-scheduling \
-    --load-format fastsafetensors \
-    --trust-remote-code \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-    --kv-cache-dtype fp8 \
-    --tensor-parallel-size 4 \
-    --max-num-batched-tokens 16384 \
-    --gpu-memory-utilization 0.9 \
-    --no-enable-prefix-caching \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
-```
-Note:
-- Quick allreduce is used to accelerate the communication and flydsl sort enabled for MOE layers.
-- FP8 kv cache is used for memory efficiency and performance benefits.
-- Online quantization is used to convert the original FP8 weights to kernel-friendly formats, i.e., attention linear weights in PTPC-FP8 and expert weights in MXFP8, enabling optimal hardware performance.
-- The MTP feature is also supported. To enable it, add `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` to the command above.
+The examples below are ordered by hardware. On MI355, MXFP4 recipes are listed first, followed by FP8 recipes. MI300 and MI308 use the same FP8 recipes as MI355.
 
-### Deployment on MI300X/MI308X GPUs
-```bash
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_USE_FLYDSL_MOE_SORTING=1
+### MI355
 
-vllm serve zai-org/GLM-5.2-FP8 \
-    --host localhost \
-    --port 8000 \
-    --async-scheduling \
-    --load-format fastsafetensors \
-    --trust-remote-code \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-    --kv-cache-dtype fp8 \
-    --tensor-parallel-size 8 \
-    --max-num-batched-tokens 16384 \
-    --gpu-memory-utilization 0.9 \
-    --no-enable-prefix-caching \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
-```
-Note:
-- TP=8 is needed on MI300X GPUs due to the memory limit.
-- Online quantization is used to convert both attention and MoE from the original FP8 weights to PTPC-FP8.
-- Similarly, add `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` to enable MTP. Add `--max-model-len 16384` in this usecase as well to fit the memory limit.
+#### GLM-5.2-MXFP4
 
-
-## GLM-5.2-MXFP4 Recipe
-GLM-5.2-MXFP4 is only supported on MI350X GPUs.
-
-### Deployment on MI350X GPUs
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
@@ -87,7 +39,10 @@ vllm serve amd/GLM-5.2-MXFP4 \
     --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "*expert*"]}}'
 ```
 
-To run MTP with MXFP4 model, the `online-quant-config` needs to be updated to quant the bf16 draft layer to PTPC-FP8 for better performance. 
+#### GLM-5.2-MXFP4 MTP
+
+To run MTP with the MXFP4 model, the `online_quant_config` needs to be updated to quantize the bf16 draft layer to PTPC-FP8 for better performance.
+
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
@@ -105,6 +60,139 @@ vllm serve amd/GLM-5.2-MXFP4 \
     --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
     --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "model.layers.[0-9].mlp.*expert*", "model.layers.[1-6][0-9].mlp.*expert*", "model.layers.7[0-7].mlp.*expert*"]}}' \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+```
+
+#### GLM-5.2-FP8
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+vllm serve zai-org/GLM-5.2-FP8 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
+```
+
+#### GLM-5.2-FP8 MTP
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+vllm serve zai-org/GLM-5.2-FP8 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+```
+
+### MI300
+
+#### GLM-5.2-FP8
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+vllm serve zai-org/GLM-5.2-FP8 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
+```
+
+#### GLM-5.2-FP8 MTP
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+vllm serve zai-org/GLM-5.2-FP8 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+```
+
+### MI308
+
+#### GLM-5.2-FP8
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+vllm serve zai-org/GLM-5.2-FP8 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
+```
+
+#### GLM-5.2-FP8 MTP
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+vllm serve zai-org/GLM-5.2-FP8 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 ```
 
