@@ -252,6 +252,114 @@ class TestSchedule:
         assert seq.output_tokens == [sched.eos_token_id]
 
 
+# ── _waiting_new_token_count (PrefillDelayer queue signal) ─────────────────
+
+
+class TestWaitingNewTokenCount:
+    """The coalescer fill signal must count only ADMITTABLE waiting seqs,
+    mirroring `_can_admit_head_prefill`'s skip set — otherwise remote-KV /
+    unschedulable tokens inflate the aggregate and reach the fill target early."""
+
+    def _sched(self):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                max_model_len=64,
+                enable_chunked_prefill=True,
+            )
+        )
+
+    def test_counts_normal_waiting_tokens(self, seq_factory):
+        sched = self._sched()
+        sched.waiting = deque(
+            [seq_factory(list(range(8))), seq_factory(list(range(10)))]
+        )
+        assert sched._waiting_new_token_count() == 18
+
+    def test_skips_remote_kv_seqs(self, seq_factory):
+        sched = self._sched()
+        normal = seq_factory(list(range(8)))
+        remote = seq_factory(list(range(10)))
+        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.waiting = deque([normal, remote])
+        # Only the 8 admittable tokens count; the 10 remote-KV tokens are skipped.
+        assert sched._waiting_new_token_count() == 8
+
+    def test_skips_unschedulable_oversized_seq(self, seq_factory):
+        # Prompt longer than max_model_len is permanently unschedulable → skipped.
+        sched = self._sched()
+        normal = seq_factory(list(range(8)))
+        oversized = seq_factory(list(range(200)))  # > max_model_len=64
+        sched.waiting = deque([normal, oversized])
+        assert sched._waiting_new_token_count() == 8
+
+    def test_saturates_at_cap(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=16,
+                max_model_len=64,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.waiting = deque([seq_factory(list(range(10))) for _ in range(5)])
+        assert sched._waiting_new_token_count() == 16  # capped, scan short-circuits
+
+
+class TestPartialPrefillRemainingTokens:
+    """Remaining tokens of mid-chunked-prefill seqs, folded into the coalescer
+    pending signal so a small partial tail chunk batches instead of firing
+    its own tiny forward. `remaining = num_tokens - num_cached_tokens`."""
+
+    def _sched(self):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                max_model_len=64,
+                enable_chunked_prefill=True,
+            )
+        )
+
+    def test_zero_when_no_partials(self, seq_factory):
+        sched = self._sched()
+        sched.running = deque([seq_factory(list(range(8)))])  # not partial
+        assert sched._partial_prefill_remaining_tokens() == 0
+
+    def test_sums_partial_remaining(self, seq_factory):
+        sched = self._sched()
+        p1 = seq_factory(list(range(20)))
+        p1.is_partial_prefill = True
+        p1.num_cached_tokens = 8  # 12 remaining
+        p2 = seq_factory(list(range(30)))
+        p2.is_partial_prefill = True
+        p2.num_cached_tokens = 25  # 5 remaining
+        plain = seq_factory(list(range(10)))  # not partial → excluded
+        sched.running = deque([p1, p2, plain])
+        sched._partial_prefill_count = 2
+        assert sched._partial_prefill_remaining_tokens() == 17
+
+    def test_saturates_at_cap(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=1000,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=16,
+                max_model_len=4096,
+                enable_chunked_prefill=True,
+            )
+        )
+        big = seq_factory(list(range(100)))
+        big.is_partial_prefill = True
+        sched.running = deque([big])
+        sched._partial_prefill_count = 1
+        assert sched._partial_prefill_remaining_tokens() == 16  # capped
+
+
 # ── long_prefill_token_threshold ──────────────────────────────────────────
 
 
