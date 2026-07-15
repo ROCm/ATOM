@@ -3144,14 +3144,18 @@ class ModelRunner:
 
         return logits, hidden_states
 
-    def flush_pp_send(self) -> None:
+    def flush_pp_send(self) -> bool:
         """Commit any outstanding async PP send work.
 
-        Called during shutdown to ensure in-flight isend operations complete
-        before process teardown.
+        Called both mid-run (when a stage would idle without issuing a forward)
+        and during shutdown, to ensure in-flight isend operations complete
+        instead of dangling without a matching downstream recv. Returns True so
+        callers using ``call_func(..., wait_out=True)`` receive a result (the
+        worker only enqueues non-None returns).
         """
         if self._pp_pending_send:
             commit_pp_send_work(self._pp_pending_send)
+        return True
 
     def postprocess(
         self,

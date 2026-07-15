@@ -114,12 +114,33 @@ class PPEngineCoreProc(EngineCore):
             # run this stage's layers; workers NCCL-send hidden downstream and
             # (non-last) produce no logits. The forward returns fast — it does
             # not wait for downstream stages, which is what fills the pipeline.
+            if (
+                self.kv_transfer_enabled
+                and scheduled_batch.connector_meta_output is not None
+            ):
+                self.runner_mgr.call_func(
+                    "process_kvconnector_output",
+                    scheduled_batch.connector_meta_output,
+                )
             self.pp_transport.send_metadata(scheduled_batch)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
             # Block re-decoding these seqs until their tokens come back.
             self.scheduler.mark_pp_inflight(scheduled_batch)
             self._in_flight.append((scheduled_batch, seqs, needs_output))
             launched += 1
+
+        # No forward ran this step: commit the previous forward's deferred send
+        # now. run_model only commits at the start of the *next* forward, so an
+        # uncommitted send would dangle across the collect/idle spin and leave
+        # the downstream stage's matching recv unposted until the NCCL watchdog.
+        if launched == 0:
+            self.runner_mgr.call_func("flush_pp_send", wait_out=True)
+
+        # ---- KV transfer: drain completed transfers so blocks are freed. ----
+        # The non-PP path (engine_core.py) calls _poll_kv_transfer_progress()
+        # after every forward. Without this, deferred_free_blocks accumulates
+        # indefinitely and the block pool exhausts under sustained load.
+        self._poll_kv_transfer_progress()
 
         # ---- Collect: drain the FIFO head without blocking the stage. ----
         # Non-output batches (middle-chunk prefill) never produce tokens, so
@@ -178,6 +199,10 @@ class PPEngineCoreProc(EngineCore):
                 # head's scheduled batch, then run this stage's layers.
                 batch = self.pp_transport.recv_metadata(timeout_ms=100)
                 if batch is None:
+                    # No forward this iteration: commit any deferred send so it
+                    # does not dangle across the idle wait and starve the next
+                    # stage's matching recv.
+                    self.runner_mgr.call_func("flush_pp_send", wait_out=True)
                     continue
                 fwd_out = self.runner_mgr.call_func("forward", batch, wait_out=True)
                 if self.is_last and batch.produces_output():
