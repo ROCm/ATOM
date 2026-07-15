@@ -169,12 +169,17 @@ def _aiter_rms_quant_fake(
         # (M, num_groups). Matches GemmaRMSNorm._forward_fused_fp8.
         out = torch.empty((M, N), dtype=fp8, device=x.device)
         num_groups = N // 128
+        scale_dtype = (
+            torch.float8_e8m0fnu
+            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+            else torch.float32
+        )
         if transpose_scale:
             scale = torch.empty(
-                (num_groups, M), dtype=torch.float32, device=x.device
+                (num_groups, M), dtype=scale_dtype, device=x.device
             ).view(M, num_groups)
         else:
-            scale = torch.empty((M, num_groups), dtype=torch.float32, device=x.device)
+            scale = torch.empty((M, num_groups), dtype=scale_dtype, device=x.device)
     else:  # _QV_PER_TOKEN
         out = torch.empty((M, N), dtype=fp8, device=x.device)
         scale = torch.empty((M, 1), dtype=torch.float32, device=x.device)

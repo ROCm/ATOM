@@ -62,22 +62,12 @@ else:
 
 if use_triton_gemm():
     try:
-        # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
         from aiter.ops.triton.gemm_afp4wfp4 import (
             gemm_afp4wfp4_preshuffle,
         )  # noqa: E402
     except ImportError as e:
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
-
-    # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
-    try:
-        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-            gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton,
-        )  # noqa: E402
-    except ImportError as e:
-        logger.warning(f"Triton w8a8 GEMM not available: {e}")
-        gemm_a8w8_blockscale_bpreshuffle_triton = None
 
     # Plain (non-preshuffle) Triton blockscale GEMM. Consumes an unshuffled
     # (N, K) weight with row-major x_scale (M, scale_k) and w_scale
@@ -100,7 +90,6 @@ if use_triton_gemm():
         gemm_a8w8_triton = None
 else:
     gemm_afp4wfp4_preshuffle = None
-    gemm_a8w8_blockscale_bpreshuffle_triton = None
     gemm_a8w8_blockscale_triton = None
     gemm_a8w8_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
@@ -281,14 +270,7 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
 ) -> torch.Tensor:
-    if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
-        weight_shuffled = weight.reshape(weight.shape[0] // 16, weight.shape[1] * 16)
-        y = gemm_a8w8_blockscale_bpreshuffle_triton(
-            x, weight_shuffled, x_scale, w_scale, dtype
-        )
-    else:
-        y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
-    return y
+    return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
 
 
 def gemm_a8w8_blockscale_triton_fake(
@@ -476,11 +458,16 @@ class LinearBase(nn.Module):
                     torch.empty(self.output_size, 1, dtype=dtypes.fp32)
                 )
             elif quant_type == QuantType.per_1x128:
+                scale_dtype = (
+                    dtypes.fp8_e8m0
+                    if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+                    else dtypes.fp32
+                )
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
-                        dtype=dtypes.fp32,
+                        dtype=scale_dtype,
                     )
                 )
             elif quant_type == QuantType.per_1x32:
@@ -597,6 +584,7 @@ class LinearBase(nn.Module):
 
         assert online_quant_dtype in [
             torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
             torch.float4_e2m1fn_x2,
         ], (
             f"Unsupported online quant: "
@@ -678,6 +666,7 @@ class LinearBase(nn.Module):
         self.quant_func = get_hip_quant(online_quant_type)
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
+            and q_weight.dtype != torch.float8_e4m3fnuz
         )
         # A dynamic online target (e.g. ptpc per_Token) quantizes activations at
         # runtime. Drop any static input_scale inherited from a static per_Tensor
@@ -810,6 +799,11 @@ class LinearBase(nn.Module):
                     quant_func = functools_partial(
                         self.quant_func,
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                        **(
+                            {"scale_type": dtypes.fp8_e8m0}
+                            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+                            else {}
+                        ),
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(
