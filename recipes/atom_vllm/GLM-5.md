@@ -57,6 +57,28 @@ vllm serve amd/GLM-5.2-MXFP4 \
     --no-enable-prefix-caching
 ```
 
+### GLM-5.2-MXFP4 MTP3 Recipe
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+vllm serve amd/GLM-5.2-MXFP4 \
+    --host localhost \
+    --port 8004 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.9 \
+    --max-num-batched-tokens 16384 \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "model.layers.[0-9].mlp.*expert*", "model.layers.[1-6][0-9].mlp.*expert*", "model.layers.7[0-7].mlp.*expert*"]}}' \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+```
+
+
+
 ## Step 3: Performance Benchmark
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash
