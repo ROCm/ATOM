@@ -43,7 +43,7 @@ on:
         default: ''
         type: string
       case_names:
-        description: 'Overrides model_names. Comma-separated: ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-2p1d-dpa-tp8,kimi-k25-1p1d-tp4,kimi-k25-2p1d-tp4,kimi-k25-2p1d-dpa-tp4,kimi-k25-1p2d-tp4,minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3'
+        description: 'Overrides model_names. Comma-separated: ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-2p1d-dpa-tp8,kimi-k25-1p1d-tp4,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3'
         required: false
         default: ''
         type: string
@@ -52,21 +52,14 @@ on:
         required: false
         default: rocm/atom-dev:latest
         type: string
-      atomesh_slurm_account:
-        description: 'Slurm account'
-        required: false
-        default: ''
-        type: string
-      atomesh_slurm_partition:
-        description: 'Slurm partition'
-        required: false
-        default: ''
-        type: string
       atomesh_slurm_submit_runner:
-        description: 'GitHub runner label used to submit Slurm jobs'
+        description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X'
         required: false
         default: atomesh-cicd
-        type: string
+        type: choice
+        options:
+          - atomesh-cicd
+          - atomesh-cicd-mi350
       atomesh_log_root:
         description: 'Root directory for ATOMesh Slurm logs'
         required: false
@@ -104,15 +97,15 @@ on:
         type: boolean
 
 env:
-  ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != '' && inputs.atomesh_slurm_account || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks') }}
-  ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != '' && inputs.atomesh_slurm_partition || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks') }}
+  ATOMESH_SLURM_ACCOUNT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks' }}
+  ATOMESH_SLURM_PARTITION: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks' }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
   ATOMESH_DASHBOARD_HARDWARE: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'MI350X' || 'MI355X' }}
   ATOMESH_PD_RANK_MAPPING_POLICY: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'idx2idx' || 'none' }}
   ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root != '' && inputs.atomesh_log_root || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || '/it-share/ATOMESH_LOG/') }}
   ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || '/mnt/models' }}
-  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != '' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'mia1-p02-g42,mia1-p02-g44') }}
-  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != '' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47') }}
+  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != '' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || 'mia1-p02-g42,mia1-p02-g44') }}
+  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != '' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47') }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
