@@ -1059,6 +1059,7 @@ class Config:
     mark_trace: bool = False
     load_dummy: bool = False
     enable_expert_parallel: bool = False
+    fake_eplb: bool = False
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
