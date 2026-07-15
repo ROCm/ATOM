@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783963239143,
+  "lastUpdate": 1784140975680,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -913,6 +913,40 @@ window.BENCHMARK_DATA = {
             "value": 0.7498,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29268178884 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607121715 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7498 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "zufayu",
+            "username": "zufayu",
+            "email": "zufa.yu@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "0e9804c21ae050e4fc5627ff8c8d40390b63e2a5",
+          "message": "review-pr skill v2: dispatch gap rule, arch-constant FP fix, P5 timing error (#1549)\n\n* review-pr skill v2: dispatch gap rule, arch-constant FP fix, P5 timing error\n\nKey changes based on 191-PR test sweep (88 aiter + 93 ATOM):\n\n- B6 (new): \"New dispatch value not handled by all paths, no warning\"\n  Highest-frequency finding (~18% of PRs). Covers: new dtype/arch/flag/\n  getattr attribute added to a multi-way dispatch where some branches silently\n  fall through to wrong behavior with no assert/warning. FP self-check\n  included (upstream assert/isinstance guard → skip).\n  Real examples: ATOM#1548 (getattr silent zero), ATOM#841 (unmerged aiter kwarg).\n\n- C3 (new): \"New GPU arch string or arch-specific constant hardcoded\"\n  Extended beyond arch strings to cover magic constants tied to specific\n  model configs (e.g., hardcoded 576 for MLA kv_lora_rank+qk_rope_head_dim).\n  FP self-check front-loaded: search unchanged lines first; if constant\n  already exists → skip (pre-existing style).\n  Real example: ATOM#860 _bind_kv_cache_to_modules() hardcoded 576.\n\n- P5 (new): \"Benchmark timing excludes one-time setup cost\"\n  Covers: shuffle_weight, first-call JIT compile excluded from timing window\n  → claimed speedup is actually a regression when setup cost is included.\n\n- Step 3 classification: wired B6/P5 into trigger lines so new\n  constexpr/routing-flag PRs and perf PRs auto-prompt the right checks.\n  New aiter API usage PRs trigger B6 (new kwarg unhandled by all branches?).\n\n- Step 8 output format: findings now require three parts (Problem + Impact +\n  Action verb). \"Author must\" / \"Reviewer should ask\" required; no verb = do\n  not include in output.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n\n* review-pr skill: B5→parametric family, G1b, D1b, C3 exemption, HK5 envs.py\n\n- B5 restructured into a 5-row parametric table (param-discard, param-removed,\n  attr-missing, dispatch-silent, rename) — aligned with aiter's B6 family;\n  ATOM-specific attr-missing sub-type added (getattr silent-zero fallback,\n  ATOM#1548 real example)\n- G1b: blocking queue.get() without timeout in production serving code;\n  ATOM#789 call_soon_threadsafe noted as correct pattern (not G1b)\n- D1b: Python-side UnboundLocalError from conditional variable assignment\n  (ATOM#860 real example)\n- C3: add capability guard exemption — arch string in dedicated _detect_*()\n  helper is not centralized dispatch hardcoding (ATOM#749)\n- HK5: updated to \"register in atom/envs.py AND document in README\"\n  (ATOM#749 finding: ATOM_NATIVE_TRITON_ATTN not in envs.py)\n- Step 3 classification: new trigger entries for G1b and D1b\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n\n* review-pr: sync cross-file verification + CI-failure triage + verified/inferred discipline\n\nPorts the general (non-aiter-specific) v3 hardening from the aiter skill:\n- grep .cu+.cuh+.h, not just diff files, before claiming missing sync/branch\n- classify CI failures as infra/unrelated vs real (e.g. RTD docs failing on a .claude-only change is infra, ATOM#1549)\n- tag findings [verified]/[inferred]; never ship an unconfirmed root cause\n(aiter-only rules E4 downstream-CI / E5 owner-signoff intentionally NOT ported — ATOM is the downstream.)\n\n* review-pr: add global 🔴 gate — must name concrete triggering input before firing 🔴\n\nGeneralizes the per-rule FP self-check into a mandatory gate over all 🔴\nfindings, closing the gap on rules like D9 that omit one. A 🔴 with no\ndemonstrable triggering shape/scale/input must be downgraded or dropped.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* review-pr: fix P5 — #4166 was a false positive, not a real example\n\naiter#4166 preshuffles the static weight once outside the timing loop and\nhonestly reports geomean 0.69x; it never claimed 1.14x. The old example\ntaught the amortization error. Reframe P5 to fire only on costs that recur\nper call / per cold start, and keep #4166 as a counter-example.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* review-pr: Step 6 — add structural verification for AI-generated code\n\nThe description-smell table only pre-filters; AI fails structurally. Add six\naction-forcing checks that each yield a verified/inferred finding: hallucinated\n-symbol sweep, twin divergence, claim/comment↔code + number provenance, safety\ntheater, test-calibrated-to-pass, magic constant without derivation.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* review-pr: close Step-3 routing gaps + add FP self-check + staleness guard\n\n① Route D6/D7 (fake fns), D8 (contiguous), D9 (int32), D4 (invariant reversal)\n   into Step 3 — previously reachable only by scanning all of Section D.\n② Add pre-existing-search FP self-check to C1 (dtype hardcode), matching C3.\n③ Staleness guard on P2 production shapes.\n(ATOM has no tl.load-mask rule and no E4, so those aiter-side changes N/A here.)\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* review-pr: fix B5 (API-modification rule) — route it + widen public-API scope\n\nB5 (API propagation) had no Step-3 entry, and the \"aiter API change\" row pointed\nonly to B6 (new dispatch value), not B5. Route B5 via that row + a new \"API\nsignature change\" row. Fix param-removed/rename scope: a base-class or\nbridge-read signature change breaks all subclasses/bridges, not just same-file\n— widened and linked to E2 (plugin bridge sync).\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* review-pr: add FP self-check to B5 rename/param-removed (found by live test on aiter#4227)\n\nMirror of the aiter B6 fix: a rename/removal behind a same-named wrapper / alias /\nre-export is backward-compatible and must not fire. Confirm no compatibility shim\nbefore firing.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: root <root@hjbog-srdc-24.amd.com>\nCo-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>",
+          "timestamp": "2026-07-15T10:13:21Z",
+          "url": "https://github.com/ROCm/ATOM/commit/0e9804c21ae050e4fc5627ff8c8d40390b63e2a5"
+        },
+        "date": 1784140948256,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7551,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29433095078 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607151539 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7544 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.881,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29433095078 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202607151539 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3055 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
