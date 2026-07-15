@@ -3,8 +3,16 @@
 This recipe shows how to run `GLM-5` (including `GLM-5.1` and `GLM-5.2`) models with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
 GLM-5 features sparse MLA, and is architecturally similar to DeepSeek-V3.2. Its architecture is exposed through `GlmMoeDsaForCausalLM` to be picked up by ATOM OOT. GLM-5.2 is the pivot version of GLM-5 family that additionally uses IndexShare: `"shared"` layers reuse the preceding `"full"` layer's DSA indexer.
+Here is the support matrix for GLM-5.2 across different hardware platforms:
 
-Refer to the [GLM-5.2 Recipes by Hardware](#glm-52-recipes-by-hardware) for deployment details of the latest GLM-5.2 model.
+| Hardware | Data Type | Model | MTP Support | Supported Backend |
+| --- | --- | --- | --- | --- |
+| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | ✅ | - [ATOM](../GLM-5.md)<br>- [vLLM-ATOM](./GLM-5.md)<br>- [SGLang-ATOM](../atom_sglang/GLM-5.md) |
+| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | - [ATOM](../GLM-5.md)<br>- [vLLM-ATOM](./GLM-5.md)<br>- [SGLang-ATOM](../atom_sglang/GLM-5.md) |
+| MI300 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | - [ATOM](../GLM-5.md) <br>- [vLLM-ATOM](./GLM-5.md) <br>- [SGLang-ATOM](../atom_sglang/GLM-5.md) |
+| MI308 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | - [ATOM](../GLM-5.md) <br>- [vLLM-ATOM](./GLM-5.md) <br>- [SGLang-ATOM](../atom_sglang/GLM-5.md) |
+
+Refer to the [GLM-5.2 Recipes](#glm-52-recipes-by-hardware) for deployment details on different platforms with vLLM-ATOM backend.
 
 ## Pull the Docker Image
 Use the latest image for all the recipes below.
@@ -12,9 +20,9 @@ Use the latest image for all the recipes below.
 docker pull rocm/atom-dev:vllm-latest
 ```
 
-## GLM-5.2 Recipes by Hardware
+## GLM-5.2 Recipes
 
-The examples below are ordered by hardware. On MI355, MXFP4 recipes are listed first, followed by FP8 recipes. MI300 and MI308 use the same FP8 recipes as MI355.
+MI355 supports both FP4 and FP8 deployments, whereas MI300 and MI308 support FP8 deployments only. Recipe configurations may differ across platforms to account for hardware-specific capabilities.
 
 ### MI355
 
@@ -107,6 +115,8 @@ vllm serve zai-org/GLM-5.2-FP8 \
 ```
 
 ### MI300
+On MI300/308, TP=8 is needed due to the memory limitations. To run MTP, set `max-model-len` to 16384 to further reduce memory pressure, otherwise OOM crash may occur. 
+Note `online_quant_config` for the difference compared to MI355. On MI300/308, both attention linear layers and MoE experts are online-quantized to PTPC-FP8, leveraging the high-performance kernels on these platforms.
 
 #### GLM-5.2-FP8
 
@@ -122,11 +132,11 @@ vllm serve zai-org/GLM-5.2-FP8 \
     --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
-    --tensor-parallel-size 4 \
+    --tensor-parallel-size 8 \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
 ```
 
 #### GLM-5.2-FP8 MTP
@@ -143,11 +153,12 @@ vllm serve zai-org/GLM-5.2-FP8 \
     --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
-    --tensor-parallel-size 4 \
+    --tensor-parallel-size 8 \
     --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 ```
 
@@ -167,11 +178,11 @@ vllm serve zai-org/GLM-5.2-FP8 \
     --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
-    --tensor-parallel-size 4 \
+    --tensor-parallel-size 8 \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
 ```
 
 #### GLM-5.2-FP8 MTP
@@ -190,9 +201,10 @@ vllm serve zai-org/GLM-5.2-FP8 \
     --kv-cache-dtype fp8 \
     --tensor-parallel-size 4 \
     --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 ```
 
