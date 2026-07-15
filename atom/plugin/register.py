@@ -787,33 +787,11 @@ def init_aiter_dist(config: Config) -> None:
     logger.info(
         f"Initialize aiter dist for using aiter custom collective op for plugin mode, rank:{rank}"
     )
-    if (
-        config.plugin_config.is_sglang
-        and os.environ.get("SGLANG_DISABLE_AITER_CUSTOM_ALL_REDUCE", "0") == "1"
-    ):
-        original_set_custom_all_reduce = aiter_comm.set_custom_all_reduce
-
-        def _force_disable_custom_all_reduce(_enable: bool) -> None:
-            original_set_custom_all_reduce(False)
-
-        aiter_comm.set_custom_all_reduce = _force_disable_custom_all_reduce
-        try:
-            init_dist_env(
-                tensor_model_parallel_size=tensor_parallel_size,
-                rankID=rank,
-                backend="nccl",
-                distributed_init_method=distributed_init_method,
-                data_parallel_size=config.parallel_config.data_parallel_size,
-                data_parallel_rank=config.parallel_config.data_parallel_rank,
-            )
-        finally:
-            aiter_comm.set_custom_all_reduce = original_set_custom_all_reduce
-    else:
-        init_dist_env(
-            tensor_model_parallel_size=tensor_parallel_size,
-            rankID=rank,
-            backend="nccl",
-            distributed_init_method=distributed_init_method,
-            data_parallel_size=config.parallel_config.data_parallel_size,
-            data_parallel_rank=config.parallel_config.data_parallel_rank,
-        )
+    init_dist_env(
+        tensor_model_parallel_size=tensor_parallel_size,
+        rankID=rank,
+        backend="nccl",
+        distributed_init_method=distributed_init_method,
+        data_parallel_size=config.parallel_config.data_parallel_size,
+        data_parallel_rank=config.parallel_config.data_parallel_rank,
+    )
