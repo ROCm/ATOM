@@ -870,6 +870,9 @@ class MLAAttention(nn.Module):
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
             paged_kv_indices = self.sparse_kv_indices_buffer
+            # Sparse attention needs one last-page len per query token; the dense
+            # kv_last_page_lens (per-seq) would over-read -> illegal access.
+            kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
@@ -1047,8 +1050,14 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     max_q_len = 1
                 else:
+                    # Non-MTP sparse decode: KV is packed per token at
+                    # page_size=1, so last_page_len is 1 for every seq. Use the
+                    # all-1s sparse buffer, NOT the dense per-block
+                    # kv_last_page_lens (which makes the asm kernel over-read
+                    # past the written sparse-index region -> illegal access).
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = not (dp_size > 1)

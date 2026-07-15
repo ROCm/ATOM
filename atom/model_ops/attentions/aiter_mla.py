@@ -8,6 +8,7 @@ from typing import List, Optional, Type
 
 import numpy as np
 import torch
+import triton
 from atom.utils import envs
 from aiter import (
     decode_update_mla_metadata_v1,
@@ -20,6 +21,7 @@ from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
+    mtp_prepare_decode_mla_kernel,
 )
 from atom.utils.forward_context import AttentionMetaData, Context
 
@@ -99,6 +101,11 @@ class AiterMLABackend(AttentionBackend):
 
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
+    # EagleProposer folds the per-draft-step position/context bump into
+    # prepare_mtp_decode's fused kernel when this is set (matches the MHA
+    # backend). The fused kernel handles both sparse and dense MLA.
+    fuse_mtp_decode_position_update = True
+
     def __init__(self, model_runner):
         if envs.ATOM_MLA_PAGE_SIZE > 1:
             self.block_size = envs.ATOM_MLA_PAGE_SIZE
@@ -111,6 +118,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 f"got --block-size {model_runner.block_size}"
             )
         CommonAttentionBuilder.__init__(self, model_runner)
+        # Single-program block for the fused MTP-decode metadata kernel. Sized
+        # to the max batch (runtime bs <= max_bs) so one tl.cumsum spans the
+        # whole batch in a single launch.
+        self._mtp_fuse_block = triton.next_power_of_2(self.max_bs + 1)
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
@@ -508,6 +519,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         max_q_len: int,
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
+        sparse_decode: bool = False,
     ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
@@ -523,20 +535,41 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
-        # Dense layers use kv_indptr (full KV lengths per seq).
-        # sparse_kv_indptr is per-token in MTP mode and must NOT be
-        # indexed with [:bs+1] here — that misinterprets the per-token
-        # cumsum as per-seq, producing wrong KV lengths and OOB metadata.
+        # This work metadata feeds sparse (DSA) attention when either:
+        #   - max_q_len == 1: the plain single-token sparse decode, or
+        #   - sparse_decode=True: the MTP draft (EagleProposer) whose single
+        #     sparse block reuses these buffers but passes the target's original
+        #     max_seqlen_qo (>1) through prepare_mtp_decode, so the max_q_len==1
+        #     test alone misses it.
+        # In both cases the KV is the per-token top-k selection, so the metadata
+        # must be built from sparse_kv_indptr; using the dense kv_indptr makes the
+        # asm kernel's kv_end run past sparse_kv_indptr[-1] into the stale region
+        # of the persistent sparse-index buffer once the context exceeds
+        # index_topk (dense >> sparse) -> illegal KV-cache access.
+        use_sparse_meta = self.is_sparse and (max_q_len == 1 or sparse_decode)
         kv_indptr_for_metadata = (
             var["sparse_kv_indptr"].gpu[: bs + 1]
-            if self.is_sparse and max_q_len == 1
+            if use_sparse_meta
             else var["kv_indptr"].gpu[: bs + 1]
+        )
+        # Sparse decode packs KV per query token at page_size=1, so every "page"
+        # is exactly one token -> last_page_len must be 1. The dense
+        # var["kv_last_page_lens"] holds the real last-BLOCK fill (1..block_size);
+        # feeding it here makes get_mla_metadata_v1 compute a per-seq KV extent of
+        # (sparse_count - 1 + dense_last_page_len), i.e. up to block_size-1 pages
+        # PAST the written sparse-index region -> stale-index over-read. Mirror
+        # kv_indptr_for_metadata (and the prefill/MTP-verify paths, which already
+        # use the all-1s sparse buffer).
+        kv_last_page_lens_for_metadata = (
+            var["sparse_kv_last_page_lens"].gpu[:bs]
+            if use_sparse_meta
+            else var["kv_last_page_lens"].gpu[:bs]
         )
         if only_update:
             decode_update_mla_metadata_v1(
                 var["cu_seqlens_q"].gpu[: bs + 1],
                 kv_indptr_for_metadata,
-                var["kv_last_page_lens"].gpu[:bs],
+                kv_last_page_lens_for_metadata,
                 self.padded_num_attention_heads,
                 1,  # nhead_kv,
                 True,
@@ -557,7 +590,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             get_mla_metadata_v1(
                 var["cu_seqlens_q"].gpu[: bs + 1],
                 kv_indptr_for_metadata,
-                var["kv_last_page_lens"].gpu[:bs],
+                kv_last_page_lens_for_metadata,
                 self.padded_num_attention_heads,
                 1,  # nhead_kv,
                 True,
@@ -589,21 +622,53 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         positions: torch.Tensor,  # [total_tokens] int32
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
+        *,
+        update_context_lens: bool = False,
+        positions_out: torch.Tensor | None = None,
+        last_token_indices: torch.Tensor | None = None,
     ):
+        """Per-draft-step MLA metadata update, fused into a single kernel.
+
+        One ``_mtp_prepare_decode_mla_kernel`` launch performs, in place:
+          - ``kv_indptr += cu_seqlens_q`` (needed by kv_indices + slot_mapping),
+          - (sparse) per-seq ``min(kv_count, index_topk)`` cumsum ->
+            ``sparse_kv_indptr``,
+          - (fused position update) ``positions += 1`` when ``positions_out`` is
+            given, and ``context_lens += 1`` when ``update_context_lens`` is set.
+
+        ``fuse_mtp_decode_position_update`` makes EagleProposer route the
+        per-step position/context bumps through here instead of launching them
+        as separate kernels. ``last_token_indices`` is accepted for signature
+        parity with the MHA backend but unused (MLA's ``positions`` is already
+        one entry per sequence at this point).
+        """
+        del last_token_indices  # MLA positions are already per-seq (1 per token)
         var = self.model_runner.forward_vars
         kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+        cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
         if self.is_sparse:
-            # Update dense kv_indptr (needed for kv_indices generation and slot_mapping)
-            kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
-            # Recompute sparse_kv_indptr: per-seq sparse count = min(dense_kv_count, index_topk)
             sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
-            kv_counts = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
-            sparse_counts = torch.clamp(kv_counts, max=self.index_topk)
-            sparse_kv_indptr[0] = 0
-            sparse_kv_indptr[1 : bs + 1] = torch.cumsum(sparse_counts, dim=0)
         else:
             assert self.block_size == 1
-            kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
+            sparse_kv_indptr = None
+
+        update_positions = positions_out is not None
+        context_lens = var["context_lens"].gpu[:bs] if update_context_lens else None
+
+        mtp_prepare_decode_mla_kernel[(1,)](
+            kv_indptr,
+            cu_seqlens_q,
+            sparse_kv_indptr if self.is_sparse else kv_indptr,
+            positions_out if update_positions else kv_indptr,
+            context_lens if update_context_lens else kv_indptr,
+            bs,
+            self.index_topk if self.is_sparse else 0,
+            positions_out.stride(0) if update_positions else 1,
+            IS_SPARSE=self.is_sparse,
+            UPDATE_POSITIONS=update_positions,
+            UPDATE_CONTEXT_LENS=update_context_lens,
+            BLOCK=self._mtp_fuse_block,
+        )
 
         kv_indices_generate_triton(
             var["block_tables"].gpu[:bs],
@@ -612,11 +677,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             max_seqlen_k,
         )
-        result = self.set_mla_persistent_worker_buffers(
-            bs, max_seqlen_q, only_update, num_reject_tokens
-        )
         if self.is_sparse:
+            # The MTP draft's single sparse block reads sparse_kv_indptr, but it
+            # reuses the TARGET's work_info buffer, which was built dense. The
+            # incremental decode_update path cannot convert that dense work_info
+            # to sparse: it rebases each item's (dense) work_kv_len onto the new
+            # sparse seq_kv_end, driving kv_start negative and kv_end past the
+            # written sparse-index region -> illegal access. So do a FRESH sparse
+            # build (only_update=False) from sparse_kv_indptr instead. The draft
+            # emits exactly one query token per seq (cu_seqlens_q is an arange),
+            # so max_seqlen_qo must be 1 — passing the caller's max_seqlen_q (the
+            # target's verify width, e.g. 4) sets uni_seqlen_qo>1 while
+            # cu_seqlens_q says 1, which makes get_mla_metadata_v1 emit q ranges
+            # that run past the actual query rows. sparse_kv_indptr already
+            # reflects the reject-adjusted KV lengths, so num_reject_tokens is
+            # not needed here.
+            result = self.set_mla_persistent_worker_buffers(
+                bs,
+                1,
+                only_update=False,
+                num_reject_tokens=None,
+                sparse_decode=True,
+            )
             result["sparse_kv_indptr"] = sparse_kv_indptr
+        else:
+            result = self.set_mla_persistent_worker_buffers(
+                bs, max_seqlen_q, only_update, num_reject_tokens
+            )
         return result
 
     def compute_block_bytes(self) -> int:
@@ -814,9 +901,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : sum_scheduled_tokens + 1
             ]
-            attn_metadata.kv_last_page_lens = var["sparse_kv_last_page_lens"].gpu[
-                :sum_scheduled_tokens
-            ]
+            # Sparse (DSA) attention: one last-page len per query token (all 1s,
+            # page_size=1). Lives only on sparse_kv_last_page_lens; kv_last_page_lens
+            # stays the dense per-seq buffer set by the has_cached block below.
+            attn_metadata.sparse_kv_last_page_lens = var[
+                "sparse_kv_last_page_lens"
+            ].gpu[:sum_scheduled_tokens]
 
             # Per-query req_id: token_id 0..sum_scheduled_tokens-1 maps to batch id.
             # Use counts (new tokens per batch), not context_lens (full seq len).
@@ -835,7 +925,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             get_mla_metadata_v1(
                 attn_metadata.sparse_cu_seqlens_q,
                 attn_metadata.sparse_kv_indptr,
-                attn_metadata.kv_last_page_lens,
+                attn_metadata.sparse_kv_last_page_lens,
                 self.padded_num_attention_heads,
                 1,  # nhead_kv
                 True,
@@ -1191,6 +1281,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ).repeat_interleave(max_seqlen_q)
             self._token_to_seq_idxs_gpu[sum_scheduled_tokens:sum_tokens] = 0
             attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:sum_tokens]
+        elif self.is_sparse:
+            # Non-MTP sparse decode (single token per seq): the sparse KV is
+            # packed at page_size=1, so last_page_len is 1 for every seq. Expose
+            # the all-1s buffer so _forward_decode passes it to mla_decode_fwd
+            # instead of the dense per-block kv_last_page_lens (which would make
+            # the kernel over-read past the written sparse-index region).
+            attn_metadata.sparse_kv_last_page_lens = var[
+                "sparse_kv_last_page_lens"
+            ].gpu[:bs]
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
@@ -1325,13 +1424,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
 
         kv_indptr_for_mla = var[f"{p}kv_indptr"].gpu[: padded_bs + 1]
+        kv_last_page_lens_for_mla = var[f"{p}kv_last_page_lens"].gpu[:padded_bs]
         if self.is_sparse:
             kv_indptr_for_mla = var[f"{p}sparse_kv_indptr"].gpu[: padded_bs + 1]
+            # Sparse KV is packed per token at page_size=1 -> last_page_len is 1.
+            # The dense per-block buffer would over-read past the sparse indices
+            # (see set_mla_persistent_worker_buffers). The all-1s sparse buffer is
+            # batch-independent, so the shared (non-ubatch) copy is safe here.
+            kv_last_page_lens_for_mla = var["sparse_kv_last_page_lens"].gpu[:padded_bs]
 
         get_mla_metadata_v1(
             var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
             kv_indptr_for_mla,
-            var[f"{p}kv_last_page_lens"].gpu[:padded_bs],
+            kv_last_page_lens_for_mla,
             self.padded_num_attention_heads,
             1,  # nhead_kv
             True,
@@ -1412,6 +1517,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 bs, dtype=torch.int32, device=self.device
             ).repeat_interleave(max_q_len)
             attn_matadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:sum_tokens]
+        elif self.is_sparse:
+            # Non-MTP sparse decode capture: all-1s per-token last-page lens,
+            # matching prepare_decode so _forward_decode reads the sparse buffer.
+            attn_matadata.sparse_kv_last_page_lens = var[
+                "sparse_kv_last_page_lens"
+            ].gpu[:bs]
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
@@ -1442,6 +1553,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_last_page_lens=var[f"{p}kv_last_page_lens"].gpu[:padded_bs],
             sparse_kv_indptr=(
                 var[f"{p}sparse_kv_indptr"].gpu[: padded_bs + 1]
+                if self.is_sparse
+                else None
+            ),
+            sparse_kv_last_page_lens=(
+                var["sparse_kv_last_page_lens"].gpu[:padded_bs]
                 if self.is_sparse
                 else None
             ),
@@ -1506,11 +1622,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if attn_metadata.slot_mapping is not None
             else 0
         )
+        # Sparse prefill: sparse_kv_last_page_lens is per query TOKEN, so slice it
+        # by the token slice. (The dense kv_last_page_lens is per-seq and is sliced
+        # by request in split_attn_metadata.)
         if (
-            attn_metadata.kv_last_page_lens is not None
-            and attn_metadata.kv_last_page_lens.shape[0] == total_tokens
+            attn_metadata.sparse_kv_last_page_lens is not None
+            and attn_metadata.sparse_kv_last_page_lens.shape[0] == total_tokens
         ):
-            ub_attn.kv_last_page_lens = attn_metadata.kv_last_page_lens[ts]
+            ub_attn.sparse_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[
+                ts
+            ]
 
         if (
             attn_metadata.sparse_kv_indptr is not None
