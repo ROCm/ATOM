@@ -77,6 +77,7 @@ def _v4_paged_prefill_indices_kernel(
     block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
     swa_pages,  # num_blocks * block_size — boundary into HCA compress section
     HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
+    K2_HCA: tl.constexpr,  # HCA compress entries per physical block (block_size // HCA_RATIO)
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
 ):
     """One program per token. Writes four per-token segments:
@@ -156,18 +157,25 @@ def _v4_paged_prefill_indices_kernel(
     tl.store(prefix_csa_indices_ptr + csa_tail_base + i, paged, mask=swa_mask)
     tl.store(prefix_hca_indices_ptr + swa_base_hca + i, paged, mask=swa_mask)
 
-    # ---- HCA compress section: block_tables[bid, k] for k in [0, n_hca) ----
+    # ---- HCA compress section: HCA entry k -> paged offset for k in [0, n_hca) ----
     # Written at offset prefix_swa_count past the SWA prefix segment in HCA buffer.
+    # Each physical block packs K2_HCA HCA compress entries (block_size // ratio),
+    # matching the compressor's cache view [num_blocks, K2_HCA, head_dim]: entry k
+    # lives in physical block block_tables[bid, k // K2_HCA] at slot k % K2_HCA, so
+    # its unified row is swa_pages + phys * K2_HCA + slot. (At K2_HCA==1 this
+    # reduces to the old swa_pages + block_tables[bid, k].)
     hca_dst_base = swa_base_hca + prefix_swa_count
     # block_tables row stride is `bt_stride_bs` int32 elements (== max_num_blocks_per_seq).
     bt_row_base = bid * bt_stride_bs
     for j in tl.range(0, n_hca, BLOCK_N):
         k = j + i
         hca_mask = k < n_hca
-        bt = tl.load(block_tables_ptr + bt_row_base + k, mask=hca_mask, other=0)
+        blk = k // K2_HCA
+        slot = k % K2_HCA
+        bt = tl.load(block_tables_ptr + bt_row_base + blk, mask=hca_mask, other=0)
         tl.store(
             prefix_hca_indices_ptr + hca_dst_base + k,
-            swa_pages + bt,
+            swa_pages + bt * K2_HCA + slot,
             mask=hca_mask,
         )
 
@@ -195,6 +203,7 @@ def write_v4_paged_prefill_indices(
     block_size: int,
     swa_pages: int,
     hca_ratio: int = 128,
+    k2_hca: int = 1,
 ) -> None:
     """One-shot GPU build of the V4 paged-prefill index buffers.
 
@@ -289,6 +298,7 @@ def write_v4_paged_prefill_indices(
         block_size=block_size,
         swa_pages=swa_pages,
         HCA_RATIO=hca_ratio,
+        K2_HCA=k2_hca,
         BLOCK_N=BLOCK_N,
     )
 
@@ -316,6 +326,7 @@ def write_v4_paged_prefill_indices_reference(
     block_size: int,
     swa_pages: int,
     hca_ratio: int = 128,
+    k2_hca: int = 1,
 ) -> None:
     """Pure-Python equivalent of ``write_v4_paged_prefill_indices``.
     Per-token Python loop — slow but readable; used for unit-test bit-exact
@@ -389,8 +400,13 @@ def write_v4_paged_prefill_indices_reference(
             prefix_csa_indices[csa_end - prefix_swa_count : csa_end] = paged
             prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = paged
 
-        # HCA compress
+        # HCA compress: entry k in physical block block_tables[bid, k // k2_hca]
+        # at slot k % k2_hca -> unified row swa_pages + phys * k2_hca + slot
+        # (K2_HCA entries packed per block; == old swa_pages + bt at k2_hca==1).
         if n_hca > 0:
-            bt = block_tables_cpu[bid, :n_hca].to(device).to(prefix_hca_indices.dtype)
+            ks = torch.arange(n_hca, device=device)
+            blk = (ks // k2_hca).cpu()
+            slot = (ks % k2_hca).to(prefix_hca_indices.dtype)
+            bt = block_tables_cpu[bid, blk].to(device).to(prefix_hca_indices.dtype)
             hca_dst = sb_hca + prefix_swa_count
-            prefix_hca_indices[hca_dst : hca_dst + n_hca] = swa_pages + bt
+            prefix_hca_indices[hca_dst : hca_dst + n_hca] = swa_pages + bt * k2_hca + slot

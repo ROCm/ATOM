@@ -85,4 +85,39 @@ exp = phys * block_size + 13 % block_size
 got = int(rs[int(swa_indptr[1])])  # seq1 SWA slice start (swa head=0)
 assert got == exp, f"spot check {got} != {exp}"
 print(f"PASS: seq1 window-start pos=13 -> phys={phys} paged={exp}")
+
+
+# ---------------------------------------------------------------------------
+# HCA compress paged offsets (decode path) at k2_hca > 1 — regression for the
+# HCA paged-gather bug. `_attach_v4_paged_decode_meta` builds the HCA compress
+# section with `hca_compress_paged_offsets`; with V4 block_size=256, ratio=128
+# each physical block packs k2_hca=2 HCA entries, so entry e -> block
+# block_tables[bid, e//k2] slot e%k2 -> swa_pages + phys*k2 + slot. The pre-fix
+# math used swa_pages + block_tables[bid, e] (k2==1), reading wrong blocks.
+import numpy as np  # noqa: E402
+from atom.model_ops.v4_kernels import hca_compress_paged_offsets  # noqa: E402
+
+k2 = 2
+swa_pages_h = 10_000
+bt_np = np.array([[5, 9, 13, 17], [2, 6, 10, 14]], dtype=np.int32)  # [bs, blocks]
+entry_idx = np.array([0, 1, 2, 3, 0, 1, 2], dtype=np.int64)  # seq0:4 entries, seq1:3
+bid_per_entry = np.array([0, 0, 0, 0, 1, 1, 1], dtype=np.int64)
+got_h = hca_compress_paged_offsets(entry_idx, bid_per_entry, bt_np, swa_pages_h, k2)
+exp_h = np.array(
+    [swa_pages_h + int(bt_np[b][e // k2]) * k2 + e % k2
+     for e, b in zip(entry_idx.tolist(), bid_per_entry.tolist())],
+    dtype=np.int32,
+)
+assert np.array_equal(got_h, exp_h), (
+    f"k2={k2} decode HCA compress offset wrong (the HCA paged-gather bug)\n"
+    f"got={got_h.tolist()}\nexp={exp_h.tolist()}"
+)
+# k2==1 must reduce to the legacy swa_pages + block_tables[bid, e]
+got_1 = hca_compress_paged_offsets(entry_idx, bid_per_entry, bt_np, swa_pages_h, 1)
+exp_1 = np.array(
+    [swa_pages_h + int(bt_np[b][e]) for e, b in zip(entry_idx.tolist(), bid_per_entry.tolist())],
+    dtype=np.int32,
+)
+assert np.array_equal(got_1, exp_1), "k2==1 must equal legacy swa_pages + bt"
+print(f"PASS: k2_hca={k2} decode HCA compress offsets = {got_h.tolist()} (block-packed)")
 print("ALL OK")

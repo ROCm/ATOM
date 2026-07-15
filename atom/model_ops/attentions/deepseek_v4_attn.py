@@ -61,6 +61,7 @@ from atom.model_ops.attentions.backends import (
     CommonAttentionBuilder,
 )
 from atom.model_ops.v4_kernels import (
+    hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
@@ -2325,9 +2326,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # write_v4_paged_decode_indices.
             write_pos = hca_indptr_np[token_indices] + entry_offsets
             bid_expanded = batch_id_per_token_np[token_indices]
-            hca_indices_np[write_pos] = (
-                swa_pages + block_tables_np_full[bid_expanded, entry_offsets]
-            ).astype(np.int32)
+            # Each physical block packs k2_hca HCA compress entries (compressor
+            # cache view [num_blocks, k2_hca, head_dim]); shared with the prefill
+            # kernel + regression test via hca_compress_paged_offsets.
+            hca_indices_np[write_pos] = hca_compress_paged_offsets(
+                entry_offsets, bid_expanded, block_tables_np_full, swa_pages, self.k2_hca
+            )
         # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
         hca_indices_gpu = self._stage(
             f"{buf_prefix_ubatch}v4_kv_indices_hca", hca_indices_np
@@ -2601,6 +2605,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             win=win,
             block_size=self.block_size,
             swa_pages=swa_pages,
+            k2_hca=self.k2_hca,
         )
 
         # ----- skip_prefix_len_csa: per-token SWA prefix length -----
