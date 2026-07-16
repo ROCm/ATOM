@@ -254,6 +254,7 @@ class CompilationConfig:
                 "aiter.mla_attention",
                 "aiter.atom_vllm_mha_attention",
                 "aiter.atom_vllm_mla_attention",
+                "aiter.atom_vllm_mla_attention_cp",
             ]
 
 

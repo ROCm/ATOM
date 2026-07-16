@@ -540,17 +540,98 @@ class LinearBase(nn.Module):
 
     def _gather_full_weight(self, weight):
         """Gather sharded weight from all TP ranks to reconstruct the full unpartitioned weight."""
+        return self._gather_full_weight_via(weight, get_tp_group())
+
+    def _gather_full_weight_via(self, weight, group):
+        """Like :meth:`_gather_full_weight` but over an explicit group coordinator.
+
+        ``group`` must expose ``all_gather(tensor, dim=...)`` (a vLLM
+        GroupCoordinator). Reuse-TP-as-CP runtime weight gather passes a DEDICATED
+        gather group here (distinct RCCL communicator) so a background gather stream
+        can run concurrently with the MoE's TP/CP collectives without sharing a
+        communicator (concurrent collectives on one communicator can deadlock).
+        """
         if self.tp_size <= 1 or self.tp_dim is None:
             return weight
         # NCCL cannot all_gather E8M0 scales (MXFP8 source); gather the raw
         # bytes as uint8 and reinterpret afterwards. The gather only moves
         # bytes, so this is bit-exact.
         if weight.dtype == dtypes.fp8_e8m0:
-            gathered = get_tp_group().all_gather(
-                weight.view(torch.uint8), dim=self.tp_dim
-            )
+            gathered = group.all_gather(weight.view(torch.uint8), dim=self.tp_dim)
             return gathered.view(dtypes.fp8_e8m0)
-        return get_tp_group().all_gather(weight, dim=self.tp_dim)
+        return group.all_gather(weight, dim=self.tp_dim)
+
+    def gather_full_weight_scale(self, group=None):
+        """Reconstruct the full unpartitioned ``(weight, weight_scale)`` from this
+        rank's TP shard, for reuse-TP-as-CP runtime weight gather.
+
+        Bit-exact with the offline full weight iff the shard-local quantized layout
+        (16x16 preshuffle + per-block/per-tensor scales) tiles cleanly along
+        ``tp_dim`` -- i.e. concatenating the preshuffled shards along ``tp_dim``
+        equals preshuffling the full weight. This holds for ColumnParallel (tp_dim=0,
+        head-block boundary) and is the top hardware-validation item for RowParallel
+        (tp_dim=1, o_proj) where the shard boundary is on the reduction dim.
+        """
+        g = group if group is not None else get_tp_group()
+        w = self._gather_full_weight_via(self.weight.data, g)
+        ws = None
+        if getattr(self, "weight_scale", None) is not None:
+            ws = self.weight_scale.data
+            # Only gather the scale along tp_dim if it is actually sharded there
+            # (mirror of _shard_quantized_weight). A per-output-channel per_Token
+            # scale on a RowParallel layer (o_proj) is computed over the FULL row at
+            # (online-)quant time and REPLICATED across ranks -- gathering it would
+            # wrongly tile it and corrupt the GEMM. Block/tensor scales that ARE
+            # sharded along tp_dim (per_1x128/per_1x32) are still gathered.
+            if (
+                self.tp_dim is not None
+                and ws.dim() > self.tp_dim
+                and ws.shape[self.tp_dim] > 1
+            ):
+                ws = self._gather_full_weight_via(ws, g)
+        return w, ws
+
+    def forward_full(
+        self,
+        x,
+        x_scale,
+        full_weight,
+        full_weight_scale,
+        full_output_size,
+        otype=dtypes.bf16,
+    ):
+        """Run this TP-sharded linear as if it held the full unpartitioned weight,
+        with NO cross-rank reduce. Used by the reuse-TP-as-CP attention op on the
+        gather path (q_b projects the full head set; o_proj is a local GEMM on the
+        already-full attention output). The full weight/scale come from
+        :meth:`gather_full_weight_scale` (possibly prefetched on a gather stream).
+
+        The full tensors are bound transiently (restored in ``finally``); this runs
+        inside the Dynamo-opaque CP attention op on the compute stream and only for
+        prefill/mixed batches (never cudagraph-captured), so the transient rebind is
+        invisible to torch.compile and safe.
+        """
+        saved_w = self.weight.data
+        saved_ws = (
+            self.weight_scale.data
+            if getattr(self, "weight_scale", None) is not None
+            else None
+        )
+        saved_out = self.output_size
+        saved_reduce = self.reduce_results
+        try:
+            self.weight.data = full_weight
+            if saved_ws is not None and full_weight_scale is not None:
+                self.weight_scale.data = full_weight_scale
+            self.output_size = full_output_size
+            self.reduce_results = False
+            return self.forward(x, x_scale, otype=otype)
+        finally:
+            self.weight.data = saved_w
+            if saved_ws is not None:
+                self.weight_scale.data = saved_ws
+            self.output_size = saved_out
+            self.reduce_results = saved_reduce
 
     def _shard_quantized_weight(self, q_weight, weight_scale):
         """Split the quantized full weight and scale back to this rank's shard."""
@@ -694,6 +775,21 @@ class LinearBase(nn.Module):
             "quant_dtype": str(online_quant_dtype),
         }
 
+    def _weight_preshuffle_enabled(self) -> bool:
+        """Whether this layer's fp8 blockscale weight uses aiter's 16x16 preshuffle.
+
+        Defaults to the global env, but reuse-TP-as-CP force-disables it on layers
+        whose TP shards are gathered at runtime along the REDUCTION dim (RowParallel
+        ``o_proj``): preshuffled shards do NOT tile there (only ColumnParallel
+        head-dim shards do -- validated: q_proj gather is bit-exact, o_proj is not),
+        so the naive gathered full weight is corrupt. Unshuffled fp8 tiles
+        bit-exactly along both dims and keeps fp8 (the matching non-preshuffle
+        blockscale GEMM is selected in :meth:`forward`).
+        """
+        if getattr(self, "cp_disable_preshuffle", False):
+            return False
+        return bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
+
     def process_weights_after_loading(self):
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
@@ -764,20 +860,28 @@ class LinearBase(nn.Module):
                 # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
                 # weight; only the AITER bpreshuffle fallback needs the shuffle.
                 and not (use_triton_gemm() and gemm_a8w8_triton is not None)
+                # Reuse-TP-as-CP o_proj must stay UNSHUFFLED so its shards tile
+                # bit-exactly when gathered along the reduction dim at runtime;
+                # forward() runs the matching non-preshuffle a8w8 GEMM.
+                and not getattr(self, "cp_disable_preshuffle", False)
             ) or (
                 self.quant_type == QuantType.per_1x32
                 and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
             )
             # per_1x128 only needs shuffle when using the preshuffle GEMM path
             if not need_shuffle and self.quant_type == QuantType.per_1x128:
-                need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+                need_shuffle = self._weight_preshuffle_enabled()
                 # Modules whose fused forward calls a *preshuffle* blockscale GEMM
                 # directly (e.g. DeepSeek fused qkv_a_proj) need the 16x16-shuffled
                 # weight even under the non-preshuffle path
                 # (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0). Shuffle once here at
-                # load time instead of per-forward.
-                if not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE and getattr(
-                    self, "needs_preshuffled_weight", False
+                # load time instead of per-forward. Reuse-TP-as-CP layers
+                # (cp_disable_preshuffle) never take this override -- they MUST stay
+                # unshuffled so runtime gather along the reduction dim is bit-exact.
+                if (
+                    not self._weight_preshuffle_enabled()
+                    and getattr(self, "needs_preshuffled_weight", False)
+                    and not getattr(self, "cp_disable_preshuffle", False)
                 ):
                     need_shuffle = True
             if need_shuffle:
@@ -809,7 +913,7 @@ class LinearBase(nn.Module):
                     # non-preshuffle GEMM expects row-major x_scale
                     quant_func = functools_partial(
                         self.quant_func,
-                        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                        transpose_scale=self._weight_preshuffle_enabled(),
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(
@@ -856,6 +960,19 @@ class LinearBase(nn.Module):
                         bias=self.bias,
                         dtype=otype,
                     )
+                elif getattr(self, "cp_disable_preshuffle", False):
+                    # Reuse-TP-as-CP: this o_proj stores UNSHUFFLED per-token fp8 (the
+                    # per-output-channel scale is over the full row and replicated), so
+                    # its shards tile bit-exactly when gathered along the reduction dim.
+                    # Run the matching non-preshuffle a8w8 GEMM (still fully fp8).
+                    y = gemm_a8w8(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        self.bias,
+                        dtype=otype,
+                    )
                 else:
                     y = gemm_a8w8_bpreshuffle(
                         x,
@@ -867,7 +984,7 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
-                if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+                if self._weight_preshuffle_enabled():
                     y = gemm_a8w8_blockscale_preshuffle_impl(
                         x,
                         self.weight,

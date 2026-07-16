@@ -232,8 +232,6 @@ python -m atom.entrypoints.openai_server \
   --model "$model_path" \
   --server-port 8000 \
   --kv_cache_dtype fp8 \
-  --no-enable_prefix_caching \
-  --no-enable_chunked_prefill \
   -tp 2 -pcp 2 2>&1 | tee server_pcp.log &
 ```
 

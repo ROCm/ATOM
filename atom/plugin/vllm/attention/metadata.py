@@ -15,7 +15,6 @@ from atom.distributed.pcp_utils import (
     pcp_is_enabled,
     pcp_pad_dense,
     pcp_pad_len,
-    pcp_reindex_decode,
     pcp_round_robin_query_indices,
     pcp_sparse_prefill_reindex,
     plugin_attn_cp_enabled,
@@ -1656,29 +1655,33 @@ def _plugin_cp_should_split(common_attn_metadata, topk_tokens, decode_threshold=
     """Batch-global split gate shared by the plugin sparse builders (main
     sparse-MLA and sparse indexer), mirrored by deepseek_v2._plugin_pcp_active().
 
-    UNIVERSAL query-dim split: when reuse-TP-as-CP is enabled (``ATOM_VLLM_ATTN_CP``)
-    and the aiter _PCP group is aliased to the TP group (world > 1), split EVERY
-    batch type -- pure prefill, pure plain-decode, and MIXED -- over the query dim
-    using ONE shared whole-batch round-robin partition. Each rank runs the whole
-    model forward on its ``T/cp`` query shard with full (replicated) KV; the single
-    exit all-gather restores the full token order before lm_head. This removes the
-    old replicated-attention fallback (full 64-head attention on every rank).
+    HAS-PREFILL query-dim split (RFC ROCm/ATOM#196 weight-gather revision): when
+    reuse-TP-as-CP is enabled (``ATOM_VLLM_ATTN_CP``) and the aiter _PCP group is
+    aliased to the TP group (world > 1), split ONLY prefill-containing batches --
+    pure prefill and MIXED (plain-decode + prefill) -- over the query dim using ONE
+    shared whole-batch round-robin partition. Each such rank runs the whole model
+    forward on its ``T/cp`` query shard with full (replicated) KV and full-head
+    attention whose q_b/kv_b/o_proj weights are gathered on demand; the single exit
+    all-gather restores the full token order before lm_head.
+
+    This ``pcp_split`` stamp is ALSO the weight-gather signal: split == gather-full
+    (full-head, ``o_proj`` local) and not-split == the original TP-sharded impl
+    (1/tp heads, ``o_proj`` all-reduce). Pure plain-decode and spec/MTP verify are
+    therefore NOT split -- they run classic TP so decode TPOT stays on the sharded
+    path with no per-step weight gather.
 
     Correctness constraints:
-      * Any decode region must be single-token plain decode built by a non-spec
-        builder (``decode_threshold == 1``) so token index == request index for the
-        owned-decode slice. Spec/MTP verify batches (``decode_threshold > 1``) keep
-        decode replicated.
+      * Spec/MTP verify batches (``decode_threshold > 1`` with a decode region) are
+        never split; they run the original TP-sharded impl.
       * PREFILL has NO seq_len gate. The plugin indexer has no dense-MHA fallback
         (it always runs the sparse top-k, selecting all keys for short rows), and
         every plugin CP call site keys off the pcp_split stamp with a length-
         agnostic K all-gather + owned reindex, so short-context prefill splits
         correctly. (The native path DOES have a dense fallback and keeps the gate;
         this plugin gate no longer does.)
-      * PLAIN-DECODE has NO seq_len gate. The round-robin split is over the QUERY
-        dim with full replicated KV (mathematically correct at any seq_len) and the
-        decode path always runs the sparse indexer with a ``min(seq_len, topk)``
-        clamp (no dense fallback to desync). Matches native deepseek_v4._pcp_active.
+      * MIXED splits its decode region via the same whole-batch round-robin
+        partition (owned_q restricted to the decode tokens); those decode tokens
+        ride the full-head gathered path along with the prefill tokens.
     """
     if not (plugin_attn_cp_enabled() and pcp_is_enabled()):
         return False
@@ -1697,22 +1700,17 @@ def _plugin_cp_should_split(common_attn_metadata, topk_tokens, decode_threshold=
     # replicated (return False for pure- and mixed-decode spec batches).
     if int(num_decode_tokens) > 0 and int(decode_threshold) != 1:
         return False
-    if int(num_prefill_tokens) > 0:
-        # PREFILL-containing (pure prefill or MIXED): ALWAYS split over the query
-        # dim, at any seq_len. The plugin indexer (sparse_attn_indexer_plugin_mode)
-        # has NO dense-MHA fallback -- unlike the native indexer it never early-
-        # returns on max_seqlen_k <= index_topk; it always runs the sparse top-k,
-        # which selects all keys when the row is shorter than topk (dense-
-        # equivalent). Every plugin CP call site (entry split, indexer K all-gather
-        # + separate q/k rope, exit gather, sparse-MLA) keys off the pcp_split
-        # stamp, not seq_len, and the K all-gather + owned per-query reindex fire
-        # for any length, so short-context prefill splits correctly (topk_tokens is
-        # therefore no longer consulted here).
-        return True
-    # PURE plain-decode: always split under CP, no seq_len gate. The round-robin
-    # split is over the query dim with full replicated KV (correct at any seq_len)
-    # and the decode indexer clamps min(seq_len, topk) with no dense fallback.
-    return int(common_attn_metadata.max_query_len) == 1
+    # HAS-PREFILL gate (weight-gather revision): split == gather-full (full-head,
+    # o_proj local) iff the batch contains prefill tokens (pure prefill or MIXED).
+    # The plugin indexer (sparse_attn_indexer_plugin_mode) has NO dense-MHA fallback
+    # (it always runs the sparse top-k, selecting all keys for short rows), and every
+    # plugin CP call site keys off the pcp_split stamp with a length-agnostic K
+    # all-gather + owned reindex, so short-context prefill splits correctly. MIXED
+    # splits its decode region via the same whole-batch round-robin partition
+    # (owned_q restricted to the decode tokens). Pure plain-decode returns False and
+    # runs the original TP-sharded impl (no split, no weight gather, o_proj
+    # all-reduce), keeping decode TPOT on the classic TP path.
+    return int(num_prefill_tokens) > 0
 
 
 class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
@@ -2272,19 +2270,6 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        # Persistent owned-query buffers for the PCP decode-split path (see
-        # _build_indexer). pcp_reindex_decode returns fresh per-step tensors;
-        # under FULL cudagraph the captured indexer decode kernel bakes their
-        # addresses, so the owned seq_lens / block_table are copied into these
-        # stable buffers that build() refreshes in place on every replay.
-        self._pcp_seq_lens_owned = torch.empty(
-            (max_num_batched_tokens,), dtype=torch.int32, device=self.device
-        )
-        self._pcp_block_table_owned = torch.empty(
-            (max_num_batched_tokens, max_num_blocks_per_req),
-            dtype=torch.int32,
-            device=self.device,
-        )
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
@@ -2429,42 +2414,30 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             # to prevent OOB access in the DeepGEMM kernel (padded rows have
             # seq_len=0, so they produce no meaningful output).
             block_table_full.clamp_(min=0)
-            if num_prefills > 0:
-                # MIXED: the owned decode queries MUST come from the SAME
-                # whole-batch round-robin partition (owned_q) that the prefill
-                # chunks and the sparse-MLA _build_pcp_split reindex use, restricted
-                # to the decode region [0, num_decode_tokens). The decode region is
-                # NOT padded separately (unlike pure decode) -- padding it would
-                # shift the prefill token_start offsets (os/oe are computed over the
-                # same owned_q in _build_indexer_one_prefill_chunk) and desync the
-                # topk rows from the owned paged_kv_indptr the sparse layer reads.
-                # Mixed batches run piecewise/eager, so per-rank-variable owned
-                # decode counts (differing by at most 1) are fine.
-                owned_dec_q = owned_q[owned_q < num_decode_tokens].to(
-                    seq_lens_full.device
-                )
-                n_owned_dec = int(owned_dec_q.shape[0])
-                seq_lens_owned = seq_lens_full.index_select(0, owned_dec_q).contiguous()
-                block_table_owned = block_table_full.index_select(
-                    0, owned_dec_q
-                ).contiguous()
-            else:
-                # PURE decode: pad the decode region to a multiple of cp so every
-                # rank runs the same owned count (FULL cudagraph uniform shape);
-                # dummy queries attend nothing and are dropped at the model exit
-                # all-gather. Same round-robin start/stride as the combined owned_q,
-                # so the owned decode set matches owned_q < num_decode_tokens.
-                seq_lens_owned, block_table_owned, _owned_dec_q, n_owned_dec = (
-                    pcp_reindex_decode(
-                        seq_lens_full, block_table_full, num_decode_tokens
-                    )
-                )
+            # MIXED only: reuse-TP-as-CP now splits the token batch exclusively for
+            # prefill/mixed batches (pcp_split is gated on num_prefill_tokens > 0),
+            # so num_prefills > 0 here by construction -- pure decode stays on the
+            # replicated TP path and never reaches this branch. The owned decode
+            # queries MUST come from the SAME whole-batch round-robin partition
+            # (owned_q) that the prefill chunks and the sparse-MLA _build_pcp_split
+            # reindex use, restricted to the decode region [0, num_decode_tokens).
+            # The decode region is NOT padded separately -- padding it would shift
+            # the prefill token_start offsets (os/oe are computed over the same
+            # owned_q in _build_indexer_one_prefill_chunk) and desync the topk rows
+            # from the owned paged_kv_indptr the sparse layer reads. Mixed batches
+            # run piecewise/eager, so per-rank-variable owned decode counts
+            # (differing by at most 1) are fine.
+            owned_dec_q = owned_q[owned_q < num_decode_tokens].to(seq_lens_full.device)
+            n_owned_dec = int(owned_dec_q.shape[0])
+            seq_lens_owned = seq_lens_full.index_select(0, owned_dec_q).contiguous()
+            block_table_owned = block_table_full.index_select(
+                0, owned_dec_q
+            ).contiguous()
             if not AiterMlaSparseIndexerMetadataBuilder._pcp_decode_split_logged:
                 AiterMlaSparseIndexerMetadataBuilder._pcp_decode_split_logged = True
                 logger.info(
-                    "[PCP] indexer DECODE-split ENGAGED (%s): pre_split_decode=%d "
+                    "[PCP] indexer DECODE-split ENGAGED (mixed): pre_split_decode=%d "
                     "n_owned=%d num_prefills=%d max_seq_len=%d topk=%d",
-                    "mixed" if num_prefills > 0 else "pure-decode",
                     int(num_decode_tokens),
                     int(n_owned_dec),
                     int(num_prefills),
@@ -2478,20 +2451,11 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         decode_metadata = None
         if num_decodes > 0:
             if pcp_dec is not None:
-                # FULL cudagraph safety: route the owned tensors through persistent
-                # buffers so a captured indexer decode kernel reads stable addresses
-                # that are refreshed in place on every replay (see __init__). The
-                # sparse-MLA slot_mapping stays FULL for the replicated KV write.
-                seq_lens_owned, block_table_owned = pcp_dec
-                self._pcp_seq_lens_owned[:num_decodes].copy_(
-                    seq_lens_owned, non_blocking=True
-                )
-                seq_lens = self._pcp_seq_lens_owned[:num_decodes]
-                bw = block_table_owned.shape[1]
-                self._pcp_block_table_owned[:num_decodes, :bw].copy_(
-                    block_table_owned, non_blocking=True
-                )
-                block_table = self._pcp_block_table_owned[:num_decodes, :bw]
+                # Mixed-only decode split: the owning batch has prefill tokens, so it
+                # runs eager/piecewise (never FULL cudagraph). Fresh per-step owned
+                # tensors are therefore safe -- no persistent capture buffers needed.
+                # The sparse-MLA slot_mapping stays FULL for the replicated KV write.
+                seq_lens, block_table = pcp_dec
                 self.decode_lens_buffer[:num_decodes].fill_(1)
                 decode_lens = self.decode_lens_buffer[:num_decodes]
                 decode_lens_cpu = torch.ones(num_decodes, dtype=torch.int32)

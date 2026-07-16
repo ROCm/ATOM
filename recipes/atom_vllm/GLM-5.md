@@ -57,6 +57,34 @@ vllm serve amd/GLM-5.2-MXFP4 \
     --no-enable-prefix-caching
 ```
 
+### Attention CP: Prefill Context Parallelism (long-context throughput)
+
+For long-context serving you can reuse Attention CP to optimize performance. Tokens are sharded `T/cp` with sequence parallelism: prefill / mixed batches run full-head, token-parallel attention on each rank's `1/cp` query shard (the `q_b` / `kv_b` / `o_proj` weights stay TP-sharded in memory and are gathered to full heads on demand per layer), the MoE is wrapped in all-gather / reduce-scatter, and plain decode stays on the classic TP path. This cuts prefill attention / indexer compute by `cp` and improves TTFT and throughput for long inputs at high concurrency. It applies only to sparse-MLA (DSA) models (GLM-5.2 / DeepSeek-V3.2), requires `--tensor-parallel-size > 1`, and is a bit-exact no-op when disabled.
+
+Enable it with a single environment variable:
+
+- `ATOM_VLLM_ATTN_CP=1` — enable reuse-TP-as-CP. Each layer's attention weight all-gather automatically overlaps the previous layer's MoE compute (dedicated communicator + background CUDA stream + 2-slot double buffer), so no extra flag is needed.
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_VLLM_ATTN_CP=1
+
+vllm serve amd/GLM-5.2-MXFP4 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.9 \
+    --max-num-batched-tokens 32768 \
+    --no-enable-prefix-caching \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "model.layers.[0-9].mlp.*expert*", "model.layers.[1-6][0-9].mlp.*expert*", "model.layers.7[0-7].mlp.*expert*"]}}'
+```
+
 ## Step 3: Performance Benchmark
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash

@@ -44,19 +44,6 @@ def plugin_attn_cp_enabled() -> bool:
     return bool(envs.ATOM_VLLM_ATTN_CP)
 
 
-def plugin_attn_cp_decode_split_enabled() -> bool:
-    """True when reuse-TP-as-CP additionally round-robin splits the DECODE batch.
-
-    Requires :func:`plugin_attn_cp_enabled` (this flag only extends that path).
-    When off (default) decode stays full/replicated (every rank runs all tokens
-    with full heads); when on, a pure-decode batch is split 1/cp exactly like
-    prefill. See ``ATOM_VLLM_ATTN_CP_DECODE_SPLIT`` in ``envs.py``.
-    """
-    from atom.utils import envs
-
-    return bool(envs.ATOM_VLLM_ATTN_CP_DECODE_SPLIT) and plugin_attn_cp_enabled()
-
-
 def get_pcp_world_size() -> int:
     return get_prefill_context_model_parallel_world_size()
 
@@ -392,43 +379,6 @@ def pcp_sparse_prefill_reindex(
         "req_id_per_token": req_id_owned,
         "slot_mapping_owned": slot_mapping_owned,
     }
-
-
-def pcp_reindex_decode(
-    seq_lens: torch.Tensor,  # [num_decode_tokens] per-query cached KV length
-    block_table: torch.Tensor,  # [num_decode_tokens, max_blocks] per-query blocks
-    num_decode_tokens: int,
-    pcp_size: Optional[int] = None,
-    pcp_rank: Optional[int] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Reduce plain-decode per-query metadata to this rank's round-robin queries.
-
-    Plain decode has exactly one query per request, so ``num_decode_tokens ==
-    num_decodes`` and owning a round-robin subset of decode QUERIES is the same
-    as owning that subset of requests. The global decode-token count is padded to
-    a multiple of ``pcp_size`` with dummy (``seq_len == 0``, ``block_table == 0``)
-    queries so every rank runs the same ``n_owned == padded / pcp_size`` count;
-    the dummies attend nothing (their sparse-MLA KV segment is zero-length) and
-    their hidden output is dropped after the model's exit all-gather.
-
-    Only these per-owned-query rows shrink here; the sparse-MLA ``slot_mapping``
-    (KV write) stays FULL, mirroring the prefill reindex, so every rank still
-    writes the full replicated KV for the new decode tokens.
-
-    Returns ``(seq_lens_owned, block_table_owned, owned_q, n_owned)``.
-    """
-    device = seq_lens.device
-    padded_total = pcp_pad_len(num_decode_tokens, pcp_size)
-    n_pad = padded_total - num_decode_tokens
-    owned_q = pcp_round_robin_query_indices(padded_total, pcp_size, pcp_rank).to(device)
-    n_owned = int(owned_q.shape[0])
-    seq_lens_owned = pcp_pad_dense(seq_lens[:num_decode_tokens], n_pad)[
-        owned_q
-    ].contiguous()
-    block_table_owned = pcp_pad_dense(block_table[:num_decode_tokens], n_pad)[
-        owned_q
-    ].contiguous()
-    return seq_lens_owned, block_table_owned, owned_q, n_owned
 
 
 def pcp_reindex_ragged(

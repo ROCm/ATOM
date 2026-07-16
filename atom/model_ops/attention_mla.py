@@ -184,11 +184,25 @@ class MLAModules:
 
 
 def dynamic_per_batched_tensor_quant(
-    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn, cross_rank_group=None
 ):
+    """Per-(whole-)tensor dynamic fp8 quant of an absorbed BMM weight (W_K / W_V).
+
+    ``cross_rank_group`` (reuse-TP-as-CP): when set, the amax is reduced with MAX
+    across the group so EVERY rank quantizes its head shard with the SAME scalar
+    scale. That makes the per-rank fp8 shards tile bit-exactly into the full-head
+    weight after an all-gather (a per-rank local amax would differ across ranks, so
+    the gathered bytes could not share one scalar). The stored scale is that shared
+    global scalar, so the runtime gather never has to move the scale.
+    """
     DTYPE_MAX = torch.finfo(dtype).max
     min_val, max_val = x.aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-10)
+    if cross_rank_group is not None:
+        import torch.distributed as dist
+
+        amax = amax.clone()
+        dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=cross_rank_group)
     scale = DTYPE_MAX / amax
     x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
@@ -347,11 +361,23 @@ class MLAAttention(nn.Module):
             )
             W_K = W_UK.transpose(0, 1)  # 16 512 128
             W_V = W_UV.permute(1, 2, 0)  # 16 128 512
+            # Reuse-TP-as-CP: CP layers gather these per-head-sharded fp8 weights to
+            # full heads on demand (prefill/mixed), so they must be quantized with a
+            # SHARED cross-rank scalar scale (see dynamic_per_batched_tensor_quant).
+            # head dim is dim 0 for both W_K [H, L, P] and W_V [H, P, L].
+            cross_rank_group = None
+            if getattr(self, "_cp_attn", False):
+                from vllm.distributed.parallel_state import get_tp_group
+
+                tp = get_tp_group()
+                if tp.world_size > 1:
+                    cross_rank_group = tp.device_group
+                    self._cp_wk_wv_head_dim = 0
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
-                W_K, dtype=dtypes.fp8
+                W_K, dtype=dtypes.fp8, cross_rank_group=cross_rank_group
             )
             self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
-                W_V, dtype=dtypes.fp8
+                W_V, dtype=dtypes.fp8, cross_rank_group=cross_rank_group
             )
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)

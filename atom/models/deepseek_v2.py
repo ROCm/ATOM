@@ -2061,6 +2061,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         layer_num: int = 0,
         use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
+        is_mtp_block: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -2076,15 +2077,20 @@ class DeepseekV2MLAAttention(nn.Module):
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
-        # RFC ROCm/ATOM#196: when the vLLM plugin reuses the TP group as the CP
-        # group, attention is token-parallel with *full-head replicated* weights
-        # (each rank runs ALL heads on its 1/cp query shard against the full,
-        # gathered KV), so heads are NOT sharded across the group. The q/kv/o
-        # projections then load the full tensor and o_proj skips its all-reduce.
-        self._attn_cp_full_head = plugin_attn_cp_enabled() and tp_size > 1
-        self.num_local_heads = (
-            num_heads if self._attn_cp_full_head else num_heads // tp_size
+        # RFC ROCm/ATOM#196 (weight-gather revision): the vLLM plugin reuses the TP
+        # group as the CP group. Attention weights STAY TP-sharded in memory (heads
+        # sharded 1/tp across the group, exactly like plain TP) -- we do NOT store a
+        # full-head replicated copy per layer. Instead, prefill / mixed batches
+        # gather the full q_b/kv_b/o_proj weights on demand per-layer at runtime (see
+        # AttentionForVllmMLA.forward_impl_cp + cp_gather), run full-head token-
+        # parallel attention on the 1/cp query shard, then release the transients;
+        # plain decode keeps running the sharded weights on the classic TP path.
+        # MTP blocks are excluded (plain TP only, no CP / no gather).
+        self._attn_cp = (
+            plugin_attn_cp_enabled() and tp_size > 1 and not is_mtp_block
         )
+        self._attn_cp_tp_size = tp_size
+        self.num_local_heads = num_heads // tp_size
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -2130,11 +2136,10 @@ class DeepseekV2MLAAttention(nn.Module):
             else:
                 base_quant_config = quant_config
 
-        # Head-parallel projections (q_b/q/kv_b) shard the head dim across TP by
-        # default; under reuse-TP-as-CP they become replicated (full heads).
-        HeadColParallel = (
-            ReplicatedLinear if self._attn_cp_full_head else ColumnParallelLinear
-        )
+        # Head-parallel projections (q_b/q/kv_b) shard the head dim across TP. Under
+        # reuse-TP-as-CP they stay sharded here and are gathered to full heads on
+        # demand at runtime (prefill/mixed); nothing is stored replicated.
+        HeadColParallel = ColumnParallelLinear
         if self.q_lora_rank is not None:
             # self.q_a_proj = ReplicatedLinear(self.hidden_size,
             #                                  self.q_lora_rank,
@@ -2194,28 +2199,29 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype if is_rocm_aiter_fp4bmm_enabled() else None
             ),
         )
-        if self._attn_cp_full_head:
-            # Full-head replicated output projection: each rank already holds the
-            # complete [num_heads * v_head_dim] attention output for its query
-            # shard, so o_proj is a local GEMM with no cross-rank all-reduce.
-            self.o_proj = ReplicatedLinear(
-                self.num_heads * self.v_head_dim,
-                self.hidden_size,
-                bias=False,
-                quant_config=base_quant_config,
-                prefix=f"{prefix}.o_proj",
-                source_quant_dtype=None,
-            )
-        else:
-            self.o_proj = RowParallelLinear(
-                self.num_heads * self.v_head_dim,
-                self.hidden_size,
-                bias=False,
-                quant_config=base_quant_config,
-                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
-                prefix=f"{prefix}.o_proj",
-                source_quant_dtype=None,
-            )
+        self.o_proj = RowParallelLinear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=base_quant_config,
+            # Under reuse-TP-as-CP the o_proj reduce is performed *inside* the CP
+            # attention op (local GEMM on the split/gathered path, manual all-reduce
+            # on the unsplit decode path), so the module itself never reduces.
+            reduce_results=(
+                False if self._attn_cp else (not ENABLE_ALLREDUCE_RMSNORM_FUSION)
+            ),
+            prefix=f"{prefix}.o_proj",
+            source_quant_dtype=None,
+        )
+        if self._attn_cp:
+            # Reuse-TP-as-CP: o_proj is RowParallel (sharded on the reduction dim).
+            # Its fp8 shards are gathered to full heads at runtime for the split
+            # (prefill/mixed) path; the aiter 16x16 preshuffle does NOT tile along
+            # the reduction dim, so a naive byte-gather of preshuffled shards is
+            # corrupt (validated: q_proj/ColumnParallel gather is bit-exact, o_proj
+            # is not). Keep o_proj UNSHUFFLED fp8 (tiles bit-exactly along K) and run
+            # the matching non-preshuffle blockscale GEMM; still fully fp8-quantized.
+            self.o_proj.cp_disable_preshuffle = True
 
         rope_params = config.rope_parameters
         rope_theta = rope_params.get("rope_theta") or 10000
@@ -2341,6 +2347,17 @@ class DeepseekV2MLAAttention(nn.Module):
             use_mla=True,
             mla_modules=mla_modules,
             prefix=prefix,
+        )
+        # Reuse-TP-as-CP runtime weight gather: tell the attention op whether this
+        # layer participates in CP (sharded weights gathered to full heads on
+        # demand for prefill/mixed) and give it the full (pre-shard) head count and
+        # TP size it needs to reconstruct the full-head shapes. MTP blocks pass
+        # _attn_cp=False so they always run the plain sharded TP path.
+        self.mla_attn.setup_cp_weight_gather(
+            attn_cp=self._attn_cp,
+            num_heads_full=self.num_heads,
+            tp_size=self._attn_cp_tp_size,
+            hidden_size=self.hidden_size,
         )
 
         # Enable q/k RMSNorm + q quant fusion for FP8 and FP4. The larger
@@ -2601,6 +2618,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
+            is_mtp_block=is_mtp_block,
         )
 
         # Keep input RMSNorm quant fusion narrow: non-Triton FP8 activation quant is only supported for per-token layouts.
@@ -2650,14 +2668,17 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self.input_norm_quant_type = attn_input_quant_config.quant_type.value
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
-        # RFC ROCm/ATOM#196 (reuse-TP-as-CP): the residual stream is sequence
-        # parallel [T/cp]. Attention is full-head replicated (o_proj has no
-        # cross-rank partial) and the FFN is wrapped in all-gather/reduce-scatter
-        # at this layer (see forward), so NOTHING produces a plain TP partial to
-        # fold into a fused all-reduce norm. Disable AR fusion so the norms run
-        # as ordinary (local) RMSNorms on the [T/cp] shard.
+        # RFC ROCm/ATOM#196 (reuse-TP-as-CP): for prefill/mixed the residual stream
+        # is sequence parallel [T/cp]. The attention op emits already-reduced output
+        # (o_proj local on the gathered full heads, or a manual all-reduce on the
+        # unsplit decode path) and the FFN is wrapped in all-gather/reduce-scatter at
+        # this layer (see forward), so NOTHING produces a plain TP partial to fold
+        # into a fused all-reduce norm. Disable AR fusion so the norms run as
+        # ordinary (local) RMSNorms. MTP blocks stay on plain TP (no CP wrapping).
         self._attn_cp = (
-            plugin_attn_cp_enabled() and get_tensor_model_parallel_world_size() > 1
+            plugin_attn_cp_enabled()
+            and get_tensor_model_parallel_world_size() > 1
+            and not is_mtp_block
         )
         self._cp_ffn_layer_name = prefix
         if self._attn_cp:
@@ -2783,6 +2804,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             # legs share the CP slot allocator (isolated from TP all-reduce),
             # which the registered custom all-gather needs to replay correctly.
             hidden_states = pcp_tp_all_gather_dim0(hidden_states)
+            # Kick the NEXT CP layer's attention weight all-gather only AFTER the
+            # pre-MoE activation all-gather above has been issued, so the two
+            # collectives don't fight for NIC/CU bandwidth. The weight gather runs on
+            # its dedicated stream/communicator and now overlaps the MoE compute
+            # below (the gather stream waits on the current stream, i.e. on the
+            # activation all-gather, before it starts).
+            from atom.plugin.vllm.attention.cp_gather import prefetch_next_layer
+
+            prefetch_next_layer(self.self_attn.mla_attn)
             hidden_states = self.mlp(hidden_states)
             hidden_states = pcp_reduce_scatter_dim0(hidden_states)
         else:
