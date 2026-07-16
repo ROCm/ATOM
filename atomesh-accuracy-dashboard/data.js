@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784140975680,
+  "lastUpdate": 1784222703623,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -947,6 +947,40 @@ window.BENCHMARK_DATA = {
             "value": 0.881,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29433095078 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202607151539 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3055 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Phi-C",
+            "username": "Phi-C",
+            "email": "chenxjhit@163.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9bed95e4e48ac9a4eca2c0298e975298554c35a5",
+          "message": "Fix: support agentic dataset benchmark under PD disaggregation mode (#1586)\n\n* Fix: support agentic dataset running under PD disaggregation mode\n\nSigned-off-by: Phi-C <chenxjhit@163.com>\n\n* add recipe\n\nSigned-off-by: Phi-C <chenxjhit@163.com>\n\n* fix pre-checkin\n\nSigned-off-by: Phi-C <chenxjhit@163.com>\n\n* add this case to nightly ci\n\nSigned-off-by: Phi-C <chenxjhit@163.com>\n\n* fix ci nightly case\n\nSigned-off-by: Phi-C <chenxjhit@163.com>\n\n* unify an interface to get kv_connector's flag\n\nSigned-off-by: Phi-C <chenxjhit@163.com>\n\n* Revert agentic PD M3 CI changes\n\n---------\n\nSigned-off-by: Phi-C <chenxjhit@163.com>",
+          "timestamp": "2026-07-16T15:26:58Z",
+          "url": "https://github.com/ROCm/ATOM/commit/9bed95e4e48ac9a4eca2c0298e975298554c35a5"
+        },
+        "date": 1784222682156,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9462,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29516182338 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202607151539 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9416 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7536,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29516182338 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607151539 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7544 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
           }
         ]
       }
