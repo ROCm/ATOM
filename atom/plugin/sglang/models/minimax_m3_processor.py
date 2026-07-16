@@ -1,4 +1,4 @@
-"""Text-only processor registration for MiniMax-M3 in SGLang plugin mode."""
+"""Processor registration for MiniMax-M3 in SGLang plugin mode."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ try:
 except Exception:
     Modality = None
     TransformersAutoMultimodalProcessor = object
+else:
+    if not hasattr(Modality, "MULTI_IMAGES"):
+        Modality.MULTI_IMAGES = Modality.IMAGE
 
 
 class MiniMaxM3SparseForCausalLM:
@@ -52,34 +55,9 @@ class MiniMaxM3TextOnlyProcessor(TransformersAutoMultimodalProcessor):
             processor._preprocess = _preprocess_with_resample
             processor._atom_resample_patched = True
 
-    def _build_mm_items(self, processor_output: dict, input_ids):
-        items = self.collect_mm_items_from_processor_output(processor_output)
-
-        modality_to_token_id = {
-            Modality.IMAGE: self.mm_tokens.image_token_id,
-            Modality.VIDEO: self.mm_tokens.video_token_id,
-            Modality.AUDIO: self.mm_tokens.audio_token_id,
-        }
-        if hasattr(Modality, "MULTI_IMAGES"):
-            modality_to_token_id[Modality.MULTI_IMAGES] = self.mm_tokens.image_token_id
-
-        for item in items:
-            token_id = modality_to_token_id.get(item.modality)
-            if token_id is not None:
-                item.offsets = self.get_mm_items_offset(input_ids, token_id)
-
-        return items
-
 
 def register_minimax_m3_text_only_processor() -> None:
-    """Let SGLang tokenizer init accept MiniMax-M3 text-only serving.
-
-    MiniMax-M3 checkpoints advertise a conditional-generation architecture and
-    include multimodal sub-configs, so SGLang asks for a multimodal processor
-    before model workers start.  The ATOM SGLang path currently supports only
-    the language model, so plain text requests need a processor placeholder
-    that rejects actual multimodal inputs.
-    """
+    """Register MiniMax-M3 on SGLang's generic HF processor path."""
 
     try:
         from sglang.srt.managers.multimodal_processor import PROCESSOR_MAPPING
