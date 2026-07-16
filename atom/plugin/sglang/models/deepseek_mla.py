@@ -46,9 +46,17 @@ def setup_deepseek_for_sglang(model) -> None:
 
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
 
+    last_sparse_indexer = None
     for module in model.modules():
         if isinstance(module, DeepseekV2MLAAttention):
             _patch_mla_attention_for_sglang(module, config, kv_cache_dtype)
+            if getattr(module, "use_nsa", False):
+                indexer = getattr(module, "indexer", None)
+                if indexer is not None and not getattr(module, "skip_topk", False):
+                    last_sparse_indexer = indexer
+                    module._atom_sglang_topk_source_indexer = indexer
+                else:
+                    module._atom_sglang_topk_source_indexer = last_sparse_indexer
 
 
 def _patch_mla_attention_for_sglang(

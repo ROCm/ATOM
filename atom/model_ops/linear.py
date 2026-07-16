@@ -583,6 +583,7 @@ class LinearBase(nn.Module):
             return
 
         assert online_quant_dtype in [
+            dtypes.fp8,
             torch.float8_e4m3fn,
             torch.float8_e4m3fnuz,
             torch.float4_e2m1fn_x2,
