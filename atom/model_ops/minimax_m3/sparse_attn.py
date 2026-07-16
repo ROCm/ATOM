@@ -138,13 +138,13 @@ def _sparse_decode_unified_attention(
 ) -> None:
     """gfx1250 fallback for the sparse per-token-as-decode gluon kernel.
 
-    gfx1250 (MI455) has no ``pa_decode_gluon`` kernel (gluon supports gfx942 /
+    gfx1250 has no `pa_decode_gluon` kernel (gluon supports gfx942 /
     gfx950 only). The sparse runners have already compacted the indexer's
-    selected blocks into a dense physical-16 ``sparse_bt`` + exact ``sparse_ctx``
+    selected blocks into a dense physical-16 `sparse_bt` + exact `sparse_ctx`
     over the (kv-head collapsed) SHUFFLE cache — which is exactly the
-    ``(block_table, seqused_k)`` contract ``unified_attention`` consumes with
-    ``shuffled_kv_cache=True``. Each token is a length-1 causal "sequence",
-    mirroring the gluon ``max_seqlen_q=1`` per-token-as-decode setup.
+    `(block_table, seqused_k)` contract `unified_attention` consumes with
+    `shuffled_kv_cache=True`. Each token is a length-1 causal "sequence",
+    mirroring the gluon `max_seqlen_q=1` per-token-as-decode setup.
 
     bf16 KV cache only: fp8 sparse decode plumbs per-token (per-page) descales
     into the gluon kernel, which does not map onto ``unified_attention``'s descale
@@ -1235,14 +1235,14 @@ def minimax_m3_sparse_attn_decode_asm(
 
     num_seqs = T * num_kv_heads
 
-    # gfx1250 (MI455): no gluon pa_decode kernel (gluon supports gfx942 / gfx950
+    # gfx1250: no gluon pa_decode kernel (gluon supports gfx942 / gfx950
     # only). Route through the triton unified_attention sparse fallback over the
     # same SHUFFLE cache + compacted sparse block table.
     if get_gfx() == "gfx1250":
         if _is_fp8_kv_cache_tensor(k_cache):
             raise NotImplementedError(
-                "MiniMax-M3 fp8 sparse decode is not yet supported on gfx1250 "
-                "(MI455): the gluon per-page descale path has no unified_attention "
+                "MiniMax-M3 fp8 sparse decode is not yet supported on gfx1250:"
+                "the gluon per-page descale path has no unified_attention "
                 "equivalent here. Use a bf16 KV cache on gfx1250."
             )
         _sparse_decode_unified_attention(
@@ -1352,14 +1352,11 @@ def _run_prefill_fp8_gluon(
 
     num_seqs = T * num_kv_heads
 
-    # gfx1250 (MI455): no gluon pa_decode kernel (gluon supports gfx942 / gfx950
-    # only). Route through the triton unified_attention sparse fallback over the
-    # same SHUFFLE cache + compacted sparse block table.
     if get_gfx() == "gfx1250":
         if _is_fp8_kv_cache_tensor(k_cache):
             raise NotImplementedError(
-                "MiniMax-M3 fp8 sparse decode is not yet supported on gfx1250 "
-                "(MI455): the gluon per-page descale path has no unified_attention "
+                "Paged Attn fp8 prefill is not yet supported on gfx1250:"
+                "the gluon per-page descale path has no unified_attention "
                 "equivalent here. Use a bf16 KV cache on gfx1250."
             )
         _sparse_decode_unified_attention(
