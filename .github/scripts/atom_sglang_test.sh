@@ -66,15 +66,24 @@ if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
 fi
 
 prepare_runtime_paths() {
-  if [[ -d /app/sglang/python && -d /app/ATOM ]]; then
-    local path_prefix="/app/sglang/python:/app/ATOM"
-    if [[ -d /app/aiter-test ]]; then
-      path_prefix="/app/aiter-test:${path_prefix}"
-    fi
-    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
-    cd /app
-  elif [[ -d /workspace ]]; then
+  local path_prefix=""
+  if [[ -d /app/aiter-test ]]; then
+    path_prefix="/app/aiter-test"
+  fi
+  if [[ -d /app/sglang/python ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/sglang/python"
+  fi
+  if [[ -d /workspace ]]; then
+    # The CI checkout is mounted at /workspace; prefer it over the ATOM copy
+    # baked into the base image so validation covers the current branch.
+    path_prefix="${path_prefix:+${path_prefix}:}/workspace"
     cd /workspace
+  elif [[ -d /app/ATOM ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/ATOM"
+    cd /app
+  fi
+  if [[ -n "${path_prefix}" ]]; then
+    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
   fi
 }
 
