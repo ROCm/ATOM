@@ -1047,11 +1047,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
 
-        # GUGU (is_guinterleave) reorders the stage1 output rows to
-        # [g0, u0, g1, u1, ...]; moe_shuffle_weight interleaves the weight rows
-        # but not the bias, so interleave w13_bias to match. w2_bias (stage2,
-        # single N=hidden GEMM) has no gate/up concept and is left as-is.
-        if self.is_guinterleave and layer.w13_bias is not None:
+        # On gfx1250, GUGU interleaves stage1 bias rows to [g0, u0, g1, u1, ...].
+        if self.is_gfx1250 and self.is_guinterleave and layer.w13_bias is not None:
             layer.w13_bias.data = interleave_gate_up_rows(layer.w13_bias.data)
 
         # shuffle scale
