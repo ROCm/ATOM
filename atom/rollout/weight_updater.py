@@ -32,6 +32,13 @@ class WeightUpdaterMixin:
         if getattr(self, "enforce_eager", False):
             return
 
+        # No-eager policy: weights are updated in-place (param.data.copy_ and
+        # in-place shuffle preserve the parameter storage/address), so captured
+        # CUDA graphs read the refreshed values from the same addresses and stay
+        # valid. Keep the graphs resident instead of dropping+recapturing them,
+        # which under expandable_segments faults during post-wake graph capture.
+        return
+
         torch.cuda.synchronize()
         graphs = getattr(self, "graphs", None)
         if graphs:
