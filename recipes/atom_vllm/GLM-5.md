@@ -9,7 +9,8 @@ Here is the support matrix for GLM-5.2 across different hardware platforms:
 | --- | --- | --- | --- | --- | --- |
 | MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | ✅ | TP4 | [MI355 FP4](#mi355-fp4) |
 | MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP4 | [MI355 FP8](#mi355-fp8) |
-| MI300X / MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
+| MI300X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
+| MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
 
 Refer to the [GLM-5.2 Recipes](#glm-52-recipes-by-hardware) for deployment details on different platforms with vLLM-ATOM backend.
 
