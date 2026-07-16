@@ -5,12 +5,12 @@ This recipe shows how to run `GLM-5` (including `GLM-5.1` and `GLM-5.2`) models 
 GLM-5 features sparse MLA, and is architecturally similar to DeepSeek-V3.2. Its architecture is exposed through `GlmMoeDsaForCausalLM` to be picked up by ATOM OOT. GLM-5.2 is the pivot version of GLM-5 family that additionally uses IndexShare: `"shared"` layers reuse the preceding `"full"` layer's DSA indexer.
 Here is the support matrix for GLM-5.2 across different hardware platforms:
 
-| Hardware | Data Type | Model | MTP Support | Supported Backend |
-| --- | --- | --- | --- | --- |
-| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | ✅ | - [ATOM](../GLM-5.md)<br>- [vLLM-ATOM](./GLM-5.md)<br>- [SGLang-ATOM](../atom_sglang/GLM-5.md) |
-| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | - [ATOM](../GLM-5.md)<br>- [vLLM-ATOM](./GLM-5.md)<br>- [SGLang-ATOM](../atom_sglang/GLM-5.md) |
-| MI300 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | - [ATOM](../GLM-5.md) <br>- [vLLM-ATOM](./GLM-5.md) <br>- [SGLang-ATOM](../atom_sglang/GLM-5.md) |
-| MI308 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | - [ATOM](../GLM-5.md) <br>- [vLLM-ATOM](./GLM-5.md) <br>- [SGLang-ATOM](../atom_sglang/GLM-5.md) |
+| Hardware | Data Type | Model | MTP Support | Parallelism | Recipe Section |
+| --- | --- | --- | --- | --- | --- |
+| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | ✅ | TP4 | [MI355 FP4](#mi355-fp4) |
+| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP4 | [MI355 FP8](#mi355-fp8) |
+| MI300 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300 FP8](#mi300-fp8) |
+| MI308 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI308 FP8](#mi308-fp8) |
 
 Refer to the [GLM-5.2 Recipes](#glm-52-recipes-by-hardware) for deployment details on different platforms with vLLM-ATOM backend.
 
@@ -25,6 +25,8 @@ docker pull rocm/atom-dev:vllm-latest
 MI355 supports both FP4 and FP8 deployments, whereas MI300 and MI308 support FP8 deployments only. Recipe configurations may differ across platforms to account for hardware-specific capabilities.
 
 ### MI355
+
+<a id="mi355-fp4"></a>
 
 #### GLM-5.2-MXFP4
 
@@ -70,6 +72,8 @@ vllm serve amd/GLM-5.2-MXFP4 \
     --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "model.layers.[0-9].mlp.*expert*", "model.layers.[1-6][0-9].mlp.*expert*", "model.layers.7[0-7].mlp.*expert*"]}}' \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 ```
+
+<a id="mi355-fp8"></a>
 
 #### GLM-5.2-FP8
 
@@ -118,6 +122,8 @@ vllm serve zai-org/GLM-5.2-FP8 \
 On MI300/308, TP=8 is needed due to the memory limitations. To run MTP, set `max-model-len` to 16384 to further reduce memory pressure, otherwise OOM crash may occur. 
 Note `online_quant_config` for the difference compared to MI355. On MI300/308, both attention linear layers and MoE experts are online-quantized to PTPC-FP8, leveraging the high-performance kernels on these platforms.
 
+<a id="mi300-fp8"></a>
+
 #### GLM-5.2-FP8
 
 ```bash
@@ -163,6 +169,8 @@ vllm serve zai-org/GLM-5.2-FP8 \
 ```
 
 ### MI308
+
+<a id="mi308-fp8"></a>
 
 #### GLM-5.2-FP8
 

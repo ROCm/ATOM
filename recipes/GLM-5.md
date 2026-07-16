@@ -4,6 +4,15 @@
 
 > The newer [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) is also supported — it shares the same `glm_moe_dsa` architecture and adds **IndexShare**. See [GLM-5.2 (IndexShare)](#glm-52-indexshare) below.
 
+Here is the support matrix for GLM-5.2 across different hardware platforms:
+
+| Hardware | Data Type | Model | MTP Support | Parallelism | Recipe Section |
+| --- | --- | --- | --- | --- | --- |
+| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | ✅ | TP4 | [MI355 FP4](#mi355-fp4) |
+| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP4 | [MI355 FP8](#mi355-fp8) |
+| MI300 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300 FP8](#mi300-fp8) |
+| MI308 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI308 FP8](#mi308-fp8) |
+
 ## Preparing environment
 Pull the latest docker from https://hub.docker.com/r/rocm/atom-dev/ :
 ```bash
@@ -15,6 +24,8 @@ All the operations in the next will be executed inside the container.
 ATOM supports running the model with different parallelism, e.g., tensor parallel, expert parallel, data parallel. The examples below are organized by hardware and use the current ATOM server entrypoint.
 
 ### MI355
+
+<a id="mi355-fp4"></a>
 
 #### GLM-5.2 MXFP4 Server
 
@@ -55,6 +66,8 @@ python -m atom.entrypoints.openai_server \
   --method mtp \
   -tp $TP 2>&1 | tee server_mtp.log &
 ```
+
+<a id="mi355-fp8"></a>
 
 #### GLM-5.2 FP8 Server
 
@@ -98,6 +111,8 @@ python -m atom.entrypoints.openai_server \
 
 ### MI300
 
+<a id="mi300-fp8"></a>
+
 #### GLM-5.2 FP8 Server
 
 ```bash
@@ -139,6 +154,8 @@ python -m atom.entrypoints.openai_server \
 ```
 
 ### MI308
+
+<a id="mi308-fp8"></a>
 
 #### GLM-5.2 FP8 Server
 
