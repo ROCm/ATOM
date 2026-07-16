@@ -60,9 +60,8 @@ from atom.model_ops.utils import (
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.quantization.quark.utils import (
+    dequant_weight_online,
     quant_weight_online,
-    weight_dequant_fp8,
-    weight_dequant_mxfp8,
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -2691,29 +2690,37 @@ class FusedMoE(torch.nn.Module):
         online_quant_type = online_quant_config.quant_type
         online_quant_dtype = online_quant_config.quant_dtype
         source_quant_type = self.layer_quant_config.quant_type
+        source_quant_dtype = self.layer_quant_config.quant_dtype
         if should_skip_online_quant(
             source_quant_type, self.params_dtype, online_quant_config
         ):
             return
 
+        # Re-quantize any source we can dequantize back to float first:
+        # unquantized (No), per-output-channel FP8 (per_Token / ptpc_fp8),
+        # 128x128 block FP8 (per_1x128) and MXFP8 (per_1x32). Other sources
+        # (e.g. per_Tensor) are rejected up front rather than silently
+        # producing garbage.
         assert source_quant_type in (
             QuantType.No,
+            QuantType.per_Token,
             QuantType.per_1x128,
             QuantType.per_1x32,
         ), (
             f"Unsupported source quant_type for MoE online quantization: "
-            f"{source_quant_type} (layer={self.layer_name})"
+            f"{source_quant_type} (layer={self.layer_name}). Supported sources: "
+            f"No, per_Token, per_1x128, per_1x32."
         )
         need_dequant = source_quant_type in (
+            QuantType.per_Token,
             QuantType.per_1x128,
             QuantType.per_1x32,
         )
 
         def _dequant_func(w: torch.Tensor, sc: torch.Tensor) -> torch.Tensor:
-            # per_1x128 -> deepseek-style square-block FP8; per_1x32 -> MXFP8.
-            if source_quant_type == QuantType.per_1x32:
-                return weight_dequant_mxfp8(w.contiguous(), sc.contiguous())
-            return weight_dequant_fp8(w.contiguous(), sc.contiguous())
+            return dequant_weight_online(
+                w.contiguous(), sc.contiguous(), source_quant_type, source_quant_dtype
+            )
 
         # Online weight quant dispatch (MXFP4 vs FP8), shared with the Linear
         # path via a single helper under quark so both stay in sync.
