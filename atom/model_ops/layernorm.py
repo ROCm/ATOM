@@ -324,7 +324,7 @@ class RMSNorm(nn.Module):
             "kind": "rmsnorm_activation",
         }
 
-    @mark_trace(prefix="rmsnorm", torch_compile=True)
+    @mark_trace
     def forward(
         self,
         x: torch.Tensor,
@@ -633,6 +633,7 @@ class RMSNormGated(nn.Module):
         # out_scales: [num_tokens, (num_heads*head_dim)//group_size]
         return (out_fp8, out_scales)
 
+    @mark_trace
     def forward(
         self, x: torch.Tensor, z: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:

@@ -57,6 +57,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
 from atom.utils import envs
 
@@ -369,6 +371,7 @@ def _fused_compress_attn_kernel(
             tl.store(kv_cache_ptr + cache_addr, rotated.to(tl.bfloat16), mask=d_mask)
 
 
+@mark_trace
 def fused_compress_attn(
     *,
     # Source tensors (ragged across all seqs in batch)
@@ -404,6 +407,7 @@ def fused_compress_attn(
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
     fp8_max: Optional[float] = None,  # E4M3 max; required when quant=True
+    prefix: str = "",
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
     dispatched via SGLang-style packed plan.
