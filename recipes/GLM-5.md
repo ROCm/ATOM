@@ -10,8 +10,7 @@ Here is the support matrix for GLM-5.2 across different hardware platforms:
 | --- | --- | --- | --- | --- | --- |
 | MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | ✅ | TP4 | [MI355 FP4](#mi355-fp4) |
 | MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP4 | [MI355 FP8](#mi355-fp8) |
-| MI300 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300 FP8](#mi300-fp8) |
-| MI308 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI308 FP8](#mi308-fp8) |
+| MI300X / MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
 
 ## Preparing environment
 Pull the latest docker from https://hub.docker.com/r/rocm/atom-dev/ :
@@ -109,53 +108,9 @@ python -m atom.entrypoints.openai_server \
   -tp $TP 2>&1 | tee server_mtp.log &
 ```
 
-### MI300
+### MI300X / MI308X
 
-<a id="mi300-fp8"></a>
-
-#### GLM-5.2 FP8 Server
-
-```bash
-#!/bin/bash
-
-model_path=zai-org/GLM-5.2-FP8
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_USE_FLYDSL_MOE_SORTING=1
-TP=4
-
-python -m atom.entrypoints.openai_server \
-  --model "$model_path" \
-  --server-port 8000 \
-  --kv_cache_dtype fp8 \
-  --no-enable_prefix_caching \
-  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}' \
-  -tp $TP 2>&1 | tee server.log &
-```
-
-#### GLM-5.2 FP8 MTP Server
-
-```bash
-#!/bin/bash
-
-model_path=zai-org/GLM-5.2-FP8
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_USE_FLYDSL_MOE_SORTING=1
-TP=4
-
-python -m atom.entrypoints.openai_server \
-  --model "$model_path" \
-  --server-port 8004 \
-  --kv_cache_dtype fp8 \
-  --no-enable_prefix_caching \
-  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}' \
-  --num-speculative-tokens 3 \
-  --method mtp \
-  -tp $TP 2>&1 | tee server_mtp.log &
-```
-
-### MI308
-
-<a id="mi308-fp8"></a>
+<a id="mi300x-mi308x-fp8"></a>
 
 #### GLM-5.2 FP8 Server
 
