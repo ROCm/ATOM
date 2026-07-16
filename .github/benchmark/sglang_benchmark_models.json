@@ -472,6 +472,7 @@
       "prefix": "qwen3-5-35b-a3b-fp8-tp1-mi308",
       "extra_args": [
         "--tensor-parallel-size 1",
+        "--page-size 16",
         "qwen_reasoning"
       ],
       "bench_args": "",
@@ -488,6 +489,7 @@
       "prefix": "qwen3-5-35b-a3b-ptpc-fp8-tp1-mi308",
       "extra_args": [
         "--tensor-parallel-size 1",
+        "--page-size 16",
         "qwen_reasoning"
       ],
       "bench_args": "",

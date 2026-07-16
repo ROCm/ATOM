@@ -778,6 +778,8 @@ def init_aiter_dist(config: Config) -> None:
             dp_master_ip = "127.0.0.1"
             dp_master_port = config.plugin_config.sglang_port_args.nccl_port
     elif config.plugin_config.is_rtpllm:
+        import os
+
         dp_master_ip = os.getenv("MASTER_ADDR", "127.0.0.1")
         dp_master_port = int(os.getenv("MASTER_PORT", "29500"))
 
