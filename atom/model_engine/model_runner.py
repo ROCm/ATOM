@@ -2419,6 +2419,43 @@ class ModelRunner:
         mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
         return mode is not None and mode.requires_piecewise_compilation()
 
+    def _force_aiter_unreg_capture_for_piecewise(self):
+        """PIECEWISE cudagraph + aiter custom all_gather/reduce_scatter: force the
+        copy-in ('unreg') capture path instead of the direct-read ('registered')
+        one.
+
+        The registered path lets the collective kernel directly read each peer's
+        ORIGINAL input pointer (cross-registered at register_graph_buffers). That
+        is only safe under a single whole-forward FULL cudagraph, whose global
+        read/overwrite ordering holds across all ranks. PIECEWISE splits the
+        forward into many small graphs with eager sections between them, losing
+        that ordering: a fast rank can overwrite its pool-recycled input via a
+        later piece while a slow peer is still reading it -> stale cross-rank
+        reads -> progressive hidden corruption -> repeated-token garbage
+        (DP+PIECEWISE accuracy bug). The unreg path snapshots the input into a
+        pre-registered pool before the collective, so it is order-independent.
+        """
+        seen = set()
+        for getter in ("get_tp_group", "get_dp_group", "get_ep_group"):
+            try:
+                from aiter.dist import parallel_state as _ps
+
+                group = getattr(_ps, getter)()
+            except Exception:
+                continue
+            dc = getattr(group, "device_communicator", None)
+            ca = getattr(dc, "ca_comm", None) if dc is not None else None
+            if ca is None or id(ca) in seen:
+                continue
+            seen.add(id(ca))
+            if getattr(ca, "enable_register_for_capturing", False):
+                ca.enable_register_for_capturing = False
+                logger.info(
+                    "PIECEWISE: forced aiter ca_comm (%s) to unreg copy-in "
+                    "capture path for cudagraph-safe DP collectives.",
+                    getter,
+                )
+
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
         if _piecewise:
@@ -2426,6 +2463,7 @@ class ModelRunner:
                 "PIECEWISE cudagraph: capturing per-piece graphs (attention "
                 "eager); manual FULL whole-forward capture disabled."
             )
+            self._force_aiter_unreg_capture_for_piecewise()
         start_time = time.time()
         # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:

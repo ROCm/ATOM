@@ -228,13 +228,21 @@ EOF
   fi
 
   SPUR_NODE_RANK_FOR_CLEANUP="${node_rank}"
+  SPUR_CLEANUP_DONE=0
   cleanup_spur() {
-    local rc=$?
+    local rc="${1:-$?}"
+    if [[ "${SPUR_CLEANUP_DONE}" == "1" ]]; then
+      return "${rc}"
+    fi
+    SPUR_CLEANUP_DONE=1
     echo "=== cleanup rank=${SPUR_NODE_RANK_FOR_CLEANUP} rc=${rc} ==="
-    docker stop -t 0 "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}" >/dev/null 2>&1 || true
+    docker rm -f "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}" >/dev/null 2>&1 || true
     return "${rc}"
   }
-  trap cleanup_spur EXIT
+  trap 'cleanup_spur $?' EXIT
+  trap 'cleanup_spur 129; exit 129' HUP
+  trap 'cleanup_spur 130; exit 130' INT
+  trap 'cleanup_spur 143; exit 143' TERM
 
   local rc=0
   run_container_rank "${node_rank}" "${env_file}" || rc=$?
@@ -328,16 +336,28 @@ echo "run_dir=${RUN_DIR}"
 ENV_FILE="${RUN_DIR}/docker.env"
 write_env_file "${ENV_FILE}"
 
+CLEANUP_DONE=0
 cleanup() {
-  local rc=$?
+  local rc="${1:-$?}"
+  local idx node container
+  if [[ "${CLEANUP_DONE}" == "1" ]]; then
+    return "${rc}"
+  fi
+  CLEANUP_DONE=1
   echo "=== cleanup rc=${rc} ==="
-  for node in "${SELECTED_NODES[@]}"; do
+  for idx in "${!SELECTED_NODES[@]}"; do
+    node="${SELECTED_NODES[$idx]}"
+    container="atomesh-${ATOMESH_CELL_ID}-${SLURM_JOB_ID}-${idx}"
     srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc "
-      docker stop -t 0 atomesh-${ATOMESH_CELL_ID}-${SLURM_JOB_ID}-\${SLURM_PROCID:-x} >/dev/null 2>&1 || true
+      docker rm -f '${container}' >/dev/null 2>&1 || true
     " || true
   done
+  return "${rc}"
 }
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
+trap 'cleanup 129; exit 129' HUP
+trap 'cleanup 130; exit 130' INT
+trap 'cleanup 143; exit 143' TERM
 
 echo "=== docker.env (passed to container) ==="
 cat "${ENV_FILE}"
