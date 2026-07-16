@@ -1330,7 +1330,11 @@ jobs:
           set -euo pipefail
           TRUST_REMOTE_CODE_ARG=""
           if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
+            if [[ "${BENCHMARK_CLIENT}" == "vLLM bench" ]]; then
               TRUST_REMOTE_CODE_ARG="--trust_remote_code"
+            else
+              TRUST_REMOTE_CODE_ARG="--trust-remote-code"
+            fi
           fi
 
           TEMPERATURE_ARG=""
