@@ -156,7 +156,12 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     """
 
     try:
-        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+        try:
+            from sglang.srt.model_executor.runner import (
+                DecodeCudaGraphRunner as CudaGraphRunner,
+            )
+        except ImportError:
+            from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
         from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
             EAGLEDraftCudaGraphRunner,
         )
@@ -257,17 +262,41 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         allowed = {int(x) for x in configured.replace(" ", ",").split(",") if x.strip()}
         return [bs for bs in original_bs if int(bs) in allowed]
 
+    def _get_decode_cuda_graph_bs(server_args):
+        if server_args is None:
+            return None
+        graph_config = getattr(server_args, "cuda_graph_config", None)
+        decode_config = getattr(graph_config, "decode", None)
+        bs = getattr(decode_config, "bs", None)
+        if bs is not None:
+            return list(bs)
+        for name in ("cuda_graph_bs_decode", "cuda_graph_bs"):
+            if hasattr(server_args, name):
+                bs = getattr(server_args, name)
+                if bs is not None:
+                    return list(bs)
+        return None
+
+    def _set_decode_cuda_graph_bs(server_args, bs):
+        if server_args is None:
+            return
+        bs = list(bs)
+        graph_config = getattr(server_args, "cuda_graph_config", None)
+        decode_config = getattr(graph_config, "decode", None)
+        if decode_config is not None and hasattr(decode_config, "bs"):
+            decode_config.bs = bs
+        if hasattr(server_args, "cuda_graph_bs_decode"):
+            server_args.cuda_graph_bs_decode = bs
+        if hasattr(server_args, "cuda_graph_bs"):
+            server_args.cuda_graph_bs = bs
+
     if not getattr(CudaGraphRunner, "_atom_dsv4_init_patched", False):
         original_target_init = CudaGraphRunner.__init__
 
         def __init__(self, model_runner, *args, **kwargs):
             should_cap = False
             server_args = getattr(model_runner, "server_args", None)
-            original_cuda_graph_bs = (
-                list(getattr(server_args, "cuda_graph_bs", []))
-                if server_args is not None
-                else None
-            )
+            original_cuda_graph_bs = _get_decode_cuda_graph_bs(server_args)
             try:
                 should_cap = _is_dsv4_runner(model_runner) and bool(
                     getattr(
@@ -286,9 +315,12 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
             try:
                 if should_cap and server_args is not None and original_cuda_graph_bs:
-                    server_args.cuda_graph_bs = _safe_spec_graph_bs(
-                        original_cuda_graph_bs,
-                        "ATOM_SGLANG_V4_TARGET_VERIFY_CG_BS",
+                    _set_decode_cuda_graph_bs(
+                        server_args,
+                        _safe_spec_graph_bs(
+                            original_cuda_graph_bs,
+                            "ATOM_SGLANG_V4_TARGET_VERIFY_CG_BS",
+                        ),
                     )
                 original_target_init(self, model_runner, *args, **kwargs)
             finally:
@@ -297,13 +329,17 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     and server_args is not None
                     and original_cuda_graph_bs is not None
                 ):
-                    server_args.cuda_graph_bs = original_cuda_graph_bs
+                    _set_decode_cuda_graph_bs(server_args, original_cuda_graph_bs)
 
         CudaGraphRunner.__init__ = __init__
         CudaGraphRunner._atom_dsv4_init_patched = True
 
+    can_run_method = (
+        "can_run_graph" if hasattr(CudaGraphRunner, "can_run_graph") else "can_run"
+    )
+
     if not getattr(CudaGraphRunner, "_atom_dsv4_spec_can_run_patched", False):
-        original_can_run = CudaGraphRunner.can_run
+        original_can_run = getattr(CudaGraphRunner, can_run_method)
 
         def can_run(self, forward_batch):
             try:
@@ -330,11 +366,14 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 pass
             return original_can_run(self, forward_batch)
 
-        CudaGraphRunner.can_run = can_run
+        setattr(CudaGraphRunner, can_run_method, can_run)
         CudaGraphRunner._atom_dsv4_spec_can_run_patched = True
 
     if not getattr(EAGLEDraftCudaGraphRunner, "_atom_dsv4_replay_patched", False):
-        original_draft_replay = EAGLEDraftCudaGraphRunner.replay
+        draft_replay_method = (
+            "execute" if hasattr(EAGLEDraftCudaGraphRunner, "execute") else "replay"
+        )
+        original_draft_replay = getattr(EAGLEDraftCudaGraphRunner, draft_replay_method)
 
         def replay(self, forward_batch):
             if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
@@ -351,12 +390,26 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if original_hidden_states is not None:
                     forward_batch.spec_info.hidden_states = original_hidden_states
 
-        EAGLEDraftCudaGraphRunner.replay = replay
+        setattr(EAGLEDraftCudaGraphRunner, draft_replay_method, replay)
         EAGLEDraftCudaGraphRunner._atom_dsv4_replay_patched = True
 
     if not getattr(EAGLEDraftExtendCudaGraphRunner, "_atom_dsv4_replay_patched", False):
-        original_extend_replay = EAGLEDraftExtendCudaGraphRunner.replay
-        original_extend_can_run = EAGLEDraftExtendCudaGraphRunner.can_run
+        extend_replay_method = (
+            "execute"
+            if hasattr(EAGLEDraftExtendCudaGraphRunner, "execute")
+            else "replay"
+        )
+        original_extend_replay = getattr(
+            EAGLEDraftExtendCudaGraphRunner, extend_replay_method
+        )
+        extend_can_run_method = (
+            "can_run_graph"
+            if hasattr(EAGLEDraftExtendCudaGraphRunner, "can_run_graph")
+            else "can_run"
+        )
+        original_extend_can_run = getattr(
+            EAGLEDraftExtendCudaGraphRunner, extend_can_run_method
+        )
 
         def _dsv4_draft_extend_graph_layout_ok(runner, forward_batch=None):
             try:
@@ -480,8 +533,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if original_hidden_states is not None:
                     forward_batch.spec_info.hidden_states = original_hidden_states
 
-        EAGLEDraftExtendCudaGraphRunner.can_run = can_run
-        EAGLEDraftExtendCudaGraphRunner.replay = replay
+        setattr(EAGLEDraftExtendCudaGraphRunner, extend_can_run_method, can_run)
+        setattr(EAGLEDraftExtendCudaGraphRunner, extend_replay_method, replay)
         EAGLEDraftExtendCudaGraphRunner._atom_dsv4_replay_patched = True
 
     if not getattr(EagleDraftWorker, "_atom_dsv4_draft_extend_accept_patched", False):
@@ -563,13 +616,23 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 forward_batch.spec_info.num_correct_drafts = graph_accept_lens - 1
                 forward_batch.spec_info.num_accept_tokens = graph_accept_lens
 
+                graph_runner = self.cuda_graph_runner_for_draft_extend
+                graph_can_run = None
+                if graph_runner is not None:
+                    graph_can_run = getattr(
+                        graph_runner, "can_run_graph", None
+                    ) or getattr(graph_runner, "can_run", None)
                 can_cuda_graph = (
-                    self.cuda_graph_runner_for_draft_extend
-                    and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+                    graph_can_run is not None and graph_can_run(forward_batch)
                 )
                 if can_cuda_graph:
+                    graph_execute = getattr(
+                        self.cuda_graph_runner_for_draft_extend, "execute", None
+                    ) or getattr(
+                        self.cuda_graph_runner_for_draft_extend, "replay", None
+                    )
                     draft_logits_output = (
-                        self.cuda_graph_runner_for_draft_extend.replay(forward_batch)
+                        graph_execute(forward_batch)
                     )
                 else:
                     draft_logits_output = self.draft_runner.forward(
@@ -662,16 +725,15 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             backend._cuda_graph_seq_len_fill_value = seq_len_fill
                     draft_runner = getattr(self, "draft_runner", None)
                     server_args = getattr(draft_runner, "server_args", None)
-                    original_cuda_graph_bs = (
-                        list(getattr(server_args, "cuda_graph_bs", []))
-                        if server_args is not None
-                        else None
-                    )
+                    original_cuda_graph_bs = _get_decode_cuda_graph_bs(server_args)
                     try:
                         if server_args is not None and original_cuda_graph_bs:
-                            server_args.cuda_graph_bs = _safe_spec_graph_bs(
-                                original_cuda_graph_bs,
-                                "ATOM_SGLANG_V4_DRAFT_EXTEND_CG_BS",
+                            _set_decode_cuda_graph_bs(
+                                server_args,
+                                _safe_spec_graph_bs(
+                                    original_cuda_graph_bs,
+                                    "ATOM_SGLANG_V4_DRAFT_EXTEND_CG_BS",
+                                ),
                             )
                         self.cuda_graph_runner_for_draft_extend = (
                             EAGLEDraftExtendCudaGraphRunner(self)
@@ -681,7 +743,9 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             server_args is not None
                             and original_cuda_graph_bs is not None
                         ):
-                            server_args.cuda_graph_bs = original_cuda_graph_bs
+                            _set_decode_cuda_graph_bs(
+                                server_args, original_cuda_graph_bs
+                            )
                 elif _is_dsv4_nextn_runner(getattr(self, "draft_runner", None)):
                     self.cuda_graph_runner_for_draft_extend = None
             except Exception as exc:

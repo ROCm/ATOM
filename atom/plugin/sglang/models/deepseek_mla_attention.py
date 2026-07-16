@@ -190,7 +190,12 @@ class SGLangDeepseekMLAAttention(nn.Module):
             mla_absorbed_bmm,
             mla_v_up_proj,
         )
-        from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+        try:
+            from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+        except ImportError:
+            from sglang.srt.layers.attention.nsa.utils import (
+                nsa_use_prefill_cp as dsa_use_prefill_cp,
+            )
 
         q = self._project_q(q_input, q_scale)
         k_nope = kv_c_normed.unsqueeze(1)
@@ -206,7 +211,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
         ):
             q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             latent_cache = torch.cat([k_nope.squeeze(1), k_pe.squeeze(1)], dim=-1)
             k_nope, k_pe = attn.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
