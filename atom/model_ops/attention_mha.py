@@ -889,7 +889,6 @@ class PagedAttentionImpl(nn.Module):
             if (
                 envs.ATOM_USE_UNIFIED_ATTN
                 or self.use_flash_layout
-                or get_gfx() == "gfx1250"
             ):
                 return self.prefill_attention_triton
             return self.prefill_attention
