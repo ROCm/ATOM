@@ -644,8 +644,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     graph_can_run = getattr(
                         graph_runner, "can_run_graph", None
                     ) or getattr(graph_runner, "can_run", None)
-                can_cuda_graph = (
-                    graph_can_run is not None and graph_can_run(forward_batch)
+                can_cuda_graph = graph_can_run is not None and graph_can_run(
+                    forward_batch
                 )
                 if can_cuda_graph:
                     graph_execute = getattr(
@@ -653,9 +653,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     ) or getattr(
                         self.cuda_graph_runner_for_draft_extend, "replay", None
                     )
-                    draft_logits_output = (
-                        graph_execute(forward_batch)
-                    )
+                    draft_logits_output = graph_execute(forward_batch)
                 else:
                     draft_logits_output = self.draft_runner.forward(
                         forward_batch, skip_attn_backend_init=True
