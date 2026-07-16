@@ -86,8 +86,7 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
             # plus its separate indexer-key cache bound here, then falls through to the
             # standard branch for K/V + scale binding. The standard binding is page-128
             # SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it to page-16
-            # SHUFFLE (zero-copy) at attention time. Mirrors AiterBackend so the sparse
-            # layers work identically under ATOM_USE_UNIFIED_ATTN=1.
+            # SHUFFLE (zero-copy) at attention time.
             runner = self.model_runner
             sparse_idx = runner._sparse_attention_cache_next
             runner._sparse_attention_cache_next += 1
