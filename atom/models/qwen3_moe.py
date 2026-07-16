@@ -133,7 +133,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+        # Under expert parallel, FusedMoE already routes tokens across EP ranks
+        # and returns the assembled per-token output.  Only the non-EP TP-sharded
+        # path needs an explicit all-reduce here.
+        if (
+            self.tp_size > 1
+            and not self.experts.use_ep
+            and not ENABLE_ALLREDUCE_RMSNORM_FUSION
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
