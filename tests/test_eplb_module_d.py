@@ -71,6 +71,7 @@ def test_migrate_single_layer_local_copy_only():
         rank=0,
         world_size=1,
         ep_group=None,
+        num_logical_experts=2,
         p2p_batch_chunk_size=32,
     )
 
@@ -103,27 +104,21 @@ def test_migrate_single_layer_runs_local_copy_on_given_stream(monkeypatch):
         rank=0,
         world_size=1,
         ep_group=None,
+        num_logical_experts=2,
         p2p_batch_chunk_size=32,
         cuda_stream=stream_obj,
     )
     assert seen["stream"] is stream_obj
 
 
-def test_effective_p2p_chunk_size_rocm_clamp():
-    # ROCm forbids one-shot when requested >= num_logical_experts.
-    out = eplb._effective_p2p_chunk_size(
-        requested=999,
-        num_logical_experts=8,
-        is_rocm=True,
-    )
-    assert out == 7
-    # CUDA keeps requested chunk (min 1 clamp only).
-    out_cuda = eplb._effective_p2p_chunk_size(
-        requested=999,
-        num_logical_experts=8,
-        is_rocm=False,
-    )
-    assert out_cuda == 999
+def test_effective_p2p_chunk_size_clamp():
+    # Chunk must stay < num_logical_experts (ROCm one-shot P2P constraint);
+    # oversized requests clamp to num_logical_experts - 1.
+    assert eplb._effective_p2p_chunk_size(requested=999, num_logical_experts=8) == 7
+    # Within range: kept as-is.
+    assert eplb._effective_p2p_chunk_size(requested=4, num_logical_experts=8) == 4
+    # Degenerate num_logical_experts <= 1 -> 1.
+    assert eplb._effective_p2p_chunk_size(requested=999, num_logical_experts=1) == 1
 
 
 def test_select_source_rank_prefers_same_node():
@@ -142,6 +137,7 @@ def test_migrate_experts_chunk_reads_config_and_returns_plan(monkeypatch):
     class _Meta:
         def __init__(self, p2l):
             self.physical_to_logical_map = p2l
+            self.num_logical_experts = int(p2l.max().item()) + 1
 
     old = _Meta(torch.tensor([[0, 1]], dtype=torch.int32))
     new = _Meta(torch.tensor([[1, 0]], dtype=torch.int32))
