@@ -542,6 +542,7 @@ class UBatchWrapper(nn.Module):
             batch_size=ub_num_reqs,
             graph_bs=graph_bs,
             is_draft=ctx.context.is_draft,
+            dp_uniform_decode=ctx.context.dp_uniform_decode,
         )
 
         return ForwardContext(

@@ -673,3 +673,49 @@ class TestScheduledBatchPDFirstDecodeMTP:
         )
 
         assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]
+
+
+# ── Prefill dense-batch gate ───────────────────────────────────────────────
+
+
+class TestPrefillBatchThreshold:
+    def test_threshold_defaults_to_batch_budget(self):
+        cfg = MockConfig(max_num_batched_tokens=32)
+        sched = Scheduler(cfg)
+        # Threshold is derived from the batch-token budget, not a separate knob.
+        assert sched.prefill_batch_token_threshold == 32
+
+    def test_token_threshold_can_be_lower_than_batch_budget(self):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=32,
+                prefill_batch_token_threshold=20,
+            )
+        )
+        assert sched.prefill_batch_token_threshold == 20
+
+    def test_waiting_prefill_tokens_reaches_threshold(self, seq_factory):
+        # chunked prefill on so a 40-token prompt is clamped to the 32 budget
+        # (not rejected as oversized) and counts toward the threshold.
+        cfg = MockConfig(max_num_batched_tokens=32, enable_chunked_prefill=True)
+        sched = Scheduler(cfg)
+        # 40 waiting tokens are clamped to the 32-token batch budget.
+        sched.waiting.append(seq_factory(list(range(40))))
+        assert sched._waiting_prefill_tokens() >= 32
+
+    def test_without_delayer_underfull_prefill_is_admitted(self, seq_factory):
+        cfg = MockConfig(
+            max_num_batched_tokens=32,
+            enable_chunked_prefill=False,
+            data_parallel_size=8,
+        )
+        sched = Scheduler(cfg)
+        r = seq_factory([1, 2, 3])
+        r.status = SequenceStatus.RUNNING
+        r.type = SequenceType.DECODE
+        sched.block_manager.allocate(r, 0)
+        sched.running.append(r)
+        sched.waiting.append(seq_factory(list(range(8))))
+        batch, _ = sched.schedule()
+        assert batch is not None
+        assert batch.total_seqs_num_prefill == 1

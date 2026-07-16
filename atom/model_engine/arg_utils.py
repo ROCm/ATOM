@@ -43,6 +43,7 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
+    prefill_batch_token_threshold: int = 0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
@@ -211,6 +212,15 @@ class EngineArgs:
             type=int,
             default=16384,
             help="Maximum number of tokens to batch together in async engine",
+        )
+        parser.add_argument(
+            "--prefill-batch-token-threshold",
+            type=int,
+            default=0,
+            help=(
+                "Hold new prefills until this many eligible tokens are waiting. "
+                "0 uses max-num-batched-tokens."
+            ),
         )
         parser.add_argument(
             "--long-prefill-token-threshold",

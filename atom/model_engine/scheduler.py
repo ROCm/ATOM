@@ -447,6 +447,11 @@ class Scheduler:
         # Latency of the last prompt step
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
+        self.prefill_batch_token_threshold = (
+            config.prefill_batch_token_threshold
+            if config.prefill_batch_token_threshold > 0
+            else self.max_num_batched_tokens
+        )
 
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
@@ -558,6 +563,33 @@ class Scheduler:
                 return False  # KV-pressured: definitely cannot prefill
             return True
         return False
+
+    def _waiting_prefill_tokens(self) -> int:
+        """Sum of admissible new-prefill tokens sitting in the waiting queue,
+        capped at max_num_batched_tokens (we only care whether a *dense* batch
+        can be filled). Skips unschedulable / remote-KV-waiting entries and
+        clamps each seq to the chunked-prefill / budget limit, mirroring the
+        Phase-2 admission math so the count reflects what would actually pack
+        into one prefill step."""
+        total = 0
+        cap = self.max_num_batched_tokens
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            n = seq.num_tokens - seq.num_cached_tokens
+            if (
+                self.enable_chunked_prefill
+                and 0 < self.long_prefill_token_threshold < n
+            ):
+                n = self.long_prefill_token_threshold
+            if n > cap:
+                n = cap
+            total += n
+            if total >= cap:
+                return cap
+        return total
 
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
@@ -721,16 +753,33 @@ class Scheduler:
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
+        _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
-            delayer_allows = self.prefill_delayer.should_allow_prefill(
-                local_prefillable=self._can_admit_head_prefill(),
+            # A rank counts as "prefillable" for cross-DP alignment only if it
+            # can admit a prefill AND has a full batch's worth of waiting tokens.
+            # This makes all ranks align on firing dense prefills together
+            # instead of straggling partials.
+            _local_prefillable = self._can_admit_head_prefill()
+            _local_prefill_sufficient = (
+                _local_prefillable
+                and self._waiting_prefill_tokens()
+                >= self.prefill_batch_token_threshold
+            )
+            _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
+                local_prefillable=_local_prefillable,
+                local_prefill_sufficient=_local_prefill_sufficient,
                 token_usage=self._kv_usage(),
             )
-        else:
-            delayer_allows = True
 
         if not self.running and not self.waiting:
             return None
+
+        # PrefillDelayer's result is a cross-rank decision. Do not apply a
+        # second rank-local density gate here: ranks could otherwise disagree
+        # after negotiation and recreate the mixed prefill/decode step the
+        # delayer is meant to prevent. Without a delayer, preserve immediate
+        # prefill admission rather than holding decode behind a local gate.
+        _new_prefill_allowed = _delayer_allows_prefill
 
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `delayer_allows` so cross-DP alignment still holds when one
@@ -738,7 +787,7 @@ class Scheduler:
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
-        if delayer_allows and self._partial_prefill_count > 0:
+        if _delayer_allows_prefill and self._partial_prefill_count > 0:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
@@ -759,7 +808,7 @@ class Scheduler:
 
         # ---- Phase 2: new requests from waiting ----
         while (
-            delayer_allows
+            _new_prefill_allowed
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
