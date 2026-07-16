@@ -5,12 +5,12 @@ This recipe shows how to run `GLM-5` (including `GLM-5.1` and `GLM-5.2`) models 
 GLM-5 features sparse MLA, and is architecturally similar to DeepSeek-V3.2. Its architecture is exposed through `GlmMoeDsaForCausalLM` to be picked up by ATOM OOT. GLM-5.2 is the pivot version of GLM-5 family that additionally uses IndexShare: `"shared"` layers reuse the preceding `"full"` layer's DSA indexer.
 Here is the support matrix for GLM-5.2 across different hardware platforms:
 
-| Hardware | Data Type | Model | MTP Support | Parallelism | Recipe Section |
+| Hardware | Data Type | Model | Parallelism | MTP Support | Recipe Section |
 | --- | --- | --- | --- | --- | --- |
-| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | ✅ | TP4 | [MI355 FP4](#mi355-fp4) |
-| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP4 | [MI355 FP8](#mi355-fp8) |
-| MI300X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
-| MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | ✅ | TP8 | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
+| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | TP4 | ✅ | [MI355 FP4](#mi355-fp4) |
+| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP4 | ✅ | [MI355 FP8](#mi355-fp8) |
+| MI300X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
+| MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
 
 Refer to the [GLM-5.2 Recipes](#glm-52-recipes-by-hardware) for deployment details on different platforms with vLLM-ATOM backend.
 
