@@ -93,7 +93,7 @@ vllm serve zai-org/GLM-5.2-FP8 \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"per_block_fp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
 ```
 
 #### GLM-5.2-FP8 MTP
@@ -114,7 +114,7 @@ vllm serve zai-org/GLM-5.2-FP8 \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"per_block_fp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}' \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 ```
 
