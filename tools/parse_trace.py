@@ -512,7 +512,9 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
     Parse prefill phase from a run trace (no warmup mixed in this trace).
     """
     # CPU side prefill annotations.
-    # Matches "prefill[bs=1 tok=115 ctx=115]" format.
+    # Matches "prefill[bs=1 tok=115 ctx=115]" format. The exact "prefill["
+    # prefix intentionally EXCLUDES dummy warmup prefills ("dummy_prefill[")
+    # so they don't pollute the stats — see atom/model_engine/run_labels.py.
     prefills = [
         e
         for e in events
@@ -809,7 +811,10 @@ def parse_decode(
     """
     print("Building event index...")
 
-    # Find GPU-annotated decode events (cat='gpu_user_annotation')
+    # Find GPU-annotated decode events (cat='gpu_user_annotation').
+    # "decode[" matches only real CUDAGraph decodes; "dummy_decode[" (DP-sync
+    # dummy) and "eager_decode[" are excluded by design — see
+    # atom/model_engine/run_labels.py for the full label taxonomy.
     decodes = [
         e
         for e in run_events

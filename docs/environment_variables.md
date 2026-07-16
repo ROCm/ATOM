@@ -16,6 +16,35 @@ This document describes the environment variables used in the ATOM project.
 
 ---
 
+## Prefill Delayer (DP attention)
+
+Prefill **coalescer** for DP-attention + EP-MoE serving. Holds back prefill
+admission until the accumulated prefill (fresh waiting tokens + resumable
+partials' remaining tokens) fills a worthwhile forward, so fragmented
+short-input prefills / small partial tail chunks batch into one forward instead
+of firing many tiny ones. Releases when the fill target is reached, when a
+must-fire bound trips (no decode to hide behind, KV pressure/starvation, TTFT
+deadline, partial deadline), or when the queue stops growing. Preserves
+cross-rank phase alignment (releases only when every rank is prefill-ready,
+unless a bound forces it). All timing is tick-based (deterministic across ranks —
+no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only when
+`data_parallel_size > 1`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_ENABLE_PREFILL_DELAYER** | bool | true | Master switch for the prefill coalescer. |
+| **ATOM_PREFILL_DELAYER_TARGET_FILL** | float | 0.7 | Release once accumulated pending tokens reach `target_fill × max_num_batched_tokens` (averaged across prefillable ranks). In (0, 1]; higher = fewer, larger prefills at some TTFT cost. Clamped to (0, 1]. |
+| **ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS** | int | 30 | Max consecutive scheduler ticks a held prefill waits before force-release. Values `< 1` clamped to 1. |
+| **ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS** | int | 8 | Tighter bound for a held mid-chunked-prefill (it holds allocated KV). Values `< 1` clamped to 1. |
+| **ATOM_PREFILL_DELAYER_STALL_TICKS** | int | 3 | After this many consecutive non-growing ticks, release (burst ended, more won't come). Values `< 1` clamped to 1. |
+| **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a prefillable rank force-releases (can't accumulate a bigger batch anyway). |
+| **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
+| **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued (since arrival) ≥ this many ms, force-release regardless of the fill target. Measures true end-to-end wait (backlog + coalescer holds), unlike the tick-based TTFT bound which only caps one hold episode. Empty = disabled; set to your TTFT budget (a small value under heavy backlog fires every tick and defeats coalescing). |
+| **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
+| **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
+
+---
+
 ## Model Loading
 
 | Variable | Type | Default | Description |

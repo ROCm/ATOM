@@ -562,15 +562,109 @@ class Scheduler:
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
 
-        Used as the `token_usage` signal for PrefillDelayer's low-watermark
-        safety valve. Derived from BlockManager bookkeeping; cheap (no
-        traversal of seq tables).
+        The `kv_usage` signal for PrefillDelayer's KV watermark bounds — both the
+        high watermark (near-full → release, can't accumulate more) and the
+        optional low watermark (GPU starving → release, feed it). Derived from
+        BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
         bm = self.block_manager
         total = len(bm.blocks)
         if total <= 0:
             return 0.0
         return len(bm.used_block_ids) / total
+
+    def _waiting_new_token_count(self) -> int:
+        """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
+        saturated at `max_num_batched_tokens`.
+
+        Feeds PrefillDelayer's coalescer fill signal (accumulate a full prefill
+        batch before releasing, instead of firing many tiny fragments). The cap
+        early-exits the scan: one batch's worth is all the coalescer compares
+        against, so there's no point summing a deep queue.
+
+        Skips the same non-admittable seqs as `_can_admit_head_prefill` —
+        unschedulable, WAITING_FOR_REMOTE_KVS, and oversized-when-chunking-off —
+        so the "queued work" signal counts only tokens this rank could actually
+        prefill this step. Counting remote-KV / unschedulable tokens here would
+        inflate the cross-rank aggregate and reach the fill target before a real
+        batch has accumulated. The `num_cached_tokens` discount is best-effort:
+        an un-admitted seq has not been probed against the prefix cache yet, so
+        this is an upper bound on new tokens for cache-hit prompts.
+        """
+        cap = self.max_num_batched_tokens
+        total = 0
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            if (
+                not self.enable_chunked_prefill
+                and num_new_tokens > self.max_num_batched_tokens
+            ):
+                continue
+            total += max(0, num_new_tokens)
+            if total >= cap:
+                return cap
+        return total
+
+    def _partial_prefill_remaining_tokens(self) -> int:
+        """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill
+        seqs in `running`, saturated at `max_num_batched_tokens`.
+
+        Folded into the coalescer's pending-token signal so a small partial tail
+        chunk does not force its own tiny prefill forward — it accumulates with
+        fresh prefills instead, bounded by the coalescer's partial deadline.
+        Skipped entirely in the common steady-state (no partial) via the
+        `_partial_prefill_count` counter, and stops scanning once all
+        `_partial_prefill_count` partials have been summed.
+
+        This is an UPPER BOUND on what a partial can actually contribute in one
+        forward: `remaining = num_tokens - num_cached_tokens` does NOT apply the
+        per-step `long_prefill_token_threshold` chunk clamp that Phase-1
+        scheduling uses, so when that threshold is set the coalescer fill signal
+        may read slightly high. Acceptable for a coalescing heuristic; consistent
+        with `_waiting_new_token_count`'s best-effort estimate.
+        """
+        if self._partial_prefill_count == 0:
+            return 0
+        cap = self.max_num_batched_tokens
+        total = 0
+        seen = 0
+        for seq in self.running:
+            if not seq.is_partial_prefill:
+                continue
+            total += max(0, seq.num_tokens - seq.num_cached_tokens)
+            if total >= cap:
+                return cap
+            seen += 1
+            if seen >= self._partial_prefill_count:
+                break  # all partials summed; skip the rest of the decode tail
+        return total
+
+    def _oldest_waiting_prefill_age_ms(self) -> float:
+        """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
+        or 0.0 if none.
+
+        Feeds PrefillDelayer's TTFT SLA guard: if this exceeds max_queue_ms the
+        coalescer force-releases so a request never starves in the queue. Uses
+        `seq.arrive_time` (wall-clock seconds, stamped at engine entry) — the
+        true end-to-end wait, including backlog and coalescer holds. Skips the
+        same non-admittable seqs as `_can_admit_head_prefill` (unschedulable,
+        WAITING_FOR_REMOTE_KVS) so a permanently-stuck seq can't peg the guard.
+        """
+        oldest_arrive = None
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if oldest_arrive is None or seq.arrive_time < oldest_arrive:
+                oldest_arrive = seq.arrive_time
+        if oldest_arrive is None:
+            return 0.0
+        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -722,9 +816,25 @@ class Scheduler:
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
+            # pending = fresh waiting new-tokens + resumable partials' remaining,
+            # capped at the batch budget: the coalescer's accumulation signal.
+            pending_tokens = min(
+                self._waiting_new_token_count()
+                + self._partial_prefill_remaining_tokens(),
+                self.max_num_batched_tokens,
+            )
             delayer_allows = self.prefill_delayer.should_allow_prefill(
-                local_prefillable=self._can_admit_head_prefill(),
-                token_usage=self._kv_usage(),
+                prefillable=self._can_admit_head_prefill(),
+                pending_tokens=pending_tokens,
+                # decode-only: self.running also holds mid-chunked-prefill seqs,
+                # which are NOT decode load — counting them would defeat the
+                # coalescer's "no decode → fire" fast path.
+                running_decode_batch=max(
+                    0, len(self.running) - self._partial_prefill_count
+                ),
+                kv_usage=self._kv_usage(),
+                has_partial=self._partial_prefill_count > 0,
+                oldest_waiting_age_ms=self._oldest_waiting_prefill_age_ms(),
             )
         else:
             delayer_allows = True

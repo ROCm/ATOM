@@ -250,24 +250,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
+    # The delayer is a prefill COALESCER: it holds back prefill admission under
+    # DP-attention until the accumulated prefill fills a worthwhile forward, so
+    # fragmented short-input prefills / small partial tail chunks batch into one
+    # forward instead of firing many tiny ones.
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
         os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
     ),
-    # Max consecutive scheduler passes the delayer is allowed to suppress
-    # prefill admission while waiting for cross-DP alignment.
-    "ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES", "30")
+    # Fill target: release prefill once accumulated pending tokens reach
+    # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
+    # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT
+    # cost. Default 0.7.
+    "ATOM_PREFILL_DELAYER_TARGET_FILL": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.7")
     ),
-    # Wall-clock cap (milliseconds) on a single delay window.
-    "ATOM_PREFILL_DELAYER_MAX_DELAY_MS": lambda: float(
-        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_MS", "5000")
+    # TTFT bound: max consecutive scheduler ticks a held prefill waits before
+    # force-release (deterministic across ranks; replaces the old wall-clock +
+    # pass-count pair).
+    "ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "30")
     ),
-    # Optional KV-usage low watermark below which delaying is allowed.
-    # Empty string => None (use PrefillDelayer's internal default).
+    # Tight bound (ticks) for a held mid-chunked-prefill: a partial holds already
+    # allocated KV, so it force-releases sooner than a fresh prefill.
+    "ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "8")
+    ),
+    # Consecutive non-growing ticks after which the coalescer gives up waiting
+    # (burst ended, more won't come) and releases.
+    "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "3")
+    ),
+    # KV high watermark: at/above this KV usage a prefillable rank force-releases
+    # (can't accumulate a bigger batch anyway).
+    "ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK", "0.9")
+    ),
+    # Optional KV-usage low watermark: below it a prefillable rank force-releases
+    # (GPU starving — feed it). Empty string => None => disabled.
     "ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": lambda: (
         None
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
+    # TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued
+    # (since arrival) >= this many ms, force-release regardless of the fill
+    # target. Bounds worst-case TTFT. Empty string => None => disabled (set this
+    # to your TTFT budget in ms to activate; a small value under heavy backlog
+    # will fire every tick and defeat coalescing, so size it to the SLA).
+    "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS": lambda: (
+        None
+        if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
+        else float(os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS"))
     ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),

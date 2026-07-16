@@ -23,6 +23,7 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
 from atom.utils.cuda_graph import BatchDescriptor
+from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
@@ -2066,23 +2067,21 @@ class ModelRunner:
         # internally short-circuits for prefill / cudagraph.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
+        # Profiler label. Kind (prefix) distinguishes real/dummy and
+        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
+        # `build_run_label`.
+        label = build_run_label(
+            is_prefill=is_prefill,
+            use_cudagraph=forward_mode.use_cudagraph,
+            is_dummy=context.is_dummy_run,
+            tbo_on=forward_context.ubatch_slices is not None,
+            bs=bs,
+            batch=batch,
+        )
+
         if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
-            if is_prefill:
-                label = f"prefill[bs={bs}"
-            else:
-                label = f"eager_decode[bs={bs}"
-            if batch is not None:
-                ctx = batch.context_lens
-                if len(ctx) == 1:
-                    ctx_str = str(ctx[0])
-                elif len(ctx) <= 5:
-                    ctx_str = str(ctx.tolist())
-                else:
-                    ctx_str = f"{ctx[:3].tolist()}...+{len(ctx)-3}"
-                label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
-            label += "]"
             with record_function(label):
                 # Handle multimodal prefill: compute vision embeddings and merge
                 inputs_embeds = None
@@ -2122,16 +2121,8 @@ class ModelRunner:
                     self._aux_hidden_states = None
                 logits = self.model.compute_logits(hidden_states)
         else:
-            # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
-            label = f"decode[bs={bs}"
-            if batch is not None:
-                label += f" tok={batch.total_tokens_num}"
-                if batch.total_seqs_num_prefill > 0:
-                    label += f" p={batch.total_seqs_num_prefill}"
-                label += f" d={batch.total_seqs_num_decode}"
-                if batch.num_spec_step > 0:
-                    label += f" spec={batch.num_spec_step}"
-            label += "]"
+            # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
+            # dummy_decode[...] — see build_run_label.
             with record_function(label):
                 graph_bs = context.graph_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
