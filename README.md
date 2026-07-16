@@ -126,7 +126,7 @@ hf auth login
 The default optimization level is 3 (piecewise torch.compile with CUDA graphs).
 
 ```bash
-python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --kv_cache_dtype fp8
+python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --kv-cache-dtype fp8
 ```
 
 > **Note:** First-time execution may take approximately 10 minutes for model compilation.
@@ -137,13 +137,13 @@ Start an OpenAI-compatible server:
 
 ```bash
 # Single GPU
-python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --kv_cache_dtype fp8
+python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --kv-cache-dtype fp8
 
 # Multi-GPU with tensor parallelism
-python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8
+python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv-cache-dtype fp8 -tp 8
 
 # With MTP speculative decoding
-python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8 \
+python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv-cache-dtype fp8 -tp 8 \
   --method mtp --num-speculative-tokens 3
 ```
 
@@ -191,7 +191,7 @@ Launch the server with `--torch-profiler-dir` and `--mark-trace`:
 
 ```bash
 python -m atom.entrypoints.openai_server \
-  --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8 \
+  --model deepseek-ai/DeepSeek-R1 --kv-cache-dtype fp8 -tp 8 \
   --torch-profiler-dir ./trace --mark-trace
 ```
 

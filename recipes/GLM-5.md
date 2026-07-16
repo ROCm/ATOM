@@ -4,6 +4,15 @@
 
 > The newer [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) is also supported — it shares the same `glm_moe_dsa` architecture and adds **IndexShare**. See [GLM-5.2 (IndexShare)](#glm-52-indexshare) below.
 
+Here is the support matrix for GLM-5.2 across different hardware platforms:
+
+| Hardware | Data Type | Model | Parallelism | MTP Support | Recipe Section |
+| --- | --- | --- | --- | --- | --- |
+| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | TP4 | ✅ | [MI355 FP4](#mi355-fp4) |
+| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP4 | ✅ | [MI355 FP8](#mi355-fp8) |
+| MI300X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
+| MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
+
 ## Preparing environment
 Pull the latest docker from https://hub.docker.com/r/rocm/atom-dev/ :
 ```bash
@@ -12,46 +21,13 @@ docker pull rocm/atom-dev:latest
 All the operations in the next will be executed inside the container.
 
 ## Launching server
-ATOM supports running the model with different parallelism, e.g., tensor parallel, expert parallel, data parallel. The examples below use the current ATOM server entrypoint and keep the recommended runtime environment close to the command.
+ATOM supports running the model with different parallelism, e.g., tensor parallel, expert parallel, data parallel. The examples below are organized by hardware and use the current ATOM server entrypoint.
 
-### GLM-5.2 FP8 Server
+### MI355
 
-```bash
-#!/bin/bash
+<a id="mi355-fp4"></a>
 
-model_path=zai-org/GLM-5.2-FP8
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_USE_FLYDSL_MOE_SORTING=1
-TP=8
-
-python -m atom.entrypoints.openai_server \
-  --model "$model_path" \
-  --server-port 7777 \
-  --kv_cache_dtype fp8 \
-  --no-enable_prefix_caching \
-  -tp $TP 2>&1 | tee server.log &
-```
-
-### GLM-5.2 FP8 Server with online quant to MXFP8 MOE
-
-```bash
-#!/bin/bash
-
-model_path=zai-org/GLM-5.2-FP8
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_USE_FLYDSL_MOE_SORTING=1
-TP=4
-
-python -m atom.entrypoints.openai_server \
-  --model "$model_path" \
-  --server-port 8000 \
-  --kv_cache_dtype fp8 \
-  --no-enable_prefix_caching \
-  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}' \
-  -tp $TP 2>&1 | tee server.log &
-```
-
-### GLM-5.2 MXFP4 Server
+#### GLM-5.2 MXFP4 Server
 
 ```bash
 #!/bin/bash
@@ -70,7 +46,7 @@ python -m atom.entrypoints.openai_server \
   -tp $TP 2>&1 | tee server.log &
 ```
 
-### GLM-5.2 MXFP4 MTP Server
+#### GLM-5.2 MXFP4 MTP Server
 
 ```bash
 #!/bin/bash
@@ -78,7 +54,6 @@ python -m atom.entrypoints.openai_server \
 model_path=amd/GLM-5.2-MXFP4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-export ATOM_ENABLE_RELAXED_MTP=1
 TP=4
 
 python -m atom.entrypoints.openai_server \
@@ -87,6 +62,92 @@ python -m atom.entrypoints.openai_server \
   --kv_cache_dtype fp8 \
   --no-enable_prefix_caching \
   --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate", "model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}' \
+  --num-speculative-tokens 3 \
+  --method mtp \
+  -tp $TP 2>&1 | tee server_mtp.log &
+```
+
+<a id="mi355-fp8"></a>
+
+#### GLM-5.2 FP8 Server
+
+```bash
+#!/bin/bash
+
+model_path=zai-org/GLM-5.2-FP8
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+TP=4
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8000 \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"per_block_fp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}' \
+  -tp $TP 2>&1 | tee server.log &
+```
+
+#### GLM-5.2 FP8 MTP Server
+
+```bash
+#!/bin/bash
+
+model_path=zai-org/GLM-5.2-FP8
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+TP=4
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8004 \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"per_block_fp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}' \
+  --num-speculative-tokens 3 \
+  --method mtp \
+  -tp $TP 2>&1 | tee server_mtp.log &
+```
+
+### MI300X / MI308X
+
+<a id="mi300x-mi308x-fp8"></a>
+
+#### GLM-5.2 FP8 Server
+
+```bash
+#!/bin/bash
+
+model_path=zai-org/GLM-5.2-FP8
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+TP=4
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8000 \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}' \
+  -tp $TP 2>&1 | tee server.log &
+```
+
+#### GLM-5.2 FP8 MTP Server
+
+```bash
+#!/bin/bash
+
+model_path=zai-org/GLM-5.2-FP8
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+TP=4
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8004 \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}' \
   --num-speculative-tokens 3 \
   --method mtp \
   -tp $TP 2>&1 | tee server_mtp.log &
