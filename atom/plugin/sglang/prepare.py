@@ -47,8 +47,14 @@ def prepare_model(config: Any):
         set_attn_cls,
     )
 
-    if model_arch not in _ATOM_SUPPORTED_MODELS:
-        supported_archs = list(_ATOM_SUPPORTED_MODELS.keys())
+    supported_models = dict(_ATOM_SUPPORTED_MODELS)
+    if model_arch == "LlamaForCausalLMEagle3":
+        from atom.models.eagle3_llama import Eagle3LlamaModel
+
+        supported_models[model_arch] = Eagle3LlamaModel
+
+    if model_arch not in supported_models:
+        supported_archs = list(supported_models.keys())
         raise ValueError(
             f"ATOM does not support the required model architecture: {model_arch}. "
             f"For now supported model architectures: {supported_archs}"
@@ -57,8 +63,31 @@ def prepare_model(config: Any):
     from atom.plugin.config import generate_atom_config_for_plugin_mode
 
     atom_config = generate_atom_config_for_plugin_mode(config)
+    target_hf_config = getattr(atom_config, "hf_config", None)
+    target_hf_config = getattr(target_hf_config, "text_config", target_hf_config)
+    target_num_hidden_layers = int(
+        getattr(target_hf_config, "num_hidden_layers", 0) or 0
+    )
+    # `generate_atom_config_for_plugin_mode` is built from SGLang global
+    # ServerArgs, which always describe the target model.  External draft
+    # runners (for example EAGLE3) pass their own HF config into this wrapper,
+    # so overwrite the model-local pieces here before constructing ATOM modules.
+    # Otherwise the draft modeling is built with target dimensions while
+    # SGLang allocates draft KV pools from the draft config.
+    atom_config.hf_config = config
+    model_path = getattr(config, "_name_or_path", None) or getattr(
+        config, "name_or_path", None
+    )
+    if model_path:
+        atom_config.model = model_path
+    from atom.config import QuantizationConfig
 
-    model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
+    atom_config.quant_config = QuantizationConfig(
+        atom_config.hf_config,
+        online_quant_config=getattr(atom_config, "online_quant_config", None),
+    )
+
+    model_cls = supported_models[model_arch]
     logger.info("ATOM model class for %s is %s", model_arch, model_cls)
 
     from atom.plugin.sglang.runtime import get_model_arch_spec
@@ -83,8 +112,11 @@ def prepare_model(config: Any):
     apply_graph_capture_patch()
 
     init_params = inspect.signature(model_cls.__init__).parameters
+    init_kwargs = {}
+    if model_arch == "LlamaForCausalLMEagle3" and "layer_offset" in init_params:
+        init_kwargs["layer_offset"] = target_num_hidden_layers
     if "atom_config" in init_params:
-        model = model_cls(atom_config=atom_config)
+        model = model_cls(atom_config=atom_config, **init_kwargs)
     elif "config" in init_params:
         model = model_cls(config=atom_config)
     else:

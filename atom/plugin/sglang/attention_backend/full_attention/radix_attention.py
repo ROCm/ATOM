@@ -16,6 +16,7 @@ from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import BaseAttention
 from atom.model_ops.layernorm import GemmaRMSNorm, fused_qk_norm
 from atom.model_ops.utils import atom_parameter
+from atom.config import get_current_atom_config
 from atom.plugin.prepare import is_plugin_mode, is_sglang
 from atom.models.utils import maybe_prefix
 
@@ -90,6 +91,34 @@ class RadixAttention(BaseAttention):
                 v_head_dim=_v_head_dim,
                 prefix=maybe_prefix(prefix, "attn"),
             )
+            atom_config = get_current_atom_config()
+            hf_config = getattr(atom_config, "hf_config", None)
+            text_config = getattr(hf_config, "text_config", None)
+            model_type = getattr(hf_config, "model_type", "")
+            text_model_type = getattr(text_config, "model_type", "")
+            architectures = getattr(hf_config, "architectures", []) or []
+            is_minimax_m3 = model_type == "minimax_m3_vl" or (
+                text_model_type in {"minimax_m3", "minimax_m3_text", "minimax_m3_vl"}
+            )
+            is_eagle3_llama = "LlamaForCausalLMEagle3" in architectures
+            if (
+                is_minimax_m3
+                and not use_mla
+                and rotary_emb is not None
+                and q_norm is not None
+                and k_norm is not None
+                and head_dim == 128
+                and _v_head_dim == 128
+            ):
+                self.attn._atom_minimax_m3_dense_mha = True
+            if (
+                is_eagle3_llama
+                and not use_mla
+                and rotary_emb is not None
+                and head_dim == 128
+                and _v_head_dim == 128
+            ):
+                self.attn._atom_eagle3_dense_mha = True
             # sglang's RadixAttention expects k_scale/v_scale on device;
             # ensure they exist with identity scaling for non-quantised KV cache.
             # device="cuda" is safe here: this branch is guarded by is_sglang(),

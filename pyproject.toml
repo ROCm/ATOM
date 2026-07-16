@@ -42,3 +42,6 @@ atom = "atom.plugin.vllm.register:register_platform"
 
 [project.entry-points."vllm.general_plugins"]
 atom_model_registry = "atom.plugin.vllm.register:register_model"
+
+[project.entry-points."sglang.srt.plugins"]
+atom_sglang = "atom.plugin.sglang.register:register_plugin"

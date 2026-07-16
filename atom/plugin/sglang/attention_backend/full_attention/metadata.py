@@ -29,6 +29,10 @@ class ForwardMetadata:
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     num_kv_splits: Optional[int] = None
     run_graph: Optional[bool] = True
+    custom_mask: Optional[torch.Tensor] = None
+    mask_indptr: Optional[torch.Tensor] = None
+    max_extend_len: Optional[int] = None
+    swa_page_table: Optional[torch.Tensor] = None
     # PA metadata for pa_persistent_fwd (only used in decode mode, non-MLA)
     pa_metadata_qo_indptr: Optional[torch.Tensor] = None
     pa_metadata_pages_kv_indptr: Optional[torch.Tensor] = None

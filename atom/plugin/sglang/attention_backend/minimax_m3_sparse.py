@@ -51,10 +51,44 @@ def _slice_i32(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
 
 
 def _get_query_lens(forward_batch, batch_size: int) -> torch.Tensor:
+    if forward_batch.forward_mode.is_target_verify():
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if spec_info is None:
+            raise RuntimeError("MiniMax-M3 target_verify requires speculative metadata")
+        draft_num = int(spec_info.draft_token_num)
+        return torch.full(
+            (batch_size,),
+            draft_num,
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
         query_lens = getattr(forward_batch, "seq_lens")
     return _slice_i32(query_lens, batch_size)
+
+
+def _get_seq_lens(forward_batch, batch_size: int) -> torch.Tensor:
+    seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
+    if forward_batch.forward_mode.is_target_verify():
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if spec_info is None:
+            raise RuntimeError("MiniMax-M3 target_verify requires speculative metadata")
+        seq_lens = seq_lens + int(spec_info.draft_token_num)
+    return seq_lens
+
+
+def _get_max_seq_len(forward_batch, batch_size: int, seq_lens: torch.Tensor) -> int:
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is not None and batch_size:
+        max_seq_len = int(seq_lens_cpu[:batch_size].max().item())
+        if forward_batch.forward_mode.is_target_verify():
+            spec_info = getattr(forward_batch, "spec_info", None)
+            if spec_info is None:
+                raise RuntimeError("MiniMax-M3 target_verify requires speculative metadata")
+            max_seq_len += int(spec_info.draft_token_num)
+        return max_seq_len
+    return int(seq_lens.max().item()) if batch_size else 0
 
 
 def _get_prefix_lens(
@@ -607,21 +641,32 @@ def build_minimax_m3_block_table(forward_batch, page_size: int) -> torch.Tensor:
 
     if not forward_batch.forward_mode.is_decode_or_idle():
         query_lens = _get_query_lens(forward_batch, batch_size)
-        seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
+        seq_lens = _get_seq_lens(forward_batch, batch_size)
         prefix_lens = _get_prefix_lens(forward_batch, batch_size, seq_lens, query_lens)
         out_cache_loc = forward_batch.out_cache_loc
-        offset = 0
-        for req_idx in range(batch_size):
-            prefix_len = int(prefix_lens[req_idx].item())
-            query_len = int(query_lens[req_idx].item())
-            if query_len > 0:
-                token_table[req_idx, prefix_len : prefix_len + query_len] = (
-                    out_cache_loc[offset : offset + query_len]
-                )
-            offset += query_len
+        if _is_stream_capturing():
+            columns = torch.arange(token_table.shape[1], device=token_table.device)
+            rel_pos = columns.unsqueeze(0) - prefix_lens.unsqueeze(1)
+            mask = (rel_pos >= 0) & (rel_pos < query_lens.unsqueeze(1))
+            query_offsets = torch.cumsum(query_lens, dim=0) - query_lens
+            src_idx = (query_offsets.unsqueeze(1) + rel_pos).clamp_min(0)
+            max_src_idx = max(int(out_cache_loc.numel()) - 1, 0)
+            src_idx = src_idx.clamp_max(max_src_idx).to(torch.long)
+            src_values = out_cache_loc.gather(0, src_idx.reshape(-1)).view_as(src_idx)
+            token_table = torch.where(mask, src_values, token_table)
+        else:
+            offset = 0
+            for req_idx in range(batch_size):
+                prefix_len = int(prefix_lens[req_idx].item())
+                query_len = int(query_lens[req_idx].item())
+                if query_len > 0:
+                    token_table[req_idx, prefix_len : prefix_len + query_len] = (
+                        out_cache_loc[offset : offset + query_len]
+                    )
+                offset += query_len
 
-    seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
-    if _is_stream_capturing() and forward_batch.forward_mode.is_decode_or_idle():
+    seq_lens = _get_seq_lens(forward_batch, batch_size)
+    if _is_stream_capturing():
         max_blocks = int(token_table.shape[1]) // page_size
     else:
         max_seq_len = int(seq_lens.max().item()) if batch_size else 0
@@ -639,11 +684,8 @@ def build_minimax_m3_forward_metadata(
 
     validate_minimax_m3_page_size(page_size)
     batch_size = _get_batch_size(forward_batch)
-    seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
-    if _is_stream_capturing() and forward_batch.forward_mode.is_decode_or_idle():
-        max_seq_len = int(block_table.shape[1]) * page_size
-    else:
-        max_seq_len = int(seq_lens.max().item()) if batch_size else 0
+    seq_lens = _get_seq_lens(forward_batch, batch_size)
+    max_seq_len = _get_max_seq_len(forward_batch, batch_size, seq_lens)
 
     if forward_batch.forward_mode.is_decode_or_idle():
         return MiniMaxM3SGLangMetadata(
@@ -655,16 +697,22 @@ def build_minimax_m3_forward_metadata(
 
     query_lens = _get_query_lens(forward_batch, batch_size)
     context_lens = _get_prefix_lens(forward_batch, batch_size, seq_lens, query_lens)
-    cu_seqlens_q = torch.empty(
-        batch_size + 1, dtype=torch.int32, device=seq_lens.device
+    cu_seqlens_q = torch.nn.functional.pad(
+        torch.cumsum(query_lens, dim=0, dtype=torch.int32),
+        (1, 0),
     )
-    cu_seqlens_k = torch.empty(
-        batch_size + 1, dtype=torch.int32, device=seq_lens.device
+    cu_seqlens_k = torch.nn.functional.pad(
+        torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
+        (1, 0),
     )
-    cu_seqlens_q[0] = 0
-    cu_seqlens_k[0] = 0
-    torch.cumsum(query_lens, dim=0, out=cu_seqlens_q[1:])
-    torch.cumsum(seq_lens, dim=0, out=cu_seqlens_k[1:])
+
+    if _is_stream_capturing():
+        if forward_batch.forward_mode.is_target_verify():
+            max_query_len = int(getattr(forward_batch.spec_info, "draft_token_num", 1))
+        else:
+            max_query_len = int(getattr(forward_batch, "extend_num_tokens", None) or 1)
+    else:
+        max_query_len = int(query_lens.max().item()) if batch_size else 0
 
     return MiniMaxM3SGLangMetadata(
         is_decode=False,
@@ -674,7 +722,7 @@ def build_minimax_m3_forward_metadata(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         context_lens=context_lens,
-        max_query_len=int(query_lens.max().item()) if batch_size else 0,
+        max_query_len=max_query_len,
     )
 
 
@@ -825,7 +873,9 @@ def minimax_m3_sparse_attention_for_sglang(
     else:
         assert metadata.cu_seqlens_q is not None
         assert metadata.context_lens is not None
-        num_tokens = int(metadata.cu_seqlens_q[-1].item())
+        num_tokens = int(q.shape[0]) if _is_stream_capturing() else int(
+            metadata.cu_seqlens_q[-1].item()
+        )
         topk_idx = minimax_m3_index_topk(
             index_q[:num_tokens],
             index_cache,
