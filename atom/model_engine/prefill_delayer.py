@@ -89,6 +89,7 @@ class PrefillDelayer:
         "stall_ticks",
         "kv_high_watermark",
         "token_usage_low_watermark",
+        "max_queue_ms",
         # buffer / episode state
         "_reduce_buf",
         "_hold_ticks",
@@ -102,6 +103,7 @@ class PrefillDelayer:
         "_stat_fire_kv",
         "_stat_fire_partial",
         "_stat_fire_nodecode",
+        "_stat_fire_queue_ms",
         "_stat_fire_vacuous",
         "_stat_hold",
         "_stat_log_every",
@@ -118,6 +120,7 @@ class PrefillDelayer:
         stall_ticks: int = 3,
         kv_high_watermark: float = 0.9,
         token_usage_low_watermark: Optional[float] = None,
+        max_queue_ms: Optional[float] = None,
     ):
         self.dp_size = dp_size
         self.cpu_group = cpu_group
@@ -150,15 +153,26 @@ class PrefillDelayer:
         self.stall_ticks = self._clamp_ticks("stall_ticks", stall_ticks)
         self.kv_high_watermark = kv_high_watermark
         self.token_usage_low_watermark = token_usage_low_watermark
+        # TTFT SLA guard: if any rank's oldest schedulable waiting-prefill has
+        # queued (since arrival) >= this many ms, force release regardless of the
+        # fill target. None disables it. Wall-clock, but lockstep-safe: each rank
+        # compares its OWN requests' ages to the threshold locally (disjoint
+        # request sets across ranks), and only the OR of those per-rank booleans
+        # crosses the collective — so all ranks act on the identical result the
+        # same tick. (Contrast the removed per-rank hold-clock E1, which compared
+        # each rank's own clock to a threshold for a GLOBAL decision → skew.)
+        self.max_queue_ms = max_queue_ms
 
-        # 6-slot SUM-reduce buffer (gloo-safe). Encoding:
+        # 7-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
         #   slot 1 = pending_tokens     (SUM → G_pending; fresh + partial remain)
         #   slot 2 = running_decode     (SUM → G_running_dec)
-        #   slot 3 = kv_high flag       (SUM>0 → any prefillable rank KV-high; E-KV)
-        #   slot 4 = kv_low flag        (SUM>0 → any prefillable rank KV-low; E-KV)
+        #   slot 3 = kv_high flag       (SUM>0 → any prefillable rank KV-high)
+        #   slot 4 = kv_low flag        (SUM>0 → any prefillable rank KV-low)
         #   slot 5 = has_partial flag   (SUM>0 → any rank mid-chunked-prefill)
-        self._reduce_buf = torch.zeros(6, dtype=torch.int64, device="cpu")
+        #   slot 6 = queue_hot flag     (SUM>0 → any rank's oldest waiting prefill
+        #                                aged past max_queue_ms; TTFT SLA guard)
+        self._reduce_buf = torch.zeros(7, dtype=torch.int64, device="cpu")
 
         # Episode state. All ticks decide FIRE/HOLD in lockstep, so these evolve
         # identically on every rank (deterministic).
@@ -179,6 +193,7 @@ class PrefillDelayer:
         self._stat_fire_kv = 0
         self._stat_fire_partial = 0
         self._stat_fire_nodecode = 0
+        self._stat_fire_queue_ms = 0
         self._stat_fire_vacuous = 0
         self._stat_hold = 0
         self._stat_log_every = int(
@@ -193,7 +208,8 @@ class PrefillDelayer:
             f"partial_max_ticks={self.partial_max_ticks} "
             f"stall_ticks={self.stall_ticks} "
             f"kv_high_watermark={kv_high_watermark} "
-            f"token_usage_low_watermark={token_usage_low_watermark}"
+            f"token_usage_low_watermark={token_usage_low_watermark} "
+            f"max_queue_ms={max_queue_ms}"
         )
 
     @staticmethod
@@ -213,6 +229,7 @@ class PrefillDelayer:
         running_decode_batch: int = 0,
         kv_usage: float = 0.0,
         has_partial: bool = False,
+        oldest_waiting_age_ms: float = 0.0,
     ) -> bool:
         """Return True iff this rank may admit new prefills this tick (FIRE).
 
@@ -235,6 +252,10 @@ class PrefillDelayer:
             has_partial: this rank has a mid-chunked-prefill seq in flight. Its
                 remaining tokens are in pending_tokens; a partial only forces
                 release once held for partial_max_ticks (it holds KV).
+            oldest_waiting_age_ms: age (ms since arrival) of this rank's oldest
+                schedulable waiting prefill. If it reaches max_queue_ms, this
+                rank flags the TTFT SLA guard and all ranks release. 0 / no
+                waiting prefill / max_queue_ms=None → guard inactive.
         """
         # First call fires unconditionally (one-time warmup seed); not counted in
         # the per-exit stats so `fire_vacuous` stays exactly "n_prefillable == 0".
@@ -243,10 +264,16 @@ class PrefillDelayer:
             self._reset()
             return True
 
-        # KV bounds are gated on this rank actually having prefill to push.
+        # KV + queue-age bounds are gated on this rank actually having prefill to
+        # push (firing when this rank can't admit anything would be a no-op).
         low = self.token_usage_low_watermark
         kv_high = prefillable and kv_usage >= self.kv_high_watermark
         kv_low = prefillable and low is not None and kv_usage < low
+        queue_hot = (
+            prefillable
+            and self.max_queue_ms is not None
+            and oldest_waiting_age_ms >= self.max_queue_ms
+        )
 
         self._reduce_buf[0] = 1 if prefillable else 0
         self._reduce_buf[1] = int(pending_tokens)
@@ -254,6 +281,7 @@ class PrefillDelayer:
         self._reduce_buf[3] = 1 if kv_high else 0
         self._reduce_buf[4] = 1 if kv_low else 0
         self._reduce_buf[5] = 1 if has_partial else 0
+        self._reduce_buf[6] = 1 if queue_hot else 0
         try:
             torch.distributed.all_reduce(
                 self._reduce_buf,
@@ -268,14 +296,21 @@ class PrefillDelayer:
             self._reset()
             return True
 
-        # One host<-device readback for all 6 slots (a single .tolist() beats
-        # six .item() boundary crossings on this per-tick hot path).
-        n_prefillable, g_pending, g_running_dec, kv_high_n, kv_low_n, partial_n = (
-            self._reduce_buf.tolist()
-        )
+        # One host<-device readback for all 7 slots (a single .tolist() beats
+        # seven .item() boundary crossings on this per-tick hot path).
+        (
+            n_prefillable,
+            g_pending,
+            g_running_dec,
+            kv_high_n,
+            kv_low_n,
+            partial_n,
+            queue_hot_n,
+        ) = self._reduce_buf.tolist()
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
         any_partial = partial_n > 0
+        any_queue_hot = queue_hot_n > 0
 
         # Nothing to prefill anywhere → allow (vacuous), reset the episode.
         if n_prefillable == 0:
@@ -289,6 +324,12 @@ class PrefillDelayer:
             return self._fire("nodecode", g_pending)
         if any_kv_high or any_kv_low:
             return self._fire("kv", g_pending)
+        # TTFT SLA guard: a real request has queued (since arrival) past the
+        # threshold — release now regardless of fill/alignment. This is the
+        # end-to-end wait (includes backlog + coalescer holds), unlike the
+        # tick-based ttft bound below which only caps a single hold episode.
+        if any_queue_hot:
+            return self._fire("queue_ms", g_pending)
         if self._hold_ticks >= self.ttft_max_ticks:
             return self._fire("ttft", g_pending)
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
@@ -348,7 +389,7 @@ class PrefillDelayer:
         self._prev_pending = -1
 
     def _maybe_log(self) -> None:
-        # Cheap guard first — skip the 8-counter sum entirely when logging is
+        # Cheap guard first — skip the counter sum entirely when logging is
         # disabled (this runs on every FIRE/HOLD tick).
         if self._stat_log_every <= 0:
             return
@@ -359,6 +400,7 @@ class PrefillDelayer:
             + self._stat_fire_kv
             + self._stat_fire_partial
             + self._stat_fire_nodecode
+            + self._stat_fire_queue_ms
             + self._stat_fire_vacuous
             + self._stat_hold
         )
@@ -373,6 +415,7 @@ class PrefillDelayer:
                 f"fire_kv={self._stat_fire_kv} "
                 f"fire_partial={self._stat_fire_partial} "
                 f"fire_nodecode={self._stat_fire_nodecode} "
+                f"fire_queue_ms={self._stat_fire_queue_ms} "
                 f"fire_vacuous={self._stat_fire_vacuous} "
                 f"hold={self._stat_hold} "
                 f"(hold_rate={self._stat_hold / total:.2%})"

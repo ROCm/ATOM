@@ -492,6 +492,7 @@ class DPEngineCoreProc(EngineCore):
                     stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
                     kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 )
             )
 

@@ -4,6 +4,7 @@
 
 from collections import deque
 from types import SimpleNamespace
+from unittest import mock
 
 from atom.model_engine.scheduler import (
     ScheduledBatch,
@@ -358,6 +359,48 @@ class TestPartialPrefillRemainingTokens:
         sched.running = deque([big])
         sched._partial_prefill_count = 1
         assert sched._partial_prefill_remaining_tokens() == 16  # capped
+
+
+class TestOldestWaitingPrefillAge:
+    """TTFT SLA guard signal: age (ms) of the oldest ADMITTABLE waiting prefill,
+    skipping the same non-admittable seqs as _can_admit_head_prefill."""
+
+    def _sched(self):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                max_model_len=64,
+                enable_chunked_prefill=True,
+            )
+        )
+
+    def test_zero_when_empty(self):
+        sched = self._sched()
+        sched.waiting = deque()
+        assert sched._oldest_waiting_prefill_age_ms() == 0.0
+
+    def test_uses_oldest_arrival(self, seq_factory):
+        sched = self._sched()
+        new = seq_factory(list(range(8)))
+        old = seq_factory(list(range(8)))
+        sched.waiting = deque([new, old])
+        with mock.patch("atom.model_engine.scheduler.time.time", return_value=1000.0):
+            new.arrive_time = 999.0  # 1s ago
+            old.arrive_time = 997.5  # 2.5s ago → oldest
+            assert sched._oldest_waiting_prefill_age_ms() == 2500.0
+
+    def test_skips_remote_kv(self, seq_factory):
+        sched = self._sched()
+        admittable = seq_factory(list(range(8)))
+        remote = seq_factory(list(range(8)))
+        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.waiting = deque([admittable, remote])
+        with mock.patch("atom.model_engine.scheduler.time.time", return_value=1000.0):
+            admittable.arrive_time = 999.0  # 1s
+            remote.arrive_time = 990.0  # 10s but skipped (remote-KV)
+            assert sched._oldest_waiting_prefill_age_ms() == 1000.0
 
 
 # ── long_prefill_token_threshold ──────────────────────────────────────────

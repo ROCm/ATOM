@@ -61,6 +61,7 @@ def call(
     running_decode_batch=64,
     kv_usage=0.5,
     has_partial=False,
+    oldest_waiting_age_ms=0.0,
     reduce=_noop_all_reduce,
 ):
     with mock.patch("torch.distributed.all_reduce", reduce):
@@ -70,6 +71,7 @@ def call(
             running_decode_batch=running_decode_batch,
             kv_usage=kv_usage,
             has_partial=has_partial,
+            oldest_waiting_age_ms=oldest_waiting_age_ms,
         )
 
 
@@ -138,6 +140,46 @@ class TestMustFireBounds:
         assert call(d, pending_tokens=3000) is False  # hold_ticks 3
         assert call(d, pending_tokens=4000) is True  # hold_ticks>=3 → ttft
         assert d._stat_fire_ttft == 1
+
+
+class TestQueueAgeGuard:
+    def test_disabled_by_default(self):
+        # max_queue_ms=None → guard inactive even with an ancient waiting req.
+        d = make_delayer()  # no max_queue_ms
+        skip_first(d)
+        assert call(d, pending_tokens=1000, oldest_waiting_age_ms=1e9) is False
+
+    def test_fires_when_queue_age_exceeds_threshold(self):
+        d = make_delayer(max_queue_ms=5000, ttft_max_ticks=1000, stall_ticks=1000)
+        skip_first(d)
+        # below target, below age → hold
+        assert call(d, pending_tokens=1000, oldest_waiting_age_ms=1000) is False
+        # aged past 5000ms → force release regardless of fill
+        assert call(d, pending_tokens=1000, oldest_waiting_age_ms=6000) is True
+        assert d._stat_fire_queue_ms == 1
+
+    def test_age_guard_beats_alignment_gate(self):
+        # Even when mixed (n_prefillable<dp_size), an over-age request releases.
+        d = make_delayer(dp_size=2, max_queue_ms=5000, ttft_max_ticks=1000)
+        skip_first(d)
+        mixed = _add_rank({})  # sibling not prefillable → mixed
+        assert (
+            call(d, pending_tokens=1000, oldest_waiting_age_ms=6000, reduce=mixed)
+            is True
+        )
+        assert d._stat_fire_queue_ms == 1
+
+    def test_age_guard_gated_on_prefillable(self):
+        # A non-prefillable rank (can't admit) does not trip the guard itself;
+        # with dp_size=1 that means no release from age.
+        d = make_delayer(max_queue_ms=5000, ttft_max_ticks=1000, stall_ticks=1000)
+        skip_first(d)
+        # not prefillable → vacuous allow (n_prefillable==0), not a queue_ms fire
+        assert (
+            call(d, prefillable=False, pending_tokens=0, oldest_waiting_age_ms=9000)
+            is True
+        )
+        assert d._stat_fire_queue_ms == 0
 
 
 class TestStall:

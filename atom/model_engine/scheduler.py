@@ -643,6 +643,29 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    def _oldest_waiting_prefill_age_ms(self) -> float:
+        """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
+        or 0.0 if none.
+
+        Feeds PrefillDelayer's TTFT SLA guard: if this exceeds max_queue_ms the
+        coalescer force-releases so a request never starves in the queue. Uses
+        `seq.arrive_time` (wall-clock seconds, stamped at engine entry) — the
+        true end-to-end wait, including backlog and coalescer holds. Skips the
+        same non-admittable seqs as `_can_admit_head_prefill` (unschedulable,
+        WAITING_FOR_REMOTE_KVS) so a permanently-stuck seq can't peg the guard.
+        """
+        oldest_arrive = None
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if oldest_arrive is None or seq.arrive_time < oldest_arrive:
+                oldest_arrive = seq.arrive_time
+        if oldest_arrive is None:
+            return 0.0
+        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
+
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
         by EngineCore at the end of each scheduler step. No-op when events are
@@ -811,6 +834,7 @@ class Scheduler:
                 ),
                 kv_usage=self._kv_usage(),
                 has_partial=self._partial_prefill_count > 0,
+                oldest_waiting_age_ms=self._oldest_waiting_prefill_age_ms(),
             )
         else:
             delayer_allows = True
