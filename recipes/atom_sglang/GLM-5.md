@@ -1,6 +1,6 @@
-# GLM-5 with ATOM SGLang Backend
+# GLM-5 / GLM-5.2 with ATOM SGLang Plugin
 
-This recipe shows how to run `zai-org/GLM-5-FP8` with the SGLang-ATOM backend. GLM-5 uses sparse MLA and is architecturally similar to DeepSeek-V3.2; in the SGLang-ATOM plugin it is exposed through `GlmMoeDsaForCausalLM`.
+This recipe shows how to run GLM-5 and GLM-5.2 FP8 models with the SGLang-ATOM plugin. GLM-5 uses sparse MLA and is architecturally similar to DeepSeek-V3.2; in the SGLang-ATOM plugin it is exposed through `GlmMoeDsaForCausalLM`. GLM-5.2 uses the same model family and adds IndexShare, where shared sparse MLA layers reuse the index cache produced by the preceding full sparse MLA layer.
 
 ## Step 1: Pull the SGLang-ATOM Docker
 
@@ -14,21 +14,15 @@ Launch a container from this image and run the remaining commands inside the con
 
 The SGLang-ATOM backend keeps the standard SGLang CLI, server APIs, and general usage flow compatible with upstream SGLang. For general server options and API usage, users can refer to the [official SGLang documentation](https://docs.sglang.ai/).
 
-Before launching the server, export the SGLang-ATOM settings used by the benchmark workflow:
+### GLM-5 FP8 (TP=4)
 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export SGLANG_AITER_FP8_PREFILL_ATTN=0
 export SGLANG_USE_AITER=1
-export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
-# Introduce ATOM as external model package of SGLang
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 export SGLANG_ENABLE_TORCH_COMPILE=1
-```
 
-### GLM-5 FP8 (TP=4)
-
-```bash
 TP=4
 PORT=9000
 
@@ -43,10 +37,130 @@ python3 -m sglang.launch_server \
     --kv-cache-dtype fp8_e4m3 \
     --mem-fraction-static 0.8 \
     --page-size 1 \
-    --disable-radix-cache \
+    --disable-radix-cache
 ```
 
+### GLM-5.2 FP8
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export SGLANG_USE_AITER=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+
+MODEL_PATH=zai-org/GLM-5.2-FP8
+# Or use a local checkpoint path, for example:
+# MODEL_PATH=/shared/data/amd_int/models/GLM-5.2-FP8
+TP=8
+PORT=9000
+
+TORCHINDUCTOR_COMPILE_THREADS=128 \
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --host localhost \
+    --port "${PORT}" \
+    --trust-remote-code \
+    --tp-size "${TP}" \
+    --mem-fraction-static 0.8 \
+    --disable-radix-cache \
+    --kv-cache-dtype fp8_e4m3
+```
+
+### GLM-5.2 FP8 with online quant
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export SGLANG_USE_AITER=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+
+MODEL_PATH=zai-org/GLM-5.2-FP8
+# Or use a local checkpoint path, for example:
+# MODEL_PATH=/shared/data/amd_int/models/GLM-5.2-FP8
+TP=8
+PORT=9000
+MODEL_LOADER_EXTRA_CONFIG='{"online_quant_config":{"global_quant_config":"ptpc_fp8","layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"},"exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate"]}}'
+
+TORCHINDUCTOR_COMPILE_THREADS=128 \
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --host localhost \
+    --port "${PORT}" \
+    --trust-remote-code \
+    --tp-size "${TP}" \
+    --mem-fraction-static 0.8 \
+    --disable-radix-cache \
+    --kv-cache-dtype fp8_e4m3 \
+    --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}"
+```
+
+### GLM-5.2 FP8 with online quant on MI308
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export SGLANG_AITER_FP8_PREFILL_ATTN=0
+export SGLANG_ENABLE_TORCH_COMPILE=1
+export SGLANG_USE_AITER=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+
+MODEL_PATH=zai-org/GLM-5.2-FP8
+# Or use a local checkpoint path, for example:
+# MODEL_PATH=/shared/data/amd_int/models/GLM-5.2-FP8
+TP=8
+PORT=9000
+MODEL_LOADER_EXTRA_CONFIG='{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate"]}}'
+
+TORCHINDUCTOR_COMPILE_THREADS=128 \
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --host localhost \
+    --port "${PORT}" \
+    --trust-remote-code \
+    --tp-size "${TP}" \
+    --mem-fraction-static 0.8 \
+    --page-size 1 \
+    --disable-radix-cache \
+    --kv-cache-dtype fp8_e4m3 \
+    --attention-backend aiter \
+    --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}"
+```
+
+`online_quant_config` must be nested under `model_loader_extra_config`. The ATOM plugin consumes this nested key before SGLang's default model loader validates the remaining loader config. Putting `global_quant_config`, `layer_quant_config`, or `exclude_layer` at the top level will make SGLang reject the config.
+
 For an 8-GPU run, set `TP=8` and expose the target GPUs with `CUDA_VISIBLE_DEVICES`.
+
+
+### GLM-5.2 MXFP4 with online quant
+
+Use this case with the Quark MXFP4 checkpoint and online quantize the
+non-expert weights to `ptpc_fp8`.
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export SGLANG_USE_AITER=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+
+MODEL_PATH=amd/GLM-5.2-MXFP4
+# Or use a local checkpoint path, for example:
+# MODEL_PATH=/shared/data/amd_int/models/GLM-5.2-MXFP4
+TP=4
+PORT=9000
+MODEL_LOADER_EXTRA_CONFIG='{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}}'
+
+TORCHINDUCTOR_COMPILE_THREADS=128 \
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --host localhost \
+    --port "${PORT}" \
+    --trust-remote-code \
+    --tp-size "${TP}" \
+    --mem-fraction-static 0.8 \
+    --disable-radix-cache \
+    --kv-cache-dtype fp8_e4m3 \
+    --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}"
+```
 
 ## Step 3: Performance Benchmark
 
@@ -60,10 +174,10 @@ OSL=1024
 CONC=64
 RANDOM_RANGE_RATIO=1.0
 RESULT_DIR=./benchmark-results
-RESULT_FILENAME=glm-5-sglang-tp${TP}-${ISL}-${OSL}-${CONC}-${RANDOM_RANGE_RATIO}.json
+RESULT_FILENAME=glm-5.2-sglang-tp${TP}-${ISL}-${OSL}-${CONC}-${RANDOM_RANGE_RATIO}.json
 
 python3 /tmp/bench_serving/benchmark_serving.py \
-    --model=zai-org/GLM-5-FP8 \
+    --model="${MODEL_PATH}" \
     --backend=sglang \
     --base-url=http://127.0.0.1:${PORT} \
     --dataset-name=random \
@@ -100,7 +214,7 @@ The sparse MLA mechanism contains an indexer that selects the top-k tokens it de
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=zai-org/GLM-5-FP8,base_url=http://localhost:${PORT}/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True \
+        --model_args "model=${MODEL_PATH},base_url=http://localhost:${PORT}/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
         --tasks gsm8k \
-        --num_fewshot 20
+        --num_fewshot 5
 ```
