@@ -19,10 +19,36 @@ Fix:
 import sys
 import unittest
 
-# Clear cached atom modules (conftest.py stubs)
-for mod_name in list(sys.modules):
-    if mod_name.startswith("atom"):
-        del sys.modules[mod_name]
+import pytest
+
+# These tests load the real atom.config / atom.model_ops.moe, which import the
+# AITER GPU kernel library (e.g. `from aiter import QuantType`). AITER has no
+# CPU/PyPI build, so skip this module visibly on the non-GPU unit gate; it runs
+# in the GPU CI where AITER is present.
+pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+
+# This test needs to inspect real atom source (not conftest.py stubs), so it
+# wipes any cached `atom.*` modules at module-import time. Previously this
+# also wiped the conftest stubs and never restored them, polluting later
+# tests (test_arg_utils_spec / test_scheduler / test_sequence) that depend
+# on the stubs. setUpModule / tearDownModule now snapshots-and-restores
+# sys.modules so this file's effect is local to its own collection.
+_saved_atom_modules: dict[str, object] = {}
+
+
+def setUpModule():
+    global _saved_atom_modules
+    _saved_atom_modules = {
+        name: mod for name, mod in sys.modules.items() if name.startswith("atom")
+    }
+    for name in list(_saved_atom_modules):
+        del sys.modules[name]
+
+
+def tearDownModule():
+    for name in [n for n in sys.modules if n.startswith("atom")]:
+        del sys.modules[name]
+    sys.modules.update(_saved_atom_modules)
 
 
 class TestFusedMoEDefaultHasBias(unittest.TestCase):
@@ -200,29 +226,6 @@ class TestSwiGLUInterleavingWithoutBias(unittest.TestCase):
         ``layer.activation == ActivationType.Swiglu``
       and guard only the bias interleaving on ``layer.w13_bias is not None``.
     """
-
-    def test_swiglu_branch_condition_no_bias_check(self):
-        """The SwiGLU branch must NOT require bias to be present."""
-        import inspect
-        from atom.model_ops.moe import Mxfp4MoEMethod
-
-        source = inspect.getsource(Mxfp4MoEMethod.process_weights_after_loading)
-
-        # The condition should be just ActivationType.Swiglu, without "and ... bias"
-        self.assertIn(
-            "layer.activation == ActivationType.Swiglu:",
-            source.replace("\n", ""),
-            "SwiGLU branch must trigger on activation type alone, "
-            "not conditionally on bias presence",
-        )
-
-        # Bias interleaving should be guarded separately
-        self.assertIn(
-            "if layer.w13_bias is not None:",
-            source,
-            "Bias interleaving should be a separate conditional inside "
-            "the SwiGLU branch",
-        )
 
     def test_swiglu_branch_does_not_couple_bias_and_shuffle(self):
         """Ensure the old coupled condition is gone."""

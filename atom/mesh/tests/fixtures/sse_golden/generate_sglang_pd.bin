@@ -1,0 +1,8 @@
+data: {"text":"Hello","output_ids":[1],"meta_info":{"id":"req-fixture-0","finish_reason":null,"prompt_tokens":0,"weight_version":"default","output_token_logprobs":null,"completion_tokens":1,"cached_tokens":0},"index":0}
+
+data: {"text":"Helloworld","output_ids":[2],"meta_info":{"id":"req-fixture-0","finish_reason":null,"prompt_tokens":0,"weight_version":"default","output_token_logprobs":null,"completion_tokens":2,"cached_tokens":0},"index":0}
+
+data: {"text":"Helloworld","output_ids":[6],"meta_info":{"id":"req-fixture-0","finish_reason":{"type":"stop"},"prompt_tokens":3,"weight_version":"default","input_token_logprobs":null,"output_token_logprobs":null,"completion_tokens":3,"cached_tokens":0,"e2e_latency":0.0},"index":0}
+
+data: [DONE]
+

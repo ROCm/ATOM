@@ -4,11 +4,10 @@
 from atom.model_engine.llm_engine import LLMEngine
 from atom.sampling_params import SamplingParams
 
-# interface for upper framework to construct the model from ATOM
-from atom.plugin import prepare_model
+from atom.plugin.sglang import prepare_model_for_sglang
 
 __all__ = [
     "LLMEngine",
     "SamplingParams",
-    "prepare_model",
+    "prepare_model_for_sglang",
 ]

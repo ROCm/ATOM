@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional, NamedTuple
 from unittest.mock import patch
@@ -61,6 +62,18 @@ class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+
+
+# Shared cudagraph pool across all piecewise pieces (default). Combined with the
+# weak_ref_tensor op it lets the pool OVERLAY piece outputs across shapes, so the
+# retained pool stays small (~10GB vs ~35GB unshared on DSV4 TP8). First
+# torch.cuda.graph makes the pool; the rest reuse it.
+_shared_graph_pool: Optional[Any] = None
+
+# Per-num_tokens pools (ATOM_PER_BUCKET_POOL=1 fallback). Isolates each shape's
+# pool so shapes can't overlap — costs more memory but avoids any cross-shape
+# reuse. Kept as a safety escape hatch; default is the shared pool above.
+_graph_pools: dict = {}
 
 
 class CUDAGraphWrapper:
@@ -187,8 +200,21 @@ class CUDAGraphWrapper:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
 
-                # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool):
+                import atom.utils.cuda_graph as _cg_mod
+
+                # Default: single shared pool (overlays piece outputs across
+                # shapes -> low memory; safe here because pieces replay serially
+                # and inter-piece tensors are pinned via persistent buffers).
+                # ATOM_PER_BUCKET_POOL=1 isolates a pool per num_tokens bucket
+                # (more memory) as a fallback.
+                _per_bucket = os.environ.get("ATOM_PER_BUCKET_POOL") == "1"
+                _bkey = batch_descriptor.num_tokens if batch_descriptor else 0
+                _pool = (
+                    _cg_mod._graph_pools.get(_bkey)
+                    if _per_bucket
+                    else _cg_mod._shared_graph_pool
+                )
+                with torch.cuda.graph(cudagraph, pool=_pool):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.cudagraph_options.weak_ref_output:
@@ -202,6 +228,14 @@ class CUDAGraphWrapper:
 
             # here we always use weak ref for the output
             # to save memory
+            if _per_bucket:
+                if _bkey not in _cg_mod._graph_pools:
+                    # first graph of this bucket -> remember its pool.
+                    _cg_mod._graph_pools[_bkey] = cudagraph.pool()
+            elif _cg_mod._shared_graph_pool is None:
+                # first graph overall -> remember the shared pool.
+                _cg_mod._shared_graph_pool = cudagraph.pool()
+
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
 

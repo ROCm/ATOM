@@ -266,6 +266,33 @@ def fp8_w8a8_moe_quant_config(
     )
 
 
+def mxfp4_w4a8_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    per_act_token_quant: bool = False,
+    block_shape: list[int] | None = None,
+) -> FusedMoEQuantConfig:
+    """
+    Construct a quant config for fp8 activations and fp8 weights.
+    """
+    return FusedMoEQuantConfig.make(
+        torch.float8_e4m3fn,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        per_act_token_quant=per_act_token_quant,
+        block_shape=block_shape,
+        weight_dtype="mxfp4",
+    )
+
+
 FUSED_MOE_UNQUANTIZED_CONFIG: FusedMoEQuantConfig = FusedMoEQuantConfig.make()
 
 
@@ -280,6 +307,10 @@ class FusedMoEConfig:
 
     # The activation type.
     in_dtype: torch.dtype | str | None = None
+    # activation quant type -- to differentiate triton aiter mxfp4 kernels
+    a_quant_dtype: torch.dtype | str | None = None
+
+    static_scale: torch.Tensor | None = None
 
     max_num_tokens: int = 256
 

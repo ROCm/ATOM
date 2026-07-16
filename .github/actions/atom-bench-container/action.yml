@@ -1,0 +1,84 @@
+name: ATOM benchmark container
+description: >-
+  Start the ROCm CI container and download the model into it. Shared by the
+  benchmark and regression-rerun jobs so the container/download boilerplate
+  lives in one place. The caller is responsible for the pre-checkout workspace
+  cleanup and for tearing the container down afterwards (needs `if: always()`).
+
+inputs:
+  image:
+    description: Docker image to run.
+    required: true
+  container-name:
+    description: Name for the started container (e.g. atom-benchmark).
+    required: true
+  model-path:
+    description: HF model id / path to download into the container.
+    required: true
+  env-vars:
+    description: Newline-separated KEY=VAL model env vars (written to an env-file).
+    required: false
+    default: ""
+  container-env:
+    description: Extra `docker run` flags, e.g. "-e ISL=1024 -e OSL=1024".
+    required: false
+    default: ""
+  hf-token:
+    description: HuggingFace token for gated model downloads.
+    required: false
+    default: ""
+  download-required:
+    description: "'true' fails the job on download error; 'false' warns and continues."
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # Container boilerplate is shared with the test/accuracy jobs. benchmark
+    # always pulls the (often `latest`) image fresh, runs with --network=host,
+    # and passes its -e ISL/OSL/... knobs through extra-run-flags.
+    - name: Start CI container
+      uses: ./.github/actions/setup-gpu-container
+      with:
+        container-name: ${{ inputs.container-name }}
+        base-image: ${{ inputs.image }}
+        env-vars: ${{ inputs.env-vars }}
+        hf-token: ${{ inputs.hf-token }}
+        network-host: "true"
+        pull-policy: "always"
+        extra-run-flags: ${{ inputs.container-env }}
+
+    - name: Download model
+      shell: bash
+      env:
+        HF_TOKEN: ${{ inputs.hf-token }}
+        MODEL_DOWNLOAD_TIMEOUT: "30m"
+        MODEL_LOCK_WAIT_SECONDS: "1800"
+        MODEL_LOCK_POLL_INTERVAL: "30"
+        MODEL_PROGRESS_INTERVAL: "60"
+      run: |
+        set -euo pipefail
+        if [ ! -d "/models" ]; then
+          echo "/models directory not found, skipping model download"
+          exit 0
+        fi
+        model_dir="/models/${{ inputs.model-path }}"
+        echo "Lock-protected download for ${model_dir}"
+        if docker exec \
+          -e HF_TOKEN="${HF_TOKEN:-}" \
+          -e MODEL_ID="${{ inputs.model-path }}" \
+          -e TARGET_DIR="${model_dir}" \
+          -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+          -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+          -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+          -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+          "${{ inputs.container-name }}" \
+          bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+          echo "Model ready: ${model_dir}"
+        elif [ "${{ inputs.download-required }}" = "true" ]; then
+          echo "Model download failed for '${{ inputs.model-path }}'. Aborting."
+          exit 1
+        else
+          echo "::warning::Failed to download ${{ inputs.model-path }}, will use HF online"
+        fi

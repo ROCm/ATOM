@@ -37,8 +37,8 @@ PR/Push → pre-checks (black + ruff)
 | DeepSeek-R1-0528 MTP | `--kv_cache_dtype fp8 -tp 8 --method mtp` | 0.94 | Yes | 8gpu |
 | DeepSeek-R1-0528 MXFP4 | `--kv_cache_dtype fp8 -tp 8` | 0.93 | Yes | 8gpu |
 | DeepSeek-R1-0528 MXFP4 MTP | `--kv_cache_dtype fp8 -tp 8 --method mtp` | 0.93 | Yes | 8gpu |
-| gpt-oss-120b | `--kv_cache_dtype fp8 --gpu-memory-utilization 0.3` | 0.38 | Yes | mi355-1 |
-| gpt-oss-120b (2 GPU) | `-tp 2 --enable-dp-attention --enable-expert-parallel` | 0.38 | No | mi355-4 |
+| gpt-oss-120b | `--kv_cache_dtype fp8 --gpu-memory-utilization 0.5` | 0.88 | Yes | mi355-1 |
+| gpt-oss-120b (2 GPU) | `-tp 2 --enable-dp-attention --enable-expert-parallel` | 0.88 | No | mi355-4 |
 | Qwen3-235B FP8 | `-tp 8 --enable-expert-parallel` + `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1` | 0.87 | Yes | 8gpu |
 | Qwen3-235B MXFP4 | `-tp 8 --enable-expert-parallel` + `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1` | 0.87 | No | 8gpu |
 | Qwen3-Next-80B-A3B | `-tp 8` | 0.65 | Yes | 8gpu |

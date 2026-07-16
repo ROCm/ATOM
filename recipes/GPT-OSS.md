@@ -20,7 +20,7 @@ GPT-OSS-120B fits on a single MI300X/MI355X GPU:
 python -m atom.entrypoints.openai_server \
   --model openai/gpt-oss-120b \
   --kv_cache_dtype fp8 \
-  --gpu-memory-utilization 0.3
+  --gpu-memory-utilization 0.5
 ```
 
 ### Multi-GPU with DP Attention + Expert Parallel
@@ -32,12 +32,12 @@ python -m atom.entrypoints.openai_server \
   --model openai/gpt-oss-120b \
   --kv_cache_dtype fp8 -tp 2 \
   --enable-dp-attention --enable-expert-parallel \
-  --gpu-memory-utilization 0.3
+  --gpu-memory-utilization 0.5
 ```
 
 Tips on server configuration:
 - Single GPU is sufficient for this model — no TP required.
-- `--gpu-memory-utilization 0.3` is recommended to leave room for KV cache growth.
+- `--gpu-memory-utilization 0.5` is recommended to leave room for KV cache growth.
 - DP attention + EP mode does not require `--trust-remote-code` since ATOM has built-in `GptOssForCausalLM`.
 - Sliding window attention is applied on even-indexed layers automatically.
 
@@ -63,11 +63,10 @@ python -m atom.benchmarks.benchmark_serving \
 
 We verified the lm_eval accuracy on gsm8k dataset with command:
 ```bash
-lm_eval \
-  --model local-completions \
-  --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
-  --tasks gsm8k \
-  --num_fewshot 3
+lm_eval --model local-chat-completions --apply_chat_template \
+        --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False \
+        --tasks gsm8k \
+        --num_fewshot 3
 ```
 
-CI accuracy threshold: `flexible-extract ≥ 0.38`.
+CI accuracy threshold: `flexible-extract ≥ 0.88`.

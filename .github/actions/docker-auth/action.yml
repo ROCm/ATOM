@@ -1,0 +1,64 @@
+name: Docker auth
+description: >-
+  Log in to a container registry with stdin-fed credentials. Replaces the
+  per-workflow inline `echo $PASSWORD | docker login` blocks so the credential
+  handling lives in one place. Credentials are passed via env (never interpolated
+  into the shell command line), which avoids both argv leakage and the
+  template-injection class that inline secret interpolation triggered.
+
+inputs:
+  username:
+    description: Registry username.
+    required: true
+  password:
+    description: Registry password / token.
+    required: true
+  registry:
+    description: >-
+      Explicit registry host to log in to. Takes precedence over `image`.
+      Empty + no `image` => the engine default (Docker Hub).
+    required: false
+    default: ""
+  image:
+    description: >-
+      Image reference to derive the registry from (the leading host component).
+      A bare name with no host (no dot / not localhost / no port) resolves to
+      docker.io. Ignored when `registry` is set.
+    required: false
+    default: ""
+  engine:
+    description: Container engine binary (e.g. docker or podman).
+    required: false
+    default: "docker"
+
+runs:
+  using: composite
+  steps:
+    - name: Log in to registry
+      shell: bash
+      env:
+        DOCKER_USERNAME: ${{ inputs.username }}
+        DOCKER_PASSWORD: ${{ inputs.password }}
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE: ${{ inputs.image }}
+        ENGINE: ${{ inputs.engine }}
+      run: |
+        set -euo pipefail
+        ENGINE="${ENGINE:-docker}"
+        if [ -n "$REGISTRY" ]; then
+          REG="$REGISTRY"
+        elif [ -n "$IMAGE" ]; then
+          REG="${IMAGE%%/*}"
+          if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
+            REG="docker.io"
+          fi
+        else
+          REG=""
+        fi
+        if [ -n "$REG" ]; then
+          echo "Logging in to registry: ${REG}"
+        else
+          echo "Logging in to default registry (Docker Hub)"
+        fi
+        printf '%s' "$DOCKER_PASSWORD" \
+          | "$ENGINE" login ${REG:+"$REG"} -u "$DOCKER_USERNAME" --password-stdin

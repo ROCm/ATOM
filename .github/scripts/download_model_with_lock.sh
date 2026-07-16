@@ -46,14 +46,14 @@ print_dir_snapshot() {
   local size
   local file_count
   size="$(du -sh "${dir}" 2>/dev/null | awk '{print $1}')"
-  file_count="$(find "${dir}" -type f 2>/dev/null | wc -l | tr -d ' ')"
-  log "Directory snapshot for ${dir}: size=${size:-0} files=${file_count:-0}"
-  find "${dir}" -maxdepth 2 -type f 2>/dev/null | sort | head -20 | sed 's/^/[model-download]   /' || true
+  file_count="$(find "${dir}" \( -type f -o -type l \) 2>/dev/null | wc -l | tr -d ' ')"
+  log "Directory snapshot for ${dir}: size=${size:-0} files_or_links=${file_count:-0}"
+  find "${dir}" -maxdepth 2 \( -type f -o -type l \) 2>/dev/null | sort | head -20 | sed 's/^/[model-download]   /' || true
 }
 
 has_model_payload() {
   local dir="$1"
-  find "${dir}" -type f \
+  find "${dir}" \( -type f -o -type l \) \
     ! -name 'config.json' \
     ! -name '.atom_download_complete' \
     ! -name '.download-complete' \
@@ -290,13 +290,33 @@ start_progress_reporter
 
 (
   export HF_HUB_ENABLE_HF_TRANSFER=1
-  if [ -n "${REMOTE_REVISION}" ]; then
-    timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" \
-      hf download "${MODEL_ID}" --revision "${REMOTE_REVISION}" --local-dir "${STAGING_DIR}"
-  else
-    timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" \
-      hf download "${MODEL_ID}" --local-dir "${STAGING_DIR}"
-  fi
+  export MODEL_ID REMOTE_REVISION STAGING_DIR
+  timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" python3 - <<'PY'
+import os
+import sys
+
+model_id = os.environ["MODEL_ID"]
+revision = os.environ.get("REMOTE_REVISION") or None
+token = os.environ.get("HF_TOKEN") or None
+
+try:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        repo_id=model_id,
+        revision=revision,
+        local_dir=os.environ["STAGING_DIR"],
+        local_dir_use_symlinks=False,
+        token=token,
+    )
+except Exception as exc:
+    print(
+        f"Failed to download model '{model_id}'"
+        f" at revision '{revision or 'default'}': {exc}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
 ) &
 DOWNLOAD_PID="$!"
 wait "${DOWNLOAD_PID}"

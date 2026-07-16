@@ -82,6 +82,20 @@ class TestSeparateReasoning:
         reasoning, content = separate_reasoning(text)
         assert content == "The answer."
 
+    def test_no_think_start_tag(self):
+        """MiniMax M2.7 pattern: model doesn't generate <think>, only </think>.
+        The chat template injects <think> as part of the prompt."""
+        text = "The user wants hello world...\n</think>\n\nprint('Hello')"
+        reasoning, content = separate_reasoning(text)
+        assert reasoning == "The user wants hello world..."
+        assert content == "print('Hello')"
+
+    def test_no_think_start_tag_empty_content(self):
+        text = "Reasoning only\n</think>"
+        reasoning, content = separate_reasoning(text)
+        assert reasoning == "Reasoning only"
+        assert content == ""
+
 
 # ============================================================================
 # ReasoningFilter (Streaming) Tests

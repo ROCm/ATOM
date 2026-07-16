@@ -78,6 +78,7 @@ def _install_api_server_stubs() -> list[str]:
     return injected
 
 
+_injected_modules: list[str] = []  # set in try; kept defined for `finally`
 try:
     _injected_modules = _install_api_server_stubs()
     import importlib
@@ -86,7 +87,12 @@ try:
 except Exception as exc:  # pragma: no cover - environment-dependent skip
     api_server = None  # type: ignore[assignment]
     _import_error = exc
-    _injected_modules = []
+    # NB: do NOT reset _injected_modules here. When api_server import fails
+    # (e.g. PIL absent on the non-GPU runner), the stubs injected by
+    # _install_api_server_stubs() must still be torn down in `finally`;
+    # clearing the list here would leak them into sys.modules and pollute
+    # tests collected later (notably tests/test_arg_utils_spec.py, which then
+    # sees a stub EngineArgs instead of the real one).
 else:
     _import_error = None
 finally:
@@ -165,3 +171,37 @@ class TestBuildSamplingParams:
                 ignore_eos=False,
                 n=0,
             )
+
+
+class TestValidateContextLength:
+    """Oversized OpenAI requests should fail before entering the scheduler."""
+
+    def test_equal_to_max_model_len_is_allowed(self):
+        api_server._validate_context_length(
+            num_prompt_tokens=120,
+            max_tokens=8,
+            max_model_len=128,
+        )
+
+    def test_total_over_max_model_len_is_rejected(self):
+        with pytest.raises(ValueError, match="maximum context length is 128"):
+            api_server._validate_context_length(
+                num_prompt_tokens=121,
+                max_tokens=8,
+                max_model_len=128,
+            )
+
+    def test_prompt_alone_over_max_model_len_is_rejected(self):
+        with pytest.raises(ValueError, match="prompt contains at least 129"):
+            api_server._validate_context_length(
+                num_prompt_tokens=129,
+                max_tokens=0,
+                max_model_len=128,
+            )
+
+    def test_missing_max_model_len_skips_validation(self):
+        api_server._validate_context_length(
+            num_prompt_tokens=129,
+            max_tokens=8,
+            max_model_len=None,
+        )

@@ -3,11 +3,12 @@
 
 import argparse
 import logging
+import json
 from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, SpeculativeConfig
+from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
 
 logger = logging.getLogger("atom")
 
@@ -29,19 +30,24 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
+    long_prefill_token_threshold: int = 0
+    attn_prefill_chunk_size: int = 16384
+    enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
+    cudagraph_mode: str = "FULL"
     load_dummy: bool = False
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
@@ -51,7 +57,10 @@ class EngineArgs:
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
+    draft_model: Optional[str] = None
     mark_trace: bool = False
+    online_quant_config: Optional[dict] = None
+    hf_overrides: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -73,6 +82,14 @@ class EngineArgs:
             help="Tensor parallel size.",
         )
         parser.add_argument(
+            "--prefill-context-parallel-size",
+            "-pcp",
+            type=int,
+            default=1,
+            help="Prefill context parallel size. Independent dimension "
+            "(world = tp x pcp); splits the sequence during prefill.",
+        )
+        parser.add_argument(
             "--data-parallel-size",
             "-dp",
             type=int,
@@ -86,8 +103,10 @@ class EngineArgs:
         )
         parser.add_argument(
             "--enable_prefix_caching",
-            action="store_true",
-            help="Enable prefix caching.",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Enable prefix caching (default: enabled). "
+            "Use --no-enable_prefix_caching to disable.",
         )
         parser.add_argument(
             "--port",
@@ -114,11 +133,20 @@ class EngineArgs:
         parser.add_argument(
             "--cudagraph-capture-sizes",
             type=str,
-            default="[1,2,4,8,16,32,48,64,128,256]",
+            default="[1,2,4,8,16,32,48,64,128,256,512]",
             help="Sizes to capture cudagraph. Example: [1,2,4,8,16]",
         )
         parser.add_argument(
             "--level", type=int, default=3, help="The level of compilation (0-3)."
+        )
+        parser.add_argument(
+            "--cudagraph-mode",
+            type=str,
+            default="FULL",
+            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+            help="CUDA graph runtime mode. FULL = manual whole-forward capture "
+            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
+            "attention eager (requires --level 3).",
         )
         parser.add_argument(
             "--load_dummy", action="store_true", help="Skip loading model weights."
@@ -163,7 +191,7 @@ class EngineArgs:
             "--method",
             type=str,
             default=None,
-            choices=["mtp"],
+            choices=["mtp", "eagle3"],
             help="Speculative method",
         )
         parser.add_argument(
@@ -173,10 +201,43 @@ class EngineArgs:
             help="Number of speculative tokens to generate per iteration (draft model runs this many times autoregressively)",
         )
         parser.add_argument(
+            "--draft-model",
+            type=str,
+            default=None,
+            help="Path to external Eagle3 draft model. Required when --method eagle3.",
+        )
+        parser.add_argument(
             "--max-num-batched-tokens",
             type=int,
             default=16384,
             help="Maximum number of tokens to batch together in async engine",
+        )
+        parser.add_argument(
+            "--long-prefill-token-threshold",
+            type=int,
+            default=0,
+            help=(
+                "For chunked prefill, cap a single request's per-step prefill "
+                "size at this many tokens. 0 disables the cap (request is only "
+                "bounded by max_num_batched_tokens). Useful to interleave long "
+                "prefills with decode for lower ITL."
+            ),
+        )
+        parser.add_argument(
+            "--attn-prefill-chunk-size",
+            type=int,
+            default=16384,
+            help=(
+                "MLA chunked-prefill budget in tokens. Default uses "
+                "max_num_batched_tokens."
+            ),
+        )
+        parser.add_argument(
+            "--enable_chunked_prefill",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Enable chunked prefill (default: enabled). "
+            "Use --no-enable_chunked_prefill to disable.",
         )
         parser.add_argument(
             "--max-num-seqs",
@@ -210,6 +271,38 @@ class EngineArgs:
             action="store_true",
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
         )
+        parser.add_argument(
+            "--online_quant_config",
+            type=json.loads,
+            default=None,
+            help=(
+                "Online quantization config as a JSON string. "
+                "Supported quantization formats: ptpc_fp8, mxfp4. "
+                "The JSON object has three fields "
+                "(at least one must be provided):\n"
+                '  - "global_quant_config": str, default quantization '
+                "format applied to all layers.\n"
+                '  - "layer_quant_config": dict, per-layer overrides '
+                "using glob patterns as keys. "
+                "Overrides global_quant_config for matched layers.\n"
+                '  - "exclude_layer": str or list[str], layer name '
+                "patterns to exclude from quantization.\n"
+                "Example:\n"
+                """  '{"global_quant_config": "ptpc_fp8", """
+                """"layer_quant_config": {"*expert*": "mxfp4"}, """
+                """"exclude_layer": "lm_head"}'"""
+            ),
+        )
+        parser.add_argument(
+            "--hf-overrides",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON object of HF config attributes to override after loading "
+                "the model config. Example: "
+                '\'{"use_index_cache": true, "index_topk_freq": 4}\''
+            ),
+        )
 
         return parser
 
@@ -236,6 +329,7 @@ class EngineArgs:
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
+            cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],
             cudagraph_capture_sizes=(
                 parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
                 if self.cudagraph_capture_sizes
@@ -243,14 +337,25 @@ class EngineArgs:
             ),
         )
         if self.method and self.num_speculative_tokens > 0:
-            kwargs["speculative_config"] = SpeculativeConfig(
-                method=kwargs.pop("method"),
-                model=self.model,
-                num_speculative_tokens=kwargs.pop("num_speculative_tokens"),
-            )
+            method = kwargs.pop("method")
+            num_spec_tokens = kwargs.pop("num_speculative_tokens")
+            draft_model = kwargs.pop("draft_model")
+            if method == "eagle3":
+                kwargs["speculative_config"] = SpeculativeConfig(
+                    method=method,
+                    model=draft_model,
+                    num_speculative_tokens=num_spec_tokens,
+                )
+            else:
+                kwargs["speculative_config"] = SpeculativeConfig(
+                    method=method,
+                    model=self.model,
+                    num_speculative_tokens=num_spec_tokens,
+                )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
+            kwargs.pop("draft_model")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode

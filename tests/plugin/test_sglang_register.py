@@ -324,10 +324,13 @@ def test_register_custom_attention_uses_aiter_name():
         "atom.models.qwen3_moe": ModuleType("atom.models.qwen3_moe"),
         "atom.models.glm4_moe": ModuleType("atom.models.glm4_moe"),
         "atom.models.deepseek_v2": ModuleType("atom.models.deepseek_v2"),
+        "atom.models.minimax_m2": ModuleType("atom.models.minimax_m2"),
+        "atom.models.qwen3_next": ModuleType("atom.models.qwen3_next"),
+        "atom.models.qwen3_5": ModuleType("atom.models.qwen3_5"),
         "atom.config": ModuleType("atom.config"),
         "atom.plugin.prepare": fake_prepare_mod,
-        "atom.plugin.sglang.attention_backend.sgl_attn_backend": ModuleType(
-            "atom.plugin.sglang.attention_backend.sgl_attn_backend"
+        "atom.plugin.sglang.attention_backend.full_attention.full_attention_backend": ModuleType(
+            "atom.plugin.sglang.attention_backend.full_attention.full_attention_backend"
         ),
     }
     fake_modules["atom.models.qwen3"].Qwen3ForCausalLM = type(
@@ -342,9 +345,24 @@ def test_register_custom_attention_uses_aiter_name():
     fake_modules["atom.models.deepseek_v2"].DeepseekV3ForCausalLM = type(
         "DeepseekV3ForCausalLM", (), {}
     )
+    fake_modules["atom.models.deepseek_v2"].GlmMoeDsaForCausalLM = type(
+        "GlmMoeDsaForCausalLM", (), {}
+    )
+    fake_modules["atom.models.minimax_m2"].MiniMaxM2ForCausalLM = type(
+        "MiniMaxM2ForCausalLM", (), {}
+    )
+    fake_modules["atom.models.qwen3_next"].Qwen3NextForCausalLM = type(
+        "Qwen3NextForCausalLM", (), {}
+    )
+    fake_modules["atom.models.qwen3_5"].Qwen3_5ForCausalLM = type(
+        "Qwen3_5ForCausalLM", (), {}
+    )
+    fake_modules["atom.models.qwen3_5"].Qwen3_5MoeForCausalLM = type(
+        "Qwen3_5MoeForCausalLM", (), {}
+    )
     fake_modules["atom.config"].Config = type("Config", (), {})
     fake_modules[
-        "atom.plugin.sglang.attention_backend.sgl_attn_backend"
+        "atom.plugin.sglang.attention_backend.full_attention.full_attention_backend"
     ].ATOMAttnBackendForSgl = _FakeBackend
 
     with patch.dict(sys.modules, fake_modules):

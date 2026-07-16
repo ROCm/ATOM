@@ -91,33 +91,16 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     # BLOCK_N elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    idx_feats_start = tl.program_id(1) * BLOCK_N
-    o_ptr = x_ptr
-    stride_o_token = stride_x_token
-    stride_o_dim = stride_x_dim
-    idx_feats_o = idx_feats
-    dim_limits = dim
-    # Assume the idx_feats can be fully divided by BLOCK_N
-    if idx_feats_start < k_start_dim:
-        o_ptr = query_ptr
-        stride_o_token = query_token_stride
-        stride_o_dim = query_dim_stride
-        idx_feats_o = idx_feats
-        dim_limits = k_dim_size
-    elif idx_feats_start < v_start_dim:
-        o_ptr = key_ptr
-        stride_o_token = key_token_stride
-        stride_o_dim = key_dim_stride
-        idx_feats_o = idx_feats - k_start_dim
-        dim_limits = k_dim_size
-    elif idx_feats_start < dim:
-        o_ptr = value_ptr
-        stride_o_token = value_token_stride
-        stride_o_dim = value_dim_stride
-        idx_feats_o = idx_feats - v_start_dim
-        dim_limits = v_dim_size
-    else:
-        return
+
+    # Pre-compute per-output feature indices and block-level masks.
+    # BLOCK_N divides k_dim_size evenly, so each program block falls entirely
+    # within one of q/k/v — only one mask is all-true per block.
+    q_feat_idx = idx_feats
+    k_feat_idx = idx_feats - k_start_dim
+    v_feat_idx = idx_feats - v_start_dim
+    is_q_block = idx_feats < k_start_dim
+    is_k_block = (idx_feats >= k_start_dim) & (idx_feats < v_start_dim)
+    is_v_block = idx_feats >= v_start_dim
 
     if idx_seq == pad_slot_id:
         return
@@ -505,17 +488,25 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
 
-        mask_1d = (idx_token < segment_len) & (
-            idx_feats_o < dim_limits
-        )  # token-index  # feature-index
+        token_pos = sequence_start_index + token_offset + idx_token
+        mask_token = idx_token < segment_len
 
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats_o * stride_o_dim)
+        # Store to q/k/v via separate tl.store calls (avoids pointer
+        # reassignment that crashes AMD TritonAMDGPUCanonicalizePointers).
+        # Each block falls entirely within one output, so only one store
+        # per block writes real data.
+        q_ptrs = (
+            query_ptr + token_pos * query_token_stride + q_feat_idx * query_dim_stride
         )
+        tl.store(q_ptrs, acc, mask=mask_token & is_q_block)
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+        k_ptrs = key_ptr + token_pos * key_token_stride + k_feat_idx * key_dim_stride
+        tl.store(k_ptrs, acc, mask=mask_token & is_k_block)
+
+        v_ptrs = (
+            value_ptr + token_pos * value_token_stride + v_feat_idx * value_dim_stride
+        )
+        tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
 def causal_conv1d_fn(
@@ -596,7 +587,6 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -656,15 +646,7 @@ def causal_conv1d_fn(
         stride_istate_seq = conv_states.stride(0)
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
-        # Keep this aligned with upstream: the Triton kernel consumes the
-        # runtime conv_state strides directly instead of requiring dim-stride 1.
-        # assert stride_istate_dim == 1
-    if out.dim() == 2:
-        stride_o_dim = out.stride(0)
-        stride_o_token = out.stride(1)
-    else:
-        stride_o_dim = out.stride(1)
-        stride_o_token = out.stride(2)
+
     stride_cache_indices = cache_indices.stride(0) if cache_indices is not None else 0
 
     if validate_data:
@@ -884,42 +866,18 @@ def _causal_conv1d_update_kernel(
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    idx_feats_start = tl.program_id(1) * BLOCK_N
     k_start_point: tl.constexpr = k_dim_size
     v_start_point: tl.constexpr = k_dim_size * 2
-    stride_o_seq = stride_q_seq
 
-    o_ptr = x_ptr
-    stride_o_token = stride_x_token
-    stride_o_dim = stride_x_dim
-    idx_feats_o = idx_feats
-    dim_limits = dim
-    if idx_feats_start < k_start_point:
-        o_ptr = query_ptr
-        # In VARLEN mode, tokens are indexed along dim-0 of the output tensor,
-        # so the token stride is stride_q_seq (not stride_q_token which is the
-        # last-dim stride of the [num_tokens, k_dim, 1] output).
-        stride_o_token = stride_q_seq if IS_VARLEN else stride_q_token
-        stride_o_dim = stride_q_dim
-        idx_feats_o = idx_feats
-        dim_limits = k_dim_size
-        stride_o_seq = stride_q_seq
-    elif idx_feats_start < v_start_point:
-        o_ptr = key_ptr
-        stride_o_token = stride_k_seq if IS_VARLEN else stride_k_token
-        stride_o_dim = stride_k_dim
-        idx_feats_o = idx_feats - k_start_point
-        dim_limits = k_dim_size
-        stride_o_seq = stride_k_seq
-    elif idx_feats_start < dim:
-        o_ptr = value_ptr
-        stride_o_token = stride_v_seq if IS_VARLEN else stride_v_token
-        stride_o_dim = stride_v_dim
-        idx_feats_o = idx_feats - v_start_point
-        dim_limits = v_dim_size
-        stride_o_seq = stride_v_seq
-    else:
-        return
+    # Pre-compute per-output feature indices and block-level masks.
+    # BLOCK_N divides k_dim_size evenly, so each program block falls entirely
+    # within one of q/k/v — only one mask is all-true per block.
+    q_feat_idx = idx_feats
+    k_feat_idx = idx_feats - k_start_point
+    v_feat_idx = idx_feats - v_start_point
+    is_q_block = idx_feats < k_start_point
+    is_k_block = (idx_feats >= k_start_point) & (idx_feats < v_start_point)
+    is_v_block = (idx_feats >= v_start_point) & (idx_feats < dim)
 
     if IS_APC_ENABLED:
         # Get the state from the initial_state_idx
@@ -946,12 +904,25 @@ def _causal_conv1d_update_kernel(
         state_len = state_len - (seqlen - (query_end_index - query_start_index))
         seqlen = query_end_index - query_start_index
         x_offset = query_start_index * stride_x_token
-        o_offset = query_start_index * stride_o_token
+        # Varlen: output is [num_tokens, split_dim, 1], token_pos indexes dim-0
+        # so the "token" stride is stride_q_seq (the dim-0 stride).
+        q_base = query_start_index * stride_q_seq
+        k_base = query_start_index * stride_k_seq
+        v_base = query_start_index * stride_v_seq
+        q_tok_stride = stride_q_seq
+        k_tok_stride = stride_k_seq
+        v_tok_stride = stride_v_seq
     else:
         query_start_index = idx_seq * seqlen
         query_end_index = query_start_index + seqlen
         x_offset = idx_seq * stride_x_seq
-        o_offset = idx_seq * stride_o_seq
+        # Non-varlen: output is [batch, split_dim, seqlen]
+        q_base = idx_seq * stride_q_seq
+        k_base = idx_seq * stride_k_seq
+        v_base = idx_seq * stride_v_seq
+        q_tok_stride = stride_q_token
+        k_tok_stride = stride_k_token
+        v_tok_stride = stride_v_token
 
     if query_start_index == query_end_index:
         return
@@ -1184,14 +1155,24 @@ def _causal_conv1d_update_kernel(
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
 
-        mask_1d = (idx_token < seqlen) & (
-            idx_feats_o < dim_limits
-        )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr + o_offset + idx_token * stride_o_token + (idx_feats_o * stride_o_dim)
-        )
+        mask_token = idx_token < seqlen
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+        # Store to q/k/v via separate tl.store calls (avoids pointer
+        # reassignment that crashes AMD TritonAMDGPUCanonicalizePointers).
+        # Each block falls entirely within one output, so only one store
+        # per block writes real data.
+        q_ptrs = (
+            query_ptr + q_base + idx_token * q_tok_stride + q_feat_idx * stride_q_dim
+        )
+        tl.store(q_ptrs, acc, mask=mask_token & is_q_block)
+
+        k_ptrs = key_ptr + k_base + idx_token * k_tok_stride + k_feat_idx * stride_k_dim
+        tl.store(k_ptrs, acc, mask=mask_token & is_k_block)
+
+        v_ptrs = (
+            value_ptr + v_base + idx_token * v_tok_stride + v_feat_idx * stride_v_dim
+        )
+        tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
 def causal_conv1d_update(
@@ -1308,19 +1289,15 @@ def causal_conv1d_update(
     stride_k_seq, stride_k_dim, stride_k_token = key.stride()
     stride_v_seq, stride_v_dim, stride_v_token = value.stride()
 
-    out = x
     stride_w_dim, stride_w_width = weight.stride()
 
     if query_start_loc is None:
         # X (batch, dim, seqlen)
         stride_x_seq, stride_x_dim, stride_x_token = x.stride()
-        stride_o_seq, stride_o_dim, stride_o_token = out.stride()
     else:
-        # X (dim, cu_seqlen)
+        # X (num_tokens, dim)
         stride_x_token, stride_x_dim = x.stride()
         stride_x_seq = 0
-        stride_o_token, stride_o_dim = out.stride()
-        stride_o_seq = 0
 
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
     stride_state_indices = (
@@ -1392,8 +1369,6 @@ def causal_conv1d_update(
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
     )
-    if unsqueeze:
-        out = out.squeeze(-1)
     query = query.squeeze(-1)
     key = key.squeeze(-1)
     value = value.squeeze(-1)

@@ -24,7 +24,7 @@ docker run -it --device=/dev/kfd --device=/dev/dri \
 | DeepSeek-R1-0528 | MoE + MLA | FP8 / MXFP4 | 8 | [recipes/DeepSeek-R1.md](../recipes/DeepSeek-R1.md) |
 | GLM-5 | MoE + MLA | FP8 | 8 | [recipes/GLM-5.md](../recipes/GLM-5.md) |
 | GPT-OSS-120B | MoE | FP8 | 1 | [recipes/GPT-OSS.md](../recipes/GPT-OSS.md) |
-| Kimi-K2.5 | MoE | MXFP4 | 4 | [recipes/Kimi-K2.5.md](../recipes/Kimi-K2.5.md) |
+| Kimi-K2.5/K2.7 | MoE | MXFP4 | 4 | [recipes/Kimi-K2.md](../recipes/Kimi-K2.md) |
 | Kimi-K2-Thinking | MoE | FP8 | 8 | [recipes/Kimi-K2-Thinking.md](../recipes/Kimi-K2-Thinking.md) |
 | Qwen3-235B | MoE | FP8 | 8 | [recipes/Qwen3-235b.md](../recipes/Qwen3-235b.md) |
 | Qwen3-Next | MoE | FP8 | 8 | [recipes/Qwen3-Next.md](../recipes/Qwen3-Next.md) |

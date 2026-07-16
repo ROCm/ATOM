@@ -23,6 +23,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from catalog import load_variants  # noqa: E402
+
 
 def _find_model_config(regression_entry, models):
     """Match a regression entry to a models.json config.
@@ -66,7 +69,7 @@ def _regression_severity(r):
 def generate_configs(report_path, models_path, top_n=3):
     """Generate flat config list from regression report and model registry."""
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
-    models = json.loads(Path(models_path).read_text(encoding="utf-8"))
+    models = load_variants(models_path)
 
     regressions = report.get("regressions", [])
     if not regressions:
@@ -135,7 +138,7 @@ def generate_matrix(report_path, models_path, top_n=3):
         groups.setdefault(key, []).append(c)
 
     # Load models.json to look up runner field
-    models = json.loads(Path(models_path).read_text(encoding="utf-8"))
+    models = load_variants(models_path)
 
     matrix = []
     for (model_path, server_args, env_vars), group_configs in groups.items():

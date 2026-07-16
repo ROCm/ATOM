@@ -5,11 +5,44 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import torch
 
+from atom.utils import envs
 from atom.utils.forward_context import AttentionMetaData
 
 logger = logging.getLogger("atom")
+
+
+def derive_prefill_lens_from_positions(
+    positions,
+    full_cu_seqlens_q,
+    ub_slice,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (extend_lens, seq_lens) for a prefill ubatch.
+
+    ``positions`` are the absolute positions for this ubatch's new tokens.
+    ``seq_lens`` are the total visible sequence lengths for sparse metadata,
+    preserving the absolute prefix length of a straddled request instead of
+    treating the ubatch as a standalone prompt.
+    """
+    rs = ub_slice.request_slice
+    ts = ub_slice.token_slice
+    ub_num_reqs = rs.stop - rs.start
+    positions_np = np.asarray(positions)
+    full_cu = np.asarray(full_cu_seqlens_q)
+
+    req_global_starts = full_cu[rs.start : rs.stop].astype(np.int64)
+    req_global_ends = full_cu[rs.start + 1 : rs.stop + 1].astype(np.int64)
+    clamped_starts = np.maximum(req_global_starts, ts.start)
+    clamped_ends = np.minimum(req_global_ends, ts.stop)
+    extend_lens = (clamped_ends - clamped_starts).astype(np.int32)
+
+    ub_cu = np.zeros(ub_num_reqs + 1, dtype=np.int32)
+    np.cumsum(extend_lens, dtype=np.int32, out=ub_cu[1:])
+    start_positions = positions_np[ub_cu[:ub_num_reqs]].astype(np.int32)
+    seq_lens = (start_positions + extend_lens).astype(np.int32)
+    return extend_lens, seq_lens
 
 
 @dataclass
@@ -25,7 +58,7 @@ def maybe_create_ubatch_slices(
     num_tokens: int,
     num_ubatches: int = 2,
     is_prefill: bool = False,
-    num_scheduled_tokens: Optional[list[int]] = None,
+    num_scheduled_tokens: Optional[np.ndarray] = None,
     max_tokens_per_ubatch: Optional[int] = None,
 ) -> Optional[list[UBatchSlice]]:
     """Split a batch into N micro-batch slices.
@@ -40,11 +73,31 @@ def maybe_create_ubatch_slices(
     if num_ubatches <= 1:
         return None
 
-    if num_reqs < num_ubatches:
+    # Token-midpoint prefill split can cut *inside* a request, so it works
+    # even with a single request (bs=1) — only require that there are at
+    # least `num_ubatches` tokens to go around. The request-boundary path
+    # below still needs num_reqs >= num_ubatches.
+    token_split = num_scheduled_tokens is not None and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+    if not token_split and num_reqs < num_ubatches:
         return None
 
     if num_scheduled_tokens is not None:
+        # Skip TBO for small prefills
+        _min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
+        if _min_pref > 0:
+            _pref_total = int(num_scheduled_tokens[:num_reqs].sum())
+            if _pref_total < _min_pref:
+                return None
         # Prefill: token-balanced split
+        if token_split:
+            if num_tokens < num_ubatches:
+                return None
+            return _split_prefill_token_midpoint(
+                num_reqs,
+                num_scheduled_tokens,
+                num_ubatches,
+                max_tokens_per_ubatch,
+            )
         return _split_prefill_balanced(
             num_reqs,
             num_scheduled_tokens,
@@ -128,6 +181,55 @@ def _split_prefill_balanced(
     ]
 
 
+def _split_prefill_token_midpoint(
+    num_reqs: int,
+    num_scheduled_tokens: list[int],
+    num_ubatches: int,
+    max_tokens_per_ubatch: Optional[int],
+) -> Optional[list[UBatchSlice]]:
+    """split prefill at the exact token midpoint."""
+    toks = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
+    total_tokens = int(toks.sum())
+    # Exclusive-prefix cumulative token offsets: cu[i] = first token of req i.
+    cu = np.zeros(num_reqs + 1, dtype=np.int64)
+    np.cumsum(toks, out=cu[1:])
+
+    # Token split points at exact fractions of the total.
+    split_points = [(total_tokens * i) // num_ubatches for i in range(1, num_ubatches)]
+
+    slices: list[UBatchSlice] = []
+    tok_start = 0
+    for tok_end in split_points + [total_tokens]:
+        if tok_end <= tok_start:
+            # Degenerate (e.g. total_tokens < num_ubatches) — bail out and
+            # let the caller fall back to no-split.
+            return None
+        # Requests overlapping [tok_start, tok_end):
+        #   first req = the one containing tok_start
+        #   last req  = the one containing tok_end - 1
+        req_start = int(np.searchsorted(cu, tok_start, side="right") - 1)
+        req_stop = int(np.searchsorted(cu, tok_end - 1, side="right"))
+        slices.append(
+            UBatchSlice(
+                request_slice=slice(req_start, req_stop),
+                token_slice=slice(tok_start, tok_end),
+            )
+        )
+        tok_start = tok_end
+
+    if max_tokens_per_ubatch is not None:
+        for s in slices:
+            if (s.token_slice.stop - s.token_slice.start) > max_tokens_per_ubatch:
+                logger.info(
+                    "[TBO] token-midpoint split rejected: ubatch tokens "
+                    "exceed buffer %s",
+                    max_tokens_per_ubatch,
+                )
+                return None
+
+    return slices
+
+
 def split_attn_metadata(
     attn_metadata: AttentionMetaData,
     ub_slice: UBatchSlice,
@@ -140,13 +242,13 @@ def split_attn_metadata(
     req_end = rs.stop
     ub_num_reqs = req_end - req_start
 
-    # cu_seqlens_q: need to re-base so it starts from 0
     ub_cu_seqlens_q = None
     if attn_metadata.cu_seqlens_q is not None:
         orig_cu = attn_metadata.cu_seqlens_q
-        # Take [req_start : req_end + 1] and subtract the base offset
-        base_offset = orig_cu[req_start]
-        ub_cu_seqlens_q = orig_cu[req_start : req_end + 1] - base_offset
+        seg = orig_cu[req_start : req_end + 1]
+        # clamp absolute token offsets to [ts.start, ts.stop], then re-base
+        clamped = torch.clamp(seg, min=ts.start, max=ts.stop)
+        ub_cu_seqlens_q = clamped - clamped[0]
         # Pad remaining entries up to padded_bs + 1
         if padded_bs > ub_num_reqs:
             last_val = ub_cu_seqlens_q[-1]
@@ -224,6 +326,31 @@ def split_attn_metadata(
             )
             ub_kv_last_page_lens = torch.cat([ub_kv_last_page_lens, pad])
 
+    # Prefix-cache prefill needs these fields to gather cached KV before
+    # varlen attention. Dropping them makes cu_seqlens_k describe cached+new
+    # tokens while K/V only contain new tokens, which can OOB in flash-attn.
+    ub_num_cached_tokens = None
+    if attn_metadata.num_cached_tokens is not None:
+        ub_num_cached_tokens = attn_metadata.num_cached_tokens[rs]
+        if padded_bs > ub_num_reqs:
+            pad = torch.zeros(
+                padded_bs - ub_num_reqs,
+                dtype=attn_metadata.num_cached_tokens.dtype,
+                device=attn_metadata.num_cached_tokens.device,
+            )
+            ub_num_cached_tokens = torch.cat([ub_num_cached_tokens, pad])
+
+    ub_seq_starts = None
+    if attn_metadata.seq_starts is not None:
+        ub_seq_starts = attn_metadata.seq_starts[rs]
+        if padded_bs > ub_num_reqs:
+            pad = torch.zeros(
+                padded_bs - ub_num_reqs,
+                dtype=attn_metadata.seq_starts.dtype,
+                device=attn_metadata.seq_starts.device,
+            )
+            ub_seq_starts = torch.cat([ub_seq_starts, pad])
+
     # sparse_kv_indptr: slice and re-base if present (per-request dimension).
     # NOTE: In MLA prefill sparse mode, sparse_kv_indptr is per-token — that
     # case is handled by the MLA builder's build_ubatch_prefill_metadata override.
@@ -247,8 +374,12 @@ def split_attn_metadata(
     ub_cu_seqlens_k = None
     if attn_metadata.cu_seqlens_k is not None:
         orig_cu_k = attn_metadata.cu_seqlens_k
-        base_offset_k = orig_cu_k[req_start]
-        ub_cu_seqlens_k = orig_cu_k[req_start : req_end + 1] - base_offset_k
+        seg_k = orig_cu_k[req_start : req_end + 1]
+        if not getattr(attn_metadata, "has_cached", False):
+            clamped_k = torch.clamp(seg_k, min=ts.start, max=ts.stop)
+            ub_cu_seqlens_k = clamped_k - clamped_k[0]
+        else:
+            ub_cu_seqlens_k = seg_k - seg_k[0]
         if padded_bs > ub_num_reqs:
             last_val = ub_cu_seqlens_k[-1]
             pad_size = padded_bs - ub_num_reqs
@@ -261,6 +392,15 @@ def split_attn_metadata(
         # Per-request q lengths are the diffs of consecutive cu_seqlens entries
         per_req_q = ub_cu_seqlens_q[1 : ub_num_reqs + 1] - ub_cu_seqlens_q[:ub_num_reqs]
         ub_max_seqlen_q = int(per_req_q.max().item())
+
+    ub_total_kv = None
+    if attn_metadata.has_cached:
+        if ub_cu_seqlens_k is not None and ub_num_reqs > 0:
+            ub_total_kv = int(ub_cu_seqlens_k[ub_num_reqs].item())
+        elif ub_context_lens is not None and ub_num_reqs > 0:
+            ub_total_kv = int(ub_context_lens[:ub_num_reqs].sum().item())
+        else:
+            ub_total_kv = 0
 
     # MLA work buffers are set to None here — they will be recomputed
     # by decode_update_mla_metadata_v1 in UBatchWrapper before each micro-batch run.
@@ -280,6 +420,10 @@ def split_attn_metadata(
         kv_indices=ub_kv_indices,
         kv_last_page_lens=ub_kv_last_page_lens,
         sparse_kv_indptr=ub_sparse_kv_indptr,
+        has_cached=attn_metadata.has_cached,
+        total_kv=ub_total_kv,
+        num_cached_tokens=ub_num_cached_tokens,
+        seq_starts=ub_seq_starts,
         work_meta_data=None,
         work_indptr=None,
         work_info_set=None,

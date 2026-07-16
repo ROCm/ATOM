@@ -148,7 +148,18 @@ def chunk_fwd_o(
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    o: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Returns the attention output tensor.
+
+    If ``o`` is provided, the kernel writes into it inplace and ``o`` is
+    returned. The caller's buffer MUST match ``v``'s shape and dtype and
+    be contiguous — the Triton kernel assumes stride ``(H * V, 1)`` along
+    ``(T, V)`` for a ``[B, T, H, V]`` layout. The public chunk_gated_delta_rule
+    entry point asserts these contracts before .apply() (so input_guard's
+    silent .contiguous() clone can't defeat them); we re-assert here as a
+    defense-in-depth backstop for any caller that bypasses the public API.
+    """
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = 64 if FLA_GDN_FIX_BT else min(chunk_size, max(16, triton.next_power_of_2(T)))
@@ -159,7 +170,20 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.empty_like(v)
+    if o is None:
+        o = torch.empty_like(v)
+    else:
+        assert o.shape == v.shape, (
+            f"chunk_fwd_o: caller-provided o.shape {tuple(o.shape)} != "
+            f"v.shape {tuple(v.shape)}"
+        )
+        assert o.dtype == v.dtype, (
+            f"chunk_fwd_o: caller-provided o.dtype {o.dtype} != v.dtype " f"{v.dtype}"
+        )
+        assert o.is_contiguous(), (
+            "chunk_fwd_o: caller-provided o must be contiguous (kernel "
+            "assumes stride (H*V, 1) on the (T, V) plane)"
+        )
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)

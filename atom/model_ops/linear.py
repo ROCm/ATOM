@@ -13,6 +13,7 @@ from aiter import (
     gemm_a8w8,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
+    gemm_a8w8_blockscale,
     get_hip_quant,
 )
 
@@ -22,7 +23,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from atom.config import QuantizationConfig, get_current_atom_config
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -31,6 +32,11 @@ from atom.model_ops.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+from atom.quantization.quark.utils import (
+    quant_weight_online,
+    weight_dequant_fp8,
+    weight_dequant_mxfp8,
+)
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -40,9 +46,22 @@ def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
 
+def use_fp4_non_shuffle_triton_gemm() -> bool:
+    return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
+
+
+if use_fp4_non_shuffle_triton_gemm():
+    try:
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton FP4 GEMM not available: {e}")
+        gemm_afp4wfp4 = None
+else:
+    gemm_afp4wfp4 = None
+
+
 if use_triton_gemm():
     try:
-        # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
         from aiter.ops.triton.gemm_afp4wfp4 import (
             gemm_afp4wfp4_preshuffle,
         )  # noqa: E402
@@ -50,18 +69,29 @@ if use_triton_gemm():
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
 
-    # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
+    # Plain (non-preshuffle) Triton blockscale GEMM. Consumes an unshuffled
+    # (N, K) weight with row-major x_scale (M, scale_k) and w_scale
+    # (scale_n, scale_k) -- the same layout the non-preshuffle path produces.
     try:
         from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-            gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton,
+            gemm_a8w8_blockscale as gemm_a8w8_blockscale_triton,
         )  # noqa: E402
     except ImportError as e:
-        logger.warning(f"Triton w8a8 GEMM not available: {e}")
-        gemm_a8w8_blockscale_bpreshuffle_triton = None
+        logger.warning(f"Triton w8a8 blockscale GEMM not available: {e}")
+        gemm_a8w8_blockscale_triton = None
+
+    # Per-tensor / per-token a8w8 (per-row activation x per-column weight scale).
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
+            gemm_a8w8 as gemm_a8w8_triton,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton a8w8 GEMM not available: {e}")
+        gemm_a8w8_triton = None
 else:
     gemm_afp4wfp4_preshuffle = None
-    gemm_a8w8_blockscale_bpreshuffle_triton = None
-
+    gemm_a8w8_blockscale_triton = None
+    gemm_a8w8_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
@@ -98,14 +128,20 @@ def gemm_a4w4_quant(
     input_scale: torch.Tensor,
     output_size: int,
 ) -> torch.Tensor:
-    if gemm_afp4wfp4_preshuffle is None:
+    # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
+    # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
+    if params_dtype == dtypes.fp4x2 and use_fp4_non_shuffle_triton_gemm():
+        if gemm_afp4wfp4 is None:
+            raise RuntimeError(
+                "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 requires aiter.ops.triton.gemm_afp4wfp4"
+            )
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
                 scale=input_scale,
-                shuffle=True,
+                shuffle=False,
             )
         else:
             x_scale = x_scale.view(torch.float8_e8m0fnu)
@@ -122,14 +158,22 @@ def gemm_a4w4_quant(
             dtype=otype,
             device=x.device,
         )
-        y = gemm_a4w4(
-            x,
-            weight,
-            x_scale,
-            weight_scale,
+        y = gemm_afp4wfp4(
+            x.view(torch.uint8),
+            weight.view(torch.uint8),
+            x_scale.view(torch.uint8),
+            weight_scale.view(torch.uint8),
+            otype,
             y,
         )
-    else:
+    # Preshuffle FP4 Triton path: used when ATOM_USE_TRITON_GEMM is enabled
+    # and the non-shuffle path is disabled. This expects preshuffled weights.
+    elif (
+        params_dtype == dtypes.fp4x2
+        and use_triton_gemm()
+        and not use_fp4_non_shuffle_triton_gemm()
+        and gemm_afp4wfp4_preshuffle is not None
+    ):
         m, k = x.view(-1, x.size(-1)).shape
 
         y = torch.empty(
@@ -190,6 +234,39 @@ def gemm_a4w4_quant(
             ),
             y=y,
         )
+    # Default AITER path: quantize/shuffle into the layout expected by gemm_a4w4
+    # and use the backend ASM implementation.
+    else:
+        if x_scale is None:
+            quant_func = get_hip_quant(QuantType.per_1x32)
+            x, x_scale = quant_func(
+                x,
+                quant_dtype=params_dtype,
+                scale=input_scale,
+                shuffle=True,
+            )
+        else:
+            x_scale = x_scale.view(torch.float8_e8m0fnu)
+            x = x.view(torch.float4_e2m1fn_x2)
+
+        m = x.view(-1, x.size(-1)).shape[0]
+        y = torch.empty(
+            (
+                (m + MXFP4_QUANT_BLOCK_SIZE - 1)
+                // MXFP4_QUANT_BLOCK_SIZE
+                * MXFP4_QUANT_BLOCK_SIZE,
+                output_size,
+            ),
+            dtype=otype,
+            device=x.device,
+        )
+        y = gemm_a4w4(
+            x,
+            weight,
+            x_scale,
+            weight_scale,
+            y,
+        )
 
     return y[:m, ...]
 
@@ -215,14 +292,110 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
 ) -> torch.Tensor:
-    if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
-        weight_shuffled = weight.reshape(weight.shape[0] // 16, weight.shape[1] * 16)
-        y = gemm_a8w8_blockscale_bpreshuffle_triton(
-            x, weight_shuffled, x_scale, w_scale, dtype
-        )
-    else:
-        y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
-    return y
+    return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+
+
+def gemm_a8w8_blockscale_triton_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@mark_trace(torch_compile=False)
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_triton_fake, mutates_args=[])
+def gemm_a8w8_blockscale_triton_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    # Wrap the raw Triton launcher in a custom-op boundary so Dynamo treats it
+    # as opaque (otherwise tracing into the Triton kernel launch causes a graph
+    # break that splits the compiled model into >1 graph).
+    return gemm_a8w8_blockscale_triton(x, weight, x_scale, w_scale, dtype)
+
+
+def gemm_a8w8_per_tensor_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@mark_trace(torch_compile=False)
+@torch_compile_guard(gen_fake=gemm_a8w8_per_tensor_fake, mutates_args=[])
+def gemm_a8w8_per_tensor_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    # The triton a8w8 kernel applies a per-row (activation) and per-column
+    # (weight) scale. Per-tensor quantization produces a single scalar scale
+    # for each operand, so broadcast them into the (M,) / (N,) vectors the
+    # kernel expects before launching.
+    M = x.shape[0]
+    N = weight.shape[0]
+    x_scale_vec = x_scale.reshape(-1)[:1].to(torch.float32).expand(M).contiguous()
+    w_scale_vec = w_scale.reshape(-1)[:1].to(torch.float32).expand(N).contiguous()
+    return gemm_a8w8_triton(
+        x,
+        weight,
+        x_scale_vec,
+        w_scale_vec,
+        bias=bias,
+        dtype=dtype,
+    )
+
+
+def gemm_a8w8_per_token_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@mark_trace(torch_compile=False)
+@torch_compile_guard(gen_fake=gemm_a8w8_per_token_fake, mutates_args=[])
+def gemm_a8w8_per_token_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    # The triton a8w8 kernel natively applies a per-row (activation) and
+    # per-column (weight) scale -- exactly per-token-per-channel. The scales are
+    # already (M, 1) / (N, 1); flatten them to the (M,) / (N,) vectors the kernel
+    # expects. Unlike the AITER bpreshuffle path this consumes the unshuffled
+    # (N, K) weight, so the loader must skip the per_Token weight shuffle when
+    # use_triton_gemm() is enabled (see process_weights_after_loading).
+    x_scale_vec = x_scale.reshape(-1).to(torch.float32).contiguous()
+    w_scale_vec = w_scale.reshape(-1).to(torch.float32).contiguous()
+    return gemm_a8w8_triton(
+        x,
+        weight,
+        x_scale_vec,
+        w_scale_vec,
+        bias=bias,
+        dtype=dtype,
+    )
 
 
 class LinearBase(nn.Module):
@@ -247,6 +420,7 @@ class LinearBase(nn.Module):
         params_dtype = layer_quant_config.quant_dtype
         self.source_quant_dtype = source_quant_dtype
         self.layer_quant_config = layer_quant_config
+        self.quant_config = quant_config
         super().__init__()
         self.reduce_results = reduce_results
         self.input_size = input_size
@@ -306,11 +480,16 @@ class LinearBase(nn.Module):
                     torch.empty(self.output_size, 1, dtype=dtypes.fp32)
                 )
             elif quant_type == QuantType.per_1x128:
+                scale_dtype = (
+                    dtypes.fp8_e8m0
+                    if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+                    else dtypes.fp32
+                )
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
-                        dtype=dtypes.fp32,
+                        dtype=scale_dtype,
                     )
                 )
             elif quant_type == QuantType.per_1x32:
@@ -340,11 +519,19 @@ class LinearBase(nn.Module):
         loaded_weight: torch.Tensor,
         post_process_func: Callable = lambda a: a,
     ):
-        if (
-            param.data.dtype != loaded_weight.dtype
-            and param.data.element_size() == loaded_weight.element_size()
-        ):
-            param.data = param.data.view(loaded_weight.dtype)
+        if param.data.dtype != loaded_weight.dtype:
+            if param.data.element_size() == loaded_weight.element_size():
+                # Same byte-width: use view for raw-bit-compatible pairs
+                # (e.g. fp8 variants) but convert for semantically different
+                # formats (float16 ↔ bfloat16) where bit reinterpretation
+                # would corrupt values.
+                incompatible = {torch.float16, torch.bfloat16}
+                if {param.data.dtype, loaded_weight.dtype} == incompatible:
+                    loaded_weight = loaded_weight.to(param.data.dtype)
+                else:
+                    param.data = param.data.view(loaded_weight.dtype)
+            else:
+                loaded_weight = loaded_weight.to(param.data.dtype)
         loaded_weight = post_process_func(loaded_weight)
         if (
             loaded_weight.shape != param.data.shape
@@ -360,14 +547,190 @@ class LinearBase(nn.Module):
         param_data = param.data
         param.weight_loader_process(param_data, loaded_weight)
 
-    def process_weights_after_loading(self):
-        if (
-            self.quant_type == QuantType.per_Tensor
-            and len(self.output_partition_sizes) > 1
+    def _gather_full_weight(self, weight):
+        """Gather sharded weight from all TP ranks to reconstruct the full unpartitioned weight."""
+        if self.tp_size <= 1 or self.tp_dim is None:
+            return weight
+        # NCCL cannot all_gather E8M0 scales (MXFP8 source); gather the raw
+        # bytes as uint8 and reinterpret afterwards. The gather only moves
+        # bytes, so this is bit-exact.
+        if weight.dtype == dtypes.fp8_e8m0:
+            gathered = get_tp_group().all_gather(
+                weight.view(torch.uint8), dim=self.tp_dim
+            )
+            return gathered.view(dtypes.fp8_e8m0)
+        return get_tp_group().all_gather(weight, dim=self.tp_dim)
+
+    def _shard_quantized_weight(self, q_weight, weight_scale):
+        """Split the quantized full weight and scale back to this rank's shard."""
+        if self.tp_size <= 1 or self.tp_dim is None:
+            return q_weight, weight_scale
+        # fp4x2 packs 2 values per byte; view as uint8 so narrow() works correctly
+        is_mxfp4 = q_weight.dtype == torch.float4_e2m1fn_x2
+        if is_mxfp4:
+            q_weight = q_weight.view(torch.uint8)
+        w_shard = q_weight.shape[self.tp_dim] // self.tp_size
+        w_start = self.tp_rank * w_shard
+        q_weight_local = q_weight.narrow(self.tp_dim, w_start, w_shard).contiguous()
+        if is_mxfp4:
+            q_weight_local = q_weight_local.view(torch.float4_e2m1fn_x2)
+
+        # for col linear qkv, w13, [m, n] -> [m // tp, n] -> [m // tp, 1], TP and non-TP are equivalent
+        if weight_scale.dim() > self.tp_dim and weight_scale.shape[self.tp_dim] > 1:
+            s_shard = weight_scale.shape[self.tp_dim] // self.tp_size
+            s_start = self.tp_rank * s_shard
+            weight_scale_local = weight_scale.narrow(
+                self.tp_dim, s_start, s_shard
+            ).contiguous()
+        # for row linear o, w2, [m, n] -> [m, n // tp] -> [m, 1], TP and non-TP are not equivalent
+        else:
+            weight_scale_local = weight_scale
+
+        return q_weight_local, weight_scale_local
+
+    def online_quantize_weight(self):
+        """Re-quantize this layer's weight at load time using the online quant config.
+
+        Handles TP gather/shard when local quantization would produce
+        different results than quantizing the full unpartitioned weight.
+        """
+        online_layer_quant_config = self.quant_config.get_layer_quant_config(
+            self.prefix, use_online_quant=True
+        )
+        online_quant_type = online_layer_quant_config.quant_type
+        online_quant_dtype = online_layer_quant_config.quant_dtype
+        if should_skip_online_quant(
+            self.quant_type, self.params_dtype, online_layer_quant_config
         ):
+            return
+
+        assert online_quant_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float4_e2m1fn_x2,
+        ], (
+            f"Unsupported online quant: "
+            f"dtype={online_quant_dtype}, type={online_quant_type}"
+        )
+        assert self.quant_type in [
+            QuantType.No,
+            QuantType.per_Tensor,
+            QuantType.per_1x128,
+            QuantType.per_1x32,
+        ], (
+            f"Unsupported source quant_type for online quantization: "
+            f"{self.quant_type} (layer={self.prefix})"
+        )
+        weight = self.weight.data
+        weight_scale = getattr(self, "weight_scale", None)
+        # Gather is required whenever local quantization would differ from
+        # quantizing the full unpartitioned weight (bit-exact with offline).
+        need_gather = False
+        if self.tp_size > 1 and self.tp_dim is not None:
+            if isinstance(self, ReplicatedLinear):
+                # W and S of kv_a_proj_with_mqa don't match,
+                # but it doesn't need to be split.
+                return
+            # col qkv w13, tp_dim=0, [m, n] -> [m // tp, n] -> [m // tp, 1], don't need gather
+            # row o, w2, tp_dim=1, [m, n] -> [m, n //tp] -> [m, 1], need gather
+            if online_quant_type == QuantType.per_Token:
+                # per_Token: scale = max(|full_row|), tp_dim=1 has partial rows
+                need_gather = self.tp_dim == 1
+            elif online_quant_type == QuantType.per_1x128:
+                # 128×128 blocks: misaligned if partition size % 128 != 0
+                if self.tp_dim == 0:
+                    need_gather = self.output_size % 128 != 0
+                else:
+                    need_gather = self.input_size % 128 != 0
+            elif online_quant_type == QuantType.per_1x32:
+                # 1×32 blocks: row dim is 1 (always aligned), only column matters
+                # col qkv w13, tp_dim=0, [m, n] -> [m // tp, n] -> [m // tp, n // 32], don't need gather
+                # row o, w2, tp_dim=1, [m, n] -> [m, n //tp] -> [m, n // tp // 32], need gather
+                need_gather = self.tp_dim == 1 and self.input_size % 32 != 0
+        if need_gather:
+            weight = self._gather_full_weight(weight)
+            if weight_scale is not None:
+                weight_scale = self._gather_full_weight(weight_scale)
+
+        if self.quant_type == QuantType.per_1x128:
+            # dequant per block fp8
+            weight = weight_dequant_fp8(weight, weight_scale)
+        elif self.quant_type == QuantType.per_1x32:
+            # dequant MXFP8 (FP8 elements + 1x32 E8M0 shared scale)
+            weight = weight_dequant_mxfp8(weight, weight_scale)
+        elif self.quant_type == QuantType.per_Tensor:
+            # dequant per-tensor fp8: weight (N, K) * per-partition scalar scale.
+            # Merged layers (qkv/gate_up) carry one scale per output partition.
+            w = weight.to(torch.float32)
+            ws = weight_scale.reshape(-1)
+            if ws.numel() <= 1:
+                w = w * ws.reshape(())
+            else:
+                off = 0
+                for i, sz in enumerate(self.output_partition_sizes):
+                    w[off : off + sz] = w[off : off + sz] * ws[i]
+                    off += sz
+            weight = w.to(get_current_atom_config().torch_dtype)
+
+        q_weight, weight_scale = quant_weight_online(
+            weight, online_quant_type, online_quant_dtype
+        )
+        if need_gather:
+            q_weight, weight_scale = self._shard_quantized_weight(
+                q_weight, weight_scale
+            )
+        self.weight = nn.Parameter(q_weight, requires_grad=False)
+        self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+
+        # Update quant state
+        self.quant_type = online_quant_type
+        self.params_dtype = online_quant_dtype
+        self.quant_func = get_hip_quant(online_quant_type)
+        self.need_normalize_e4m3fn_to_e4m3fnuz = (
+            online_quant_dtype == torch.float8_e4m3fnuz
+            and q_weight.dtype != torch.float8_e4m3fnuz
+        )
+        # A dynamic online target (e.g. ptpc per_Token) quantizes activations at
+        # runtime. Drop any static input_scale inherited from a static per_Tensor
+        # source, otherwise the per-token quant kernel rejects it
+        # ("unsupported: static per token quant").
+        if (
+            online_layer_quant_config.is_dynamic
+            and getattr(self, "input_scale", None) is not None
+        ):
+            self.input_scale = None
+        self._online_quant_info = {
+            "layer": self.prefix,
+            "quant_type": online_quant_type.name,
+            "quant_dtype": str(online_quant_dtype),
+        }
+
+    def process_weights_after_loading(self):
+        # Re-quantize before process_weights if online quantization is enabled
+        if self.quant_config is not None and self.quant_config.online_quant:
+            self.online_quantize_weight()
+        if self.quant_type == QuantType.per_Tensor and (
+            len(self.output_partition_sizes) > 1
+            or hasattr(self, "_loaded_weight_scale_for_requant")
+            or hasattr(self, "_loaded_weight_scale_for_requant_parts")
+        ):
+            loaded_weight_scale = getattr(
+                self, "_loaded_weight_scale_for_requant", None
+            )
+            loaded_weight_scale_parts = getattr(
+                self, "_loaded_weight_scale_for_requant_parts", None
+            )
+            if loaded_weight_scale is None and loaded_weight_scale_parts is not None:
+                if all(part is not None for part in loaded_weight_scale_parts):
+                    loaded_weight_scale = torch.cat(loaded_weight_scale_parts, dim=0)
+            weight_scale_for_requant = (
+                loaded_weight_scale
+                if loaded_weight_scale is not None
+                else self.weight_scale.data
+            )
             weight_scale, weight = requantize_with_max_scale(
                 weight=self.weight.data,
-                weight_scale=self.weight_scale.data,
+                weight_scale=weight_scale_for_requant.to(self.weight.device),
                 logical_widths=self.output_partition_sizes,
                 normalize_e4m3fn_to_e4m3fnuz=self.need_normalize_e4m3fn_to_e4m3fnuz,
             )
@@ -398,43 +761,72 @@ class LinearBase(nn.Module):
             # Only quantized 2D GEMM weights use aiter's preshuffle layout.
             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
             # quantized models must keep that tensor unshuffled here.
-            if self.weight.dim() == 2:
+            if self.weight.dim() == 2 and not use_fp4_non_shuffle_triton_gemm():
                 shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
-            if (
+            is_fp4_blockscale = (
+                self.quant_type == QuantType.per_1x32
+                and self.params_dtype == dtypes.fp4x2
+            )
+            need_shuffle = (
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
-            ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
-                if self.quant_type == QuantType.per_1x32 and self.params_dtype in [dtypes.fp4x2, dtypes.i4x2]:
-                    w_u8 = self.weight.data.view(torch.uint8)
-                    k_packed = w_u8.shape[-1]
-                    _ASM_K_ALIGN = 128
-                    if k_packed % _ASM_K_ALIGN != 0:
-                        k_pad_128 = (k_packed + _ASM_K_ALIGN - 1) // _ASM_K_ALIGN * _ASM_K_ALIGN
-                        if k_pad_128 % 256 != 0:
-                            _ASM_K_ALIGN = 256
-                    if k_packed % _ASM_K_ALIGN != 0:
-                        k_pad = (k_packed + _ASM_K_ALIGN - 1) // _ASM_K_ALIGN * _ASM_K_ALIGN
-                        w_new = torch.zeros(w_u8.shape[0], k_pad, dtype=torch.uint8, device=w_u8.device)
-                        w_new[:, :k_packed] = w_u8
-                        self.weight = atom_parameter(w_new.view(self.weight.data.dtype))
-                        if self.weight_scale is not None:
-                            ws_u8 = self.weight_scale.data.view(torch.uint8)
-                            ws_k = ws_u8.shape[-1]
-                            ws_k_pad = k_pad // (MXFP4_QUANT_BLOCK_SIZE // 2)
-                            if ws_k < ws_k_pad:
-                                ws_new = torch.zeros(ws_u8.shape[0], ws_k_pad, dtype=torch.uint8, device=ws_u8.device)
-                                ws_new[:, :ws_k] = ws_u8
-                                self.weight_scale = atom_parameter(ws_new.view(self.weight_scale.data.dtype))
-                        self._fp4_k_orig = k_packed
-                        self._fp4_k_padded = k_pad
-                        logger.info(f"[MXFP4] Padded weight K {k_packed} -> {k_pad} for {self.prefix}")
+                # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
+                # weight; only the AITER bpreshuffle fallback needs the shuffle.
+                and not (use_triton_gemm() and gemm_a8w8_triton is not None)
+            ) or (
+                self.quant_type == QuantType.per_1x32
+                and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
+            )
+            # per_1x128 only needs shuffle when using the preshuffle GEMM path
+            if not need_shuffle and self.quant_type == QuantType.per_1x128:
+                need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+                # Modules whose fused forward calls a *preshuffle* blockscale GEMM
+                # directly (e.g. DeepSeek fused qkv_a_proj) need the 16x16-shuffled
+                # weight even under the non-preshuffle path
+                # (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0). Shuffle once here at
+                # load time instead of per-forward.
+                if not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE and getattr(
+                    self, "needs_preshuffled_weight", False
+                ):
+                    need_shuffle = True
+            # Gemma4 MXFP4: pad weight K to the ASM a4w4 alignment (128, or 256 when
+            # 128-padding is still not a multiple of 256) so the AITER a4w4 GEMM
+            # accepts the shape. Paired with the x/x_scale re-pad in the per_1x32
+            # forward path below (keyed off _fp4_k_padded).
+            if self.quant_type == QuantType.per_1x32 and self.params_dtype in [dtypes.fp4x2, dtypes.i4x2]:
+                w_u8 = self.weight.data.view(torch.uint8)
+                k_packed = w_u8.shape[-1]
+                _ASM_K_ALIGN = 128
+                if k_packed % _ASM_K_ALIGN != 0:
+                    k_pad_128 = (k_packed + _ASM_K_ALIGN - 1) // _ASM_K_ALIGN * _ASM_K_ALIGN
+                    if k_pad_128 % 256 != 0:
+                        _ASM_K_ALIGN = 256
+                if k_packed % _ASM_K_ALIGN != 0:
+                    k_pad = (k_packed + _ASM_K_ALIGN - 1) // _ASM_K_ALIGN * _ASM_K_ALIGN
+                    w_new = torch.zeros(w_u8.shape[0], k_pad, dtype=torch.uint8, device=w_u8.device)
+                    w_new[:, :k_packed] = w_u8
+                    self.weight = atom_parameter(w_new.view(self.weight.data.dtype))
+                    if self.weight_scale is not None:
+                        ws_u8 = self.weight_scale.data.view(torch.uint8)
+                        ws_k = ws_u8.shape[-1]
+                        ws_k_pad = k_pad // (MXFP4_QUANT_BLOCK_SIZE // 2)
+                        if ws_k < ws_k_pad:
+                            ws_new = torch.zeros(ws_u8.shape[0], ws_k_pad, dtype=torch.uint8, device=ws_u8.device)
+                            ws_new[:, :ws_k] = ws_u8
+                            self.weight_scale = atom_parameter(ws_new.view(self.weight_scale.data.dtype))
+                    self._fp4_k_orig = k_packed
+                    self._fp4_k_padded = k_pad
+                    logger.info(f"[MXFP4] Padded weight K {k_packed} -> {k_pad} for {self.prefix}")
+            if need_shuffle:
                 if self.weight.dim() == 2:
                     shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
-        if self.quant_type == QuantType.per_1x32:
+        if self.quant_type == QuantType.per_1x32 and (
+            self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
+        ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     @mark_trace
@@ -452,8 +844,16 @@ class LinearBase(nn.Module):
             if x_scale is None:
                 quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:
+                    # preshuffle GEMM expects column-major x_scale;
+                    # non-preshuffle GEMM expects row-major x_scale
                     quant_func = functools_partial(
-                        self.quant_func, transpose_scale=True
+                        self.quant_func,
+                        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                        **(
+                            {"scale_type": dtypes.fp8_e8m0}
+                            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+                            else {}
+                        ),
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(
@@ -462,14 +862,24 @@ class LinearBase(nn.Module):
                         scale=getattr(self, "input_scale", None),
                     )
             if self.quant_type.value == QuantType.per_Tensor.value:
-                y = tgemm.mm(
-                    x,
-                    self.weight,
-                    self.bias,
-                    otype=otype,
-                    scale_a=x_scale,
-                    scale_b=self.weight_scale,
-                )
+                if use_triton_gemm() and gemm_a8w8_triton is not None:
+                    y = gemm_a8w8_per_tensor_impl(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        bias=self.bias,
+                        dtype=otype,
+                    )
+                else:
+                    y = tgemm.mm(
+                        x,
+                        self.weight,
+                        self.bias,
+                        otype=otype,
+                        scale_a=x_scale,
+                        scale_b=self.weight_scale,
+                    )
             elif self.quant_type.value == QuantType.per_Token.value:
                 if self.params_dtype == dtypes.i8:
                     y = gemm_a8w8(
@@ -478,6 +888,16 @@ class LinearBase(nn.Module):
                         x_scale,
                         self.weight_scale,
                         self.bias,
+                        dtype=otype,
+                    )
+                elif use_triton_gemm() and gemm_a8w8_triton is not None:
+                    # Triton a8w8 per-token-per-channel GEMM (unshuffled weight).
+                    y = gemm_a8w8_per_token_impl(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        bias=self.bias,
                         dtype=otype,
                     )
                 else:
@@ -491,14 +911,32 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
-                y = gemm_a8w8_blockscale_preshuffle_impl(
-                    x,
-                    self.weight,
-                    x_scale,
-                    self.weight_scale,
-                    dtype=otype,
-                    prefix=self.prefix,
-                )
+                if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+                    y = gemm_a8w8_blockscale_preshuffle_impl(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        dtype=otype,
+                        prefix=self.prefix,
+                    )
+                else:
+                    if use_triton_gemm() and gemm_a8w8_blockscale_triton is not None:
+                        y = gemm_a8w8_blockscale_triton_impl(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                        )
+                    else:
+                        y = gemm_a8w8_blockscale(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                        )
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
@@ -651,7 +1089,11 @@ class MergedColumnParallelLinear(LinearBase):
                 if param is getattr(self, "weight_scale", None) or param is getattr(
                     self, "input_scale", None
                 ):
-                    shard_size //= 128
+                    if self.quant_type not in (
+                        QuantType.per_1x32,
+                        QuantType.per_Token,
+                    ):
+                        shard_size //= 128
                 shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
                 self.weight_loader(param, shard, shard_id)
                 current_offset += shard_size
@@ -694,9 +1136,26 @@ class MergedColumnParallelLinear(LinearBase):
                 shard_offset = (shard_offset + 127) // 128
                 shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
-                loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
-                shard_offset = loaded_shard_id
-                shard_size = 1
+                param_data = param_data.narrow(self.tp_dim, loaded_shard_id, 1)
+                if (
+                    loaded_weight.ndim > self.tp_dim
+                    and loaded_weight.shape[self.tp_dim] > 1
+                ):
+                    local_scale = loaded_weight.chunk(self.tp_size, self.tp_dim)[
+                        self.tp_rank
+                    ].contiguous()
+                    if not hasattr(self, "_loaded_weight_scale_for_requant_parts"):
+                        self._loaded_weight_scale_for_requant_parts = [None] * len(
+                            self.output_sizes
+                        )
+                    self._loaded_weight_scale_for_requant_parts[loaded_shard_id] = (
+                        local_scale
+                    )
+                    loaded_weight = local_scale.max().view(1, 1)
+                else:
+                    loaded_weight = loaded_weight.max().view(1, 1)
+                param.weight_loader_process(param_data, loaded_weight)
+                return
 
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
@@ -704,6 +1163,17 @@ class MergedColumnParallelLinear(LinearBase):
 
 
 class QKVZBAParallelLinear(ColumnParallelLinear):
+    """Fused QKVZBA linear with deinterleaved output layout.
+
+    Output layout is always ``[q | k | v | z | b | a]`` contiguous on dim-0,
+    so the caller can use ``torch.split`` for zero-copy views.
+
+    The weight_loader deinterleaves the Qwen3-Next interleaved per-k-head-group
+    checkpoint layout during loading.  Qwen3.5 checkpoints (which have separate
+    per-component weights) are loaded via individual shard_ids and work without
+    deinterleaving.
+    """
+
     def __init__(
         self,
         input_size: int,
@@ -724,11 +1194,15 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         tp_size = get_tp_group().world_size
         self.num_k_heads = divide(self.num_k_heads, tp_size)
         self.num_v_heads = divide(self.num_v_heads, tp_size)
-        output_sizes = [
-            (2 * head_k_dim * self.num_k_heads + 2 * head_v_dim * self.num_v_heads)
-            * tp_size,
-            2 * self.num_v_heads * tp_size,
-        ]
+        # Output layout: [q_all | k_all | v_all | z_all | b_all | a_all]
+        q_size = self.num_k_heads * head_k_dim
+        k_size = self.num_k_heads * head_k_dim
+        v_size = self.num_v_heads * head_v_dim
+        z_size = self.num_v_heads * head_v_dim
+        b_size = self.num_v_heads
+        a_size = self.num_v_heads
+        self._section_sizes = [q_size, k_size, v_size, z_size, b_size, a_size]
+        output_sizes = [s * tp_size for s in self._section_sizes]
         super().__init__(
             input_size,
             output_sizes,
@@ -738,69 +1212,302 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
             prefix=prefix,
         )
 
+    # -- helpers for deinterleaving during weight loading --
+
+    def _deinterleave_qkvz(self, param_data: torch.Tensor, loaded_weight: torch.Tensor):
+        """Scatter interleaved qkvz checkpoint rows into [q|k|v|z] regions.
+
+        Checkpoint layout per k-head group (``QKVZ_DIM_SIZE`` rows):
+            [q(head_k_dim) | k(head_k_dim) | v0..vR(R*head_v_dim) | z0..zR(R*head_v_dim)]
+        where R = num_v_heads / num_k_heads (KV_HEAD_RATIO).
+        """
+        nk = self.num_k_heads
+        hk = self.head_k_dim
+        hv = self.head_v_dim
+        R = self.num_v_heads // nk  # KV_HEAD_RATIO
+        group_size = 2 * hk + 2 * hv * R
+
+        q_total = nk * hk
+        k_total = nk * hk
+        v_total = self.num_v_heads * hv
+
+        # TP shard the source
+        src = loaded_weight.narrow(
+            self.tp_dim, self.tp_rank * nk * group_size, nk * group_size
+        )
+
+        for g in range(nk):
+            base = g * group_size
+            # q rows
+            param_data[g * hk : (g + 1) * hk] = src[base : base + hk]
+            # k rows
+            param_data[q_total + g * hk : q_total + (g + 1) * hk] = src[
+                base + hk : base + 2 * hk
+            ]
+            # v sub-heads
+            for s in range(R):
+                v_src_start = base + 2 * hk + s * hv
+                v_dst_start = q_total + k_total + (g * R + s) * hv
+                param_data[v_dst_start : v_dst_start + hv] = src[
+                    v_src_start : v_src_start + hv
+                ]
+            # z sub-heads
+            for s in range(R):
+                z_src_start = base + 2 * hk + R * hv + s * hv
+                z_dst_start = q_total + k_total + v_total + (g * R + s) * hv
+                param_data[z_dst_start : z_dst_start + hv] = src[
+                    z_src_start : z_src_start + hv
+                ]
+
+    def _deinterleave_ba(self, param_data: torch.Tensor, loaded_weight: torch.Tensor):
+        """Scatter interleaved ba checkpoint rows into [b|a] regions.
+
+        Checkpoint layout per k-head group (2*R elements):
+            [b_sub0, b_sub1, ..., b_subR-1, a_sub0, a_sub1, ..., a_subR-1]
+        where R = num_v_heads / num_k_heads.
+        """
+        nk = self.num_k_heads
+        nv = self.num_v_heads
+        R = nv // nk
+        ba_total = 2 * nv
+
+        # TP shard the source
+        src = loaded_weight.narrow(self.tp_dim, self.tp_rank * ba_total, ba_total)
+
+        qkvz_total = sum(self._section_sizes[:4])
+        b_offset = qkvz_total
+        a_offset = qkvz_total + nv
+
+        for g in range(nk):
+            group_base = g * 2 * R
+            # b sub-heads
+            for s in range(R):
+                param_data[b_offset + g * R + s] = src[group_base + s]
+            # a sub-heads
+            for s in range(R):
+                param_data[a_offset + g * R + s] = src[group_base + R + s]
+
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
     ):
         param_data = param.data
         assert loaded_shard_id in ["qkvz", "ba", "qkv", "z", "b", "a"]
-        if loaded_shard_id == "qkvz":
-            shard_size = (
-                2 * self.num_k_heads * self.head_k_dim
-                + 2 * self.num_v_heads * self.head_v_dim
-            )
-            shard_offset = 0
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "qkv":
-            shard_size = (
-                2 * self.num_k_heads * self.head_k_dim
-                + self.num_v_heads * self.head_v_dim
-            )
-            shard_offset = 0
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "z":
-            shard_size = self.num_v_heads * self.head_v_dim
-            shard_offset = (
-                2 * self.num_k_heads * self.head_k_dim
-                + self.num_v_heads * self.head_v_dim
-            )
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "ba":
-            shard_size = 2 * self.num_v_heads
-            shard_offset = (
-                2 * self.num_k_heads * self.head_k_dim
-                + 2 * self.num_v_heads * self.head_v_dim
-            )
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "b":
-            shard_size = self.num_v_heads
-            shard_offset = (
-                2 * self.num_k_heads * self.head_k_dim
-                + 2 * self.num_v_heads * self.head_v_dim
-            )
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "a":
-            shard_size = self.num_v_heads
-            shard_offset = (
-                2 * self.num_k_heads * self.head_k_dim
-                + 2 * self.num_v_heads * self.head_v_dim
-                + self.num_v_heads
-            )
-            shard_rank = self.tp_rank
 
-        if param is getattr(self, "weight_scale", None) or param is getattr(
+        is_scale = param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
-        ):
+        )
+
+        # For interleaved checkpoint shards ("qkvz", "ba"), deinterleave
+        # weight rows so output is [q|k|v|z|b|a] contiguous.
+        if loaded_shard_id == "qkvz" and not is_scale:
+            self._deinterleave_qkvz(param_data, loaded_weight)
+            return
+        if loaded_shard_id == "ba" and not is_scale:
+            self._deinterleave_ba(param_data, loaded_weight)
+            return
+
+        # For individual shard_ids or scale params, use offset-based loading.
+        q_size, k_size, v_size, z_size, b_size, a_size = self._section_sizes
+        if loaded_shard_id == "qkvz":
+            shard_size = q_size + k_size + v_size + z_size
+            shard_offset = 0
+        elif loaded_shard_id == "qkv":
+            shard_size = q_size + k_size + v_size
+            shard_offset = 0
+        elif loaded_shard_id == "z":
+            shard_size = z_size
+            shard_offset = q_size + k_size + v_size
+        elif loaded_shard_id == "ba":
+            shard_size = b_size + a_size
+            shard_offset = q_size + k_size + v_size + z_size
+        elif loaded_shard_id == "b":
+            shard_size = b_size
+            shard_offset = q_size + k_size + v_size + z_size
+        elif loaded_shard_id == "a":
+            shard_size = a_size
+            shard_offset = q_size + k_size + v_size + z_size + b_size
+
+        if is_scale:
             if self.quant_type == QuantType.per_1x128:
                 shard_offset = (shard_offset + 127) // 128
                 shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
-                shard_offset = ["qkvz", "ba"].index(loaded_shard_id)
+                shard_offset = ["qkvz", "ba", "qkv", "z", "b", "a"].index(
+                    loaded_shard_id
+                )
                 shard_size = 1
-        start_idx = shard_rank * shard_size
+        start_idx = self.tp_rank * shard_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
+
+
+class QKVZParallelLinear(ColumnParallelLinear):
+    """Deinterleaving linear for the separate ``in_proj_qkvz`` checkpoint.
+
+    The Qwen3-Next checkpoint stores qkvz in per-k-head-group interleaved
+    layout::
+
+        [q(hk) | k(hk) | v0..vR(R*hv) | z0..zR(R*hv)]  per group
+
+    This class deinterleaves both weight rows **and** per-1x128 block scales
+    during loading so the output layout is ``[q_all | k_all | v_all | z_all]``
+    contiguous, enabling zero-copy ``torch.split`` at runtime.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
+        **kwargs,
+    ):
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        tp_size = get_tp_group().world_size
+        self.nk = divide(num_k_heads, tp_size)
+        self.nv = divide(num_v_heads, tp_size)
+        self.R = num_v_heads // num_k_heads  # v-heads per k-head group
+        output_size = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
+        super().__init__(
+            input_size,
+            output_size,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+        )
+
+    @staticmethod
+    def _deinterleave(param_data, src, nk, R, hk, hv):
+        """Scatter interleaved rows into [q|k|v|z] regions."""
+        group_size = 2 * hk + 2 * hv * R
+        q_total = nk * hk
+        k_total = nk * hk
+        v_total = nk * R * hv
+
+        for g in range(nk):
+            base = g * group_size
+            # q
+            param_data[g * hk : (g + 1) * hk] = src[base : base + hk]
+            # k
+            param_data[q_total + g * hk : q_total + (g + 1) * hk] = src[
+                base + hk : base + 2 * hk
+            ]
+            # v sub-heads
+            for s in range(R):
+                v_src = base + 2 * hk + s * hv
+                v_dst = q_total + k_total + (g * R + s) * hv
+                param_data[v_dst : v_dst + hv] = src[v_src : v_src + hv]
+            # z sub-heads
+            for s in range(R):
+                z_src = base + 2 * hk + R * hv + s * hv
+                z_dst = q_total + k_total + v_total + (g * R + s) * hv
+                param_data[z_dst : z_dst + hv] = src[z_src : z_src + hv]
+
+    @staticmethod
+    def _match_dtype(param_data, loaded_weight):
+        """View param_data as loaded_weight's dtype if they differ but share element size.
+
+        This mirrors ``weight_loader_process`` behaviour for FP8 on ROCm where
+        the param is ``float8_e4m3fnuz`` but the checkpoint stores
+        ``float8_e4m3fn``.  The normalisation happens later in
+        ``process_weights_after_loading``.
+        """
+        if (
+            param_data.dtype != loaded_weight.dtype
+            and param_data.element_size() == loaded_weight.element_size()
+        ):
+            return param_data.view(loaded_weight.dtype)
+        return param_data
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # Load like ColumnParallelLinear (no deinterleave at load time).
+        super().weight_loader(param, loaded_weight)
+
+    def process_weights_after_loading(self):
+        nk, R = self.nk, self.R
+        hk, hv = self.head_k_dim, self.head_v_dim
+
+        # Deinterleave weight rows: interleaved → [q|k|v|z]
+        w = self.weight.data
+        dw = torch.empty_like(w)
+        self._deinterleave(dw, w, nk, R, hk, hv)
+        self.weight.data = dw
+
+        # Deinterleave weight_scale rows (per_1x128 block scale)
+        ws = getattr(self, "weight_scale", None)
+        if ws is not None:
+            hk_s, hv_s = hk // 128, hv // 128
+            s = ws.data
+            ds = torch.empty_like(s)
+            self._deinterleave(ds, s, nk, R, hk_s, hv_s)
+            self.weight_scale.data = ds
+
+        super().process_weights_after_loading()
+
+
+class BAParallelLinear(ColumnParallelLinear):
+    """Deinterleaving linear for the separate ``in_proj_ba`` checkpoint.
+
+    The Qwen3-Next checkpoint stores ba in per-k-head-group layout::
+
+        [b_s0..b_sR | a_s0..a_sR]  per group  (R = num_v_heads / num_k_heads)
+
+    This class deinterleaves during loading so the output layout is
+    ``[b_all | a_all]`` contiguous, enabling zero-copy ``torch.split``.
+
+    ``in_proj_ba`` is always BF16 (listed in ``modules_to_not_convert``),
+    so no weight-scale handling is needed.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
+        **kwargs,
+    ):
+        tp_size = get_tp_group().world_size
+        self.nk = divide(num_k_heads, tp_size)
+        self.R = num_v_heads // num_k_heads
+        self.nv = self.nk * self.R
+        output_size = 2 * num_v_heads
+        super().__init__(
+            input_size,
+            output_size,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+        )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # Load like ColumnParallelLinear (no deinterleave at load time).
+        super().weight_loader(param, loaded_weight)
+
+    def process_weights_after_loading(self):
+        nk, R, nv = self.nk, self.R, self.nv
+        w = self.weight.data
+        dw = torch.empty_like(w)
+        group_size = 2 * R
+        for g in range(nk):
+            base = g * group_size
+            dw[g * R : (g + 1) * R] = w[base : base + R]
+            dw[nv + g * R : nv + (g + 1) * R] = w[base + R : base + 2 * R]
+        self.weight.data = dw
+        super().process_weights_after_loading()
 
 
 class QKVGParallelLinear(ColumnParallelLinear):
@@ -1033,6 +1740,127 @@ class QKVParallelLinear(ColumnParallelLinear):
         param.weight_loader_process(param_data, loaded_weight)
 
 
+class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
+    """QKV projection fused with MiniMax-M3 lightning-indexer projections.
+
+    The sparse attention layers emit ``[q | k | v | index_q | index_k]`` from a
+    single column-parallel GEMM. ``index_q`` follows the KV-head sharding and
+    replication rules, while ``index_k`` is a single replicated head.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        total_num_index_heads: int,
+        index_head_size: int,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
+        **kwargs,
+    ):
+        if total_num_index_heads != total_num_kv_heads:
+            raise ValueError(
+                "MiniMax-M3 index_q must shard like KV heads: "
+                "total_num_index_heads must equal total_num_kv_heads."
+            )
+
+        self.head_size = head_size
+        self.v_head_size = head_size
+        self.index_head_size = index_head_size
+        self.total_num_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        self.total_num_index_heads = total_num_index_heads
+
+        tp_size = get_tp_group().world_size
+        self.num_heads = divide(self.total_num_heads, tp_size)
+        if self.total_num_kv_heads >= tp_size:
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+        else:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        self.num_index_heads = self.num_kv_heads
+
+        output_sizes = [
+            self.num_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.v_head_size * tp_size,
+            self.num_index_heads * self.index_head_size * tp_size,
+            self.index_head_size * tp_size,
+        ]
+
+        ColumnParallelLinear.__init__(
+            self,
+            hidden_size,
+            output_sizes,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+            **kwargs,
+        )
+
+    def _shard_offset_size(self, loaded_shard_id: str) -> tuple[int, int]:
+        h = self.head_size
+        ih = self.index_head_size
+        nq = self.num_heads
+        nkv = self.num_kv_heads
+        nidx = self.num_index_heads
+        mapping = {
+            "q": (0, nq * h),
+            "k": (nq * h, nkv * h),
+            "v": ((nq + nkv) * h, nkv * h),
+            "index_q": ((nq + 2 * nkv) * h, nidx * ih),
+            "index_k": ((nq + 2 * nkv) * h + nidx * ih, ih),
+        }
+        if loaded_shard_id not in mapping:
+            raise ValueError(
+                "MiniMax-M3 QKV/indexer shard id must be one of "
+                "'q', 'k', 'v', 'index_q', 'index_k'; got "
+                f"{loaded_shard_id!r}."
+            )
+        return mapping[loaded_shard_id]
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str,
+    ):
+        shard_offset, shard_size = self._shard_offset_size(loaded_shard_id)
+        if param is getattr(self, "weight_scale", None) or param is getattr(
+            self, "input_scale", None
+        ):
+            if self.quant_type == QuantType.per_1x128:
+                shard_offset = (shard_offset + 127) // 128
+                shard_size = (shard_size + 127) // 128
+            elif self.quant_type == QuantType.per_Tensor:
+                loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
+                shard_offset = ["q", "k", "v", "index_q", "index_k"].index(
+                    loaded_shard_id
+                )
+                shard_size = 1
+
+        if loaded_shard_id == "q":
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "index_k":
+            shard_rank = 0
+        else:
+            shard_rank = self.tp_rank // self.num_kv_head_replicas
+
+        param_data = param.data.narrow(self.tp_dim, shard_offset, shard_size)
+        loaded_weight = loaded_weight.narrow(
+            self.tp_dim,
+            shard_rank * shard_size,
+            shard_size,
+        )
+        param.weight_loader_process(param_data, loaded_weight)
+
+
 class RowParallelLinear(LinearBase):
     def __init__(
         self,
@@ -1060,6 +1888,14 @@ class RowParallelLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if param is not getattr(self, "bias", None):
+            if (
+                param is getattr(self, "weight_scale", None)
+                or param is getattr(self, "input_scale", None)
+            ) and self.quant_type == QuantType.per_Tensor:
+                if loaded_weight.ndim > 0 and loaded_weight.shape[0] > 1:
+                    self._loaded_weight_scale_for_requant = loaded_weight.contiguous()
+                param.weight_loader_process(param_data, loaded_weight.max().view(1, 1))
+                return
             if len(loaded_weight.shape) == 0:
                 loaded_weight = loaded_weight.view(1, 1)
             if loaded_weight.ndim <= self.tp_dim:

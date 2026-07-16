@@ -96,7 +96,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
   - `ATOM_ENABLE_DS_QKNORM_QUANT_FUSION` -- fuses QK norm with quantization.
   - `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` -- fuses allreduce with RMSNorm.
   - Dedicated Triton kernels for FP8 MQA logits (`fp8_mqa_logits`), paged MQA logits (`deepgemm_fp8_paged_mqa_logits`), and fused RMSNorm+quantization (`_fuse_rmsnorm_quant`).
-- **V3.2 extension:** `DeepseekV32ForCausalLM` is an alias. The `DeepseekV2Model` detects V3.2 via `config.index_topk` and allocates an `topk_indices_buffer` for index-based routing.
+- **V3.2 extension:** `DeepseekV32ForCausalLM` is an alias. The `DeepseekV2Model` detects V3.2 via `config.index_topk`; the indexer computes top-k rows as per-forward scratch and the MLA path packs them into sparse attention metadata.
 - **Note:** `DeepseekV3ForCausalLM` is a subclass of `DeepseekV2ForCausalLM` (pass-through, no override).
 
 ### DeepSeek MTP (`DeepSeekMTP`)

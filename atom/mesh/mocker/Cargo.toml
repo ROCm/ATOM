@@ -1,0 +1,31 @@
+[package]
+name = "atomesh-mocker"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "atomesh_mocker"
+path = "lib.rs"
+
+[[bin]]
+name = "atomesh-mocker"
+path = "main.rs"
+
+[dependencies]
+mesh = { package = "atomesh", path = ".." }
+axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }
+clap = { version = "4", features = ["derive", "env"] }
+data-connector = "=1.0.0"
+futures-util = "0.3"
+http-body-util = "0.1"
+mesh_grpc = { package = "smg-grpc-client", version = "=1.0.0" }
+portpicker = "0.1"
+reqwest = { version = "0.12.8", features = ["stream", "blocking", "json", "rustls-tls"], default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = [
+    "std",
+    "preserve_order",
+] }
+tokio = { version = "1.42.0", features = ["full"] }
+tonic = { version = "0.14.2", features = ["gzip", "transport"] }
+tower = { version = "0.5", features = ["util"] }

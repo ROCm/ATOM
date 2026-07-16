@@ -153,6 +153,37 @@ class OAIAttention(nn.Module):
         return output
 
 
+def _interleave_swiglu_weights(experts: FusedMoE):
+    """Interleave gate/up weights, scales, and biases for Swiglu activation.
+
+    Must run before Mxfp4MoEMethod.process_weights_after_loading (shuffle).
+    The loader calls module.process_weights_after_loading() before
+    quant_method.process_weights_after_loading(module), so this ordering
+    is guaranteed.
+    """
+    e, n, k = experts.w13_weight.shape
+    experts.w13_weight.view(torch.uint8).copy_(
+        experts.w13_weight.data.view(torch.uint8)
+        .view(e, n // 2, 2, k)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(e, n, k)
+    )
+    experts.w13_weight_scale.data = (
+        experts.w13_weight_scale.data.view(e, n // 2, 2, -1)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(e, n, -1)
+    )
+    if experts.w13_bias is not None:
+        experts.w13_bias.data = (
+            experts.w13_bias.data.view(-1, n // 2, 2)
+            .permute(0, 2, 1)
+            .contiguous()
+            .view(-1, n)
+        )
+
+
 class MLPBlock(torch.nn.Module):
     def __init__(
         self,
@@ -201,6 +232,11 @@ class MLPBlock(torch.nn.Module):
             self.moe_hidden_pad = self.experts.quant_method.hidden_pad
         else:
             self.moe_hidden_pad = 0
+
+    def process_weights_after_loading(self):
+        if getattr(self.experts.quant_method, "use_triton", False):
+            return
+        _interleave_swiglu_weights(self.experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
@@ -300,11 +336,18 @@ class GptOssModel(nn.Module):
         self.config = atom_config.hf_config
         self.quant_config = atom_config.quant_config
         self.config.hidden_size = self.config.hidden_size
-        self.embedding = VocabParallelEmbedding(
+        # Register `embed_tokens` first so it stays the primary (non-deduped)
+        # name reported by `named_parameters()`. The checkpoint stores this
+        # tensor as `model.embed_tokens.weight`; if `embedding` were the primary
+        # name instead, the load-completeness check would falsely flag
+        # `model.embedding.weight` as unloaded (the weight is in fact loaded via
+        # the shared-storage alias). `embedding` remains as an alias for the
+        # internal call sites below.
+        self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
             self.config.hidden_size,
         )
-        self.embed_tokens = self.embedding
+        self.embedding = self.embed_tokens
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_hidden_layers,
             lambda prefix, layer_num=None: TransformerBlock(

@@ -52,6 +52,7 @@ def _make_fake_server_args(**overrides):
         enable_torch_compile=False,
         disable_cuda_graph=False,
         enable_dp_attention=False,
+        trust_remote_code=False,
     )
     defaults.update(overrides)
     return _Obj(**defaults)
@@ -137,6 +138,7 @@ def test_generate_sglang_config_translates_core_fields(monkeypatch):
         context_length=16384,
         max_running_requests=128,
         mem_fraction_static=0.9,
+        trust_remote_code=True,
     )
 
     mock_sglang_server_args = MagicMock()
@@ -178,6 +180,7 @@ def test_generate_sglang_config_translates_core_fields(monkeypatch):
         )
 
     assert cfg.model == "/fake/model"
+    assert cfg.trust_remote_code is True
     assert cfg.tensor_parallel_size == 4
     assert cfg.kv_cache_dtype == "fp8_e4m3fn"
     assert cfg.max_model_len == 16384

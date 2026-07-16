@@ -2,8 +2,16 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
-from atom.model_engine.scheduler import Scheduler, ScheduledBatchOutput, SpecStats
-from atom.model_engine.sequence import SequenceStatus, SequenceType
+from collections import deque
+from types import SimpleNamespace
+
+from atom.model_engine.scheduler import (
+    ScheduledBatch,
+    Scheduler,
+    ScheduledBatchOutput,
+    SpecStats,
+)
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 from conftest import MockConfig
 
@@ -83,11 +91,56 @@ class TestSchedule:
         assert batch.total_seqs_num_prefill == 2
 
     def test_prefill_respects_max_batched_tokens(self, seq_factory):
-        sched = Scheduler(MockConfig(max_num_batched_tokens=6, num_kvcache_blocks=100))
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                enable_chunked_prefill=True,
+            )
+        )
         sched.add(seq_factory([1, 2, 3, 4]))  # 4 tokens
-        sched.add(seq_factory([5, 6, 7, 8]))  # 4 more → 8 > 6
+        sched.add(seq_factory([5, 6, 7, 8]))  # 4 tokens total, but only 2 fit in budget
         batch, _ = sched.schedule()
-        assert batch.total_seqs_num_prefill == 1
+        # Chunked prefill: seq2 gets a 2-token chunk (budget 6-4=2)
+        assert batch.total_seqs_num_prefill == 2
+        assert batch.total_tokens_num_prefill == 6
+        assert list(batch.num_scheduled_tokens) == [4, 2]
+
+    def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+
+        batch1, _ = sched.schedule()
+        assert batch1.total_tokens_num_prefill == 6
+        assert list(batch1.scheduled_tokens) == list(range(6))
+        assert list(batch1.num_cached_tokens) == [0]
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+        assert seq.is_partial_prefill is True
+        assert seq.num_cached_tokens == 6
+
+        batch2, _ = sched.schedule()
+        assert batch2.total_tokens_num_prefill == 4
+        assert list(batch2.scheduled_tokens) == list(range(6, 10))
+        assert list(batch2.num_cached_tokens) == [6]
 
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
@@ -100,6 +153,7 @@ class TestSchedule:
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
         scheduler.schedule()  # prefill
+        seq.num_cached_tokens = seq.num_prompt_tokens  # simulate forward pass
         seq.append_token(5)
         batch, _ = scheduler.schedule()  # decode
         assert batch.total_seqs_num_decode == 1
@@ -111,12 +165,218 @@ class TestSchedule:
         sched.add(s1)
         sched.add(s2)
         sched.schedule()  # prefill both
+        s1.num_cached_tokens = s1.num_prompt_tokens  # simulate forward pass
+        s2.num_cached_tokens = s2.num_prompt_tokens
         s1.append_token(9)
         s2.append_token(10)
         sched.schedule()  # one preempted
         statuses = {s1.status, s2.status}
         assert SequenceStatus.RUNNING in statuses
         assert SequenceStatus.WAITING in statuses
+
+    def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
+        sched = Scheduler.__new__(Scheduler)
+        fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
+        ready = SimpleNamespace(id=2, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
+        blocked = SimpleNamespace(id=3, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
+        sched.waiting = deque([fresh, ready, blocked])
+        sched.finished_recving_kv_req_ids = ["2"]
+        sched.failed_recving_kv_req_ids = []
+
+        sched._promote_ready_remote_kv_requests()
+
+        assert [seq.id for seq in sched.waiting] == [2, 1, 3]
+
+    def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
+        class _Connector:
+            def should_park_partial_prefill_for_load(self, seq):
+                return seq.id == 2
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = _Connector()
+        sched.waiting = deque()
+        sched._partial_prefill_count = 1
+        keep = SimpleNamespace(
+            id=1,
+            status=SequenceStatus.RUNNING,
+            is_partial_prefill=False,
+        )
+        ready = SimpleNamespace(
+            id=2,
+            status=SequenceStatus.RUNNING,
+            is_partial_prefill=True,
+        )
+        sched.running = deque([keep, ready])
+
+        sched._park_ready_offload_partial_prefills()
+
+        assert [seq.id for seq in sched.running] == [1]
+        assert [seq.id for seq in sched.waiting] == [2]
+        assert ready.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        assert ready.is_partial_prefill is False
+        assert ready._discard_next_deferred_output is True
+        assert sched._partial_prefill_count == 0
+
+    def test_offload_partial_handoff_discards_stale_deferred_output(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=10,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)), sampling_params=SamplingParams(max_tokens=4))
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.PREFILL
+        seq.num_cached_tokens = 8
+        seq._discard_next_deferred_output = True
+        sched.running = deque([seq])
+
+        sched.postprocess(
+            [seq],
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(999,)],
+                num_rejected=[0],
+                num_bonus=[0],
+                draft_token_ids=None,
+                is_deferred_out=True,
+            ),
+            batch=SimpleNamespace(req_ids=[seq.id], num_scheduled_tokens=[2]),
+        )
+
+        assert seq.num_cached_tokens == 10
+        assert seq._discard_next_deferred_output is False
+        assert 999 not in seq.output_tokens
+        assert seq.output_tokens == [sched.eos_token_id]
+
+
+# ── long_prefill_token_threshold ──────────────────────────────────────────
+
+
+class TestLongPrefillTokenThreshold:
+    """Per-request cap on prefill tokens per step (vLLM parity)."""
+
+    def test_disabled_by_default(self, seq_factory):
+        """threshold=0 → no per-request cap, only max_num_batched_tokens applies."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [20]
+
+    def test_caps_single_long_request(self, seq_factory):
+        """A 20-token prompt with threshold=8 → first step does 8 tokens."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [8]
+
+    def test_short_request_unaffected(self, seq_factory):
+        """Prompt shorter than threshold → full prefill in one step."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                long_prefill_token_threshold=16,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory([1, 2, 3, 4, 5]))
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [5]
+
+    def test_applied_per_request_not_batch(self, seq_factory):
+        """Two long prompts each capped at 8 → batch carries 16 tokens."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))
+        sched.add(seq_factory(list(range(20, 40))))
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [8, 8]
+        assert batch.total_tokens_num_prefill == 16
+
+    def test_min_with_budget_remaining(self, seq_factory):
+        """budget < threshold → chunk is bounded by budget, not threshold."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=10,
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))  # capped at 8
+        sched.add(seq_factory(list(range(20, 40))))  # budget left = 2
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [8, 2]
+
+    def test_ignored_when_chunked_prefill_disabled(self, seq_factory):
+        """No chunked prefill → threshold is a no-op (full prompt or reject)."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=False,
+            )
+        )
+        sched.add(seq_factory(list(range(20))))
+        batch, _ = sched.schedule()
+        # Full 20-token prompt scheduled in one shot, threshold ignored.
+        assert list(batch.num_scheduled_tokens) == [20]
+
+    def test_partial_prefill_resume_capped(self, seq_factory):
+        """Phase-1 resume of a partial-prefill seq is also capped by threshold."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=8,  # forces chunking on the 20-tok prompt
+                long_prefill_token_threshold=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(20)))
+        sched.add(seq)
+
+        # Step 1: new request, capped at 8.
+        batch1, _ = sched.schedule()
+        assert list(batch1.num_scheduled_tokens) == [8]
+        # Simulate postprocess marking it partial (would normally happen after
+        # forward returns and num_cached_tokens < num_prompt_tokens).
+        seq.num_cached_tokens = 8
+        seq.is_partial_prefill = True
+        sched._partial_prefill_count += 1
+
+        # Step 2: partial-prefill resume, also capped at 8 (not 12 remaining).
+        batch2, _ = sched.schedule()
+        assert list(batch2.num_scheduled_tokens) == [8]
 
 
 # ── prefix caching ────────────────────────────────────────────────────────
@@ -147,7 +407,8 @@ class TestPrefixCaching:
         batch1, _ = sched.schedule()
         assert batch1.total_tokens_num_prefill == 9  # no cache, all tokens
 
-        # Complete seq1 so its blocks are freed (but hashes remain)
+        # Complete seq1 so its blocks are freed (but hashes remain).
+        # `batch=batch1` is required for postprocess to call hash_blocks().
         seq1.append_token(2)  # EOS
         sched.postprocess(
             list(sched.running),
@@ -158,6 +419,7 @@ class TestPrefixCaching:
                 num_bonus=None,
                 draft_token_ids=None,
             ),
+            batch=batch1,
         )
 
         # Second request shares the same prefix, differs in last block
@@ -178,7 +440,7 @@ class TestPrefixCaching:
 
         seq1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
         sched.add(seq1)
-        sched.schedule()
+        batch1, _ = sched.schedule()
 
         seq1.append_token(2)  # EOS
         sched.postprocess(
@@ -190,6 +452,7 @@ class TestPrefixCaching:
                 num_bonus=None,
                 draft_token_ids=None,
             ),
+            batch=batch1,
         )
 
         seq2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 10, 11])
@@ -352,9 +615,61 @@ class TestGetNextBatchInfo:
         assert num_reqs == 1
 
     def test_running(self, scheduler, seq_factory):
-        scheduler.add(seq_factory([1, 2, 3, 4]))
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
         scheduler.schedule()
+        seq.num_cached_tokens = seq.num_prompt_tokens  # simulate forward pass
         is_prefill, n, num_reqs = scheduler.get_next_batch_info()
         assert is_prefill is False
         assert n == 1
         assert num_reqs == 1
+
+
+# ── ScheduledBatch: PD consumer first decode primed with T0 + drafts (MTP) ──
+
+
+class TestScheduledBatchPDFirstDecodeMTP:
+
+    def test_first_decode_slices_t0_then_drafts(self):
+        mtp_k = 3
+        prompt_tok, t0 = 6366, 14
+        drafts = [101, 102, 103]  # mtp_k transferred drafts
+        seq = Sequence([prompt_tok], block_size=16)  # 1-token prompt
+        seq.append_token(t0)  # injected T0
+        for d in drafts:  # primed drafts
+            seq.append_token(d)
+        seq.type = SequenceType.DECODE
+        assert seq.num_tokens == 1 + 1 + mtp_k  # prompt + T0 + drafts
+
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+
+        assert list(batch.scheduled_tokens) == [t0, *drafts]
+
+    def test_normal_decode_window_unchanged(self):
+        """offset >= 0 path is byte-for-byte the trailing mtp_k+1 slice."""
+        mtp_k = 3
+        toks = list(range(100, 110))  # 10 tokens, ample context
+        seq = Sequence(toks[:6], block_size=16)
+        for t in toks[6:]:
+            seq.append_token(t)
+        seq.type = SequenceType.DECODE
+
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+
+        assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]

@@ -63,39 +63,45 @@ jobs:
             -filter-mode=diff_context \
             -fail-on-error=true
 
-  upload-success-artifact:
-    name: Upload Success Signal
+  validate-catalog:
+    name: Validate accuracy catalogs against schema
     runs-on: ubuntu-latest
-    needs: [black, ruff]
-    if: ${{ needs.black.result == 'success' && needs.ruff.result == 'success' }}
     steps:
-      - name: Create success signal file
-        run: echo "success" > checks_signal.txt
-
-      - name: Upload success artifact
-        uses: actions/upload-artifact@v4
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Python environment
+        uses: actions/setup-python@v6
         with:
-          name: checks-signal-${{ github.sha }}
-          path: checks_signal.txt
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip3 install jsonschema
+      - name: Validate catalogs
+        run: python3 .github/scripts/validate_catalog.py
 
-  upload-failure-artifact:
-    name: Upload Failure Signal
+  unit-tests:
+    name: Run non-GPU unit tests
     runs-on: ubuntu-latest
-    needs: [black, ruff]
-    if: ${{ always() && (needs.black.result != 'success' || needs.ruff.result != 'success') }}
     steps:
-      - name: Create failure signal file with failed jobs
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs full history/tags for versioning
+      - name: Set up Python environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
         run: |
-          echo "failure" > checks_signal.txt
-          if [ "${{ needs.black.result }}" != "success" ]; then
-            echo "FAILED: black (${{ needs.black.result }})" >> checks_signal.txt
-          fi
-          if [ "${{ needs.ruff.result }}" != "success" ]; then
-            echo "FAILED: ruff (${{ needs.ruff.result }})" >> checks_signal.txt
-          fi
-
-      - name: Upload failure artifact
-        uses: actions/upload-artifact@v4
+          pip3 install torch --index-url https://download.pytorch.org/whl/cpu
+          pip3 install -e .
+          pip3 install pytest msgpack quart
+      - name: Run unit tests
+        env:
+          UNIT_TEST_REPORT: unit-report.xml
+        run: bash .github/scripts/run_unit_tests.sh
+      - name: Upload JUnit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
         with:
-          name: checks-signal-${{ github.sha }}
-          path: checks_signal.txt
+          name: unit-test-report
+          path: unit-report.xml

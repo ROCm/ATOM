@@ -11,6 +11,13 @@ from transformers import DeepseekV3Config
 from transformers.configuration_utils import PretrainedConfig
 
 
+def _first_non_none(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 class KimiK25VisionConfig(PretrainedConfig):
     model_type = "kimi_k25_vision"
 
@@ -22,10 +29,10 @@ class KimiK25VisionConfig(PretrainedConfig):
         init_pos_emb_width: int = 64,
         init_pos_emb_time: int = 4,
         pos_emb_type: str = "divided_fixed",
-        num_attention_heads: int = 16,
-        num_hidden_layers: int = 27,
-        hidden_size: int = 1152,
-        intermediate_size: int = 4304,
+        num_attention_heads: int | None = None,
+        num_hidden_layers: int | None = None,
+        hidden_size: int | None = None,
+        intermediate_size: int | None = None,
         merge_kernel_size: tuple[int, int] = (2, 2),
         video_attn_type: str = "spatial_temporal",
         merge_type: str = "sd2_tpool",
@@ -34,9 +41,23 @@ class KimiK25VisionConfig(PretrainedConfig):
         mm_hidden_size: int | None = None,
         projector_hidden_act: str = "gelu",
         projector_ln_eps: float = 1e-5,
+        # moonshotai/Kimi-K2.5 remote-code field names
+        vt_num_attention_heads: int | None = None,
+        vt_num_hidden_layers: int | None = None,
+        vt_hidden_size: int | None = None,
+        vt_intermediate_size: int | None = None,
+        text_hidden_size: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        num_attention_heads = _first_non_none(
+            num_attention_heads, vt_num_attention_heads, 16
+        )
+        num_hidden_layers = _first_non_none(num_hidden_layers, vt_num_hidden_layers, 27)
+        hidden_size = _first_non_none(hidden_size, vt_hidden_size, 1152)
+        intermediate_size = _first_non_none(
+            intermediate_size, vt_intermediate_size, 4304
+        )
         # Vision Tower
         self.patch_size = patch_size
         self.init_pos_emb_height = init_pos_emb_height
@@ -47,6 +68,11 @@ class KimiK25VisionConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        # Preserve the repo-specific aliases so either schema can be consumed.
+        self.vt_num_attention_heads = num_attention_heads
+        self.vt_num_hidden_layers = num_hidden_layers
+        self.vt_hidden_size = hidden_size
+        self.vt_intermediate_size = intermediate_size
         self.merge_kernel_size = merge_kernel_size
         self.video_attn_type = video_attn_type
         self.merge_type = merge_type
@@ -58,6 +84,25 @@ class KimiK25VisionConfig(PretrainedConfig):
             self.mm_hidden_size = hidden_size
         self.projector_hidden_act = projector_hidden_act
         self.projector_ln_eps = projector_ln_eps
+        if text_hidden_size is not None:
+            self.text_hidden_size = text_hidden_size
+
+    @classmethod
+    def from_remote_config(
+        cls,
+        vision_config: dict | PretrainedConfig | None,
+    ) -> "KimiK25VisionConfig":
+        if vision_config is None:
+            return cls()
+        if isinstance(vision_config, cls):
+            return vision_config
+        if isinstance(vision_config, dict):
+            config_dict = dict(vision_config)
+        elif hasattr(vision_config, "to_dict"):
+            config_dict = dict(vision_config.to_dict())
+        else:
+            config_dict = dict(vars(vision_config))
+        return cls(**config_dict)
 
 
 class KimiK25Config(PretrainedConfig):
@@ -89,11 +134,7 @@ class KimiK25Config(PretrainedConfig):
         **kwargs,
     ):
         # Vision config
-        if vision_config is None:
-            vision_config = KimiK25VisionConfig()
-        elif isinstance(vision_config, dict):
-            vision_config = KimiK25VisionConfig(**vision_config)
-        self.vision_config: KimiK25VisionConfig = vision_config
+        self.vision_config = KimiK25VisionConfig.from_remote_config(vision_config)
 
         # Text config
         if text_config is None:
@@ -105,6 +146,8 @@ class KimiK25Config(PretrainedConfig):
         # Set mm_hidden_size to text hidden size if not explicitly set
         if self.vision_config.mm_hidden_size == self.vision_config.hidden_size:
             self.vision_config.mm_hidden_size = self.text_config.hidden_size
+        if getattr(self.vision_config, "text_hidden_size", None) is None:
+            self.vision_config.text_hidden_size = self.text_config.hidden_size
 
         # Other config
         self.ignore_index = ignore_index

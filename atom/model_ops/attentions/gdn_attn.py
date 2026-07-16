@@ -526,6 +526,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         bs: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        positions: torch.Tensor,  # [total_tokens] int32
         only_update: bool = False,
         num_reject_tokens=None,
     ):
@@ -567,11 +568,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],
             max_seqlen_k=self.model_runner.config.max_model_len,
-            block_tables_converted=(
-                var["block_tables_converted"].gpu[:bs]
-                if "block_tables_converted" in var
-                else None
-            ),
             **ctx_pa_ps,
         )
 
