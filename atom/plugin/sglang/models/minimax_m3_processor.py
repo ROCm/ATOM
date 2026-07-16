@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 try:
-    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+    from sglang.srt.managers.schedule_batch import Modality
+    from sglang.srt.multimodal.processors.transformers_auto import (
+        TransformersAutoMultimodalProcessor,
+    )
 except Exception:
-    BaseMultimodalProcessor = object
+    Modality = None
+    TransformersAutoMultimodalProcessor = object
 
 
 class MiniMaxM3SparseForCausalLM:
@@ -16,66 +20,55 @@ class MiniMaxM3SparseForConditionalGeneration:
     pass
 
 
-class MiniMaxM3TextOnlyProcessor(BaseMultimodalProcessor):
-    """SGLang processor placeholder for text-only MiniMax-M3 serving."""
+class MiniMaxM3TextOnlyProcessor(TransformersAutoMultimodalProcessor):
+    """Use SGLang's generic HF processor path for MiniMax-M3 inputs."""
 
     models = [MiniMaxM3SparseForCausalLM, MiniMaxM3SparseForConditionalGeneration]
+    supports_transformers_backend = True
 
-    @staticmethod
-    def _has_multimodal_payload(value) -> bool:
-        if value is None:
-            return False
-        if isinstance(value, (str, bytes)):
-            return bool(value)
-        if isinstance(value, dict):
-            return any(
-                MiniMaxM3TextOnlyProcessor._has_multimodal_payload(v)
-                for v in value.values()
-            )
-        if isinstance(value, (list, tuple)):
-            return any(
-                MiniMaxM3TextOnlyProcessor._has_multimodal_payload(item)
-                for item in value
-            )
-        return bool(value)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for processor_name in ("image_processor", "video_processor"):
+            processor = getattr(self._processor, processor_name, None)
+            default_resample = getattr(processor, "resample", None)
+            preprocess = getattr(processor, "_preprocess", None)
+            if (
+                processor is None
+                or default_resample is None
+                or preprocess is None
+                or getattr(processor, "_atom_resample_patched", False)
+            ):
+                continue
 
-    @classmethod
-    def _reject_multimodal_inputs(
-        cls, image_data=None, audio_data=None, video_data=None
-    ):
-        if (
-            cls._has_multimodal_payload(image_data)
-            or cls._has_multimodal_payload(audio_data)
-            or cls._has_multimodal_payload(video_data)
-        ):
-            raise ValueError(
-                "ATOM SGLang MiniMax-M3 plugin currently supports text-only "
-                "serving; multimodal inputs are not supported."
-            )
+            def _preprocess_with_resample(
+                *args,
+                _preprocess=preprocess,
+                _default_resample=default_resample,
+                **kwargs,
+            ):
+                kwargs.setdefault("resample", _default_resample)
+                return _preprocess(*args, **kwargs)
 
-    def process_mm_data(
-        self,
-        input_text,
-        images=None,
-        videos=None,
-        audios=None,
-        **kwargs,
-    ) -> dict:
-        del input_text, kwargs
-        self._reject_multimodal_inputs(images, audios, videos)
-        return {}
+            processor._preprocess = _preprocess_with_resample
+            processor._atom_resample_patched = True
 
-    async def process_mm_data_async(
-        self,
-        image_data,
-        audio_data,
-        input_text,
-        request_obj,
-        **kwargs,
-    ):
-        del input_text, request_obj, kwargs
-        self._reject_multimodal_inputs(image_data, audio_data)
-        return {}
+    def _build_mm_items(self, processor_output: dict, input_ids):
+        items = self.collect_mm_items_from_processor_output(processor_output)
+
+        modality_to_token_id = {
+            Modality.IMAGE: self.mm_tokens.image_token_id,
+            Modality.VIDEO: self.mm_tokens.video_token_id,
+            Modality.AUDIO: self.mm_tokens.audio_token_id,
+        }
+        if hasattr(Modality, "MULTI_IMAGES"):
+            modality_to_token_id[Modality.MULTI_IMAGES] = self.mm_tokens.image_token_id
+
+        for item in items:
+            token_id = modality_to_token_id.get(item.modality)
+            if token_id is not None:
+                item.offsets = self.get_mm_items_offset(input_ids, token_id)
+
+        return items
 
 
 def register_minimax_m3_text_only_processor() -> None:
