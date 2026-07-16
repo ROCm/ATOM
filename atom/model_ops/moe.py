@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from functools import lru_cache
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
