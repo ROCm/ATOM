@@ -868,6 +868,11 @@ class ModelRunner:
                 dp_gather_scatter=dp_gather_scatter,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
+        # forward_vars is now fully populated (runner + attn builder + any V4/TBO
+        # buffers, all allocated in the builder ctor above). Build the
+        # per-in-flight-slot ring so concurrent pipeline microbatches don't share
+        # metadata staging buffers.
+        self._init_forward_vars_ring()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self.warmup_model()
@@ -1449,6 +1454,93 @@ class ModelRunner:
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
             )
+
+    def _init_forward_vars_ring(self):
+        """Build a ring of independent ``forward_vars`` copies, one per possible
+        in-flight pipeline microbatch.
+
+        Under chunked pipeline parallelism the head launches up to ``pp_size``
+        forwards back-to-back without a GPU sync (``pp_engine_core`` /
+        ``call_func(wait_out=True)`` only waits for the CPU return). All
+        per-forward attention metadata lives in a single reused set of
+        ``forward_vars`` buffers, so microbatch N+1's ``prepare_inputs`` would
+        overwrite the staging buffers microbatch N's kernels are still reading
+        -> cross-microbatch corruption -> GPU memory fault.
+
+        Giving each in-flight slot its own buffer set fixes this. Reuse of a
+        slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
+        ``_record_forward_vars_event``): before overwriting slot k the host
+        blocks until slot k's previous forward has finished consuming it on the
+        GPU. This bounds how far the CPU may race ahead to exactly the ring size
+        regardless of how the head collects — necessary because the head pops
+        non-output (middle prefill chunk) batches without any GPU confirmation
+        (``pp_engine_core._pp_head_step``), so the ``< pp_size`` in-flight gate
+        alone does NOT bound GPU lead. ``pp_size`` slots keep the event a no-op
+        in the balanced case (the slot's prior forward is already done on wrap).
+
+        When ``pp_size == 1`` (all non-PP paths, incl. the decode consumer and
+        cudagraph capture) the ring is the single original dict and advance is a
+        no-op, so behavior is unchanged.
+        """
+        pp_size = self.config.pipeline_parallel_size
+        self._fv_idx = 0
+        if pp_size <= 1:
+            self._fv_ring = [self.forward_vars]
+            self._fv_slot_events = None
+            return
+
+        # CUDAGraph replay binds to fixed buffer addresses captured on slot 0;
+        # swapping slots per forward would desync replay from the metadata the
+        # model reads. PP under this engine is eager (--level 0 / --enforce-eager)
+        # so capture never runs; enforce that invariant rather than corrupt
+        # silently if someone enables graphs with PP.
+        assert self.enforce_eager, (
+            "pipeline_parallel_size > 1 requires eager execution "
+            "(--enforce-eager / --level 0): the forward_vars ring swaps metadata "
+            "buffers per microbatch, which is incompatible with CUDAGraph replay."
+        )
+
+        def _clone_slot(src: dict) -> dict:
+            # Only CpuGpuBuffers are per-forward host-pinned staging buffers that
+            # get overwritten each forward. Everything else (the eager `outputs`
+            # tensor, scalar `mtp_k`, ...) is either unused on the eager PP path
+            # or immutable, so share it by reference.
+            return {
+                k: (v.clone() if isinstance(v, CpuGpuBuffer) else v)
+                for k, v in src.items()
+            }
+
+        self._fv_ring = [self.forward_vars] + [
+            _clone_slot(self.forward_vars) for _ in range(pp_size - 1)
+        ]
+        # One event per slot, marking completion of the last forward that used
+        # it. Fresh (never-recorded) events synchronize immediately, so the
+        # first pass over the ring is unthrottled.
+        self._fv_slot_events = [torch.cuda.Event() for _ in range(pp_size)]
+        logger.info(f"forward_vars ring: {pp_size} slots (pipeline parallel)")
+
+    def _advance_forward_vars(self):
+        """Rotate to the next in-flight slot. Called once per real forward,
+        before any buffer is written. No-op when the ring has a single slot."""
+        if len(self._fv_ring) == 1:
+            return
+        self._fv_idx = (self._fv_idx + 1) % len(self._fv_ring)
+        # Block until this slot's previous forward finished reading it on the
+        # GPU before we overwrite its host-pinned staging buffers. No-op unless
+        # the CPU has raced > ring-size forwards ahead of the GPU.
+        self._fv_slot_events[self._fv_idx].synchronize()
+        self.forward_vars = self._fv_ring[self._fv_idx]
+        # `input_ids` is the one forward_vars buffer aliased outside the dict
+        # (tokenID_processor writes into it directly); repoint it at this slot.
+        self.tokenID_processor.input_ids = self.forward_vars["input_ids"]
+
+    def _record_forward_vars_event(self):
+        """Mark the current slot's forward as done on the GPU stream. Paired
+        with the synchronize() in ``_advance_forward_vars``. Called at the end of
+        every real forward. No-op when the ring has a single slot."""
+        if len(self._fv_ring) == 1:
+            return
+        self._fv_slot_events[self._fv_idx].record()
 
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
@@ -3299,6 +3391,11 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        # Rotate to this microbatch's own metadata slot before any buffer is
+        # written (prepare_model/prepare_inputs). Keeps pipeline microbatches
+        # from sharing staging buffers under CPP. No-op unless pp_size > 1.
+        if not batch.is_dummy_run:
+            self._advance_forward_vars()
         (
             input_ids,
             temperatures,
@@ -3314,6 +3411,9 @@ class ModelRunner:
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
         if pp_non_last or self._is_pure_middle_chunk(batch):
             reset_forward_context()
+            # Mark this slot's GPU work (attention consumed its metadata) done.
+            if not batch.is_dummy_run:
+                self._record_forward_vars_event()
             return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
@@ -3332,7 +3432,8 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
-
+        if not batch.is_dummy_run:
+            self._record_forward_vars_event()
         return fwd_output
 
     @staticmethod
