@@ -66,6 +66,12 @@ if [[ -n "${DECODE_EXTRA_SERVER_ARGS}" ]]; then
   DECODE_SERVER_ARGS="${DECODE_SERVER_ARGS:+${DECODE_SERVER_ARGS} }${DECODE_EXTRA_SERVER_ARGS}"
 fi
 
+has_cli_flag() {
+  local args="$1"
+  local flag="$2"
+  [[ " ${args} " == *" ${flag} "* ]]
+}
+
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
 CONC_LIST="${CONC_LIST:-4,8}"
@@ -229,6 +235,28 @@ decode_cudagraph_args=()
 build_cudagraph_args "${PREFILL_CUDAGRAPH:-}" prefill_cudagraph_args
 build_cudagraph_args "${DECODE_CUDAGRAPH:-}" decode_cudagraph_args
 
+build_server_cache_env() {
+  local role="$1"
+  local server_port="$2"
+  local -n out="$3"
+  local cache_base cache_root
+
+  cache_base="${ATOMESH_WORKER_CACHE_BASE:-${XDG_CACHE_HOME:-/tmp/atomesh-cache-${SLURM_JOB_ID:-local}-${NODE_RANK}}/workers}"
+  cache_root="${cache_base}/${role}-${server_port}"
+  mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
+
+  out=(
+    "HOME=${cache_root}/home"
+    "XDG_CACHE_HOME=${cache_root}/xdg"
+    "TORCHINDUCTOR_CACHE_DIR=${cache_root}/torchinductor"
+    "TRITON_CACHE_DIR=${cache_root}/triton"
+    "AITER_CACHE_DIR=${cache_root}/aiter"
+    "AITER_JIT_DIR=${cache_root}/aiter/jit"
+    "FLYDSL_RUNTIME_CACHE_DIR=${cache_root}/flydsl"
+  )
+  echo "[runtime] ${role} cache root=${cache_root} (port=${server_port})"
+}
+
 server_common=(
   --model "${MODEL_PATH}"
   --host 0.0.0.0
@@ -315,6 +343,59 @@ wait_router_closed() {
   echo "[wait][OK] router closed"
 }
 
+start_logged_process() {
+  local pid_var="$1"
+  local log_file="$2"
+  shift 2
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" > >(tee "${log_file}") 2>&1 &
+  else
+    "$@" > >(tee "${log_file}") 2>&1 &
+  fi
+  printf -v "${pid_var}" '%s' "$!"
+}
+
+process_is_running() {
+  local pid="$1"
+  local state
+
+  if [[ -r "/proc/${pid}/stat" ]]; then
+    state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
+    [[ -n "${state}" && "${state}" != "Z" ]]
+    return
+  fi
+
+  kill -0 "${pid}" 2>/dev/null
+}
+
+terminate_process_group() {
+  local pid="${1:-}"
+  local deadline
+
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 0
+  process_is_running "${pid}" || return 0
+
+  kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+  deadline=$(( $(date +%s) + 20 ))
+  while process_is_running "${pid}" && [[ "$(date +%s)" -lt "${deadline}" ]]; do
+    sleep 1
+  done
+  if process_is_running "${pid}"; then
+    kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+  fi
+  wait "${pid}" 2>/dev/null || true
+}
+
+cleanup_processes() {
+  local rc=$?
+  local pid
+  for pid in "$@"; do
+    terminate_process_group "${pid}"
+  done
+  return "${rc}"
+}
+
 write_metadata() {
   cat > "${RUN_DIR}/metadata-rank-${NODE_RANK}.json" <<EOF
 {
@@ -340,6 +421,8 @@ start_prefill() {
   local server_port="${2:-${PREFILL_PORT}}"
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  local -a prefill_cache_env=()
+  build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -352,8 +435,7 @@ start_prefill() {
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  "${prefill_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
-  server_pid=$!
+  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -369,6 +451,8 @@ start_decode() {
   if [[ "${ISL_LIST}" == "1024" && "${OSL}" == "1024" ]]; then
     decode_max_num_seqs="${max_conc}"
   fi
+  local -a decode_cache_env=()
+  build_server_cache_env "decode" "${server_port}" decode_cache_env
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} cudagraph=${DECODE_CUDAGRAPH:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -381,12 +465,28 @@ start_decode() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
-  "${decode_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
-  server_pid=$!
+  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${decode_cache_env[@]}" "${decode_cmd[@]}"
 }
 
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
+  case "${ATOM_PD_RANK_MAPPING_POLICY}" in
+    none|idx2idx) ;;
+    *)
+      echo "[router][FAIL] invalid ATOM_PD_RANK_MAPPING_POLICY=${ATOM_PD_RANK_MAPPING_POLICY}" >&2
+      exit 1
+      ;;
+  esac
+
+  local -a router_rank_mapping_args=()
+  if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]] \
+    && has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
+    && has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"; then
+    router_rank_mapping_args=(
+      --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"
+      --dp-aware
+    )
+  fi
   local -a router_cmd=(
     /usr/local/bin/atomesh launch
     --host 0.0.0.0
@@ -395,14 +495,14 @@ start_router() {
     "${prefill_args[@]}"
     "${decode_args[@]}"
     --policy "${ROUTER_POLICY}"
+    "${router_rank_mapping_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker
     --prometheus-port "${PROMETHEUS_PORT}"
   )
   dump_launch_info "ROUTER" "${router_cmd[@]}"
-  "${router_cmd[@]}" 2>&1 | tee "${RUN_DIR}/logs/router.log" &
-  router_pid=$!
+  start_logged_process router_pid "${RUN_DIR}/logs/router.log" "${router_cmd[@]}"
 }
 
 run_benchmark() {
@@ -533,7 +633,7 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pid="${server_pid}"
   start_decode
   decode_pid="${server_pid}"
-  trap 'kill ${router_pid:-0} ${prefill_pid:-0} ${decode_pid:-0} 2>/dev/null || true' EXIT
+  trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   for ip in "${prefill_ips[@]}"; do
     wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
   done
@@ -544,7 +644,7 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_eval
   run_benchmark
-  kill "${router_pid}" "${prefill_pid}" "${decode_pid}" 2>/dev/null || true
+  cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
   for idx in $(seq 0 $((xP - 1))); do
@@ -556,7 +656,7 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
     start_prefill "prefill-rank-0-worker-${idx}" "${prefill_port}" "${handshake_port}"
     prefill_pids+=("${server_pid}")
   done
-  trap 'kill ${router_pid:-0} ${prefill_pids[*]:-} 2>/dev/null || true' EXIT
+  trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
   for idx in "${!prefill_ips[@]}"; do
     wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
@@ -571,10 +671,10 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_eval
   run_benchmark
-  kill "${router_pid}" "${prefill_pids[@]}" 2>/dev/null || true
+  cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
   start_prefill "prefill-rank-0"
-  trap 'kill ${router_pid:-0} ${server_pid:-0} 2>/dev/null || true' EXIT
+  trap 'cleanup_processes ${router_pid:-} ${server_pid:-}' EXIT
   for idx in "${!prefill_ips[@]}"; do
     wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
@@ -600,26 +700,26 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
     start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_port}"
     decode_pids+=("${server_pid}")
   done
-  trap 'kill ${decode_pids[*]:-} 2>/dev/null || true' EXIT
+  trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
   wait_router_closed
-  kill "${decode_pids[@]}" 2>/dev/null || true
+  cleanup_processes "${decode_pids[@]}"
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   start_decode
-  trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
+  trap 'cleanup_processes ${server_pid:-}' EXIT
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
-  kill "${server_pid}" 2>/dev/null || true
+  cleanup_processes "${server_pid}"
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
   start_prefill "prefill-rank-${NODE_RANK}"
-  trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
+  trap 'cleanup_processes ${server_pid:-}' EXIT
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
-  kill "${server_pid}" 2>/dev/null || true
+  cleanup_processes "${server_pid}"
 else
   start_decode
-  trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
+  trap 'cleanup_processes ${server_pid:-}' EXIT
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
-  kill "${server_pid}" 2>/dev/null || true
+  cleanup_processes "${server_pid}"
 fi

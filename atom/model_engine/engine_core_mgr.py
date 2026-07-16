@@ -460,6 +460,18 @@ class CoreManager:
                 copy=False,
             )
 
+    def abort_request(self, req_id):
+        """Tell the engine core(s) to drop a request (client disconnected).
+
+        Broadcast to every DP rank (only the one holding ``req_id`` acts). The
+        scheduler finishes the seq at its next step via the normal stop path,
+        freeing its KV blocks. Fire-and-forget; safe if the seq already finished.
+        """
+        try:
+            self.broadcast_utility_command("abort_request", req_id=req_id)
+        except Exception as e:
+            logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
+
     def broadcast_utility_command(self, cmd: str, **kwargs):
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)

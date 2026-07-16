@@ -231,26 +231,20 @@ class WeightUpdaterMixin:
         quant_type = getattr(module, "quant_type", None)
 
         if quant_type is not None and quant_type.value == _QT.per_1x128.value:
-            N, K = tensor_gpu.shape
-            block_k = 128
-            K_blocks = (K + block_k - 1) // block_k
-            if K % block_k != 0:
-                padded = torch.zeros(
-                    N, K_blocks * block_k, dtype=torch.float32, device=self.device
-                )
-                padded[:, :K] = tensor_gpu
-            else:
-                padded = tensor_gpu
-            blocks = padded.reshape(N, K_blocks, block_k)
-            block_amax = blocks.abs().amax(dim=-1)
-            scale = (block_amax / fp8_max).clamp(min=1e-12)
-            quantized = (blocks / scale.unsqueeze(-1)).to(fp8_dtype)
-            quantized = quantized.reshape(N, K_blocks * block_k)[:, :K].contiguous()
-            param.data.copy_(quantized)
-            ws = weight_scale.data
-            weight_scale.data.copy_(
-                scale[: ws.shape[0], : ws.shape[1]].contiguous().to(ws.dtype)
+            # Must match the load-time online_quantize_weight layout: a true
+            # 128x128 block scale of shape (N//128, K//128). The previous code
+            # produced a 1x128-along-K scale (N, K//128) and sliced it into the
+            # (N//128, K//128) buffer, which is inconsistent with the blockscale
+            # GEMM and collapses generation after the first weight update.
+            from atom.quantization.quark.utils import (
+                quantize_weight_to_fp8_128x128_blockscale,
             )
+
+            q_weight, scale = quantize_weight_to_fp8_128x128_blockscale(
+                tensor_gpu, fp8_dtype
+            )
+            param.data.copy_(q_weight)
+            weight_scale.data.copy_(scale.to(weight_scale.dtype))
 
         elif quant_type is not None and quant_type.value == _QT.per_Tensor.value:
             amax = tensor_gpu.abs().max()

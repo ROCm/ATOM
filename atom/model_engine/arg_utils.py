@@ -115,7 +115,9 @@ class EngineArgs:
             help="Engine internal port",
         )
         parser.add_argument(
+            "--kv-cache-dtype",
             "--kv_cache_dtype",
+            dest="kv_cache_dtype",
             choices=["bf16", "fp8"],
             type=str,
             default="bf16",
