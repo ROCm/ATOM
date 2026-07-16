@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
+from functools import lru_cache
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
@@ -116,7 +117,7 @@ def init_balance_router_logits(
     # included).
     device = "cuda"
     E = n_routed_experts
-    if ep_size <= 1:
+    if True:
         # No EP: rank-balance is trivial; keep pure expert-balance via a rolling
         # window of topk consecutive experts per token.
         stride = E + topk

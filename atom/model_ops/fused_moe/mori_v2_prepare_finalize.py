@@ -20,8 +20,6 @@ topk_ids carry only routed expert ids and mori routes them cleanly.
 """
 
 import logging
-import os
-import sys
 from functools import lru_cache
 from typing import Any
 
@@ -46,9 +44,7 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger("atom")
 
-# Populated lazily by _import_v2(); the v2 module is test-only packaged and its
-# internal imports (``from intranode_kernels import ...``) require its own
-# directory on sys.path.
+# Populated lazily by _import_v2() from mori.ops.dispatch_combine_v2.
 EpDispatchCombineConfig = None
 EpDispatchCombineOp = None
 _V2_IMPORTED = False
@@ -60,12 +56,7 @@ def _import_v2() -> None:
         return
     if not MORI_AVAILABLE:
         raise ImportError("mori is required for MoriV2PrepareAndFinalize")
-    v2_dir = os.path.join(
-        os.path.dirname(mori.__file__), "ops", "dispatch_combine_v2"
-    )
-    if v2_dir not in sys.path:
-        sys.path.insert(0, v2_dir)
-    from dispatch_combine_op import (  # type: ignore  # noqa: E402
+    from mori.ops.dispatch_combine_v2.dispatch_combine_op import (  # type: ignore
         EpDispatchCombineConfig as _Cfg,
         EpDispatchCombineOp as _Op,
     )
