@@ -61,22 +61,30 @@ def _swa_write_kernel(
     kv_ptr,  # [T, head_dim]
     positions_ptr,  # [T] int — full positions
     cu_seqlens_q_ptr,  # [bs+1] int — per-seq cumulative seqlens
-    state_slot_per_seq_ptr,  # [bs] int — state_slot_mapping_gpu_i32
-    swa_kv_ptr,  # [num_slots, cache_size, head_dim]
-    swa_kv_slot_stride: tl.constexpr,  # = cache_size * head_dim
-    swa_kv_pos_stride: tl.constexpr,  # = head_dim
-    head_dim: tl.constexpr,
-    cache_size: tl.constexpr,
+    block_tables_ptr,  # [bs, max_blocks_per_seq] int32 — logical→physical
+    block_tables_stride,  # = max_blocks_per_seq (row stride)
+    swa_region_ptr,  # [num_pages, head_dim] flat SWA region of unified_kv
+    swa_region_row_stride,  # = head_dim
+    head_dim,
+    block_size,
     WRITE_PER_BATCH: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """2D grid `(bs, WRITE_PER_BATCH)`. Program `(b, r)` writes the `r`-th
-    of the last-N tokens of seq `b`, where `N = min(tok_n_b, WRITE_PER_BATCH)`
-    and `tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`. Threads with
-    `r >= N` bail.
+    """paged-SWA write. 2D grid `(bs, WRITE_PER_BATCH)`. Program `(b, r)`
+    writes the `r`-th of the last-N tokens of seq `b`, where
+    `N = min(tok_n_b, WRITE_PER_BATCH)` and
+    `tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`. Threads with `r >= N` bail.
 
     `src_id = cu_seqlens_q[b+1] - N + r` — selects directly from `kv` /
     `positions` with NO shared GPU index buffer (no DMA race window).
+
+    The destination is content-addressed by `block_tables` (same physical
+    block id the compressed cache uses), so a cross-request prefix-cache hit
+    reads the original request's SWA from the cached physical block instead of
+    a stale per-request ring (issue #1417):
+        blk      = pos // block_size
+        phys     = block_tables[b, blk]
+        dst_row  = phys * block_size + (pos % block_size)
     """
     batch_idx = tl.program_id(0)
     row_in_batch = tl.program_id(1)
@@ -92,9 +100,10 @@ def _swa_write_kernel(
 
     src_id = cu_end - write_n + row_in_batch
 
-    slot = tl.load(state_slot_per_seq_ptr + batch_idx)
     pos = tl.load(positions_ptr + src_id)
-    ring_idx = pos % cache_size
+    blk = pos // block_size
+    phys = tl.load(block_tables_ptr + batch_idx * block_tables_stride + blk)
+    dst_row = phys * block_size + (pos % block_size)
 
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < head_dim
@@ -103,12 +112,7 @@ def _swa_write_kernel(
         kv_ptr + src_id * head_dim + d_offsets,
         mask=d_mask,
     )
-    dst = (
-        swa_kv_ptr
-        + slot * swa_kv_slot_stride
-        + ring_idx * swa_kv_pos_stride
-        + d_offsets
-    )
+    dst = swa_region_ptr + dst_row * swa_region_row_stride + d_offsets
     tl.store(dst, src, mask=d_mask)
 
 
@@ -116,45 +120,47 @@ def swa_write(
     kv: torch.Tensor,
     positions: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    state_slot_per_seq: torch.Tensor,
-    swa_kv: torch.Tensor,
-    cache_size: int,
+    block_tables: torch.Tensor,
+    swa_region: torch.Tensor,
+    block_size: int,
     write_per_batch: int,
 ) -> None:
-    """In-place write `swa_kv[state_slot_per_seq[b], pos % cache_size, :] = kv[r, :]`
-    for the last `min(tok_n_b, write_per_batch)` tokens of every seq
-    `b ∈ [0, bs)` this fwd, where `tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`.
-    `bs = state_slot_per_seq.shape[0]`.
+    """paged-SWA in-place write. For the last
+    `min(tok_n_b, write_per_batch)` tokens of every seq `b ∈ [0, bs)` this fwd
+    (`tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`, `bs = block_tables.shape[0]`),
+    write `kv[r]` to the content-addressed SWA region:
+        swa_region[block_tables[b, pos//block_size] * block_size
+                   + pos % block_size, :] = kv[r, :]
 
-    The kernel derives `r` from `cu_seqlens_q` diff inside the kernel,
-    eliminating the prior `write_indices` GPU staging buffer (which had a DMA
-    tearing race when its CPU mirror was rewritten by the next fwd before
-    the H2D for the current fwd had completed; see `_swa_write_kernel` doc).
+    Replaces the per-request ring (`swa_kv[slot, pos % cache_size]`). The
+    physical block id is the SAME one the compressed cache uses, so a
+    cross-request prefix-cache hit reads the original request's SWA from the
+    cached block instead of a stale ring (issue #1417).
 
     Args:
         kv: [T, head_dim] per-fwd KV (BF16). `T = cu_seqlens_q[bs]`.
         positions: [T'] int — full forward_vars["positions"] (`T' >= T`).
-        cu_seqlens_q: [bs+1] int — exact size (`bs == state_slot_per_seq.shape[0]`).
-        state_slot_per_seq: [bs] int — per-seq state cache slot. Its
-            `shape[0]` is the grid X dim and source-of-truth for `bs`.
-        swa_kv: [num_slots, cache_size, head_dim] ring buffer.
-        cache_size: ring-slot count = `window_size + max_spec_steps`.
-        write_per_batch: `min(max_q_len, cache_size)` — max tokens written
-            per seq this fwd (grid y dim, kernel `constexpr`).
+        cu_seqlens_q: [bs+1] int — exact size (`bs == block_tables.shape[0]`).
+        block_tables: [bs, max_blocks_per_seq] int32 — logical→physical block.
+            Its `shape[0]` is the grid X dim and source-of-truth for `bs`.
+        swa_region: [num_pages, head_dim] flat SWA region of `unified_kv`
+            (= `unified_kv[:swa_pages]`), `num_pages = num_blocks * block_size`.
+        block_size: tokens per block (= V4 block_size, 128).
+        write_per_batch: `min(max_q_len, block_size_window)` — max tokens
+            written per seq this fwd (grid y dim, kernel `constexpr`).
     """
     assert kv.dim() == 2, f"kv must be [T, D], got {kv.shape}"
     assert positions.dim() == 1
-    assert state_slot_per_seq.dim() == 1
-    bs = state_slot_per_seq.shape[0]
+    assert (
+        block_tables.dim() == 2
+    ), f"block_tables must be [bs, MB], got {block_tables.shape}"
+    bs = block_tables.shape[0]
     assert cu_seqlens_q.dim() == 1 and cu_seqlens_q.shape[0] >= bs + 1
-    assert swa_kv.dim() == 3, f"swa_kv must be [S, C, D], got {swa_kv.shape}"
+    assert swa_region.dim() == 2, f"swa_region must be [P, D], got {swa_region.shape}"
     T, head_dim = kv.shape
     assert positions.shape[0] >= T, f"positions {positions.shape[0]} < kv T={T}"
-    assert (
-        swa_kv.shape[1] == cache_size
-    ), f"swa_kv ring dim {swa_kv.shape[1]} != cache_size {cache_size}"
-    assert swa_kv.shape[2] == head_dim
-    assert kv.is_contiguous() and swa_kv.is_contiguous()
+    assert swa_region.shape[1] == head_dim
+    assert kv.is_contiguous() and swa_region.is_contiguous()
     assert (
         bs > 0 and write_per_batch > 0
     ), f"bs={bs}, write_per_batch={write_per_batch} must be positive"
@@ -168,12 +174,12 @@ def swa_write(
         kv,
         positions,
         cu_seqlens_q,
-        state_slot_per_seq,
-        swa_kv,
-        swa_kv.stride(0),
-        swa_kv.stride(1),
+        block_tables,
+        block_tables.stride(0),
+        swa_region,
+        swa_region.stride(0),
         head_dim,
-        cache_size,
+        block_size,
         WRITE_PER_BATCH=write_per_batch,
         BLOCK_D=BLOCK_D,
     )
@@ -183,20 +189,20 @@ def swa_write_reference(
     kv: torch.Tensor,
     positions: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    state_slot_per_seq: torch.Tensor,
-    swa_kv: torch.Tensor,
-    cache_size: int,
+    block_tables: torch.Tensor,
+    swa_region: torch.Tensor,
+    block_size: int,
     write_per_batch: int,
 ) -> None:
-    """Pure-PyTorch reference equivalent of `swa_write`. For tests / dump-bisect.
+    """Pure-PyTorch reference equivalent of `swa_write` (paged). For tests.
 
     Mirrors the kernel: for each seq `b ∈ [0, bs)`
-    (`bs = state_slot_per_seq.shape[0]`), take the last
+    (`bs = block_tables.shape[0]`), take the last
     `min(cu_seqlens_q[b+1] - cu_seqlens_q[b], write_per_batch)` rows of `kv`
-    for that seq (via `cu_seqlens_q[b+1] - N + arange(N)`), look up state
-    slot, ring write.
+    for that seq, translate each token's position through `block_tables`, and
+    write to the content-addressed SWA region.
     """
-    bs = state_slot_per_seq.shape[0]
+    bs = block_tables.shape[0]
     cu_cpu = cu_seqlens_q[: bs + 1].tolist()
     for b in range(bs):
         cu_start = int(cu_cpu[b])
@@ -209,10 +215,11 @@ def swa_write_reference(
             cu_end - write_n, cu_end, dtype=torch.long, device=kv.device
         )
         src_kv = kv[src_ids]
-        src_pos = positions[src_ids]
-        slot = int(state_slot_per_seq[b].item())
-        ring_idx = src_pos % cache_size
-        swa_kv[slot, ring_idx] = src_kv
+        src_pos = positions[src_ids].to(torch.long)
+        blk = src_pos // block_size
+        phys = block_tables[b, blk].to(torch.long)
+        dst_row = phys * block_size + (src_pos % block_size)
+        swa_region[dst_row] = src_kv
 
 
 # === Unified Compressor state save (plan path) ==========================

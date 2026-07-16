@@ -82,8 +82,12 @@ def test_build_args_smoke_over_real_catalog():
 
 
 def test_load_variants_shape():
+    # Content-agnostic: assert the catalog produces at least one variant and
+    # every variant carries the required fields. Deliberately does NOT pin the
+    # variant count — that couples the test to catalog churn (models added /
+    # removed) without testing any real invariant.
     variants = catalog.load_variants(CATALOG)
-    assert len(variants) == 22
+    assert variants, "catalog produced no variants"
     required = {
         "display",
         "path",
@@ -175,7 +179,7 @@ def test_validate_dispatch_inputs_in_sync_and_drift():
 
 
 def test_workflow_dispatch_inputs_match_catalog():
-    """The 13 workflow_dispatch model toggles must equal the catalog prefixes."""
+    """The workflow_dispatch model toggles must equal the catalog prefixes."""
     yaml = pytest.importorskip("yaml")
     wf = yaml.safe_load(WORKFLOW.read_text())
     # PyYAML parses the bare `on:` key as boolean True.

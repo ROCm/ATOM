@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -16,7 +20,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::types::{BackendType, RetryConfig},
+    config::types::{AtomPdRankMappingPolicy, BackendType, RetryConfig},
     core::{
         is_retryable_status,
         placement::{
@@ -69,6 +73,7 @@ pub struct PDRouter {
     pub client: Client,
     pub retry_config: RetryConfig,
     pub backend: BackendType,
+    pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
     pub planner: Arc<dyn PdPlanner>,
     pub adapter: Arc<dyn BackendAdapter>,
     /// Set when backend == Atom. enrich_decode_kv is ATOM-specific and not on the trait.
@@ -82,6 +87,10 @@ impl std::fmt::Debug for PDRouter {
             .field("client", &self.client)
             .field("retry_config", &self.retry_config)
             .field("backend", &self.backend)
+            .field(
+                "atom_pd_rank_mapping_policy",
+                &self.atom_pd_rank_mapping_policy,
+            )
             .finish()
     }
 }
@@ -201,10 +210,86 @@ impl PDRouter {
             client,
             retry_config: ctx.router_config.effective_retry_config(),
             backend,
+            atom_pd_rank_mapping_policy: ctx.router_config.atom_pd_rank_mapping_policy,
             planner,
             adapter,
             atom_adapter,
         })
+    }
+
+    fn apply_atom_pd_rank_mapping_policy(
+        &self,
+        prefill: Arc<dyn Worker>,
+        decode: &Arc<dyn Worker>,
+    ) -> Arc<dyn Worker> {
+        match self.atom_pd_rank_mapping_policy {
+            AtomPdRankMappingPolicy::None => prefill,
+            AtomPdRankMappingPolicy::Idx2Idx => self.map_atom_prefill_idx2idx(prefill, decode),
+        }
+    }
+
+    fn map_atom_prefill_idx2idx(
+        &self,
+        prefill: Arc<dyn Worker>,
+        decode: &Arc<dyn Worker>,
+    ) -> Arc<dyn Worker> {
+        let (Some(prefill_dp_size), Some(decode_dp_rank)) = (prefill.dp_size(), decode.dp_rank())
+        else {
+            debug!(
+                "ATOM PD rank mapping policy=idx2idx skipped: prefill={} prefill_dp_size={:?} decode={} decode_dp_rank={:?}",
+                prefill.url(),
+                prefill.dp_size(),
+                decode.url(),
+                decode.dp_rank()
+            );
+            return prefill;
+        };
+
+        if decode_dp_rank >= prefill_dp_size {
+            warn!(
+                "ATOM PD rank mapping policy=idx2idx skipped: decode rank {} is outside prefill dp_size {} (prefill={}, decode={})",
+                decode_dp_rank,
+                prefill_dp_size,
+                prefill.url(),
+                decode.url()
+            );
+            return prefill;
+        }
+
+        if prefill.dp_rank() == Some(decode_dp_rank) {
+            return prefill;
+        }
+
+        let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
+        match self.worker_registry.get_by_url(&mapped_url) {
+            Some(mapped) if mapped.is_healthy() => {
+                info!(
+                    "ATOM PD rank mapping policy=idx2idx: prefill {} -> {}, decode={}",
+                    prefill.url(),
+                    mapped.url(),
+                    decode.url()
+                );
+                mapped
+            }
+            Some(mapped) => {
+                warn!(
+                    "ATOM PD rank mapping policy=idx2idx target {} is unhealthy; keeping prefill {} (decode={})",
+                    mapped.url(),
+                    prefill.url(),
+                    decode.url()
+                );
+                prefill
+            }
+            None => {
+                warn!(
+                    "ATOM PD rank mapping policy=idx2idx target {} not found; keeping prefill {} (decode={})",
+                    mapped_url,
+                    prefill.url(),
+                    decode.url()
+                );
+                prefill
+            }
+        }
     }
 
     async fn fetch_vllm_prefill_info(
@@ -314,9 +399,17 @@ impl PDRouter {
         }
 
         let mut tp_sizes = HashMap::new();
+        let mut queried_base_urls = HashSet::new();
         for worker in &prefill_workers {
             let worker_url = worker.url().to_string();
-            let info_url = format!("{}/kv_transfer_info", worker_url);
+            let base_url = worker.base_url().trim_end_matches('/').to_string();
+            if !queried_base_urls.insert(base_url.clone()) {
+                if let Some(tp) = tp_sizes.get(&base_url).copied() {
+                    tp_sizes.insert(worker_url, tp);
+                }
+                continue;
+            }
+            let info_url = format!("{}/kv_transfer_info", base_url);
 
             info!("Querying ATOM prefill kv_transfer_info: {}", info_url);
             let resp = client
@@ -341,10 +434,11 @@ impl PDRouter {
             if kv_role != Some("kv_producer") {
                 return Err(format!(
                     "{} is not a prefill (kv_role={:?}, expected kv_producer)",
-                    worker_url, kv_role
+                    base_url, kv_role
                 ));
             }
-            info!("ATOM prefill {} tp_size={}", worker_url, tp);
+            info!("ATOM prefill {} tp_size={}", base_url, tp);
+            tp_sizes.insert(base_url, tp);
             tp_sizes.insert(worker_url, tp);
         }
         Ok(AtomPrefillInfo { tp_sizes })
@@ -420,7 +514,7 @@ impl PDRouter {
             stream: context.is_stream,
         };
 
-        let (prefill, decode, prefill_policy, decode_policy) =
+        let (mut prefill, decode, prefill_policy, decode_policy) =
             match self.planner.plan(&descriptor).await {
                 Ok(PlacementPlan::Pair {
                     prefill,
@@ -451,6 +545,18 @@ impl PDRouter {
             model,
             decode_policy,
         );
+
+        if let BackendType::Atom = self.backend {
+            prefill = self.apply_atom_pd_rank_mapping_policy(prefill, &decode);
+            info!(
+                "ATOM PD DP ranks selected: policy={} prefill={} prefill_dp_rank={:?} decode={} decode_dp_rank={:?}",
+                self.atom_pd_rank_mapping_policy,
+                prefill.url(),
+                prefill.dp_rank(),
+                decode.url(),
+                decode.dp_rank()
+            );
+        }
 
         let ctx = self
             .adapter
@@ -606,14 +712,20 @@ impl PDRouter {
 
         // P request: fire-and-forget background task. Mooncake coordinates KV transfer
         // via its own out-of-band channel; we only need to ensure P starts processing.
-        let prefill_post = self.build_post_with_headers(
-            &self.client,
-            prefill.url(),
-            context.route,
-            &prefill_request_json,
-            headers,
-            false,
-        );
+        let prefill_post = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                prefill_request_json,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_for_outcome = prefill.clone();
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
@@ -647,14 +759,20 @@ impl PDRouter {
         });
 
         // D request: client sees the streamed (or buffered) response from D.
-        let decode_post = self.build_post_with_headers(
-            &self.client,
-            decode.url(),
-            context.route,
-            &decode_request_json,
-            headers,
-            false,
-        );
+        let decode_post = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                decode.as_ref(),
+                context.route,
+                decode_request_json,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
         let decode_result = decode_post.send().await;
         events::RequestReceivedEvent {}.emit();
 
@@ -871,14 +989,20 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_post = self.build_post_with_headers(
-            &self.client,
-            prefill.url(),
-            context.route,
-            &prefill_request_json,
-            headers,
-            false,
-        );
+        let prefill_post = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                prefill_request_json,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
         let correlation_for_log = correlation_id
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
@@ -989,14 +1113,20 @@ impl PDRouter {
         };
         decode_obj.insert("kv_transfer_params".to_string(), kv_params);
 
-        let decode_post = self.build_post_with_headers(
-            &self.client,
-            decode.url(),
-            context.route,
-            &decode_request_json,
-            headers,
-            false,
-        );
+        let decode_post = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                decode.as_ref(),
+                context.route,
+                decode_request_json,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
         let decode_result = decode_post.send().await;
         events::RequestReceivedEvent {}.emit();
 
@@ -1665,6 +1795,45 @@ impl PDRouter {
         request
     }
 
+    async fn build_worker_post_with_headers(
+        &self,
+        client: &Client,
+        worker: &dyn Worker,
+        route: &'static str,
+        json_request: Value,
+        headers: Option<&HeaderMap>,
+        connection_close: bool,
+    ) -> Result<reqwest::RequestBuilder, Response> {
+        let prepared_request = worker.prepare_request(json_request).await.map_err(|e| {
+            error!(
+                worker_url = %worker.url(),
+                error = ?e,
+                "Failed to prepare DP-aware worker request"
+            );
+            error::internal_error(
+                "worker_prepare_request_failed",
+                format!("Failed to prepare worker request for {}: {:?}", worker.url(), e),
+            )
+        })?;
+
+        let mut request = client
+            .post(worker.endpoint_url(route))
+            .json(&prepared_request);
+        if connection_close {
+            request = request.header("Connection", "close");
+        }
+        if let Some(headers) = headers {
+            for (name, value) in headers.iter() {
+                if header_utils::should_forward_request_header(name.as_str()) {
+                    if let Ok(val) = value.to_str() {
+                        request = request.header(name, val);
+                    }
+                }
+            }
+        }
+        Ok(request)
+    }
+
     // Helper to merge logprobs from prefill and decode responses
     // Optimized to avoid double cloning by taking ownership of decode array
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
@@ -1965,7 +2134,10 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{placement::backend::sglang::SglangAdapter, BasicWorkerBuilder, WorkerType};
+    use crate::core::{
+        placement::backend::sglang::SglangAdapter, BasicWorkerBuilder, DPAwareWorkerBuilder,
+        WorkerType,
+    };
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1984,6 +2156,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             backend: BackendType::Sglang,
+            atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
             planner,
             adapter,
             atom_adapter: None,
@@ -1996,6 +2169,80 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    fn create_test_dp_worker(
+        base_url: &str,
+        dp_rank: usize,
+        dp_size: usize,
+        worker_type: WorkerType,
+        healthy: bool,
+    ) -> Arc<dyn Worker> {
+        let worker = DPAwareWorkerBuilder::new_with_type(
+            base_url.to_string(),
+            dp_rank,
+            dp_size,
+            worker_type,
+        )
+        .build();
+        worker.set_healthy(healthy);
+        Arc::new(worker)
+    }
+
+    #[test]
+    fn test_atom_pd_rank_mapping_none_keeps_prefill_rank() {
+        let mut router = create_test_pd_router();
+        router.backend = BackendType::Atom;
+        router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::None;
+
+        let prefill = create_test_dp_worker(
+            "http://prefill",
+            2,
+            8,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let decode = create_test_dp_worker("http://decode", 5, 8, WorkerType::Decode, true);
+
+        let mapped = router.apply_atom_pd_rank_mapping_policy(prefill.clone(), &decode);
+        assert_eq!(mapped.url(), prefill.url());
+        assert_eq!(mapped.dp_rank(), Some(2));
+    }
+
+    #[test]
+    fn test_atom_pd_rank_mapping_idx2idx_maps_prefill_to_decode_rank() {
+        let mut router = create_test_pd_router();
+        router.backend = BackendType::Atom;
+        router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+
+        let prefill_rank_2 = create_test_dp_worker(
+            "http://prefill",
+            2,
+            8,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let prefill_rank_5 = create_test_dp_worker(
+            "http://prefill",
+            5,
+            8,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let decode_rank_5 = create_test_dp_worker("http://decode", 5, 8, WorkerType::Decode, true);
+
+        router.worker_registry.register(prefill_rank_2.clone());
+        router.worker_registry.register(prefill_rank_5.clone());
+
+        let mapped = router.apply_atom_pd_rank_mapping_policy(prefill_rank_2, &decode_rank_5);
+        assert_eq!(mapped.url(), "http://prefill@5");
+        assert_eq!(mapped.dp_rank(), Some(5));
     }
 
     #[test]

@@ -1191,7 +1191,11 @@ class Config:
             if self.compilation_config.level == CompilationLevel.PIECEWISE:
                 self.compilation_config.set_splitting_ops_for_v1()
                 self._set_cudagraph_sizes()
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                # Keep an explicit cudagraph_mode (e.g. FULL); default to
+                # PIECEWISE only when unset. splitting_ops/sizes are set either
+                # way so the model is still piece-split-compiled at level 3.
+                if self.compilation_config.cudagraph_mode is None:
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
                 self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (
@@ -1288,6 +1292,13 @@ class Config:
                 ),
             )
         )
+        # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
+        # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
+        # F.embedding vs masked-embedding + all-reduce), so it alters the compiled
+        # graph and MUST be part of its key. Without this, toggling the flag — or
+        # deploying it on top of a cache built with the other setting — reuses a
+        # stale artifact and trips assert_size_stride at runtime.
+        factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

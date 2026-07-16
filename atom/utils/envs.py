@@ -32,6 +32,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
+        os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
@@ -44,6 +47,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
+    == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
@@ -89,14 +94,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
+    # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
+    # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
+    # identical to V3.2, so the fusion is math-equivalent to the unfused path. Set to
+    # "0" to fall back to the per-op Python path if a regression is suspected.
+    "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
+        os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
-    # Replicate the EAGLE3 draft vocab embedding on every TP rank (full table per
-    # rank, local lookup) instead of sharding it — eliminates the post-embedding
-    # all-reduce. The draft embed is independent of the (sharded) lm_head.
-    "ATOM_EAGLE_REPLICATE_EMBED": lambda: (
-        os.getenv("ATOM_EAGLE_REPLICATE_EMBED", "1") == "1"
+    # Replicate the vocab embedding on every TP rank (full table per rank, purely
+    # local lookup) instead of TP-sharding it — eliminates the post-embedding
+    # all-reduce. Applies to BOTH the main/target model and the speculative draft
+    # (EAGLE3 head + MTP draft steps), so the collective is dropped on every embed
+    # on the critical path. Only used where the embedding is independent of the
+    # still TP-sharded lm_head (EAGLE3 draft; GLM-5.2 target+MTP, whose
+    # tie_word_embeddings=False), so the lookup is bit-identical to the sharded
+    # masked-embedding + all-reduce path. Trades (tp-1)/tp of the embedding's
+    # memory per rank for one fewer collective per embed. Default on; set "0" to
+    # fall back to the sharded VocabParallelEmbedding.
+    "ATOM_REPLICATE_VOCAB_EMBED": lambda: (
+        os.getenv("ATOM_REPLICATE_VOCAB_EMBED", "1") == "1"
     ),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
@@ -255,6 +275,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default on; set "0" to fall back to the request-boundary balanced split.
     "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
         os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
+    ),
+    # Minimum prefill tokens (per rank) required to TBO-split.
+    "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores

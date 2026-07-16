@@ -169,12 +169,17 @@ def _aiter_rms_quant_fake(
         # (M, num_groups). Matches GemmaRMSNorm._forward_fused_fp8.
         out = torch.empty((M, N), dtype=fp8, device=x.device)
         num_groups = N // 128
+        scale_dtype = (
+            torch.float8_e8m0fnu
+            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+            else torch.float32
+        )
         if transpose_scale:
             scale = torch.empty(
-                (num_groups, M), dtype=torch.float32, device=x.device
+                (num_groups, M), dtype=scale_dtype, device=x.device
             ).view(M, num_groups)
         else:
-            scale = torch.empty((M, num_groups), dtype=torch.float32, device=x.device)
+            scale = torch.empty((M, num_groups), dtype=scale_dtype, device=x.device)
     else:  # _QV_PER_TOKEN
         out = torch.empty((M, N), dtype=fp8, device=x.device)
         scale = torch.empty((M, 1), dtype=torch.float32, device=x.device)
@@ -219,6 +224,7 @@ class RMSNorm(nn.Module):
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
         fused_quant: bool = False,
+        fused_quant_emit_bf16: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -229,6 +235,12 @@ class RMSNorm(nn.Module):
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
+        # When the fused AllReduce+RMSNorm+quant path is active AND a downstream
+        # consumer also needs the unquantized (bf16) normed activation (e.g. the
+        # GLM-5.2 DSA indexer, whose wk/weights_proj GEMMs run in BF16), the
+        # kernel additionally emits that bf16 mirror. forward() then returns
+        # ((fp8, scale, bf16), residual) instead of ((fp8, scale), residual).
+        self.fused_quant_emit_bf16 = fused_quant_emit_bf16
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.prefix = prefix
@@ -335,6 +347,44 @@ class RMSNorm(nn.Module):
             assert (
                 residual is not None
             ), "fused_allreduce_rmsnorm requires residual input!"
+            if self.use_fused_quant and self.quant_type.value in (
+                _QV_PER_1X128,
+                _QV_PER_TOKEN,
+            ):
+                # Combined AllReduce + RMSNorm + FP8 quant: the downstream GEMM
+                # (e.g. fused_qkv_a_proj) consumes the (fp8, scale) output
+                # directly, dropping a standalone per-token/per-group quant kernel
+                # from the hot path. `_aiter_transpose_scale` (resolved at init)
+                # selects the scale layout for that GEMM. The fused kernel does
+                # not support non-contiguous input.
+                if self.fused_quant_emit_bf16:
+                    # Also emit the pre-quant bf16 normed activation for a
+                    # co-consumer that runs in BF16 (GLM-5.2 DSA indexer).
+                    x, residual, x_scale, x_bf16 = (
+                        tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                            x.contiguous(),
+                            residual,
+                            self.weight,
+                            self.eps,
+                            quant_type=self.quant_type,
+                            group_size=128,
+                            transpose_scale=self._aiter_transpose_scale,
+                            emit_bf16=True,
+                        )
+                    )
+                    return (x, x_scale, x_bf16), residual
+                x, residual, x_scale = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                        x.contiguous(),
+                        residual,
+                        self.weight,
+                        self.eps,
+                        quant_type=self.quant_type,
+                        group_size=128,
+                        transpose_scale=self._aiter_transpose_scale,
+                    )
+                )
+                return (x, x_scale), residual
             # tensor_model_parallel_fused_allreduce_rmsnorm does not support non-contiguous input
             x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x.contiguous(),
@@ -1052,6 +1102,109 @@ class DualRMSNorm:
             q.view(-1, self.num_q_heads * self.head_dim),
             k.view(-1, self.num_kv_heads * self.head_dim),
         )
+
+
+# ---------------------------------------------------------------------------
+# Fused dual RMSNorm + concat — single Triton launch.
+#
+# Two independent RMSNorms over the SAME hidden dim (different inputs, different
+# weights, shared eps) whose bf16 results are concatenated on the last axis:
+#     out = cat([rmsnorm(xe, we), rmsnorm(xh, wh)], dim=-1)   # [M, 2H]
+# One program per row does both norms and writes each into its half of the
+# [M, 2H] output, so the concat is free — it eliminates the separate cat
+# kernel's read+write of 2*M*H (halving traffic vs two norms + torch.cat) and
+# folds three launches (enorm, hnorm, cat) into one. Used by the DeepSeek/GLM
+# MTP eh_proj input (enorm(embed) ++ hnorm(prev_hidden)).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fused_dual_rmsnorm_cat_kernel(
+    xe_ptr,
+    xh_ptr,
+    we_ptr,
+    wh_ptr,
+    out_ptr,
+    H,
+    stride_xe_m,
+    stride_xh_m,
+    stride_out_m,
+    eps,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_H)
+    mask = cols < H
+
+    # enorm half -> out[row, :H]
+    xe = tl.load(xe_ptr + row * stride_xe_m + cols, mask=mask, other=0.0).to(tl.float32)
+    we = tl.load(we_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    rstd_e = tl.rsqrt(tl.sum(xe * xe, axis=-1) / H + eps)
+    out_e = (xe * rstd_e * we).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + row * stride_out_m + cols, out_e, mask=mask)
+
+    # hnorm half -> out[row, H:2H]
+    xh = tl.load(xh_ptr + row * stride_xh_m + cols, mask=mask, other=0.0).to(tl.float32)
+    wh = tl.load(wh_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    rstd_h = tl.rsqrt(tl.sum(xh * xh, axis=-1) / H + eps)
+    out_h = (xh * rstd_h * wh).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + row * stride_out_m + H + cols, out_h, mask=mask)
+
+
+def _fused_dual_rmsnorm_cat_fake(
+    xe: torch.Tensor,
+    we: torch.Tensor,
+    xh: torch.Tensor,
+    wh: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    M, H = xe.shape
+    return torch.empty((M, 2 * H), dtype=xe.dtype, device=xe.device)
+
+
+@torch_compile_guard(gen_fake=_fused_dual_rmsnorm_cat_fake)
+def fused_dual_rmsnorm_cat(
+    xe: torch.Tensor,
+    we: torch.Tensor,
+    xh: torch.Tensor,
+    wh: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """cat([rmsnorm(xe, we), rmsnorm(xh, wh)], dim=-1) in one Triton launch.
+
+    Args:
+        xe, xh: (M, H) bf16/fp16 inputs (same shape).
+        we, wh: (H,) RMSNorm weights (one per input).
+        eps: shared RMSNorm epsilon.
+    Returns:
+        (M, 2H) tensor: [:, :H] = rmsnorm(xe, we), [:, H:] = rmsnorm(xh, wh).
+    """
+    assert xe.shape == xh.shape, f"shape mismatch {xe.shape} vs {xh.shape}"
+    assert xe.dim() == 2, f"expected 2-D inputs, got {xe.dim()}-D"
+    xe = xe.contiguous()
+    xh = xh.contiguous()
+    M, H = xe.shape
+    out = torch.empty((M, 2 * H), dtype=xe.dtype, device=xe.device)
+    if M == 0:
+        return out
+    BLOCK_H = triton.next_power_of_2(H)
+    num_warps = 8 if BLOCK_H >= 4096 else 4
+    _fused_dual_rmsnorm_cat_kernel[(M,)](
+        xe,
+        xh,
+        we,
+        wh,
+        out,
+        H,
+        xe.stride(0),
+        xh.stride(0),
+        out.stride(0),
+        eps,
+        BLOCK_H=BLOCK_H,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    return out
 
 
 @torch_compile_guard()

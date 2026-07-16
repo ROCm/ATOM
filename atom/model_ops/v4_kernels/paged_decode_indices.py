@@ -38,7 +38,8 @@ import triton.language as tl
 
 @triton.jit
 def _v4_paged_decode_indices_kernel(
-    state_slot_per_seq_ptr,  # [bs] int32
+    block_tables_ptr,  # [bs, max_blocks] int32 — logical→physical block
+    block_tables_stride,  # = max_blocks (row stride)
     batch_id_per_token_ptr,  # [T+pad] int — sentinel -1 in pad tail
     positions_ptr,  # [T+pad] int — global token position
     swa_indptr_ptr,  # [T+1] int32 — ragged SWA-prefix cumsum
@@ -47,7 +48,7 @@ def _v4_paged_decode_indices_kernel(
     swa_indices_ptr,  # [swa_total] int32, output
     csa_indices_ptr,  # [csa_total] int32, output (writes SWA-prefix segment only)
     hca_indices_ptr,  # [hca_total] int32, output (writes SWA-prefix segment only)
-    cs,  # win_with_spec — stride into unified_kv SWA region (paper §3.6.1)
+    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
     win: tl.constexpr,  # window_size — max SWA prefix slots
     BLOCK_N: tl.constexpr,  # next_pow2(win)
 ):
@@ -65,8 +66,8 @@ def _v4_paged_decode_indices_kernel(
         # slice tail (indptr[t+1] - n) so the compress section fills the head.
         for i in range(n):
             abs_pos = pos - n + 1 + i
-            ring = abs_pos % cs
-            paged = slot * cs + ring
+            phys = block_tables[bid, abs_pos // block_size]
+            paged = phys * block_size + abs_pos % block_size
             swa_indices[swa_indptr[t+1] - n + i] = paged
             csa_indices[csa_indptr[t+1] - n + i] = paged
             hca_indices[hca_indptr[t+1] - n + i] = paged
@@ -76,7 +77,6 @@ def _v4_paged_decode_indices_kernel(
     if bid < 0:
         return  # CG-padded sentinel — leave outputs untouched
 
-    slot = tl.load(state_slot_per_seq_ptr + bid)
     pos = tl.load(positions_ptr + t)
     # `n` = actual valid SWA prefix count. Cast to match `win` (compile-time
     # int) — pos is i32/i64 from positions buffer.
@@ -91,8 +91,14 @@ def _v4_paged_decode_indices_kernel(
     i = tl.arange(0, BLOCK_N)
     mask = i < n
     abs_pos = pos - n + 1 + i  # ∈ [0, pos] for valid i
-    ring_idx = abs_pos % cs
-    paged = slot * cs + ring_idx
+    # paged-SWA: content-address each window position via block_tables
+    # (same physical block as the compressed cache → prefix-cache hits read
+    # the original request's SWA, not a stale ring). issue #1417.
+    blk = abs_pos // block_size
+    phys = tl.load(
+        block_tables_ptr + bid * block_tables_stride + blk, mask=mask, other=0
+    )
+    paged = phys * block_size + abs_pos % block_size
 
     tl.store(swa_indices_ptr + swa_end - n + i, paged, mask=mask)
     tl.store(csa_indices_ptr + csa_end - n + i, paged, mask=mask)
@@ -101,7 +107,7 @@ def _v4_paged_decode_indices_kernel(
 
 def write_v4_paged_decode_indices(
     *,
-    state_slot_per_seq: torch.Tensor,
+    block_tables: torch.Tensor,
     batch_id_per_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
@@ -112,20 +118,25 @@ def write_v4_paged_decode_indices(
     hca_indices: torch.Tensor,
     T: int,
     win: int,
-    cs: int,
+    block_size: int,
 ) -> None:
     """In-place fill SWA / CSA / HCA window-prefix offsets via a single
     Triton kernel. Replaces the prior `_build_window_topk_np` (CPU O(T·win))
     + `index_copy_` chain. All inputs are persistent forward_vars buffers —
     no allocator churn.
 
-    Args (all GPU tensors except T/win/cs):
-      state_slot_per_seq:  [bs]   int32 — per-seq state cache slot.
+    paged-SWA: SWA offsets are content-addressed via `block_tables`
+    (`block_tables[bid, abs_pos//block_size]*block_size + abs_pos%block_size`),
+    same physical block as the compressed cache — so prefix-cache hits read the
+    original request's SWA, not a stale per-request ring (issue #1417).
+
+    Args (all GPU tensors except T/win/block_size):
+      block_tables:        [bs, MB] int32 — logical→physical block.
       batch_id_per_token:  [>=T]  int   — token→seq map; -1 sentinel skipped.
       positions:           [>=T]  int   — global token position
                                    (forward_vars["positions"]); used to derive
-                                   `n = min(pos+1, win)` per token + the ring
-                                   index `(pos - n + 1 + i) % cs`.
+                                   `n = min(pos+1, win)` per token + the paged
+                                   offset for each window position.
       swa_indptr:          [>=T+1] int32 — ragged SWA-prefix cumsum, where
                                    `swa_indptr[t+1] - swa_indptr[t] =
                                     min(positions[t]+1, win)`.
@@ -145,13 +156,12 @@ def write_v4_paged_decode_indices(
                                    caller via numpy fill.
       T:                   int — number of real tokens (grid size).
       win:                 int — SWA window size (typically 128 for V4-Pro).
-      cs:                  int — `win_with_spec = window_size + max_spec_steps`,
-                                 stride into unified_kv SWA region per slot
-                                 AND modulo for ring-index wrap.
+      block_size:          int — tokens per block (= V4 block_size, 128);
+                                 stride into the paged SWA region.
     """
     if T == 0:
         return
-    assert state_slot_per_seq.dim() == 1
+    assert block_tables.dim() == 2
     assert batch_id_per_token.dim() == 1 and batch_id_per_token.shape[0] >= T
     assert positions.dim() == 1 and positions.shape[0] >= T
     assert swa_indptr.dim() == 1 and swa_indptr.shape[0] >= T + 1
@@ -163,7 +173,8 @@ def write_v4_paged_decode_indices(
 
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_decode_indices_kernel[(T,)](
-        state_slot_per_seq,
+        block_tables,
+        block_tables.stride(0),
         batch_id_per_token,
         positions,
         swa_indptr,
@@ -172,7 +183,7 @@ def write_v4_paged_decode_indices(
         swa_indices,
         csa_indices,
         hca_indices,
-        cs,
+        block_size,
         win=win,
         BLOCK_N=BLOCK_N,
     )
@@ -180,7 +191,7 @@ def write_v4_paged_decode_indices(
 
 def write_v4_paged_decode_indices_reference(
     *,
-    state_slot_per_seq: torch.Tensor,
+    block_tables: torch.Tensor,
     batch_id_per_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
@@ -191,11 +202,11 @@ def write_v4_paged_decode_indices_reference(
     hca_indices: torch.Tensor,
     T: int,
     win: int,
-    cs: int,
+    block_size: int,
 ) -> None:
-    """Pure-PyTorch reference equivalent of `write_v4_paged_decode_indices`.
-    For unit tests and bisect verification. Mirrors the kernel exactly:
-    per-token ragged-packed write, no -1 sentinels in output.
+    """Pure-PyTorch reference equivalent of `write_v4_paged_decode_indices`
+    (paged-SWA). For unit tests and bisect verification. Mirrors the kernel:
+    per-token ragged-packed write, content-addressed via block_tables.
     """
     if T == 0:
         return
@@ -205,19 +216,16 @@ def write_v4_paged_decode_indices_reference(
     # n = min(pos+1, win) per token; clamp invalid rows to 0 to skip writes.
     n_per_tok = torch.minimum(pos_t + 1, torch.full_like(pos_t, win))
     n_per_tok = torch.where(valid, n_per_tok, torch.zeros_like(n_per_tok))
-    slot = torch.where(
-        valid, state_slot_per_seq[bid.clamp(min=0)].long(), torch.zeros_like(bid)
-    )
     for t in range(T):
         n = int(n_per_tok[t].item())
         if n == 0:
             continue
         p = int(pos_t[t].item())
-        s = int(slot[t].item())
+        b = int(bid[t].item())
         i_arr = torch.arange(n, device=positions.device, dtype=torch.long)
         abs_pos = p - n + 1 + i_arr  # [n]
-        ring = abs_pos % cs
-        paged = (s * cs + ring).to(torch.int32)
+        phys = block_tables[b, abs_pos // block_size].long()
+        paged = (phys * block_size + abs_pos % block_size).to(torch.int32)
         # SWA prefix segment at the slice TAIL (compress section fills the head).
         swa_end = int(swa_indptr[t + 1].item())
         csa_end = int(csa_indptr[t + 1].item())

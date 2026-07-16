@@ -12,7 +12,7 @@ DECODE_WORKERS="${DECODE_WORKERS:-1}"
 POLICY="${POLICY:-round_robin}"
 RESULT_DIR="${RESULT_DIR:-atomesh-mocker-results}"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MESH_DIR="${REPO_ROOT}/atom/mesh"
 MOCKER_DIR="${MESH_DIR}/mocker"
 MOCKER_TARGET_DIR="${MOCKER_DIR}/target/mocker"

@@ -58,7 +58,7 @@ def maybe_create_ubatch_slices(
     num_tokens: int,
     num_ubatches: int = 2,
     is_prefill: bool = False,
-    num_scheduled_tokens: Optional[list[int]] = None,
+    num_scheduled_tokens: Optional[np.ndarray] = None,
     max_tokens_per_ubatch: Optional[int] = None,
 ) -> Optional[list[UBatchSlice]]:
     """Split a batch into N micro-batch slices.
@@ -82,6 +82,12 @@ def maybe_create_ubatch_slices(
         return None
 
     if num_scheduled_tokens is not None:
+        # Skip TBO for small prefills
+        _min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
+        if _min_pref > 0:
+            _pref_total = int(num_scheduled_tokens[:num_reqs].sum())
+            if _pref_total < _min_pref:
+                return None
         # Prefill: token-balanced split
         if token_split:
             if num_tokens < num_ubatches:

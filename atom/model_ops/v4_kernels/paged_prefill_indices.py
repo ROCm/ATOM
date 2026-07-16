@@ -58,8 +58,10 @@ def _v4_paged_prefill_indices_kernel(
     cu_seqlens_q_per_seq_ptr,  # [bs] int — per-seq prefix sum start in per-fwd kv tensor
     state_slot_per_seq_ptr,  # [bs] int — per-seq SWA ring slot
     n_committed_hca_per_seq_ptr,  # [bs] int — per-seq HCA compress entry count
-    block_tables_ptr,  # [bs, MAX_BLOCKS] int — per-seq paged block ids
-    bt_stride_bs,  # bytes between block_tables rows
+    block_tables_ptr,  # [bs, MAX_BLOCKS] int — compressed pool block ids (HCA)
+    bt_stride_bs,  # row stride of block_tables
+    swa_block_tables_ptr,  # [bs, MAX_BLOCKS] int — SWA pool block ids
+    swa_bt_stride_bs,  # row stride of swa_block_tables
     # Indptrs (already cumsum'd by caller, all length [T+1]).
     extend_indptr_ptr,
     prefix_swa_indptr_ptr,
@@ -72,8 +74,8 @@ def _v4_paged_prefill_indices_kernel(
     prefix_hca_indices_ptr,
     # Constants.
     win: tl.constexpr,
-    cs,  # win_with_spec — SWA ring stride (NOT constexpr because varies w/ mtp_k)
-    swa_pages,  # state_slot count * cs — boundary into HCA compress section
+    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
+    swa_pages,  # num_blocks * block_size — boundary into HCA compress section
     HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
 ):
@@ -97,7 +99,6 @@ def _v4_paged_prefill_indices_kernel(
     pos = tl.load(positions_ptr + t)
     chunk_start = tl.load(chunk_start_per_seq_ptr + bid)
     cu_q = tl.load(cu_seqlens_q_per_seq_ptr + bid)
-    state_slot = tl.load(state_slot_per_seq_ptr + bid)
     # Per-token CAUSAL HCA visibility: token at `pos` may see only the
     # `(pos+1)//HCA_RATIO` compressed groups committed up to its own position
     # (matches the reference `get_compress_topk_idxs` prefill mask, and mirrors
@@ -124,13 +125,23 @@ def _v4_paged_prefill_indices_kernel(
     tl.store(extend_indices_ptr + ext_base + i, ext_start_row + i, mask=ext_mask)
 
     # ---- SWA prefix paged offsets: written to all three prefix buffers ----
-    # paged = state_slot * cs + ((swa_low + k) % cs), k in [0, prefix_swa_count)
+    # paged-SWA: content-address each prior-chunk window position via
+    # block_tables (same physical block as the compressed cache) so a
+    # cross-request prefix-cache hit reads the original request's SWA instead of
+    # a stale per-request ring (issue #1417):
+    #   paged = block_tables[bid, gp//block_size]*block_size + gp%block_size,
+    #   gp = swa_low + k, k in [0, prefix_swa_count)
     swa_base_swa = tl.load(prefix_swa_indptr_ptr + t)
     swa_base_hca = tl.load(prefix_hca_indptr_ptr + t)
     swa_mask = i < prefix_swa_count
     global_pos = swa_low + i
-    ring_idx = global_pos - (global_pos // cs) * cs  # global_pos % cs
-    paged = state_slot * cs + ring_idx
+    swa_blk = global_pos // block_size
+    swa_phys = tl.load(
+        swa_block_tables_ptr + bid * swa_bt_stride_bs + swa_blk,
+        mask=swa_mask,
+        other=0,
+    )
+    paged = swa_phys * block_size + (global_pos - swa_blk * block_size)
     tl.store(prefix_swa_indices_ptr + swa_base_swa + i, paged, mask=swa_mask)
     # CSA buffer: the SWA prefix goes at the slice TAIL. `csa_translate_pack`
     # writes the CSA topk section at the slice HEAD
@@ -170,6 +181,7 @@ def write_v4_paged_prefill_indices(
     state_slot_per_seq: torch.Tensor,
     n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
+    swa_block_tables: torch.Tensor,
     extend_indptr: torch.Tensor,
     prefix_swa_indptr: torch.Tensor,
     prefix_csa_indptr: torch.Tensor,
@@ -180,7 +192,7 @@ def write_v4_paged_prefill_indices(
     prefix_hca_indices: torch.Tensor,
     T: int,
     win: int,
-    cs: int,
+    block_size: int,
     swa_pages: int,
     hca_ratio: int = 128,
 ) -> None:
@@ -263,6 +275,8 @@ def write_v4_paged_prefill_indices(
         n_committed_hca_per_seq,
         block_tables,
         block_tables.stride(0),
+        swa_block_tables,
+        swa_block_tables.stride(0),
         extend_indptr,
         prefix_swa_indptr,
         prefix_csa_indptr,
@@ -272,7 +286,7 @@ def write_v4_paged_prefill_indices(
         prefix_csa_indices,
         prefix_hca_indices,
         win=win,
-        cs=cs,
+        block_size=block_size,
         swa_pages=swa_pages,
         HCA_RATIO=hca_ratio,
         BLOCK_N=BLOCK_N,
@@ -288,6 +302,7 @@ def write_v4_paged_prefill_indices_reference(
     state_slot_per_seq: torch.Tensor,
     n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
+    swa_block_tables: torch.Tensor,
     extend_indptr: torch.Tensor,
     prefix_swa_indptr: torch.Tensor,
     prefix_csa_indptr: torch.Tensor,
@@ -298,7 +313,7 @@ def write_v4_paged_prefill_indices_reference(
     prefix_hca_indices: torch.Tensor,
     T: int,
     win: int,
-    cs: int,
+    block_size: int,
     swa_pages: int,
     hca_ratio: int = 128,
 ) -> None:
@@ -316,9 +331,9 @@ def write_v4_paged_prefill_indices_reference(
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
     cu_q_cpu = cu_seqlens_q_per_seq.cpu().tolist()
-    state_slot_cpu = state_slot_per_seq.cpu().tolist()
     n_hca_cpu = n_committed_hca_per_seq.cpu().tolist()
     block_tables_cpu = block_tables.cpu()
+    swa_block_tables_cpu = swa_block_tables.cpu()
     ext_indptr_cpu = extend_indptr.cpu().tolist()
     swa_indptr_cpu = prefix_swa_indptr.cpu().tolist()
     csa_indptr_cpu = prefix_csa_indptr.cpu().tolist()
@@ -330,7 +345,6 @@ def write_v4_paged_prefill_indices_reference(
         pos = pos_cpu[t]
         chunk_start = cs_per_seq_cpu[bid]
         cu_q = cu_q_cpu[bid]
-        state_slot = state_slot_cpu[bid]
         # Per-token causal HCA cap (mirrors kernel + reference get_compress_topk_idxs).
         n_hca = min((pos + 1) // hca_ratio, n_hca_cpu[bid])
 
@@ -360,7 +374,14 @@ def write_v4_paged_prefill_indices_reference(
                 device=device,
                 dtype=prefix_swa_indices.dtype,
             )
-            paged = state_slot * cs + (global_pos % cs)
+            # paged-SWA: content-address via block_tables (issue #1417).
+            blk = (global_pos // block_size).long()
+            phys = swa_block_tables_cpu[bid, blk.cpu()].to(
+                device=device, dtype=prefix_swa_indices.dtype
+            )
+            paged = phys * block_size + (
+                global_pos - blk.to(global_pos.dtype) * block_size
+            )
             prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = paged
             # CSA: SWA prefix at the slice TAIL (head holds the CSA topk section
             # filled by csa_translate_pack). See the kernel comment above.

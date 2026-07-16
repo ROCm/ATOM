@@ -21,6 +21,15 @@ if _atom_config_stub is not None:
         _atom_config_stub.SpeculativeConfig = MagicMock(
             side_effect=lambda **kw: MagicMock(**kw)
         )
+    if not hasattr(_atom_config_stub, "CUDAGraphMode"):
+        # arg_utils imports CUDAGraphMode and does CUDAGraphMode[name] to map the
+        # --cudagraph-mode string; use a real enum so subscript access works.
+        import enum as _enum
+
+        _atom_config_stub.CUDAGraphMode = _enum.Enum(
+            "CUDAGraphMode",
+            {"NONE": 0, "PIECEWISE": 1, "FULL": 2, "FULL_AND_PIECEWISE": 3},
+        )
 
 from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
 

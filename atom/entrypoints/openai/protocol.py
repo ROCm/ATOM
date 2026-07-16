@@ -157,6 +157,8 @@ class CompletionRequest(BaseModel):
     stream: Optional[bool] = False
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: Optional[Dict[str, Any]] = None
+    # Optional DPA routing hint inserted by atomesh for DP-aware workers.
+    data_parallel_rank: Optional[int] = None
     n: Optional[int] = 1
 
     def get_max_tokens(self) -> int:
