@@ -395,9 +395,37 @@
     "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
   },
   {
+    "model_name": "GLM-5.2-FP8 TP4",
+    "model_path": "zai-org/GLM-5.2-FP8",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"mxfp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+    "runner": "atom-plugin-acc-validation-runner",
+    "test_level": "nightly",
+    "priority": "P0",
+    "lm_eval_num_fewshot": 20,
+    "accuracy_test_threshold": 0.92,
+    "accuracy_baseline": 0.9447,
+    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
+    "_baseline_note": "20-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare; threshold follows the existing GLM-5.2 nightly gate until FP8 CI baseline is recalibrated."
+  },
+  {
+    "model_name": "GLM-5.2-FP8 MTP TP4",
+    "model_path": "zai-org/GLM-5.2-FP8",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"mxfp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}}' --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+    "runner": "atom-plugin-acc-validation-runner",
+    "test_level": "nightly",
+    "priority": "P0",
+    "lm_eval_num_fewshot": 20,
+    "accuracy_test_threshold": 0.92,
+    "accuracy_baseline": 0.9447,
+    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
+    "_baseline_note": "20-shot GSM8K is lossless for MTP; threshold follows GLM-5.2-FP8 until MTP-specific CI baseline is calibrated."
+  },
+  {
     "model_name": "GLM-5.2-MXFP4 TP4",
     "model_path": "amd/GLM-5.2-MXFP4",
-    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --gpu-memory-utilization 0.8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --max-num-batched-tokens 16384 --max-model-len 16384",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}}'",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
     "runner": "atom-plugin-acc-validation-runner",
     "test_level": "nightly",
@@ -407,5 +435,19 @@
     "accuracy_baseline": 0.9447,
     "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
     "_baseline_note": "20-shot GSM8K local-completions coverage for GLM-5.2-MXFP4 IndexShare; threshold/baseline follow GLM-5.2-FP8 until MXFP4 CI baseline is calibrated."
+  },
+  {
+    "model_name": "GLM-5.2-MXFP4 MTP TP4",
+    "model_path": "amd/GLM-5.2-MXFP4",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\", \"model.layers.[1-6][0-9].mlp.*expert*\", \"model.layers.7[0-7].mlp.*expert*\"]}}' --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+    "runner": "atom-plugin-acc-validation-runner",
+    "test_level": "nightly",
+    "priority": "P0",
+    "lm_eval_num_fewshot": 20,
+    "accuracy_test_threshold": 0.92,
+    "accuracy_baseline": 0.9447,
+    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
+    "_baseline_note": "20-shot GSM8K is lossless for MTP; threshold follows GLM-5.2-FP8 until MXFP4 MTP-specific CI baseline is calibrated."
   }
 ]

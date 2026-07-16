@@ -144,11 +144,23 @@ For a UI view, drop the `.gz` (decompressed `.json`) into <https://ui.perfetto.d
 
 ## `record_function` tag format
 
-ATOM annotates the critical path with `torch.profiler.record_function`. The tags follow a stable format used by `parse_trace.py`:
+ATOM annotates the critical path with `torch.profiler.record_function`. The **kind** is the label prefix (groups in Perfetto, greppable); sub-attributes are `key=value` fields. Taxonomy lives in `atom/model_engine/run_labels.py`:
 
-- Prefill: `prefill[bs=<batch> tok=<num_tokens> ctx=<max_ctx>]`
-- Decode: `decode[bs=<batch> tok=<num_tokens> d=<draft_step> spec=<num_spec>]`
-- Draft (eagle mid-step): `draft[i/k bs=<batch>]`
+| Prefix | Meaning |
+|---|---|
+| `prefill[bs= tok= ctx=]` | real prefill (eager) |
+| `decode[bs= tok= p= d= spec=]` | real decode via CUDAGraph |
+| `eager_decode[bs= tok= ctx=]` | real decode forced eager |
+| `dummy_decode[...]` | **DP-sync dummy** (idle rank keeps the MoE collective aligned) |
+| `dummy_eager_decode[...]` | DP-sync dummy, forced eager |
+| `dummy_prefill[...]` | warmup dummy prefill |
+| `draft[i/k bs=]` | eagle/MTP draft mid-step |
+
+Fields: `bs` effective batch, `tok` total tokens, `ctx` per-seq context lens (truncated if many), `p`/`d` prefill/decode seq counts, `spec` speculative steps, and **`tbo=1`** appended when the step ran Two-Batch-Overlap ubatches.
+
+Distinguishing dummy vs real matters: e.g. the leading `dummy_decode[bs=1 tok=1]` runs are DP-sync idle steps, NOT real decode. `parse_trace.py` matches only the exact `prefill[` / `decode[` prefixes, so dummy/eager variants are auto-excluded from its stats.
+
+> **Comparability note:** pre-taxonomy traces labeled DP-sync dummies as plain `decode[...]`, so `parse_trace.py` counted them as real decodes. New traces exclude dummies — decode/prefill counts and averages on a new trace will differ from an old trace of the same workload. Don't attribute that delta to a perf change; re-baseline with a fresh trace.
 
 Searching by these tags is far more reliable than searching by kernel name (which varies across PyTorch/Triton/AITER versions).
 

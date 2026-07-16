@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from contextlib import nullcontext
 from typing import Any
 
 from atom.plugin.prepare import _set_framework_backbone
@@ -82,13 +83,19 @@ def prepare_model(config: Any):
 
     apply_graph_capture_patch()
 
-    init_params = inspect.signature(model_cls.__init__).parameters
-    if "atom_config" in init_params:
-        model = model_cls(atom_config=atom_config)
-    elif "config" in init_params:
-        model = model_cls(config=atom_config)
-    else:
-        model = model_cls(atom_config)
+    construct_context = (
+        model_adapter.construction_context()
+        if model_adapter.construction_context is not None
+        else nullcontext()
+    )
+    with construct_context:
+        init_params = inspect.signature(model_cls.__init__).parameters
+        if "atom_config" in init_params:
+            model = model_cls(atom_config=atom_config)
+        elif "config" in init_params:
+            model = model_cls(config=atom_config)
+        else:
+            model = model_cls(atom_config)
     if not hasattr(model, "atom_config"):
         model.atom_config = atom_config
     return model
