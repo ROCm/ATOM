@@ -587,14 +587,7 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
-        # gfx1250 decode lands here even without ATOM_USE_UNIFIED_ATTN (see
-        # _dispatch_decode), and unified_attention writes bf16 for an fp8 cache.
-        use_unified = (
-            envs.ATOM_USE_UNIFIED_ATTN
-            or self.use_flash_layout
-            or get_gfx() == "gfx1250"
-        )
-        if use_unified and self.kv_cache_dtype.startswith("fp8"):
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             o = torch.empty_like(q)
@@ -1063,18 +1056,13 @@ class PagedAttentionImpl(nn.Module):
             envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout or over_gluon
         )
 
-        # gfx1250 (MI455) has no pa_decode_gluon kernel (gluon supports gfx942 /
-        # gfx950 only), so every arm that would pick gluon takes unified_attention
-        # instead, which is gfx1250-capable and reads the same SHUFFLE KV cache.
-        gluon_decode = (
-            self.paged_attention_unified
-            if get_gfx() == "gfx1250"
-            else self.paged_attention_triton
-        )
-
         # Sliding-window layers must use triton (ASM paths don't support it)
         if self.sliding_window != -1:
-            return self.paged_attention_unified if wants_unified else gluon_decode
+            return (
+                self.paged_attention_unified
+                if wants_unified
+                else self.paged_attention_triton
+            )
 
         atom_config = get_current_atom_config()
 
@@ -1088,7 +1076,7 @@ class PagedAttentionImpl(nn.Module):
         if wants_unified:
             return self.paged_attention_unified
         if self.use_triton_attn:
-            return gluon_decode
+            return self.paged_attention_triton
 
         # use_pa_decode_bf16_asm() requires ATOM_USE_UNIFIED_ATTN, which the
         # block above has already returned on, so it cannot be reached here.
@@ -1096,7 +1084,7 @@ class PagedAttentionImpl(nn.Module):
         # pa_persistent_fwd / pa_decode_bf16_asm, different kernels with their
         # own tables, so this envelope does not describe them.
         if over_asm:
-            return gluon_decode
+            return self.paged_attention_triton
         return self.paged_attention_asm
 
     def dispatch_backend(
@@ -1112,11 +1100,7 @@ class PagedAttentionImpl(nn.Module):
             # _can_use_prefill_sink_asm is valid.
             if self._can_use_prefill_sink_asm(q, k, v, fwd_ctx):
                 return self.prefill_attention
-            if (
-                envs.ATOM_USE_UNIFIED_ATTN
-                or self.use_flash_layout
-                or get_gfx() == "gfx1250"
-            ):
+            if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention
         attn_metadata = fwd_ctx.attn_metadata

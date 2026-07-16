@@ -281,7 +281,7 @@ def _sparse_pa_ran_on_asm(
     return True
 
 
-def _sparse_decode_unified_attention(
+def _sparse_unified_attention(
     q_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim] (kv-head collapsed)
     out_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim]
     k_cache_view: torch.Tensor,  # SHUFFLE 5D, num_kv_heads collapsed to 1
@@ -293,13 +293,13 @@ def _sparse_decode_unified_attention(
 ) -> None:
     """gfx1250 fallback for the sparse per-token-as-decode gluon kernel.
 
-    gfx1250 (MI455) has no ``pa_decode_gluon`` kernel (gluon supports gfx942 /
+    gfx1250 has no `pa_decode_gluon` kernel (gluon supports gfx942 /
     gfx950 only). The sparse runners have already compacted the indexer's
-    selected blocks into a dense physical-16 ``sparse_bt`` + exact ``sparse_ctx``
+    selected blocks into a dense physical-16 `sparse_bt` + exact `sparse_ctx`
     over the (kv-head collapsed) SHUFFLE cache — which is exactly the
-    ``(block_table, seqused_k)`` contract ``unified_attention`` consumes with
-    ``shuffled_kv_cache=True``. Each token is a length-1 causal "sequence",
-    mirroring the gluon ``max_seqlen_q=1`` per-token-as-decode setup.
+    `(block_table, seqused_k)` contract `unified_attention` consumes with
+    `shuffled_kv_cache=True`. Each token is a length-1 causal "sequence",
+    mirroring the gluon `max_seqlen_q=1` per-token-as-decode setup.
 
     bf16 KV cache only: fp8 sparse decode plumbs per-token (per-page) descales
     into the gluon kernel, which does not map onto ``unified_attention``'s descale
@@ -311,7 +311,16 @@ def _sparse_decode_unified_attention(
     # key_cache: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     block_size = k_cache_view.shape[3]
     # Each token is its own length-1 sequence (decode); cu_seqlens_q = 0..num_seqs.
-    cu_seqlens_q = torch.arange(num_seqs + 1, dtype=torch.int32, device=q_view.device)
+    _cache = getattr(_sparse_unified_attention, "_cu_seqlens_q_cache", None)
+    if _cache is None:
+        _cache = {}
+        _sparse_unified_attention._cu_seqlens_q_cache = _cache
+    key = (q_view.device, int(num_seqs))
+    if key not in _cache:
+        _cache[key] = torch.arange(
+            num_seqs + 1, dtype=torch.int32, device=q_view.device
+        )
+    cu_seqlens_q = _cache[key]
     # Safe upper bound: full block table width * page size (>= every sparse_ctx).
     max_seqlen_k = int(sparse_bt.shape[1]) * int(block_size)
 
@@ -1472,17 +1481,16 @@ def _sparse_pa_per_row(
 
     num_seqs = T * num_kv_heads
 
-    # gfx1250 (MI455): no gluon pa_decode kernel (gluon supports gfx942 / gfx950
-    # only). Route through the triton unified_attention sparse fallback over the
-    # same SHUFFLE cache + compacted sparse block table.
+    # gfx1250: no gluon pa_decode kernel (gluon supports gfx942 / gfx950 only).
+    # Serves both the decode and prefill sparse paths.
     if get_gfx() == "gfx1250":
         if _is_fp8_kv_cache_tensor(k_cache):
             raise NotImplementedError(
-                "MiniMax-M3 fp8 sparse decode is not yet supported on gfx1250 "
-                "(MI455): the gluon per-page descale path has no unified_attention "
+                "MiniMax-M3 fp8 sparse attention is not yet supported on gfx1250: "
+                "the gluon per-page descale path has no unified_attention "
                 "equivalent here. Use a bf16 KV cache on gfx1250."
             )
-        _sparse_decode_unified_attention(
+        _sparse_unified_attention(
             q_view,
             out_view,
             k_cache_view,

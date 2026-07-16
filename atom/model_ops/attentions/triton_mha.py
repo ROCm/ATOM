@@ -95,22 +95,13 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         ):
             return None
 
-        # Ahead of the parent call, and so duplicating its guard: the refusal
-        # below is about *this* module, and a model's non-attention modules
-        # must not trip it. (The MiMo-V2 refusal that used to sit here went
-        # with the per-layer allocation path it named -- a second KV-head
-        # geometry is a second pool now, which this backend reads like any
-        # other.)
+        # No refusal for the fused qk_norm+rope+shuffle cache path (MiniMax-M3):
+        # its writer, the parent's pool and unified_attention(shuffled_kv_cache=
+        # True) all share the 5D SHUFFLE layout. (The MiMo-V2 refusal that used
+        # to sit here went with the per-layer allocation path it named -- a
+        # second KV-head geometry is a second pool now, which this backend reads
+        # like any other.)
         impl = getattr(module, "impl", None)
-        if impl is not None and (
-            getattr(impl, "rotary_emb", None) is not None
-            and getattr(impl, "q_norm", None) is not None
-            and getattr(impl, "k_norm", None) is not None
-        ):
-            raise NotImplementedError(
-                "TritonMHABackend is incompatible with the fused qk_norm+rope+shuffle "
-                "cache path; use AiterBackend for this model."
-            )
 
         bound = super().build_kv_cache_tensor(module)
         if bound is not None and impl is not None:
