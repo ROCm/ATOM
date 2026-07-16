@@ -79,7 +79,9 @@ class AtomGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if real_num_decodes == attn_metadata.num_decodes:
             return
 
-        batch_size = int(common_attn_metadata.num_actual_tokens)
+        # vLLM 0.25.x pads num_actual_tokens for full graph replay, but this
+        # compacted GDN state/query metadata is indexed by request.
+        batch_size = int(common_attn_metadata.num_reqs)
         if batch_size > self.decode_cudagraph_max_bs:
             return
 
