@@ -41,6 +41,7 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
+from aiter.ops.fused_qk_norm_rope_cache_quant import fused_qk_norm_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -96,7 +97,6 @@ from atom.model_ops.v4_kernels import (
     fused_compress_attn,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
-    qk_norm_rope_maybe_quant_fp8_2buff,
     scale_indexer_weights,
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
@@ -2178,36 +2178,43 @@ class DeepseekV4Attention(nn.Module):
         # scatter.
         q_packed = q_rope_q = k_packed = k_rope = None
         if self.kv_fp8:
-            q_packed, q_rope_q, k_packed, k_rope = qk_norm_rope_maybe_quant_fp8_2buff(
-                q,
+            # Decode FUSES the paged (content-addressed) SWA cache-write into the
+            # aiter norm+rope+quant launch via swa_block_tables — the fp8 analogue
+            # of the bf16 decode's flydsl-fused paged write. The kernel scatters
+            # each K row into both SWA pools (nope-fp8 + rope-bf16), addressed by
+            # swa_block_tables[batch_id, pos//bs] (batch_id<0 skips CG-pad),
+            # exactly like the standalone swa_write it replaces. Runs before the
+            # decode attention reads the window (no ordering hazard). Prefill
+            # passes swa_*=None and scatters its window tail post-attn below.
+            # aiter derives rot_dim from cos_cache.shape[-1]*2, so it needs the 2D
+            # [max_pos, rd//2] tables; the _V4RoPE caches are 4D [.,rd//2,1,1].
+            cos_2d = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+            sin_2d = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+            # Single fused launch: per-head weightless Q RMSNorm + weighted KV
+            # RMSNorm + GPT-J RoPE + 1x64 e8m0 fp8 group-quant into the 2buff
+            # layout (nope-fp8 [.,512] + rope-bf16 [.,64]) that op4 (prefill) and
+            # op5 (decode) consume directly. q: [T, H*D] -> [T, H, D]; kv_pre stays
+            # 2D (MQA -> num_kv_heads=1). is_neox=False = GPT-J adjacent-pair RoPE;
+            # q_weight=None = V4-Pro weightless Q.
+            q_packed, q_rope_q, k_packed, k_rope = fused_qk_norm_rope_group_quant(
+                q.view(num_tokens, self.n_local_heads, self.head_dim),
                 kv_pre,
                 self.kv_norm.weight,
-                self.rotary_emb.cos_cache,
-                self.rotary_emb.sin_cache,
                 positions,
-                self.n_local_heads,
-                self.head_dim,
-                rd,
+                cos_2d,
+                sin_2d,
                 self.eps,
+                is_neox=False,
+                q_out_dtype=dtypes.fp8,
+                q_weight=None,
+                quant_group_size=64,
+                scale_dtype="e8m0",
+                swa_nope_scale_buff=self.swa_kv if is_decode else None,
+                swa_rope_buff=self.swa_kv_rope if is_decode else None,
+                swa_block_tables=swa_block_tables_gpu if is_decode else None,
+                swa_block_size=swa_block_size if is_decode else None,
+                batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
             )
-            if is_decode:
-                # Paged 2buff SWA write — the fp8 analogue of the bf16 decode's
-                # flydsl-fused paged write. The compute-only quant does NOT fuse
-                # the scatter, so emit an explicit content-addressed write of the
-                # K row into both SWA pools (nope-fp8 + rope-bf16), addressed by
-                # swa_block_tables exactly like the bf16 `swa_write`. Runs before
-                # the decode attention reads the window (no ordering hazard).
-                swa_write_2buff_prepacked(
-                    k_packed.view(k_packed.shape[0], -1),
-                    k_rope.view(k_rope.shape[0], -1),
-                    positions,
-                    attn_md.cu_seqlens_q,
-                    swa_block_tables_gpu,
-                    self.swa_kv,
-                    self.swa_kv_rope,
-                    swa_block_size,
-                    attn_md.max_seqlen_q,
-                )
             q_sa = kv = q_scale = kv_scale = None
         else:
             q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
