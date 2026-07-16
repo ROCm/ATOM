@@ -26,7 +26,10 @@ from atom.models.deepseek_v2 import (
 )
 from atom.models.utils import maybe_prefix
 
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+try:
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+except ImportError:
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     _is_hip,
