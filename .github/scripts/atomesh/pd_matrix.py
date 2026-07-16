@@ -244,8 +244,19 @@ def build_cell(
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
     allow_auto_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
 
-    nodes = [] if allow_auto_nodes else resolve_nodes(suite_cfg.get("nodes"))
-    if single_node_pd:
+    nodes = resolve_nodes(suite_cfg.get("nodes"))
+    if allow_auto_nodes:
+        if not nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs a non-empty "
+                "Spur nodelist"
+            )
+        if len(nodes) < required_nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs at least "
+                f"{required_nodes} node(s)"
+            )
+    elif single_node_pd:
         if not nodes and not allow_auto_nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs at least one node"
@@ -273,7 +284,7 @@ def build_cell(
             f"{suite_cfg.get('name', model_name)} needs at least "
             f"{required_nodes} node(s)"
         )
-    num_nodes = len(nodes) if nodes else required_nodes
+    num_nodes = required_nodes if allow_auto_nodes else len(nodes)
 
     server_args = deep_merge(
         model_cfg.get("server", {}).get("common_args", {}),

@@ -110,6 +110,75 @@ models:
       fewshot: 3
       limit: null
 
+  GLM-5.2-MXFP4:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/GLM-5.2-MXFP4"
+    precision: MXFP4
+    env:
+      common:
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        AITER_USE_FLYDSL_MOE_SORTING: "1"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        gpu_memory_utilization: 0.8
+        max_num_batched_tokens: 16384
+        max_model_len: 16384
+        cudagraph-mode: FULL_AND_PIECEWISE
+        default-chat-template-kwargs: {"enable_thinking":false}
+    suites:
+      nightly:
+        - name: glm-52-mxfp4-1p1d-tp4
+          topology: 1p1d
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [65]
+
+        - name: glm-52-mxfp4-1p1d-tp8
+          topology: 1p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [65]
+
+    accuracy:
+      task: gsm8k
+      fewshot: 20
+      limit: null
+      model_type: local-completions
+      endpoint: completions
+
   Kimi-K2.5-MXFP4:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/"
