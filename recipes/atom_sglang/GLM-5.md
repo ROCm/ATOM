@@ -118,6 +118,8 @@ python3 -m sglang.launch_server \
     --tp-size "${TP}" \
     --mem-fraction-static 0.8 \
     --disable-radix-cache \
+    --page-size 1 \
+    --attention-backend aiter \
     --kv-cache-dtype fp8_e4m3 \
     --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}" \
     2>&1 | tee glm-server-fp8-tp8-sglang.log
@@ -173,37 +175,6 @@ Then append `--profile` to the `benchmark_serving.py` command in Step 3.
 ## Accuracy Validation
 
 The sparse MLA mechanism contains an indexer that selects the top-k tokens it deems most relevant for each query from the KV cache. For GLM-5, the top-2048 tokens are selected from the context by the indexer. To evaluate its accuracy, it is recommended to use requests with context longer than 2048 so that the indexer can be tested. In `lm_eval`, this can be set by increasing the `num_fewshot=20` to increase the context length.
-
-Launch the accuracy server with the same MI355 MXFP4 recipe:
-
-```bash
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_USE_FLYDSL_MOE_SORTING=1
-export SGLANG_USE_AITER=1
-export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-
-MODEL_PATH=amd/GLM-5.2-MXFP4
-# Or use a local checkpoint path, for example:
-# MODEL_PATH=/shared/data/amd_int/models/GLM-5.2-MXFP4
-TP=4
-PORT=8015
-MODEL_LOADER_EXTRA_CONFIG='{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}}'
-
-TORCHINDUCTOR_COMPILE_THREADS=128 \
-python3 -m sglang.launch_server \
-    --model-path "${MODEL_PATH}" \
-    --host localhost \
-    --port "${PORT}" \
-    --trust-remote-code \
-    --tp-size "${TP}" \
-    --mem-fraction-static 0.8 \
-    --disable-radix-cache \
-    --kv-cache-dtype fp8_e4m3 \
-    --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}" \
-    2>&1 | tee glm-server-mxfp4-tp4-sglang.log
-```
-
-Then run the accuracy test:
 
 ```bash
 MODEL_PATH=amd/GLM-5.2-MXFP4

@@ -670,7 +670,6 @@ jobs:
               "glm-5-1-fp8-tp8",
               "glm-5-2-fp8-tp4",
               "glm-5-2-fp4-tp4",
-              "glm-5-2-fp8-tp8-mi308",
           ]
           OOB_P1_PREFIX_ORDER = [
               "deepseek-v3-2-fp8-tp4",
