@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ATOM vLLM Plugin Backend &mdash; ATOM 0.1.0 documentation</title>
+  <title>vLLM-ATOM Backend &mdash; ATOM 0.1.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
@@ -466,7 +466,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Framework Integrations</span></p>
 <ul class="current">
-<li class="toctree-l1 current"><a class="current reference internal" href="#">ATOM vLLM Plugin Backend</a><ul>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">vLLM-ATOM Backend</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#architecture">1. Architecture</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#design-overview">1.1 Design overview</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#how-it-works">1.2 How it works</a></li>
@@ -542,7 +542,7 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">ATOM vLLM Plugin Backend</li>
+      <li class="breadcrumb-item active">vLLM-ATOM Backend</li>
       <li class="wy-breadcrumbs-aside">
             <a href="_sources/vllm_plugin_backend_guide.md.txt" rel="nofollow"> View page source</a>
       </li>
@@ -552,9 +552,9 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="atom-vllm-plugin-backend">
-<h1>ATOM vLLM Plugin Backend<a class="headerlink" href="#atom-vllm-plugin-backend" title="Link to this heading"></a></h1>
-<p>ATOM can work as the vLLM out-of-tree (OOT) plugin backend — installed as a separate Python package and plugged into vLLM through vLLM’s official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.</p>
+  <section id="vllm-atom-backend">
+<h1>vLLM-ATOM Backend<a class="headerlink" href="#vllm-atom-backend" title="Link to this heading"></a></h1>
+<p>ATOM can work as the vLLM-ATOM out-of-tree (OOT) backend — installed as a separate Python package and plugged into vLLM through vLLM’s official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.</p>
 <p>This integration follows the direction described in the <a class="reference external" href="https://github.com/ROCm/ATOM/issues/201">RFC to enable ATOM as a vLLM out-of-tree platform</a>. The high-level idea is that vLLM remains the framework-level runtime, while ATOM focuses on model-level and kernel-level optimization for AMD GPUs. In this mode, ATOM serves as the optimized execution backend and an incubation layer for new kernels, fusions, and model implementations before they are mature enough to be upstreamed.</p>
 <section id="architecture">
 <h2>1. Architecture<a class="headerlink" href="#architecture" title="Link to this heading"></a></h2>
@@ -899,7 +899,7 @@ pre-installed — no manual dependency management is required.</p>
 </section>
 <section id="launch-vllm-with-atom-plugin">
 <h3>5.3 Launch vLLM with ATOM Plugin<a class="headerlink" href="#launch-vllm-with-atom-plugin" title="Link to this heading"></a></h3>
-<p>The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options, OpenAI-compatible API usage, and client patterns, refer to the <a class="reference external" href="https://docs.vllm.ai/en/latest/">official vLLM documentation</a>.</p>
+<p>The vLLM-ATOM backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options, OpenAI-compatible API usage, and client patterns, refer to the <a class="reference external" href="https://docs.vllm.ai/en/latest/">official vLLM documentation</a>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>vllm<span class="w"> </span>serve<span class="w"> </span><span class="si">${</span><span class="nv">model</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--host<span class="w"> </span>localhost<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
