@@ -39,7 +39,8 @@ fi
 MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
 SGLANG_PORT=${SGLANG_PORT:-8000}
-SGLANG_HOST=${SGLANG_HOST:-localhost}
+# Prefer IPv4 loopback: Docker often sets disable_ipv6=1 while localhost still resolves to ::1.
+SGLANG_HOST=${SGLANG_HOST:-127.0.0.1}
 SGLANG_PID_FILE=${SGLANG_PID_FILE:-/tmp/atom_sglang.pid}
 SGLANG_LOG_FILE=${SGLANG_LOG_FILE:-/tmp/atom_sglang.log}
 RESULT_DIR=${RESULT_DIR:-/tmp/atom_sglang_accuracy_results}
