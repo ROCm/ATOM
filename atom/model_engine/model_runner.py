@@ -24,6 +24,7 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
 from atom.utils.cuda_graph import BatchDescriptor
+from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
@@ -588,13 +589,13 @@ class ModelRunner:
         # so that dp config fields are still at their original values)
         self.profiler = None
         self.profiler_dir = None
+        dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
+        if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
+            self.rank_name = f"dp{dp_rank_local}_tp{rank}"
+        else:
+            self.rank_name = f"rank_{rank}"
         if config.torch_profiler_dir is not None:
-            dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
-            if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
-                rank_name = f"dp{dp_rank_local}_tp{rank}"
-            else:
-                rank_name = f"rank_{rank}"
-            self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
+            self.profiler_dir = os.path.join(config.torch_profiler_dir, self.rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self._setup_device_and_distributed(rank, config)
@@ -749,6 +750,7 @@ class ModelRunner:
         if hasattr(self.model, "load_fused_expert_weights"):
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
+        load_start = time.perf_counter()
         load_model(
             self.model,
             config.model,
@@ -756,7 +758,11 @@ class ModelRunner:
             config.load_dummy,
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
-        logger.info(f"Model load done: {config.model}")
+        load_elapsed = time.perf_counter() - load_start
+        logger.info(
+            f"[{self.rank_name}] Model load done: {config.model} "
+            f"(weights loaded in {load_elapsed:.2f}s)"
+        )
 
     def _maybe_warmup(self):
         """Run model warmup. Override point: the rapidserve decode process
@@ -1773,7 +1779,14 @@ class ModelRunner:
                     f"diff={diff_pct:.1%}"
                 )
 
-        if torch.distributed.is_initialized():
+        # Skip on single-rank: a world_size==1 barrier is a no-op but still
+        # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
+        # which can OOM/fail on single-card runs. The process group stays
+        # initialized so get_tp_group() and friends keep working.
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
             torch.distributed.barrier()
         return True
 
@@ -1816,11 +1829,16 @@ class ModelRunner:
             return None
 
         tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        # tbo_collective_active is the OR-reduced cross-DP decision: this rank
+        # is committed to splitting even if it's below ATOM_TBO_PREFILL_MIN_TOKENS
+        # (a peer cleared the bar). force=True bypasses the local min-token gate
+        # so we don't desync from peers and hang.
         ubatch_slices = maybe_create_ubatch_slices(
             num_reqs=tbo_num_reqs,
             num_tokens=actual_num_tokens,
             is_prefill=is_prefill,
             num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
+            force=True,
         )
         if ubatch_slices is not None:
             logger.debug(
@@ -1850,17 +1868,27 @@ class ModelRunner:
         dp_size = self.config.parallel_config.data_parallel_size
 
         # Rank-local TBO precompute (needed for both dp==1 fast path and
-        # the cross-DP packed gather below).
-        local_eligible, local_ub0, local_ub1 = False, 0, 0
+        # the cross-DP packed gather below). `meets_min_tokens` = this rank's
+        # prefill reached the min-token bar (e.g. 8k), OR-reduced across DP;
+        # `can_split` = structurally splittable, AND-reduced across DP.
+        local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = (
+            False,
+            False,
+            0,
+            0,
+        )
         if tbo_on:
             if num_scheduled_tokens is None:
                 num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-            local_eligible, local_ub0, local_ub1 = local_tbo_precompute(
-                self.config, batch, is_prefill, num_scheduled_tokens
+            local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = (
+                local_tbo_precompute(
+                    self.config, batch, is_prefill, num_scheduled_tokens
+                )
             )
 
         if dp_size <= 1:
             # Single-rank: TBO decision is purely local; no collective needed.
+            # Both bits must hold (reached min-tokens AND able to split).
             # dp_uniform_decode=True mirrors the DP-disabled case in the
             # multi-rank branch (`not enable_dp_attention` => True) and the
             # Context default — otherwise single-GPU/TP-only decode would
@@ -1870,24 +1898,19 @@ class ModelRunner:
                 None,
                 True,
                 num_input_tokens,
-                local_eligible,
+                local_meets_min_tokens and local_can_split,
                 None,
             )
 
-        # Mixed prefill+decode DP steps only deadlock under prefill
-        # token-split + TBO-decode
-        require_uniform_mode = (
-            self.config.enable_tbo_decode and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-        )
         sync = sync_dp_for_tbo(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
             num_input_tokens=num_input_tokens,
             is_prefill=is_prefill,
             tbo_on=tbo_on,
-            local_tbo_eligible=local_eligible,
+            local_meets_min_tokens=local_meets_min_tokens,
+            local_can_split=local_can_split,
             local_ub_tokens=(local_ub0, local_ub1),
-            require_uniform_mode=require_uniform_mode,
         )
 
         max_tokens = int(sync.num_tokens_across_dp.max())
@@ -2091,23 +2114,21 @@ class ModelRunner:
         # internally short-circuits for prefill / cudagraph.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
+        # Profiler label. Kind (prefix) distinguishes real/dummy and
+        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
+        # `build_run_label`.
+        label = build_run_label(
+            is_prefill=is_prefill,
+            use_cudagraph=forward_mode.use_cudagraph,
+            is_dummy=context.is_dummy_run,
+            tbo_on=forward_context.ubatch_slices is not None,
+            bs=bs,
+            batch=batch,
+        )
+
         if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
-            if is_prefill:
-                label = f"prefill[bs={bs}"
-            else:
-                label = f"eager_decode[bs={bs}"
-            if batch is not None:
-                ctx = batch.context_lens
-                if len(ctx) == 1:
-                    ctx_str = str(ctx[0])
-                elif len(ctx) <= 5:
-                    ctx_str = str(ctx.tolist())
-                else:
-                    ctx_str = f"{ctx[:3].tolist()}...+{len(ctx)-3}"
-                label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
-            label += "]"
             with record_function(label):
                 # Handle multimodal prefill: compute vision embeddings and merge
                 inputs_embeds = None
@@ -2147,16 +2168,8 @@ class ModelRunner:
                     self._aux_hidden_states = None
                 logits = self.model.compute_logits(hidden_states)
         else:
-            # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
-            label = f"decode[bs={bs}"
-            if batch is not None:
-                label += f" tok={batch.total_tokens_num}"
-                if batch.total_seqs_num_prefill > 0:
-                    label += f" p={batch.total_seqs_num_prefill}"
-                label += f" d={batch.total_seqs_num_decode}"
-                if batch.num_spec_step > 0:
-                    label += f" spec={batch.num_spec_step}"
-            label += "]"
+            # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
+            # dummy_decode[...] — see build_run_label.
             with record_function(label):
                 graph_bs = context.graph_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
@@ -2446,6 +2459,43 @@ class ModelRunner:
         mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
         return mode is not None and mode.requires_piecewise_compilation()
 
+    def _force_aiter_unreg_capture_for_piecewise(self):
+        """PIECEWISE cudagraph + aiter custom all_gather/reduce_scatter: force the
+        copy-in ('unreg') capture path instead of the direct-read ('registered')
+        one.
+
+        The registered path lets the collective kernel directly read each peer's
+        ORIGINAL input pointer (cross-registered at register_graph_buffers). That
+        is only safe under a single whole-forward FULL cudagraph, whose global
+        read/overwrite ordering holds across all ranks. PIECEWISE splits the
+        forward into many small graphs with eager sections between them, losing
+        that ordering: a fast rank can overwrite its pool-recycled input via a
+        later piece while a slow peer is still reading it -> stale cross-rank
+        reads -> progressive hidden corruption -> repeated-token garbage
+        (DP+PIECEWISE accuracy bug). The unreg path snapshots the input into a
+        pre-registered pool before the collective, so it is order-independent.
+        """
+        seen = set()
+        for getter in ("get_tp_group", "get_dp_group", "get_ep_group"):
+            try:
+                from aiter.dist import parallel_state as _ps
+
+                group = getattr(_ps, getter)()
+            except Exception:
+                continue
+            dc = getattr(group, "device_communicator", None)
+            ca = getattr(dc, "ca_comm", None) if dc is not None else None
+            if ca is None or id(ca) in seen:
+                continue
+            seen.add(id(ca))
+            if getattr(ca, "enable_register_for_capturing", False):
+                ca.enable_register_for_capturing = False
+                logger.info(
+                    "PIECEWISE: forced aiter ca_comm (%s) to unreg copy-in "
+                    "capture path for cudagraph-safe DP collectives.",
+                    getter,
+                )
+
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
         if _piecewise:
@@ -2453,6 +2503,7 @@ class ModelRunner:
                 "PIECEWISE cudagraph: capturing per-piece graphs (attention "
                 "eager); manual FULL whole-forward capture disabled."
             )
+            self._force_aiter_unreg_capture_for_piecewise()
         start_time = time.time()
         # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:

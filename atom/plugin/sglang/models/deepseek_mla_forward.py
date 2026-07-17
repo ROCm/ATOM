@@ -269,7 +269,9 @@ def init_sgl_attrs(
     attn.use_deep_gemm_bmm = False
     attn.alt_stream = None
     attn.kv_cache_dtype = kv_cache_dtype
-    attn.use_fused_qk_rope_concat_and_cache_mla = _use_aiter_gfx95
+    attn.use_fused_qk_rope_concat_and_cache_mla = (
+        kv_cache_dtype == "fp8_e4m3" or _use_aiter_gfx95
+    )
     attn.current_sgl_plugin_attn_path = None
     attn.w_kc, attn.w_vc = None, None
     attn.w_scale = None

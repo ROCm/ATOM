@@ -36,6 +36,7 @@ class EngineArgs:
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: Optional[str] = None
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
@@ -64,6 +65,10 @@ class EngineArgs:
     disagg_constrained: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        if self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -118,11 +123,21 @@ class EngineArgs:
             help="Engine internal port",
         )
         parser.add_argument(
+            "--kv-cache-dtype",
             "--kv_cache_dtype",
+            dest="kv_cache_dtype",
             choices=["bf16", "fp8"],
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'.",
+        )
+        parser.add_argument(
+            "--index-cache-dtype",
+            "--index_cache_dtype",
+            choices=["bf16", "fp8"],
+            type=str,
+            default=None,
+            help="Index cache type. Defaults to --kv_cache_dtype.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
