@@ -1096,6 +1096,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # per-token dequant scales into k_scale / v_scale (outputs).
         fused_k_scale = k_scale if is_fp8 else None
         fused_v_scale = v_scale if is_fp8 else None
+        fused_index_cache_dtype = (
+            self.index_cache_dtype if self.index_cache_dtype == "fp8" else "auto"
+        )
 
         if self.skip_index_topk:
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
@@ -1168,7 +1171,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             index_q,
             slot_mapping,
             kv_cache_dtype=kv_cache_dtype,
-            index_cache_dtype=self.index_cache_dtype,
+            index_cache_dtype=fused_index_cache_dtype,
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
             asm_layout=True,
