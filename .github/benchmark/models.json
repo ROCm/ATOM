@@ -3,13 +3,33 @@
     {
       "isl": 1024,
       "osl": 1024,
-      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+      "concurrency": [
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024
+      ],
       "random_range_ratio": 0.8
     },
     {
       "isl": 8192,
       "osl": 1024,
-      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+      "concurrency": [
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024
+      ],
       "random_range_ratio": 0.8
     }
   ],
@@ -26,36 +46,12 @@
         "extra_args": "--no-enable_prefix_caching"
       },
       "variants": [
-        { "label": "", "suffix": "", "conc_max": 256 },
-        {
-          "label": "MTP3",
-          "suffix": "-mtp3",
-          "extra_args": "--method mtp --num-speculative-tokens 3",
-          "bench_args": "--use-chat-template",
-          "conc_min": 4,
-          "conc_max": 256
-        },
-        {
-          "label": "DPA",
-          "suffix": "-dpa",
-          "extra_args": "--enable-dp-attention",
-          "conc_min": 64,
-          "conc_max": 1024
-        },
         {
           "label": "DPA TBO",
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
           "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
           "conc_min": 256,
-          "conc_max": 1024
-        },
-        {
-          "label": "DPA MTP3",
-          "suffix": "-dpa-mtp3",
-          "extra_args": "--method mtp --num-speculative-tokens 3 --enable-dp-attention",
-          "bench_args": "--use-chat-template",
-          "conc_min": 64,
           "conc_max": 1024
         }
       ]
@@ -66,9 +62,16 @@
       "prefix": "deepseek-r1-0528-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
       "env_vars": "",
-      "config": { "tp": 4, "kv_cache_dtype": "fp8" },
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8"
+      },
       "variants": [
-        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "",
+          "suffix": "",
+          "conc_max": 256
+        },
         {
           "label": "MTP3",
           "suffix": "-mtp3",
@@ -85,8 +88,18 @@
       "prefix": "glm-5-2-fp8",
       "runner": "atom-mi355-8gpu.predownload",
       "env_vars": "",
-      "config": { "tp": 8, "kv_cache_dtype": "fp8", "extra_args": "--gpu-memory-utilization 0.8" },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "config": {
+        "tp": 8,
+        "kv_cache_dtype": "fp8",
+        "extra_args": "--gpu-memory-utilization 0.8"
+      },
+      "variants": [
+        {
+          "label": "",
+          "suffix": "",
+          "conc_max": 256
+        }
+      ]
     },
     {
       "display": "GLM-5.2-MXFP4",
@@ -100,7 +113,11 @@
         "extra_args": "--online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}'"
       },
       "variants": [
-        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "",
+          "suffix": "",
+          "conc_max": 256
+        },
         {
           "label": "MTP3",
           "suffix": "-mtp3",
@@ -121,7 +138,13 @@
         "kv_cache_dtype": "fp8",
         "extra_args": "--gpu-memory-utilization 0.9"
       },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "variants": [
+        {
+          "label": "",
+          "suffix": "",
+          "conc_max": 256
+        }
+      ]
     },
     {
       "display": "Kimi-K2.7-Code-MXFP4",
@@ -135,7 +158,13 @@
         "trust_remote_code": true,
         "extra_args": "--gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"\", \"layer_quant_config\": {\"model.layers.*.self_attn.fused_qkv_a_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.q_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.kv_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.o_proj\": \"ptpc_fp8\"}}'"
       },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "variants": [
+        {
+          "label": "",
+          "suffix": "",
+          "conc_max": 256
+        }
+      ]
     },
     {
       "display": "MiniMax-M3-MXFP8",
@@ -150,7 +179,11 @@
         "extra_args": "--gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}' --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'"
       },
       "variants": [
-        { "label": "", "suffix": "", "extra_args": "--max-num-seqs 256" },
+        {
+          "label": "",
+          "suffix": "",
+          "extra_args": "--max-num-seqs 256"
+        },
         {
           "label": "EAGLE3",
           "suffix": "-eagle3",
@@ -174,7 +207,11 @@
         "extra_args": "--gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}' --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'"
       },
       "variants": [
-        { "label": "", "suffix": "", "extra_args": "--max-num-seqs 256" },
+        {
+          "label": "",
+          "suffix": "",
+          "extra_args": "--max-num-seqs 256"
+        },
         {
           "label": "EAGLE3",
           "suffix": "-eagle3",
@@ -197,7 +234,11 @@
         "extra_args": "--no-enable_prefix_caching"
       },
       "variants": [
-        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "",
+          "suffix": "",
+          "conc_max": 256
+        },
         {
           "label": "MTP3",
           "suffix": "-mtp3",
@@ -219,7 +260,13 @@
         "kv_cache_dtype": "fp8",
         "extra_args": "--no-enable_prefix_caching"
       },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "variants": [
+        {
+          "label": "",
+          "suffix": "",
+          "conc_max": 256
+        }
+      ]
     },
     {
       "display": "Llama-3.3-70B-Instruct-MXFP4",
@@ -227,8 +274,17 @@
       "prefix": "llama-3-3-70b-instruct-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
       "env_vars": "",
-      "config": { "tp": 1, "kv_cache_dtype": "fp8" },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+      "config": {
+        "tp": 1,
+        "kv_cache_dtype": "fp8"
+      },
+      "variants": [
+        {
+          "label": "",
+          "suffix": "",
+          "conc_max": 256
+        }
+      ]
     }
   ]
 }
