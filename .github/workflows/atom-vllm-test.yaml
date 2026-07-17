@@ -301,7 +301,7 @@ jobs:
           - display_name: "MiniMax-M3-MXFP4 TP4"
             model_name: "MiniMax-M3-MXFP4"
             model_path: "amd/MiniMax-M3-MXFP4"
-            client_command: "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=32,max_gen_toks=2048 --tasks gsm8k --num_fewshot 5 --batch_size 65"
+            client_command: "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=32,max_gen_toks=2048 --tasks gsm8k --num_fewshot 5 --batch_size 65 --output_path ${OUTPUT_PATH}"
             extra_args: "--tensor-parallel-size 4 --kv-cache-dtype auto --no-trust-remote-code --gpu-memory-utilization 0.85 --block-size 128 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --no-enable_prefix_caching --no-async-scheduling --language-model-only --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}'"
             env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
             lm_eval_num_fewshot: 5
