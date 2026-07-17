@@ -927,10 +927,27 @@ class Scheduler:
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
             cached_per_req = [s.num_cached_tokens for s in scheduled_seqs.values()]
+            # [diag] queue depth + free VRAM at prefill-schedule time (OOM hunt)
+            _bm = self.block_manager
+            try:
+                _kv_free = len(getattr(_bm, "free_block_ids_set", None) or _bm.free_block_ids)
+            except Exception:
+                _kv_free = -1
+            _kv_total = len(_bm.blocks)
+            try:
+                import torch
+
+                _free_b, _total_b = torch.cuda.mem_get_info()
+                _free_vram = f"{_free_b // (1024 * 1024)}MB/{_total_b // (1024 * 1024)}MB"
+            except Exception:
+                _free_vram = "n/a"
             logger.info(
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
                 f"{total_tokens_num_prefill} new tokens "
                 f"(cached: {cached_per_req}, new: {num_scheduled_tokens}), "
+                f"waiting_prefill={len(self.waiting)}, "
+                f"kv_free_blocks={_kv_free}/{_kv_total}, "
+                f"free_vram={_free_vram}, "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True
