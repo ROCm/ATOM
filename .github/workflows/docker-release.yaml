@@ -165,7 +165,7 @@ jobs:
           --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
           --build-arg RCCL_BRANCH="${{ inputs.rccl_branch || env.RCCL_BRANCH }}" \
           --build-arg CACHEBUST=$(date +%s) \
-          -f docker/Dockerfile .
+          -f docker/atom_release.dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image
@@ -271,7 +271,7 @@ jobs:
             --build-arg VLLM_COMMIT="${{ env.VLLM_COMMIT }}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f docker/vllm_release.dockerfile .
           docker inspect atom_oot_release:ci
 
       - name: Re-login to Docker Hub before OOT push
@@ -319,7 +319,7 @@ jobs:
             --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
             --build-arg SGLANG_REPO="${{ inputs.sglang_repo || env.SGLANG_REPO }}" \
             --build-arg SGLANG_REF="${{ inputs.sglang_ref || env.SGLANG_REF }}" \
-            -f docker/Dockerfile .
+            -f docker/sglang_release.dockerfile .
           docker inspect atom_sglang_release:ci
 
       - name: Re-login to Docker Hub before SGLang push
