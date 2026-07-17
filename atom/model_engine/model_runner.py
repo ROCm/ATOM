@@ -1792,11 +1792,16 @@ class ModelRunner:
             return None
 
         tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        # tbo_collective_active is the OR-reduced cross-DP decision: this rank
+        # is committed to splitting even if it's below ATOM_TBO_PREFILL_MIN_TOKENS
+        # (a peer cleared the bar). force=True bypasses the local min-token gate
+        # so we don't desync from peers and hang.
         ubatch_slices = maybe_create_ubatch_slices(
             num_reqs=tbo_num_reqs,
             num_tokens=actual_num_tokens,
             is_prefill=is_prefill,
             num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
+            force=True,
         )
         if ubatch_slices is not None:
             logger.debug(
@@ -1826,17 +1831,19 @@ class ModelRunner:
         dp_size = self.config.parallel_config.data_parallel_size
 
         # Rank-local TBO precompute (needed for both dp==1 fast path and
-        # the cross-DP packed gather below).
-        local_eligible, local_ub0, local_ub1 = False, 0, 0
+        # the cross-DP packed gather below). `wants` = cleared min-token bar
+        # (OR-reduced); `can_split` = structurally splittable (AND-reduced).
+        local_wants, local_can_split, local_ub0, local_ub1 = False, False, 0, 0
         if tbo_on:
             if num_scheduled_tokens is None:
                 num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-            local_eligible, local_ub0, local_ub1 = local_tbo_precompute(
+            local_wants, local_can_split, local_ub0, local_ub1 = local_tbo_precompute(
                 self.config, batch, is_prefill, num_scheduled_tokens
             )
 
         if dp_size <= 1:
             # Single-rank: TBO decision is purely local; no collective needed.
+            # Both bits must hold (want it AND able to split it).
             # dp_uniform_decode=True mirrors the DP-disabled case in the
             # multi-rank branch (`not enable_dp_attention` => True) and the
             # Context default — otherwise single-GPU/TP-only decode would
@@ -1846,24 +1853,19 @@ class ModelRunner:
                 None,
                 True,
                 num_input_tokens,
-                local_eligible,
+                local_wants and local_can_split,
                 None,
             )
 
-        # Mixed prefill+decode DP steps only deadlock under prefill
-        # token-split + TBO-decode
-        require_uniform_mode = (
-            self.config.enable_tbo_decode and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-        )
         sync = sync_dp_for_tbo(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
             num_input_tokens=num_input_tokens,
             is_prefill=is_prefill,
             tbo_on=tbo_on,
-            local_tbo_eligible=local_eligible,
+            local_tbo_wants=local_wants,
+            local_tbo_can_split=local_can_split,
             local_ub_tokens=(local_ub0, local_ub1),
-            require_uniform_mode=require_uniform_mode,
         )
 
         max_tokens = int(sync.num_tokens_across_dp.max())
