@@ -36,6 +36,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.v4_kernels.state_writes import swa_write
+from atom.utils.decorators import mark_trace
 
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
 # is unavailable; the dispatch in ``qk_norm_rope_maybe_quant`` will fall
@@ -305,6 +306,7 @@ def _qk_norm_rope_maybe_quant_kernel(
         tl.store(kv_out_base + NOPE + rd_offs[None, :], pe.to(ot), mask=m_mask[:, None])
 
 
+@mark_trace
 def qk_norm_rope_maybe_quant(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -326,6 +328,7 @@ def qk_norm_rope_maybe_quant(
     swa_write_per_batch: Optional[int] = None,
     swa_block_tables: Optional[torch.Tensor] = None,
     swa_block_size: Optional[int] = None,
+    prefix: str = "",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
 
@@ -538,6 +541,7 @@ def qk_norm_rope_maybe_quant(
                 swa_kv,
                 swa_block_size,
                 swa_write_per_batch,
+                prefix=f"{prefix}.swa_write" if prefix else "",
             )
         else:
             if swa_cache_size is None:
@@ -550,6 +554,7 @@ def qk_norm_rope_maybe_quant(
                 swa_kv,
                 swa_cache_size,
                 swa_write_per_batch,
+                prefix=f"{prefix}.swa_write" if prefix else "",
             )
 
     return q_out, kv_out, q_scale, kv_scale

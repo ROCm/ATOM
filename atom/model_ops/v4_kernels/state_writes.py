@@ -55,6 +55,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 
 @triton.jit
 def _swa_write_kernel(
@@ -116,6 +118,7 @@ def _swa_write_kernel(
     tl.store(dst, src, mask=d_mask)
 
 
+@mark_trace
 def swa_write(
     kv: torch.Tensor,
     positions: torch.Tensor,
@@ -124,6 +127,7 @@ def swa_write(
     swa_region: torch.Tensor,
     block_size: int,
     write_per_batch: int,
+    prefix: str = "",
 ) -> None:
     """paged-SWA in-place write. For the last
     `min(tok_n_b, write_per_batch)` tokens of every seq `b ∈ [0, bs)` this fwd
@@ -315,6 +319,7 @@ def _update_compressor_states_kernel(
     )
 
 
+@mark_trace
 def update_compressor_states(
     kv: torch.Tensor,
     score: torch.Tensor,
@@ -327,6 +332,7 @@ def update_compressor_states(
     state_slot_mapping: torch.Tensor,  # [bs] int32 — per-seq state slot
     ratio: int,
     overlap: bool,
+    prefix: str = "",
 ) -> None:
     """In-place update of Compressor's per-request `kv_state`/`score_state`
     ring buffer (size ≥ `K_pool = (1+overlap)*ratio`; V4-Pro widens to

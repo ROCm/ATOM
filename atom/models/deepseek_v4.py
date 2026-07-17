@@ -103,7 +103,7 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
-from atom.utils.decorators import support_torch_compile
+from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
 from torch import nn
 
@@ -869,12 +869,16 @@ class _V4RoPE(nn.Module):
                 nope_first=False,
             )
 
-    def inverse(self, positions: torch.Tensor, x: torch.Tensor) -> None:
+    def inverse(
+        self, positions: torch.Tensor, x: torch.Tensor, prefix: str = ""
+    ) -> None:
         """In-place inverse RoPE via fused Triton kernel.
 
         ``x`` must be the rope-slice only (last dim == rotary_dim).
         """
-        inverse_rope_inplace(x, self.cos_cache, self.sin_cache, positions)
+        inverse_rope_inplace(
+            x, self.cos_cache, self.sin_cache, positions, prefix=prefix
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1129,6 +1133,7 @@ class Compressor(nn.Module):
             use_ue8m0=(self.scale_fmt == "ue8m0"),
             preshuffle=True,
             fp8_max=(torch.finfo(self.kv_cache.dtype).max if is_quant else None),
+            prefix=f"{self.prefix}.fused_compress_attn",
         )
         update_compressor_states(
             kv,
@@ -1141,6 +1146,7 @@ class Compressor(nn.Module):
             state_slot_mapping=state_slot_mapping,
             ratio=ratio,
             overlap=overlap,
+            prefix=f"{self.prefix}.update_compressor_states",
         )
 
 
@@ -1229,6 +1235,7 @@ class Indexer(nn.Module):
             prefix
         ] = self
 
+    @mark_trace
     def forward_batched(
         self,
         x_full: torch.Tensor,  # [total_tokens, dim]
@@ -1330,7 +1337,12 @@ class Indexer(nn.Module):
         # weights_proj is BF16 but auto-promotes to fp32 via fp32 q_scale,
         # so no explicit `.float()` cast needed.
         weights = self.weights_proj(x_full)
-        weights = scale_indexer_weights(weights, q_scale, self._weights_scale)
+        weights = scale_indexer_weights(
+            weights,
+            q_scale,
+            self._weights_scale,
+            prefix=f"{self.prefix}.scale_indexer_weights",
+        )
         return q_fp8, weights
 
     def score_topk_from(
@@ -1952,9 +1964,9 @@ class DeepseekV4Attention(nn.Module):
             )
         return q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights
 
-    def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
-        """Grouped output LoRA + wo_b (graphable, num_tokens-shaped)."""
-        num_tokens = o.shape[0]
+    @mark_trace
+    def _wo_a_grouped_lora(self, o: torch.Tensor, prefix: str = "") -> torch.Tensor:
+        num_tokens = o.size(0)
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if num_tokens <= 32 or self._is_gfx1250:
@@ -1966,9 +1978,12 @@ class DeepseekV4Attention(nn.Module):
                 device=o.device,
             ).transpose(0, 1)
             y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
-            o = y.transpose(0, 1)
-        else:
-            o = torch.einsum("sgd,grd->sgr", o, wo_a)
+            return y.transpose(0, 1)
+        return torch.einsum("sgd,grd->sgr", o, wo_a)
+
+    def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
+        """Grouped output LoRA + wo_b (graphable, num_tokens-shaped)."""
+        o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
         return self.wo_b(o.flatten(1))
 
     def forward_impl(
@@ -2165,6 +2180,7 @@ class DeepseekV4Attention(nn.Module):
             swa_block_size=swa_block_size if is_decode else None,
             swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
             swa_write_per_batch=attn_md.max_seqlen_q if is_decode else None,
+            prefix=f"{self.layer_name}.qk_norm_rope_maybe_quant",
         )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
@@ -2218,6 +2234,7 @@ class DeepseekV4Attention(nn.Module):
                 kv_indptr,
                 self.attn_sink,
                 self.softmax_scale,
+                prefix=f"{self.layer_name}.sparse_attn_decode",
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
@@ -2278,6 +2295,7 @@ class DeepseekV4Attention(nn.Module):
                 # Reuse q_sa as the attention output buffer; q_sa is not needed
                 # after this call and this avoids an extra empty_like allocation.
                 out=q_sa,
+                prefix=f"{self.layer_name}.sparse_attn_prefill",
             )  # [S, H, head_dim]
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
             # prior chunk's contents (not this chunk's just-computed tail).
@@ -2299,11 +2317,16 @@ class DeepseekV4Attention(nn.Module):
                 self.swa_kv,
                 swa_block_size,
                 min(self.window_size, attn_md.max_seqlen_q),
+                prefix=f"{self.layer_name}.swa_write",
             )
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
-        self.rotary_emb.inverse(positions, o[..., -rd:])
+        self.rotary_emb.inverse(
+            positions,
+            o[..., -rd:],
+            prefix=f"{self.layer_name}.inverse_rope",
+        )
         # Output LoRA (wo_a/wo_b) now runs in `_attn_post` (graphed piece).
         return o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
 
@@ -2382,6 +2405,7 @@ class DeepseekV4Attention(nn.Module):
             swa_pages=attn_md.swa_pages,
             csa_block_capacity=csa_block_capacity,
             window_size=window_size,
+            prefix=f"{self.layer_name}.csa_translate_pack",
         )
 
 
@@ -2693,10 +2717,12 @@ class MoE(nn.Module):
             ids_2d, _ = all_gather_with_padding(ids_2d, use_cag=False)
         return ids_2d.flatten()
 
+    @mark_trace
     def combine_outputs(
         self,
         routed: torch.Tensor,  # [num_tokens, dim]
         shared: Optional[torch.Tensor],  # [num_tokens, dim] or None
+        prefix: str = "",
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Add shared-expert contribution (when not fused into routed) and
         all-reduce across TP ranks.
@@ -2713,7 +2739,9 @@ class MoE(nn.Module):
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
         routed = self.routed_expert_forward(x)
-        return self.combine_outputs(routed, shared)
+        return self.combine_outputs(
+            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+        )
 
     def dual_stream_moe_forward(
         self, x: torch.Tensor  # [num_tokens, dim]
@@ -2729,7 +2757,9 @@ class MoE(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts.forward(x)
         current_stream.wait_stream(self.alt_stream)
-        return self.combine_outputs(routed, shared)
+        return self.combine_outputs(
+            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+        )
 
     def forward(
         self,
@@ -2782,6 +2812,7 @@ class Block(nn.Module):
         indexer_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        self.prefix = prefix
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.attn = DeepseekV4Attention(
@@ -2921,6 +2952,60 @@ class Block(nn.Module):
         )
         return y.type_as(x)
 
+    @mark_trace
+    def mhc_fused_post_pre(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+        prefix: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._mhc_fused_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            float(self.norm_eps),
+            float(self.hc_eps),
+            float(self.hc_eps),
+            self.HC_POST_MULT,
+            int(self.hc_sinkhorn_iters),
+            norm_weight,
+            norm_eps,
+        )
+
+    @mark_trace
+    def mhc_post_pre(
+        self,
+        x: Optional[torch.Tensor],
+        residual: torch.Tensor,
+        post: Optional[torch.Tensor],
+        comb: Optional[torch.Tensor],
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+        prefix: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if x is not None:
+            res = self.hc_post(x, residual, post, comb)
+        else:
+            res = residual
+        x, post, comb = self.hc_pre(
+            res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+        )
+        return x, post, comb, res
+
     def fuse_hc(
         self,
         hc_state: HCState,
@@ -2935,7 +3020,7 @@ class Block(nn.Module):
         comb = hc_state.comb_mix
         x = hc_state.x_prev
         if self.enable_fused_hc and x is not None:
-            post, comb, x, res = self._mhc_fused_post_pre(
+            post, comb, x, res = self.mhc_fused_post_pre(
                 x,
                 residual,
                 post,
@@ -2943,21 +3028,22 @@ class Block(nn.Module):
                 hc_fn,
                 hc_scale,
                 hc_base,
-                float(self.norm_eps),
-                float(self.hc_eps),
-                float(self.hc_eps),
-                self.HC_POST_MULT,
-                int(self.hc_sinkhorn_iters),
                 norm_weight,
                 norm_eps,
+                prefix=f"{self.prefix}.mhc_fused_post_pre",
             )
         else:
-            if x is not None:
-                res = self.hc_post(x, residual, post, comb)
-            else:
-                res = residual
-            x, post, comb = self.hc_pre(
-                res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+            x, post, comb, res = self.mhc_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_weight,
+                norm_eps,
+                prefix=f"{self.prefix}.mhc_post_pre",
             )
         return HCState(residual=res, post_mix=post, comb_mix=comb, x_prev=x)
 
@@ -3100,7 +3186,11 @@ class DeepseekV4Model(nn.Module):
         # VocabParallelEmbedding shards along vocab dim. At TP=1 weight shape
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
         # directly. At TP>1 each rank holds vocab_size/tp rows.
-        self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
+        self.embed = VocabParallelEmbedding(
+            args.vocab_size,
+            args.dim,
+            prefix="embed",
+        )
         # alt_stream: dual-stream MoE (shared_experts // routed_experts) AND
         # Main Compressor overlap. indexer_stream: Indexer Compressor overlap.
         # Both allocated once, shared across all blocks. Attention runs before
