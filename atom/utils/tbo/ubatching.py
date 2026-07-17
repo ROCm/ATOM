@@ -159,7 +159,9 @@ def local_tbo_precompute(
             return _precompute_prefill_token_split(
                 num_scheduled_tokens, num_pref_reqs, min_pref
             )
-        return _precompute_prefill_req_split(num_scheduled_tokens, num_pref_reqs, min_pref)
+        return _precompute_prefill_req_split(
+            num_scheduled_tokens, num_pref_reqs, min_pref
+        )
 
     # Decode path
     if not config.enable_tbo_decode or batch.is_dummy_run:
