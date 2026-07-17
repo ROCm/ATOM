@@ -40,9 +40,10 @@ jobs:
           git fetch origin gh-pages
           git checkout gh-pages
 
-          # Deploy subdirectories
+          # Deploy subdirectories (clean first so stale files don't linger)
           for dir in /tmp/pages_copy/*/; do
             page_name=$(basename "$dir")
+            git rm -r --quiet "$page_name" 2>/dev/null || true
             mkdir -p "$page_name"
             cp -r "$dir"* "$page_name/"
             git add "$page_name/"
