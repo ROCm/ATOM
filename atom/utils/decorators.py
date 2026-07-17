@@ -27,6 +27,7 @@ import time
 from atom.config import CompilationConfig, Config, CompilationLevel
 
 from atom.utils.graph_marker import graph_marker
+from atom.models.utils import IntermediateTensors
 
 # from atom.utils import start_monitoring_torch_compile
 
@@ -525,6 +526,15 @@ def _support_torch_compile(
                             "Unsupported dynamic dimensions"
                             f" {dims} for argument {k} with type {type(arg)}."
                         )
+            # PP non-first stages receive activations inside an
+            # IntermediateTensors container, so the Tensor-typed arg inference
+            # above never marks them; mark the token dim of each contained
+            # tensor here so inductor keeps the general-shape graph dynamic.
+            for arg in bound_args.arguments.values():
+                if isinstance(arg, IntermediateTensors):
+                    for t in arg.tensors.values():
+                        if isinstance(t, torch.Tensor):
+                            torch._dynamo.mark_dynamic(t, 0)
             # here, it is the starting point of the `torch.compile` process
             start_monitoring_torch_compile(self.atom_config)
             # print("Start compiling function %s",
