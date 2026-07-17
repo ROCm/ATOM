@@ -235,6 +235,15 @@ class MLPBlock(torch.nn.Module):
 
     def process_weights_after_loading(self):
         if getattr(self.experts.quant_method, "use_triton", False):
+            # The triton SwiGLU MoE kernel consumes w13 gate/up INTERLEAVED
+            # (gugu), which is exactly how the gpt-oss checkpoint already stores
+            # it, so no interleave is needed on this path (unlike MiniMax-M3's
+            # separated gguu, which Mxfp4MoEMethod.process_weights_after_loading
+            # interleaves). Mark the layer as already-interleaved so that path's
+            # _interleave_gate_up_rows_ is skipped and does not re-scramble the
+            # gate/up rows. (Model process_weights_after_loading runs before the
+            # quant_method's, so this flag is set in time.)
+            self.experts._w13_gate_up_interleaved = True
             return
         _interleave_swiglu_weights(self.experts)
 
