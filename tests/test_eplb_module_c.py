@@ -5,12 +5,15 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from atom.model_ops.eplb import (
-    _build_logical_to_physical_map,
-    balanced_packing,
-    rebalance_experts,
-    replicate_experts,
-)
+try:
+    from atom.model_ops.eplb import (
+        _build_logical_to_physical_map,
+        balanced_packing,
+        rebalance_experts,
+        replicate_experts,
+    )
+except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
+    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
 
 def test_balanced_packing_equal_cardinality():

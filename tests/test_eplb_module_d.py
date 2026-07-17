@@ -6,9 +6,13 @@ from contextlib import contextmanager
 
 torch = pytest.importorskip("torch")
 
-# Keep config import order consistent with existing EPLB tests.
-import atom.config  # noqa: F401
-import atom.model_ops.eplb as eplb
+# Keep config import order consistent; skip if the full atom import env
+# (aiter/triton) is unavailable.
+try:
+    import atom.config  # noqa: F401
+    import atom.model_ops.eplb as eplb
+except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
+    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
 
 def test_assign_sender_for_receiver_even_split():

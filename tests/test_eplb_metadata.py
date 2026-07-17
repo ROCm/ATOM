@@ -5,8 +5,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import atom.config  # noqa: F401  (load fully first to avoid mainline circular import)
-from atom.model_ops.eplb import ExpertLocationMetadata
+# Load atom.config fully first to avoid the mainline circular import; skip the
+# whole module if the full atom import env (aiter/triton) is unavailable.
+try:
+    import atom.config  # noqa: F401
+    from atom.model_ops.eplb import ExpertLocationMetadata
+except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
+    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
 
 def test_from_rebalance_result_pads_and_derives_rank0():

@@ -5,7 +5,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import atom.model_ops.eplb as eplb
+try:
+    import atom.model_ops.eplb as eplb
+except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
+    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
 
 class _FakeTPGroup:

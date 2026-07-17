@@ -55,8 +55,8 @@ def balanced_packing(
     weight_rows = weight.cpu().tolist()
     pack_index_rows: list[list[int]] = []
     rank_in_pack_rows: list[list[int]] = []
-    for l in range(num_layers):
-        wl = weight_rows[l]
+    for layer in range(num_layers):
+        wl = weight_rows[layer]
         # Descending by weight, tie-break by original index (stable).
         order = sorted(range(num_items), key=lambda i: (-wl[i], i))
         loads = [0.0] * num_packs
@@ -107,8 +107,8 @@ def replicate_experts(
     logcnt_rows: list[list[int]] = []
     phy2log_rows: list[list[int]] = []
     phyrank_rows: list[list[int]] = []
-    for l in range(num_layers):
-        wl = weight_rows[l]
+    for layer in range(num_layers):
+        wl = weight_rows[layer]
         cnt_l = [1] * num_logical
         for _ in range(extra):
             # Greedy: replicate the expert with the highest per-replica load.
@@ -149,10 +149,10 @@ def _build_logical_to_physical_map(
     prank_rows = physical_rank.cpu().tolist()
     logcnt_rows = logcnt.cpu().tolist()
     out_rows: list[list[list[int]]] = []
-    for l in range(num_layers):
-        p2l_l = p2l_rows[l]
-        prank_l = prank_rows[l]
-        cnt_l = logcnt_rows[l]
+    for layer in range(num_layers):
+        p2l_l = p2l_rows[layer]
+        prank_l = prank_rows[layer]
+        cnt_l = logcnt_rows[layer]
         row = [[-1] * cur for _ in range(num_logical)]
         for p in range(num_physical):
             e = p2l_l[p]
@@ -421,18 +421,18 @@ def rebalance_experts(
     )
 
     if not enable_hierarchical or num_groups == 1 or num_nodes == 1:
-        for l in range(num_layers):
-            old_p2l_l = None if old_p2l is None else old_p2l[l]
+        for layer in range(num_layers):
+            old_p2l_l = None if old_p2l is None else old_p2l[layer]
             p2l_l, rank_l, cnt_l = _rebalance_single_layer_global(
-                weight[l],
+                weight[layer],
                 num_physical,
                 num_gpus,
                 policy=policy,
                 old_p2l_layer=old_p2l_l,
             )
-            p2l[l] = p2l_l
-            phyrank[l] = rank_l
-            logcnt[l] = cnt_l
+            p2l[layer] = p2l_l
+            phyrank[layer] = rank_l
+            logcnt[layer] = cnt_l
         l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
         return p2l, l2p, logcnt
 
@@ -443,8 +443,8 @@ def rebalance_experts(
     phy_per_node = num_physical // num_nodes
     phy_per_gpu = num_physical // num_gpus
 
-    for l in range(num_layers):
-        group_weight = weight[l].view(num_groups, group_size).sum(dim=1).view(1, -1)
+    for layer in range(num_layers):
+        group_weight = weight[layer].view(num_groups, group_size).sum(dim=1).view(1, -1)
         group_to_node, _ = balanced_packing(group_weight, num_nodes)
         group_to_node = group_to_node[0]
 
@@ -470,7 +470,7 @@ def rebalance_experts(
 
         for node_id in range(num_nodes):
             node_logical_ids = logical_ids_per_node[node_id]
-            node_weight = weight[l, node_logical_ids]
+            node_weight = weight[layer, node_logical_ids]
             node_p2l_local, node_rank_local, node_cnt_local = (
                 _rebalance_single_layer_global(
                     node_weight, phy_per_node, gpus_per_node, policy=policy
@@ -496,9 +496,9 @@ def rebalance_experts(
             p2l_l[global_phy.to(torch.int64)] = node_global_logical
             phyrank_l[global_phy.to(torch.int64)] = node_rank_local
 
-        p2l[l] = p2l_l
-        phyrank[l] = phyrank_l
-        logcnt[l] = cnt_l
+        p2l[layer] = p2l_l
+        phyrank[layer] = phyrank_l
+        logcnt[layer] = cnt_l
 
     l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
     return p2l, l2p, logcnt
@@ -565,9 +565,9 @@ def _build_rank_dispatch_map(
     l2p_rows = logical_to_physical_map.cpu().tolist()
     cnt_rows = logical_replica_count.cpu().tolist()
     out_rows: list[list[int]] = []
-    for l in range(num_layers):
-        l2p_l = l2p_rows[l]
-        cnt_l = cnt_rows[l]
+    for layer in range(num_layers):
+        l2p_l = l2p_rows[layer]
+        cnt_l = cnt_rows[layer]
         row = [0] * num_logical
         for e in range(num_logical):
             cnt = cnt_l[e]
@@ -2110,16 +2110,15 @@ class EPLBManager:
     def _log_rebalance_metrics(
         self, *, rc: int, logical_load: torch.Tensor, logcnt: torch.Tensor
     ) -> None:
-        """Log per-rebalance tuning metrics (ep_rank 0 only; both are identical
-        across ranks). Two signals for sizing num_redundant / choosing placement
-        policy:
+        """Log the NEW plan's characteristics (ep_rank 0 only; identical across
+        ranks) for sizing num_redundant / choosing placement policy:
+          - replicated_experts: how many (layer, logical) slots got >1 replica.
           - traffic_to_replicated: fraction of load hitting replicated (logcnt>1)
             experts. The CEILING of any locality-first dispatch benefit, since
             non-replicated experts have a single slot and no dispatch choice.
-          - realized: the LIVE placement (installed at the *previous* rebalance)
-            scored on THIS window's traffic = per-GPU balancedness, i.e. per-layer
-            mean/max total load over ranks, averaged over layers; comparable to
-            vllm's per-window metric.
+
+        The live placement's per-GPU balancedness (the gate metric) is logged
+        by the gate (_need_rebalance) for the same window.
 
         Diagnostic only: never raises into the rebalance path.
         """
@@ -2134,30 +2133,16 @@ class EPLBManager:
             frac = float(ll[redundant_mask].sum().item()) / total if total > 0 else 0.0
             num_redundant = int(redundant_mask.sum().item())
 
-            ep = int(self.live_metadata.ep_size)
-
-            def _pergpu_bal(p2l_map: torch.Tensor) -> float:
-                pm = p2l_map.detach().to("cpu")
-                safe = pm.clamp(min=0).to(torch.int64)
-                slot = torch.gather(ll, 1, safe)
-                slot = torch.where(pm >= 0, slot, torch.zeros_like(slot))
-                num_l, num_p = pm.shape
-                perg = slot.view(num_l, ep, num_p // ep).sum(dim=2)
-                mx = perg.max(dim=1).values
-                mn = perg.mean(dim=1)
-                b = torch.where(mx > 0, mn / mx, torch.ones_like(mn))
-                return float(b.mean().item())
-
-            realized = _pergpu_bal(self.live_metadata.physical_to_logical_map)
+            # New-plan characteristics only. The live placement's per-GPU
+            # balancedness is logged by the gate (_need_rebalance).
             logger.info(
                 "EPLB rebalance #%d metrics: replicated_experts=%d/%d "
-                "(%.1f/layer), traffic_to_replicated=%.4f, realized=%.3f",
+                "(%.1f/layer), traffic_to_replicated=%.4f",
                 rc,
                 num_redundant,
                 logcnt_cpu.numel(),
                 num_redundant / logcnt_cpu.shape[0],
                 frac,
-                realized,
             )
         except Exception as exc:  # pragma: no cover - diagnostic only
             logger.warning("EPLB rebalance #%d metrics calc failed: %s", rc, exc)
@@ -2184,10 +2169,23 @@ class EPLBManager:
         return balancedness
 
     def _compute_balancedness(self, physical_load: torch.Tensor) -> float:
-        # per-layer balancedness = mean / max over physical experts
+        # Per-GPU balancedness of the live placement on THIS window, from the
+        # MEASURED per-physical-slot load: sum each GPU's contiguous slot block
+        # into a per-(layer, GPU) load, take per-layer mean/max over GPUs, then
+        # aggregate over layers (agg='min' = worst layer, 'mean' = average).
+        # Measured load means replica traffic is already split across GPUs -- no
+        # logical->physical projection, no replica double-counting. GPU is the
+        # bottleneck unit (ranks sync at combine), so this is the balancedness
+        # that actually reflects whether a rebalance would help.
         load_f = physical_load.to(torch.float32)
-        per_layer_max = load_f.max(dim=1).values
-        per_layer_mean = load_f.mean(dim=1)
+        num_l, num_p = load_f.shape
+        meta = self.live_metadata
+        ep = int(meta.ep_size) if meta is not None else 0
+        if ep <= 0 or num_p % ep != 0:
+            return 0.0
+        perg = load_f.view(num_l, ep, num_p // ep).sum(dim=2)
+        per_layer_max = perg.max(dim=1).values
+        per_layer_mean = perg.mean(dim=1)
         per_layer_bal = torch.ones_like(per_layer_mean)
         nonzero = per_layer_max > 0
         per_layer_bal[nonzero] = per_layer_mean[nonzero] / per_layer_max[nonzero]

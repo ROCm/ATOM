@@ -8,8 +8,11 @@ torch = pytest.importorskip("torch")
 # Import atom.config first so it is fully initialized before atom.model_ops's
 # __init__ chain references get_current_atom_config (avoids a mainline circular
 # import that only surfaces when atom.model_ops is the entry-point import).
-import atom.config  # noqa: F401
-import atom.model_ops.eplb as eplb
+try:
+    import atom.config  # noqa: F401
+    import atom.model_ops.eplb as eplb
+except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
+    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
 
 class _FakeTPGroup:

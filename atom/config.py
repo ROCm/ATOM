@@ -1032,7 +1032,7 @@ class EPLBConfig:
     rebalance_interval: int = 3000
     rebalance_layers_per_chunk: int = 64
     num_redundant_experts: int = 0
-    rebalance_min_balancedness: float = 0.8
+    rebalance_min_balancedness: float = 2.0
     rebalance_balancedness_agg: str = "min"
     p2p_batch_chunk_size: int = 32
     # Placement policy for spending the redundant-expert budget:
