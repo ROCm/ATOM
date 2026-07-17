@@ -16,6 +16,13 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_is_enabled,
+    pcp_pad_dense,
+    pcp_pad_len,
+    pcp_round_robin_query_indices,
+)
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
 from atom.utils import CpuGpuBuffer
@@ -961,6 +968,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_prefill_reduce_partial_map"
             ]
 
+            # ---- Prefill Context Parallel: shrink per-query sparse metadata --
+            # to this rank's 1/pcp round-robin queries. Gate on
+            # `not batch.is_dummy_run` so the reindex stays in lock-step with the
+            # model's round-robin token split (ForCausalLM._pcp_active() also
+            # skips dummy/warmup). Per-sequence + KV-write fields (slot_mapping,
+            # block_tables, cu_seqlens_q/k) stay FULL — every rank keeps full KV.
+            if pcp_is_enabled() and not batch.is_dummy_run:
+                self._apply_pcp_reindex(
+                    attn_metadata, sum_scheduled_tokens, sparse_counts
+                )
+
         if hasattr(self.model_runner, "drafter") or attn_metadata.has_cached:
             # Populate kv_last_page_lens for full sequence (needed for MLA prefill with
             # prefix cache; decode does the same)
@@ -1096,6 +1114,107 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             k_workspace=self.k_chunk_workspace,
             v_workspace=self.v_chunk_workspace,
         )
+
+    def _apply_pcp_reindex(
+        self,
+        attn_metadata: AttentionMetaData,
+        sum_scheduled_tokens: int,
+        sparse_counts: np.ndarray,
+    ) -> None:
+        """Reduce the per-query sparse-prefill metadata to this PCP rank's
+        1/pcp round-robin queries.
+
+        Prefill Context Parallel round-robin splits the token sequence so each
+        rank runs the model on 1/pcp of the query tokens while still keeping the
+        FULL KV. Only *query-indexed* metadata shrinks here; *per-sequence* and
+        *KV-write* fields (slot_mapping, block_tables, cu_seqlens_q/k) stay full
+        so the full k-cache is still written and gathered.
+
+        The global token count is padded to a multiple of pcp_size; the extra
+        (dummy) queries get zero-length KV (they attend nothing and their hidden
+        output is dropped after the model's final all-gather + unpad).
+        """
+        device = self.device
+        pcp_ws = get_pcp_world_size()
+        s_real = int(sum_scheduled_tokens)
+        padded_total = pcp_pad_len(s_real, pcp_ws)
+        n_pad = padded_total - s_real
+        owned_q = pcp_round_robin_query_indices(padded_total, pcp_ws).to(device)
+        n_owned = int(owned_q.shape[0])
+
+        # --- dense per-query fields: pad with zeros (dummy query -> 0), select.
+        #     cu_seqlen_ks/ke become 0/0 for dummies == empty logits row.
+        ks_padded = pcp_pad_dense(attn_metadata.cu_seqlen_ks, n_pad)
+        attn_metadata.cu_seqlen_ks = ks_padded[owned_q].contiguous()
+        ke_padded = pcp_pad_dense(attn_metadata.cu_seqlen_ke, n_pad)
+        attn_metadata.cu_seqlen_ke = ke_padded[owned_q].contiguous()
+        t2s_padded = pcp_pad_dense(attn_metadata.token_to_seq_idxs, n_pad)
+        attn_metadata.token_to_seq_idxs = t2s_padded[owned_q].contiguous()
+
+        # --- one query per row (incl dummies) -> sparse_cu_seqlens_q = arange.
+        attn_metadata.sparse_cu_seqlens_q = torch.arange(
+            n_owned + 1, dtype=torch.int32, device=device
+        )
+
+        # --- sparse_kv_indptr: cumsum of min(sparse_counts, topk); dummy -> 0.
+        sparse_counts_t = torch.as_tensor(sparse_counts, device=device)
+        owned_counts = pcp_pad_dense(sparse_counts_t, n_pad)[owned_q].to(torch.int64)
+        owned_counts = torch.clamp(owned_counts, max=self.index_topk)
+        indptr_owned = torch.zeros(n_owned + 1, dtype=torch.int32, device=device)
+        indptr_owned[1:] = torch.cumsum(owned_counts, 0).to(torch.int32)
+        attn_metadata.sparse_kv_indptr = indptr_owned
+
+        # --- sparse kv_last_page_lens: one page per owned query (all 1s).
+        attn_metadata.kv_last_page_lens = torch.ones(
+            n_owned, dtype=torch.int32, device=device
+        )
+
+        # --- rebuild the sparse-prefill work buffers for the owned queries.
+        var = self.model_runner.forward_vars
+        get_mla_metadata_v1(
+            attn_metadata.sparse_cu_seqlens_q,
+            attn_metadata.sparse_kv_indptr,
+            attn_metadata.kv_last_page_lens,
+            self.padded_num_attention_heads,
+            1,  # nhead_kv
+            True,
+            var["sparse_prefill_work_meta_data"],
+            var["sparse_prefill_work_info_set"],
+            var["sparse_prefill_work_indptr"],
+            var["sparse_prefill_reduce_indptr"],
+            var["sparse_prefill_reduce_final_map"],
+            var["sparse_prefill_reduce_partial_map"],
+            page_size=self.block_size,
+            dtype_q=self.dtype_q,
+            dtype_kv=self.dtype_kv,
+            kv_granularity=max(self.block_size, 16),
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=1,
+            max_split_per_batch=16,
+        )
+        attn_metadata.sparse_prefill_work_meta_data = var[
+            "sparse_prefill_work_meta_data"
+        ]
+        attn_metadata.sparse_prefill_work_info_set = var["sparse_prefill_work_info_set"]
+        attn_metadata.sparse_prefill_work_indptr = var["sparse_prefill_work_indptr"]
+        attn_metadata.sparse_prefill_reduce_indptr = var["sparse_prefill_reduce_indptr"]
+        attn_metadata.sparse_prefill_reduce_final_map = var[
+            "sparse_prefill_reduce_final_map"
+        ]
+        attn_metadata.sparse_prefill_reduce_partial_map = var[
+            "sparse_prefill_reduce_partial_map"
+        ]
+
+        # --- owned slot_mapping for the fused q_out kernel in MLAAttention. The
+        #     fused MLA kernel that produces q_out also writes k to these slots;
+        #     that write is throwaway (the full-KV completion write in
+        #     MLAAttention overwrites every real slot). Dummy queries clamp to
+        #     the last real slot so they can never touch an unrelated slot.
+        owned_clamped = torch.clamp(owned_q, max=max(s_real - 1, 0))
+        attn_metadata.slot_mapping_owned = attn_metadata.slot_mapping[
+            owned_clamped
+        ].contiguous()
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode

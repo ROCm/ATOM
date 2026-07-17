@@ -52,6 +52,8 @@ class KVOutputAggregator:
         self._seen_recving: dict[ReqId, set[int]] = {}
         self._seen_recv_failed: dict[ReqId, set[int]] = {}
         self._seen_saving: dict[ReqId, set[int]] = {}
+        self._seen_loading: dict[ReqId, set[int]] = {}
+        self._seen_load_failed: dict[ReqId, set[int]] = {}
 
     @property
     def world_size(self) -> int:
@@ -84,6 +86,12 @@ class KVOutputAggregator:
             if wo.finished_saving:
                 for rid in wo.finished_saving:
                     self._seen_saving.setdefault(rid, set()).add(worker_idx)
+            if wo.finished_loading:
+                for rid in wo.finished_loading:
+                    self._seen_loading.setdefault(rid, set()).add(worker_idx)
+            if wo.failed_loading:
+                for rid in wo.failed_loading:
+                    self._seen_load_failed.setdefault(rid, set()).add(worker_idx)
 
         done_sending = {
             rid
@@ -110,6 +118,21 @@ class KVOutputAggregator:
             for rid, workers in self._seen_saving.items()
             if len(workers) >= self._world_size
         }
+        failed_loading = set()
+        load_ids = set(self._seen_loading) | set(self._seen_load_failed)
+        for rid in load_ids:
+            done_workers = self._seen_loading.get(rid, set())
+            failed_workers = self._seen_load_failed.get(rid, set())
+            if (
+                failed_workers
+                and len(done_workers | failed_workers) >= self._world_size
+            ):
+                failed_loading.add(rid)
+        done_loading = {
+            rid
+            for rid, workers in self._seen_loading.items()
+            if len(workers) >= self._world_size and rid not in failed_loading
+        }
 
         for rid in done_sending:
             del self._seen_sending[rid]
@@ -121,12 +144,20 @@ class KVOutputAggregator:
             self._seen_recv_failed.pop(rid, None)
         for rid in done_saving:
             del self._seen_saving[rid]
+        for rid in done_loading:
+            del self._seen_loading[rid]
+            self._seen_load_failed.pop(rid, None)
+        for rid in failed_loading:
+            self._seen_loading.pop(rid, None)
+            self._seen_load_failed.pop(rid, None)
 
         return KVConnectorOutput(
             finished_sending=done_sending,
             finished_recving=done_recving,
             failed_recving=failed_recving,
             finished_saving=done_saving,
+            finished_loading=done_loading,
+            failed_loading=failed_loading,
         )
 
     def reset(self) -> None:
@@ -135,6 +166,8 @@ class KVOutputAggregator:
         self._seen_recving.clear()
         self._seen_recv_failed.clear()
         self._seen_saving.clear()
+        self._seen_loading.clear()
+        self._seen_load_failed.clear()
 
     @property
     def pending_count(self) -> tuple[int, int]:
@@ -142,5 +175,6 @@ class KVOutputAggregator:
         return (
             len(self._seen_sending),
             len(set(self._seen_recving) | set(self._seen_recv_failed))
-            + len(self._seen_saving),
+            + len(self._seen_saving)
+            + len(set(self._seen_loading) | set(self._seen_load_failed)),
         )

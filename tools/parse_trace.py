@@ -1,75 +1,48 @@
 #!/usr/bin/env python3
-"""
-Parse PyTorch profiler trace JSON to extract kernel information.
+"""Small, step-by-step ATOM trace parser.
 
-Usage:
-    python parse_trace.py <trace.json> [--layer N]
+Step 1: find the decode warmup window in the capture trace that corresponds to
+the first decode event in the run trace.
 """
 
-import json
-import gzip
-import sys
-import bisect
+from __future__ import annotations
+
 import argparse
-import re
+import csv
+import gzip
+import json
 import os
+import re
 from glob import glob
-from typing import List, Dict, Any, Tuple, Optional
-from openpyxl import Workbook
+from typing import Any
 
-# Modules to filter out (no corresponding GPU kernel in decode)
-FILTER_OUT = ["fill_"]
-
-# Sampling-related modules and low-level ops to filter out in prefill
-FILTER_OUT_PREFILL = ["aiter::mixed_sample"]
-STRICT_NORM_NAMES = ["layernorm", "rmsnorm", "rmsnorm_quant"]
-SPECIAL_KERNEL_LAUNCH_NAMES = ["hipmemcpyasync"]
+SPECIAL_KERNEL_LAUNCH_NAMES = {"hipmemcpyasync"}
 
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
+def load_events(path: str) -> list[dict[str, Any]]:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+        return json.load(f).get("traceEvents", [])
 
 
-def load_trace(filepath: str) -> Dict[str, Any]:
-    """Load trace JSON file (supports .gz)."""
-    opener = gzip.open if filepath.endswith(".gz") else open
-    with opener(filepath, "rt", encoding="utf-8") as f:
-        return json.load(f)
+def event_end(event: dict[str, Any]) -> float:
+    return float(event.get("ts", 0.0)) + float(event.get("dur", 0.0))
 
 
 def is_kernel_launch(name: str) -> bool:
-    """Check if name is a kernel launch or equivalent runtime op."""
-    n = name.lower()
-    return ("launch" in n and "kernel" in n) or n in SPECIAL_KERNEL_LAUNCH_NAMES
+    normalized = name.lower()
+    return (
+        "launch" in normalized and "kernel" in normalized
+    ) or normalized in SPECIAL_KERNEL_LAUNCH_NAMES
 
 
-def should_filter(name: str) -> bool:
-    """Check if module should be filtered out."""
-    return any(f in name for f in FILTER_OUT)
+def short(text: Any, limit: int = 80) -> str:
+    value = str(text)
+    return value if len(value) <= limit else value[: limit - 3] + "..."
 
 
-def should_filter_prefill(name: str) -> bool:
-    """Check if module should be filtered out in prefill (sampling ops)."""
-    return any(f in name for f in FILTER_OUT_PREFILL)
-
-
-def is_strict_norm_name(name: str) -> bool:
-    """Match norm module names strictly, not by substring."""
-    if not isinstance(name, str):
-        return False
-    n = name.strip().lower()
-    return n in STRICT_NORM_NAMES
-
-
-def extract_model_name_from_trace_filename(filepath: str) -> Optional[str]:
-    """
-    Extract model name from trace filename prefix before `_ts_`.
-    Examples:
-      - Meta-Llama-3.1-8B-Instruct_ts_... -> Meta-Llama-3.1-8B-Instruct
-      - capture_graph_Meta-Llama-3.1-8B-Instruct_ts_... -> Meta-Llama-3.1-8B-Instruct
-    """
-    base = os.path.basename(filepath)
+def model_name_from_trace(path: str) -> str | None:
+    base = os.path.basename(path)
     if "_ts_" not in base:
         return None
     prefix = base.split("_ts_", 1)[0]
@@ -78,1028 +51,895 @@ def extract_model_name_from_trace_filename(filepath: str) -> Optional[str]:
     return prefix or None
 
 
-def find_capture_graph_trace_path(run_trace_path: str) -> Optional[str]:
-    """
-    Find capture graph trace file in the same directory as the run trace.
-    Pattern: capture_graph_<model>_ts_*.pt.trace.json[.gz]
-    """
-    model_name = extract_model_name_from_trace_filename(run_trace_path)
+def find_capture_trace(run_trace: str) -> str | None:
+    model_name = model_name_from_trace(run_trace)
     if not model_name:
         return None
-    trace_dir = os.path.dirname(run_trace_path) or "."
+    trace_dir = os.path.dirname(run_trace) or "."
     pattern = os.path.join(trace_dir, f"capture_graph_{model_name}_ts_*.pt.trace.json*")
     candidates = sorted(glob(pattern), key=os.path.getmtime, reverse=True)
+    run_abs = os.path.abspath(run_trace)
+    for candidate in candidates:
+        if os.path.abspath(candidate) != run_abs:
+            return candidate
+    return None
+
+
+def find_first_decode(events: list[dict[str, Any]]) -> dict[str, Any]:
+    decodes = sorted(
+        [
+            event
+            for event in events
+            if event.get("ph") == "X"
+            and event.get("cat") == "gpu_user_annotation"
+            and str(event.get("name", "")).startswith("decode[")
+        ],
+        key=lambda event: event["ts"],
+    )
+    if not decodes:
+        raise RuntimeError("No decode gpu_user_annotation found in run trace.")
+    return decodes[0]
+
+
+def decode_batch_size(decode_event: dict[str, Any]) -> int:
+    match = re.search(r"bs=(\d+)", str(decode_event.get("name", "")))
+    if not match:
+        raise RuntimeError(
+            f"Could not parse batch size from {decode_event.get('name')!r}"
+        )
+    return int(match.group(1))
+
+
+def find_cpu_capture_graphs(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        [
+            event
+            for event in events
+            if event.get("ph") == "X"
+            and event.get("cat") == "user_annotation"
+            and str(event.get("name", "")).startswith("capture_graph_bs_")
+        ],
+        key=lambda event: event["ts"],
+    )
+
+
+def find_capture_graph_for_bs(
+    capture_events: list[dict[str, Any]], batch_size: int
+) -> dict[str, Any]:
+    graphs = find_cpu_capture_graphs(capture_events)
+    if not graphs:
+        raise RuntimeError(
+            "No CPU capture_graph_bs_* annotations found in capture trace."
+        )
+    target_name = f"capture_graph_bs_{batch_size}"
+    for graph in graphs:
+        if graph.get("name") == target_name:
+            return graph
+    raise RuntimeError(f"No {target_name} found in capture trace.")
+
+
+def warmup_window_for_graph(
+    capture_events: list[dict[str, Any]], target_graph: dict[str, Any]
+) -> tuple[float, float]:
+    """Return [previous_capture_graph_end, target_capture_graph_start)."""
+    start = 0.0
+    for graph in find_cpu_capture_graphs(capture_events):
+        if graph is target_graph:
+            return start, float(target_graph["ts"])
+        start = max(start, event_end(graph))
+    raise RuntimeError("Target capture graph was not in capture graph list.")
+
+
+def count_events_in_window(
+    events: list[dict[str, Any]], start: float, end: float
+) -> dict[str, int]:
+    counts = {"duration": 0, "user_annotation": 0, "cuda_runtime": 0, "kernel": 0}
+    for event in events:
+        if event.get("ph") != "X":
+            continue
+        ts = float(event.get("ts", 0.0))
+        if not (start <= ts < end):
+            continue
+        counts["duration"] += 1
+        cat = event.get("cat")
+        if cat in counts:
+            counts[cat] += 1
+    return counts
+
+
+def build_correlation_index(
+    events: list[dict[str, Any]], start: float, end: float
+) -> tuple[dict[Any, dict[str, Any]], dict[Any, dict[str, Any]]]:
+    launches: dict[Any, dict[str, Any]] = {}
+    kernels: dict[Any, dict[str, Any]] = {}
+    for event in events:
+        if event.get("ph") != "X":
+            continue
+        ts = float(event.get("ts", 0.0))
+        if not (start <= ts < end):
+            continue
+        corr = (event.get("args") or {}).get("correlation")
+        if corr is None:
+            continue
+        if event.get("cat") == "cuda_runtime" and is_kernel_launch(
+            str(event.get("name", ""))
+        ):
+            launches.setdefault(corr, event)
+        elif event.get("cat") == "kernel":
+            kernels.setdefault(corr, event)
+    return launches, kernels
+
+
+def containing_annotations(
+    event: dict[str, Any], annotations: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    start = float(event["ts"])
+    end = event_end(event)
+    return [
+        ann
+        for ann in annotations
+        if ann.get("pid") == event.get("pid")
+        and ann.get("tid") == event.get("tid")
+        and float(ann.get("ts", 0.0)) <= start
+        and end <= event_end(ann)
+    ]
+
+
+def is_compiled_graph_tag(name: str) -> bool:
+    return name.startswith("## Call CompiledFxGraph")
+
+
+def cpu_fallback_tag_for_compiled_kernel(
+    kernel: dict[str, Any],
+    launch_by_corr: dict[Any, dict[str, Any]],
+    cpu_events: list[dict[str, Any]],
+) -> str | None:
+    corr = (kernel.get("args") or {}).get("correlation")
+    launch = launch_by_corr.get(corr)
+    if launch is None:
+        return None
+
+    containers = containing_annotations(launch, cpu_events)
+    # Include cpu_op parents as well as user annotations, then pick the largest
+    # non-CompiledFxGraph container. This maps tiny compiled graph kernels such
+    # as FillFunctor copies back to semantic CPU ops like aiter::all_reduce_.
+    start = float(launch["ts"])
+    end = event_end(launch)
+    containers.extend(
+        event
+        for event in cpu_events
+        if event.get("cat") == "cpu_op"
+        and event.get("pid") == launch.get("pid")
+        and event.get("tid") == launch.get("tid")
+        and float(event.get("ts", 0.0)) <= start
+        and end <= event_end(event)
+    )
+    candidates = [
+        event
+        for event in containers
+        if not is_compiled_graph_tag(str(event.get("name", "")))
+    ]
     if not candidates:
         return None
-    run_abs = os.path.abspath(run_trace_path)
-    for fp in candidates:
-        if os.path.abspath(fp) != run_abs:
-            return fp
-    return None
-
-
-_LLVM_CXXFILT_PATH: Optional[str] = None
-_DEMANGLE_CACHE: Dict[str, str] = {}
-
-
-def _find_llvm_cxxfilt() -> Optional[str]:
-    """Find llvm-cxxfilt binary (supports HIP/ROCm mangled names)."""
-    global _LLVM_CXXFILT_PATH
-    if _LLVM_CXXFILT_PATH is not None:
-        return _LLVM_CXXFILT_PATH or None
-
-    import shutil
-    import subprocess
-
-    # Check PATH first
-    path = shutil.which("llvm-cxxfilt")
-    if path:
-        _LLVM_CXXFILT_PATH = path
-        return path
-
-    # Check known install paths before resorting to find
-    known_paths = [
-        "/opt/rocm/llvm/bin/llvm-cxxfilt",
-        "/usr/bin/llvm-cxxfilt",
-        "/usr/local/bin/llvm-cxxfilt",
-    ]
-    for p in known_paths:
-        if os.path.isfile(p):
-            _LLVM_CXXFILT_PATH = p
-            return p
-
-    # Fallback: search common locations with depth limit
-    search_dirs = ["/root/.triton/llvm", "/opt/rocm"]
-    for d in search_dirs:
-        if not os.path.isdir(d):
-            continue
-        try:
-            result = subprocess.run(
-                [
-                    "find",
-                    d,
-                    "-maxdepth",
-                    "5",
-                    "-name",
-                    "llvm-cxxfilt",
-                    "-type",
-                    "f",
-                    "-print",
-                    "-quit",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            found = result.stdout.strip()
-            if found:
-                _LLVM_CXXFILT_PATH = found
-                return found
-        except (subprocess.TimeoutExpired, OSError):
-            continue
-
-    _LLVM_CXXFILT_PATH = ""
-    return None
-
-
-def _demangle_batch(names: list[str]) -> None:
-    """Batch demangle C++ mangled names using a single llvm-cxxfilt call."""
-    mangled = [n for n in names if n.startswith("_Z") and n not in _DEMANGLE_CACHE]
-    if not mangled:
-        return
-
-    cxxfilt = _find_llvm_cxxfilt()
-    if not cxxfilt:
-        for n in mangled:
-            _DEMANGLE_CACHE[n] = n
-        return
-
-    import subprocess
-
-    try:
-        result = subprocess.run(
-            [cxxfilt],
-            input="\n".join(mangled),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        demangled_list = result.stdout.strip().split("\n")
-        for orig, dem in zip(mangled, demangled_list):
-            _DEMANGLE_CACHE[orig] = dem.strip() if dem.strip() else orig
-    except (subprocess.TimeoutExpired, OSError):
-        for n in mangled:
-            _DEMANGLE_CACHE[n] = n
-
-
-def _demangle_kernel_name(name: str) -> str:
-    """Demangle C++ mangled kernel name (uses cache populated by _demangle_batch)."""
-    if name in _DEMANGLE_CACHE:
-        return _DEMANGLE_CACHE[name]
-    _DEMANGLE_CACHE[name] = name
-    return name
-
-
-def write_breakdown_xlsx(
-    output_xlsx: str,
-    rows: List[List[Any]],
-    sheet_name: str,
-    avg_rows: Optional[List[List[Any]]] = None,
-) -> None:
-    """
-    Write XLSX breakdown with columns:
-    cpu_module, gpu_kernel, duration_us, pct%, sum per module, module_pct%,
-    avg duration_us, avg sum per module.
-
-    Also writes a 'kernel_summary' sheet with aggregated kernel statistics.
-
-    The 1st/5th columns are merged for contiguous identical modules.
-    AVG columns are appended to the right in the same table.
-    """
-    wb = Workbook()
-    # Batch demangle all kernel names upfront (single subprocess call)
-    all_kernels = [r[1] for r in rows]
-    if avg_rows:
-        all_kernels.extend(r[1] for r in avg_rows)
-    _demangle_batch(all_kernels)
-
-    ws = wb.active
-    ws.title = sheet_name
-    ws.append(
-        [
-            "cpu_module",
-            "gpu_kernel",
-            "duration_us",
-            "pct%",
-            "sum per module",
-            "module_pct%",
-            "avg duration_us",
-            "avg sum per module",
-        ]
+    return str(
+        max(candidates, key=lambda event: float(event.get("dur", 0.0))).get("name")
     )
 
-    total_duration = sum(float(r[2]) for r in rows) if rows else 0.0
 
-    def build_groups(block_rows: List[List[Any]]) -> List[Tuple[int, int, str, float]]:
-        groups: List[Tuple[int, int, str, float]] = []
-        i = 0
-        while i < len(block_rows):
-            mod = block_rows[i][0]
-            j = i + 1
-            total = float(block_rows[i][2])
-            while j < len(block_rows) and block_rows[j][0] == mod:
-                total += float(block_rows[j][2])
-                j += 1
-            groups.append((i, j - 1, mod, total))
-            i = j
-        return groups
-
-    main_groups = build_groups(rows) if rows else []
-    renamed_group_mods = [g[2] for g in main_groups]
-    seen_rmsnorm = 0
-    for gi, mod in enumerate(renamed_group_mods):
-        if is_strict_norm_name(mod):
-            if seen_rmsnorm == 0:
-                renamed_group_mods[gi] = "input_layernorm"
-            elif seen_rmsnorm == 1:
-                renamed_group_mods[gi] = "post_attn_layernorm"
-            seen_rmsnorm += 1
-
-    avg_sum_by_row: Dict[int, float] = {}
-    if avg_rows:
-        avg_groups = build_groups(avg_rows)
-        for start, end, _, total in avg_groups:
-            for i in range(start, end + 1):
-                avg_sum_by_row[i] = total
-
-    data_start_row = ws.max_row + 1
-    for gi, (start, end, _, mod_total) in enumerate(main_groups):
-        renamed_mod = renamed_group_mods[gi]
-        mod_pct = (mod_total / total_duration * 100) if total_duration > 0 else 0
-        for idx in range(start, end + 1):
-            _, kernel, dur = rows[idx]
-            dur_f = float(dur)
-            pct = (dur_f / total_duration * 100) if total_duration > 0 else 0
-            avg_dur = (
-                float(avg_rows[idx][2]) if avg_rows and idx < len(avg_rows) else ""
-            )
-            avg_sum = avg_sum_by_row.get(idx, "")
-            ws.append(
-                [
-                    renamed_mod,
-                    _demangle_kernel_name(kernel),
-                    dur,
-                    round(pct, 1),
-                    mod_total,
-                    round(mod_pct, 1),
-                    avg_dur,
-                    avg_sum,
-                ]
-            )
-
-    for start, end, _, _ in main_groups:
-        if end > start:
-            r1 = data_start_row + start
-            r2 = data_start_row + end
-            ws.merge_cells(start_row=r1, start_column=1, end_row=r2, end_column=1)
-            ws.merge_cells(start_row=r1, start_column=5, end_row=r2, end_column=5)
-            ws.merge_cells(start_row=r1, start_column=6, end_row=r2, end_column=6)
-            if avg_rows:
-                ws.merge_cells(start_row=r1, start_column=8, end_row=r2, end_column=8)
-
-    total_avg_duration = sum(float(r[2]) for r in avg_rows) if avg_rows else ""
-    ws.append(["TOTAL", "", total_duration, 100.0, "", 100.0, total_avg_duration, ""])
-
-    # --- Kernel Summary Sheet ---
-    if rows:
-        _write_kernel_summary_sheet(wb, rows, total_duration)
-
-    wb.save(output_xlsx)
+def gpu_tag_for_kernel(
+    kernel: dict[str, Any],
+    gpu_annotations: list[dict[str, Any]],
+    launch_by_corr: dict[Any, dict[str, Any]],
+    cpu_events: list[dict[str, Any]],
+) -> str:
+    containers = containing_annotations(kernel, gpu_annotations)
+    if not containers:
+        return "<no gpu tag>"
+    tag = str(
+        min(containers, key=lambda event: float(event.get("dur", 0.0))).get("name")
+    )
+    if is_compiled_graph_tag(tag):
+        fallback = cpu_fallback_tag_for_compiled_kernel(
+            kernel, launch_by_corr, cpu_events
+        )
+        if fallback:
+            return fallback
+    return tag
 
 
-def _write_kernel_summary_sheet(
-    wb: "Workbook",
-    rows: List[List[Any]],
-    total_duration: float,
-) -> None:
-    """Write a kernel_summary sheet: aggregated stats by kernel name."""
-    ws = wb.create_sheet("kernel_summary")
-    ws.append(["gpu_kernel", "calls", "total_duration_us", "avg_duration_us", "pct%"])
+def build_warmup_mapping(
+    capture_events: list[dict[str, Any]], start: float, end: float
+) -> list[dict[str, Any]]:
+    """Build the internal decode warmup mapping.
 
-    kernel_stats: Dict[str, List[float]] = {}
-    for _, kernel, dur in rows:
-        short_name = _demangle_kernel_name(kernel)
-        kernel_stats.setdefault(short_name, []).append(float(dur))
+    Each row is intentionally minimal:
+      - module: resolved CPU/GPU tag name
+      - kernel: GPU kernel name
+      - stream: GPU stream id
 
-    # Sort by total duration descending
-    sorted_kernels = sorted(kernel_stats.items(), key=lambda x: sum(x[1]), reverse=True)
+    This mapping is the attribution source for later replay-duration matching;
+    it is not meant to be emitted as the final user-facing breakdown.
+    """
+    launch_by_corr, _ = build_correlation_index(capture_events, start, end)
+    cpu_events = [
+        event
+        for event in capture_events
+        if event.get("ph") == "X"
+        and start <= float(event.get("ts", 0.0)) < end
+        and event.get("cat") in {"user_annotation", "cpu_op"}
+    ]
+    gpu_annotations = [
+        event
+        for event in capture_events
+        if event.get("ph") == "X"
+        and start <= float(event.get("ts", 0.0)) < end
+        and event.get("cat") == "gpu_user_annotation"
+    ]
+    kernels = sorted(
+        [
+            event
+            for event in capture_events
+            if event.get("ph") == "X"
+            and start <= float(event.get("ts", 0.0)) < end
+            and event.get("cat") == "kernel"
+        ],
+        key=lambda event: event["ts"],
+    )
+    mapping: list[dict[str, Any]] = []
+    for kernel in kernels:
+        args = kernel.get("args") or {}
+        mapping.append(
+            {
+                "module": gpu_tag_for_kernel(
+                    kernel, gpu_annotations, launch_by_corr, cpu_events
+                ),
+                "kernel": str(kernel.get("name", "")),
+                "stream": args.get("stream"),
+            }
+        )
+    return mapping
 
-    for kernel_name, durations in sorted_kernels:
-        total_dur = sum(durations)
-        count = len(durations)
-        avg_dur = total_dur / count
-        pct = (total_dur / total_duration * 100) if total_duration > 0 else 0
-        ws.append(
-            [kernel_name, count, round(total_dur, 3), round(avg_dur, 3), round(pct, 1)]
+
+def print_first_warmup_mappings(mapping: list[dict[str, Any]], limit: int) -> None:
+    print("")
+    print(f"First {limit} warmup mappings:")
+    print("| # | module/tag | stream | kernel |")
+    print("|---:|---|---:|---|")
+    for idx, item in enumerate(mapping[:limit]):
+        print(
+            f"| {idx} | `{short(item['module'], 55)}` | {item['stream']} | "
+            f"`{short(item['kernel'], 85)}` |"
         )
 
 
-def _normalize_module_for_avg(name: str) -> str:
-    if not isinstance(name, str):
-        return str(name)
-    return re.sub(r"model\.layers\.\d+\.", "model.layers.*.", name)
+def decode_gpu_window(
+    run_events: list[dict[str, Any]], decode_event: dict[str, Any]
+) -> tuple[float, float]:
+    """Return the GPU annotation time range for the selected decode event.
+
+    We intentionally use the GPU-side annotation range here: the final CSV is
+    for observed replay GPU kernels. Kernels that fall just outside this range
+    are not included in this first formal path.
+    """
+    external_id = (decode_event.get("args") or {}).get("External id")
+    gpu_decodes = [
+        event
+        for event in run_events
+        if event.get("ph") == "X"
+        and event.get("cat") == "gpu_user_annotation"
+        and (event.get("args") or {}).get("External id") == external_id
+    ]
+    if not gpu_decodes:
+        # Fallback for traces without GPU annotation projection.
+        return float(decode_event["ts"]), event_end(decode_event)
+    return min(float(event["ts"]) for event in gpu_decodes), max(
+        event_end(event) for event in gpu_decodes
+    )
 
 
-def build_avg_rows_from_layers(
-    layer_rows_list: List[Tuple[int, List[List[Any]]]],
-    section_name: str,
-) -> Optional[List[List[Any]]]:
+def replay_kernels_in_window(
+    run_events: list[dict[str, Any]], start: float, end: float
+) -> list[dict[str, Any]]:
+    return sorted(
+        [
+            event
+            for event in run_events
+            if event.get("ph") == "X"
+            and event.get("cat") == "kernel"
+            and start <= float(event.get("ts", 0.0)) < end
+        ],
+        key=lambda event: event["ts"],
+    )
+
+
+def remap_streams(replay_kernels: list[dict[str, Any]]) -> dict[Any, int]:
+    """Map real replay stream ids to compact 1..N ids by numeric order."""
+    streams = sorted(
+        {(event.get("args") or {}).get("stream") for event in replay_kernels},
+        key=lambda value: (value is None, value),
+    )
+    return {stream: idx + 1 for idx, stream in enumerate(streams)}
+
+
+LAYER_RE = re.compile(r"(^|\.)layers\.(\d+)\.")
+
+
+def module_layer(module: str) -> int | None:
+    match = LAYER_RE.search(module)
+    return int(match.group(2)) if match else None
+
+
+def normalize_layer_module(module: str) -> str:
+    return re.sub(r"(^|\.)layers\.\d+\.", r"\1layers.*.", module)
+
+
+def layer_group_label(layers: list[int]) -> str:
+    layers = sorted(layers)
+    if not layers:
+        return "layers <empty>"
+    if len(layers) == 1:
+        return f"layer {layers[0]}"
+    if layers == list(range(layers[0], layers[-1] + 1)):
+        return f"layers {layers[0]}-{layers[-1]}"
+    if len(layers) <= 8:
+        return "layers " + ",".join(str(layer) for layer in layers)
+    return f"layers {layers[0]},{layers[1]},...,{layers[-1]} ({len(layers)} layers)"
+
+
+def warmup_item_owner_layers(warmup_mapping: list[dict[str, Any]]) -> list[int | None]:
+    """Assign warmup rows to layer parse windows.
+
+    A few runtime helper kernels, such as maybe_dual_stream_forward, appear as
+    non-layer tags between two chunks of the same layer.  They should still be
+    consumed while parsing that layer; their original module tag is preserved in
+    the final row.
     """
-    Build AVG rows across layers with fallback:
-    1) try contiguous layers from avg_start_layer.
-    2) if mismatch, retry every other layer: start, start+2, start+4, ...
-    Returns None if still not alignable.
+    direct_layers = [module_layer(item["module"]) for item in warmup_mapping]
+    owners: list[int | None] = []
+    for idx, layer in enumerate(direct_layers):
+        if layer is not None:
+            owners.append(layer)
+            continue
+
+        prev_layer = None
+        for prev_idx in range(idx - 1, -1, -1):
+            if direct_layers[prev_idx] is not None:
+                prev_layer = direct_layers[prev_idx]
+                break
+
+        next_layer = None
+        for next_idx in range(idx + 1, len(direct_layers)):
+            if direct_layers[next_idx] is not None:
+                next_layer = direct_layers[next_idx]
+                break
+
+        owners.append(
+            prev_layer if prev_layer is not None and prev_layer == next_layer else None
+        )
+    return owners
+
+
+def warmup_parse_blocks(
+    warmup_mapping: list[dict[str, Any]],
+) -> list[tuple[int | None, list[tuple[int, dict[str, Any]]]]]:
+    owners = warmup_item_owner_layers(warmup_mapping)
+    blocks: list[tuple[int | None, list[tuple[int, dict[str, Any]]]]] = []
+    for idx, (owner, item) in enumerate(zip(owners, warmup_mapping, strict=True)):
+        if not blocks or blocks[-1][0] != owner:
+            blocks.append((owner, []))
+        blocks[-1][1].append((idx, item))
+    return blocks
+
+
+def primary_replay_stream(replay_kernels: list[dict[str, Any]]) -> Any:
+    counts: dict[Any, int] = {}
+    first_ts: dict[Any, float] = {}
+    for event in replay_kernels:
+        stream = (event.get("args") or {}).get("stream")
+        counts[stream] = counts.get(stream, 0) + 1
+        first_ts.setdefault(stream, float(event.get("ts", 0.0)))
+    return max(counts, key=lambda stream: (counts[stream], -first_ts[stream]))
+
+
+def consume_replay_stream_for_block(
+    stream_events: list[dict[str, Any]],
+    cursor: int,
+    template: list[tuple[int, dict[str, Any]]],
+    used_template_positions: set[int],
+) -> tuple[int, list[tuple[int, dict[str, Any], dict[str, Any]]]]:
+    """Consume one replay stream against one warmup layer block.
+
+    The stream is matched event-by-event to the next compatible warmup kernel in
+    this block, skipping template rows that ran on other replay streams.
     """
-    if not layer_rows_list:
+    rows: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    template_pos = 0
+    pos = cursor
+    while pos < len(stream_events):
+        replay = stream_events[pos]
+        replay_kernel = str(replay.get("name", ""))
+        matched_pos = None
+        for idx in range(template_pos, len(template)):
+            if idx in used_template_positions:
+                continue
+            if template[idx][1]["kernel"] == replay_kernel:
+                matched_pos = idx
+                break
+        if matched_pos is None:
+            break
+
+        used_template_positions.add(matched_pos)
+        template_pos = matched_pos + 1
+        rows.append((template[matched_pos][0], template[matched_pos][1], replay))
+        pos += 1
+    return pos, rows
+
+
+def match_replay_to_warmup(
+    replay_kernels: list[dict[str, Any]], warmup_mapping: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Match replay to warmup layer-by-layer without stream-id assumptions.
+
+    Warmup mapping is treated as the semantic operator template.  For each layer
+    block, the primary replay stream is consumed first, then the remaining
+    streams consume the still-unmatched kernels in the same block.  This avoids
+    assuming capture streams and CUDAGraph replay streams are one-to-one.
+    """
+    if not replay_kernels:
         return []
 
-    def _try_build(
-        selected_layers: List[Tuple[int, List[List[Any]]]],
-    ) -> Tuple[Optional[List[List[Any]]], Optional[int]]:
-        base_layer, base_rows = selected_layers[0]
-        base_sig = [(_normalize_module_for_avg(r[0]), r[1]) for r in base_rows]
+    replay_by_stream: dict[Any, list[dict[str, Any]]] = {}
+    for event in replay_kernels:
+        stream = (event.get("args") or {}).get("stream")
+        replay_by_stream.setdefault(stream, []).append(event)
 
-        for layer_idx, rows in selected_layers[1:]:
-            sig = [(_normalize_module_for_avg(r[0]), r[1]) for r in rows]
-            if sig != base_sig:
-                return None, layer_idx
+    main_stream = primary_replay_stream(replay_kernels)
+    other_streams = [
+        stream
+        for stream in sorted(replay_by_stream, key=lambda value: (value is None, value))
+        if stream != main_stream
+    ]
+    stream_order = [main_stream] + other_streams
+    stream_cursors = {stream: 0 for stream in replay_by_stream}
+    used_warmup_indices: set[int] = set()
+    warmup_owner_layers = warmup_item_owner_layers(warmup_mapping)
+    rows: list[dict[str, Any]] = []
 
-        n = len(selected_layers)
-        avg_rows: List[List[Any]] = []
-        for i, (_, kernel) in enumerate(base_sig):
-            # Keep display style from base layer rows.
-            display_mod = base_rows[i][0]
-            avg_dur = (
-                sum(float(selected_layers[layer_i][1][i][2]) for layer_i in range(n))
-                / n
+    for _, template in warmup_parse_blocks(warmup_mapping):
+        used_template_positions: set[int] = set()
+        block_matches: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+        for stream in stream_order:
+            next_cursor, stream_matches = consume_replay_stream_for_block(
+                replay_by_stream[stream],
+                stream_cursors[stream],
+                template,
+                used_template_positions,
             )
-            avg_rows.append([display_mod, kernel, avg_dur])
-        return avg_rows, None
+            stream_cursors[stream] = next_cursor
+            block_matches.extend(stream_matches)
 
-    start_layer = layer_rows_list[0][0]
-    avg_rows, bad_layer = _try_build(layer_rows_list)
-    if avg_rows is not None:
-        return avg_rows
-
-    print(
-        f"{section_name} avg mismatch: layer {bad_layer} does not match layer {start_layer} layout."
-    )
-    fallback_layers = [
-        item for item in layer_rows_list if (item[0] - start_layer) % 2 == 0
-    ]
-    fallback_indices = [str(layer_idx) for layer_idx, _ in fallback_layers]
-    print(
-        f"{section_name} avg retry with every other layer: {'.'.join(fallback_indices)}"
-    )
-    if len(fallback_layers) < 2:
-        print(f"{section_name} avg skipped: fallback has fewer than 2 layers.")
-        return None
-
-    avg_rows, bad_layer = _try_build(fallback_layers)
-    if avg_rows is not None:
-        return avg_rows
-
-    print(f"{section_name} avg skipped: still mismatch at layer {bad_layer}.")
-    return None
-
-
-# =============================================================================
-# Optimized Event Index for fast time-range queries
-# =============================================================================
-
-
-class EventIndex:
-    """Pre-indexed events for fast time-range queries."""
-
-    def __init__(self, events: List[Dict]):
-        # Filter duration events only
-        self.duration_events = [e for e in events if e.get("ph") == "X"]
-        self.duration_events.sort(key=lambda x: x["ts"])
-        self.ts_list = [e["ts"] for e in self.duration_events]
-
-        # Pre-compute kernel launch flags and prefix sum
-        self._is_kernel_launch = [
-            is_kernel_launch(e.get("name", "")) for e in self.duration_events
-        ]
-        self._kernel_prefix_sum = [0]
-        for is_kl in self._is_kernel_launch:
-            self._kernel_prefix_sum.append(
-                self._kernel_prefix_sum[-1] + (1 if is_kl else 0)
-            )
-
-    def events_in_range(self, start_ts: float, end_ts: float) -> List[Dict]:
-        """Get all duration events within [start_ts, end_ts]."""
-        left = bisect.bisect_left(self.ts_list, start_ts)
-        right = bisect.bisect_right(self.ts_list, end_ts)
-        return [
-            e
-            for e in self.duration_events[left:right]
-            if e["ts"] + e.get("dur", 0) <= end_ts
-        ]
-
-    def count_kernel_launches_in_range(self, start_ts: float, end_ts: float) -> int:
-        """Count kernel launches within time range (fast using prefix sum)."""
-        left = bisect.bisect_left(self.ts_list, start_ts)
-        right = bisect.bisect_right(self.ts_list, end_ts)
-        count = 0
-        for i in range(left, right):
-            e = self.duration_events[i]
-            if e["ts"] + e.get("dur", 0) <= end_ts and self._is_kernel_launch[i]:
-                count += 1
-        return count
-
-    def get_direct_children(self, parent: Dict) -> List[Dict]:
-        """Get direct children of parent event (optimized)."""
-        p_ts = parent["ts"]
-        p_end = p_ts + parent.get("dur", 0)
-
-        # Get candidates in parent's time range
-        candidates = [e for e in self.events_in_range(p_ts, p_end) if e is not parent]
-
-        if not candidates:
-            return []
-
-        # Filter to direct children only (not nested in other candidates)
-        # Sort by duration descending - larger events are potential parents
-        candidates_sorted = sorted(candidates, key=lambda x: -x.get("dur", 0))
-
-        direct = []
-        for i, c in enumerate(candidates_sorted):
-            c_ts, c_dur = c["ts"], c.get("dur", 0)
-            c_end = c_ts + c_dur
-            # Check if c is nested inside any larger candidate
-            is_nested = False
-            for j in range(i):  # Only check larger (earlier in sorted list)
-                o = candidates_sorted[j]
-                o_ts = o["ts"]
-                o_end = o_ts + o.get("dur", 0)
-                if c_ts >= o_ts and c_end <= o_end:
-                    is_nested = True
-                    break
-            if not is_nested:
-                direct.append(c)
-
-        return sorted(direct, key=lambda x: x["ts"])
-
-    def count_kernel_launches(self, event: Dict) -> int:
-        """Count kernel launches within event's time range."""
-        e_ts = event["ts"]
-        e_end = e_ts + event.get("dur", 0)
-        return self.count_kernel_launches_in_range(e_ts, e_end)
-
-    def has_kernel_launch(self, event: Dict) -> bool:
-        """Check if event contains any kernel launch."""
-        return self.count_kernel_launches(event) > 0
-
-
-# =============================================================================
-# Parse Functions
-# =============================================================================
-
-
-def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -> None:
-    """
-    Parse prefill phase from a run trace (no warmup mixed in this trace).
-    """
-    # CPU side prefill annotations.
-    # Matches "prefill[bs=1 tok=115 ctx=115]" format. The exact "prefill["
-    # prefix intentionally EXCLUDES dummy warmup prefills ("dummy_prefill[")
-    # so they don't pollute the stats — see atom/model_engine/run_labels.py.
-    prefills = [
-        e
-        for e in events
-        if e.get("name", "").startswith("prefill[")
-        and e.get("ph") == "X"
-        and e.get("cat") == "user_annotation"
-    ]
-    prefills = sorted(prefills, key=lambda x: x["ts"])
-
-    if not prefills:
-        print("No prefill (user_annotation) events found.")
-        write_breakdown_xlsx(output_xlsx, [], sheet_name="prefill")
-        return
-
-    actual_prefill_idx = 0
-    actual_prefill = prefills[actual_prefill_idx]
-    print(f"Found {len(prefills)} prefill events (user_annotation)")
-    print("Using first prefill event (run trace has no warmup phase).")
-    print(
-        f"Using prefill[{actual_prefill_idx}] "
-        f"(ts={actual_prefill.get('ts', 0):.0f}, dur={actual_prefill.get('dur', 0):.0f})"
-    )
-
-    # Build prefill hierarchy on the same thread as the selected CPU prefill.
-    # Using thread affinity is more robust than category-only filtering.
-    prefill_tid = actual_prefill.get("tid")
-    prefill_pid = actual_prefill.get("pid")
-    prefill_hierarchy_events = [
-        e
-        for e in events
-        if e.get("ph") == "X"
-        and e.get("tid") == prefill_tid
-        and e.get("pid") == prefill_pid
-    ]
-    # Build index once for fast subtree queries in prefill parsing.
-    prefill_idx = EventIndex(prefill_hierarchy_events)
-    level1_children = prefill_idx.get_direct_children(actual_prefill)
-    print(
-        f"Prefill level 1 (same thread pid={prefill_pid}, tid={prefill_tid}): "
-        f"{len(level1_children)} nodes"
-    )
-
-    # Keep only level2 children that have kernel launch in their subtree.
-    launch_level2_items = []
-    for l1 in level1_children:
-        l1_name = l1.get("name", "<unknown>")
-        level2_children = prefill_idx.get_direct_children(l1)
-        level2_with_launch = [
-            l2 for l2 in level2_children if prefill_idx.has_kernel_launch(l2)
-        ]
-        for l2 in level2_with_launch:
-            launch_level2_items.append(
+        for warmup_idx, matched, replay in sorted(
+            block_matches, key=lambda item: item[0]
+        ):
+            used_warmup_indices.add(warmup_idx)
+            replay_stream = (replay.get("args") or {}).get("stream")
+            rows.append(
                 {
-                    "level1_name": l1_name,
-                    "level2_event": l2,
+                    "warmup_index": warmup_idx,
+                    "cpu_module": matched["module"],
+                    "owner_layer": warmup_owner_layers[warmup_idx],
+                    "kernel_name": str(replay.get("name", "")),
+                    "stream": replay_stream,
+                    "duration_us": float(replay.get("dur", 0.0)),
                 }
             )
 
-    print(f"Level2 children with kernel launch: {len(launch_level2_items)}")
+    leftovers: list[dict[str, Any]] = []
+    for stream, events in replay_by_stream.items():
+        leftovers.extend(events[stream_cursors[stream] :])
 
-    # Layer extraction by rmsnorm positions:
-    # each layer has 2 rmsnorm modules, layer N starts at rmsnorm index 2*N (0-based).
-    all_norm_indices = [
-        i
-        for i, item in enumerate(launch_level2_items)
-        if is_strict_norm_name(item["level2_event"].get("name", ""))
-    ]
+    unused_warmup_by_kernel: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for idx, item in enumerate(warmup_mapping):
+        if idx in used_warmup_indices:
+            continue
+        unused_warmup_by_kernel.setdefault(item["kernel"], []).append((idx, item))
 
-    # Build launch->kernel mapping by correlation id.
-    # Build launch candidates from current prefill thread/range once.
-    runtime_launches = [
-        e
-        for e in prefill_hierarchy_events
-        if e.get("cat") == "cuda_runtime" and is_kernel_launch(e.get("name", ""))
-    ]
-    runtime_launches.sort(key=lambda x: x.get("ts", 0))
-    runtime_launch_ts = [e.get("ts", 0) for e in runtime_launches]
-
-    item_corrs: List[List[Any]] = []
-    corr_needed = set()
-    for item in launch_level2_items:
-        l2 = item["level2_event"]
-        l2_start = l2.get("ts", 0)
-        l2_end = l2_start + l2.get("dur", 0)
-
-        left = bisect.bisect_left(runtime_launch_ts, l2_start)
-        right = bisect.bisect_right(runtime_launch_ts, l2_end)
-        launches_in_l2 = runtime_launches[left:right]
-        curr_corrs = []
-        for launch in launches_in_l2:
-            corr = (launch.get("args") or {}).get("correlation")
-            if corr is not None:
-                corr_needed.add(corr)
-                curr_corrs.append(corr)
-        item_corrs.append(curr_corrs)
-
-    # Build kernel index only for correlations we actually need.
-    kernel_by_corr: Dict[Any, List[Dict]] = {}
-    if corr_needed:
-        for e in events:
-            if e.get("ph") != "X" or e.get("cat") != "kernel":
-                continue
-            corr = (e.get("args") or {}).get("correlation")
-            if corr is None or corr not in corr_needed:
-                continue
-            kernel_by_corr.setdefault(corr, []).append(e)
-        for corr in kernel_by_corr:
-            kernel_by_corr[corr].sort(key=lambda x: x.get("ts", 0))
-
-    item_kernels: List[List[Dict[str, Any]]] = []
-    for corrs in item_corrs:
-        kernels = []
-        for corr in corrs:
-            for k in kernel_by_corr.get(corr, []):
-                kernels.append({"name": k.get("name", "N/A"), "dur": k.get("dur", 0)})
-        item_kernels.append(kernels)
-
-    def _resolve_moe_child_name_prefill(event: Dict[str, Any]) -> str:
-        mod_name = event.get("name", "<unknown>")
-        if "moe" not in mod_name.lower():
-            return mod_name
-        children = prefill_idx.get_direct_children(event)
-        children_with_launch = [c for c in children if prefill_idx.has_kernel_launch(c)]
-        if children_with_launch:
-            return children_with_launch[0].get("name", mod_name)
-        return mod_name
-
-    def build_rows_from_item_range(start: int, end: int) -> List[List[Any]]:
-        rows = []
-        for i in range(start, end):
-            item = launch_level2_items[i]
-            mod_name = _resolve_moe_child_name_prefill(item["level2_event"])
-            if should_filter_prefill(mod_name):
-                continue
-            kernels = [k for k in item_kernels[i] if k["name"] not in ("", "N/A")]
-            if not kernels:
-                continue
-            rows.extend(process_module(mod_name, len(kernels), 0, kernels))
-        return rows
-
-    _extract_layer_and_write(
-        all_norm_indices,
-        len(launch_level2_items),
-        target_layer,
-        "Prefill",
-        "prefill",
-        build_rows_from_item_range,
-        output_xlsx,
+    for replay in sorted(leftovers, key=lambda event: float(event.get("ts", 0.0))):
+        replay_stream = (replay.get("args") or {}).get("stream")
+        replay_kernel = str(replay.get("name", ""))
+        matched_items = unused_warmup_by_kernel.get(replay_kernel, [])
+        matched_idx, matched = matched_items.pop(0) if matched_items else (-1, None)
+        rows.append(
+            {
+                "warmup_index": matched_idx,
+                "cpu_module": matched["module"] if matched else "<unmatched>",
+                "owner_layer": (
+                    warmup_owner_layers[matched_idx] if matched_idx >= 0 else None
+                ),
+                "kernel_name": replay_kernel,
+                "stream": replay_stream,
+                "duration_us": float(replay.get("dur", 0.0)),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["warmup_index"] < 0,
+            row["warmup_index"],
+        ),
     )
 
 
-def clean_module_name(name: str, mapped_kernel_name: str = "") -> str:
-    """Clean and simplify module name."""
-    # Runtime launch wrappers should display the actual launched operator name.
-    if "hipmodulelaunchkernel" in name.lower() and mapped_kernel_name not in (
-        "",
-        "N/A",
-    ):
-        name = _demangle_kernel_name(mapped_kernel_name)
+def build_grouped_breakdown_rows(
+    rows: list[dict[str, Any]], stream_map: dict[Any, int], print_head: bool = False
+) -> list[dict[str, Any]]:
+    """Aggregate matched replay rows into layer-structure groups.
 
-    # Demangle mangled C++ names
-    if name.startswith("_Z"):
-        name = _demangle_kernel_name(name)
-
-    # Remove 'aiter::' prefix if present
-    if name.startswith("aiter::"):
-        name = name[7:]  # len('aiter::') == 7
-
-    return name
-
-
-def _extract_layer_and_write(
-    all_norm_indices: List[int],
-    total_module_count: int,
-    target_layer: int,
-    section_name: str,
-    sheet_name: str,
-    build_rows_fn,
-    output_xlsx: str,
-) -> None:
+    Layer rows are grouped by identical per-layer operator sequence.  Each output
+    row for a layer group is the average time for that operator position across
+    layers in the group.  Non-layer and unmatched rows are aggregated by
+    module/kernel/stream.
     """
-    Shared layer-extraction, AVG computation, and XLSX write logic
-    used by both parse_prefill and parse_decode.
+    layer_rows: dict[int, list[dict[str, Any]]] = {}
+    non_layer_accum: dict[tuple[str, str, int], tuple[float, int]] = {}
+    unmatched_accum: dict[tuple[str, int], float] = {}
 
-    Args:
-        all_norm_indices: indices of all norm modules (including final layernorm)
-        total_module_count: total number of modules (used as fallback final_norm_idx)
-        target_layer: which layer to extract
-        section_name: "Prefill" or "Decode" for print messages
-        sheet_name: XLSX sheet name
-        build_rows_fn: callable(start, end) -> List[List[Any]]
-        output_xlsx: output file path
-    """
-    norm_indices = all_norm_indices[:-1] if len(all_norm_indices) > 0 else []
-    print(
-        f"Found {len(all_norm_indices)} norm modules "
-        f"({len(norm_indices)} used for layer split, excluding final layernorm)"
-    )
-
-    TARGET_LAYER = target_layer
-    norm_start_idx = TARGET_LAYER * 2
-    norm_end_idx = (TARGET_LAYER + 1) * 2
-    final_norm_idx = (
-        all_norm_indices[-1] if len(all_norm_indices) > 0 else total_module_count
-    )
-
-    mod_start = 0
-    mod_end = 0
-    if norm_start_idx >= len(norm_indices):
-        print(f"Not enough norms for layer {TARGET_LAYER}")
-        if sheet_name == "prefill":
-            print(
-                f"Not enough rmsnorm modules for layer {TARGET_LAYER}, writing empty XLSX"
-            )
-        write_breakdown_xlsx(output_xlsx, [], sheet_name=sheet_name)
-        return
-    else:
-        mod_start = norm_indices[norm_start_idx]
-        mod_end = (
-            norm_indices[norm_end_idx]
-            if norm_end_idx < len(norm_indices)
-            else final_norm_idx
-        )
-        print(
-            f"Layer {TARGET_LAYER}: modules [{mod_start}:{mod_end}] "
-            f"(norms at indices {norm_start_idx}, {norm_start_idx+1})"
-        )
-
-    avg_start_layer = TARGET_LAYER
-    avg_end_layer = (len(norm_indices) - 1) // 2
-    if avg_start_layer <= avg_end_layer:
-        print(
-            f"Target layer: {TARGET_LAYER}; AVG layers: [{avg_start_layer}..{avg_end_layer}]"
-        )
-    else:
-        print(
-            f"Target layer: {TARGET_LAYER}; AVG layers: disabled (no eligible layers)"
-        )
-
-    # Target layer rows.
-    rows = build_rows_fn(mod_start, mod_end)
-    print(f"Layer {TARGET_LAYER} rows: {len(rows)}")
-
-    # AVG rows.
-    avg_rows = None
-    avg_layer_rows: List[Tuple[int, List[List[Any]]]] = []
-    layer = avg_start_layer
-    while 2 * layer < len(norm_indices):
-        s = norm_indices[2 * layer]
-        e_idx = 2 * (layer + 1)
-        e = norm_indices[e_idx] if e_idx < len(norm_indices) else final_norm_idx
-        avg_layer_rows.append((layer, build_rows_fn(s, e)))
-        layer += 1
-    if avg_layer_rows:
-        avg_rows = build_avg_rows_from_layers(avg_layer_rows, section_name)
-        if avg_rows is not None:
-            print(f"{section_name} avg rows: {len(avg_rows)}")
-
-    write_breakdown_xlsx(output_xlsx, rows, sheet_name=sheet_name, avg_rows=avg_rows)
-    print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
-    print(f"XLSX written to: {output_xlsx} ({len(rows)} rows)")
-
-
-def process_module(
-    mod_name: str, kernel_count: int, start_gpu_idx: int, gpu_kernels: List[Dict]
-) -> List[List]:
-    """Process a module and return [display_name, gpu_kernel_name, gpu_dur] rows."""
-    rows = []
-    for i in range(kernel_count):
-        gpu_idx = start_gpu_idx + i
-        gpu_kernel_name = "N/A"
-        gpu_dur = 0
-        if gpu_idx < len(gpu_kernels):
-            gpu = gpu_kernels[gpu_idx]
-            gpu_kernel_name = gpu.get("name", "N/A")
-            gpu_dur = gpu.get("dur", 0)
-        display_name = clean_module_name(mod_name, gpu_kernel_name)
-        rows.append([display_name, gpu_kernel_name, gpu_dur])
-    return rows
-
-
-def parse_decode(
-    run_events: List[Dict],
-    capture_events: List[Dict],
-    output_xlsx: str,
-    target_layer: int = 3,
-) -> None:
-    """
-    Parse decode phase:
-    - use run trace for first decode and real kernel timings
-    - use capture trace for capture_graph module hierarchy
-
-    Output CSV columns: cpu_module, gpu_kernel, duration_us
-    """
-    print("Building event index...")
-
-    # Find GPU-annotated decode events (cat='gpu_user_annotation').
-    # "decode[" matches only real CUDAGraph decodes; "dummy_decode[" (DP-sync
-    # dummy) and "eager_decode[" are excluded by design — see
-    # atom/model_engine/run_labels.py for the full label taxonomy.
-    decodes = [
-        e
-        for e in run_events
-        if e.get("name", "").startswith("decode[")
-        and e.get("ph") == "X"
-        and e.get("cat") == "gpu_user_annotation"
-    ]
-    decodes = sorted(decodes, key=lambda x: x["ts"])
-
-    if not decodes:
-        print("No decode (gpu_user_annotation) events found.")
-        return
-
-    first_ds = decodes[0]
-    first_ds_name = first_ds.get("name", "")
-    target_bs: Optional[int] = None
-    bs_match = re.search(r"bs=(\d+)", first_ds_name)
-    if bs_match:
-        target_bs = int(bs_match.group(1))
-        target_cg_name = f"capture_graph_bs_{target_bs}"
-    else:
-        target_cg_name = "capture_graph"
-
-    print(f"First decode: {first_ds_name}")
-    print(f"Looking for: {target_cg_name}")
-
-    # Find matching capture_graph
-    capture_graphs = [
-        e
-        for e in capture_events
-        if e.get("name") == target_cg_name and e.get("ph") == "X"
-    ]
-    if not capture_graphs and target_bs is not None:
-        # Prefer the largest capture_graph_bs_K where K < target_bs.
-        lower_bs_candidates: List[Tuple[int, Dict[str, Any]]] = []
-        for e in capture_events:
-            if e.get("ph") != "X":
-                continue
-            n = e.get("name", "")
-            m = re.match(r"^capture_graph_bs_(\d+)$", n)
-            if not m:
-                continue
-            k = int(m.group(1))
-            if k < target_bs:
-                lower_bs_candidates.append((k, e))
-        if lower_bs_candidates:
-            best_bs = max(k for k, _ in lower_bs_candidates)
-            capture_graphs = sorted(
-                [e for k, e in lower_bs_candidates if k == best_bs],
-                key=lambda x: x.get("ts", 0),
-            )
-            print(f"No exact match, using nearest lower capture_graph_bs_{best_bs}")
-    if not capture_graphs:
-        # Fallback: find any capture_graph
-        capture_graphs = [
-            e
-            for e in capture_events
-            if e.get("name", "").startswith("capture_graph") and e.get("ph") == "X"
-        ]
-        capture_graphs = sorted(capture_graphs, key=lambda x: x["ts"])
-        print("No exact match, using first capture_graph")
-
-    if not capture_graphs:
-        print("No capture_graph events found.")
-        return
-
-    cg = capture_graphs[0]
-    print(f"Using: {cg.get('name')}")
-
-    # Build optimized index only for capture_graph's time range
-    cg_start = cg["ts"]
-    cg_end = cg_start + cg.get("dur", 0)
-    cg_events = [
-        e
-        for e in capture_events
-        if e.get("ph") == "X"
-        and e.get("ts", 0) >= cg_start
-        and e.get("ts", 0) + e.get("dur", 0) <= cg_end
-    ]
-    print(f"Events in capture_graph: {len(cg_events)}")
-    idx = EventIndex(cg_events)
-
-    # Get GPU kernels from first decode (within its duration)
-    ds1_start = first_ds["ts"]
-    ds1_end = ds1_start + first_ds.get("dur", 0)
-
-    gpu_kernels = [
-        e
-        for e in run_events
-        if e.get("cat") == "kernel" and ds1_start <= e["ts"] <= ds1_end
-    ]
-    gpu_kernels = sorted(gpu_kernels, key=lambda x: x["ts"])
-    print(f"First decode (tid={first_ds.get('tid')}): {first_ds_name}")
-    print(
-        f"  Range: {ds1_start:.0f} ~ {ds1_end:.0f} (dur={first_ds.get('dur', 0):.0f})"
-    )
-    print(f"  GPU kernels: {len(gpu_kernels)}")
-
-    # Use optimized index for children lookup
-    direct_children = idx.get_direct_children(cg)
-    kernel_children = [c for c in direct_children if idx.has_kernel_launch(c)]
-    print(f"Direct children with kernels: {len(kernel_children)}")
-
-    # Collect all modules with their kernel info
-    all_modules = []  # list of (mod_name, kernel_count, start_gpu_idx)
-    all_module_events = []
-    gpu_idx = 0
-
-    def _resolve_moe_child_name_decode(event: Dict[str, Any]) -> str:
-        mod_name = event.get("name", "<unknown>")
-        if "moe" not in mod_name.lower():
-            return mod_name
-        children = idx.get_direct_children(event)
-        children_with_launch = [c for c in children if idx.has_kernel_launch(c)]
-        if children_with_launch:
-            return children_with_launch[0].get("name", mod_name)
-        return mod_name
-
-    for child in kernel_children:
-        child_name = child.get("name", "")
-        if should_filter(child_name):
+    for row in rows:
+        stream_no = stream_map.get(row["stream"], 0)
+        if row["cpu_module"] == "<unmatched>":
+            key = (row["kernel_name"], stream_no)
+            unmatched_accum[key] = unmatched_accum.get(key, 0.0) + row["duration_us"]
             continue
 
-        # Get sub-children (actual module names)
-        sub_children = idx.get_direct_children(child)
-        sub_kernel_children = [sc for sc in sub_children if idx.has_kernel_launch(sc)]
-
-        # Determine modules to process
-        modules = sub_kernel_children if sub_kernel_children else [child]
-
-        for mod in modules:
-            mod_name = _resolve_moe_child_name_decode(mod)
-            kernel_count = idx.count_kernel_launches(mod)
-            all_modules.append((mod_name, kernel_count, gpu_idx))
-            all_module_events.append(mod)
-            gpu_idx += kernel_count
-
-    # Decode module sequence should start from the first norm module to avoid
-    # wrapper/initialization nodes before the model block.
-    first_norm_module_idx = next(
-        (i for i, (name, _, _) in enumerate(all_modules) if is_strict_norm_name(name)),
-        None,
-    )
-    if first_norm_module_idx is None:
-        print("No norm module found in capture_graph modules.")
-        return
-    if first_norm_module_idx > 0:
-        print(f"Dropped {first_norm_module_idx} leading modules before first norm.")
-    all_modules = all_modules[first_norm_module_idx:]
-    all_module_events = all_module_events[first_norm_module_idx:]
-
-    # Anchor module->kernel alignment by first norm's correlated launch kernel:
-    # 1) find first launch inside first norm and read its correlation/kernel
-    # 2) find same kernel's first occurrence in run decode kernels
-    # 3) rebuild module start indices from that anchor.
-    capture_runtime_launches = [
-        e
-        for e in cg_events
-        if e.get("cat") == "cuda_runtime" and is_kernel_launch(e.get("name", ""))
-    ]
-    capture_runtime_launches.sort(key=lambda x: x.get("ts", 0))
-    capture_launch_ts = [e.get("ts", 0) for e in capture_runtime_launches]
-
-    def _first_kernel_name_in_capture(mod_event: Dict[str, Any]) -> Optional[str]:
-        m_start = mod_event.get("ts", 0)
-        m_end = m_start + mod_event.get("dur", 0)
-        left = bisect.bisect_left(capture_launch_ts, m_start)
-        right = bisect.bisect_right(capture_launch_ts, m_end)
-        for launch in capture_runtime_launches[left:right]:
-            corr = (launch.get("args") or {}).get("correlation")
-            if corr is None:
-                continue
-            kernel_name = (launch.get("args") or {}).get("kernel", "")
-            if kernel_name:
-                return str(kernel_name)
-        return None
-
-    anchor_kernel_name = _first_kernel_name_in_capture(all_module_events[0])
-    if not anchor_kernel_name:
-        raise RuntimeError(
-            "Cannot resolve anchor kernel from first rmsnorm correlation in capture trace."
-        )
-    found = next(
-        (
-            i
-            for i, k in enumerate(gpu_kernels)
-            if k.get("name", "") == anchor_kernel_name
-        ),
-        None,
-    )
-    if found is None:
-        raise RuntimeError(
-            f"Anchor kernel '{anchor_kernel_name}' not found in run decode kernels."
-        )
-    anchor_gpu_idx = found
-    print(
-        f"Aligned from first norm kernel: {anchor_kernel_name} at gpu_idx={anchor_gpu_idx}"
-    )
-
-    rebuilt_modules = []
-    running_gpu_idx = anchor_gpu_idx
-    for name, count, _ in all_modules:
-        rebuilt_modules.append((name, count, running_gpu_idx))
-        running_gpu_idx += count
-    all_modules = rebuilt_modules
-
-    # Find norm positions (rmsnorm in name)
-    all_norm_indices = [
-        i for i, (name, _, _) in enumerate(all_modules) if is_strict_norm_name(name)
-    ]
-
-    def build_rows_for_module_range(start: int, end: int) -> List[List[Any]]:
-        rows = []
-        for mod_name, kernel_count, start_gpu_idx in all_modules[start:end]:
-            rows.extend(
-                process_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels)
+        layer = module_layer(row["cpu_module"])
+        if layer is None:
+            layer = row.get("owner_layer")
+        normalized = normalize_layer_module(row["cpu_module"])
+        normalized_row = {
+            **row,
+            "module_pattern": normalized,
+            "stream_no": stream_no,
+        }
+        if layer is None:
+            key = (normalized, row["kernel_name"], stream_no)
+            total, order_key = non_layer_accum.get(key, (0.0, row["warmup_index"]))
+            non_layer_accum[key] = (
+                total + row["duration_us"],
+                min(order_key, row["warmup_index"]),
             )
-        return rows
+        else:
+            layer_rows.setdefault(layer, []).append(normalized_row)
 
-    _extract_layer_and_write(
-        all_norm_indices,
-        len(all_modules),
-        target_layer,
-        "Decode",
-        "decode",
-        build_rows_for_module_range,
-        output_xlsx,
+    grouped: list[dict[str, Any]] = []
+
+    # Non-layer prologue/epilogue rows are hidden by default. They still
+    # contribute to the full-decode denominator.
+    if print_head:
+        for (module, kernel, stream_no), (
+            total_us,
+            order_key,
+        ) in non_layer_accum.items():
+            grouped.append(
+                {
+                    "layer_group": "non_layer",
+                    "module": module,
+                    "kernel": kernel,
+                    "stream_no": stream_no,
+                    "time_us": total_us,
+                    "order_key": order_key,
+                    "group_order_key": order_key,
+                }
+            )
+
+    # Layer groups by exact normalized operator sequence.  Stream id is kept as
+    # output metadata, but does not decide whether two layers have the same
+    # operator layout.
+    signature_to_layers: dict[tuple[tuple[str, str], ...], list[int]] = {}
+    for layer in sorted(layer_rows):
+        items = layer_rows[layer]
+        signature = tuple(
+            (item["module_pattern"], item["kernel_name"]) for item in items
+        )
+        signature_to_layers.setdefault(signature, []).append(layer)
+
+    for signature, layers in signature_to_layers.items():
+        layer_count = len(layers)
+        label = layer_group_label(layers)
+        group_order_key = min(layer_rows[layer][0]["warmup_index"] for layer in layers)
+        for idx, (module, kernel) in enumerate(signature):
+            total = sum(layer_rows[layer][idx]["duration_us"] for layer in layers)
+            stream_ids = [layer_rows[layer][idx]["stream_no"] for layer in layers]
+            order_key = min(layer_rows[layer][idx]["warmup_index"] for layer in layers)
+            stream_no: int | str
+            if all(stream_id == stream_ids[0] for stream_id in stream_ids):
+                stream_no = stream_ids[0]
+            else:
+                stream_no = ",".join(
+                    str(stream_id) for stream_id in sorted(set(stream_ids))
+                )
+            grouped.append(
+                {
+                    "layer_group": label,
+                    "module": module,
+                    "kernel": kernel,
+                    "stream_no": stream_no,
+                    "time_us": total / layer_count,
+                    "order_key": order_key,
+                    "group_order_key": group_order_key,
+                }
+            )
+        group_time_us = sum(
+            sum(layer_rows[layer][idx]["duration_us"] for layer in layers) / layer_count
+            for idx in range(len(signature))
+        )
+        grouped.append(
+            {
+                "layer_group": label,
+                "module": "__group_total__",
+                "kernel": "GROUP TOTAL",
+                "stream_no": "",
+                "time_us": group_time_us,
+                "order_key": float("inf"),
+                "group_order_key": group_order_key,
+            }
+        )
+
+    # Keep unmatched in the same output file for follow-up instrumentation work.
+    for (kernel, stream_no), total_us in unmatched_accum.items():
+        grouped.append(
+            {
+                "layer_group": "unmatched",
+                "module": "<unmatched>",
+                "kernel": kernel,
+                "stream_no": stream_no,
+                "time_us": total_us,
+                "order_key": float("inf"),
+                "group_order_key": float("inf"),
+            }
+        )
+
+    return sorted(grouped, key=lambda row: (row["group_order_key"], row["order_key"]))
+
+
+DECODE_BREAKDOWN_HEADER = [
+    "layer_group",
+    "module/tag",
+    "kernel",
+    "stream_id",
+    "time_us",
+    "percent_of_full_decode_forward",
+]
+XLSX_KERNEL_DISPLAY_LIMIT = 120
+
+
+def decode_breakdown_values(
+    rows: list[dict[str, Any]], full_decode_us: float
+) -> list[list[Any]]:
+    values: list[list[Any]] = []
+    for row in rows:
+        percent = row["time_us"] / full_decode_us * 100.0 if full_decode_us > 0 else 0.0
+        values.append(
+            [
+                row["layer_group"],
+                row["module"],
+                row["kernel"],
+                row["stream_no"],
+                float(row["time_us"]),
+                percent,
+            ]
+        )
+    return values
+
+
+def write_decode_csv(path: str, values: list[list[Any]]) -> None:
+    """Write CSV with repeated group/module cells blanked for readability."""
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(DECODE_BREAKDOWN_HEADER)
+        prev_layer_group: str | None = None
+        prev_module: str | None = None
+        for row in values:
+            layer_group = str(row[0])
+            module = str(row[1])
+            display_layer_group = "" if layer_group == prev_layer_group else layer_group
+            display_module = (
+                ""
+                if layer_group == prev_layer_group and module == prev_module
+                else module
+            )
+            writer.writerow(
+                [
+                    display_layer_group,
+                    display_module,
+                    row[2],
+                    row[3],
+                    f"{row[4]:.3f}",
+                    f"{row[5]:.6f}",
+                ]
+            )
+            prev_layer_group = layer_group
+            prev_module = module
+
+
+def merge_same_value_runs(ws: Any, column: int, start_row: int, end_row: int) -> None:
+    run_start = start_row
+    prev_value = ws.cell(row=start_row, column=column).value
+    for row in range(start_row + 1, end_row + 2):
+        value = ws.cell(row=row, column=column).value if row <= end_row else None
+        if value != prev_value:
+            if prev_value not in (None, "") and row - run_start > 1:
+                ws.merge_cells(
+                    start_row=run_start,
+                    start_column=column,
+                    end_row=row - 1,
+                    end_column=column,
+                )
+            run_start = row
+            prev_value = value
+
+
+def write_decode_xlsx(path: str, values: list[list[Any]]) -> None:
+    from openpyxl import Workbook
+    from openpyxl.comments import Comment
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "decode_breakdown"
+    ws.append(DECODE_BREAKDOWN_HEADER)
+    for value_row in values:
+        display_row = list(value_row)
+        kernel = str(display_row[2])
+        if len(kernel) > XLSX_KERNEL_DISPLAY_LIMIT:
+            display_row[2] = kernel[: XLSX_KERNEL_DISPLAY_LIMIT - 3] + "..."
+        ws.append(display_row)
+        if len(kernel) > XLSX_KERNEL_DISPLAY_LIMIT:
+            ws.cell(row=ws.max_row, column=3).comment = Comment(kernel, "ATOM")
+
+    ws.freeze_panes = "A2"
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    end_row = ws.max_row
+    if end_row >= 2:
+        module_run_start = 2
+        prev_key = (ws.cell(row=2, column=1).value, ws.cell(row=2, column=2).value)
+        for row in range(3, end_row + 2):
+            key = (
+                ws.cell(row=row, column=1).value if row <= end_row else None,
+                ws.cell(row=row, column=2).value if row <= end_row else None,
+            )
+            if key != prev_key:
+                if prev_key[1] not in (None, "") and row - module_run_start > 1:
+                    ws.merge_cells(
+                        start_row=module_run_start,
+                        start_column=2,
+                        end_row=row - 1,
+                        end_column=2,
+                    )
+                module_run_start = row
+                prev_key = key
+
+        merge_same_value_runs(ws, 1, 2, end_row)
+
+    for row in ws.iter_rows(min_row=2):
+        is_total_row = row[2].value == "GROUP TOTAL"
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            if is_total_row:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill("solid", fgColor="FFF2CC")
+        row[4].number_format = "0.000"
+        row[5].number_format = "0.000000"
+
+    widths = {
+        1: 24,
+        2: 72,
+        3: 72,
+        4: 10,
+        5: 12,
+        6: 28,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    wb.save(path)
+
+
+def write_decode_output(
+    path: str,
+    rows: list[dict[str, Any]],
+    full_decode_us: float,
+    print_head: bool = False,
+) -> None:
+    stream_map = remap_streams([{"args": {"stream": row["stream"]}} for row in rows])
+    breakdown_rows = build_grouped_breakdown_rows(
+        rows, stream_map, print_head=print_head
     )
+    values = decode_breakdown_values(breakdown_rows, full_decode_us)
+    if path.lower().endswith(".xlsx"):
+        write_decode_xlsx(path, values)
+    else:
+        write_decode_csv(path, values)
 
 
-# =============================================================================
-# Main
-# =============================================================================
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Parse PyTorch profiler trace JSON to extract kernel information."
-    )
-    parser.add_argument("filepath", help="Path to trace JSON or JSON.GZ file")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Formal ATOM trace parser")
+    parser.add_argument("run_trace")
+    parser.add_argument("--capture-trace", default=None)
     parser.add_argument(
-        "--layer", type=int, default=3, help="Target layer index (default: 3)"
+        "--output",
+        default="decode_breakdown.xlsx",
+        help="Output path, .xlsx or .csv (default: decode_breakdown.xlsx).",
+    )
+    parser.add_argument(
+        "--kernel-num",
+        type=int,
+        default=100,
+        help="Number of warmup kernel mappings to print (default: 100).",
+    )
+    parser.add_argument(
+        "--print-head",
+        action="store_true",
+        help="Include non-layer prologue/epilogue rows in the output.",
     )
     args = parser.parse_args()
 
-    if args.layer < 0:
-        print("--layer must be >= 0")
-        sys.exit(1)
-
-    filepath = args.filepath
-    target_layer = args.layer
-
-    print(f"Loading run trace: {filepath}")
-    trace = load_trace(filepath)
-    events = trace.get("traceEvents", [])
-    print(f"Loaded run events: {len(events)}")
-
-    capture_trace_path = find_capture_graph_trace_path(filepath)
-    if capture_trace_path is None:
-        print(
-            "Warning: matching capture trace not found; decode analysis will fallback "
-            "to current trace for capture_graph hierarchy."
+    run_events = load_events(args.run_trace)
+    capture_trace = args.capture_trace or find_capture_trace(args.run_trace)
+    if capture_trace is None:
+        raise RuntimeError(
+            "Could not auto-discover capture trace; pass --capture-trace."
         )
-        capture_events = events
-    else:
-        print(f"Loading capture trace: {capture_trace_path}")
-        capture_trace = load_trace(capture_trace_path)
-        capture_events = capture_trace.get("traceEvents", [])
-        print(f"Loaded capture events: {len(capture_events)}")
+    capture_events = load_events(capture_trace)
+
+    decode = find_first_decode(run_events)
+    batch_size = decode_batch_size(decode)
+    graph = find_capture_graph_for_bs(capture_events, batch_size)
+    warmup_start, warmup_end = warmup_window_for_graph(capture_events, graph)
+    counts = count_events_in_window(capture_events, warmup_start, warmup_end)
+
+    print(f"Run trace: {args.run_trace}")
+    print(f"Capture trace: {capture_trace}")
     print("")
+    print("First decode:")
+    print(f"  name: {decode.get('name')}")
+    print(f"  ts: {decode.get('ts'):.3f}")
+    print(f"  dur: {decode.get('dur'):.3f}")
+    print(f"  batch size: {batch_size}")
+    print("")
+    print("Matching capture graph:")
+    print(f"  name: {graph.get('name')}")
+    print(f"  ts: {graph.get('ts'):.3f}")
+    print(f"  dur: {graph.get('dur'):.3f}")
+    print("")
+    print("Decode warmup window:")
+    print(f"  start: {warmup_start:.3f}")
+    print(f"  end: {warmup_end:.3f}")
+    print(f"  dur: {warmup_end - warmup_start:.3f}")
+    print(f"  events: {counts}")
+    warmup_mapping = build_warmup_mapping(capture_events, warmup_start, warmup_end)
+    print(f"  mapping entries: {len(warmup_mapping)}")
+    print_first_warmup_mappings(warmup_mapping, limit=args.kernel_num)
 
-    print("=" * 60)
-    print("PREFILL ANALYSIS")
-    print("=" * 60)
-    parse_prefill(events, "prefill_breakdown.xlsx", target_layer=target_layer)
-
-    print("\n" + "=" * 60)
-    print("DECODE ANALYSIS")
-    print("=" * 60)
-    parse_decode(
-        events,
-        capture_events,
-        "decode_breakdown.xlsx",
-        target_layer=target_layer,
+    decode_start, decode_end = decode_gpu_window(run_events, decode)
+    replay_kernels = replay_kernels_in_window(run_events, decode_start, decode_end)
+    matched_rows = match_replay_to_warmup(replay_kernels, warmup_mapping)
+    full_decode_us = decode_end - decode_start
+    write_decode_output(
+        args.output,
+        matched_rows,
+        full_decode_us,
+        print_head=args.print_head,
     )
+    unmatched = sum(1 for row in matched_rows if row["cpu_module"] == "<unmatched>")
+    print("")
+    print("Decode replay mapping:")
+    print(f"  replay kernels: {len(replay_kernels)}")
+    print(f"  unmatched kernels: {unmatched}")
+    print(f"  output written to: {args.output}")
 
 
 if __name__ == "__main__":

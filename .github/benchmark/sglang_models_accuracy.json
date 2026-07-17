@@ -313,6 +313,34 @@
     "_baseline_note": "Threshold aligned with SGLang plugin gsm8k validation for GLM-5.1 FP8."
   },
   {
+    "model_name": "GLM-5.2-FP8 TP4",
+    "model_path": "zai-org/GLM-5.2-FP8",
+    "extraArgs": "--trust-remote-code --tp-size 4 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"},\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_USE_AITER=1\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
+    "runner": "atom-plugin-acc-validation-runner",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 65,
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
+    "_baseline_note": "5-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare using the SGLang-ATOM recipe server command."
+  },
+  {
+    "model_name": "GLM-5.2-MXFP4 TP4",
+    "model_path": "amd/GLM-5.2-MXFP4",
+    "extraArgs": "--trust-remote-code --tp-size 4 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\",\"*expert*\"]}}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_USE_AITER=1\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
+    "runner": "atom-plugin-acc-validation-runner",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 65,
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "amd/GLM-5.2-MXFP4",
+    "_baseline_note": "5-shot GSM8K local-completions coverage for GLM-5.2-MXFP4 IndexShare using the SGLang-ATOM recipe server command."
+  },
+  {
     "model_name": "MI308 Qwen3.5-397B-A17B-FP8 TP4",
     "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
     "extraArgs": "--tensor-parallel-size 4 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
@@ -399,6 +427,20 @@
     "accuracy_baseline": null,
     "accuracy_baseline_model": "zai-org/GLM-5.1-FP8",
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for GLM-5.1-FP8 TP8 on MI308."
+  },
+  {
+    "model_name": "MI308 GLM-5.2-FP8 TP8",
+    "model_path": "zai-org/GLM-5.2-FP8",
+    "extraArgs": "--trust-remote-code --tp-size 8 --mem-fraction-static 0.8 --disable-radix-cache --page-size 1 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
+    "runner": "atom-mi308-8gpu-plugins-accuracy",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 65,
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
+    "_baseline_note": "5-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare on MI308 using the SGLang-ATOM recipe server command."
   },
   {
     "model_name": "MI308 DeepSeek-V4-Flash",

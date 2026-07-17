@@ -54,6 +54,8 @@ import os
 import torch
 import triton
 import triton.language as tl
+
+from atom.utils.decorators import mark_trace
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.utils.device_info import get_num_sms
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
@@ -1033,6 +1035,7 @@ def _sparse_attn_v4_paged_decode_asm(
     return logits[:, 0].to(torch.bfloat16)
 
 
+@mark_trace
 def sparse_attn_v4_paged_decode(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -1046,6 +1049,7 @@ def sparse_attn_v4_paged_decode(
     q_rope_in: torch.Tensor | None = None,
     qo_indptr: torch.Tensor | None = None,
     kv_last_page_lens: torch.Tensor | None = None,
+    prefix: str = "",
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -1071,7 +1075,8 @@ def sparse_attn_v4_paged_decode(
             qo_indptr=qo_indptr,
             kv_last_page_lens=kv_last_page_lens,
         )
-    if get_gfx() == "gfx1250":
+    gfx = get_gfx()
+    if gfx == "gfx1250" or gfx.startswith("gfx94"):
         return pa_decode_sparse(
             q,
             unified_kv,

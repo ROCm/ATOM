@@ -57,6 +57,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
 from atom.utils import envs
 
@@ -369,6 +371,7 @@ def _fused_compress_attn_kernel(
             tl.store(kv_cache_ptr + cache_addr, rotated.to(tl.bfloat16), mask=d_mask)
 
 
+@mark_trace
 def fused_compress_attn(
     *,
     # Source tensors (ragged across all seqs in batch)
@@ -412,6 +415,7 @@ def fused_compress_attn(
     # rope into `kv_cache_rope` (bf16 [NB,k,64]) via the flydsl group_fp8 scatter.
     main_2buff_fp8: bool = False,
     kv_cache_rope: Optional[torch.Tensor] = None,  # bf16 [NB,k_per_block,64]
+    prefix: str = "",
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
     dispatched via SGLang-style packed plan.

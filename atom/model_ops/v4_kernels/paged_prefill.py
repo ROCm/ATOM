@@ -48,6 +48,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 from atom.utils import envs
 
 try:
@@ -571,6 +573,7 @@ def sparse_attn_v4_paged_prefill_reference(
     return _sparse_attn_ragged_torch(q, pool, attn_sink, topk_idxs, softmax_scale)
 
 
+@mark_trace
 def sparse_attn_v4_paged_prefill(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -588,6 +591,7 @@ def sparse_attn_v4_paged_prefill(
     q_rope: torch.Tensor | None = None,
     k_packed: torch.Tensor | None = None,
     k_rope: torch.Tensor | None = None,
+    prefix: str = "",
 ) -> torch.Tensor:
     """V4 prefill sparse attention over two KV sources (paged unified_kv +
     flat per-fwd kv), dispatching on the kv-cache layout.
