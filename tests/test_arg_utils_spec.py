@@ -83,9 +83,7 @@ class TestEngineArgsIndexCacheDtype:
         parser = argparse.ArgumentParser()
         EngineArgs.add_cli_args(parser)
 
-        args = EngineArgs.from_cli_args(
-            parser.parse_args(["--kv_cache_dtype", "fp8"])
-        )
+        args = EngineArgs.from_cli_args(parser.parse_args(["--kv_cache_dtype", "fp8"]))
 
         assert args.kv_cache_dtype == "fp8"
         assert args.index_cache_dtype == "fp8"

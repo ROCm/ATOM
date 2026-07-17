@@ -51,8 +51,7 @@ def _resolve_index_cache_dtype(config) -> torch.dtype:
     if index_cache_dtype in ("bf16", "fp8"):
         return dtypes.d_dtypes[index_cache_dtype]
     raise ValueError(
-        "index_cache_dtype must be 'bf16' or 'fp8', "
-        f"got {index_cache_dtype!r}"
+        "index_cache_dtype must be 'bf16' or 'fp8', " f"got {index_cache_dtype!r}"
     )
 
 
