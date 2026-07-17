@@ -800,6 +800,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
         self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
+        self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -832,7 +833,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
 
         mxfp4_block = 32
-        pad_align = 256
+        pad_align = self.pad_align
 
         intermediate_size_per_partition_after_pad = (
             (intermediate_size_per_partition + pad_align - 1) // pad_align * pad_align
@@ -1147,10 +1148,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
             # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
+            from aiter.ops.triton.moe.moe_routing.routing import routing
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts_a8w4_silu_gguu,
             )
-            from aiter.ops.triton.moe.moe_routing.routing import routing
 
             n_expts_act = top_k
 
@@ -2389,6 +2390,7 @@ class FusedMoE(torch.nn.Module):
         shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
         shared_expert_prefix: Optional[str] = None,
+        pad_align: Optional[int] = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -2563,6 +2565,12 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
+
+        # Override weight padding alignment before create_weights consumes it.
+        # Must happen here (pre-create_weights) — setting it on quant_method
+        # after FusedMoE construction is a no-op since weights are already sized.
+        if pad_align is not None:
+            self.quant_method.pad_align = pad_align
 
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.moe_quant_params = {
