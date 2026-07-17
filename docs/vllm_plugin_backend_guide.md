@@ -1,6 +1,6 @@
-# ATOM vLLM Plugin Backend
+# vLLM-ATOM Backend
 
-ATOM can work as the vLLM out-of-tree (OOT) plugin backend — installed as a separate Python package and plugged into vLLM through vLLM's official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.
+ATOM can work as the vLLM-ATOM out-of-tree (OOT) backend — installed as a separate Python package and plugged into vLLM through vLLM's official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.
 
 This integration follows the direction described in the [RFC to enable ATOM as a vLLM out-of-tree platform](https://github.com/ROCm/ATOM/issues/201). The high-level idea is that vLLM remains the framework-level runtime, while ATOM focuses on model-level and kernel-level optimization for AMD GPUs. In this mode, ATOM serves as the optimized execution backend and an incubation layer for new kernels, fusions, and model implementations before they are mature enough to be upstreamed.
 
@@ -221,7 +221,7 @@ docker pull rocm/atom-dev:vllm-v0.17.0-nightly_20260315
 
 ### 5.3 Launch vLLM with ATOM Plugin
 
-The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options, OpenAI-compatible API usage, and client patterns, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+The vLLM-ATOM backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options, OpenAI-compatible API usage, and client patterns, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
 ```bash
 vllm serve ${model} \

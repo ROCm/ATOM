@@ -41,6 +41,7 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -48,7 +49,6 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
 )
 from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-from aiter.jit.utils.chip_info import get_gfx
 from atom.config import (
     Config,
     LayerQuantConfig,

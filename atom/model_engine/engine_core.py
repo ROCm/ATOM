@@ -485,9 +485,14 @@ class DPEngineCoreProc(EngineCore):
                 PrefillDelayer(
                     dp_size=config.parallel_config.data_parallel_size,
                     cpu_group=self.dp_group,
-                    max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
-                    max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 )
             )
 

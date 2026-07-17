@@ -1266,6 +1266,15 @@ class Config:
 
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
+        # PCP changes the compiled graph: when pcp>1 the indexer runs through the
+        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
+        # query) and the indexer takes the round-robin all-gather / separate-rope
+        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # identically, so without this factor pcp2 loads pcp1's cached artifact
+        # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
+        # runtime — the same stale-artifact hazard documented for the vocab-embed
+        # flag below.
+        factors.append(self.prefill_context_parallel_size)
         factors.append(self.enable_dp_attention)
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
@@ -1292,6 +1301,13 @@ class Config:
                 ),
             )
         )
+        # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
+        # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
+        # F.embedding vs masked-embedding + all-reduce), so it alters the compiled
+        # graph and MUST be part of its key. Without this, toggling the flag — or
+        # deploying it on top of a cache built with the other setting — reuses a
+        # stale artifact and trips assert_size_stride at runtime.
+        factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
