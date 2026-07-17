@@ -597,6 +597,36 @@ class MooncakeConnector(KVConnectorBase):
     # -----------------------------------------------------------------
     _MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024
 
+    def _rdma_chunk_sizes(self, total_bytes: int, unit_bytes: int) -> list[int]:
+        """Split a region into MR chunks, each <= _MAX_RDMA_CHUNK_BYTES and, apart
+        from the final remainder, aligned down to a whole multiple of unit_bytes.
+
+        Aligning every internal boundary to a unit (block/slot) means no unit ever
+        crosses an MR boundary, so its single RDMA op never spans two registered
+        MRs. Only a unit larger than the max chunk can still straddle, which no KV
+        block/slot reaches; that degenerate case is logged and left unaligned.
+        """
+        mc = self._MAX_RDMA_CHUNK_BYTES
+        sizes: list[int] = []
+        offset = 0
+        while offset < total_bytes:
+            remaining = total_bytes - offset
+            chunk = min(mc, remaining)
+            if chunk < remaining and unit_bytes > 0:
+                aligned = chunk - (chunk % unit_bytes)
+                if aligned > 0:
+                    chunk = aligned
+                else:
+                    logger.warning(
+                        "RDMA unit_bytes=%d exceeds max chunk %d; a block will "
+                        "straddle an MR boundary and its transfer may fail",
+                        unit_bytes,
+                        mc,
+                    )
+            sizes.append(chunk)
+            offset += chunk
+        return sizes
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -680,8 +710,7 @@ class MooncakeConnector(KVConnectorBase):
             all_regions.append(tt.staging_region)
         for r in all_regions:
             offset = 0
-            while offset < r.total_bytes:
-                chunk = min(self._MAX_RDMA_CHUNK_BYTES, r.total_bytes - offset)
+            for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
                 reg_ptrs.append(r.base_addr + offset)
                 reg_sizes.append(chunk)
                 offset += chunk
