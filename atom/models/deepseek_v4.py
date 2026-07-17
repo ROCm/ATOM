@@ -2352,18 +2352,16 @@ class DeepseekV4Attention(nn.Module):
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
+                # Reuse q_sa as the attention output buffer; q_sa is not needed
+                # after this call and this avoids an extra empty_like allocation.
                 out=qkn.q_sa,
                 unified_kv_rope=self.unified_kv_rope,
                 q_packed=qkn.q_packed,
                 q_rope=qkn.q_rope,
                 k_packed=qkn.k_packed,
                 k_rope=qkn.k_rope,
-            )  # [S, H, head_dim] bf16
-                # Reuse q_sa as the attention output buffer; q_sa is not needed
-                # after this call and this avoids an extra empty_like allocation.
-                out=q_sa,
                 prefix=f"{self.layer_name}.sparse_attn_prefill",
-            )  # [S, H, head_dim]
+            )  # [S, H, head_dim] bf16
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
             # prior chunk's contents (not this chunk's just-computed tail).
             # OPT (window-only prefill write): only write each seq's trailing
