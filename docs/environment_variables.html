@@ -151,6 +151,7 @@
 <li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#weight-loading">3. Weight Loading</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#function-signature">Function Signature</a></li>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#loading-flow">Loading Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#batched-expert-staging">Batched Expert Staging</a></li>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#layers-beyond-num-hidden-layers">Layers Beyond <code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code></a></li>
 </ul>
 </li>
@@ -685,6 +686,11 @@ no wall-clock skew). See <code class="docutils literal notranslate"><span class=
 <td><p>bool</p></td>
 <td><p>false</p></td>
 <td><p>If set to <code class="docutils literal notranslate"><span class="pre">true</span></code>, disable memory-mapped file loading for model weights. Useful in containerized environments where mmap may cause issues.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>ATOM_LOADER_NUM_THREADS</strong></p></td>
+<td><p>int</p></td>
+<td><p>16</p></td>
+<td><p>Worker threads for weight loading. <code class="docutils literal notranslate"><span class="pre">&gt;1</span></code> (default <code class="docutils literal notranslate"><span class="pre">16</span></code>) enables the batched parallel loader (per-fused-param CPU staging flushed with a single H2D copy) with that many threads; set to <code class="docutils literal notranslate"><span class="pre">1</span></code> to fall back to the original sequential per-expert path. Raise on high-core hosts if loading is CPU-bound.</p></td>
 </tr>
 </tbody>
 </table>
