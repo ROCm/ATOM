@@ -1436,7 +1436,7 @@ jobs:
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f docker/vllm_release.dockerfile .
           echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom OOT image

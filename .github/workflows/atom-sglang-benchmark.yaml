@@ -961,7 +961,7 @@ jobs:
             --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f docker/sglang_release.dockerfile .
           echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom SGLang image
