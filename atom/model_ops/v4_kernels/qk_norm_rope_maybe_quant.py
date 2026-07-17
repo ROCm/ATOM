@@ -37,7 +37,6 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.v4_kernels.state_writes import swa_write
-from atom.utils.decorators import mark_trace
 
 
 @dataclass
