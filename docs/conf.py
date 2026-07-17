@@ -25,7 +25,7 @@ extensions = [
 external_toc_path = "./sphinx/_toc.yml"
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "DOCUMENTATION_AUDIT_REPORT.md"]
 
 # -- Options for HTML output -------------------------------------------------
 html_theme = "rocm_docs_theme"

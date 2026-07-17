@@ -14,8 +14,11 @@ subtrees:
     entries:
       - file: architecture_guide
       - file: configuration_guide
+      - file: environment_variables
       - file: model_support_guide
       - file: model_ops_guide
+      - file: online_quantization_guide
+      - file: eagle3_speculative_decoding
       - file: scheduling_kv_cache_guide
       - file: distributed_guide
       - file: compilation_cudagraph_guide
@@ -24,6 +27,10 @@ subtrees:
   - caption: Framework integrations
     entries:
       - file: vllm_plugin_backend_guide
+
+  - caption: Ecosystem integrations
+    entries:
+      - file: hermes_agent_guide
 
   - caption: API reference
     entries:
