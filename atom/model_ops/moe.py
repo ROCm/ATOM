@@ -1076,8 +1076,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # NOTE: this runs AFTER the shared-expert stash above, which keeps the
             # shared experts in gguu for the dense swiglu_oai_split path. Only the
             # SwiGLU triton branch needs interleaved rows; the SiLU branch uses
-            # fused_clamp_act_mul, which half-splits gguu — so gate on activation.
-            if getattr(layer, "activation", None) == ActivationType.Swiglu:
+            # fused_clamp_act_mul, which half-splits gguu, so gate on activation.
+            #
+            # LAYOUT GUARD: interleave ONLY checkpoints stored gate/up SEPARATED
+            # (gguu), e.g. MiniMax-M3. gpt-oss ships w13 already INTERLEAVED
+            # (gugu), exactly what the triton SwiGLU kernel consumes, and its
+            # model code sets ``_w13_gate_up_interleaved`` on the layer. Running
+            # the gguu->gugu permutation on already-gugu rows would scramble
+            # gate/up, so we skip those. (``_interleave_gate_up_rows_`` also
+            # honors this flag as its idempotency guard; the check here makes the
+            # per-model layout intent explicit at the call site.)
+            if getattr(
+                layer, "activation", None
+            ) == ActivationType.Swiglu and not getattr(
+                layer, "_w13_gate_up_interleaved", False
+            ):
                 _interleave_gate_up_rows_(layer)
 
             (
