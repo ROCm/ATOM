@@ -437,7 +437,7 @@ jobs:
               {
                   "model_name": "MI308 GLM-5.2-FP8 TP8",
                   "model_path": "zai-org/GLM-5.2-FP8",
-                  "extra_args": "--trust-remote-code --tp-size 8 --mem-fraction-static 0.8 --disable-radix-cache --page-size 1 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
+                  "extra_args": "--trust-remote-code --tp-size 8 --mem-fraction-static 0.8 --disable-radix-cache --max-prefill-tokens 65536 --kv-cache-dtype fp8_e4m3 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
                   "lm_eval_num_fewshot": 5,
                   "lm_eval_num_concurrent": 65,
                   "accuracy_test_threshold": 0.93,
