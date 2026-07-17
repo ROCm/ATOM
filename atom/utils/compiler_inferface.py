@@ -626,12 +626,11 @@ class InductorStandaloneAdaptor(CompilerInterface):
             compiled_graph.save(path=path, format="unpacked")
             compilation_counter.num_compiled_artifacts_saved += 1
             handle = (key, path)
-        except (AssertionError, RuntimeError) as e:
+        except AssertionError:
             logger.warning(
                 "Skipping standalone compiled graph save for %s because "
-                "PyTorch did not emit a complete unpacked artifact (%s).",
+                "PyTorch did not emit a complete unpacked artifact.",
                 key,
-                e,
             )
 
         # Post-process generated wrapper Python files: wrap regions between

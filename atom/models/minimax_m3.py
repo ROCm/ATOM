@@ -400,7 +400,7 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
         return self.o_proj(attn_output)
 
@@ -539,7 +539,8 @@ class MiniMaxM3SparseAttention(nn.Module):
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
-        q, k, v, _, _ = qkv.split(
+        q, k, v, _, _ = torch.split(
+            qkv,
             [
                 self.q_size,
                 self.kv_size,

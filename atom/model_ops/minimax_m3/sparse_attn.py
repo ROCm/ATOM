@@ -126,7 +126,7 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
     return kv_cache.dtype in {dtype for dtype in fp8_dtypes if dtype is not None}
 
 
-def _sparse_decode_unified_attention(
+def _sparse_unified_attention(
     q_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim] (kv-head collapsed)
     out_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim]
     k_cache_view: torch.Tensor,  # SHUFFLE 5D, num_kv_heads collapsed to 1
@@ -156,7 +156,14 @@ def _sparse_decode_unified_attention(
     # key_cache: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     block_size = k_cache_view.shape[3]
     # Each token is its own length-1 sequence (decode); cu_seqlens_q = 0..num_seqs.
-    cu_seqlens_q = torch.arange(num_seqs + 1, dtype=torch.int32, device=q_view.device)
+    _cache = getattr(_sparse_unified_attention, "_cu_seqlens_q_cache", None)
+    if _cache is None:
+        _cache = {}
+        _sparse_unified_attention._cu_seqlens_q_cache = _cache
+    key = (q_view.device, int(num_seqs))
+    if key not in _cache:
+        _cache[key] = torch.arange(num_seqs + 1, dtype=torch.int32, device=q_view.device)
+    cu_seqlens_q = _cache[key]
     # Safe upper bound: full block table width * page size (>= every sparse_ctx).
     max_seqlen_k = int(sparse_bt.shape[1]) * int(block_size)
 
@@ -1241,11 +1248,11 @@ def minimax_m3_sparse_attn_decode_asm(
     if get_gfx() == "gfx1250":
         if _is_fp8_kv_cache_tensor(k_cache):
             raise NotImplementedError(
-                "MiniMax-M3 fp8 sparse decode is not yet supported on gfx1250:"
+                "MiniMax-M3 fp8 sparse attention is not yet supported on gfx1250:"
                 "the gluon per-page descale path has no unified_attention "
                 "equivalent here. Use a bf16 KV cache on gfx1250."
             )
-        _sparse_decode_unified_attention(
+        _sparse_unified_attention(
             q_view,
             out_view,
             k_cache_view,
@@ -1359,7 +1366,7 @@ def _run_prefill_fp8_gluon(
                 "the gluon per-page descale path has no unified_attention "
                 "equivalent here. Use a bf16 KV cache on gfx1250."
             )
-        _sparse_decode_unified_attention(
+        _sparse_unified_attention(
             q_view,
             out_view,
             k_cache_view,
