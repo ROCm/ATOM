@@ -230,6 +230,40 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             self._init_forward_metadata_extend(forward_batch)
         self._fixup_page_table(forward_batch)
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """Build ATOM metadata for SGLang's split CUDA graph init protocol."""
+        self._patch_forward_batch_pools(forward_batch)
+        if in_capture:
+            self.init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.seq_lens_sum,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
+        else:
+            self.init_forward_metadata_replay_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                forward_batch.encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+                forward_batch.seq_lens_cpu,
+                forward_batch.out_cache_loc,
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """ATOM's full-attention metadata is prepared outside the captured graph."""
+        return None
+
     def _init_forward_metadata_decode(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info

@@ -449,11 +449,12 @@
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
     "runner": "atom-mi308-8gpu-plugins-accuracy",
     "test_level": "nightly",
-    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_fewshot": 8,
     "lm_eval_num_concurrent": 8,
-    "accuracy_threshold": 0.94,
-    "accuracy_baseline": null,
+    "lm_eval_extra_model_args": "max_gen_toks=2048,timeout=60000",
+    "accuracy_threshold": 0.9,
+    "accuracy_baseline": 0.9029567854435178,
     "accuracy_baseline_model": "sgl-project/DeepSeek-V4-Flash-FP8",
-    "_baseline_note": "MI308 SGLang DeepSeek-V4-Flash coverage uses the FP8 checkpoint to avoid the MXFP4 MoE loading path on gfx942; refresh baseline after nightly measurements land."
+    "_baseline_note": "MI308 SGLang DeepSeek-V4-Flash FP8 measured GSM8K flexible-extract=0.9029567854435178 with the validated 8-shot recipe and max_gen_toks=2048; threshold leaves minimal headroom for CI noise."
   }
 ]
