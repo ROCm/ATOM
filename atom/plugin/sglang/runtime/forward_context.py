@@ -125,6 +125,46 @@ def _resolve_num_tokens_across_dp(
     return num_tokens_across_dp
 
 
+def _max_len_from_optional(cpu_lens, gpu_lens, default: int) -> int:
+    if cpu_lens is not None:
+        if isinstance(cpu_lens, torch.Tensor):
+            return int(cpu_lens.max().item()) if cpu_lens.numel() else default
+        return max((int(x) for x in cpu_lens), default=default)
+    if gpu_lens is not None:
+        return int(gpu_lens.max().item()) if gpu_lens.numel() else default
+    return default
+
+
+def _build_generic_attention_metadata(forward_batch: ForwardBatch, max_seqlen_q: int):
+    """Build minimal ATOM metadata from SGLang batch fields for non-V4 models."""
+
+    from atom.utils.forward_context import AttentionMetaData
+
+    # GLM/DSA SGLang plugin attention kernels read detailed scheduling metadata
+    # directly from SGLang's forward_batch.  ATOM's model-level PCP gate,
+    # however, runs before those kernels and checks
+    # get_forward_context().attn_metadata.max_seqlen_k in deepseek_v2._pcp_active().
+    # Without this fallback metadata, max_seqlen_k stays at AttentionMetaData's
+    # default 0 and long-prefill PCP never activates.
+    forward_mode = forward_batch.forward_mode
+    seq_lens = getattr(forward_batch, "seq_lens", None)
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+
+    if not forward_mode.is_decode_or_idle():
+        max_seqlen_q = _max_len_from_optional(
+            extend_seq_lens_cpu, extend_seq_lens, max_seqlen_q
+        )
+    max_seqlen_k = _max_len_from_optional(seq_lens_cpu, seq_lens, 0)
+
+    return AttentionMetaData(
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        context_lens=seq_lens,
+    )
+
+
 def _slice_v4_graph_metadata_for_capture(
     attn_metadata: Any, *, num_tokens: int, bs: int
 ):
@@ -345,7 +385,6 @@ def _set_atom_forward_context(
     """Bridge SGLang batch metadata into ATOM's global forward context."""
 
     from atom.utils.forward_context import (
-        AttentionMetaData,
         Context,
         set_forward_context,
     )
@@ -374,7 +413,7 @@ def _set_atom_forward_context(
             ) from exc
 
     if attn_metadata is None:
-        attn_metadata = AttentionMetaData(max_seqlen_q=max_seqlen_q)
+        attn_metadata = _build_generic_attention_metadata(forward_batch, max_seqlen_q)
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
     is_prefill = forward_mode.is_prefill()
