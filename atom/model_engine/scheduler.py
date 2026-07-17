@@ -1468,26 +1468,43 @@ class Scheduler:
                 self._partial_prefill_count += 1 if now_partial else -1
                 seq.is_partial_prefill = now_partial
 
-    def mark_pp_inflight(self, batch: ScheduledBatch) -> None:
-        """Head: block re-scheduling of seqs whose token is now in flight.
+    @staticmethod
+    def _pp_inflight_req_ids(batch: ScheduledBatch):
+        """Req_ids that will produce a not-yet-appended token in this batch.
 
-        A decode seq, or a prefill seq on its final chunk, will produce a token
-        the head has not yet appended. Blocking them until release_pp_inflight()
-        prevents decoding against a stale token while the pipeline is filled.
+        A whole decode batch, or the final chunk of a chunked prefill, yields a
+        token the head has not appended yet. mark_pp_inflight() and
+        release_pp_inflight() MUST use this same predicate so every add() has a
+        matching discard(); a seq spanning two batches (middle then final chunk)
+        is only blocked/released by its final-chunk batch.
         """
         final = batch.is_final_chunk
-        is_decode_batch = batch.total_seqs_num_decode > 0
-        if is_decode_batch:
-            for req_id in batch.req_ids:
-                self._pp_inflight_token_block.add(req_id)
+        if batch.total_seqs_num_decode > 0:
+            yield from batch.req_ids
         elif final is not None:
             for i, req_id in enumerate(batch.req_ids):
                 if final[i]:
-                    self._pp_inflight_token_block.add(req_id)
+                    yield req_id
+
+    def mark_pp_inflight(self, batch: ScheduledBatch) -> None:
+        """Head: block re-scheduling of seqs whose token is now in flight.
+
+        Blocking them until release_pp_inflight() prevents decoding against a
+        stale token while the pipeline is filled.
+        """
+        for req_id in self._pp_inflight_req_ids(batch):
+            self._pp_inflight_token_block.add(req_id)
 
     def release_pp_inflight(self, batch: ScheduledBatch) -> None:
-        """Head: release seqs blocked by mark_pp_inflight after postprocess."""
-        for req_id in batch.req_ids:
+        """Head: release seqs blocked by mark_pp_inflight after postprocess.
+
+        Discards exactly the set mark_pp_inflight() added (see
+        _pp_inflight_req_ids). Releasing every req_id unconditionally would let
+        an earlier middle-chunk batch (collected first, FIFO) clear the block a
+        later final-chunk batch just set for the same seq, leaking it into the
+        decode segment before its first token has returned.
+        """
+        for req_id in self._pp_inflight_req_ids(batch):
             self._pp_inflight_token_block.discard(req_id)
 
     def postprocess(
