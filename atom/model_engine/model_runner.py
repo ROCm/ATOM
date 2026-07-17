@@ -27,6 +27,10 @@ from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
+from atom.model_ops.eplb import (
+    initialize_eplb_runtime,
+    with_eplb_forward_monitor,
+)
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.eagle import EagleProposer
@@ -735,6 +739,7 @@ class ModelRunner:
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
+        initialize_eplb_runtime(self)
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
@@ -2312,6 +2317,7 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
+    @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         (
             input_ids,

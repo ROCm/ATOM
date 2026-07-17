@@ -55,9 +55,40 @@ class _StubParallelConfig:
     pass
 
 
+class _StubEPLBConfig:
+    """Placeholder for EPLBConfig with the defaults EPLB code reads."""
+
+    load_window_size = 1000
+    rebalance_interval = 3000
+    p2p_batch_chunk_size = 32
+    rebalance_layers_per_chunk = 64
+    num_redundant_experts = 0
+    rebalance_min_balancedness = 2.0
+    rebalance_balancedness_agg = "min"
+    placement_policy = "naive"
+
+    def __init__(self, **kwargs):
+        # AtomArgs builds EPLBConfig(**eplb_kwargs); mirror the real dataclass
+        # constructor by accepting and storing those fields (falls back to the
+        # class-level defaults above when constructed with no args).
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class _StubAtomConfig:
+    """Placeholder returned by get_current_atom_config in unit tests."""
+
+    eplb_enable = False
+    eplb_config = _StubEPLBConfig()
+
+
 _atom_config.Config = _StubConfig
 _atom_config.KVCacheTensor = _StubKVCacheTensor
 _atom_config.ParallelConfig = _StubParallelConfig
+_atom_config.EPLBConfig = _StubEPLBConfig
+# Present so tests can monkeypatch it (raising=True) and so EPLB code paths that
+# call it without a patch get usable defaults.
+_atom_config.get_current_atom_config = lambda: _StubAtomConfig()
 sys.modules["atom.config"] = _atom_config
 
 # ── 3b. Stub forward_context; Scheduler only needs get_kvconnector in tests ──
