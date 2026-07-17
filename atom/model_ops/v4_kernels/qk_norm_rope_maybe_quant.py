@@ -37,6 +37,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.v4_kernels.state_writes import swa_write
+from atom.utils.decorators import mark_trace
 
 
 @dataclass
@@ -593,6 +594,7 @@ def _qk_norm_rope_maybe_quant_bf16(
     return q_out, kv_out, q_scale, kv_scale
 
 
+@mark_trace
 def qk_norm_rope_maybe_quant(
     q: torch.Tensor,
     kv: torch.Tensor,
