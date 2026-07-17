@@ -155,7 +155,6 @@ jobs:
           fi
           echo "ATOM checkout ref: ${ATOM_CHECKOUT} (branch: ${{ github.ref_name }})"
           DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
-          --target atom_image \
           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
@@ -265,7 +264,6 @@ jobs:
           OOT_BASE_IMAGE="atom_release:ci"
           echo "Using OOT base image: ${OOT_BASE_IMAGE}"
           docker build --network=host -t atom_oot_release:ci \
-            --target atom_oot \
             --build-arg OOT_BASE_IMAGE="${OOT_BASE_IMAGE}" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${{ env.VLLM_COMMIT }}" \
@@ -314,7 +312,6 @@ jobs:
           SGLANG_BASE_IMAGE="atom_release:ci"
           echo "Using SGLang+ATOM base image: ${SGLANG_BASE_IMAGE}"
           docker build --network=host -t atom_sglang_release:ci \
-            --target atom_sglang \
             --build-arg SGLANG_BASE_IMAGE="${SGLANG_BASE_IMAGE}" \
             --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
             --build-arg SGLANG_REPO="${{ inputs.sglang_repo || env.SGLANG_REPO }}" \

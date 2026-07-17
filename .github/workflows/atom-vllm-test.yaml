@@ -486,7 +486,6 @@ jobs:
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
             -t atom_oot:ci \
-            --target atom_oot \
             --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \

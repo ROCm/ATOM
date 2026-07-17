@@ -1430,7 +1430,6 @@ jobs:
           docker build --network=host \
             --no-cache \
             -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
             --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
