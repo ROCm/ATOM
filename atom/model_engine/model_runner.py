@@ -1831,19 +1831,20 @@ class ModelRunner:
         dp_size = self.config.parallel_config.data_parallel_size
 
         # Rank-local TBO precompute (needed for both dp==1 fast path and
-        # the cross-DP packed gather below). `wants` = cleared min-token bar
-        # (OR-reduced); `can_split` = structurally splittable (AND-reduced).
-        local_wants, local_can_split, local_ub0, local_ub1 = False, False, 0, 0
+        # the cross-DP packed gather below). `meets_min_tokens` = this rank's
+        # prefill reached the min-token bar (e.g. 8k), OR-reduced across DP;
+        # `can_split` = structurally splittable, AND-reduced across DP.
+        local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = False, False, 0, 0
         if tbo_on:
             if num_scheduled_tokens is None:
                 num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-            local_wants, local_can_split, local_ub0, local_ub1 = local_tbo_precompute(
+            local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = local_tbo_precompute(
                 self.config, batch, is_prefill, num_scheduled_tokens
             )
 
         if dp_size <= 1:
             # Single-rank: TBO decision is purely local; no collective needed.
-            # Both bits must hold (want it AND able to split it).
+            # Both bits must hold (reached min-tokens AND able to split).
             # dp_uniform_decode=True mirrors the DP-disabled case in the
             # multi-rank branch (`not enable_dp_attention` => True) and the
             # Context default — otherwise single-GPU/TP-only decode would
@@ -1853,7 +1854,7 @@ class ModelRunner:
                 None,
                 True,
                 num_input_tokens,
-                local_wants and local_can_split,
+                local_meets_min_tokens and local_can_split,
                 None,
             )
 
@@ -1863,8 +1864,8 @@ class ModelRunner:
             num_input_tokens=num_input_tokens,
             is_prefill=is_prefill,
             tbo_on=tbo_on,
-            local_tbo_wants=local_wants,
-            local_tbo_can_split=local_can_split,
+            local_meets_min_tokens=local_meets_min_tokens,
+            local_can_split=local_can_split,
             local_ub_tokens=(local_ub0, local_ub1),
         )
 
