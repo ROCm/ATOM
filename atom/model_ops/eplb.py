@@ -170,8 +170,38 @@ def _build_logical_to_physical_map(
     return torch.tensor(out_rows, dtype=torch.int32, device=physical_to_logical.device)
 
 
+def _rebuild_placement_from_p2l(
+    p2l_layer: torch.Tensor, num_logical: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reconstruct (p2l, phyrank, logcnt) from an existing physical->logical map,
+    unchanged. Used by the biased sticky fast-path: returning the old p2l verbatim
+    makes the new metadata identical to the live one, so migration planning sees a
+    zero diff (no P2P). phyrank[slot] = the 0-based replica index of that slot's
+    logical among its slots (order of appearance); logcnt[e] = #slots holding e."""
+    lst = p2l_layer.tolist()
+    dev = p2l_layer.device
+    cnt = [0] * num_logical
+    prank = [0] * len(lst)
+    seen = [0] * num_logical
+    for slot, lg in enumerate(lst):
+        if lg < 0:
+            prank[slot] = 0
+            continue
+        prank[slot] = seen[lg]
+        seen[lg] += 1
+        cnt[lg] += 1
+    return (
+        p2l_layer.clone(),
+        torch.tensor(prank, dtype=torch.int32, device=dev),
+        torch.tensor(cnt, dtype=torch.int32, device=dev),
+    )
+
+
 def _placement_biased(
-    weight_l: torch.Tensor, num_physical: int, num_gpus: int
+    weight_l: torch.Tensor,
+    num_physical: int,
+    num_gpus: int,
+    old_p2l_layer: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Biased placement policy: spend the whole redundant-expert budget on FULLY
     replicating the top-K hottest logical experts onto ALL `num_gpus` GPUs (one
@@ -195,8 +225,34 @@ def _placement_biased(
     ), f"force_n={force_n} must be in (0, {phy_per_gpu}]"
     w = weight_l.to(torch.float32).cpu().tolist()
     order = sorted(range(num_logical), key=lambda e: (-w[e], e))
-    hot = order[:force_n]
-    hot_set = set(hot)
+    _new_hot_set = set(order[:force_n])
+    # SHORTEST-PATH (sticky) fast-path: if the previous placement already fully
+    # replicates EXACTLY this hot set, keep the entire old placement -- hot AND
+    # cold -- untouched, so the migration diff is zero. Once the hot set is placed,
+    # per-GPU balance is already ~optimal; re-packing cold on every rebalance churns
+    # cold replicas for no real balancedness gain (that churn was the ~1.4-2.2s of
+    # wasted migration per interval). We only rebuild when the hot set changes.
+    if old_p2l_layer is not None:
+        old_list = old_p2l_layer.tolist()
+        old_counts: dict[int, int] = {}
+        for _lg in old_list:
+            if _lg >= 0:
+                old_counts[_lg] = old_counts.get(_lg, 0) + 1
+        old_hot_set = {e for e in old_list[:force_n] if e >= 0}
+        if old_hot_set == _new_hot_set and all(
+            old_counts.get(e, 0) == num_gpus for e in _new_hot_set
+        ):
+            return _rebuild_placement_from_p2l(old_p2l_layer, num_logical)
+    # Select the top-K hot set by load, but place them into the hot slot block in
+    # STABLE (expert-id) order rather than load-rank order. The hot block is fully
+    # replicated to every GPU, so when the hot SET is unchanged between rebalances
+    # (the common steady state), stable ordering keeps each hot expert in the same
+    # physical slot on every rank -> the per-slot old==new check in migration
+    # planning skips it -> no redundant re-migration of the hottest (highest-traffic)
+    # experts. Load-rank ordering would permute the block on every load wiggle and
+    # re-migrate all K replicas across all GPUs for nothing.
+    hot_set = _new_hot_set
+    hot = sorted(hot_set)
     cold = [e for e in range(num_logical) if e not in hot_set]
 
     cnt = [0] * num_logical
@@ -256,12 +312,18 @@ def _placement_biased(
 
 
 def _placement_naive(
-    weight_l: torch.Tensor, num_physical: int, num_gpus: int
+    weight_l: torch.Tensor,
+    num_physical: int,
+    num_gpus: int,
+    old_p2l_layer: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Naive placement policy (default): greedy per-replica-load replication
     (replicate_experts) + balanced_packing spread across GPUs — i.e. the same
     redundant budget spread thinly over the hottest experts. Contrast with
-    `_placement_biased`. Returns (p2l, phyrank, logcnt)."""
+    `_placement_biased`. `old_p2l_layer` is accepted for a uniform policy
+    signature but unused (naive has no sticky fast-path). Returns (p2l, phyrank,
+    logcnt)."""
+    _ = old_p2l_layer
     num_logical = weight_l.numel()
     phy2log, phyrank, logcnt = replicate_experts(
         weight_l.view(1, num_logical), num_physical
@@ -308,10 +370,12 @@ def _rebalance_single_layer_global(
     num_physical: int,
     num_gpus: int,
     policy=None,
+    old_p2l_layer: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (physical_to_logical, physical_rank, logcnt) for one layer via the
-    given placement policy callable (default: naive)."""
-    return (policy or _placement_naive)(weight_l, num_physical, num_gpus)
+    given placement policy callable (default: naive). `old_p2l_layer` is the layer's
+    current placement, passed to policies with a sticky/shortest-path fast-path."""
+    return (policy or _placement_naive)(weight_l, num_physical, num_gpus, old_p2l_layer)
 
 
 def rebalance_experts(
@@ -323,10 +387,13 @@ def rebalance_experts(
     num_gpus: int,
     enable_hierarchical: bool,
     policy=None,
+    old_p2l: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Module-C entrypoint. `policy` is the per-layer placement callable
     (default naive); in the hierarchical path it is applied per-node so `biased`
-    replicates within-node.
+    replicates within-node. `old_p2l` [num_layers, num_physical] is the current
+    live placement; passed per-layer to policies for a sticky/shortest-path
+    fast-path (flat/non-hierarchical path only; hierarchical recomputes fresh).
 
     Returns:
         physical_to_logical_map: [num_layers, num_physical] int32
@@ -355,8 +422,13 @@ def rebalance_experts(
 
     if not enable_hierarchical or num_groups == 1 or num_nodes == 1:
         for l in range(num_layers):
+            old_p2l_l = None if old_p2l is None else old_p2l[l]
             p2l_l, rank_l, cnt_l = _rebalance_single_layer_global(
-                weight[l], num_physical, num_gpus, policy=policy
+                weight[l],
+                num_physical,
+                num_gpus,
+                policy=policy,
+                old_p2l_layer=old_p2l_l,
             )
             p2l[l] = p2l_l
             phyrank[l] = rank_l
@@ -1394,7 +1466,24 @@ class ExpertLoadMonitor:
         group = self._load_group if self._load_group is not None else get_tp_group()
         world_size = int(getattr(group, "world_size", 1))
         if world_size > 1:
-            # Group all_reduce path is float-oriented in this stack.
+            # Reduce the integer token counts with a standard integer all-reduce.
+            # Integer SUM is exactly associative/commutative, so the reduced
+            # tensor is bit-identical on every rank regardless of the reduction
+            # order -- which is what lets each rank derive the SAME rebalance
+            # plan locally without broadcasting it (see SGLang, which reduces the
+            # load as int32 for the same reason). The previous path routed the
+            # counts through aiter's float custom all-reduce + round, which relied
+            # on FP determinism to stay bit-identical across ranks.
+            device_group = getattr(group, "device_group", None)
+            if device_group is not None:
+                global_load = local.to(torch.int64)
+                torch.distributed.all_reduce(
+                    global_load,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=device_group,
+                )
+                return global_load.to(torch.int32)
+            # Fallback: no torch process group exposed -- keep the float path.
             global_load = group.all_reduce(local.to(torch.float32), ca_fp8_quant=False)
             return global_load.round().to(torch.int32)
         return local
@@ -1495,6 +1584,14 @@ class EPLBManager:
         self._reusable_temp_buffers: Optional[list[torch.Tensor]] = None
         self._expert_map_tails: dict[int, torch.Tensor] = {}
         self._ep_group: Optional[Any] = None
+        # Dedicated process group for EPLB weight-migration P2P, isolated from the
+        # EP group that the forward pass (MoE all-to-all etc.) runs on. NCCL/RCCL
+        # matches P2P per (peer, per-communicator op order); if migration isend/
+        # irecv shared the EP communicator with in-flight forward P2P/collectives,
+        # a migration send could cross-match a forward op to the same peer and hang.
+        # SGLang avoids this by issuing migration P2P on a separate (default) group;
+        # we mirror that with an EP-membership subgroup used only for migration.
+        self._migration_group: Optional[Any] = None
         self._ep_rank: int = 0
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
@@ -1602,6 +1699,13 @@ class EPLBManager:
             self.monitor.set_load_group(ep)
             self._ep_group = ep.device_group
             self._ep_rank = int(ep.rank_in_group)
+            # Dedicated communicator for migration P2P (same members/order as the
+            # EP group, so the ep-relative peer ranks in the migration plan stay
+            # valid). Isolating migration off the EP communicator prevents its
+            # isend/irecv from cross-matching in-flight forward ops on that group.
+            # new_group is collective over the default group; every rank calls it.
+            ep_global_ranks = torch.distributed.get_process_group_ranks(self._ep_group)
+            self._migration_group = torch.distributed.new_group(ranks=ep_global_ranks)
         except Exception as exc:
             raise RuntimeError(
                 "EPLB is enabled but EP process group is unavailable; "
@@ -1633,6 +1737,11 @@ class EPLBManager:
         # Initialize redundant physical slots the checkpoint loader left empty.
         # At init the weights are loaded, the EP group is up, and no forward has
         # run yet -- an idle window for the one-time trivial copy.
+        # PyTorch requires all ranks to participate when batch_isend_irecv is
+        # the first collective on an NCCL process group. Initialize the dedicated
+        # migration group with an all-rank barrier because fill_redundant issues
+        # asymmetric P2P operations involving only a subset of EP ranks.
+        torch.distributed.barrier(group=self._migration_group)
         self.fill_redundant()
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
@@ -1773,7 +1882,9 @@ class EPLBManager:
         p2l = torch.full((num_layers, num_physical), -1, dtype=torch.int32, device=dev)
         p2l[:, :num_logical] = ident.unsqueeze(0).expand(num_layers, -1)
         logcnt = torch.ones((num_layers, num_logical), dtype=torch.int32, device=dev)
-        l2p = torch.full((num_layers, num_logical, 1), -1, dtype=torch.int32, device=dev)
+        l2p = torch.full(
+            (num_layers, num_logical, 1), -1, dtype=torch.int32, device=dev
+        )
         l2p[:, :, 0] = ident.unsqueeze(0).expand(num_layers, -1)
         return ExpertLocationMetadata.from_rebalance_result(
             physical_to_logical_map=p2l,
@@ -1808,13 +1919,21 @@ class EPLBManager:
             new_meta=m,
             expert_weights_of_layer=self._expert_weights_of_layer,
             temp_buffers=self._reusable_temp_buffers,
-            ep_group=self._ep_group,
+            ep_group=self._migration_group,
             nnodes=self._nnodes,
             rank=self._ep_rank,
             live_meta=m,
             p2p_batch_chunk_size=self._p2p_batch_chunk_size,
             cuda_stream=None,
         )
+        # fill_redundant's migration is highly asymmetric: only base-holder ranks
+        # send and only redundant-holder ranks receive (trivial placement clusters
+        # redundant slots on the last ranks), so ranks with no migration work return
+        # from migrate_and_commit_chunk immediately. Without a barrier they race
+        # ahead into the warmup forward while the migrating ranks are still running
+        # P2P. Barrier (on the migration group) so all ranks finish migration before
+        # any proceeds.
+        torch.distributed.barrier(group=self._migration_group)
         logger.info(
             "EPLB fill_redundant: initialized %d redundant slots/layer across "
             "%d layers",
@@ -1922,6 +2041,9 @@ class EPLBManager:
             num_gpus=ep_size,
             enable_hierarchical=(num_groups > 1 and num_nodes > 1),
             policy=resolve_placement_policy(self.placement_policy),
+            # Current live placement -> enables the biased sticky/shortest-path
+            # fast-path: unchanged hot set => reuse old placement => zero migration.
+            old_p2l=self.live_metadata.physical_to_logical_map,
         )
         new_meta = ExpertLocationMetadata.from_rebalance_result(
             physical_to_logical_map=p2l,
@@ -1966,7 +2088,7 @@ class EPLBManager:
                     new_meta=new_meta,
                     expert_weights_of_layer=self._expert_weights_of_layer,
                     temp_buffers=temp_buffers,
-                    ep_group=self._ep_group,
+                    ep_group=self._migration_group,
                     nnodes=self._nnodes,
                     rank=self._ep_rank,
                     live_meta=self.live_metadata,
@@ -2009,9 +2131,7 @@ class EPLBManager:
             logcnt_cpu = logcnt.detach().to("cpu")
             redundant_mask = logcnt_cpu > 1
             total = float(ll.sum().item())
-            frac = (
-                float(ll[redundant_mask].sum().item()) / total if total > 0 else 0.0
-            )
+            frac = float(ll[redundant_mask].sum().item()) / total if total > 0 else 0.0
             num_redundant = int(redundant_mask.sum().item())
 
             ep = int(self.live_metadata.ep_size)
