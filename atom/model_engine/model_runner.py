@@ -588,13 +588,13 @@ class ModelRunner:
         # so that dp config fields are still at their original values)
         self.profiler = None
         self.profiler_dir = None
+        dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
+        if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
+            self.rank_name = f"dp{dp_rank_local}_tp{rank}"
+        else:
+            self.rank_name = f"rank_{rank}"
         if config.torch_profiler_dir is not None:
-            dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
-            if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
-                rank_name = f"dp{dp_rank_local}_tp{rank}"
-            else:
-                rank_name = f"rank_{rank}"
-            self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
+            self.profiler_dir = os.path.join(config.torch_profiler_dir, self.rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self._setup_device_and_distributed(rank, config)
@@ -653,6 +653,7 @@ class ModelRunner:
         if hasattr(self.model, "load_fused_expert_weights"):
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
+        load_start = time.perf_counter()
         load_model(
             self.model,
             config.model,
@@ -660,7 +661,11 @@ class ModelRunner:
             config.load_dummy,
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
-        logger.info(f"Model load done: {config.model}")
+        load_elapsed = time.perf_counter() - load_start
+        logger.info(
+            f"[{self.rank_name}] Model load done: {config.model} "
+            f"(weights loaded in {load_elapsed:.2f}s)"
+        )
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -1834,12 +1839,19 @@ class ModelRunner:
         # the cross-DP packed gather below). `meets_min_tokens` = this rank's
         # prefill reached the min-token bar (e.g. 8k), OR-reduced across DP;
         # `can_split` = structurally splittable, AND-reduced across DP.
-        local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = False, False, 0, 0
+        local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = (
+            False,
+            False,
+            0,
+            0,
+        )
         if tbo_on:
             if num_scheduled_tokens is None:
                 num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-            local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = local_tbo_precompute(
-                self.config, batch, is_prefill, num_scheduled_tokens
+            local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = (
+                local_tbo_precompute(
+                    self.config, batch, is_prefill, num_scheduled_tokens
+                )
             )
 
         if dp_size <= 1:
