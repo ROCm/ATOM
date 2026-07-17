@@ -1754,7 +1754,14 @@ class ModelRunner:
                     f"diff={diff_pct:.1%}"
                 )
 
-        if torch.distributed.is_initialized():
+        # Skip on single-rank: a world_size==1 barrier is a no-op but still
+        # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
+        # which can OOM/fail on single-card runs. The process group stays
+        # initialized so get_tp_group() and friends keep working.
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
             torch.distributed.barrier()
         return True
 
