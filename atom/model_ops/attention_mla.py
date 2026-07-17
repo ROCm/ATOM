@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional
@@ -290,6 +291,52 @@ class MLAAttention(nn.Module):
                     "aiter or set ATOM_MLA_PAGE_SIZE=1."
                 )
 
+        # Tiny graph-safe scratch for GLM target-verify debugging. During CUDA
+        # graph replay Python does not run, but captured device copies still
+        # update this buffer; the SGLang graph wrapper reads it after replay.
+        self.register_buffer(
+            "_atom_glm52_attn_debug",
+            torch.zeros((4, 8), dtype=torch.float32),
+            persistent=False,
+        )
+
+    def _atom_glm52_debug_layer_enabled(self) -> bool:
+        configured = os.environ.get("ATOM_GLM52_ATTENTION_DEBUG_LAYERS")
+        if not configured:
+            return False
+        if configured.strip().lower() in ("all", "*"):
+            return True
+        try:
+            layers = {
+                int(item)
+                for item in configured.replace(" ", ",").split(",")
+                if item.strip()
+            }
+        except ValueError:
+            return False
+        return int(self.layer_num) in layers
+
+    def _atom_glm52_write_attn_debug(self, stage: int, tensor: torch.Tensor) -> None:
+        if not self._atom_glm52_debug_layer_enabled() or not torch.is_tensor(tensor):
+            return
+        if tensor.numel() == 0:
+            return
+        try:
+            flat = tensor.reshape(tensor.shape[0], -1).float()
+            row = flat[0]
+            dim = int(row.numel())
+            buf = self._atom_glm52_attn_debug
+            out = buf[int(stage)]
+            out[0].fill_(float(self.layer_num))
+            out[1].fill_(float(stage))
+            out[2].fill_(float(tensor.shape[0]))
+            out[3 : 3 + min(5, dim)].copy_(row[: min(5, dim)])
+            if dim < 5:
+                out[3 + dim :].zero_()
+        except Exception:
+            if not torch.cuda.is_current_stream_capturing():
+                logger.exception("Failed to write GLM52 attention debug buffer")
+
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Reshape the KV cache buffer into the page-level flat seg layout
         ``[num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)]`` that the
@@ -511,6 +558,8 @@ class MLAAttention(nn.Module):
             getattr(attn_metadata, "shuffle_kv_block_indptr", None),
             getattr(attn_metadata, "shuffle_kv_block_indices", None),
         )
+        self._atom_glm52_write_attn_debug(2, k_full)
+        self._atom_glm52_write_attn_debug(3, v_full)
         output = flash_attn_varlen_func(
             q=prefill_q,
             k=k_full,
@@ -605,7 +654,7 @@ class MLAAttention(nn.Module):
         n = MLAAttention._chunked_prefill_calls = (
             getattr(MLAAttention, "_chunked_prefill_calls", 0) + 1
         )
-        if n == 1 or n % 500 == 0:
+        if (n == 1 or n % 500 == 0) and not torch.cuda.is_current_stream_capturing():
             logger.info(
                 "MLA chunked-prefill #%d: layer=%d num_chunks=%d "
                 "total_kv=%s cu_seqlens_q[-1]=%d",
@@ -1149,6 +1198,7 @@ class MLAAttention(nn.Module):
             )
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
+            self._atom_glm52_write_attn_debug(0, prefill_q)
 
             if kv_cache.numel() > 0:
                 if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
@@ -1205,6 +1255,7 @@ class MLAAttention(nn.Module):
                 output = self._forward_prefill_mha(
                     prefill_q, k_nope, k_rope, kv_cache, attn_metadata
                 )
+            self._atom_glm52_write_attn_debug(1, output)
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
@@ -1292,11 +1343,13 @@ class MLAAttention(nn.Module):
                         is_nope_first=True,
                     )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
+            self._atom_glm52_write_attn_debug(2, q_out)
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
             else:
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
+            self._atom_glm52_write_attn_debug(3, output)
 
         return output
 

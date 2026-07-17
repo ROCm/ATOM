@@ -8,6 +8,7 @@ To add a new model, append its architecture class name to _MODEL_NAMES.
 
 import inspect
 import logging
+import os
 from typing import Any, Iterable, Optional, Tuple, Union
 
 import torch
@@ -210,24 +211,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 input_embeds=input_embeds,
                 set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
             ) as runtime:
-                if self.model_arch == "DeepseekV4ForCausalLM":
-                    from atom.plugin.sglang.deepseek_v4_bridge import (
-                        bind_deepseek_v4_proxy_cache_views,
-                        maybe_get_proxy_pool_from_sglang_backend,
-                        reset_deepseek_v4_state_slots,
-                    )
-
-                    proxy_pool, _ = maybe_get_proxy_pool_from_sglang_backend()
-                    if not bind_deepseek_v4_proxy_cache_views(self.model, proxy_pool):
-                        raise RuntimeError(
-                            "DeepSeek-V4 SGLang proxy KV pool is not initialized"
-                        )
-                    from atom.utils.forward_context import get_forward_context
-
-                    reset_slots = getattr(
-                        get_forward_context().attn_metadata, "reset_slots", None
-                    )
-                    reset_deepseek_v4_state_slots(self.model, reset_slots)
+                if self.model_arch_spec.bind_cache_views is not None:
+                    self.model_arch_spec.bind_cache_views(self.model, runtime)
 
                 metadata = SGLangForwardBatchMetadata.build(
                     runtime.forward_batch,
@@ -268,6 +253,197 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                         hidden_states = self.model(
                             **self._filter_model_forward_kwargs(model_call_kwargs)
                         )
+
+                try:
+                    mode = getattr(forward_batch, "forward_mode", None)
+                    if (
+                        os.environ.get("ATOM_GLM52_ATTENTION_DEBUG_LOG", "0")
+                        in ("1", "true", "True")
+                        and mode is not None
+                        and bool(getattr(mode, "is_target_verify", lambda: False)())
+                        and "GLM" in str(self.model_arch).upper()
+                        and not torch.cuda.is_current_stream_capturing()
+                    ):
+                        dummy_context = (
+                            torch.is_tensor(positions)
+                            and int(positions.numel()) > 0
+                            and bool(torch.all(positions == 0).item())
+                            and torch.is_tensor(input_ids)
+                            and int(input_ids.numel()) > 0
+                            and bool(torch.all(input_ids == 0).item())
+                        )
+                        collected = []
+                        if dummy_context:
+                            # Skip capture/dummy target-verify forwards; they use
+                            # all-zero rows and otherwise drown real request logs.
+                            configured_layers = set()
+                        else:
+                            configured = os.environ.get(
+                                "ATOM_GLM52_ATTENTION_DEBUG_LAYERS", ""
+                            )
+                            configured_layers = None
+                            if configured.strip().lower() not in ("all", "*"):
+                                configured_layers = {
+                                    int(item)
+                                    for item in configured.replace(" ", ",").split(",")
+                                    if item.strip()
+                                }
+                        for module in self.model.modules():
+                            buf = getattr(module, "_atom_glm52_attn_debug", None)
+                            if not torch.is_tensor(buf):
+                                continue
+                            layer = getattr(module, "layer_num", None)
+                            if (
+                                configured_layers is not None
+                                and int(layer) not in configured_layers
+                            ):
+                                continue
+                            sparse_buf = getattr(module, "sparse_kv_indices_buffer", None)
+                            sparse_info = None
+                            if torch.is_tensor(sparse_buf):
+                                flat_sparse = sparse_buf.reshape(-1)
+                                sparse_info = {
+                                    "shape": tuple(sparse_buf.shape),
+                                    "head": flat_sparse[
+                                        : min(16, int(flat_sparse.numel()))
+                                    ]
+                                    .detach()
+                                    .cpu()
+                                    .tolist(),
+                                    "tail": flat_sparse[
+                                        max(0, int(flat_sparse.numel()) - 16) :
+                                    ]
+                                    .detach()
+                                    .cpu()
+                                    .tolist(),
+                                }
+                            collected.append(
+                                {
+                                    "layer": int(layer) if layer is not None else None,
+                                    "values": buf.detach().cpu().tolist(),
+                                    "sparse": sparse_info,
+                                }
+                            )
+                        if collected:
+                            context = {
+                                "input_ids": input_ids[
+                                    : min(12, int(input_ids.numel()))
+                                ]
+                                .detach()
+                                .cpu()
+                                .tolist()
+                                if torch.is_tensor(input_ids)
+                                else None,
+                                "positions": positions[
+                                    : min(12, int(positions.numel()))
+                                ]
+                                .detach()
+                                .cpu()
+                                .tolist()
+                                if torch.is_tensor(positions)
+                                else None,
+                                "out_cache_loc": (
+                                    forward_batch.out_cache_loc[
+                                        : min(
+                                            12,
+                                            int(forward_batch.out_cache_loc.numel()),
+                                        )
+                                    ]
+                                    .detach()
+                                    .cpu()
+                                    .tolist()
+                                    if torch.is_tensor(
+                                        getattr(forward_batch, "out_cache_loc", None)
+                                    )
+                                    else None
+                                ),
+                                "seq_lens": (
+                                    forward_batch.seq_lens[
+                                        : min(12, int(forward_batch.seq_lens.numel()))
+                                    ]
+                                    .detach()
+                                    .cpu()
+                                    .tolist()
+                                    if torch.is_tensor(
+                                        getattr(forward_batch, "seq_lens", None)
+                                    )
+                                    else None
+                                ),
+                                "req_pool_indices": (
+                                    forward_batch.req_pool_indices[
+                                        : min(
+                                            12,
+                                            int(forward_batch.req_pool_indices.numel()),
+                                        )
+                                    ]
+                                    .detach()
+                                    .cpu()
+                                    .tolist()
+                                    if torch.is_tensor(
+                                        getattr(forward_batch, "req_pool_indices", None)
+                                    )
+                                    else None
+                                ),
+                            }
+                            logger.info(
+                                "GLM52 attention layer debug: where=eager context=%s values=%s",
+                                context,
+                                collected,
+                            )
+                    if (
+                        os.environ.get("ATOM_GLM52_VERIFY_DEBUG", "0")
+                        in ("1", "true", "True")
+                        and mode is not None
+                        and bool(getattr(mode, "is_target_verify", lambda: False)())
+                        and "GLM" in str(self.model_arch).upper()
+                        and torch.is_tensor(hidden_states)
+                        and not torch.cuda.is_current_stream_capturing()
+                    ):
+                        rows = hidden_states[
+                            : min(4, int(hidden_states.shape[0]))
+                        ].detach().float()
+                        dim = int(rows.shape[-1])
+                        checksum_slices = []
+                        for start in (
+                            0,
+                            256,
+                            1024,
+                            2048,
+                            4096,
+                            max(0, dim - 256),
+                        ):
+                            end = min(dim, start + 256)
+                            if start < end:
+                                checksum_slices.append(rows[:, start:end].sum(dim=-1))
+                        checksum = (
+                            torch.stack(checksum_slices, dim=-1)
+                            if checksum_slices
+                            else rows.new_empty((rows.shape[0], 0))
+                        )
+                        logger.info(
+                            "GLM52 wrapper target output debug: raw_shape=%s "
+                            "norm=%s absmax=%s mean=%s checksum=%s input_ids=%s "
+                            "positions=%s",
+                            tuple(hidden_states.shape),
+                            rows.norm(dim=-1).cpu().tolist(),
+                            rows.abs().amax(dim=-1).cpu().tolist(),
+                            rows.mean(dim=-1).cpu().tolist(),
+                            checksum.cpu().tolist(),
+                            input_ids[: min(12, int(input_ids.numel()))]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                            if torch.is_tensor(input_ids)
+                            else None,
+                            positions[: min(12, int(positions.numel()))]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                            if torch.is_tensor(positions)
+                            else None,
+                        )
+                except Exception:
+                    logger.exception("Failed to log GLM52 wrapper target output debug")
 
                 hidden_states = runtime.trim_output(hidden_states)
                 logits_input_ids = input_ids
