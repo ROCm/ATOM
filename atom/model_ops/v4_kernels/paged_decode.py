@@ -994,10 +994,13 @@ def _sparse_attn_v4_paged_decode_asm(
     # region is self-consistent (qo_indptr[:N+1] == arange(N+1), kv_indptr[:N+1]
     # is the real ragged cumsum) and the dropped tail is exactly the 0-length
     # CG-padded slots. No-op when captured/padded (N == T_pad).
-    qo_indptr = qo_indptr[: N + 1].to(torch.int32)
-    kv_last_page_lens = kv_last_page_lens[:N].to(torch.int32)
-    kv_indptr_i32 = kv_indptr[: N + 1].to(torch.int32)
-    kv_page_indices_i32 = kv_indices.to(torch.int32).contiguous()
+    # These are all staged as int32 by the metadata builder, so no dtype cast is
+    # needed — only the trim to the real query count N (and a contiguity fixup on
+    # the possibly-viewed kv_indices).
+    qo_indptr = qo_indptr[: N + 1]
+    kv_last_page_lens = kv_last_page_lens[:N]
+    kv_indptr_i32 = kv_indptr[: N + 1]
+    kv_page_indices_i32 = kv_indices.contiguous()
     max_seqlen_q = 1
 
     output = torch.empty(
@@ -1026,7 +1029,7 @@ def _sparse_attn_v4_paged_decode_asm(
     # path leaves it in logits[:, 0]. logits.shape[1] = resolved split count.
     resolved_splits = logits.shape[1]
     if out_16_nosplit != 0 or resolved_splits > 1:
-        return output.to(torch.bfloat16)
+        return output
     return logits[:, 0].to(torch.bfloat16)
 
 

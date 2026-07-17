@@ -41,7 +41,6 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.ops.fused_qk_norm_rope_cache_quant import fused_qk_norm_rope_group_quant
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -101,7 +100,6 @@ from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
     swa_write,
-    swa_write_2buff_prepacked,
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
@@ -2171,74 +2169,46 @@ class DeepseekV4Attention(nn.Module):
         # prefix reads see prior-chunk contents), so writing here (before the
         # decode attention reads the window) is safe. Prefill → swa_kv=None,
         # separate post-attn swa_write below.
-        # Native 2buff fp8 Q/K buffers (populated only on the fp8 path; all
-        # remain None for bf16). fp8: compute-only Triton 2buff quant emits the
-        # 2buff layout (nope-fp8 [.,512] + rope-bf16 [.,64]) that op4 (prefill)
-        # and op5 (decode) consume directly — no torch quant, no in-kernel SWA
-        # scatter.
-        q_packed = q_rope_q = k_packed = k_rope = None
-        if self.kv_fp8:
-            # Decode FUSES the paged (content-addressed) SWA cache-write into the
-            # aiter norm+rope+quant launch via swa_block_tables — the fp8 analogue
-            # of the bf16 decode's flydsl-fused paged write. The kernel scatters
-            # each K row into both SWA pools (nope-fp8 + rope-bf16), addressed by
-            # swa_block_tables[batch_id, pos//bs] (batch_id<0 skips CG-pad),
-            # exactly like the standalone swa_write it replaces. Runs before the
-            # decode attention reads the window (no ordering hazard). Prefill
-            # passes swa_*=None and scatters its window tail post-attn below.
-            # aiter derives rot_dim from cos_cache.shape[-1]*2, so it needs the 2D
-            # [max_pos, rd//2] tables; the _V4RoPE caches are 4D [.,rd//2,1,1].
-            cos_2d = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
-            sin_2d = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
-            # Single fused launch: per-head weightless Q RMSNorm + weighted KV
-            # RMSNorm + GPT-J RoPE + 1x64 e8m0 fp8 group-quant into the 2buff
-            # layout (nope-fp8 [.,512] + rope-bf16 [.,64]) that op4 (prefill) and
-            # op5 (decode) consume directly. q: [T, H*D] -> [T, H, D]; kv_pre stays
-            # 2D (MQA -> num_kv_heads=1). is_neox=False = GPT-J adjacent-pair RoPE;
-            # q_weight=None = V4-Pro weightless Q.
-            q_packed, q_rope_q, k_packed, k_rope = fused_qk_norm_rope_group_quant(
-                q.view(num_tokens, self.n_local_heads, self.head_dim),
-                kv_pre,
-                self.kv_norm.weight,
-                positions,
-                cos_2d,
-                sin_2d,
-                self.eps,
-                is_neox=False,
-                q_out_dtype=dtypes.fp8,
-                q_weight=None,
-                quant_group_size=64,
-                scale_dtype="e8m0",
-                swa_nope_scale_buff=self.swa_kv if is_decode else None,
-                swa_rope_buff=self.swa_kv_rope if is_decode else None,
-                swa_block_tables=swa_block_tables_gpu if is_decode else None,
-                swa_block_size=swa_block_size if is_decode else None,
-                batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
-            )
-            q_sa = kv = q_scale = kv_scale = None
-        else:
-            q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
-                q,
-                kv_pre,
-                self.kv_norm.weight,
-                self.rotary_emb.cos_cache,
-                self.rotary_emb.sin_cache,
-                positions,
-                self.n_local_heads,
-                self.head_dim,
-                rd,
-                self.eps,
-                quant_q=False,
-                quant_k=False,
-                swa_kv=self.swa_kv if is_decode else None,
-                batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
-                swa_block_tables=swa_block_tables_gpu if is_decode else None,
-                swa_block_size=swa_block_size if is_decode else None,
-                swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
-                swa_write_per_batch=attn_md.max_seqlen_q if is_decode else None,
-            )
-            if _V4_USE_REF_QUANT:
-                act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+        # Fused per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE,
+        # dispatching on the kv-cache layout inside the wrapper (fp8 2buff ↔ bf16)
+        # so this call site is branch-free. Decode FUSES the paged
+        # (content-addressed) SWA cache-write into the launch via swa_block_tables
+        # (bf16: flydsl swa_kv; fp8: aiter swa_nope/rope buffers — each K row
+        # scattered into its SWA pool, batch_id<0 skips CG-pad), running before the
+        # decode attention reads the window (no ordering hazard). Prefill passes
+        # swa_*=None and scatters its window tail post-attn below.
+        #
+        # bf16 → qkn.q_sa / qkn.kv populated; fp8 2buff → qkn.q_packed / qkn.q_rope
+        # / qkn.k_packed / qkn.k_rope populated (the 2buff layout nope-fp8 [.,512] +
+        # rope-bf16 [.,64] that op4 (prefill) / op5 (decode) consume with no
+        # requant). The inactive path's fields stay None.
+        qkn = qk_norm_rope_maybe_quant(
+            q,
+            kv_pre,
+            self.kv_norm.weight,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            positions,
+            self.n_local_heads,
+            self.head_dim,
+            rd,
+            self.eps,
+            quant_q=False,
+            quant_k=False,
+            fp8_2buff=self.kv_fp8,
+            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            swa_block_tables=swa_block_tables_gpu if is_decode else None,
+            swa_block_size=swa_block_size if is_decode else None,
+            # bf16 SWA fusion (flydsl kernel / Triton fallback):
+            swa_kv=self.swa_kv if (is_decode and not self.kv_fp8) else None,
+            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
+            swa_write_per_batch=attn_md.max_seqlen_q if is_decode else None,
+            # fp8 2buff SWA fusion (aiter group-quant launch):
+            swa_nope_scale_buff=self.swa_kv if (is_decode and self.kv_fp8) else None,
+            swa_rope_buff=self.swa_kv_rope if (is_decode and self.kv_fp8) else None,
+        )
+        if _V4_USE_REF_QUANT and not self.kv_fp8:
+            act_quant_inplace(qkn.kv[..., :-rd], 64, self.scale_fmt)
 
         # HCA
         if use_async_compress:
@@ -2282,32 +2252,24 @@ class DeepseekV4Attention(nn.Module):
             else:  # ratio == 128
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
-            if self.kv_fp8:
-                # Native fp8 decode (op5, aiter asm): pre-packed fp8 Q + the 2buff
-                # fp8/bf16 pools read with no requant. Per-token paged index
-                # tensors (qo_indptr/kv_last_page_lens) come from the builder.
-                o = sparse_attn_v4_paged_decode(
-                    q_sa,
-                    self.unified_kv,
-                    kv_indices,
-                    kv_indptr,
-                    self.attn_sink,
-                    self.softmax_scale,
-                    unified_kv_rope=self.unified_kv_rope,
-                    q_packed_in=q_packed,
-                    q_rope_in=q_rope_q,
-                    qo_indptr=attn_md.qo_indptr,
-                    kv_last_page_lens=attn_md.kv_last_page_lens,
-                )  # [S, H, head_dim]
-            else:
-                o = sparse_attn_v4_paged_decode(
-                    q_sa,
-                    self.unified_kv,
-                    kv_indices,
-                    kv_indptr,
-                    self.attn_sink,
-                    self.softmax_scale,
-                )  # [S, H, head_dim]
+            # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
+            # (unified_kv_rope set) → aiter asm op5 with pre-packed fp8 Q + the
+            # 2buff fp8/bf16 pools read with no requant; bf16 (unified_kv_rope
+            # None) → Triton. qo_indptr / kv_last_page_lens come from the builder
+            # (None on bf16, ignored by the Triton path).
+            o = sparse_attn_v4_paged_decode(
+                qkn.q_sa,
+                self.unified_kv,
+                kv_indices,
+                kv_indptr,
+                self.attn_sink,
+                self.softmax_scale,
+                unified_kv_rope=self.unified_kv_rope,
+                q_packed_in=qkn.q_packed,
+                q_rope_in=qkn.q_rope,
+                qo_indptr=attn_md.qo_indptr,
+                kv_last_page_lens=attn_md.kv_last_page_lens,
+            )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
             # buffer with SWA history + compress section), extend from per-fwd
@@ -2331,7 +2293,7 @@ class DeepseekV4Attention(nn.Module):
             pcp_on = _pcp_active()
             if pcp_on:
                 pcp_ws = get_pcp_world_size()
-                kv_full = pcp_allgather_rerange(kv, pcp_ws)
+                kv_full = pcp_allgather_rerange(qkn.kv, pcp_ws)
                 # positions must match kv_full's full-sequence coords for the
                 # swa_write ring addressing (`positions[src] % cache_size`).
                 # `positions` here is this rank's 1/W shard (split in
@@ -2340,7 +2302,7 @@ class DeepseekV4Attention(nn.Module):
                 # the builder reindexed to 1/W).
                 positions_full = pcp_allgather_rerange(positions, pcp_ws)
             else:
-                kv_full = kv
+                kv_full = qkn.kv
                 positions_full = positions
 
             if ratio == 0:
@@ -2354,44 +2316,32 @@ class DeepseekV4Attention(nn.Module):
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_hca
             else:
                 raise ValueError(f"Unsupported compress_ratio {ratio}")
-            if self.kv_fp8:
-                # Native fp8 prefill (op4): the 2buff fp8 prefix pool (nope-fp8 +
-                # rope-bf16) + op-quantized fp8 Q and extend K fed directly. No
-                # dequant of the prefix, no torch quant. gfx950/gfx1250.
-                # NOTE: the extend K (k_packed/k_rope) is this fwd's shard and is
-                # NOT PCP all-gathered (unlike the bf16 kv_full path); fp8 + PCP
-                # is out of scope for this port.
-                from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
-
-                o = pa_sparse_prefill_fp8_opus(
-                    q_packed,
-                    q_rope_q,
-                    self.unified_kv,
-                    self.unified_kv_rope,
-                    kv_indices_prefix,
-                    kv_indptr_prefix,
-                    k_packed.view(k_packed.shape[0], -1),
-                    k_rope.view(k_rope.shape[0], -1),
-                    attn_md.kv_indices_extend,
-                    attn_md.kv_indptr_extend,
-                    self.attn_sink,
-                    self.softmax_scale,
-                )  # [S, H, head_dim] bf16
-            else:
-                o = sparse_attn_v4_paged_prefill(
-                    q_sa,
-                    self.unified_kv,
-                    kv_indices_prefix,
-                    kv_indptr_prefix,
-                    kv_full,
-                    attn_md.kv_indices_extend,
-                    attn_md.kv_indptr_extend,
-                    self.attn_sink,
-                    self.softmax_scale,
-                    # Reuse q_sa as the attention output buffer; q_sa is not needed
-                    # after this call and this avoids an extra empty_like allocation.
-                    out=q_sa,
-                )  # [S, H, head_dim]
+            # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
+            # (unified_kv_rope set) → aiter op4 with the 2buff fp8 prefix pool
+            # (nope-fp8 + rope-bf16) + op-quantized fp8 Q and extend K, no dequant
+            # of the prefix and no torch quant; bf16 → OPUS / Triton over q_sa and
+            # the bf16 extend kv_full. (fp8 + PCP is out of scope: k_packed/k_rope
+            # are this fwd's shard, NOT PCP all-gathered like kv_full.) On bf16 the
+            # wrapper reuses out=qkn.q_sa as the attention output buffer (q_sa is
+            # not needed after this call → avoids an extra empty_like); fp8 ignores
+            # both q_sa and out.
+            o = sparse_attn_v4_paged_prefill(
+                qkn.q_sa,
+                self.unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                kv_full,
+                attn_md.kv_indices_extend,
+                attn_md.kv_indptr_extend,
+                self.attn_sink,
+                self.softmax_scale,
+                out=qkn.q_sa,
+                unified_kv_rope=self.unified_kv_rope,
+                q_packed=qkn.q_packed,
+                q_rope=qkn.q_rope,
+                k_packed=qkn.k_packed,
+                k_rope=qkn.k_rope,
+            )  # [S, H, head_dim] bf16
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
             # prior chunk's contents (not this chunk's just-computed tail).
             # OPT (window-only prefill write): only write each seq's trailing
@@ -2404,33 +2354,24 @@ class DeepseekV4Attention(nn.Module):
             # window(128) <= chunk size, so any token's window reaches back at
             # most 127 tokens = within the prior chunk's written last-128;
             # free_after_prefill_chunk keeps that trailing block until read.
-            if self.kv_fp8:
-                # Scatter the op-quantized extend K (already 2buff fp8) into the
-                # two paged SWA pools — pure content-addressed copy, no requant,
-                # window-only (same trailing-window semantics as the bf16 path).
-                # Uses `positions` + k_packed (this fwd's shard); see the fp8+PCP
-                # note above.
-                swa_write_2buff_prepacked(
-                    k_packed.view(k_packed.shape[0], -1),
-                    k_rope.view(k_rope.shape[0], -1),
-                    positions,
-                    attn_md.cu_seqlens_q,
-                    swa_block_tables_gpu,
-                    self.swa_kv,
-                    self.swa_kv_rope,
-                    swa_block_size,
-                    min(self.window_size, attn_md.max_seqlen_q),
-                )
-            else:
-                swa_write(
-                    kv_full,
-                    positions_full,
-                    attn_md.cu_seqlens_q,
-                    swa_block_tables_gpu,
-                    self.swa_kv,
-                    swa_block_size,
-                    min(self.window_size, attn_md.max_seqlen_q),
-                )
+            # Dispatch on kv-cache layout inside the wrapper (swa_region_rope set
+            # → fp8 2buff path, which scatters the op-quantized extend K
+            # (k_packed/k_rope) into both paged SWA pools; else bf16 single-pool
+            # write over kv_full). Both are window-only (same trailing-window
+            # semantics). fp8 uses this fwd's shard, no PCP — positions_full ==
+            # positions when PCP off, and kv_full is None on fp8.
+            swa_write(
+                kv_full,
+                positions_full,
+                attn_md.cu_seqlens_q,
+                swa_block_tables_gpu,
+                self.swa_kv,
+                swa_block_size,
+                min(self.window_size, attn_md.max_seqlen_q),
+                k_packed=qkn.k_packed,
+                k_rope=qkn.k_rope,
+                swa_region_rope=self.swa_kv_rope,
+            )
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.

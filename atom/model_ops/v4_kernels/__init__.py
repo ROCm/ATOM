@@ -40,6 +40,7 @@ from atom.model_ops.v4_kernels.paged_prefill_indices import (
     write_v4_paged_prefill_indices_reference,
 )
 from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
+    QKNormRopeOut,
     qk_norm_rope_maybe_quant,
     qk_norm_rope_maybe_quant_reference,
     qk_norm_rope_maybe_quant_fp8_2buff,
@@ -70,6 +71,7 @@ __all__ = [
     "write_v4_paged_decode_indices_reference",
     "write_v4_paged_prefill_indices",
     "write_v4_paged_prefill_indices_reference",
+    "QKNormRopeOut",
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_reference",
     "qk_norm_rope_maybe_quant_fp8_2buff",

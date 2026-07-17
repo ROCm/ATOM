@@ -35,6 +35,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
   Total                                      = ~26.5 MB / slot
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type, cast
@@ -69,6 +70,8 @@ from atom.utils.forward_context import (
     Context,
     get_forward_context,
 )
+
+logger = logging.getLogger("atom")
 
 # ---------------------------------------------------------------------------
 # Typed metadata surface for V4. The base AttentionMetaData class is shared
@@ -349,17 +352,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # unchanged. SWA and classical (CSA/HCA Main) share the nope dtype; the
         # rope pool is always bf16.
         self._kv_fp8 = model_runner.kv_cache_dtype == "fp8"
+        # aiter prefill (op4) / decode (op5) implement the fp8 (2buff) path only
+        # on gfx950 / gfx1250. On any other arch, transparently fall back to a
+        # bf16 KV cache instead of hard-failing. Flipping self._kv_fp8 here (before
+        # the *_dtype attrs are read) keeps the whole V4 path consistent: pool
+        # sizing (compute_block_bytes / swa_block_bytes_per_layer), write_mode,
+        # and module.kv_fp8 (build_kv_cache_tensor) all key off self._kv_fp8 /
+        # these dtype attrs. Sync model_runner.kv_cache_dtype (and the shared
+        # config) so any generic reader / log line agrees.
+        if self._kv_fp8 and get_gfx() not in ("gfx950", "gfx1250"):
+            logger.warning(
+                "DeepSeek-V4 --kv_cache_dtype fp8 (2buff) is only supported on "
+                "gfx950 / gfx1250 (aiter op4/op5); got %r. Falling back to a "
+                "bf16 KV cache.",
+                get_gfx(),
+            )
+            self._kv_fp8 = False
+            model_runner.kv_cache_dtype = "bf16"
+            cfg = getattr(model_runner, "config", None)
+            if cfg is not None and getattr(cfg, "kv_cache_dtype", None) == "fp8":
+                cfg.kv_cache_dtype = "bf16"
         if self._kv_fp8:
             self._swa_dtype = dtypes.fp8
             self._classical_dtype = dtypes.fp8
             self._rope_dtype = torch.bfloat16  # rope pool is always bf16
-            # aiter prefill (op4) / decode (op5) support gfx950 (MI350) and
-            # gfx1250 (MI450) for the fp8 (2buff) path.
-            assert get_gfx() in ("gfx950", "gfx1250"), (
-                "DeepSeek-V4 --kv_cache_dtype fp8 (2buff) requires gfx950 (MI350) "
-                f"or gfx1250 (MI450); got {get_gfx()!r}. "
-                "Use --kv_cache_dtype bf16 on this platform."
-            )
         else:
             self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
             self._classical_dtype = torch.bfloat16  # CSA / HCA Main KV is BF16

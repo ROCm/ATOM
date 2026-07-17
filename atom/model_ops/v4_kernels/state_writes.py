@@ -124,9 +124,23 @@ def swa_write(
     swa_region: torch.Tensor,
     block_size: int,
     write_per_batch: int,
+    *,
+    k_packed: torch.Tensor | None = None,
+    k_rope: torch.Tensor | None = None,
+    swa_region_rope: torch.Tensor | None = None,
 ) -> None:
-    """paged-SWA in-place write. For the last
-    `min(tok_n_b, write_per_batch)` tokens of every seq `b ∈ [0, bs)` this fwd
+    """paged-SWA in-place write, dispatching on the kv-cache layout.
+
+    Native 2buff fp8 (``swa_region_rope`` provided): the op-quantized extend K
+    comes in as ``k_packed`` (fp8 NoPE) + ``k_rope`` (bf16 RoPE tail), in the
+    ``[T, *]`` or ``[T, 1, *]`` layout produced by the quant kernel; delegates to
+    :func:`swa_write_2buff_prepacked`, which scatters both into their paged pools
+    (``swa_region`` = NoPE pool, ``swa_region_rope`` = RoPE pool) — a pure
+    dtype-agnostic copy, no requant. The bf16 ``kv`` arg is unused on this path
+    (the caller may pass ``None``).
+
+    Otherwise (bf16): for the last `min(tok_n_b, write_per_batch)` tokens of
+    every seq `b ∈ [0, bs)` this fwd
     (`tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`, `bs = block_tables.shape[0]`),
     write `kv[r]` to the content-addressed SWA region:
         swa_region[block_tables[b, pos//block_size] * block_size
@@ -138,7 +152,8 @@ def swa_write(
     cached block instead of a stale ring (issue #1417).
 
     Args:
-        kv: [T, head_dim] per-fwd KV (BF16). `T = cu_seqlens_q[bs]`.
+        kv: [T, head_dim] per-fwd KV (BF16). bf16 path only; `T = cu_seqlens_q[bs]`.
+            May be ``None`` on the fp8 2buff path (``k_packed`` is used instead).
         positions: [T'] int — full forward_vars["positions"] (`T' >= T`).
         cu_seqlens_q: [bs+1] int — exact size (`bs == block_tables.shape[0]`).
         block_tables: [bs, max_blocks_per_seq] int32 — logical→physical block.
@@ -148,7 +163,28 @@ def swa_write(
         block_size: tokens per block (= V4 block_size, 128).
         write_per_batch: `min(max_q_len, block_size_window)` — max tokens
             written per seq this fwd (grid y dim, kernel `constexpr`).
+        k_packed: [T, 512] or [T, 1, 512] fp8 NoPE extend K — fp8 2buff path only.
+        k_rope: [T, rope_head_dim] or [T, 1, rope_head_dim] bf16 RoPE tail — fp8
+            2buff path only.
+        swa_region_rope: [num_pages, rope_head_dim] bf16 RoPE pool — presence
+            selects the fp8 2buff path.
     """
+    if swa_region_rope is not None:
+        # fp8 2buff: scatter the op-quantized extend K (k_packed/k_rope) into both
+        # paged SWA pools. Flatten the [T, 1, *] quant-kernel views to [T, *]; the
+        # bf16 `kv` source is unused here.
+        swa_write_2buff_prepacked(
+            k_packed.view(k_packed.shape[0], -1),
+            k_rope.view(k_rope.shape[0], -1),
+            positions,
+            cu_seqlens_q,
+            block_tables,
+            swa_region,
+            swa_region_rope,
+            block_size,
+            write_per_batch,
+        )
+        return
     assert kv.dim() == 2, f"kv must be [T, D], got {kv.shape}"
     assert positions.dim() == 1
     assert (
