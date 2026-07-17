@@ -359,7 +359,6 @@ jobs:
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
             -t atom_sglang:ci \
-            --target atom_sglang \
             --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg SGLANG_REF="${SGLANG_REF}" \
