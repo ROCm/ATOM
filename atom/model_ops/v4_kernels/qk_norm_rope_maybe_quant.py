@@ -616,6 +616,7 @@ def qk_norm_rope_maybe_quant(
     swa_write_per_batch: Optional[int] = None,
     swa_block_tables: Optional[torch.Tensor] = None,
     swa_block_size: Optional[int] = None,
+    prefix: str = "",
     *,
     fp8_2buff: bool = False,
     swa_nope_scale_buff: Optional[torch.Tensor] = None,
@@ -667,6 +668,7 @@ def qk_norm_rope_maybe_quant(
             swa_write_per_batch=swa_write_per_batch,
             swa_block_tables=swa_block_tables,
             swa_block_size=swa_block_size,
+            prefix=prefix,
         )
         return QKNormRopeOut(q_sa=q_out, kv=kv_out, q_scale=q_scale, kv_scale=kv_scale)
 
