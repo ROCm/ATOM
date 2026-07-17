@@ -45,13 +45,13 @@ def _is_indexed_sparse_attention(module) -> bool:
 def _resolve_index_cache_dtype(config) -> torch.dtype:
     from aiter import dtypes
 
-    index_cache_dtype = getattr(config, "index_cache_dtype", "auto")
-    if index_cache_dtype == "auto":
-        return config.torch_dtype
-    if index_cache_dtype == "fp8":
-        return dtypes.d_dtypes["fp8"]
+    index_cache_dtype = getattr(config, "index_cache_dtype", None)
+    if index_cache_dtype is None:
+        index_cache_dtype = getattr(config, "kv_cache_dtype", "bf16")
+    if index_cache_dtype in ("bf16", "fp8"):
+        return dtypes.d_dtypes[index_cache_dtype]
     raise ValueError(
-        "MiniMax-M3 index_cache_dtype must be 'auto' or 'fp8', "
+        "index_cache_dtype must be 'bf16' or 'fp8', "
         f"got {index_cache_dtype!r}"
     )
 
