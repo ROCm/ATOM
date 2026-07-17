@@ -8,6 +8,13 @@ import torch.nn as nn
 from aiter import dtypes
 from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config, KVCacheTensor
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_pad_dense,
+    pcp_pad_len,
+    pcp_round_robin_split,
+)
 from atom.model_loader.loader import load_model
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils import envs
@@ -31,6 +38,21 @@ support_eagle_model_arch_dict = {
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
 }
+
+
+def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
+    # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
+    from atom.models.deepseek_v2 import _pcp_active
+
+    if _pcp_active():
+        return True
+
+    if draft_model.__class__.__name__ != "DeepseekV4MTP":
+        return False
+
+    from atom.models.deepseek_v4 import _pcp_active as _pcp_active_v4
+
+    return _pcp_active_v4()
 
 
 class Eagle3DraftBuilder:
@@ -451,11 +473,45 @@ class EagleProposer:
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
                 # Re-sync DP token
                 self._refresh_dp_metadata(forward_context, input_ids.shape[0])
+                # ---- Prefill Context Parallel (draft i==0 prefill) --------
+                # The draft's first pass is a prefill that reuses the target's
+                # 1/pcp-reindexed attn_metadata, so it must run on this rank's
+                # 1/pcp query shard (input_ids / positions / previous hidden) and
+                # all-gather the draft hidden back to full token order before the
+                # last-token sampling gather. Later draft steps are decode
+                # (is_prefill False) and run full — identical to the non-PCP path.
+                # `input_ids` / `positions` / `hidden_states` themselves stay full
+                # so the post-i==0 decode-metadata setup (which indexes with the
+                # full `last_token_indices`) is unchanged.
+                pcp_draft_prefill = i == 0 and _pcp_active_for_draft_model(self.model)
+                if pcp_draft_prefill:
+                    pcp_ws = get_pcp_world_size()
+                    n_global_draft = input_ids.shape[0]
+                    n_pad = pcp_pad_len(n_global_draft, pcp_ws) - n_global_draft
+                    d_input_ids = pcp_round_robin_split(
+                        pcp_pad_dense(input_ids, n_pad), pcp_ws
+                    )
+                    d_positions = pcp_round_robin_split(
+                        pcp_pad_dense(positions, n_pad), pcp_ws
+                    )
+                    d_hidden = pcp_round_robin_split(
+                        pcp_pad_dense(hidden_states, n_pad), pcp_ws
+                    )
+                else:
+                    d_input_ids, d_positions, d_hidden = (
+                        input_ids,
+                        positions,
+                        hidden_states,
+                    )
                 ret_hidden_states = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    hidden_states=hidden_states,
+                    input_ids=d_input_ids,
+                    positions=d_positions,
+                    hidden_states=d_hidden,
                 )
+                if pcp_draft_prefill:
+                    ret_hidden_states = pcp_allgather_rerange(
+                        ret_hidden_states, pcp_ws
+                    )[:n_global_draft]
 
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)

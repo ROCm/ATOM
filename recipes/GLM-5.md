@@ -255,3 +255,32 @@ Reference numbers on 8×MI355X (TP8, FP8 weights, bf16 KV cache), using the benc
 | 8192 | 1024 | 1   | 73   | 669   | 409 | 13.2 |
 | 8192 | 1024 | 16  | 645  | 5818  | 418 | 23.3 |
 | 8192 | 1024 | 64  | 1210 | 10853 | 483 | 51.3 |
+
+## GLM-5.2 Prefill Context Parallel (PCP)
+
+Prefill Context Parallel accelerates **long-context prefill** (large ISL) by
+round-robin splitting the prompt tokens across an extra parallel dimension
+(`world = tp × pcp`). Only the query side is sharded — every rank keeps the
+**full KV cache**, so decode, the KV-cache layout, and accuracy are unchanged.
+The dominant `O(S²)` DSA indexer scoring and the sparse MLA attention run on
+`1/pcp` of the queries per rank, cutting TTFT on long inputs.
+
+Enable it with `--prefill-context-parallel-size` (`-pcp`). `pcp` is orthogonal
+to `-tp`, and the two multiply into the number of GPUs used
+(`GPUs = tp × pcp`). MTP speculative decoding is supported — the draft's prefill
+pass is split and gathered the same way.
+
+### Serving on 4 GPUs (TP2 × PCP2)
+
+```bash
+model_path=amd/GLM-5.2-MXFP4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --server-port 8000 \
+  --kv_cache_dtype fp8 \
+  --max-num-batched-tokens 32768 \
+  -tp 2 -pcp 2 2>&1 | tee server_pcp.log &
+```

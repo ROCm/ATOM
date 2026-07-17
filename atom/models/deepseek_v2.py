@@ -93,6 +93,14 @@ from atom.utils.custom_register import direct_register_custom_op
 # shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
 # `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_is_enabled,
+    pcp_pad_dense,
+    pcp_pad_len,
+    pcp_round_robin_split,
+)
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.plugin.vllm.attention.layer_sparse_mla import (
@@ -142,6 +150,94 @@ _FP8_DTYPES = tuple(
     )
     if dtype is not None
 )
+
+
+def _pcp_active() -> bool:
+    """True when Prefill Context Parallel must reshape the current forward.
+
+    PCP only reshapes the *sparse-MLA prefill* path (round-robin query split +
+    full-KV all-gather). It returns False and the code stays byte-for-byte
+    identical to the non-PCP path when any of these hold:
+      * pcp_size == 1;
+      * decode (PCP keeps decode on the full, already-cached KV);
+      * dummy/warmup runs (graphs are captured on the full token layout — this
+        matches the metadata builder, which gates its reindex on
+        `not batch.is_dummy_run`, so model split and metadata reindex stay in
+        lock-step);
+      * short batches that fall back to dense MHA prefill (max_seqlen_k <=
+        index_topk): only the sparse indexer / sparse-attn path is PCP-wired.
+
+    Every PCP call site (model split/gather, indexer, MLA write, metadata
+    reindex) keys off the SAME batch-global condition so they agree within a
+    forward.
+    """
+    if not pcp_is_enabled():
+        return False
+    ctx = get_forward_context()
+    context = getattr(ctx, "context", None)
+    attn_metadata = getattr(ctx, "attn_metadata", None)
+    if context is None or attn_metadata is None:
+        return False
+    if not bool(context.is_prefill) or bool(getattr(context, "is_dummy_run", False)):
+        return False
+    index_topk = getattr(get_current_atom_config().hf_config, "index_topk", None)
+    if index_topk is None:
+        return False
+    return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(index_topk)
+
+
+def _install_increment_version_pcp_shim() -> None:
+    """Make ``torch.autograd.graph.increment_version`` tolerate a torch bug that
+    only surfaces under PCP + torch.compile.
+
+    Under Prefill Context Parallel the sparse indexer must run through a
+    Dynamo-opaque custom op (``indexer_with_output``) so its runtime
+    ``_pcp_active()`` branch is not baked to the warmup value. Inserting that op
+    reshapes the pre-attention piecewise submodule, and torch's *inference*
+    runtime wrapper (``keep_input_mutations=True``, hard-coded in
+    ``torch/_inductor/compile_fx.py``) then resolves that submodule's
+    ``mutated_graph_handled_indices_seen_by_autograd`` against a runtime arg list
+    that interleaves SymInt shape symbols. The mutated-input index lands on a
+    SymInt, so ``increment_version`` is handed a non-tensor:
+
+        RuntimeError: increment_version expects each element ... to be a tensor
+        IndexError:   list index out of range   (when the index is past the end)
+
+    The baseline (indexer inlined, no extra op) only dodges this by arg-layout
+    luck. Crucially the version counter is *autograd-only* metadata: in inference
+    (no backward) it is never read, and the real in-place mutation is applied by
+    the compiled kernel regardless of this bump. So it is safe to filter the
+    iterable to real tensors and swallow the out-of-range walk. This is a strict
+    no-op for every well-formed call (all-tensor iterables materialize to the
+    same list), so baseline / non-PCP compilation is byte-for-byte unaffected.
+    """
+    import torch.autograd.graph as _agraph
+
+    if getattr(_agraph.increment_version, "_pcp_shim", False):
+        return
+    _orig_increment_version = _agraph.increment_version
+
+    def increment_version(tensor):
+        if not isinstance(tensor, torch.Tensor):
+            safe = []
+            try:
+                for t in tensor:
+                    if isinstance(t, torch.Tensor):
+                        safe.append(t)
+            except IndexError:
+                # torch handed us `(args[i] for i in <bad indices>)`; stop at the
+                # first out-of-range index (autograd metadata only — see docstring).
+                pass
+            tensor = safe
+        return _orig_increment_version(tensor)
+
+    increment_version._pcp_shim = True
+    # runtime_wrappers.py calls this via attribute access on the module, so
+    # rebinding the module attribute is enough for it to pick up the shim.
+    _agraph.increment_version = increment_version
+
+
+_install_increment_version_pcp_shim()
 
 
 def _enable_non_triton_global_mxfp4_input_norm_quant(
@@ -1190,6 +1286,22 @@ def sparse_attn_indexer(
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
+    # PCP prefill: `k` (and `positions`) arrive as the full PADDED key set
+    # [S_pad] produced by an all-gather of the round-robin shards. The KV-cache
+    # write (driven by slot_mapping) and the gathered-KV sizing (total_kv =
+    # k.shape[0]) both use the real token count S_real == slot_mapping length,
+    # so trim the round-robin padding here. Gated on the same condition as the
+    # caller's PCP path (sparse prefill with max_seqlen_k > topk); no-op
+    # otherwise.
+    if (
+        pcp_is_enabled()
+        and context.is_prefill
+        and attn_metadata.max_seqlen_k > topk_tokens
+    ):
+        n_real = slot_mapping.shape[0]
+        k = k[:n_real]
+        if positions is not None:
+            positions = positions[:n_real]
     if use_qk_rope_cache_fusion:
         q_bf16 = q_input
         q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
@@ -1232,10 +1344,13 @@ def sparse_attn_indexer(
             return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
-        total_seq_lens = hidden_states.shape[0]
-        # When has_cached, gather full KV (cached + new) for indexer top-k
+        # Size the gathered-KV buffer off the KEY length, not the hidden/query
+        # length. Under PCP the query side (hidden_states) is 1/pcp while `k` is
+        # the full all-gathered key set, so `k.shape[0]` is the correct full
+        # token count; without PCP the two are equal so behaviour is unchanged.
+        # When has_cached, gather full KV (cached + new) for indexer top-k.
         total_kv = (
-            prefill_metadata.total_kv if prefill_metadata.has_cached else total_seq_lens
+            prefill_metadata.total_kv if prefill_metadata.has_cached else k.shape[0]
         )
         k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
         k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
@@ -1577,6 +1692,85 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
 
 
 @IndexerDecoratorForPluginMode
+def _indexer_with_output_fake(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    qr_scale: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    layer_name: str,
+    sparse_kv_indices_buffer: torch.Tensor,
+) -> torch.Tensor:
+    # Identity-passthrough contract: the op returns a fresh tensor shaped like
+    # `qr` (see `indexer_with_output`). The caller consumes it as the query into
+    # `mla_attn`, which keeps the op alive and ordered even independent of the
+    # declared buffer mutation.
+    return torch.empty_like(qr)
+
+
+def indexer_with_output(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    qr_scale: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    layer_name: str,
+    sparse_kv_indices_buffer: torch.Tensor,
+) -> torch.Tensor:
+    """Dynamo-opaque wrapper around ``Indexer.forward_impl``.
+
+    Registered as a REGULAR custom op (like ``sparse_attn_indexer``), NOT a
+    splitting op. Opacity — not a graph *split* — is what defeats the bake:
+    Dynamo treats a custom op as a leaf and never traces the body, so the
+    runtime ``_pcp_active()`` branch inside the indexer (round-robin k all-gather
+    + separate q/k rope) is evaluated LIVE every forward instead of being frozen
+    to its dummy-warmup value (``False``). Prefill is not cudagraph-captured, so
+    the eager all-gather inside runs safely; decode never takes the PCP branch.
+
+    Why regular and not ``@mark_spliting_op``: adding a second split point
+    between ``qkv_a_proj`` and ``mla_attn`` shrinks the pre-attention submodule
+    to a handful of ops, and AOT-autograd then mis-resolves that tiny piece's
+    mutated-input index (``increment_version`` IndexError). Staying a plain
+    opaque op keeps the pre-attention submodule identical in shape to the
+    baseline's (which compiles cleanly).
+
+    Buffer mutation MUST be declared. ``forward_impl`` writes the indexer's
+    top-k result into ``sparse_kv_indices_buffer`` (via the nested eager
+    ``sparse_attn_indexer`` op) and ``mla_attn`` reads that same buffer to know
+    which KV to attend to. In the non-PCP path ``sparse_attn_indexer`` runs
+    *directly* in the traced graph and declares ``mutates_args=
+    ["sparse_kv_indices_buffer"]``, so inductor keeps the write ordered before
+    the MLA read. Nesting it inside this opaque op HIDES that write; with
+    ``mutates_args=[]`` inductor thinks the buffer is unchanged and the MLA reads
+    a stale / mis-ordered copy — visible as token-stutter corruption ("errerr",
+    doubled fragments) even on PCP-noop prompts. So the buffer is threaded
+    through as an explicit arg and re-declared mutated here, restoring the exact
+    write→read edge the baseline relies on. (Declaring the mutation re-triggers a
+    latent AOT-autograd ``increment_version`` bug on graphs with SymInt args,
+    which ``_install_increment_version_pcp_shim`` neutralizes.)
+
+    The identity ``qr`` return, fed by the caller as the ``mla_attn`` query, is
+    kept as belt-and-suspenders ordering + DCE protection.
+    """
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    # Side effect: writes sparse_kv_indices_buffer (via nested eager
+    # sparse_attn_indexer). `self.sparse_kv_indices_buffer` is the same tensor
+    # object passed in, so the declared mutation matches the real one.
+    self.forward_impl(hidden_states, qr, qr_scale, positions)
+    # Fresh tensor equal to qr; consumed by the caller as the mla_attn query.
+    # Clone (not a bare return of qr) so the runtime output matches the fake's
+    # fresh-tensor contract and never aliases an input.
+    return qr.clone()
+
+
+direct_register_custom_op(
+    op_name="indexer_with_output",
+    op_func=indexer_with_output,
+    mutates_args=["sparse_kv_indices_buffer"],
+    fake_impl=_indexer_with_output_fake,
+)
+
+
 class Indexer(nn.Module):
     def __init__(
         self,
@@ -1658,6 +1852,12 @@ class Indexer(nn.Module):
         self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
         atom_config.compilation_config.static_forward_context[prefix] = self
 
+        # Rope module used by `forward_impl` (and the `indexer_with_output`
+        # splitting op, which can't take a module arg). Bound by the owning
+        # DeepseekV2MLAAttention right after construction; mirrors V4's
+        # `self.indexer.rotary_emb = self.rotary_emb`.
+        self.rotary_emb = None
+
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
 
     def forward(
@@ -1666,8 +1866,43 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         qr_scale: Optional[torch.Tensor],
         positions,
-        rotary_emb,
+        rotary_emb=None,
     ) -> torch.Tensor:
+        # Under PCP, route the whole indexer through the Dynamo-opaque
+        # `indexer_with_output` splitting op so the runtime `_pcp_active()` branch
+        # (round-robin k all-gather + separate q/k rope) evaluates live instead of
+        # being baked to its warmup value by torch.compile. `pcp_is_enabled()` is
+        # a run-level constant (pcp world size is fixed for the process), so this
+        # guard is compile-safe and a no-op — a direct `forward_impl` call, graph
+        # unchanged — for non-PCP and plugin (SGLang / vLLM / RTP) backends.
+        if pcp_is_enabled():
+            # Returns `qr` (identity); the caller feeds it to mla_attn so the
+            # opaque op stays live and ordered. The top-k result travels the
+            # side-buffer (declared mutated, so its write is ordered before the
+            # sparse-MLA read), not this return value.
+            return torch.ops.aiter.indexer_with_output(
+                hidden_states,
+                qr,
+                qr_scale,
+                positions,
+                self.prefix,
+                self.sparse_kv_indices_buffer,
+            )
+        return self.forward_impl(hidden_states, qr, qr_scale, positions, rotary_emb)
+
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        qr_scale: Optional[torch.Tensor],
+        positions,
+        rotary_emb=None,
+    ) -> torch.Tensor:
+        # The opaque `indexer_with_output` op can't pass a module, so it relies on
+        # the bound `self.rotary_emb`; direct callers (non-PCP / plugins) may still
+        # pass their own rope explicitly, which takes precedence.
+        if rotary_emb is None:
+            rotary_emb = self.rotary_emb
         q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
 
@@ -1681,15 +1916,39 @@ class Indexer(nn.Module):
             k = self.wk(hidden_states)
             weights = self.weights_proj(hidden_states)
 
-        if not self.use_qk_rope_cache_fusion:
+        # Under PCP prefill the fused qk-rope-cache kernel cannot be used: it
+        # ropes q and writes k in one pass keyed on a single token count, but
+        # here q/weights are this rank's 1/pcp queries while k must become the
+        # FULL key set (every rank keeps full KV). So force the unfused path,
+        # all-gather k (and the key positions) to the full padded sequence, and
+        # rope q (1/pcp) and k (full) separately. The op then scores 1/pcp
+        # queries against the gathered full KV and writes the full k-cache.
+        pcp = _pcp_active()
+        positions_op = positions
+        if (not self.use_qk_rope_cache_fusion) or pcp:
             q_pe, _ = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
+            if pcp:
+                pcp_ws = get_pcp_world_size()
+                # k is 1/pcp (from 1/pcp hidden); gather to full padded [S_pad].
+                k = pcp_allgather_rerange(k, pcp_ws)
+                positions_op = pcp_allgather_rerange(positions, pcp_ws)
             k = self.k_norm(k)
             k_pe, _ = torch.split(
                 k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
-            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
+            if pcp:
+                # Rope q (1/pcp) and k (full) separately: they have different
+                # token counts under PCP so they can't share one rope call. The
+                # rope kernel is 2-component (ropes query AND key in place) and
+                # requires a non-None partner, so pass a throwaway of the
+                # matching length for the side we don't need. rope is in-place
+                # on the rotary_dim views (q_pe/k_pe alias q/k).
+                rotary_emb(positions, q_pe, torch.empty_like(q_pe))
+                rotary_emb(positions_op, torch.empty_like(k_pe), k_pe)
+            else:
+                q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
 
             q = q.view(-1, self.head_dim)
             q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
@@ -1719,12 +1978,12 @@ class Indexer(nn.Module):
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.eps,
-            positions,
+            positions_op,
             rotary_emb.cos_cache.squeeze(-2).squeeze(-2),
             rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
             self._weights_scale,
             rotary_emb.is_neox_style,
-            self.use_qk_rope_cache_fusion,
+            self.use_qk_rope_cache_fusion and not pcp,
         )
 
 
@@ -1962,6 +2221,10 @@ class DeepseekV2MLAAttention(nn.Module):
                     ),
                     f"{prefix}.indexer",
                 )
+                # Bind the indexer's rope so forward_impl (and the opaque
+                # indexer_with_output splitting op) can rope without receiving a
+                # module argument. Mirrors deepseek_v4.Attention.__init__.
+                self.indexer.rotary_emb = self.indexer_rope_emb
         else:
             self.indexer_rope_emb = None
             self.indexer = None
@@ -2122,13 +2385,23 @@ class DeepseekV2MLAAttention(nn.Module):
             # The indexer's wk/weights_proj GEMMs run in BF16. When input_layernorm
             # fused the quant it emits a bf16 mirror (indexer_hidden); otherwise
             # hidden_states is already the bf16 normed activation.
-            self.indexer(
+            idx_ret = self.indexer(
                 indexer_hidden if indexer_hidden is not None else hidden_states,
                 hidden_states_or_q_c,
                 hidden_states_or_q_c_scale,
                 positions,
                 self.indexer_rope_emb,
             )
+            if pcp_is_enabled():
+                # Under PCP the indexer runs through the opaque `indexer_with_output`
+                # split op, which returns `hidden_states_or_q_c` unchanged
+                # (identity). Feeding it forward as the mla_attn query is what keeps
+                # the op live under torch.compile — its real result (top-k) is a
+                # hidden write to the sparse buffer that mla_attn reads via `self` —
+                # and orders the write before that read. `pcp_is_enabled()` is a
+                # run-level constant, so baking this branch at trace time is correct
+                # (non-PCP / plugins keep discarding the return, graph unchanged).
+                hidden_states_or_q_c = idx_ret
 
         return self.mla_attn(
             hidden_states_or_q_c,
@@ -2672,9 +2945,44 @@ class DeepseekV2ForCausalLM(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        # ---- Prefill Context Parallel (PCP) query split ------------------
+        # During prefill with pcp_size > 1 the token sequence is round-robin
+        # split so each PCP rank runs the whole model (embed / norm / q-proj /
+        # MoE) on only 1/pcp of the tokens. The attention modules re-materialise
+        # the full KV internally (see DeepseekV2MLAAttention / Indexer /
+        # MLAAttention), so decode and the cache layout are untouched. When PCP
+        # is inactive (`pcp=1` or decode) this whole block is skipped and the
+        # forward is identical to the original path.
+        pcp = _pcp_active()
+        n_global = positions.shape[0]
+        if pcp:
+            pcp_ws = get_pcp_world_size()
+            n_pad = pcp_pad_len(n_global, pcp_ws) - n_global
+            positions = pcp_round_robin_split(pcp_pad_dense(positions, n_pad), pcp_ws)
+            if input_ids is not None:
+                input_ids = pcp_round_robin_split(
+                    pcp_pad_dense(input_ids, n_pad), pcp_ws
+                )
+            if inputs_embeds is not None:
+                inputs_embeds = pcp_round_robin_split(
+                    pcp_pad_dense(inputs_embeds, n_pad), pcp_ws
+                )
+
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+
+        # ---- PCP gather: 1/pcp rows -> full token order, then drop pad ----
+        # Only the last PP rank produces real hidden states; earlier stages
+        # forward IntermediateTensors (already 1/pcp) unchanged.
+        if pcp and get_pp_group().is_last_rank:
+            if isinstance(hidden_states, tuple):
+                hs, aux = hidden_states
+                hs = pcp_allgather_rerange(hs, pcp_ws)[:n_global]
+                aux = [pcp_allgather_rerange(a, pcp_ws)[:n_global] for a in aux]
+                hidden_states = (hs, aux)
+            elif isinstance(hidden_states, torch.Tensor):
+                hidden_states = pcp_allgather_rerange(hidden_states, pcp_ws)[:n_global]
         return hidden_states
 
     def compute_logits(
