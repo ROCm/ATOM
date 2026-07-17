@@ -880,42 +880,15 @@ async def _race_disconnect(coro, raw_request, request_id):
     ``request.receive()`` is safe here because FastAPI has already parsed the
     request body into a pydantic model before this handler runs, so there is no
     unread body for ``receive()`` to race against.
+
+    [stream-only-abort experiment] Non-streaming disconnect-abort is DISABLED
+    here: we just run ``coro`` to completion (the pre-1562 non-stream behavior,
+    no ``_listen_for_disconnect`` task, no abort_request). The streaming
+    abort-on-real-disconnect path (StreamingResponse + cleanup_streaming_request
+    with aborted=True) is a separate code path and is left untouched.
     """
-    handler_task = asyncio.ensure_future(coro)
-
-    # No ASGI request object (e.g. internal call) -> just await the coro.
-    if raw_request is None:
-        return await handler_task
-
-    disconnect_task = asyncio.ensure_future(_listen_for_disconnect(raw_request))
-
-    done, pending = await asyncio.wait(
-        [handler_task, disconnect_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-
-    # Cancel the loser and let its cancellation settle (drives the coro's own
-    # finally -> abort_request when the handler is the loser). Only swallow the
-    # expected CancelledError; log anything else, and let BaseException
-    # (KeyboardInterrupt/SystemExit) propagate.
-    for task in pending:
-        task.cancel()
-    for task in pending:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.warning(
-                f"Error tearing down cancelled task for request {request_id}",
-                exc_info=True,
-            )
-
-    if handler_task in done:
-        return handler_task.result()
-
-    logger.info(f"Client disconnected (non-stream), aborting request {request_id}")
-    raise _ClientDisconnected(request_id)
+    del request_id  # unused: non-stream abort disabled in this variant
+    return await coro
 
 
 async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
