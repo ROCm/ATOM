@@ -523,8 +523,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
         def _should_log_glm52_target_graph(self, forward_batch) -> bool:
             return (
-                os.environ.get("ATOM_GLM52_VERIFY_DEBUG", "0")
-                in ("1", "true", "True")
+                (
+                    _env_flag("ATOM_GLM52_VERIFY_DEBUG")
+                    or _env_flag("ATOM_GLM52_ATTENTION_DEBUG_LOG")
+                )
                 and _is_glm52_runner(getattr(self, "model_runner", None))
                 and _mode_is_target_verify(forward_batch)
             )
@@ -567,35 +569,40 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 return
             try:
                 buffers = getattr(runner, "buffers", None)
+                spec_info = getattr(forward_batch, "spec_info", None)
                 context = {
-                    "input_ids": _tensor_head(
-                        getattr(buffers, "input_ids", None)
-                        if buffers is not None
-                        else getattr(forward_batch, "input_ids", None)
-                    ),
+                    "input_ids": _tensor_head(getattr(forward_batch, "input_ids", None)),
                     "positions": _tensor_head(
-                        getattr(buffers, "positions", None)
-                        if buffers is not None
+                        getattr(spec_info, "positions", None)
+                        if getattr(spec_info, "positions", None) is not None
                         else getattr(forward_batch, "positions", None)
                     ),
                     "out_cache_loc": _tensor_head(
-                        getattr(buffers, "out_cache_loc", None)
-                        if buffers is not None
-                        else getattr(forward_batch, "out_cache_loc", None)
+                        getattr(forward_batch, "out_cache_loc", None)
                     ),
-                    "seq_lens": _tensor_head(
-                        getattr(buffers, "seq_lens", None)
-                        if buffers is not None
-                        else getattr(forward_batch, "seq_lens", None)
-                    ),
+                    "seq_lens": _tensor_head(getattr(forward_batch, "seq_lens", None)),
                     "req_pool_indices": _tensor_head(
+                        getattr(forward_batch, "req_pool_indices", None)
+                    ),
+                    "buffer_input_ids": _tensor_head(getattr(buffers, "input_ids", None))
+                    if buffers is not None
+                    else None,
+                    "buffer_positions": _tensor_head(getattr(buffers, "positions", None))
+                    if buffers is not None
+                    else None,
+                    "buffer_out_cache_loc": _tensor_head(
+                        getattr(buffers, "out_cache_loc", None)
+                    )
+                    if buffers is not None
+                    else None,
+                    "buffer_seq_lens": _tensor_head(getattr(buffers, "seq_lens", None))
+                    if buffers is not None
+                    else None,
+                    "buffer_req_pool_indices": _tensor_head(
                         getattr(buffers, "req_pool_indices", None)
-                        if buffers is not None
-                        else getattr(forward_batch, "req_pool_indices", None)
-                    ),
-                    "spec_positions": _tensor_head(
-                        getattr(getattr(forward_batch, "spec_info", None), "positions", None)
-                    ),
+                    )
+                    if buffers is not None
+                    else None,
                     "raw_bs": getattr(runner, "raw_bs", None),
                     "bs": getattr(runner, "bs", None),
                     "raw_tokens": getattr(runner, "raw_num_token", None),
