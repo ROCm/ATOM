@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Regression tests for speculative-config validation in EngineArgs._get_engine_kwargs.
 
+import argparse
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -93,3 +94,36 @@ class TestEngineArgsSpeculativeValidation:
             num_speculative_tokens=3,
         )
         assert kwargs["speculative_config"] is fake_spec_config
+
+
+class TestEngineArgsIndexCacheDtype:
+    """Regression tests for index-cache dtype CLI parity with KV cache dtype."""
+
+    def test_index_cache_dtype_defaults_to_kv_cache_dtype(self):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+
+        args = EngineArgs.from_cli_args(parser.parse_args(["--kv_cache_dtype", "fp8"]))
+
+        assert args.kv_cache_dtype == "fp8"
+        assert args.index_cache_dtype == "fp8"
+
+    def test_index_cache_dtype_accepts_dashed_spelling(self):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+
+        args = EngineArgs.from_cli_args(
+            parser.parse_args(["--index-cache-dtype", "fp8"])
+        )
+
+        assert args.index_cache_dtype == "fp8"
+
+    def test_index_cache_dtype_accepts_underscore_spelling(self):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+
+        args = EngineArgs.from_cli_args(
+            parser.parse_args(["--index_cache_dtype", "fp8"])
+        )
+
+        assert args.index_cache_dtype == "fp8"

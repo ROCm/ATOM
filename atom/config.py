@@ -1047,6 +1047,7 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     port: int = 8006
@@ -1098,6 +1099,9 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
+        if self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
+
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
         # assert os.path.isdir(self.model)
@@ -1266,7 +1270,17 @@ class Config:
 
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
+        # PCP changes the compiled graph: when pcp>1 the indexer runs through the
+        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
+        # query) and the indexer takes the round-robin all-gather / separate-rope
+        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # identically, so without this factor pcp2 loads pcp1's cached artifact
+        # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
+        # runtime — the same stale-artifact hazard documented for the vocab-embed
+        # flag below.
+        factors.append(self.prefill_context_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(self.index_cache_dtype)
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (

@@ -376,6 +376,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -622,6 +623,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -1135,7 +1137,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
-    @mark_trace(prefix="mxfp4_moe", torch_compile=False)
+    @mark_trace
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1154,6 +1156,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
             # Triton decode: GUGU (interleaved) uses the fused act+quant GEMM1;
@@ -1780,6 +1783,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         """Apply compressed-tensors FP8 MoE computation."""
         # Select top-k experts using router logits
@@ -2217,6 +2221,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -3530,6 +3535,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            prefix=f"{self.prefix}.fused_moe",
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -3588,6 +3594,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            prefix=f"{self.prefix}.fused_moe",
         )
 
         dp_group = get_dp_group()

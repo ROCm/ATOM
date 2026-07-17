@@ -55,6 +55,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 
 @triton.jit
 def _swa_write_kernel(
@@ -116,6 +118,7 @@ def _swa_write_kernel(
     tl.store(dst, src, mask=d_mask)
 
 
+@mark_trace
 def swa_write(
     kv: torch.Tensor,
     positions: torch.Tensor,
@@ -124,9 +127,24 @@ def swa_write(
     swa_region: torch.Tensor,
     block_size: int,
     write_per_batch: int,
+    *,
+    k_packed: torch.Tensor | None = None,
+    k_rope: torch.Tensor | None = None,
+    swa_region_rope: torch.Tensor | None = None,
+    prefix: str = "",
 ) -> None:
-    """paged-SWA in-place write. For the last
-    `min(tok_n_b, write_per_batch)` tokens of every seq `b ∈ [0, bs)` this fwd
+    """paged-SWA in-place write, dispatching on the kv-cache layout.
+
+    Native 2buff fp8 (``swa_region_rope`` provided): the op-quantized extend K
+    comes in as ``k_packed`` (fp8 NoPE) + ``k_rope`` (bf16 RoPE tail), in the
+    ``[T, *]`` or ``[T, 1, *]`` layout produced by the quant kernel; delegates to
+    :func:`swa_write_2buff_prepacked`, which scatters both into their paged pools
+    (``swa_region`` = NoPE pool, ``swa_region_rope`` = RoPE pool) — a pure
+    dtype-agnostic copy, no requant. The bf16 ``kv`` arg is unused on this path
+    (the caller may pass ``None``).
+
+    Otherwise (bf16): for the last `min(tok_n_b, write_per_batch)` tokens of
+    every seq `b ∈ [0, bs)` this fwd
     (`tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`, `bs = block_tables.shape[0]`),
     write `kv[r]` to the content-addressed SWA region:
         swa_region[block_tables[b, pos//block_size] * block_size
@@ -138,7 +156,8 @@ def swa_write(
     cached block instead of a stale ring (issue #1417).
 
     Args:
-        kv: [T, head_dim] per-fwd KV (BF16). `T = cu_seqlens_q[bs]`.
+        kv: [T, head_dim] per-fwd KV (BF16). bf16 path only; `T = cu_seqlens_q[bs]`.
+            May be ``None`` on the fp8 2buff path (``k_packed`` is used instead).
         positions: [T'] int — full forward_vars["positions"] (`T' >= T`).
         cu_seqlens_q: [bs+1] int — exact size (`bs == block_tables.shape[0]`).
         block_tables: [bs, max_blocks_per_seq] int32 — logical→physical block.
@@ -148,7 +167,28 @@ def swa_write(
         block_size: tokens per block (= V4 block_size, 128).
         write_per_batch: `min(max_q_len, block_size_window)` — max tokens
             written per seq this fwd (grid y dim, kernel `constexpr`).
+        k_packed: [T, 512] or [T, 1, 512] fp8 NoPE extend K — fp8 2buff path only.
+        k_rope: [T, rope_head_dim] or [T, 1, rope_head_dim] bf16 RoPE tail — fp8
+            2buff path only.
+        swa_region_rope: [num_pages, rope_head_dim] bf16 RoPE pool — presence
+            selects the fp8 2buff path.
     """
+    if swa_region_rope is not None:
+        # fp8 2buff: scatter the op-quantized extend K (k_packed/k_rope) into both
+        # paged SWA pools. Flatten the [T, 1, *] quant-kernel views to [T, *]; the
+        # bf16 `kv` source is unused here.
+        swa_write_2buff_prepacked(
+            k_packed.view(k_packed.shape[0], -1),
+            k_rope.view(k_rope.shape[0], -1),
+            positions,
+            cu_seqlens_q,
+            block_tables,
+            swa_region,
+            swa_region_rope,
+            block_size,
+            write_per_batch,
+        )
+        return
     assert kv.dim() == 2, f"kv must be [T, D], got {kv.shape}"
     assert positions.dim() == 1
     assert (
@@ -220,6 +260,71 @@ def swa_write_reference(
         phys = block_tables[b, blk].to(torch.long)
         dst_row = phys * block_size + (src_pos % block_size)
         swa_region[dst_row] = src_kv
+
+
+def swa_write_2buff_prepacked(
+    k_packed: torch.Tensor,
+    k_rope: torch.Tensor,
+    positions: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    swa_block_tables: torch.Tensor,
+    swa_region_nope: torch.Tensor,
+    swa_region_rope: torch.Tensor,
+    block_size: int,
+    write_per_batch: int,
+) -> None:
+    """Native 2buff fp8 paged SWA write: content-addressed scatter of the LAST
+    ``min(tok_n_b, write_per_batch)`` tokens of every seq into the two paged
+    SWA pools (fp8 NoPE + bf16 RoPE). The K is ALREADY in the 2buff layout
+    (nope-fp8 ``[T,512]`` + rope-bf16 ``[T,64]``), produced upstream by the
+    compute-only 2buff quant (:func:`qk_norm_rope_maybe_quant_fp8_2buff`). This
+    is a pure dtype-agnostic scatter (reuses the paged :func:`swa_write` once per
+    pool); NO torch quantization happens here.
+
+    Both pools are the flat content-addressed regions of ``unified_kv`` /
+    ``unified_kv_rope`` (``[num_pages, D]``), addressed by ``swa_block_tables``:
+    ``swa_region[block_tables[b, pos//block_size] * block_size + pos%block_size]``.
+    Replaces the pre-paged per-request ring variant (matches the paged bf16
+    :func:`swa_write` semantics; issue #1417).
+
+    Args:
+        k_packed:        [T, 512] fp8 — quantized K nope + inline e8m0 scale + pad.
+        k_rope:          [T, 64]  bf16 — rotated K-PE (not quantized).
+        swa_block_tables:[bs, max_blocks] int32 — paged-SWA logical→physical map.
+        swa_region_nope: [num_pages, 512] fp8 paged pool (2buff nope).
+        swa_region_rope: [num_pages, 64]  bf16 paged pool (rope).
+        block_size:      paging stride of both pools.
+        (other args as :func:`swa_write`.)
+    """
+    from atom.model_ops.v4_kernels.v4_quant import V4_DIM_QK_PACKED, V4_DIM_ROPE
+
+    assert (
+        k_packed.dim() == 2 and k_packed.shape[1] == V4_DIM_QK_PACKED
+    ), f"k_packed must be [T,{V4_DIM_QK_PACKED}] fp8, got {tuple(k_packed.shape)}"
+    assert (
+        k_rope.dim() == 2 and k_rope.shape[1] == V4_DIM_ROPE
+    ), f"k_rope must be [T,{V4_DIM_ROPE}] bf16, got {tuple(k_rope.shape)}"
+    assert swa_region_nope.dim() == 2 and swa_region_nope.shape[1] == V4_DIM_QK_PACKED
+    assert swa_region_rope.dim() == 2 and swa_region_rope.shape[1] == V4_DIM_ROPE
+
+    swa_write(
+        k_packed.contiguous(),
+        positions,
+        cu_seqlens_q,
+        swa_block_tables,
+        swa_region_nope,
+        block_size,
+        write_per_batch,
+    )
+    swa_write(
+        k_rope.contiguous(),
+        positions,
+        cu_seqlens_q,
+        swa_block_tables,
+        swa_region_rope,
+        block_size,
+        write_per_batch,
+    )
 
 
 # === Unified Compressor state save (plan path) ==========================
@@ -315,6 +420,7 @@ def _update_compressor_states_kernel(
     )
 
 
+@mark_trace
 def update_compressor_states(
     kv: torch.Tensor,
     score: torch.Tensor,
@@ -327,6 +433,7 @@ def update_compressor_states(
     state_slot_mapping: torch.Tensor,  # [bs] int32 — per-seq state slot
     ratio: int,
     overlap: bool,
+    prefix: str = "",
 ) -> None:
     """In-place update of Compressor's per-request `kv_state`/`score_state`
     ring buffer (size ≥ `K_pool = (1+overlap)*ratio`; V4-Pro widens to
