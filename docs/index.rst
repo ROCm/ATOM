@@ -4,11 +4,6 @@ ATOM
 **ATOM** (Accelerated Training and Optimization for Models) is AMD's high-performance LLM serving framework optimized for ROCm platforms.
 Find the source code at `<https://github.com/ROCm/ATOM>`__.
 
-.. image:: assets/atom_logo.png
-   :align: center
-   :width: 400px
-
-
 Features
 --------
 
