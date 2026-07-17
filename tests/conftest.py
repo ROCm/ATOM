@@ -62,7 +62,17 @@ class _StubEPLBConfig:
     rebalance_interval = 3000
     p2p_batch_chunk_size = 32
     rebalance_layers_per_chunk = 64
+    num_redundant_experts = 0
+    rebalance_min_balancedness = 2.0
+    rebalance_balancedness_agg = "min"
     placement_policy = "naive"
+
+    def __init__(self, **kwargs):
+        # AtomArgs builds EPLBConfig(**eplb_kwargs); mirror the real dataclass
+        # constructor by accepting and storing those fields (falls back to the
+        # class-level defaults above when constructed with no args).
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 class _StubAtomConfig:
