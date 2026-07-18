@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
+import time
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -72,6 +74,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 logger = logging.getLogger("atom")
+_MOE_LOAD_COPY_LOG_SECONDS = float(os.getenv("ATOM_MOE_LOAD_COPY_LOG_SECONDS", "0"))
 
 
 class MoEActivationQuant(Enum):
@@ -3038,8 +3041,31 @@ class FusedMoE(torch.nn.Module):
     @staticmethod
     def _copy_quant_storage(dst: torch.Tensor, src: torch.Tensor) -> None:
         """Copy quantized tensors without numeric conversion of byte formats."""
+        if src.device.type == "cpu" and not src.is_contiguous():
+            src = src.contiguous()
+        start = time.perf_counter() if _MOE_LOAD_COPY_LOG_SECONDS > 0 else None
+
+        def log_slow_copy() -> None:
+            if start is None:
+                return
+            if dst.device.type == "cuda":
+                torch.cuda.synchronize(dst.device)
+            elapsed = time.perf_counter() - start
+            if elapsed >= _MOE_LOAD_COPY_LOG_SECONDS:
+                logger.info(
+                    "Slow MoE quant copy: %.3fs dst_shape=%s dst_dtype=%s "
+                    "src_shape=%s src_dtype=%s src_contiguous=%s",
+                    elapsed,
+                    tuple(dst.shape),
+                    dst.dtype,
+                    tuple(src.shape),
+                    src.dtype,
+                    src.is_contiguous(),
+                )
+
         if dst.dtype == dtypes.fp4x2:
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            log_slow_copy()
             return
         fp8_storage_dtypes = (
             torch.float8_e4m3fn,
@@ -3053,11 +3079,13 @@ class FusedMoE(torch.nn.Module):
             # numeric conversion when destination storage uses a different FP8
             # variant; later scale fixups expect the original bytes.
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            log_slow_copy()
             return
         if dst.dtype == dtypes.fp8_e8m0 and src.dtype == torch.uint8:
             # e8m0 microscale tensors are byte-encoded; copy_ would convert the
             # uint8 values numerically instead of preserving the scale bits.
             dst.view(torch.uint8).copy_(src)
+            log_slow_copy()
             return
         if dst.dtype == torch.uint8 and src.dtype in (
             torch.float8_e8m0fnu,
@@ -3065,6 +3093,7 @@ class FusedMoE(torch.nn.Module):
         ):
             src = src.view(torch.uint8)
         dst.copy_(src)
+        log_slow_copy()
 
     def _load_w13(
         self,

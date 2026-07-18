@@ -157,6 +157,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Use the optional fastsafetensors package for safetensors file reads.
+    # The current ATOM native loader still consumes CPU tensors, so this only
+    # swaps the file reader; GPU-direct sharded loading needs a deeper loader
+    # integration.
+    "ATOM_USE_FASTSAFETENSORS": lambda: (
+        os.getenv("ATOM_USE_FASTSAFETENSORS", "0") == "1"
+    ),
+    "ATOM_FASTSAFETENSORS_NOGDS": lambda: (
+        os.getenv("ATOM_FASTSAFETENSORS_NOGDS", "1") == "1"
+    ),
+    "ATOM_FASTSAFETENSORS_DEBUG": lambda: (
+        os.getenv("ATOM_FASTSAFETENSORS_DEBUG", "0") == "1"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
@@ -234,6 +247,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
+    "ATOM_FWD_DUMP_STATS_ONLY": lambda: (
+        os.getenv("ATOM_FWD_DUMP_STATS_ONLY", "0") == "1"
+    ),
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),

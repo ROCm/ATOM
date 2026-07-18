@@ -21,7 +21,6 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from aiter.rotary_embedding import get_rope
 from einops import rearrange
 from torch import nn
 
@@ -216,7 +215,7 @@ class KimiSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.gate.e_score_correction_bias = atom_parameter(
-            torch.empty(config.num_experts)
+            torch.empty(config.num_experts, dtype=torch.float32)
         )
         self.experts = FusedMoE(
             num_experts=config.num_experts,
@@ -286,7 +285,12 @@ class KimiSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
-        router_logits = self.gate(hidden_states)
+        # Match the reference Kimi router: route in fp32 before sigmoid/top-k.
+        router_logits = F.linear(
+            hidden_states.float(),
+            self.gate.weight.float(),
+            None,
+        )
         routed_input = (
             self.routed_expert_down_proj(hidden_states)
             if self.use_latent_moe
@@ -335,7 +339,7 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.q_a_proj",
         )
-        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=1e-6)
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
             self.num_heads * self.q_head_dim,
@@ -350,7 +354,7 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.kv_a_proj_with_mqa",
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=1e-6)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -373,20 +377,6 @@ class KimiFullAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        rope_params = getattr(config, "rope_parameters", {}) or {}
-        rope_theta = (
-            rope_params.get("rope_theta")
-            or getattr(config, "rope_theta", None)
-            or 10000.0
-        )
-        self.rotary_emb = get_rope(
-            self.qk_rope_head_dim,
-            rotary_dim=self.qk_rope_head_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=None,
-            is_neox_style=False,
-        )
         self.attn = Attention(
             self.num_local_heads,
             self.q_head_dim,
@@ -399,6 +389,41 @@ class KimiFullAttention(nn.Module):
             config=atom_config,
             prefix=prefix,
         )
+
+    def _prefill_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        fwd_ctx = get_forward_context()
+        attn_metadata = fwd_ctx.attn_metadata
+        cu_seqlens = getattr(attn_metadata, "cu_seqlens_q", None)
+        out = torch.empty_like(v)
+
+        if cu_seqlens is None:
+            spans = [(0, q.shape[0])]
+        else:
+            starts = cu_seqlens[:-1].tolist()
+            ends = cu_seqlens[1:].tolist()
+            spans = list(zip(starts, ends))
+
+        for start, end in spans:
+            if end <= start:
+                continue
+            q_seq = q[start:end].transpose(0, 1).unsqueeze(0)
+            k_seq = k[start:end].transpose(0, 1).unsqueeze(0)
+            v_seq = v[start:end].transpose(0, 1).unsqueeze(0)
+            out_seq = F.scaled_dot_product_attention(
+                q_seq,
+                k_seq,
+                v_seq,
+                dropout_p=0.0,
+                is_causal=True,
+                scale=self.scaling,
+            )
+            out[start:end].copy_(out_seq.squeeze(0).transpose(0, 1))
+        return out.reshape(-1, self.local_v_size)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
@@ -416,21 +441,22 @@ class KimiFullAttention(nn.Module):
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_rope = k_rope.unsqueeze(1).expand(-1, self.num_local_heads, -1)
 
-        q_rope_f = q_rope.reshape(-1, self.num_local_heads * self.qk_rope_head_dim)
-        k_rope_f = k_rope.reshape(-1, self.num_local_heads * self.qk_rope_head_dim)
-        q_rope_f, k_rope_f = self.rotary_emb(positions, q_rope_f, k_rope_f)
-        q_rope = q_rope_f.view(-1, self.num_local_heads, self.qk_rope_head_dim)
-        k_rope = k_rope_f.view(-1, self.num_local_heads, self.qk_rope_head_dim)
+        q = torch.cat((q_nope, q_rope), dim=-1)
+        k = torch.cat((k_nope, k_rope), dim=-1)
 
-        q = torch.cat((q_nope, q_rope), dim=-1).reshape(-1, self.local_q_size)
-        k = torch.cat((k_nope, k_rope), dim=-1).reshape(-1, self.local_q_size)
-        v_padded = F.pad(v, (0, self.q_head_dim - self.v_head_dim)).reshape(
-            -1, self.local_q_size
-        )
-        attn_out = self.attn(q, k, v_padded)
-        attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
-            :, :, : self.v_head_dim
-        ].reshape(-1, self.local_v_size)
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.context.is_prefill:
+            attn_out = self._prefill_sdpa(q, k, v)
+        else:
+            q_flat = q.reshape(-1, self.local_q_size)
+            k_flat = k.reshape(-1, self.local_q_size)
+            v_padded = F.pad(v, (0, self.q_head_dim - self.v_head_dim)).reshape(
+                -1, self.local_q_size
+            )
+            attn_out = self.attn(q_flat, k_flat, v_padded)
+            attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
+                :, :, : self.v_head_dim
+            ].reshape(-1, self.local_v_size)
         attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))
         return self.o_proj(attn_out)
 
