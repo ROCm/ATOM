@@ -286,11 +286,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
 
         for ratio in self.stage_ratios:
             if self.use_fp8_kv:
-                k = (
-                    ATOM_DEEPSEEK_V4_BLOCK_SIZE // ratio
-                    if ratio in (4, 128)
-                    else 0
-                )
+                k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // ratio if ratio in (4, 128) else 0
                 num_pages = self.num_slots * self.swa_cache_size + self.num_blocks * k
 
                 nope_start = offset
@@ -348,9 +344,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
 
                 main_rope_view = None
                 if ratio in (4, 128):
-                    main_rope_bytes = (
-                        self.num_blocks * k * self.qk_rope_head_dim * 2
-                    )
+                    main_rope_bytes = self.num_blocks * k * self.qk_rope_head_dim * 2
                     main_rope_view = (
                         self._take(offset, main_rope_bytes)
                         .view(torch.bfloat16)
