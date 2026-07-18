@@ -662,6 +662,13 @@ class ModelRunner:
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
         logger.info(f"Model load done: {config.model}")
+        if (
+            os.getenv("ATOM_SYNC_AFTER_LOAD", "0").lower() in ("1", "true", "yes")
+            and get_tp_group().world_size > 1
+        ):
+            logger.info("Waiting for all TP ranks to finish model loading before warmup")
+            get_tp_group().barrier()
+            logger.info("All TP ranks finished model loading")
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.

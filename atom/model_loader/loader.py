@@ -405,7 +405,10 @@ def load_model(
         futures = []
     use_threadpool = envs.ATOM_LOADER_USE_THREADPOOL
     if use_threadpool:
-        executor = concurrent.futures.ThreadPoolExecutor()
+        max_workers = int(os.getenv("ATOM_LOADER_THREADPOOL_WORKERS", "0"))
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers or None
+        )
     else:
         executor = None
     futures = []
