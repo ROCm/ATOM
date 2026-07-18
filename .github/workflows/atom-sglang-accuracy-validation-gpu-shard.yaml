@@ -34,6 +34,40 @@ jobs:
       CONTAINER_NAME: atom_sglang_validation_${{ inputs.shard_suffix }}_${{ strategy.job-index }}
       SGLANG_IMAGE_TAG: ${{ inputs.sglang_image_tag }}
     steps:
+      - name: Restore stale workspace ownership
+        run: |
+          set -euo pipefail
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
+          if [ ! -d "$workspace" ]; then
+            echo "Workspace does not exist yet: $workspace"
+            exit 0
+          fi
+
+          uid="$(id -u)"
+          gid="$(id -g)"
+          echo "Restoring workspace ownership for ${workspace} to ${uid}:${gid}"
+
+          if command -v sudo > /dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo chown -R "${uid}:${gid}" "$workspace" || true
+            sudo chmod -R u+rwX "$workspace" || true
+            exit 0
+          fi
+
+          if docker info > /dev/null 2>&1; then
+            docker run --rm \
+              -v "$workspace":/workspace \
+              docker.io/library/busybox:latest \
+              sh -c "chown -R ${uid}:${gid} /workspace && chmod -R u+rwX /workspace" || true
+            exit 0
+          fi
+
+          if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+            podman run --rm \
+              -v "$workspace":/workspace \
+              docker.io/library/busybox:latest \
+              sh -c "chown -R ${uid}:${gid} /workspace && chmod -R u+rwX /workspace" || true
+          fi
+
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
@@ -517,9 +551,19 @@ jobs:
       - name: Collect artifacts
         if: always()
         run: |
-          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
-          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
-          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          if [ -z "${CONTAINER_ENGINE:-}" ]; then
+            if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+              CONTAINER_ENGINE=podman
+            elif docker info > /dev/null 2>&1; then
+              CONTAINER_ENGINE=docker
+            else
+              echo "::warning::No container engine available while collecting artifacts; skipping container artifact copy."
+              exit 0
+            fi
+          fi
+          "$CONTAINER_ENGINE" cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
+          "$CONTAINER_ENGINE" cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
+          "$CONTAINER_ENGINE" cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
 
       - name: Upload model artifacts
         if: always()
@@ -542,8 +586,18 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
-          $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
-          $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
-          $CONTAINER_ENGINE rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
+          if [ -z "${CONTAINER_ENGINE:-}" ]; then
+            if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+              CONTAINER_ENGINE=podman
+            elif docker info > /dev/null 2>&1; then
+              CONTAINER_ENGINE=docker
+            else
+              echo "::warning::No container engine available during cleanup; skipping container cleanup."
+              exit 0
+            fi
+          fi
+          "$CONTAINER_ENGINE" exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          "$CONTAINER_ENGINE" stop "$CONTAINER_NAME" || true
+          "$CONTAINER_ENGINE" rm "$CONTAINER_NAME" || true
+          "$CONTAINER_ENGINE" rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
 
