@@ -111,11 +111,12 @@ class EngineCore:
                     self.runner_mgr.call_func(
                         "start_profiler", "capture_graph", wait_out=True
                     )
-                cap_cost, bs = self.runner_mgr.call_func(
+                cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
                 logger.info(
-                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
+                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} "
+                    f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
                 if self.profile_enbaled and self.mark_trace:
                     # Persist a dedicated capture-graph trace immediately.

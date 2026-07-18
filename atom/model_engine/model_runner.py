@@ -3283,190 +3283,6 @@ class ModelRunner:
             return True
         return False
 
-    def _capture_graphs_dspark(self, is_tbo):
-        """DSpark CUDA graph capture: one graph set per query-length bucket.
-
-        Confidence scheduling can replay a SMALLER max_q_len than full_q, so we
-        capture a rectangular graph per (bs, q-bucket). Under PIECEWISE mode the
-        compiled per-piece wrappers self-capture, so we only register the shape
-        (skipping oversized buckets that wouldn't fit). Finally profiles SPS(B)
-        from the captured graphs for the scheduler.
-        """
-
-        @contextmanager
-        def pause_gc():
-            # No GC during capture: a finalizer's hipModuleUnload aborts it (HIP 900).
-            gc.collect()
-            gc.disable()
-            try:
-                yield
-            finally:
-                gc.enable()
-                gc.collect()
-
-        input_ids = self.forward_vars["input_ids"].gpu
-        positions = self.forward_vars["positions"].gpu
-        outputs = self.forward_vars["outputs"]
-        piecewise = self._piecewise_cg_active()
-
-        full_q_len = self.drafter.mtp_k + 1
-        # Buckets default to [full_q_len] (single-graph); confidence scheduling
-        # expands to the smaller q-buckets each decode step may replay.
-        q_buckets = self._dspark_capture_q_buckets(full_q_len)
-        if q_buckets != [full_q_len]:
-            logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
-
-        with pause_gc(), graph_capture() as capture_ctx:
-            for max_q_len in q_buckets:
-                capture_range = (
-                    tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
-                )
-                for bs in capture_range:
-                    if self.rank == 0:
-                        capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")
-
-                    cu_seqlens_q = np.arange(
-                        0, (bs + 1) * max_q_len, max_q_len, dtype=np.int32
-                    )
-                    self.forward_vars["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
-                    self.forward_vars["cu_seqlens_q"].copy_to_gpu(bs + 1)
-
-                    num_tokens = bs * max_q_len
-                    if piecewise and self._piecewise_skip_capture(num_tokens):
-                        continue
-                    # Use a simple, safe position pattern for capture.
-                    self.forward_vars["positions"].np[:num_tokens] = (
-                        np.arange(num_tokens, dtype=np.int64) % max_q_len
-                    )
-                    attn_metadata, context = (
-                        self.attn_metadata_builder.build_for_cudagraph_capture(
-                            bs=bs, max_q_len=max_q_len
-                        )
-                    )
-                    if self.use_mrope:
-                        mrope_positions = self._mrope_positions_view(num_tokens)
-                        mrope_positions.copy_(
-                            positions[:num_tokens].unsqueeze(0).expand(3, -1)
-                        )
-                        context.positions = mrope_positions
-                    num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
-                    num_tokens += num_pad
-                    # get_dp_padding built num_tokens_across_dp from the PRE-pad
-                    # count, but we just padded num_tokens. Capture is symmetric
-                    # (every DP rank captures the same bs), so the padded count is
-                    # uniform across ranks. Rebuild the tensor at the padded size so
-                    # DPMetadata.make's `across_dp[rank] == num_tokens` holds.
-                    if num_tokens_across_dp is not None:
-                        num_tokens_across_dp = torch.full_like(
-                            num_tokens_across_dp, num_tokens
-                        )
-                    # Create ubatch slices for TBO capture (need >= 2 requests)
-                    ubatch_slices = None
-                    if is_tbo and self.config.enable_tbo_decode and bs >= 2:
-                        ubatch_slices = maybe_create_ubatch_slices(
-                            num_reqs=bs,
-                            num_tokens=num_tokens,
-                        )
-
-                    set_forward_context(
-                        attn_metadata=attn_metadata,
-                        atom_config=self.config,
-                        context=context,
-                        num_tokens=num_tokens,
-                        num_tokens_across_dp=num_tokens_across_dp,
-                        ubatch_slices=ubatch_slices,
-                        in_hipgraph=True,
-                    )
-
-                    # Warmup
-                    model_positions = (
-                        self._mrope_positions_view(num_tokens)
-                        if self.use_mrope
-                        else positions[:num_tokens]
-                    )
-                    model_output = self.model(input_ids[:num_tokens], model_positions)
-                    if self.use_aux_hidden_state_outputs:
-                        outputs[:num_tokens] = model_output[0]
-                    else:
-                        outputs[:num_tokens] = model_output
-                    if self.logits_in_graph:
-                        self.model.compute_logits(outputs[:num_tokens])
-
-                    if piecewise:
-                        # PIECEWISE: no manual whole-forward graph; the compiled
-                        # per-piece wrappers self-capture. Replay once to register.
-                        fc = get_forward_context()
-                        fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-                        fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
-                        self.model(input_ids[:num_tokens], model_positions)
-                        fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
-                        fc.batch_descriptor = None
-                        self._piecewise_captured_tokens.add(num_tokens)
-                        continue
-
-                    # Capture
-                    with (
-                        record_function(f"capture_graph_bs_{bs}")
-                        if self.mark_trace
-                        else nullcontext()
-                    ):
-                        if ubatch_slices is not None:
-                            # TBO capture: threads + multi-stream captured in graph.
-                            graph, graph_output = self.model.capture_tbo_graph(
-                                input_ids[:num_tokens],
-                                positions[:num_tokens],
-                                self.graph_pool,
-                                capture_ctx.stream,
-                                output_buffer=outputs[:num_tokens],
-                            )
-                            graph_aux = (
-                                graph_output[1]
-                                if self.use_aux_hidden_state_outputs
-                                else None
-                            )
-                        else:
-                            # Standard single-stream capture
-                            graph = torch.cuda.CUDAGraph()
-                            with torch.cuda.graph(
-                                graph, self.graph_pool, stream=capture_ctx.stream
-                            ):
-                                model_output = self.model(
-                                    input_ids[:num_tokens], model_positions
-                                )
-                                if self.use_aux_hidden_state_outputs:
-                                    outputs[:num_tokens] = model_output[0]
-                                    graph_aux = model_output[1]
-                                else:
-                                    outputs[:num_tokens] = model_output
-                                    graph_aux = None
-                                if self.logits_in_graph:
-                                    graph_logits = self.model.compute_logits(
-                                        outputs[:num_tokens]
-                                    )
-                    if self.graph_pool is None:
-                        self.graph_pool = graph.pool()
-                    self.graphs[(bs, max_q_len)] = graph
-                    if self.logits_in_graph and ubatch_slices is None:
-                        self.graph_logits[(bs, max_q_len)] = graph_logits
-                    if graph_aux is not None:
-                        self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
-                    torch.cuda.synchronize()
-
-        # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
-        # dispatch (bisect_left over this to pick the tightest captured shape).
-        self._piecewise_sorted_tokens = sorted(self._piecewise_captured_tokens)
-        if piecewise and self.rank == 0:
-            logger.info(
-                "PIECEWISE captured %d num_tokens buckets: %s",
-                len(self._piecewise_sorted_tokens),
-                self._piecewise_sorted_tokens,
-            )
-
-        # DSpark Phase 2: calibrate the SPS(B) throughput profile from the just-
-        # captured target graphs (each is a B = bs*max_q_len token forward, i.e.
-        # exactly one verification step at batch B). Cheap, GPU-only, one-shot.
-        self._maybe_calibrate_dspark_sps(full_q_len)
-
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
         if _piecewise:
@@ -3529,29 +3345,40 @@ class ModelRunner:
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
         self.logits_in_graph = self.world_size == 1 and not is_tbo
 
+        @contextmanager
+        def pause_gc():
+            # No GC during capture: a finalizer's hipModuleUnload aborts it (HIP 900).
+            gc.collect()
+            gc.disable()
+            try:
+                yield
+            finally:
+                gc.enable()
+                gc.collect()
+
         _rsv_before_capture = torch.cuda.memory_reserved()
         _alloc_before_capture = torch.cuda.memory_allocated()
 
-        drafter = getattr(self, "drafter", None)
-        use_dspark = drafter is not None and getattr(drafter, "use_dspark", False)
-        if use_dspark:
-            # DSpark: multi-bucket / PIECEWISE capture + SPS calibration.
-            self._capture_graphs_dspark(is_tbo)
-        else:
-            # original (plain MTP / non-spec): classic per-(bs) whole-forward
-            # capture.
-            input_ids = self.forward_vars["input_ids"].gpu
-            positions = self.forward_vars["positions"].gpu
-            outputs = self.forward_vars["outputs"]
-            with graph_capture() as gc:
+        input_ids = self.forward_vars["input_ids"].gpu
+        positions = self.forward_vars["positions"].gpu
+        outputs = self.forward_vars["outputs"]
+
+        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        # Capture one graph per (bs, query-length bucket). Buckets default to
+        # [full_q_len] (single-graph, classic per-bs capture); DSpark confidence
+        # scheduling expands to the smaller q-buckets a decode step may replay.
+        q_buckets = self._dspark_capture_q_buckets(full_q_len)
+        if q_buckets != [full_q_len]:
+            logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
+
+        with pause_gc(), graph_capture() as capture_ctx:
+            for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
                 )
-                max_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
                 for bs in capture_range:
                     if self.rank == 0:
                         capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")
-                    graph = torch.cuda.CUDAGraph()
 
                     cu_seqlens_q = np.arange(
                         0, (bs + 1) * max_q_len, max_q_len, dtype=np.int32
@@ -3560,12 +3387,16 @@ class ModelRunner:
                     self.forward_vars["cu_seqlens_q"].copy_to_gpu(bs + 1)
 
                     num_tokens = bs * max_q_len
+                    if _piecewise and self._piecewise_skip_capture(num_tokens):
+                        continue
                     # Use a simple, safe position pattern for capture.
                     self.forward_vars["positions"].np[:num_tokens] = (
                         np.arange(num_tokens, dtype=np.int64) % max_q_len
                     )
                     attn_metadata, context = (
-                        self.attn_metadata_builder.build_for_cudagraph_capture(bs=bs)
+                        self.attn_metadata_builder.build_for_cudagraph_capture(
+                            bs=bs, max_q_len=max_q_len
+                        )
                     )
                     if self.use_mrope:
                         mrope_positions = self._mrope_positions_view(num_tokens)
@@ -3575,9 +3406,18 @@ class ModelRunner:
                         context.positions = mrope_positions
                     num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                     num_tokens += num_pad
-                    # Create ubatch slices for TBO capture (need >= 2 requests)
+                    # get_dp_padding built num_tokens_across_dp from the PRE-pad
+                    # count, but we just padded num_tokens. Capture is symmetric
+                    # (every DP rank captures the same bs), so the padded count is
+                    # uniform across ranks. Rebuild the tensor at the padded size so
+                    # DPMetadata.make's `across_dp[rank] == num_tokens` holds.
+                    if num_tokens_across_dp is not None:
+                        num_tokens_across_dp = torch.full_like(
+                            num_tokens_across_dp, num_tokens
+                        )
+                    # Create ubatch slices for TBO capture (need > 2 requests)
                     ubatch_slices = None
-                    if is_tbo and self.config.enable_tbo_decode and bs >= 2:
+                    if is_tbo and self.config.enable_tbo_decode and bs > 2:
                         ubatch_slices = maybe_create_ubatch_slices(
                             num_reqs=bs,
                             num_tokens=num_tokens,
@@ -3599,16 +3439,25 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:num_tokens]
                     )
-                    model_output = self.model(
-                        input_ids[:num_tokens],
-                        model_positions,
-                    )
+                    model_output = self.model(input_ids[:num_tokens], model_positions)
                     if self.use_aux_hidden_state_outputs:
                         outputs[:num_tokens] = model_output[0]
                     else:
                         outputs[:num_tokens] = model_output
                     if self.logits_in_graph:
                         self.model.compute_logits(outputs[:num_tokens])
+
+                    if _piecewise:
+                        # PIECEWISE: no manual whole-forward graph; the compiled
+                        # per-piece wrappers self-capture. Replay once to register.
+                        fc = get_forward_context()
+                        fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+                        fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+                        self.model(input_ids[:num_tokens], model_positions)
+                        fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
+                        fc.batch_descriptor = None
+                        self._piecewise_captured_tokens.add(num_tokens)
+                        continue
 
                     # Capture
                     with (
@@ -3622,24 +3471,22 @@ class ModelRunner:
                                 input_ids[:num_tokens],
                                 positions[:num_tokens],
                                 self.graph_pool,
-                                gc.stream,
+                                capture_ctx.stream,
                                 output_buffer=outputs[:num_tokens],
                             )
-                            graph_aux = None
+                            graph_aux = (
+                                graph_output[1]
+                                if self.use_aux_hidden_state_outputs
+                                else None
+                            )
                         else:
                             # Standard single-stream capture
                             graph = torch.cuda.CUDAGraph()
-                            model_positions = (
-                                self._mrope_positions_view(num_tokens)
-                                if self.use_mrope
-                                else positions[:num_tokens]
-                            )
                             with torch.cuda.graph(
-                                graph, self.graph_pool, stream=gc.stream
+                                graph, self.graph_pool, stream=capture_ctx.stream
                             ):
                                 model_output = self.model(
-                                    input_ids[:num_tokens],
-                                    model_positions,
+                                    input_ids[:num_tokens], model_positions
                                 )
                                 if self.use_aux_hidden_state_outputs:
                                     outputs[:num_tokens] = model_output[0]
@@ -3661,13 +3508,26 @@ class ModelRunner:
                     torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
 
+        # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
+        # dispatch (bisect_left over this to pick the tightest captured shape).
+        self._piecewise_sorted_tokens = sorted(self._piecewise_captured_tokens)
+        if _piecewise and self.rank == 0:
+            logger.info(
+                "PIECEWISE captured %d num_tokens buckets: %s",
+                len(self._piecewise_sorted_tokens),
+                self._piecewise_sorted_tokens,
+            )
+
+        # DSpark Phase 2: calibrate the SPS(B) throughput profile from the just-
+        # captured target graphs (each is a B = bs*max_q_len token forward, i.e.
+        # exactly one verification step at batch B). Cheap, GPU-only, one-shot.
+        self._maybe_calibrate_dspark_sps(full_q_len)
+
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).
+        _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)
+        _alloc_bytes = max(torch.cuda.memory_allocated() - _alloc_before_capture, 0)
         if self.rank == 0:
-            _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)
-            _alloc_bytes = max(
-                torch.cuda.memory_allocated() - _alloc_before_capture, 0
-            )
             logger.info(
                 "CUDA graph capture memory: %d graphs | pool(reserved)=%.2fGB "
                 "allocated=%.2fGB",
@@ -3697,7 +3557,7 @@ class ModelRunner:
                 f"Consider reducing gpu_memory_utilization."
             )
 
-        return time.time() - start_time, self.graph_bs
+        return time.time() - start_time, self.graph_bs, _pool_bytes
 
     @torch.inference_mode()
     def _maybe_calibrate_dspark_sps(self, max_q_len: int, n_iters: int = 20) -> None:
