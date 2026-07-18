@@ -38,14 +38,6 @@ python -m atom.entrypoints.openai_server \
   --dspark-config '{"confidence_schedule": true, "ragged": true, "ragged_graph_sizes": "8"}'
 ```
 
-For a benchmark / production run, drop `--dspark-debug` (diagnostics force host
-syncs and cost throughput). Add it back only when tuning:
-
-```bash
-  --dspark-config '{"confidence_schedule": true, "ragged": true, "ragged_graph_sizes": "8"}' \
-  --dspark-debug
-```
-
 ### `--dspark-config` knobs
 
 DSpark runtime knobs are passed as a single JSON dict via `--dspark-config`
@@ -61,22 +53,16 @@ parent process and pickled into every engine-core worker (see `DSparkConfig` in
 | `q_buckets` | str | CUDA-graph query-length buckets for the older batch-uniform q-bucket verify path (independent of the ragged path). |
 | `disable_sps_calib` | bool | Skip SPS calibration (replays captured graphs at warmup) and use the synthetic SPS stub. |
 
-Separate flag:
-
-| Flag | Meaning |
-|---|---|
-| `--dspark-debug` | Enable scheduler diagnostics (avg verify length / truncation rate / anchor OOB checks). **Forces host syncs; keep OFF in perf runs.** |
-
 Tips on server configuration:
 - **`--num-speculative-tokens 7`** sets the draft block; the max verify length is
   `mtp_k+1 = 8` (`full_q`). Per-request scheduling verifies `1..8` per seq.
 - **`ragged_graph_sizes`**: `"8"` == the full bucket, so graph capacity never
   shrinks (only attention saves via the `-1` marker bail). To actually free
   dense/MoE compute, capture smaller buckets, e.g. `"1,3,6,8"` or `"2,4,8"`.
-- **No env vars**: DSpark is configured purely through `--dspark-config` /
-  `--dspark-debug`, parsed once into a `DSparkConfig` object (`atom/config.py`)
-  and carried on `Config.dspark` into every worker. The old `ATOM_DSPARK_*` env
-  vars have been removed.
+- **No env vars**: DSpark is configured purely through `--dspark-config`,
+  parsed once into a `DSparkConfig` object (`atom/config.py`) and carried on
+  `Config.dspark` into every worker. The old `ATOM_DSPARK_*` env vars have been
+  removed.
 - Do **not** pass `--enforce-eager` with the ragged CUDA-graph path — ragged
   replays captured `(bs, q_eff)` graphs. Eager also works for correctness checks.
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`

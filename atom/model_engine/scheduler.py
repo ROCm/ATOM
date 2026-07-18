@@ -360,6 +360,12 @@ class ScheduledBatch:
         # set, consumers must use it (per-seq) instead of the scalar above.
         self.num_spec_query_tokens_per_req = None
 
+        # DSpark DP graph-shape sync (see model_runner._apply_dspark_shape_max):
+        # the DP-max decode bs / ragged token total this step, so every DP rank
+        # replays the same cudagraph shape. None outside DSpark-under-DP steps.
+        self.dspark_dp_bs = None
+        self.dspark_dp_total_tokens = None
+
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
         for seq in seqs.values():

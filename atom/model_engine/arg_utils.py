@@ -70,7 +70,6 @@ class EngineArgs:
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
     dspark_config: Optional[dict] = None
-    dspark_debug: bool = False
 
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
@@ -372,15 +371,6 @@ class EngineArgs:
                 """"ragged_graph_sizes": "8"}'"""
             ),
         )
-        parser.add_argument(
-            "--dspark-debug",
-            action="store_true",
-            help=(
-                "Enable DSpark scheduler diagnostics (avg verify length / "
-                "truncation rate / anchor OOB checks). Forces host syncs; keep "
-                "OFF in perf runs."
-            ),
-        )
 
         return parser
 
@@ -444,12 +434,9 @@ class EngineArgs:
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
 
-        # --dspark-config (JSON dict) + --dspark-debug → DSparkConfig object,
-        # passed through as Config.dspark (no env vars).
-        kwargs["dspark"] = DSparkConfig.from_dict(
-            kwargs.pop("dspark_config", None),
-            debug=kwargs.pop("dspark_debug", False),
-        )
+        # --dspark-config (JSON dict) → DSparkConfig object, passed through as
+        # Config.dspark (no env vars).
+        kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
 
         logger.info(f"Engine kwargs: {kwargs}")
 

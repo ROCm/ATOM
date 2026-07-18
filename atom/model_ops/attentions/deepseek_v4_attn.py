@@ -1378,22 +1378,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             sum_scheduled_tokens_padded = sum_scheduled_tokens
 
-        if max_seqlen_q < full_q:
-            if self.model_runner.config.dspark.debug_schedule:
-                import logging
-
-                logging.getLogger("atom").info(
-                    "DSpark prepare_decode q-shrink: bs=%d q=%d full_q=%d "
-                    "ctx[min=%d,max=%d] pos[min=%d,max=%d] (anchor=head)",
-                    scheduled_bs,
-                    max_seqlen_q,
-                    full_q,
-                    int(context_lens_np.min()),
-                    int(context_lens_np.max()),
-                    int(positions_np.min()),
-                    int(positions_np.max()),
-                )
-
         var["positions"].np[:sum_scheduled_tokens_padded] = positions_np
 
         var["context_lens"].np[:scheduled_bs] = context_lens_np

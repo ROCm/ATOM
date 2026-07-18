@@ -578,76 +578,7 @@ class EagleProposer:
             sps_table,
             sts_temperatures=self.dspark_sts_temperatures,
         )
-        if self.config.dspark.debug_schedule:
-            self._dspark_dbg_step = getattr(self, "_dspark_dbg_step", 0) + 1
-            if self._dspark_dbg_step % 50 == 1:
-                avg_ell = float(ell_t.float().mean())
-                trunc = float((ell_t < L).float().mean())
-                logger.info(
-                    "DSpark schedule[step %d]: bs=%d L=%d avg_ell=%.2f "
-                    "trunc_rate=%.1f%%",
-                    self._dspark_dbg_step,
-                    bs,
-                    L,
-                    avg_ell,
-                    trunc * 100.0,
-                )
-        if self.config.dspark.debug_schedule:
-            self._record_dspark_shadow_savings(ell_t, bs, L)
         return ell_t
-
-    def _record_dspark_shadow_savings(
-        self, ell_t: torch.Tensor, bs: int, mtp_k: int
-    ) -> None:
-        """Shadow-mode savings accounting (no effect on verification / output).
-
-        Quantifies, per concurrency level, how many target-verify tokens the
-        scheduler WOULD save vs the static mtp_k baseline, under two policies:
-
-          * per-request (paper Algorithm 1): each request verifies ell_r
-              saved = sum_r (mtp_k - ell_r)
-          * batch-uniform L (our CUDA-graph-friendly simplification, L=max ell_r)
-              saved = bs * (mtp_k - max_r ell_r)
-
-        The gap between the two is exactly what batch-uniform L gives up by
-        making every request match the strongest one. Paper Figure 8 shows the
-        budget only shrinks at HIGH concurrency, so we bucket by bs to see where
-        (and whether) either policy actually saves on this deployment.
-        """
-        if not getattr(self, "dspark_confidence_schedule", False):
-            return
-        baseline = bs * mtp_k  # static: every request verifies mtp_k draft tokens
-        per_req_verified = int(ell_t.sum().item())
-        uniform_verified = bs * int(ell_t.max().item())
-        per_req_saved = baseline - per_req_verified
-        uniform_saved = baseline - uniform_verified
-
-        st = getattr(self, "_dspark_shadow", None)
-        if st is None:
-            st = {}  # bs -> [steps, baseline_sum, per_req_saved_sum, uniform_saved_sum]
-            self._dspark_shadow = st
-        rec = st.setdefault(bs, [0, 0, 0, 0])
-        rec[0] += 1
-        rec[1] += baseline
-        rec[2] += per_req_saved
-        rec[3] += uniform_saved
-
-        self._dspark_shadow_step = getattr(self, "_dspark_shadow_step", 0) + 1
-        if self._dspark_shadow_step % 100 == 0:
-            for cbs in sorted(st):
-                steps, base, pr, uni = st[cbs]
-                if base == 0:
-                    continue
-                logger.info(
-                    "DSpark shadow-savings bs=%d: steps=%d | per-request saves "
-                    "%.1f%% of verify | batch-uniform-L saves %.1f%% | "
-                    "uniform keeps %.1f%% of the per-request win",
-                    cbs,
-                    steps,
-                    100.0 * pr / base,
-                    100.0 * uni / base,
-                    (100.0 * uni / pr) if pr > 0 else 0.0,
-                )
 
     def propose(
         self,

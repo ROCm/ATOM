@@ -1059,10 +1059,10 @@ class DSparkConfig:
 
     Single source of truth for the DSpark knobs read across the model runner,
     the V4 attention op, and the Eagle proposer. It is built ONCE in the parent
-    process from the ``--dspark-config`` JSON dict (see :meth:`from_dict`) plus
-    the ``--dspark-debug`` flag, then pickled into every engine-core worker
-    subprocess as part of :class:`Config`, so all read sites observe the same
-    resolved values via ``config.dspark.*`` (no ``os.environ`` lookups).
+    process from the ``--dspark-config`` JSON dict (see :meth:`from_dict`), then
+    pickled into every engine-core worker subprocess as part of :class:`Config`,
+    so all read sites observe the same resolved values via ``config.dspark.*``
+    (no ``os.environ`` lookups).
 
     Fields:
       - confidence_schedule: use the DSpark confidence head to pick a per-request
@@ -1075,8 +1075,6 @@ class DSparkConfig:
         q-bucket verify path (independent of the ragged path).
       - disable_sps_calib: skip SPS calibration (replays captured graphs at
         warmup); fall back to the synthetic SPS stub.
-      - debug_schedule: emit scheduler diagnostics (avg verify length /
-        truncation rate / anchor OOB checks). Forces host syncs; perf cost.
     """
 
     confidence_schedule: bool = False
@@ -1084,24 +1082,22 @@ class DSparkConfig:
     ragged_graph_sizes: str = ""
     q_buckets: str = ""
     disable_sps_calib: bool = False
-    debug_schedule: bool = False
 
     @classmethod
-    def from_dict(cls, cfg: Optional[dict], debug: bool = False) -> "DSparkConfig":
-        """Build from the ``--dspark-config`` JSON dict (+ ``--dspark-debug``).
+    def from_dict(cls, cfg: Optional[dict]) -> "DSparkConfig":
+        """Build from the ``--dspark-config`` JSON dict.
 
         ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
-        typos fail fast. ``debug_schedule`` is driven by the standalone ``debug``
-        flag rather than a dict key (it is a diagnostics switch, not a knob)."""
+        typos fail fast."""
         cfg = cfg or {}
-        allowed = {f.name for f in fields(cls) if f.name != "debug_schedule"}
+        allowed = {f.name for f in fields(cls)}
         unknown = set(cfg) - allowed
         if unknown:
             raise ValueError(
                 f"Unknown --dspark-config key(s): {sorted(unknown)}. "
                 f"Supported keys: {sorted(allowed)}"
             )
-        return cls(debug_schedule=bool(debug), **cfg)
+        return cls(**cfg)
 
 
 @dataclass
@@ -1161,9 +1157,9 @@ class Config:
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
-    # DSpark runtime knobs. Built once in the parent from --dspark-config /
-    # --dspark-debug (see EngineArgs) and pickled into every worker. Read sites
-    # use `config.dspark.*` (no os.environ lookups). Defaults to all-off.
+    # DSpark runtime knobs. Built once in the parent from --dspark-config (see
+    # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
+    # (no os.environ lookups). Defaults to all-off.
     dspark: DSparkConfig = field(default_factory=DSparkConfig)
 
     enable_tbo: bool = False
