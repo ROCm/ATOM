@@ -421,6 +421,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-32B-FP8",
                   "extra_args": "--tensor-parallel-size 1 --page-size 16 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "lm_eval_extra_model_args": "max_gen_toks=1024",
+                  "lm_eval_num_concurrent": 8,
                   "accuracy_test_threshold": 0.8,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
                   "runner": "atom-mi308-8gpu-plugins-accuracy",
@@ -437,7 +438,7 @@ jobs:
               {
                   "model_name": "MI308 GLM-5.2-FP8 TP8",
                   "model_path": "zai-org/GLM-5.2-FP8",
-                  "extra_args": "--trust-remote-code --tp-size 8 --mem-fraction-static 0.8 --disable-radix-cache --max-prefill-tokens 65536 --kv-cache-dtype fp8_e4m3 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
+                  "extra_args": "--trust-remote-code --tp-size 8 --mem-fraction-static 0.8 --disable-radix-cache --max-prefill-tokens 65536 --kv-cache-dtype fp8_e4m3 --hf-overrides '{\"use_index_cache\":true,\"index_topk_freq\":4}' --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
                   "lm_eval_num_fewshot": 5,
                   "lm_eval_num_concurrent": 65,
                   "accuracy_test_threshold": 0.93,
