@@ -42,9 +42,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-def _is_draft_extend_mode(
-    forward_mode: ForwardMode, include_v2: bool = False
-) -> bool:
+def _is_draft_extend_mode(forward_mode: ForwardMode, include_v2: bool = False) -> bool:
     is_draft_extend = getattr(forward_mode, "is_draft_extend", None)
     if is_draft_extend is not None:
         try:
@@ -1940,11 +1938,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 qo_indptr,
                 forward_batch,
             )
-        if (
-            not forward_batch.forward_mode.is_extend()
-            and not _is_draft_extend_mode(
-                forward_batch.forward_mode, include_v2=True
-            )
+        if not forward_batch.forward_mode.is_extend() and not _is_draft_extend_mode(
+            forward_batch.forward_mode, include_v2=True
         ):
             raise ValueError(
                 f"Invalid forward mode for MLA extend: {forward_batch.forward_mode=}"
