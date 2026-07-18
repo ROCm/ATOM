@@ -431,7 +431,7 @@
   {
     "model_name": "MI308 GLM-5.2-FP8 TP8",
     "model_path": "zai-org/GLM-5.2-FP8",
-    "extraArgs": "--trust-remote-code --tp-size 8 --mem-fraction-static 0.8 --disable-radix-cache --page-size 1 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
+    "extraArgs": "--trust-remote-code --tp-size 8 --mem-fraction-static 0.8 --disable-radix-cache --max-prefill-tokens 65536 --kv-cache-dtype fp8_e4m3 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
     "runner": "atom-mi308-8gpu-plugins-accuracy",
     "test_level": "nightly",

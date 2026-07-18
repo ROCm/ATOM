@@ -585,30 +585,73 @@ def sparse_attn_v4_paged_prefill(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    *,
+    unified_kv_rope: torch.Tensor | None = None,
+    q_packed: torch.Tensor | None = None,
+    q_rope: torch.Tensor | None = None,
+    k_packed: torch.Tensor | None = None,
+    k_rope: torch.Tensor | None = None,
     prefix: str = "",
 ) -> torch.Tensor:
     """V4 prefill sparse attention over two KV sources (paged unified_kv +
-    flat per-fwd kv).
+    flat per-fwd kv), dispatching on the kv-cache layout.
+
+    Native 2buff fp8 (``unified_kv_rope`` provided): routes to aiter's
+    ``pa_sparse_prefill_fp8_opus`` (op4). ``unified_kv`` is the packed fp8 NoPE
+    prefix pool and ``unified_kv_rope`` the bf16 RoPE prefix pool; the
+    op-quantized fp8 Q (``q_packed`` / ``q_rope``) and extend K
+    (``k_packed`` / ``k_rope``) are fed directly, no dequant of the prefix and no
+    torch quant. gfx950/gfx1250. (fp8 + PCP is out of scope: the extend K is this
+    fwd's shard and is not PCP all-gathered — the caller must pass the sharded
+    ``k_packed`` / ``k_rope``.)
+
+    Otherwise (bf16): the existing OPUS / Triton / reference path over ``q`` and
+    the bf16 extend ``kv``.
 
     Args:
-      q:                 [T, H, D] BF16/FP16 — query.
-      unified_kv:        [total_pages, D] BF16/FP16 — prefix source (paged).
+      q:                 [T, H, D] BF16/FP16 — query (bf16 path).
+      unified_kv:        [total_pages, D] — prefix source (paged). BF16/FP16 on
+        the bf16 path; packed fp8 NoPE pool on the fp8 2buff path.
       kv_indices_prefix: [total_prefix] int32 — flat per-token slot lists into
         unified_kv. -1 sentinels skipped.
       kv_indptr_prefix:  [T+1] int32 — true prefix sum.
-      kv:                [total_tokens, D] BF16/FP16 — extend source (this
-        fwd's input K, NOT yet in swa_kv ring).
+      kv:                [total_tokens, D] BF16/FP16 — extend source (bf16 path;
+        this fwd's input K, NOT yet in swa_kv ring).
       kv_indices_extend: [total_extend] int32 — flat per-token row idx lists
         into kv. -1 sentinels skipped.
       kv_indptr_extend:  [T+1] int32 — true prefix sum.
       attn_sink:         [H] — per-head softmax-denom bias.
       softmax_scale:     float.
       out:               optional output buffer. Can alias q when the caller no
-        longer needs q after attention.
+        longer needs q after attention (bf16 path only).
+      unified_kv_rope:   [total_pages, rd] bf16 RoPE prefix pool — presence
+        selects the native fp8 2buff path.
+      q_packed / q_rope: fp8 2buff Q ([T, H, 512] fp8 / [T, H, 64] bf16).
+      k_packed / k_rope: fp8 2buff extend K ([T, 512] fp8 / [T, 64] bf16, or the
+        [T, 1, *] views produced by the quant kernel — flattened here).
 
     Returns:
-      out: [T, H, D] same dtype as q.
+      out: [T, H, D] bf16.
     """
+    if unified_kv_rope is not None:
+        # Native fp8 prefill (op4): 2buff fp8 prefix pool + op-quantized fp8 Q
+        # and extend K fed directly. No dequant of the prefix, no torch quant.
+        from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
+
+        return pa_sparse_prefill_fp8_opus(
+            q_packed,
+            q_rope,
+            unified_kv,
+            unified_kv_rope,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            k_packed.view(k_packed.shape[0], -1),
+            k_rope.view(k_rope.shape[0], -1),
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        )  # [S, H, head_dim] bf16
     if get_gfx() == "gfx1250":
         return pa_prefill_sparse(
             q,

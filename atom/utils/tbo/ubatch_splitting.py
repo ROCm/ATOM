@@ -60,6 +60,7 @@ def maybe_create_ubatch_slices(
     is_prefill: bool = False,
     num_scheduled_tokens: Optional[np.ndarray] = None,
     max_tokens_per_ubatch: Optional[int] = None,
+    force: bool = False,
 ) -> Optional[list[UBatchSlice]]:
     """Split a batch into N micro-batch slices.
 
@@ -69,6 +70,11 @@ def maybe_create_ubatch_slices(
 
     Returns None if the batch is too small to split or if the split
     would produce a ubatch exceeding max_tokens_per_ubatch.
+
+    ``force`` bypasses the ATOM_TBO_PREFILL_MIN_TOKENS gate: the cross-DP
+    decision is OR-reduced, so a rank below the min-token bar can still be
+    told to split (because a peer cleared it). It MUST split anyway to keep
+    the per-ubatch collectives size-aligned, or RCCL will hang.
     """
     if num_ubatches <= 1:
         return None
@@ -82,9 +88,11 @@ def maybe_create_ubatch_slices(
         return None
 
     if num_scheduled_tokens is not None:
-        # Skip TBO for small prefills
+        # Skip TBO for small prefills — unless force-split (OR-reduced cross-DP
+        # decision put this under-filled rank on the TBO path; it must split to
+        # stay aligned with peers).
         _min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
-        if _min_pref > 0:
+        if _min_pref > 0 and not force:
             _pref_total = int(num_scheduled_tokens[:num_reqs].sum())
             if _pref_total < _min_pref:
                 return None

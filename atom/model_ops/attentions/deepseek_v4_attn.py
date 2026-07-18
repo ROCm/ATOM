@@ -35,6 +35,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
   Total                                      = ~26.5 MB / slot
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type, cast
@@ -42,6 +43,7 @@ from typing import Any, Dict, Optional, Type, cast
 import numpy as np
 import torch
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_is_enabled,
@@ -68,6 +70,8 @@ from atom.utils.forward_context import (
     Context,
     get_forward_context,
 )
+
+logger = logging.getLogger("atom")
 
 # ---------------------------------------------------------------------------
 # Typed metadata surface for V4. The base AttentionMetaData class is shared
@@ -179,6 +183,21 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """[bs, max_blocks] int32 GPU — paged-SWA logical→physical block table
     for the independent SWA pool (parallel to `block_tables`, which addresses
     the compressed pool). -1 entries are window-freed blocks (never indexed)."""
+
+    # ----- Native 2buff fp8 per-token paged-decode index tensors -----
+    # Feed the aiter asm decode kernel `mla_decode_fwd_v4_nm` (op5), which treats
+    # each decode token as a 1-token page (page_size=1). Both depend ONLY on the
+    # padded decode token count N (the captured kernel grid), never on batch
+    # content — the values are always arange(N+1) / ones(N). Staged every fwd via
+    # the SAME forward_vars path as `kv_indptr_*` (CpuGpuBuffer H2D), which is
+    # what makes them CUDAGraph-safe. Only populated on the fp8 path.
+    qo_indptr: Optional[torch.Tensor] = None
+    """[padded_T+1] int32 GPU — per-token q indptr `arange(N+1)` (page_size=1,
+    max_seqlen_q=1). NOT `cu_seqlens_q` (which is per-seq and differs under
+    MTP); this is the per-token indptr the decode kernel consumes."""
+    kv_last_page_lens: Optional[torch.Tensor] = None
+    """[padded_T] int32 GPU — per-token last-page length `ones(N)` (page_size=1
+    → every page is full)."""
 
     # ----- Indexer / sparse-layout side metadata -----
     indexer_meta: Optional[Dict[str, Any]] = None
@@ -307,6 +326,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.index_head_dim = getattr(hf, "index_head_dim", 128)
         self.window_size = getattr(hf, "sliding_window", 128)
         self.index_topk = getattr(hf, "index_topk", 1024)
+        self.rope_head_dim = getattr(hf, "qk_rope_head_dim", 64)
         # MTP-portion of compress_ratios. `prepare_mtp_decode`'s direct-kernel
         # fast path only handles SWA (ratio=0) draft layers; non-zero ratios
         # would also need n_committed_{csa,hca} + HCA compress tail rebuilt.
@@ -327,8 +347,39 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.k2_hca = self.block_size // 128  # = 1
 
         self._state_dtype = torch.float32  # fp32 required for softmax-pool
-        self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
-        self._classical_dtype = torch.bfloat16  # CSA Main / HCA Main KV is BF16
+        # KV cache dtype gate. fp8 → 2buff native layout (nope fp8 in a 512B
+        # entry with inline e8m0 scale; parallel bf16 rope pool). bf16 →
+        # unchanged. SWA and classical (CSA/HCA Main) share the nope dtype; the
+        # rope pool is always bf16.
+        self._kv_fp8 = model_runner.kv_cache_dtype == "fp8"
+        # aiter prefill (op4) / decode (op5) implement the fp8 (2buff) path only
+        # on gfx950 / gfx1250. On any other arch, transparently fall back to a
+        # bf16 KV cache instead of hard-failing. Flipping self._kv_fp8 here (before
+        # the *_dtype attrs are read) keeps the whole V4 path consistent: pool
+        # sizing (compute_block_bytes / swa_block_bytes_per_layer), write_mode,
+        # and module.kv_fp8 (build_kv_cache_tensor) all key off self._kv_fp8 /
+        # these dtype attrs. Sync model_runner.kv_cache_dtype (and the shared
+        # config) so any generic reader / log line agrees.
+        if self._kv_fp8 and get_gfx() not in ("gfx950", "gfx1250"):
+            logger.warning(
+                "DeepSeek-V4 --kv_cache_dtype fp8 (2buff) is only supported on "
+                "gfx950 / gfx1250 (aiter op4/op5); got %r. Falling back to a "
+                "bf16 KV cache.",
+                get_gfx(),
+            )
+            self._kv_fp8 = False
+            model_runner.kv_cache_dtype = "bf16"
+            cfg = getattr(model_runner, "config", None)
+            if cfg is not None and getattr(cfg, "kv_cache_dtype", None) == "fp8":
+                cfg.kv_cache_dtype = "bf16"
+        if self._kv_fp8:
+            self._swa_dtype = dtypes.fp8
+            self._classical_dtype = dtypes.fp8
+            self._rope_dtype = torch.bfloat16  # rope pool is always bf16
+        else:
+            self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
+            self._classical_dtype = torch.bfloat16  # CSA / HCA Main KV is BF16
+            self._rope_dtype = torch.bfloat16  # unused in bf16 path (symmetry)
         # CSA Indexer cache is FP8 + 4-byte fp32 scale per row, aligned to 16
         # bytes (matches V3.2 sparse MLA pattern; avoids torch inductor
         # unaligned-access slowdowns). Written by `indexer_k_quant_and_cache`,
@@ -437,7 +488,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         (full-resolution, ratio-1 = block_size tokens x head_dim x classical
         elem). Single source for the per-layer SWA block size, reused by both
         `swa_pool_block_bytes` and the KV-transfer region stride."""
-        return self.block_size * self.head_dim * self._classical_dtype.itemsize
+        b = self.block_size * self.head_dim * self._swa_dtype.itemsize
+        if self._kv_fp8:
+            # 2buff: parallel bf16 rope pool [block_size, rope_head_dim].
+            b += self.block_size * self.rope_head_dim * self._rope_dtype.itemsize
+        return b
 
     def swa_pool_block_bytes(self) -> int:
         """paged-SWA: bytes of ONE SWA physical block across all layers
@@ -505,16 +560,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                         read by `cp_gather_indexer_k_quant_cache`).
           - HCA Main:   k2=1 entry × head_dim BF16
         """
-        elem_classical = self._classical_dtype.itemsize
+        elem_classical = self._classical_dtype.itemsize  # fp8 = 1 or bf16 = 2
         csa_main_per_block = self.k1_csa * self.head_dim * elem_classical
         csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
         hca_main_per_block = self.k2_hca * self.head_dim * elem_classical
         # paged-SWA: the sliding-window KV is content-addressed, one full-
         # resolution (ratio-1) entry per original token in EVERY layer, so each
-        # block carries `block_size * head_dim` BF16 of SWA per layer. This term
+        # block carries `block_size * head_dim` of SWA per layer. This term
         # is charged here but the budget (model_runner.get_num_blocks) strips it
         # back out into the separate window-freed num_swa_blocks pool.
         swa_per_block = self.block_size * self.head_dim * elem_classical
+        if self._kv_fp8:
+            # 2buff: parallel bf16 rope pool per compress entry AND per SWA token.
+            elem_rope = self._rope_dtype.itemsize
+            csa_main_per_block += self.k1_csa * self.rope_head_dim * elem_rope
+            hca_main_per_block += self.k2_hca * self.rope_head_dim * elem_rope
+            swa_per_block += self.block_size * self.rope_head_dim * elem_rope
         return (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
             + len(self.hca_layers) * hca_main_per_block
@@ -577,7 +638,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         assert self._swa_dtype == self._classical_dtype, (
             "unified_kv requires SWA dtype == classical KV dtype "
-            f"(got SWA={self._swa_dtype}, classical={self._classical_dtype})"
+            f"(got SWA={self._swa_dtype}, classical={self._classical_dtype}). "
+            "fp8 path must set both to dtypes.fp8 (rope lives in a separate "
+            "bf16 pool); a genuine mismatch corrupts the unified layout."
         )
         device = self.model_runner.device
         num_blocks = self.model_runner.num_physical_kvcache_blocks
@@ -607,6 +670,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     device=device,
                 )
             )
+
+        # ---- 2buff fp8: parallel per-layer rope pool (bf16) ------------------
+        # Same [swa_pages + compress_pages] page count as unified_kv, but width
+        # = rope_head_dim (64) and dtype bf16 (rope is never quantized). bf16
+        # path: list of None (no rope pool; rope stays inline in unified_kv).
+        unified_kv_rope: list[Optional[torch.Tensor]] = []
+        if self._kv_fp8:
+            for layer_id in range(self.num_layers):
+                ratio = ratios[layer_id]
+                if ratio == 4:
+                    compress_pages = num_blocks * self.k1_csa
+                elif ratio == 128:
+                    compress_pages = num_blocks * self.k2_hca
+                else:
+                    compress_pages = 0  # Dense
+                unified_kv_rope.append(
+                    torch.zeros(
+                        (swa_pages + compress_pages, self.rope_head_dim),
+                        dtype=self._rope_dtype,
+                        device=device,
+                    )
+                )
+        else:
+            unified_kv_rope = [None] * self.num_layers
 
         # ---- Compressor state tensors (compute-contiguous) ------------------
         csa_main_kv = self._zero_state(
@@ -652,6 +739,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         return {
             "v4_unified_kv": unified_kv,
+            "v4_unified_kv_rope": unified_kv_rope,
             "v4_csa_main_kv_state": csa_main_kv,
             "v4_csa_main_score_state": csa_main_score,
             "v4_csa_idx_kv_state": csa_idx_kv,
@@ -698,6 +786,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             module.unified_kv = unified
             module.swa_kv = unified[:swa_pages]
             module.swa_block_size = self.block_size
+            module.kv_fp8 = self._kv_fp8
+            if self._kv_fp8:
+                # 2buff: parallel bf16 rope pool, same paged layout. swa_kv_rope
+                # is the flat [swa_pages, rope_head_dim] SWA region; unified_kv_rope
+                # the full pool (asm decode op5 reads it).
+                rope = runner.v4_unified_kv_rope[module.layer_id]
+                module.unified_kv_rope = rope
+                module.swa_kv_rope = rope[:swa_pages]
+            else:
+                module.unified_kv_rope = None
+                module.swa_kv_rope = None
             return None
 
         if isinstance(module, _V4Indexer):
@@ -763,6 +862,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     stride=(block_fp32_stride, 1),
                     storage_offset=idx_kv_f32.storage_offset() + scale_fp32_offset,
                 )
+                # Indexer-inner cache is always fp8 (independent of
+                # kv_cache_dtype); it has no separate rope pool.
+                module.write_mode = "indexer_fp8"
+                module.kv_cache_rope = None
             elif ratio == 4:
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_main_kv_state[pos]
@@ -776,6 +879,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_cache = unified[swa_pages:].view(
                     num_blocks, self.k1_csa, self.head_dim
                 )
+                if self._kv_fp8:
+                    rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
+                    module.kv_cache_rope = rope[swa_pages:].view(
+                        num_blocks, self.k1_csa, self.rope_head_dim
+                    )
+                    module.write_mode = "main_2buff_fp8"
+                else:
+                    module.kv_cache_rope = None
+                    module.write_mode = "bf16"
             elif ratio == 128:
                 pos = self.layer_id_to_hca_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_hca_main_kv_state[pos]
@@ -785,6 +897,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_cache = unified[swa_pages:].view(
                     num_blocks, self.k2_hca, self.head_dim
                 )
+                if self._kv_fp8:
+                    rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
+                    module.kv_cache_rope = rope[swa_pages:].view(
+                        num_blocks, self.k2_hca, self.rope_head_dim
+                    )
+                    module.write_mode = "main_2buff_fp8"
+                else:
+                    module.kv_cache_rope = None
+                    module.write_mode = "bf16"
             else:
                 raise ValueError(
                     f"Unknown V4 compress_ratio={ratio} on Compressor at "
@@ -802,6 +923,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         runner = self.model_runner
         if not hasattr(runner, "v4_unified_kv"):
+            return None
+        if self._kv_fp8:
+            # PD disaggregation with 2buff fp8 KV cache is not yet supported:
+            # the byte-region math below assumes a single unified pool and
+            # ignores the parallel rope pool. Disable KV transfer for fp8.
             return None
 
         num_slots = runner.max_per_req_cache_slots
@@ -1156,6 +1282,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indices_swa = swa_indices_buf
         attn_metadata.kv_indptr_swa = swa_indptr
         attn_metadata.batch_id_per_token = batch_id_per_token
+
+        # fp8 asm decode per-token index tensors. MTP draft step is 1-token-per-
+        # seq → the asm kernel sees N = bs. Stage the constant per-token tensors
+        # to that length via the same builder-staged path as the verify fwd.
+        if self._kv_fp8:
+            attn_metadata.qo_indptr = self._stage(
+                "v4_qo_indptr", self._v4_qo_indptr_np[: bs + 1]
+            )
+            attn_metadata.kv_last_page_lens = self._stage(
+                "v4_kv_last_page_lens", self._v4_kv_last_page_lens_np[:bs]
+            )
 
         # NOT rebuilt (unused by SWA-only MTP layer; would block a future
         # CSA/HCA MTP layer — assert at top guards):
@@ -2206,6 +2343,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indptr_hca = hca_indptr_gpu
         attn_metadata.swa_pages = swa_pages
 
+        # Per-token paged-decode index tensors for the fp8 asm decode kernel. The
+        # kernel sees N = q_packed.shape[0] = T_pad (padded decode grid). Both
+        # are re-staged every fwd (like kv_indptr_*) so the captured graph sees a
+        # freshly-copied backing store at replay.
+        # qo_indptr: per-token q indptr (page_size=1, max_seqlen_q=1). The REAL
+        # region [0..T] is arange(T+1) — one 1-length query per real decode token.
+        # The CG-padded tail [T+1..T_pad] must NOT keep counting up: repeating
+        # the last real value makes each padded slot a 0-length query
+        # (qo_indptr[t+1]-qo_indptr[t]==0) that the asm kernel bails on, exactly
+        # like the kv_indptr pad tail. Per-token, so correct for MTP too.
+        if self._kv_fp8:
+            qo_indptr_np = np.empty(T_pad + 1, dtype=np.int32)
+            qo_indptr_np[: T + 1] = np.arange(T + 1, dtype=np.int32)
+            if T_pad > T:
+                qo_indptr_np[T + 1 :] = T
+            attn_metadata.qo_indptr = self._stage("v4_qo_indptr", qo_indptr_np)
+            attn_metadata.kv_last_page_lens = self._stage(
+                "v4_kv_last_page_lens", self._v4_kv_last_page_lens_np[:T_pad]
+            )
+
     def _build_paged_prefill_meta(
         self,
         attn_metadata: AttentionMetaData_DSV4,
@@ -2754,6 +2911,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
+
+        # Per-token paged-decode index tensors for the fp8 asm decode kernel
+        # (`mla_decode_fwd_v4_nm`, page_size=1). Values are CONSTANT — they
+        # depend only on the (padded) decode token count N, not the batch:
+        #   qo_indptr        = arange(N+1)   (per-token q indptr, max_seqlen_q=1)
+        #   kv_last_page_lens = ones(N)       (page_size=1 → every page full)
+        # Built the SAME way as `kv_indptr_*`: a CpuGpuBuffer re-staged via
+        # `self._stage(...)` EVERY fwd, which is what makes them CUDAGraph-safe
+        # (re-copied into the captured buffer before graph.replay). The constant
+        # numpy sources are precomputed once so the per-fwd cost is a slice + H2D.
+        bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
+        bufs["v4_kv_last_page_lens"] = CpuGpuBuffer(T_dec, **i32)
+        self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
+        self._v4_kv_last_page_lens_np = np.ones(T_dec, dtype=np.int32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by csa_translate_pack
         # (kernel masks `(k < n_committed) & (k < index_topk)`) AND by the
         # indexer (cast to int64 inline). Built unconditionally in
