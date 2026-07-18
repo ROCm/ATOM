@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+# The CI checkout is mounted into the container. Avoid leaving root-owned
+# __pycache__ files in that host workspace between matrix jobs.
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+
 # Usage:
 #   .github/scripts/atom_sglang_test.sh start
 #   .github/scripts/atom_sglang_test.sh launch
