@@ -171,7 +171,7 @@ def load_model(
     model: nn.Module,
     model_name_or_path: str,
     hf_config: AutoConfig,
-    load_dummy: bool = False,
+    load_dummy: Optional[str] = None,
     spec_decode: bool = False,
 ):
 ```

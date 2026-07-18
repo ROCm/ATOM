@@ -49,7 +49,7 @@ class EngineArgs:
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
     cudagraph_mode: str = "FULL"
-    load_dummy: bool = False
+    load_dummy: Optional[str] = None
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
@@ -164,7 +164,16 @@ class EngineArgs:
             "attention eager (requires --level 3).",
         )
         parser.add_argument(
-            "--load_dummy", action="store_true", help="Skip loading model weights."
+            "--load_dummy",
+            nargs="?",
+            const="empty",
+            default=None,
+            choices=["empty", "zero", "xavier"],
+            help="Use dummy weights instead of reading the checkpoint. Bare flag "
+            "or '=empty': skip loading (uninitialized, legacy behavior). '=zero': "
+            "all weights 0. '=xavier': xavier_uniform_ for bf16 weights and a "
+            "constant target magnitude for fp4/fp8 packed weights (finite, "
+            "roughly real-scale; fp4 is the validated path).",
         )
         parser.add_argument(
             "--enable-expert-parallel",
