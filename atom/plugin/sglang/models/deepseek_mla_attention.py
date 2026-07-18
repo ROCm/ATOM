@@ -19,6 +19,17 @@ if TYPE_CHECKING:
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
 
 
+def _is_draft_extend_mode(forward_mode: Any) -> bool:
+    is_draft_extend = getattr(forward_mode, "is_draft_extend", None)
+    if is_draft_extend is not None:
+        try:
+            return bool(is_draft_extend(include_v2=True))
+        except TypeError:
+            return bool(is_draft_extend())
+
+    return bool(getattr(forward_mode, "is_draft_extend_v2", lambda: False)())
+
+
 class SGLangDeepseekMLAAttention(nn.Module):
     """Enter SGLang DeepSeek MLA runtime through ``self.mla_attn(...)``."""
 
@@ -390,7 +401,9 @@ class SGLangDeepseekMLAAttention(nn.Module):
             use_non_absorbed = (
                 forward_batch.forward_mode.is_extend_without_speculative()
             )
-            if not use_non_absorbed and forward_batch.forward_mode.is_draft_extend():
+            if not use_non_absorbed and _is_draft_extend_mode(
+                forward_batch.forward_mode
+            ):
                 extend_prefix_lens_cpu = getattr(
                     forward_batch, "extend_prefix_lens_cpu", None
                 )
