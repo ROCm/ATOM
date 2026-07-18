@@ -1,6 +1,6 @@
 import copy
 import logging
-from typing import Optional, Sequence
+from typing import Optional
 
 import numpy as np
 import torch
@@ -16,6 +16,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.model_loader.loader import load_model
+from atom.spec_decode.confidence_scheduler import ConfidenceScheduler
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils import envs
 from atom.utils.forward_context import (
@@ -244,28 +245,15 @@ class EagleProposer:
                 self.speculative_config.num_speculative_tokens or self.dspark_block_size
             )
             # Phase 2: confidence-scheduled verification (Level B, variable-length
-            # verify). propose() stores the scheduler-chosen ell here; the next
-            # step's calc_spec_decode_metadata consumes it (eager-only for now).
+            # verify). The ell (per-request verify length) machinery lives in a
+            # reusable ConfidenceScheduler; propose() feeds it the confidence head
+            # and the next step's calc_spec_decode_metadata consumes the ell map.
             self.dspark_confidence_schedule = bool(
                 self.config.dspark.confidence_schedule
             )
-            self._dspark_last_ell: Optional[torch.Tensor] = None
-            # req_id -> ell map from the PREVIOUS step's propose(), used to re-map
-            # ell onto the next step's (possibly reordered) batch by req_id.
-            # Deferred resolution: record_dspark_ell fires an ASYNC D2H of ell to
-            # a pinned buffer (no sync -> keeps CPU ahead of GPU, preserving the
-            # deferred-output pipeline); the map is materialized lazily on first
-            # read next step (event already complete by then). See the
-            # _dspark_ell_by_req property + record_dspark_ell.
-            self._dspark_ell_map_cache: dict = {}
-            self._dspark_ell_pending: Optional[tuple] = (
-                None  # (event, cpu_buf, req_ids)
+            self.confidence_scheduler = (
+                ConfidenceScheduler(runner) if self.dspark_confidence_schedule else None
             )
-            # SPS(B) throughput profile + STS temperatures are bound later
-            # (engine warmup / checkpoint). Until then: a synthetic monotone SPS
-            # stub and T=1 (uncalibrated) keep the path lossless and testable.
-            self.dspark_sps_table: Optional[torch.Tensor] = None
-            self.dspark_sts_temperatures: Optional[torch.Tensor] = None
         else:
             self.mtp_k: int = self.speculative_config.num_speculative_tokens or 0
 
@@ -544,41 +532,13 @@ class EagleProposer:
         # actual variable-length verification (Level B) is applied downstream by
         # truncating each request's scheduled spec tokens to ell_r, which frees
         # batch capacity instead of the no-op in-block masking of Level A.
-        if self.dspark_confidence_schedule and confidence is not None:
-            self._dspark_last_ell = self._compute_schedule_ell(
-                confidence[:, : self.mtp_k]
+        if self.confidence_scheduler is not None and confidence is not None:
+            self.confidence_scheduler.set_last_ell(
+                self.confidence_scheduler.compute_ell(confidence[:, : self.mtp_k])
             )
-        else:
-            self._dspark_last_ell = None
+        elif self.confidence_scheduler is not None:
+            self.confidence_scheduler.set_last_ell(None)
         return draft_token_ids
-
-    def _compute_schedule_ell(
-        self,
-        confidence: torch.Tensor,  # [bs, L] per-position acceptance probs
-    ) -> torch.Tensor:
-        """Run the Hardware-Aware Prefix Scheduler (paper Algorithm 1) and return
-        the per-request verify length ``ell`` as an int tensor [bs].
-
-        This ONLY computes ell — it does not touch the draft tokens. The actual
-        variable-length verification (Level B) consumes ell downstream to size
-        each request's verification batch, which is where the throughput win
-        comes from. Kept sync-free (no .item()/.tolist()) for the decode hot path.
-        """
-        from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths_tensor
-
-        bs, L = confidence.shape
-        sps_table = self.dspark_sps_table
-        if sps_table is None:
-            # Synthetic monotone-decreasing SPS stub until real calibration lands.
-            sps_table = torch.linspace(
-                1.0, 0.1, steps=bs * (L + 1) + 1, device=confidence.device
-            )
-        ell_t = schedule_prefix_lengths_tensor(
-            confidence.detach(),
-            sps_table,
-            sts_temperatures=self.dspark_sts_temperatures,
-        )
-        return ell_t
 
     def propose(
         self,
@@ -850,85 +810,6 @@ class EagleProposer:
                 token_indices = token_indices.clamp_(0, total_tokens - 1)
 
         return token_indices
-
-    def record_dspark_ell(self, req_ids: Sequence) -> None:
-        """Fire an ASYNC copy of this step's ell, keyed later by req_id.
-
-        ell was computed in propose() ordered by THIS step's decode batch. We
-        save {req_id: ell} so the NEXT step can re-map it onto its own (possibly
-        reordered) batch by req_id — batch position is not stable across steps
-        under continuous batching.
-        """
-        ell = getattr(self, "_dspark_last_ell", None)
-        if ell is None:
-            self._dspark_ell_pending = None
-            self._dspark_ell_map_cache = {}
-            return
-        ell = ell.detach()
-        # Reuse the runner's shared async D2H stream
-        copy_stream = self.runner.tokenID_processor.async_copy_stream
-        default_stream = torch.cuda.current_stream()
-        event = torch.cuda.Event()
-        with torch.cuda.stream(copy_stream):
-            copy_stream.wait_stream(default_stream)
-            cpu_buf = ell.to("cpu", non_blocking=True)
-            event.record(copy_stream)
-        # Keep req_ids as a plain list snapshot (CPU-only, order-safe).
-        self._dspark_ell_pending = (event, cpu_buf, list(req_ids))
-        # Invalidate last step's resolved map; recomputed lazily on first read.
-        self._dspark_ell_map_cache = None
-
-    @property
-    def _dspark_ell_by_req(self) -> dict:
-        """Lazily materialize {req_id: ell} from the async D2H fired by
-        record_dspark_ell. Syncs the (already-complete) event on first read,
-        then caches so repeated reads within a step are free."""
-        cache = getattr(self, "_dspark_ell_map_cache", {})
-        if cache is not None:
-            return cache
-        pending = self._dspark_ell_pending
-        if pending is None:
-            self._dspark_ell_map_cache = {}
-            return self._dspark_ell_map_cache
-        event, cpu_buf, req_ids = pending
-        event.synchronize()  # long done by next step; no hot-path stall
-        ell_np = cpu_buf.numpy().astype(np.int32)
-        n = min(len(req_ids), ell_np.shape[0])
-        self._dspark_ell_map_cache = {req_ids[i]: int(ell_np[i]) for i in range(n)}
-        return self._dspark_ell_map_cache
-
-    @_dspark_ell_by_req.setter
-    def _dspark_ell_by_req(self, value: dict) -> None:
-        # Direct assignment (e.g. reset to {}) bypasses the pending copy.
-        self._dspark_ell_map_cache = value
-        self._dspark_ell_pending = None
-
-    def dspark_ell_nonblocking(self) -> dict:
-        """Non-blocking read of the ell map for the SAME-step postprocess path
-        (carried back to the scheduler as fwd_output.dspark_ell). Must NOT sync:
-        record_dspark_ell just fired this step's async D2H, and forcing it here
-        would re-serialize CPU on GPU — the exact stall we removed. If the copy
-        is already resolved (cache present) return it; if it's still pending
-        (this step's fresh copy) query without waiting; else fall back to {}.
-
-        Correctness: the scheduler only uses this to set seq.dspark_next_ell for
-        NEXT-step sizing, and the worker's own _dspark_apply_q_bucket reads the
-        (fully resolved) property next step regardless — so a same-step empty
-        here never under-verifies."""
-        cache = getattr(self, "_dspark_ell_map_cache", None)
-        if cache:
-            return dict(cache)
-        pending = self._dspark_ell_pending
-        if pending is None:
-            return {}
-        event, cpu_buf, req_ids = pending
-        if not event.query():  # not done yet — do NOT stall the hot path
-            return {}
-        ell_np = cpu_buf.numpy().astype(np.int32)
-        n = min(len(req_ids), ell_np.shape[0])
-        resolved = {req_ids[i]: int(ell_np[i]) for i in range(n)}
-        self._dspark_ell_map_cache = resolved
-        return dict(resolved)
 
     def calc_spec_decode_metadata(
         self,

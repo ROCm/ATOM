@@ -1347,7 +1347,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # OOB); dropped tail slots are re-drafted next step (lossless). No-op when
         # q == full_q.
         full_q = batch.num_spec_step + 1
-        ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
+        ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
         if ragged_lens is not None:
             # RAGGED (§5.2): each seq forwards len_i tokens (no batch pad); build
             # positions via per-seq cumsum + in-seg arange, span-head anchored:

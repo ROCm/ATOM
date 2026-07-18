@@ -358,7 +358,7 @@ class ScheduledBatch:
         # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
         # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when
         # set, consumers must use it (per-seq) instead of the scalar above.
-        self.num_spec_query_tokens_per_req = None
+        self.dynamic_spec_query_tokens_per_req = None
 
         # DSpark DP graph-shape sync (see model_runner._apply_dspark_shape_max):
         # the DP-max decode bs / ragged token total this step, so every DP rank

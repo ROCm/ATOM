@@ -380,7 +380,10 @@ class tokenIDProcessor:
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
             if self.use_spec:
-                if getattr(batch, "num_spec_query_tokens_per_req", None) is not None:
+                if (
+                    getattr(batch, "dynamic_spec_query_tokens_per_req", None)
+                    is not None
+                ):
                     # RAGGED: scheduled_tokens is already the flat [anchor, drafts...]
                     # so no rectangular reshape/overwrite is needed.
                     pass
@@ -410,7 +413,7 @@ class tokenIDProcessor:
         # num_spec_query_tokens is the single source of truth (= mtp_k+1 for
         # plain MTP, or the DSpark q-bucket when shrunk this step). See
         # ScheduledBatch.num_spec_query_tokens.
-        _per_req = getattr(batch, "num_spec_query_tokens_per_req", None)
+        _per_req = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
         if self.use_spec and _per_req is not None and is_all_same:
             _pr = np.asarray(_per_req)
             tokens_per_seq = int(batch.num_spec_query_tokens)
@@ -441,7 +444,7 @@ class tokenIDProcessor:
 
         # DSpark dynamic: per-req lengths differ, build input_ids by scattering each
         # seq's [anchor, drafts...] into its cu-offset segment.
-        ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
+        ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
         if ragged_lens is not None and is_all_same and self.use_spec:
             self._ragged_fill_deferred_all_same(batch, ragged_lens, num_deferred_tokens)
             input_ids = self.input_ids.gpu[:total_tokens]
@@ -2167,11 +2170,16 @@ class ModelRunner:
             return
         full_q = self.drafter.mtp_k + 1
 
-        # {req_id: ell} from the PREVIOUS step's propose() (record_dspark_ell,
+        # {req_id: ell} from the PREVIOUS step's propose() (confidence_scheduler,
         # same process). The worker batch copy has req_ids but NOT the
         # scheduler-side `seqs` dict, so look ell up by req_id. A request with no
         # prior ell (new this step) -> full length (never under-verify).
-        by_req = getattr(self.drafter, "_dspark_ell_by_req", None) or {}
+        confidence_scheduler = self.drafter.confidence_scheduler
+        by_req = (
+            confidence_scheduler.ell_by_req
+            if confidence_scheduler is not None
+            else None
+        ) or {}
         if not by_req:
             return
 
@@ -2329,7 +2337,7 @@ class ModelRunner:
         batch.total_tokens_num = prefill_tok + total_new
         # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
         # [0:Σ] with the per-seq ragged new_len.
-        #   * num_spec_query_tokens_per_req : the true ragged per-seq lengths.
+        #   * dynamic_spec_query_tokens_per_req : the true ragged per-seq lengths.
         #   * num_spec_query_tokens (scalar) : graph CAPACITY selector q_eff, so
         #     C = bs*q_eff >= Σ (q_eff = ceil(Σ/bs) quantized up to a captured
         #     bucket). Graph replays a fixed C grid; tail [Σ:C] is -1-batch_id
@@ -2345,7 +2353,7 @@ class ModelRunner:
             q_ceil = (total_new + scheduled_bs - 1) // max(scheduled_bs, 1)
             q_eff = quantize_to_bucket(q_ceil, buckets)
         batch.num_spec_query_tokens = int(q_eff)
-        batch.num_spec_query_tokens_per_req = new_len
+        batch.dynamic_spec_query_tokens_per_req = new_len
 
         # (No flat scheduled_spec_decode_tokens is built here: the ragged
         # input_ids are assembled downstream in _ragged_fill_deferred_all_same
@@ -2458,28 +2466,21 @@ class ModelRunner:
         # has no drafter / uses 1.
         decide_num_input_tokens = num_input_tokens
         dp_bs = batch.dspark_dp_bs
-        if not is_prefill and dp_bs is not None:
-            # DP-attention (see _dspark_sync_graph_shape_dp): the graph shape is
-            # DP-max-synced there so every rank picks the identical graph and the
-            # MoE all_gather (pad = graph_bs * max_seqlen_q) matches across ranks
-            # (a divergent local shape RCCL-deadlocks).
-            q_eff = int(batch.num_spec_query_tokens)
-            mtp_step = q_eff
-            decide_num_input_tokens = int(dp_bs) * q_eff
-        elif (
-            not is_prefill
-            and getattr(batch, "num_spec_query_tokens_per_req", None) is not None
-        ):
-            # RAGGED (single-DP): the real Σtokens (num_input_tokens) is
-            # irregular, but we replay the (bs, q_eff) graph whose capacity is
-            # bs*q_eff (q_eff = num_spec_query_tokens, the quantized bucket).
-            # Feed ForwardMode the GRAPH-CAPACITY token count so it recovers
+        is_ragged = (
+            getattr(batch, "dynamic_spec_query_tokens_per_req", None) is not None
+        )
+        if not is_prefill and (dp_bs is not None or is_ragged):
+            # DSpark: the real Σtokens is irregular, but we
+            # replay the rectangular (bs, q_eff) graph whose capacity is bs*q_eff
+            # (q_eff = num_spec_query_tokens, the quantized bucket). Feed
+            # ForwardMode the GRAPH-CAPACITY token count so it recovers
             # padded_scheduled_bs = bs*q_eff // q_eff = bs and picks the matching
-            # (bs, q_eff) graph. The real ragged tokens sit in [0:Σ]; the tail
-            # to bs*q_eff is -1 padding (CTAs bail).
+            # (bs, q_eff) graph; the real ragged tokens sit in [0:Σ], the tail is
+            # -1 padding (CTAs bail).
             q_eff = int(batch.num_spec_query_tokens)
+            eff_bs = dp_bs if dp_bs is not None else batch.total_seqs_num_decode
             mtp_step = q_eff
-            decide_num_input_tokens = batch.total_seqs_num_decode * q_eff
+            decide_num_input_tokens = int(eff_bs) * q_eff
         elif not is_prefill and hasattr(self, "drafter"):
             mtp_step = batch.num_spec_query_tokens
         else:
@@ -2519,7 +2520,8 @@ class ModelRunner:
         # corner (enforce_eager / bs>graph_bs[-1]) where attention needs local
         # but MoE pad needs the DP-unified padded_scheduled_bs.
         graph_bs = num_input_tokens if is_prefill else forward_mode.moe_pad_bs
-        if not is_prefill:
+        drafter = getattr(self, "drafter", None)
+        if not is_prefill and getattr(drafter, "use_dspark", False):
             graph_bs = self._dspark_ragged_moe_graph_bs(batch, graph_bs)
         context = Context(
             positions=positions,
@@ -2924,13 +2926,13 @@ class ModelRunner:
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
-        # ordering ambiguity). The worker already built this map in propose() via
-        # record_dspark_ell(batch.req_ids).
+        # ordering ambiguity). The worker already fired this map in propose() via
+        # confidence_scheduler.record_ell(batch.req_ids).
         dspark_ell = None
-        if getattr(self, "drafter", None) is not None and getattr(
-            self.drafter, "dspark_confidence_schedule", False
-        ):
-            dspark_ell = self.drafter.dspark_ell_nonblocking()
+        drafter = getattr(self, "drafter", None)
+        confidence_scheduler = getattr(drafter, "confidence_scheduler", None)
+        if confidence_scheduler is not None:
+            dspark_ell = confidence_scheduler.ell_nonblocking()
 
         return ScheduledBatchOutput(
             req_ids=req_ids_out,
@@ -3020,7 +3022,7 @@ class ModelRunner:
         # offset over-counts by (full_q-q) -> index_select OOB. Subtract the shrink
         # so the anchor lands at segment_start+num_bonus. No-op when q==full_q or
         # on prefill/mixed steps.
-        ragged_lens = getattr(batch, "num_spec_query_tokens_per_req", None)
+        ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
         if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
             # RAGGED: each seg has its own len_i; anchor offset = len_i - num_bonus_i
             # (num_bonus_i = mtp_k - num_reject_i), applied to cu_seqlens_q ends.
@@ -3061,8 +3063,9 @@ class ModelRunner:
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
         # reordered) batch. Keying by req_id (not batch position) is required:
         # continuous batching reorders requests between steps.
-        if getattr(self.drafter, "dspark_confidence_schedule", False):
-            self.drafter.record_dspark_ell(batch.req_ids[: batch.total_seqs_num])
+        confidence_scheduler = getattr(self.drafter, "confidence_scheduler", None)
+        if confidence_scheduler is not None:
+            confidence_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     @torch.inference_mode()
@@ -3573,7 +3576,8 @@ class ModelRunner:
         drafter = getattr(self, "drafter", None)
         if drafter is None or not getattr(drafter, "use_dspark", False):
             return
-        if not getattr(drafter, "dspark_confidence_schedule", False):
+        confidence_scheduler = getattr(drafter, "confidence_scheduler", None)
+        if confidence_scheduler is None:
             return
         if not getattr(self, "graphs", None):
             return
@@ -3632,7 +3636,7 @@ class ModelRunner:
 
         max_b = self.config.max_num_seqs * max_q_len
         sps_table = build_sps_table(token_points, sps_points, max_b).to(self.device)
-        drafter.dspark_sps_table = sps_table
+        confidence_scheduler.sps_table = sps_table
         logger.info(
             "DSpark SPS calibrated over %d points (B=%d..%d), table size %d.",
             len(token_points),
