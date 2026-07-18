@@ -338,6 +338,7 @@ class InputOutputProcessor:
                 "qwen3_next",
                 "qwen3_5_text",
                 "qwen3_5_moe_text",
+                "kimi_linear",
                 "deepseek_v4",
             }
         )
