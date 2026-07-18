@@ -87,6 +87,7 @@ support_model_arch_dict = {
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
+    "KimiK3ForConditionalGeneration": "atom.models.kimi_k3.KimiK3ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
@@ -899,9 +900,13 @@ class ModelRunner:
             "qwen3_next_mtp",
             "qwen3_5_text",
             "qwen3_5_moe_text",
+            "kimi_linear",
         ):
             return True
         return False
+
+    def is_kimi_linear(self) -> bool:
+        return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
 
     def is_deepseek_v4(self) -> bool:
         # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because

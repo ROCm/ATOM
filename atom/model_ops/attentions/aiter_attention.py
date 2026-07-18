@@ -617,7 +617,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         # attn_idx: hybrid models (Qwen3-Next) skip linear-attention layers
         # in the kv_cache slot ordering; non-hybrid models use layer_id 1:1.
-        if runner.is_qwen_next():
+        if getattr(runner, "is_kimi_linear", lambda: False)():
+            mtp_start = runner.mtp_start_layer_idx
+            if layer_id < mtp_start:
+                attn_idx = runner.full_attention_layers.index(layer_id)
+            else:
+                attn_idx = runner.num_full_attn + (layer_id - mtp_start)
+        elif runner.is_qwen_next():
             mtp_start = runner.mtp_start_layer_idx
             if layer_id < mtp_start:
                 attn_idx = layer_id // runner.full_attention_interval
