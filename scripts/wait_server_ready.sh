@@ -38,7 +38,7 @@ for ((i=1; i<=ITERS; i++)); do
             LOG_START_BYTES=0
         fi
         ERR=$(tail -c "+$((LOG_START_BYTES + 1))" "$LOG_FILE" 2>/dev/null \
-            | grep -c "cluster_dims\|InductorError\|SHUTDOWN signal\|proc died")
+            | grep -c "cluster_dims\|InductorError\|SHUTDOWN signal\|proc died\|Memory access fault\|HSA_STATUS_ERROR")
     else
         ERR=0
     fi
