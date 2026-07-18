@@ -55,7 +55,16 @@ try:
 except ImportError:
     _HAS_GPU = False
 
-pytestmark = pytest.mark.skipif(not _HAS_GPU, reason="No GPU available")
+# Opt-in guard. This module spawns a real ATOM server (Popen + model load, blocks
+# up to TIMEOUT on /health), so a bare `pytest tests/` on a GPU box would hang and
+# leave an orphan server holding VRAM. Require an explicit opt-in in addition to a
+# GPU so the default full-suite run always skips it. CI runs it (when it does) via
+# the entrypoints path with ATOM_RUN_SERVER_INTEGRATION=1, not the unit gate.
+_OPT_IN = os.environ.get("ATOM_RUN_SERVER_INTEGRATION") == "1"
+pytestmark = pytest.mark.skipif(
+    not (_HAS_GPU and _OPT_IN),
+    reason="server integration test; set ATOM_RUN_SERVER_INTEGRATION=1 (needs GPU) to run",
+)
 
 
 # ---------------------------------------------------------------------------

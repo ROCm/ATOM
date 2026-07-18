@@ -50,7 +50,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
 | `quant_config` | `QuantizationConfig` | *(auto-detected)* | Quantization settings; auto-detected from HuggingFace config during `__post_init__` via `QuantizationConfig(hf_config)` (see Section 3) |
 | `asyncio_mode` | `bool` | `False` | Enable asyncio-based engine loop |
-| `load_dummy` | `bool` | `False` | Skip loading model weights (for benchmarking / testing) |
+| `load_dummy` | `Optional[str]` | `None` | Dummy-weight mode (no checkpoint read): `None` off; `"empty"` skip load (uninitialized, legacy); `"zero"` all-zero; `"xavier"` xavier for bf16, constant target magnitude for fp4/fp8 |
 | `enable_expert_parallel` | `bool` | `False` | Enable Expert Parallelism for MoE models |
 | `master_addr` | `str` | `"127.0.0.1"` | Master address for distributed communication |
 | `graph_bs` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
@@ -374,7 +374,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--max-model-len` | | `int` | `None` | Maximum model context length; defaults to `hf_config.max_position_embeddings` |
 | `--cudagraph-capture-sizes` | | `str` | `"[1,2,4,8,16,32,48,64,128,256]"` | CUDA graph capture sizes as a Python list string |
 | `--level` | | `int` | `3` | Compilation level (0 -- 3) |
-| `--load_dummy` | | flag | `False` | Skip loading model weights |
+| `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |

@@ -588,13 +588,13 @@ class ModelRunner:
         # so that dp config fields are still at their original values)
         self.profiler = None
         self.profiler_dir = None
+        dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
+        if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
+            self.rank_name = f"dp{dp_rank_local}_tp{rank}"
+        else:
+            self.rank_name = f"rank_{rank}"
         if config.torch_profiler_dir is not None:
-            dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
-            if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
-                rank_name = f"dp{dp_rank_local}_tp{rank}"
-            else:
-                rank_name = f"rank_{rank}"
-            self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
+            self.profiler_dir = os.path.join(config.torch_profiler_dir, self.rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self._setup_device_and_distributed(rank, config)
@@ -653,6 +653,7 @@ class ModelRunner:
         if hasattr(self.model, "load_fused_expert_weights"):
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
+        load_start = time.perf_counter()
         load_model(
             self.model,
             config.model,
@@ -660,7 +661,11 @@ class ModelRunner:
             config.load_dummy,
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
-        logger.info(f"Model load done: {config.model}")
+        load_elapsed = time.perf_counter() - load_start
+        logger.info(
+            f"[{self.rank_name}] Model load done: {config.model} "
+            f"(weights loaded in {load_elapsed:.2f}s)"
+        )
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -1749,7 +1754,14 @@ class ModelRunner:
                     f"diff={diff_pct:.1%}"
                 )
 
-        if torch.distributed.is_initialized():
+        # Skip on single-rank: a world_size==1 barrier is a no-op but still
+        # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
+        # which can OOM/fail on single-card runs. The process group stays
+        # initialized so get_tp_group() and friends keep working.
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
             torch.distributed.barrier()
         return True
 
@@ -1792,11 +1804,16 @@ class ModelRunner:
             return None
 
         tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        # tbo_collective_active is the OR-reduced cross-DP decision: this rank
+        # is committed to splitting even if it's below ATOM_TBO_PREFILL_MIN_TOKENS
+        # (a peer cleared the bar). force=True bypasses the local min-token gate
+        # so we don't desync from peers and hang.
         ubatch_slices = maybe_create_ubatch_slices(
             num_reqs=tbo_num_reqs,
             num_tokens=actual_num_tokens,
             is_prefill=is_prefill,
             num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
+            force=True,
         )
         if ubatch_slices is not None:
             logger.debug(
@@ -1826,17 +1843,27 @@ class ModelRunner:
         dp_size = self.config.parallel_config.data_parallel_size
 
         # Rank-local TBO precompute (needed for both dp==1 fast path and
-        # the cross-DP packed gather below).
-        local_eligible, local_ub0, local_ub1 = False, 0, 0
+        # the cross-DP packed gather below). `meets_min_tokens` = this rank's
+        # prefill reached the min-token bar (e.g. 8k), OR-reduced across DP;
+        # `can_split` = structurally splittable, AND-reduced across DP.
+        local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = (
+            False,
+            False,
+            0,
+            0,
+        )
         if tbo_on:
             if num_scheduled_tokens is None:
                 num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-            local_eligible, local_ub0, local_ub1 = local_tbo_precompute(
-                self.config, batch, is_prefill, num_scheduled_tokens
+            local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = (
+                local_tbo_precompute(
+                    self.config, batch, is_prefill, num_scheduled_tokens
+                )
             )
 
         if dp_size <= 1:
             # Single-rank: TBO decision is purely local; no collective needed.
+            # Both bits must hold (reached min-tokens AND able to split).
             # dp_uniform_decode=True mirrors the DP-disabled case in the
             # multi-rank branch (`not enable_dp_attention` => True) and the
             # Context default — otherwise single-GPU/TP-only decode would
@@ -1846,24 +1873,19 @@ class ModelRunner:
                 None,
                 True,
                 num_input_tokens,
-                local_eligible,
+                local_meets_min_tokens and local_can_split,
                 None,
             )
 
-        # Mixed prefill+decode DP steps only deadlock under prefill
-        # token-split + TBO-decode
-        require_uniform_mode = (
-            self.config.enable_tbo_decode and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-        )
         sync = sync_dp_for_tbo(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
             num_input_tokens=num_input_tokens,
             is_prefill=is_prefill,
             tbo_on=tbo_on,
-            local_tbo_eligible=local_eligible,
+            local_meets_min_tokens=local_meets_min_tokens,
+            local_can_split=local_can_split,
             local_ub_tokens=(local_ub0, local_ub1),
-            require_uniform_mode=require_uniform_mode,
         )
 
         max_tokens = int(sync.num_tokens_across_dp.max())

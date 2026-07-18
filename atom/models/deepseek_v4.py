@@ -2652,6 +2652,9 @@ class MoE(nn.Module):
             e_score_correction_bias=getattr(self.gate, "e_score_correction_bias", None),
             config=moe_cfg,
             shared_expert_prefix=f"{prefix}.shared_experts",
+            # inter=3072/TP8=384 is a 128-multiple; pad to 128 (not the 256
+            # default) to avoid padding the MoE intermediate up to 512.
+            pad_align=128,
         )
         self.experts.swiglu_limit = args.swiglu_limit
 

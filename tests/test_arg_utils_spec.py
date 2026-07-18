@@ -32,8 +32,6 @@ if _atom_config_stub is not None:
             {"NONE": 0, "PIECEWISE": 1, "FULL": 2, "FULL_AND_PIECEWISE": 3},
         )
 
-import argparse  # noqa: E402
-
 from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
 
 
