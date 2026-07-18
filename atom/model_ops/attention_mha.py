@@ -794,23 +794,31 @@ class PagedAttentionImpl(nn.Module):
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
 
-        # `block_tables` is always populated by TritonMHAMetadataBuilder.
-        # For pure prefill (no cached tokens) it is, by default, the fake table
-        # built in prepare_prefill that maps seq i to token indices
-        # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
-        # treated as kv_cache with block_size=1.
-        #
-        # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
-        # per-seq block_table and reads from KV cache, the new tokens
-        # already written into the paged flash-layout cache during rope_cache
-        # are read straight from `k_cache`/`v_cache`, identical to the
-        # prefix-cache-hit path.
+        # Prefix-cache hits use real paged block tables. Pure prefill may not
+        # have paged KV metadata; in that case, feed raw K/V as a block_size=1
+        # flash-layout cache and synthesize a table that maps each sequence's
+        # logical positions to dense token offsets.
+        block_table = attn_metadata.block_tables
+        if attn_metadata.block_tables is None and not attn_metadata.has_cached:
+            offsets = torch.arange(
+                attn_metadata.max_seqlen_k, dtype=torch.int32, device=q.device
+            )
+            seq_starts = attn_metadata.cu_seqlens_k[:-1].to(torch.int32)
+            block_table = seq_starts[:, None] + offsets[None, :]
+
         if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
-            k_for_attn = k_cache
-            v_for_attn = v_cache
-            # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
-            # 4D flash layout is in use.
-            shuffled_kv_cache = not self.use_flash_layout
+            if attn_metadata.block_tables is None and not attn_metadata.has_cached:
+                #   k: [total_tokens, num_kv_heads, head_size]
+                #     -> [total_tokens, 1, num_kv_heads, head_size]
+                k_for_attn = k.unsqueeze(1)
+                v_for_attn = v.unsqueeze(1)
+                shuffled_kv_cache = False
+            else:
+                k_for_attn = k_cache
+                v_for_attn = v_cache
+                # Reads the paged KV cache, which is 5D SHUFFLE unless the
+                # (default) 4D flash layout is in use.
+                shuffled_kv_cache = not self.use_flash_layout
         else:
             #   k: [total_tokens, num_kv_heads, head_size]
             #     -> [total_tokens, 1, num_kv_heads, head_size]
@@ -832,7 +840,7 @@ class PagedAttentionImpl(nn.Module):
             causal=True,
             alibi_slopes=None,
             window_size=sliding_window,
-            block_table=attn_metadata.block_tables,
+            block_table=block_table,
             softcap=0,
             q_descale=None,
             k_descale=self.kv_scale,

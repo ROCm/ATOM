@@ -14,6 +14,7 @@ from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
+from aiter import ActivationType, QuantType
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -230,6 +231,7 @@ class KimiSparseMoeBlock(nn.Module):
             topk_group=getattr(config, "topk_group", 1),
             scoring_func=config.moe_router_activation_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
+            activation=ActivationType.Situv2,
             config=config,
             prefix=f"{prefix}.experts",
         )
@@ -246,19 +248,35 @@ class KimiSparseMoeBlock(nn.Module):
             self.shared_experts = None
 
         if self.use_latent_moe:
+            def _routed_source_quant_dtype(layer_prefix: str) -> torch.dtype | None:
+                if quant_config is None:
+                    return None
+                layer_quant_config = quant_config.get_layer_quant_config(layer_prefix)
+                if (
+                    layer_quant_config.quant_type == QuantType.per_1x32
+                    and layer_quant_config.quant_dtype
+                    == getattr(torch, "float4_e2m1fn_x2", None)
+                ):
+                    return torch.bfloat16
+                return None
+
+            down_proj_prefix = f"{prefix}.routed_expert_down_proj"
+            up_proj_prefix = f"{prefix}.routed_expert_up_proj"
             self.routed_expert_down_proj = ReplicatedLinear(
                 config.hidden_size,
                 self.moe_hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.routed_expert_down_proj",
+                source_quant_dtype=_routed_source_quant_dtype(down_proj_prefix),
+                prefix=down_proj_prefix,
             )
             self.routed_expert_up_proj = ReplicatedLinear(
                 self.moe_hidden_size,
                 config.hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.routed_expert_up_proj",
+                source_quant_dtype=_routed_source_quant_dtype(up_proj_prefix),
+                prefix=up_proj_prefix,
             )
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
@@ -887,8 +905,8 @@ class KimiLinearModel(nn.Module):
 
 class KimiLinearForCausalLM(nn.Module):
     packed_modules_mapping = {
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
+        ".gate_proj": (".gate_up_proj", 0),
+        ".up_proj": (".gate_up_proj", 1),
     }
     weights_mapping = {
         "weight_packed": "weight",
@@ -944,6 +962,15 @@ class KimiK3ForCausalLM(nn.Module):
         root_config = atom_config.hf_config
         if hasattr(root_config, "text_config") and root_config.text_config is not root_config:
             _normalize_kimi_config(root_config.text_config)
+            if (
+                getattr(root_config, "quantization_config", None) is None
+                and getattr(root_config.text_config, "quantization_config", None)
+                is not None
+            ):
+                atom_config.quant_config = QuantizationConfig(
+                    root_config.text_config,
+                    atom_config.online_quant_config,
+                )
         else:
             _normalize_kimi_config(root_config)
         self.config = _text_config(root_config)
@@ -972,14 +999,7 @@ class KimiK3ForCausalLM(nn.Module):
         return self.language_model.compute_logits(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        mapping = []
-        for param_name, weight_name, expert_id, shard_id in self.language_model.get_expert_mapping():
-            mapping.append(
-                (
-                    f"language_model.{param_name}",
-                    f"language_model.{weight_name}",
-                    expert_id,
-                    shard_id,
-                )
-            )
-        return mapping
+        # The loader matches expert entries as substrings of full checkpoint
+        # names, so keep these generic enough to match each layer's
+        # `block_sparse_moe.experts.{id}.w*.weight` entries.
+        return self.language_model.get_expert_mapping()

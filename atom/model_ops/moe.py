@@ -1391,6 +1391,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
+        if activation == ActivationType.Situv2:
+            moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
+            moe_extra_args["linear_beta"] = getattr(
+                layer, "activation_situ_linear_beta", None
+            )
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -2591,6 +2596,14 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
+        if config is not None:
+            self.activation_situ_beta = getattr(config, "activation_situ_beta", None)
+            self.activation_situ_linear_beta = getattr(
+                config, "activation_situ_linear_beta", None
+            )
+        else:
+            self.activation_situ_beta = None
+            self.activation_situ_linear_beta = None
 
         self.use_chunked = get_dp_group().world_size > 1
 
@@ -3125,9 +3138,9 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
         load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, load_shard_size * tp_rank, load_shard_size
-        )
+        shard_start = load_shard_size * tp_rank
+        loaded_shard = loaded_weight.narrow(shard_dim, shard_start, load_shard_size)
+        loaded_weight = loaded_shard
         if load_shard_size != shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
