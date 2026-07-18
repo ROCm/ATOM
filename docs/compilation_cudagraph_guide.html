@@ -1,0 +1,1332 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ATOM Compilation &amp; CUDA Graphs Guide &mdash; ATOM 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="ATOM Serving &amp; Benchmarking Guide" href="serving_benchmarking_guide.html" />
+    <link rel="prev" title="ATOM Distributed Inference Guide" href="distributed_guide.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            ATOM
+              <img src="_static/atom_logo.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#docker-installation">Docker Installation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#serving-a-model">Serving a Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#batch-inference">Batch Inference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#distributed-serving">Distributed Serving</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-server">API Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#performance-tips">Performance Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model Run Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_run_guide.html#vllm-plugin-backend">vLLM Plugin Backend</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live Dashboard</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="architecture_guide.html">ATOM Architecture Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#system-overview">1. System Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#component-architecture">2. Component Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#request-lifecycle">3. Request Lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#forward-context-pattern">4. Forward Context Pattern</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#multi-process-architecture">5. Multi-Process Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#sequence-lifecycle">6. Sequence Lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#speculative-decoding-mtp-eagle">7. Speculative Decoding (MTP / EAGLE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#supported-mtp-architectures">Supported MTP architectures</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#weight-sharing">Weight sharing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#propose-loop-mha-vs-mla-branching">Propose loop: MHA vs MLA branching</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#prepare-mtp-decode"><code class="docutils literal notranslate"><span class="pre">prepare_mtp_decode()</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="configuration_guide.html">ATOM Configuration Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#master-configuration-config">1. Master Configuration (<code class="docutils literal notranslate"><span class="pre">Config</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#compilation-configuration-compilationconfig">2. Compilation Configuration (<code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilation-levels-compilationlevel">2.1 Compilation Levels (<code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilationconfig-fields">2.2 <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#cuda-graph-mode-cudagraphmode">2.3 CUDA Graph Mode (<code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quantization-configuration-quantizationconfig-layerquantconfig">3. Quantization Configuration (<code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> &amp; <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layerquantconfig-fields">3.1 <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quantizationconfig-attributes">3.2 <code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> Attributes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quanttype-values-from-aiter">3.3 <code class="docutils literal notranslate"><span class="pre">QuantType</span></code> Values (from AITER)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#supported-quantization-dtypes">3.4 Supported Quantization Dtypes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#auto-detection-from-huggingface">3.5 Auto-Detection from HuggingFace</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layer-level-quantization-dispatch">3.6 Layer-Level Quantization Dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#online-quantization-at-load-time">3.7 Online Quantization at Load Time</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#parallel-configuration-parallelconfig">4. Parallel Configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#speculative-decoding-configuration-speculativeconfig">5. Speculative Decoding Configuration (<code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#table-driven-mtp-config">5.1 Table-Driven MTP Config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#post-init-behaviour-hf-config-override">5.2 Post-init behaviour (<code class="docutils literal notranslate"><span class="pre">hf_config_override</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#sampling-parameters-samplingparams">6. Sampling Parameters (<code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#cli-arguments-engineargs">7. CLI Arguments (<code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#environment-variables">8. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#variables-registered-in-atom-utils-envs-py">8.1 Variables Registered in <code class="docutils literal notranslate"><span class="pre">atom/utils/envs.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#additional-environment-variables-used-outside-envs-py">8.2 Additional Environment Variables (Used Outside <code class="docutils literal notranslate"><span class="pre">envs.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#decision-tree-choosing-a-compilation-level">9. Decision Tree – Choosing a Compilation Level</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_support_guide.html">ATOM Model Support Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#supported-model-architectures">1. Supported Model Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-architecture-details">2. Model Architecture Details</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-qwen3forcausallm">Qwen3 (<code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qwen3moeforcausallm">Qwen3-MoE (<code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-llamaforcausallm">Llama (<code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#mixtral-mixtralforcausallm">Mixtral (<code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-v2-v3-deepseekv2forcausallm">DeepSeek V2/V3 (<code class="docutils literal notranslate"><span class="pre">DeepseekV2ForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-mtp-deepseekmtp">DeepSeek MTP (<code class="docutils literal notranslate"><span class="pre">DeepSeekMTP</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#gpt-oss-gptossforcausallm">GPT-OSS (<code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#glm-5-glmmoedsa-glmmoedsaforcausallm">GLM-5 / GlmMoeDsa (<code class="docutils literal notranslate"><span class="pre">GlmMoeDsaForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#glm4-moe-glm4moeforcausallm">GLM4-MoE (<code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-next-qwen3nextforcausallm">Qwen3-Next (<code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-5-qwen3-5forconditionalgeneration-and-qwen3-5moeforconditionalgeneration">Qwen3.5 (<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code> and <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-5-mtp-qwen3-5mtp">Qwen3.5 MTP (<code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#weight-loading">3. Weight Loading</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#function-signature">Function Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#loading-flow">Loading Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#batched-expert-staging">Batched Expert Staging</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#layers-beyond-num-hidden-layers">Layers Beyond <code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#adding-a-new-model">4. Adding a New Model</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-1-create-the-model-file">Step 1: Create the Model File</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-2-implement-layer-classes">Step 2: Implement Layer Classes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-3-implement-the-model-and-causallm-classes">Step 3: Implement the Model and CausalLM Classes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-4-register-the-model">Step 4: Register the Model</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-5-handle-weight-loading">Step 5: Handle Weight Loading</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-specific-optimizations">5. Model-Specific Optimizations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-fused-rmsnorm-quant-and-silu-mul-quant">Llama: Fused RMSNorm+Quant and SiLU+Mul+Quant</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-v2-v3-mla-fused-input-norm-qk-norm-fusion">DeepSeek V2/V3: MLA + Fused Input Norm + QK Norm Fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qk-norm-rope-cache-quant-fusion">Qwen3-MoE: QK Norm + RoPE + Cache + Quant Fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#mtp-multi-token-prediction-speculative-decoding">MTP: Multi-Token Prediction (Speculative Decoding)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_ops_guide.html">ATOM Model Operations Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#aiter-integration-overview">1. AITER Integration Overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#aiter-kernel-mapping-table">AITER Kernel Mapping Table</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#linear-operations">2. Linear Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#class-hierarchy">2.1 Class Hierarchy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#quantization-dispatch">2.2 Quantization Dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#tensor-parallel-sharding">2.3 Tensor Parallel Sharding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#weight-processing">2.4 Weight Processing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#attention-operations">3. Attention Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#base-attention-base-attention-py">3.1 Base: <code class="docutils literal notranslate"><span class="pre">Attention</span></code> (<code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#multi-head-attention-attention-mha-py">3.2 Multi-Head Attention (<code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#multi-head-latent-attention-attention-mla-py">3.3 Multi-head Latent Attention (<code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#backend-abstraction-attentions-backends-py">3.4 Backend Abstraction (<code class="docutils literal notranslate"><span class="pre">attentions/backends.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#kv-cache-operations">3.5 KV Cache Operations</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#mixture-of-experts-moe">4. Mixture of Experts (MoE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#fusedmoe-class-moe-py">4.1 <code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code> Class (<code class="docutils literal notranslate"><span class="pre">moe.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#quantization-methods">4.2 Quantization Methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#topk-routing-topk-py">4.3 TopK Routing (<code class="docutils literal notranslate"><span class="pre">topK.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#fusedmoeparallelconfig">4.4 <code class="docutils literal notranslate"><span class="pre">FusedMoEParallelConfig</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#mori-integration-fused-moe-mori-prepare-finalize-py">4.5 MORI Integration (<code class="docutils literal notranslate"><span class="pre">fused_moe/mori_prepare_finalize.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#moe-quantization-config-fused-moe-config-py">4.6 MoE Quantization Config (<code class="docutils literal notranslate"><span class="pre">fused_moe/config.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#triton-moe-fallback-fused-moe-triton-py">4.7 Triton MoE Fallback (<code class="docutils literal notranslate"><span class="pre">fused_moe_triton.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#normalization">5. Normalization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rmsnorm-layernorm-py">5.1 <code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#layernorm-layernorm-py">5.2 <code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#activation-functions">6. Activation Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#siluandmul-activation-py">6.1 <code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code> (<code class="docutils literal notranslate"><span class="pre">activation.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#embedding-output-head">7. Embedding &amp; Output Head</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#vocabparallelembedding-embed-head-py">7.1 <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#parallellmhead-embed-head-py">7.2 <code class="docutils literal notranslate"><span class="pre">ParallelLMHead</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#rotary-position-embedding-rope">8. Rotary Position Embedding (RoPE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rotaryembedding-rotary-embedding-py">8.1 <code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">rotary_embedding.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#get-rope-factory">8.2 <code class="docutils literal notranslate"><span class="pre">get_rope()</span></code> Factory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#integration-in-attention">8.3 Integration in Attention</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#sampling">9. Sampling</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#sampler-sampler-py">9.1 <code class="docutils literal notranslate"><span class="pre">Sampler</span></code> (<code class="docutils literal notranslate"><span class="pre">sampler.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rejectionsampler-rejection-sampler-py">9.2 <code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code> (<code class="docutils literal notranslate"><span class="pre">rejection_sampler.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#fused-kernel-chains">10. Fused Kernel Chains</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#source-files">Source Files</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops-attentions"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/attentions/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops-fused-moe"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/fused_moe/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-utils"><code class="docutils literal notranslate"><span class="pre">atom/utils/</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="scheduling_kv_cache_guide.html">ATOM Scheduling &amp; KV Cache Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduling-algorithm">1. Scheduling Algorithm</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduler-initialization">1.1 Scheduler Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#schedule-flow">1.2 Schedule Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#delay-factor">1.3 Delay Factor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#preemption">1.4 Preemption</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduledbatch-structure">2. ScheduledBatch Structure</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#constructor-signature">2.1 Constructor Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#fields">2.2 Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduledbatchoutput">2.3 ScheduledBatchOutput</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#block-manager">3. Block Manager</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#block-class">3.1 Block Class</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#blockmanager-initialization">3.2 BlockManager Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#allocation-allocate">3.3 Allocation (<code class="docutils literal notranslate"><span class="pre">allocate</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#deallocation-deallocate">3.4 Deallocation (<code class="docutils literal notranslate"><span class="pre">deallocate</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#can-allocate-and-can-append-checks">3.5 Can-Allocate and Can-Append Checks</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#may-append-decode-extension">3.6 May-Append (Decode Extension)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#prefix-caching">4. Prefix Caching</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#hash-function">4.1 Hash Function</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#hash-chaining">4.2 Hash Chaining</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#cache-lookup-during-allocation">4.3 Cache Lookup During Allocation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#reference-counting">4.4 Reference Counting</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#enabling-prefix-caching">4.5 Enabling Prefix Caching</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#postprocessing">5. Postprocessing</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#signature">5.1 Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#token-appending">5.2 Token Appending</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#stop-condition-checking">5.3 Stop Condition Checking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#stream-output">5.4 Stream Output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequence-cleanup">5.5 Sequence Cleanup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#placeholder-insertion">5.6 Placeholder Insertion</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#speculative-decoding-integration">6. Speculative Decoding Integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduler-tracking">6.1 Scheduler Tracking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#draft-tokens-in-scheduling">6.2 Draft Tokens in Scheduling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#acceptance-statistics">6.3 Acceptance Statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#draft-token-storage-on-sequences">6.4 Draft Token Storage on Sequences</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequence-management">7. Sequence Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#constructor">7.1 Constructor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#core-fields">7.2 Core Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#timing-fields">7.3 Timing Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#computed-properties">7.4 Computed Properties</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#num-tokens-setter">7.5 num_tokens Setter</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#lifecycle">7.6 Lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequencestatus-enum">7.7 SequenceStatus Enum</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequencetype-enum">7.8 SequenceType Enum</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="distributed_guide.html">ATOM Distributed Inference Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#tensor-parallelism-tp">1. Tensor Parallelism (TP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#weight-sharding">Weight Sharding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#process-group-initialization">Process Group Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#allreduce">AllReduce</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#configuration">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#data-parallelism-dp">2. Data Parallelism (DP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#architecture">Architecture</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-process-group-initialization">DP Process Group Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#synchronized-busy-loop">Synchronized Busy Loop</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dummy-batch-execution">Dummy Batch Execution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#device-assignment">Device Assignment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dpmetadata">DPMetadata</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#coremanager-dp-orchestration">CoreManager (DP Orchestration)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id1">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#expert-parallelism-ep">3. Expert Parallelism (EP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#fusedmoeparallelconfig">FusedMoEParallelConfig</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#expert-distribution">Expert Distribution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#mori-communication">MORI Communication</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id2">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#environment-variables">4. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#multi-gpu-deployment-examples">5. Multi-GPU Deployment Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#deepseek-r1-on-8-gpus-tp8">DeepSeek-R1 on 8 GPUs (TP8)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#qwen3-235b-a22b-on-8-gpus-tp8-ep">Qwen3-235B-A22B on 8 GPUs (TP8 + EP)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#kimi-k2-thinking-on-4-gpus-tp4">Kimi-K2-Thinking on 4 GPUs (TP4)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#combined-parallelism-strategies">6. Combined Parallelism Strategies</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-only-dense-models">TP Only (Dense Models)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-ep-moe-models">TP + EP (MoE Models)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-dense-throughput">TP + DP (Dense Throughput)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-ep-moe-throughput">TP + DP + EP (MoE Throughput)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-attention-mode">DP Attention Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">ATOM Compilation &amp; CUDA Graphs Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#compilation-levels">1. Compilation Levels</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#level-0-no-compilation">Level 0 – NO_COMPILATION</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#level-1-dynamo-as-is">Level 1 – DYNAMO_AS_IS</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#level-2-dynamo-once">Level 2 – DYNAMO_ONCE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#level-3-piecewise-production-default">Level 3 – PIECEWISE (Production Default)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#cuda-graph-modes">2. CUDA Graph Modes</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#none-value-0">NONE (value: 0)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#piecewise-value-1">PIECEWISE (value: 1)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#full-value-2">FULL (value: 2)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#full-decode-only-value-full-none">FULL_DECODE_ONLY (value: (FULL, NONE))</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#full-and-piecewise-value-full-piecewise">FULL_AND_PIECEWISE (value: (FULL, PIECEWISE))</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#helper-methods">Helper Methods</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#cuda-graph-capture">3. CUDA Graph Capture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#capture-flow">Capture Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#graph-keying">Graph Keying</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#graph-pool-sharing">Graph Pool Sharing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#default-capture-sizes">Default Capture Sizes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#graph-replay-in-run-model">Graph Replay in run_model()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#piecewise-compilation">4. Piecewise Compilation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#splitting-operations">Splitting Operations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#compilation-pipeline">Compilation Pipeline</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#cache-management">Cache Management</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#forward-context-stateless-dispatch">5. Forward Context &amp; Stateless Dispatch</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#forwardcontext-fields">ForwardContext Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#lifecycle">Lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#context-dataclass">Context Dataclass</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#integration-with-cuda-graphs">Integration with CUDA Graphs</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#compiler-backend">6. Compiler Backend</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#compilermanager">CompilerManager</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#compilerinterface">CompilerInterface</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#inductoradaptor">InductorAdaptor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#inductorstandaloneadaptor">InductorStandaloneAdaptor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#vllmbackend">VllmBackend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#support-torch-compile-decorator">&#64;support_torch_compile Decorator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#custom-op-registration">Custom Op Registration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#configuration-options">7. Configuration Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#decision-tree">8. Decision Tree</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#common-configurations">Common Configurations</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="serving_benchmarking_guide.html">ATOM Serving &amp; Benchmarking Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#openai-compatible-server">1. OpenAI-Compatible Server</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#endpoints">1.1 Endpoints</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#request-models">1.2 Request Models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#response-models">1.3 Response Models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#server-startup">1.4 Server Startup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#example-curl">1.5 Example: curl</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-api-llmengine">2. Programmatic API (LLMEngine)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#initialization">2.1 Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#samplingparams">2.2 SamplingParams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#core-methods">2.3 Core Methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#synchronous-generation-example">2.4 Synchronous Generation Example</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#asynchronous-streaming-usage">2.5 Asynchronous / Streaming Usage</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#simple-inference">3. Simple Inference</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#usage">3.1 Usage</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#what-it-does">3.2 What It Does</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#benchmarking">4. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#metrics">4.1 Metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#key-cli-arguments">4.2 Key CLI Arguments</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#backend-request-functions">4.3 Backend Request Functions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#full-benchmark-example">4.4 Full Benchmark Example</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#profiling">5. Profiling</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#configuration">5.1 Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#online-profiling-http">5.2 Online Profiling (HTTP)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-profiling">5.3 Programmatic Profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#offline-profiling-script">5.4 Offline Profiling Script</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#profiling-during-benchmarks">5.5 Profiling During Benchmarks</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#speculative-decoding-mtp">6. Speculative Decoding (MTP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#architecture">6.1 Architecture</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#id1">6.2 Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#mtp-statistics">6.3 MTP Statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#how-rejection-sampling-works">6.4 How Rejection Sampling Works</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#deployment-examples">7. Deployment Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#single-gpu">7.1 Single-GPU</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#multi-gpu-with-tensor-parallelism">7.2 Multi-GPU with Tensor Parallelism</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#docker-deployment">7.3 Docker Deployment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#engine-cli-arguments-engineargs">7.4 Engine CLI Arguments (EngineArgs)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#accuracy-validation">8. Accuracy Validation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#setup">8.1 Setup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#run-evaluation">8.2 Run Evaluation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Framework Integrations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">vLLM-ATOM Backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#architecture">1. Architecture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#design-overview">1.1 Design overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-it-works">1.2 How it works</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#plugin-lifecycle">1.3 Plugin lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#key-modules">1.4 Key Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#component-diagram">1.5 Component Diagram</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#configuration-translation">2. Configuration Translation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#pluginconfig-fields">2.1 <code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#vllm-config-mapping">2.2 vLLM Config Mapping</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#attention-integration">3. Attention Integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-the-backend-is-selected">3.1 How the Backend Is Selected</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#supported-models">4. Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#installation-and-quick-start">5. Installation and Quick Start</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#prerequisites">5.1 Prerequisites</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#set-up-the-environment">5.2 Set Up the Environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#launch-vllm-with-atom-plugin">5.3 Launch vLLM with ATOM Plugin</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#benchmark-serving">5.4 Benchmark Serving</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#enable-profiling">5.5 Enable Profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#disable-atom-plugin">5.6 Disable ATOM Plugin</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">6. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#online-quantization">Online quantization</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/serving.html">Serving API</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#llmengine-class">LLMEngine Class</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/serving.html#methods">Methods</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="api/serving.html#generate">generate()</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#samplingparams">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#return-values">Return Values</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#example">Example</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/models.html">Supported Models</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#llama-models">Llama Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#gpt-models">GPT Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#mixtral">Mixtral</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#other-architectures">Other Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#model-configuration">Model Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#performance-by-model-size">Performance by Model Size</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#quantization">Quantization</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">ATOM</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">ATOM Compilation &amp; CUDA Graphs Guide</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/compilation_cudagraph_guide.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="atom-compilation-cuda-graphs-guide">
+<h1>ATOM Compilation &amp; CUDA Graphs Guide<a class="headerlink" href="#atom-compilation-cuda-graphs-guide" title="Link to this heading"></a></h1>
+<blockquote>
+<div><p><strong>Quick Reference</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Concept</p></th>
+<th class="head"><p>Key Class / Enum</p></th>
+<th class="head"><p>Import</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Compilation Levels</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.config</span> <span class="pre">import</span> <span class="pre">CompilationLevel</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Compilation Config</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.config</span> <span class="pre">import</span> <span class="pre">CompilationConfig</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>CUDA Graph Modes</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.config</span> <span class="pre">import</span> <span class="pre">CUDAGraphMode</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>CUDA Graph Wrapper</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUDAGraphWrapper</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.cuda_graph</span> <span class="pre">import</span> <span class="pre">CUDAGraphWrapper</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Forward Context</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ForwardContext</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.forward_context</span> <span class="pre">import</span> <span class="pre">ForwardContext</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Compiler Backend</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">VllmBackend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.backends</span> <span class="pre">import</span> <span class="pre">VllmBackend</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Compiler Manager</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilerManager</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.backends</span> <span class="pre">import</span> <span class="pre">CompilerManager</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Compiler Interface</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilerInterface</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.compiler_inferface</span> <span class="pre">import</span> <span class="pre">CompilerInterface</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Inductor Adaptor</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">InductorAdaptor</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.compiler_inferface</span> <span class="pre">import</span> <span class="pre">InductorAdaptor</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Piecewise Backend</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">PiecewiseBackend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.cuda_piecewise_backend</span> <span class="pre">import</span> <span class="pre">PiecewiseBackend</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Compile Decorator</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&#64;support_torch_compile</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.decorators</span> <span class="pre">import</span> <span class="pre">support_torch_compile</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Custom Op Registration</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">direct_register_custom_op</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom.utils.custom_register</span> <span class="pre">import</span> <span class="pre">direct_register_custom_op</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Compilation Levels at a Glance</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Level</p></th>
+<th class="head"><p>Name</p></th>
+<th class="head"><p>Behavior</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">NO_COMPILATION</span></code></p></td>
+<td><p>Pure eager execution, no <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DYNAMO_AS_IS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> with <code class="docutils literal notranslate"><span class="pre">backend=&quot;eager&quot;</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>2</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DYNAMO_ONCE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> with Inductor</p></td>
+</tr>
+<tr class="row-odd"><td><p>3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">PIECEWISE</span></code></p></td>
+<td><p>Piecewise compilation with CUDA graph capture (production default)</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>CUDA Graph Modes at a Glance</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Mode</p></th>
+<th class="head"><p>Value</p></th>
+<th class="head"><p>Behavior</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NONE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>No graph capture</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PIECEWISE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Per-subgraph capture (default for level 3)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FULL</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2</span></code></p></td>
+<td><p>Whole-model capture</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">FULL_DECODE_ONLY</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(FULL,</span> <span class="pre">NONE)</span></code></p></td>
+<td><p>Full for decode, none for mixed batches</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FULL_AND_PIECEWISE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(FULL,</span> <span class="pre">PIECEWISE)</span></code></p></td>
+<td><p>Full for decode, piecewise for prefill</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<hr class="docutils" />
+<section id="compilation-levels">
+<h2>1. Compilation Levels<a class="headerlink" href="#compilation-levels" title="Link to this heading"></a></h2>
+<p>ATOM provides four compilation levels via the <code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code> class in <code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code>. The level is set through <code class="docutils literal notranslate"><span class="pre">CompilationConfig.level</span></code> and controls how <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> is applied to the model.</p>
+<section id="level-0-no-compilation">
+<h3>Level 0 – NO_COMPILATION<a class="headerlink" href="#level-0-no-compilation" title="Link to this heading"></a></h3>
+<p>No <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> is applied. The model runs in pure eager mode. This is the simplest mode and is useful for debugging or when using models that are incompatible with <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>.</p>
+<p>When <code class="docutils literal notranslate"><span class="pre">level=0</span></code>, the <code class="docutils literal notranslate"><span class="pre">&#64;support_torch_compile</span></code> decorator sets <code class="docutils literal notranslate"><span class="pre">self.do_not_compile</span> <span class="pre">=</span> <span class="pre">True</span></code> and the model’s <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method bypasses compilation entirely, calling <code class="docutils literal notranslate"><span class="pre">self.forward()</span></code> directly.</p>
+</section>
+<section id="level-1-dynamo-as-is">
+<h3>Level 1 – DYNAMO_AS_IS<a class="headerlink" href="#level-1-dynamo-as-is" title="Link to this heading"></a></h3>
+<p>Uses <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> with <code class="docutils literal notranslate"><span class="pre">backend=&quot;eager&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">fullgraph=True</span></code>. This runs Dynamo’s bytecode analysis and graph capture but does not apply any compiler optimizations. It is useful as a quick check to verify that a model is compatible with Dynamo’s tracing.</p>
+<p>Like level 0, <code class="docutils literal notranslate"><span class="pre">DYNAMO_AS_IS</span></code> causes the decorator to set <code class="docutils literal notranslate"><span class="pre">self.do_not_compile</span> <span class="pre">=</span> <span class="pre">True</span></code>, since the model runner (rather than the decorator) handles the compilation at this level.</p>
+</section>
+<section id="level-2-dynamo-once">
+<h3>Level 2 – DYNAMO_ONCE<a class="headerlink" href="#level-2-dynamo-once" title="Link to this heading"></a></h3>
+<p>Uses <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> with the Inductor backend. The model graph is traced by Dynamo and compiled once through Inductor for optimized GPU kernel generation. The <code class="docutils literal notranslate"><span class="pre">&#64;support_torch_compile</span></code> decorator’s custom dispatcher is activated when <code class="docutils literal notranslate"><span class="pre">compilation_level</span> <span class="pre">&gt;=</span> <span class="pre">DYNAMO_ONCE</span></code>, allowing compiled bytecode to be dispatched directly after the first compilation without repeated guard evaluation.</p>
+</section>
+<section id="level-3-piecewise-production-default">
+<h3>Level 3 – PIECEWISE (Production Default)<a class="headerlink" href="#level-3-piecewise-production-default" title="Link to this heading"></a></h3>
+<p>The most advanced level. When <code class="docutils literal notranslate"><span class="pre">Config.__post_init__</span></code> detects <code class="docutils literal notranslate"><span class="pre">level</span> <span class="pre">==</span> <span class="pre">PIECEWISE</span></code>, it:</p>
+<ol class="arabic simple">
+<li><p>Calls <code class="docutils literal notranslate"><span class="pre">CompilationConfig.set_splitting_ops_for_v1()</span></code> to configure the splitting operations (default: <code class="docutils literal notranslate"><span class="pre">[&quot;aiter.unified_attention_with_output&quot;,</span> <span class="pre">&quot;aiter.mla_attention&quot;]</span></code>).</p></li>
+<li><p>Calls <code class="docutils literal notranslate"><span class="pre">Config._set_cudagraph_sizes()</span></code> to compute the graph batch sizes.</p></li>
+<li><p>Sets <code class="docutils literal notranslate"><span class="pre">cudagraph_mode</span> <span class="pre">=</span> <span class="pre">CUDAGraphMode.PIECEWISE</span></code>.</p></li>
+<li><p>Calls <code class="docutils literal notranslate"><span class="pre">CompilationConfig.init_with_cudagraph_sizes()</span></code> to finalize compile sizes.</p></li>
+</ol>
+<p>The <code class="docutils literal notranslate"><span class="pre">VllmBackend</span></code> is then used as the <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> backend. It splits the model graph into subgraphs at the splitting operations and compiles each subgraph independently via <code class="docutils literal notranslate"><span class="pre">PiecewiseBackend</span></code>.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="cuda-graph-modes">
+<h2>2. CUDA Graph Modes<a class="headerlink" href="#cuda-graph-modes" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code> enum in <code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code> controls how CUDA graphs are captured and replayed. CUDA graphs record a sequence of GPU operations and replay them with minimal CPU overhead, which is critical for low-latency decode steps.</p>
+<section id="none-value-0">
+<h3>NONE (value: 0)<a class="headerlink" href="#none-value-0" title="Link to this heading"></a></h3>
+<p>No CUDA graph capture or replay. Every forward pass launches kernels individually. This mode is used during profiling, warmup, or when CUDA graphs are not supported.</p>
+</section>
+<section id="piecewise-value-1">
+<h3>PIECEWISE (value: 1)<a class="headerlink" href="#piecewise-value-1" title="Link to this heading"></a></h3>
+<p>The default mode for level 3 compilation. CUDA graphs are captured per subgraph (one for each piecewise-compiled region). Attention operations, which are split out by <code class="docutils literal notranslate"><span class="pre">splitting_ops</span></code>, run outside CUDA graphs because they may need dynamic metadata that changes between steps.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">CUDAGraphWrapper</span></code> class wraps each subgraph with <code class="docutils literal notranslate"><span class="pre">runtime_mode=CUDAGraphMode.PIECEWISE</span></code> for capture and replay.</p>
+</section>
+<section id="full-value-2">
+<h3>FULL (value: 2)<a class="headerlink" href="#full-value-2" title="Link to this heading"></a></h3>
+<p>The entire model forward pass is captured as a single CUDA graph. This is suitable for small models or workloads with small, uniform batch sizes. Not all attention backends support full CUDA graph capture.</p>
+</section>
+<section id="full-decode-only-value-full-none">
+<h3>FULL_DECODE_ONLY (value: (FULL, NONE))<a class="headerlink" href="#full-decode-only-value-full-none" title="Link to this heading"></a></h3>
+<p>A tuple mode that applies different strategies to different batch types:</p>
+<ul class="simple">
+<li><p><strong>Decode batches</strong>: Captured with full CUDA graphs.</p></li>
+<li><p><strong>Mixed prefill-decode batches</strong>: Run without CUDA graphs.</p></li>
+</ul>
+<p>This is useful for prefill/decode disaggregated (P/D) setups where decode latency matters more than prefill performance.</p>
+</section>
+<section id="full-and-piecewise-value-full-piecewise">
+<h3>FULL_AND_PIECEWISE (value: (FULL, PIECEWISE))<a class="headerlink" href="#full-and-piecewise-value-full-piecewise" title="Link to this heading"></a></h3>
+<p>A tuple mode combining both strategies:</p>
+<ul class="simple">
+<li><p><strong>Decode batches</strong>: Captured with full CUDA graphs.</p></li>
+<li><p><strong>Prefill and mixed batches</strong>: Captured with piecewise CUDA graphs.</p></li>
+</ul>
+<p>This is described in the code as “the most performant mode for most models.”</p>
+</section>
+<section id="helper-methods">
+<h3>Helper Methods<a class="headerlink" href="#helper-methods" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code> enum provides several helper methods for runtime dispatch:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>Returns</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">decode_mode()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code></p></td>
+<td><p>Returns the mode to use for decode batches. For tuple modes, returns the first element.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mixed_mode()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code></p></td>
+<td><p>Returns the mode to use for mixed batches. For tuple modes, returns the second element.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">separate_routine()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p>Returns <code class="docutils literal notranslate"><span class="pre">True</span></code> if the mode is a tuple (different strategies for decode vs. mixed).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">has_full_cudagraphs()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p>Returns <code class="docutils literal notranslate"><span class="pre">True</span></code> if any part of the mode uses <code class="docutils literal notranslate"><span class="pre">FULL</span></code> capture.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">requires_piecewise_compilation()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p>Returns <code class="docutils literal notranslate"><span class="pre">True</span></code> if either decode or mixed mode uses <code class="docutils literal notranslate"><span class="pre">PIECEWISE</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_cudagraph_mode()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code></p></td>
+<td><p>Returns the highest-valued mode across both decode and mixed modes.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<hr class="docutils" />
+<section id="cuda-graph-capture">
+<h2>3. CUDA Graph Capture<a class="headerlink" href="#cuda-graph-capture" title="Link to this heading"></a></h2>
+<p>CUDA graph capture is handled by <code class="docutils literal notranslate"><span class="pre">ModelRunner.capture_cudagraph()</span></code> in <code class="docutils literal notranslate"><span class="pre">atom/model_engine/model_runner.py</span></code>. This method is called at startup (under <code class="docutils literal notranslate"><span class="pre">&#64;torch.inference_mode()</span></code>) to pre-capture graphs for a set of batch sizes.</p>
+<section id="capture-flow">
+<h3>Capture Flow<a class="headerlink" href="#capture-flow" title="Link to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">capture_cudagraph</span><span class="p">()</span>
+  <span class="o">|</span>
+  <span class="o">+--</span> <span class="n">Determine</span> <span class="n">graph_bs</span> <span class="nb">list</span>
+  <span class="o">|</span>     <span class="o">|--</span> <span class="n">If</span> <span class="n">cudagraph_capture_sizes</span> <span class="ow">is</span> <span class="nb">set</span><span class="p">:</span> <span class="n">use</span> <span class="n">directly</span>
+  <span class="o">|</span>     <span class="o">|--</span> <span class="n">If</span> <span class="n">cuda_graph_sizes</span> <span class="n">has</span> <span class="mi">1</span> <span class="n">value</span> <span class="n">N</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="o">...</span><span class="p">,</span> <span class="n">N</span><span class="p">]</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">If</span> <span class="n">cuda_graph_sizes</span> <span class="n">has</span> <span class="o">&gt;</span><span class="mi">1</span> <span class="n">values</span><span class="p">:</span> <span class="n">use</span> <span class="n">the</span> <span class="n">provided</span> <span class="nb">list</span>
+  <span class="o">|</span>
+  <span class="o">+--</span> <span class="n">Sort</span> <span class="n">graph_bs</span> <span class="ow">in</span> <span class="n">descending</span> <span class="n">order</span> <span class="p">(</span><span class="n">largest</span> <span class="n">batch</span> <span class="n">first</span><span class="p">)</span>
+  <span class="o">|</span>
+  <span class="o">+--</span> <span class="n">Assert</span> <span class="nb">max</span> <span class="n">batch</span> <span class="n">size</span> <span class="o">&lt;=</span> <span class="n">max_num_seqs</span>
+  <span class="o">|</span>
+  <span class="o">+--</span> <span class="n">Initialize</span> <span class="n">graph</span> <span class="n">storage</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">graphs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
+  <span class="o">|</span>
+  <span class="o">+--</span> <span class="n">For</span> <span class="n">each</span> <span class="n">batch</span> <span class="n">size</span> <span class="n">bs</span> <span class="p">(</span><span class="k">with</span> <span class="n">progress</span> <span class="n">bar</span> <span class="n">on</span> <span class="n">rank</span> <span class="mi">0</span><span class="p">):</span>
+  <span class="o">|</span>     <span class="o">|</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Compute</span> <span class="n">max_q_len</span> <span class="p">(</span><span class="o">=</span> <span class="n">mtp_k</span> <span class="o">+</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">MTP</span> <span class="n">drafter</span><span class="p">,</span> <span class="k">else</span> <span class="mi">1</span><span class="p">)</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Compute</span> <span class="n">num_tokens</span> <span class="o">=</span> <span class="n">bs</span> <span class="o">*</span> <span class="n">max_q_len</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Prepare</span> <span class="n">cu_seqlens_q</span><span class="p">,</span> <span class="n">positions</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Build</span> <span class="n">attn_metadata</span> <span class="ow">and</span> <span class="n">context</span> <span class="n">via</span> <span class="n">attn_metadata_builder</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Handle</span> <span class="n">DP</span> <span class="n">padding</span> <span class="n">via</span> <span class="n">get_dp_padding</span><span class="p">()</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Set</span> <span class="n">forward</span> <span class="n">context</span> <span class="p">(</span><span class="n">set_forward_context</span><span class="p">)</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Warmup</span> <span class="n">run</span><span class="p">:</span> <span class="n">model</span><span class="p">(</span><span class="n">input_ids</span><span class="p">[:</span><span class="n">num_tokens</span><span class="p">],</span> <span class="n">positions</span><span class="p">[:</span><span class="n">num_tokens</span><span class="p">])</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Capture</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">graph</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">graph_pool</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="n">gc</span><span class="o">.</span><span class="n">stream</span><span class="p">)</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Share</span> <span class="n">graph_pool</span> <span class="n">across</span> <span class="n">captures</span> <span class="p">(</span><span class="nb">set</span> <span class="n">on</span> <span class="n">first</span> <span class="n">capture</span><span class="p">)</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">Store</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">graphs</span><span class="p">[(</span><span class="n">bs</span><span class="p">,</span> <span class="n">max_q_len</span><span class="p">)]</span> <span class="o">=</span> <span class="n">graph</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+  <span class="o">|</span>
+  <span class="o">+--</span> <span class="n">Sort</span> <span class="n">graph_bs</span> <span class="n">back</span> <span class="n">to</span> <span class="n">ascending</span> <span class="n">order</span>
+  <span class="o">+--</span> <span class="n">Return</span> <span class="p">(</span><span class="n">elapsed_time</span><span class="p">,</span> <span class="n">graph_bs</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="graph-keying">
+<h3>Graph Keying<a class="headerlink" href="#graph-keying" title="Link to this heading"></a></h3>
+<p>Each captured graph is stored in a dictionary keyed by a <code class="docutils literal notranslate"><span class="pre">(graph_bs,</span> <span class="pre">max_q_len)</span></code> tuple:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="bp">self</span><span class="o">.</span><span class="n">graphs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">graph_bs</span></code>: The padded batch size used during capture.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_q_len</span></code>: The maximum query length per sequence. For standard decode, this is <code class="docutils literal notranslate"><span class="pre">1</span></code>. For MTP (Multi-Token Prediction) speculative decoding, this is <code class="docutils literal notranslate"><span class="pre">mtp_k</span> <span class="pre">+</span> <span class="pre">1</span></code>.</p></li>
+</ul>
+</section>
+<section id="graph-pool-sharing">
+<h3>Graph Pool Sharing<a class="headerlink" href="#graph-pool-sharing" title="Link to this heading"></a></h3>
+<p>The first captured graph creates a CUDA memory pool via <code class="docutils literal notranslate"><span class="pre">graph.pool()</span></code>. All subsequent captures share this pool through the <code class="docutils literal notranslate"><span class="pre">self.graph_pool</span></code> parameter, enabling memory reuse across different batch sizes.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">graph_pool</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">graph_pool</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">pool</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="default-capture-sizes">
+<h3>Default Capture Sizes<a class="headerlink" href="#default-capture-sizes" title="Link to this heading"></a></h3>
+<p>When <code class="docutils literal notranslate"><span class="pre">cuda_graph_sizes</span></code> has a single value (e.g., <code class="docutils literal notranslate"><span class="pre">[512]</span></code>, the default), the capture sizes follow this pattern:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="n">cuda_graph_sizes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">16</span><span class="p">)]</span>
+<span class="c1"># Example with default 512:</span>
+<span class="c1"># [1, 2, 4, 8, 16, 32, 48, 64, ..., 496, 512]</span>
+</pre></div>
+</div>
+</section>
+<section id="graph-replay-in-run-model">
+<h3>Graph Replay in run_model()<a class="headerlink" href="#graph-replay-in-run-model" title="Link to this heading"></a></h3>
+<p>During inference, <code class="docutils literal notranslate"><span class="pre">ModelRunner.run_model()</span></code> decides whether to use eager execution or graph replay:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">run_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
+    <span class="n">forward_context</span> <span class="o">=</span> <span class="n">get_forward_context</span><span class="p">()</span>
+    <span class="n">context</span> <span class="o">=</span> <span class="n">forward_context</span><span class="o">.</span><span class="n">context</span>
+    <span class="n">bs</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">batch_size</span>
+    <span class="n">is_prefill</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">is_prefill</span>
+    <span class="n">positions</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">positions</span>
+
+    <span class="k">if</span> <span class="n">is_prefill</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">enforce_eager</span> <span class="ow">or</span> <span class="n">bs</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">graph_bs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
+        <span class="c1"># Eager path: prefills, enforce_eager mode, or oversized batches</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">positions</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># Graph replay path: decode batches within captured range</span>
+        <span class="n">graph_bs</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">graph_bs</span>
+        <span class="n">max_q_len</span> <span class="o">=</span> <span class="n">forward_context</span><span class="o">.</span><span class="n">attn_metadata</span><span class="o">.</span><span class="n">max_seqlen_q</span>
+        <span class="n">graph_key</span> <span class="o">=</span> <span class="p">(</span><span class="n">graph_bs</span><span class="p">,</span> <span class="n">max_q_len</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">graphs</span><span class="p">[</span><span class="n">graph_key</span><span class="p">]</span><span class="o">.</span><span class="n">replay</span><span class="p">()</span>
+        <span class="n">num_tokens</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">batch_size</span> <span class="o">*</span> <span class="n">max_q_len</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_vars</span><span class="p">[</span><span class="s2">&quot;outputs&quot;</span><span class="p">][:</span><span class="n">num_tokens</span><span class="p">]</span>
+
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">compute_logits</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="n">hidden_states</span>
+</pre></div>
+</div>
+<p>Key decisions:</p>
+<ul class="simple">
+<li><p><strong>Prefill</strong>: Always eager (variable sequence lengths make CUDA graphs impractical).</p></li>
+<li><p><strong>Decode with bs &lt;= max captured size</strong>: Replay the pre-captured graph.</p></li>
+<li><p><strong>Decode with bs &gt; max captured size</strong>: Fall back to eager execution.</p></li>
+<li><p><strong>enforce_eager=True</strong>: Always eager, regardless of batch size.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="piecewise-compilation">
+<h2>4. Piecewise Compilation<a class="headerlink" href="#piecewise-compilation" title="Link to this heading"></a></h2>
+<p>Piecewise compilation splits the model’s computation graph at specified operations and compiles each subgraph independently. This enables CUDA graph capture for the compilable parts while leaving incompatible operations (primarily attention) to run eagerly.</p>
+<section id="splitting-operations">
+<h3>Splitting Operations<a class="headerlink" href="#splitting-operations" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">splitting_ops</span></code> field in <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code> defines which operations split the graph. When <code class="docutils literal notranslate"><span class="pre">set_splitting_ops_for_v1()</span></code> is called (automatically at level 3), the default splitting ops are:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="p">[</span><span class="s2">&quot;aiter.unified_attention_with_output&quot;</span><span class="p">,</span> <span class="s2">&quot;aiter.mla_attention&quot;</span><span class="p">]</span>
+</pre></div>
+</div>
+<p>These attention operations are split out because:</p>
+<ol class="arabic simple">
+<li><p>They require dynamic metadata (sequence lengths, block tables) that changes per step.</p></li>
+<li><p>Some attention backends are not compatible with CUDA graph capture.</p></li>
+<li><p>Attention kernels are already highly optimized, so Inductor compilation provides minimal additional benefit.</p></li>
+</ol>
+</section>
+<section id="compilation-pipeline">
+<h3>Compilation Pipeline<a class="headerlink" href="#compilation-pipeline" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">VllmBackend.__call__</span></code> method orchestrates the piecewise compilation:</p>
+<ol class="arabic simple">
+<li><p><strong>Graph splitting</strong>: <code class="docutils literal notranslate"><span class="pre">split_graph()</span></code> divides the traced model graph at the splitting operations into a sequence of <code class="docutils literal notranslate"><span class="pre">SplitItem</span></code> objects, each containing a subgraph.</p></li>
+<li><p><strong>Submodule identification</strong>: Subgraphs that are <em>not</em> splitting operations are identified as candidates for compilation.</p></li>
+<li><p><strong>Dynamic-shape compilation</strong>: <code class="docutils literal notranslate"><span class="pre">PiecewiseCompileInterpreter</span></code> runs the split graph with fake inputs and compiles each non-splitting subgraph via <code class="docutils literal notranslate"><span class="pre">CompilerManager.compile()</span></code> for a general (dynamic) shape.</p></li>
+<li><p><strong>Backend creation</strong>: For each compiled subgraph, a <code class="docutils literal notranslate"><span class="pre">PiecewiseBackend</span></code> instance is created. It holds:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">compiled_graph_for_general_shape</span></code>: The Inductor-compiled graph for dynamic shapes.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">concrete_size_entries</span></code>: A dictionary mapping specific runtime shapes to <code class="docutils literal notranslate"><span class="pre">ConcreteSizeEntry</span></code> objects for shape-specialized compilation.</p></li>
+</ul>
+</li>
+<li><p><strong>Runtime dispatch</strong>: When <code class="docutils literal notranslate"><span class="pre">PiecewiseBackend.__call__</span></code> is invoked:</p>
+<ul class="simple">
+<li><p>On the first run, it uses the general-shape compiled graph.</p></li>
+<li><p>For subsequent runs, if the runtime shape is in <code class="docutils literal notranslate"><span class="pre">compile_sizes</span></code>, it lazily compiles a shape-specialized version via <code class="docutils literal notranslate"><span class="pre">CompilerManager.compile()</span></code> and caches it.</p></li>
+<li><p>For shapes not in <code class="docutils literal notranslate"><span class="pre">compile_sizes</span></code>, it falls back to the general-shape compiled graph.</p></li>
+</ul>
+</li>
+</ol>
+</section>
+<section id="cache-management">
+<h3>Cache Management<a class="headerlink" href="#cache-management" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">CompilerManager</span></code> caches compiled graphs using a key of <code class="docutils literal notranslate"><span class="pre">(runtime_shape,</span> <span class="pre">graph_index,</span> <span class="pre">backend_name)</span></code>. The cache is stored in a Python file (<code class="docutils literal notranslate"><span class="pre">vllm_compile_cache.py</span></code>) at the local cache directory (<code class="docutils literal notranslate"><span class="pre">~/.cache/atom/torch_compile_cache/&lt;hash&gt;/rank_&lt;i&gt;/&lt;prefix&gt;/</span></code>).</p>
+<p>On subsequent runs with the same model and configuration, compiled graphs are loaded from the cache, bypassing Inductor compilation entirely.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="forward-context-stateless-dispatch">
+<h2>5. Forward Context &amp; Stateless Dispatch<a class="headerlink" href="#forward-context-stateless-dispatch" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">ForwardContext</span></code> dataclass in <code class="docutils literal notranslate"><span class="pre">atom/utils/forward_context.py</span></code> provides a module-level global mechanism for passing metadata to layers during the forward pass. This is critical for CUDA graphs because captured graphs cannot accept new arguments – all dynamic metadata must be accessible through a side channel.</p>
+<section id="forwardcontext-fields">
+<h3>ForwardContext Fields<a class="headerlink" href="#forwardcontext-fields" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">no_compile_layers</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dict[int,</span> <span class="pre">Any]</span></code></p></td>
+<td><p>Layers that should skip compilation (from <code class="docutils literal notranslate"><span class="pre">static_forward_context</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">attn_metadata</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AttentionMetaData</span></code> or <code class="docutils literal notranslate"><span class="pre">dict</span></code></p></td>
+<td><p>Attention-specific metadata (sequence lengths, block tables, etc.)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_data</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dict[str,</span> <span class="pre">KVCacheTensor]</span></code></p></td>
+<td><p>KV cache tensors for each layer</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">context</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Context</span></code></p></td>
+<td><p>Basic forward pass context (positions, is_prefill, batch_size, graph_bs)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dp_metadata</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DPMetadata</span></code></p></td>
+<td><p>Data-parallel metadata (token counts across DP ranks)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">spec_decode_metadata</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">SpecDecodeMetadata</span></code></p></td>
+<td><p>Speculative decoding metadata (draft tokens, logits indices)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="lifecycle">
+<h3>Lifecycle<a class="headerlink" href="#lifecycle" title="Link to this heading"></a></h3>
+<p>The forward context follows a set-use-reset lifecycle:</p>
+<ol class="arabic simple">
+<li><p><strong>Set</strong>: Before each forward pass, <code class="docutils literal notranslate"><span class="pre">set_forward_context()</span></code> is called with attention metadata, the ATOM config, a <code class="docutils literal notranslate"><span class="pre">Context</span></code> object, and optional DP/speculative decoding metadata.</p></li>
+<li><p><strong>Access</strong>: During the forward pass, any layer can call <code class="docutils literal notranslate"><span class="pre">get_forward_context()</span></code> to retrieve the current metadata without needing it passed as a function argument. This is used by both eager execution and CUDA graph replay paths.</p></li>
+<li><p><strong>Reset</strong>: After the forward pass, <code class="docutils literal notranslate"><span class="pre">reset_forward_context()</span></code> replaces the global context with an empty <code class="docutils literal notranslate"><span class="pre">ForwardContext()</span></code>.</p></li>
+</ol>
+</section>
+<section id="context-dataclass">
+<h3>Context Dataclass<a class="headerlink" href="#context-dataclass" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">Context</span></code> object carries the most frequently accessed per-step state:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Context</span><span class="p">:</span>
+    <span class="n">positions</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>    <span class="c1"># Token position IDs</span>
+    <span class="n">is_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># Whether this is a prefill step</span>
+    <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>        <span class="c1"># Number of sequences in the batch</span>
+    <span class="n">graph_bs</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>          <span class="c1"># Padded batch size for graph lookup</span>
+    <span class="n">is_draft</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>     <span class="c1"># Whether this is a draft model forward</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">graph_bs</span></code> field is particularly important for CUDA graph dispatch: it holds the padded batch size that maps to a pre-captured graph key.</p>
+</section>
+<section id="integration-with-cuda-graphs">
+<h3>Integration with CUDA Graphs<a class="headerlink" href="#integration-with-cuda-graphs" title="Link to this heading"></a></h3>
+<p>For ModelRunner’s direct CUDA graph path (non-piecewise), the forward context is set before <code class="docutils literal notranslate"><span class="pre">run_model()</span></code> via <code class="docutils literal notranslate"><span class="pre">set_forward_context()</span></code>, and <code class="docutils literal notranslate"><span class="pre">run_model()</span></code> reads <code class="docutils literal notranslate"><span class="pre">context.graph_bs</span></code> and <code class="docutils literal notranslate"><span class="pre">attn_metadata.max_seqlen_q</span></code> to look up the correct pre-captured graph.</p>
+<p>For the piecewise path, <code class="docutils literal notranslate"><span class="pre">CUDAGraphWrapper</span></code> (in <code class="docutils literal notranslate"><span class="pre">atom/utils/cuda_graph.py</span></code>) expects <code class="docutils literal notranslate"><span class="pre">batch_descriptor</span></code> and <code class="docutils literal notranslate"><span class="pre">cudagraph_runtime_mode</span></code> fields on the forward context to decide whether to capture, replay, or run eagerly:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">forward_context</span> <span class="o">=</span> <span class="n">get_forward_context</span><span class="p">()</span>
+<span class="n">batch_descriptor</span> <span class="o">=</span> <span class="n">forward_context</span><span class="o">.</span><span class="n">batch_descriptor</span>
+<span class="n">cudagraph_runtime_mode</span> <span class="o">=</span> <span class="n">forward_context</span><span class="o">.</span><span class="n">cudagraph_runtime_mode</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p><strong>Note:</strong> The piecewise <code class="docutils literal notranslate"><span class="pre">CUDAGraphWrapper</span></code> integration is under development. The <code class="docutils literal notranslate"><span class="pre">batch_descriptor</span></code> and <code class="docutils literal notranslate"><span class="pre">cudagraph_runtime_mode</span></code> fields are expected by <code class="docutils literal notranslate"><span class="pre">CUDAGraphWrapper.__call__()</span></code> but are not currently defined on the <code class="docutils literal notranslate"><span class="pre">ForwardContext</span></code> dataclass. The per-subgraph wrapping in <code class="docutils literal notranslate"><span class="pre">backends.py</span></code> is also currently commented out. The direct CUDA graph path in <code class="docutils literal notranslate"><span class="pre">ModelRunner</span></code> is the active production path.</p>
+</div></blockquote>
+</section>
+</section>
+<hr class="docutils" />
+<section id="compiler-backend">
+<h2>6. Compiler Backend<a class="headerlink" href="#compiler-backend" title="Link to this heading"></a></h2>
+<section id="compilermanager">
+<h3>CompilerManager<a class="headerlink" href="#compilermanager" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">CompilerManager</span></code> in <code class="docutils literal notranslate"><span class="pre">atom/utils/backends.py</span></code> manages the full compilation lifecycle:</p>
+<ul class="simple">
+<li><p><strong>Initialization</strong>: Creates a <code class="docutils literal notranslate"><span class="pre">CompilerInterface</span></code> via <code class="docutils literal notranslate"><span class="pre">make_compiler()</span></code>. Uses <code class="docutils literal notranslate"><span class="pre">InductorStandaloneAdaptor</span></code> for PyTorch 2.8+ or <code class="docutils literal notranslate"><span class="pre">InductorAdaptor</span></code> for earlier versions.</p></li>
+<li><p><strong>Caching</strong>: Maintains a dictionary mapping <code class="docutils literal notranslate"><span class="pre">(runtime_shape,</span> <span class="pre">graph_index,</span> <span class="pre">backend_name)</span></code> to compiler-specific handles. Caches are serialized to a Python file using <code class="docutils literal notranslate"><span class="pre">pprint</span></code>.</p></li>
+<li><p><strong>Compile-or-load</strong>: On each call to <code class="docutils literal notranslate"><span class="pre">compile()</span></code>, first attempts <code class="docutils literal notranslate"><span class="pre">load()</span></code> from the cache. On miss, delegates to the compiler and stores the result.</p></li>
+</ul>
+</section>
+<section id="compilerinterface">
+<h3>CompilerInterface<a class="headerlink" href="#compilerinterface" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">CompilerInterface</span></code> in <code class="docutils literal notranslate"><span class="pre">atom/utils/compiler_inferface.py</span></code> (note the typo in the filename) defines the abstract interface that all compiler backends must implement:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">initialize_cache(cache_dir,</span> <span class="pre">disable_cache,</span> <span class="pre">prefix)</span></code></p></td>
+<td><p>Set up cache directories for the compiler</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">compute_hash(vllm_config)</span></code></p></td>
+<td><p>Generate a hash of compiler-specific state for cache invalidation</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">compile(graph,</span> <span class="pre">example_inputs,</span> <span class="pre">compiler_config,</span> <span class="pre">runtime_shape,</span> <span class="pre">key)</span></code></p></td>
+<td><p>Compile a graph, returning <code class="docutils literal notranslate"><span class="pre">(compiled_callable,</span> <span class="pre">handle)</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">load(handle,</span> <span class="pre">graph,</span> <span class="pre">example_inputs,</span> <span class="pre">graph_index,</span> <span class="pre">runtime_shape)</span></code></p></td>
+<td><p>Load a previously compiled graph from the handle</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="inductoradaptor">
+<h3>InductorAdaptor<a class="headerlink" href="#inductoradaptor" title="Link to this heading"></a></h3>
+<p>The default compiler for PyTorch &lt; 2.8. Uses <code class="docutils literal notranslate"><span class="pre">torch._inductor.compile_fx.compile_fx</span></code> and monkey-patches several internal functions to:</p>
+<ul class="simple">
+<li><p>Extract the compilation hash for caching.</p></li>
+<li><p>Provide a dummy shape environment (<code class="docutils literal notranslate"><span class="pre">AlwaysHitShapeEnv</span></code>) so Inductor cache lookups succeed outside of Dynamo’s tracing context.</p></li>
+<li><p>Force caching of graphs that Inductor would normally refuse to cache.</p></li>
+</ul>
+<p>When <code class="docutils literal notranslate"><span class="pre">runtime_shape</span></code> is an integer (specific batch size), it enables <code class="docutils literal notranslate"><span class="pre">max_autotune</span></code> and <code class="docutils literal notranslate"><span class="pre">coordinate_descent_tuning</span></code> for Triton kernel parameter optimization.</p>
+</section>
+<section id="inductorstandaloneadaptor">
+<h3>InductorStandaloneAdaptor<a class="headerlink" href="#inductorstandaloneadaptor" title="Link to this heading"></a></h3>
+<p>The preferred compiler for PyTorch 2.8+. Uses <code class="docutils literal notranslate"><span class="pre">torch._inductor.standalone_compile</span></code> which provides a cleaner interface without the monkey-patching required by <code class="docutils literal notranslate"><span class="pre">InductorAdaptor</span></code>. Compiled artifacts are saved to disk in “unpacked” format and can be loaded directly.</p>
+</section>
+<section id="vllmbackend">
+<h3>VllmBackend<a class="headerlink" href="#vllmbackend" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">VllmBackend</span></code> in <code class="docutils literal notranslate"><span class="pre">atom/utils/backends.py</span></code> serves as the <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> backend for level 3 (piecewise) compilation. When Dynamo calls it:</p>
+<ol class="arabic simple">
+<li><p>Computes a cache directory hash from config, traced files, and compiler state.</p></li>
+<li><p>Splits the graph at <code class="docutils literal notranslate"><span class="pre">splitting_ops</span></code> using <code class="docutils literal notranslate"><span class="pre">split_graph()</span></code>.</p></li>
+<li><p>Runs <code class="docutils literal notranslate"><span class="pre">PiecewiseCompileInterpreter</span></code> to compile each non-splitting subgraph.</p></li>
+<li><p>Saves the computation graph to <code class="docutils literal notranslate"><span class="pre">computation_graph.py</span></code> for debugging.</p></li>
+<li><p>Returns the stitching graph module (<code class="docutils literal notranslate"><span class="pre">split_gm</span></code>) as the callable.</p></li>
+</ol>
+<p>If <code class="docutils literal notranslate"><span class="pre">cudagraph_copy_inputs</span></code> is <code class="docutils literal notranslate"><span class="pre">True</span></code>, it wraps the callable to copy input tensors into static buffers before each call, ensuring CUDA graph input address stability.</p>
+</section>
+<section id="support-torch-compile-decorator">
+<h3>&#64;support_torch_compile Decorator<a class="headerlink" href="#support-torch-compile-decorator" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">&#64;support_torch_compile</span></code> decorator in <code class="docutils literal notranslate"><span class="pre">atom/utils/decorators.py</span></code> augments a model class to support <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>:</p>
+<ol class="arabic simple">
+<li><p><strong>Class modification</strong>: Adds <code class="docutils literal notranslate"><span class="pre">TorchCompileWrapperWithCustomDispatcher</span></code> as a base class and overrides <code class="docutils literal notranslate"><span class="pre">__init__</span></code> and <code class="docutils literal notranslate"><span class="pre">__call__</span></code>.</p></li>
+<li><p><strong>Dynamic shape marking</strong>: On the first compilation, it inspects the <code class="docutils literal notranslate"><span class="pre">forward</span></code> method signature, identifies <code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code> arguments, and calls <code class="docutils literal notranslate"><span class="pre">torch._dynamo.mark_dynamic()</span></code> to mark their batch dimensions as dynamic.</p></li>
+<li><p><strong>Custom dispatch</strong>: After the first compilation, if <code class="docutils literal notranslate"><span class="pre">use_custom_dispatcher</span></code> is True (levels &gt;= 2), subsequent calls bypass Dynamo’s guard mechanism and dispatch directly to the compiled bytecode via <code class="docutils literal notranslate"><span class="pre">dispatch_to_code(0)</span></code>.</p></li>
+<li><p><strong>Safety check</strong>: The bytecode hook checks for <code class="docutils literal notranslate"><span class="pre">update</span></code> in the compiled code’s <code class="docutils literal notranslate"><span class="pre">co_names</span></code>, raising an error if the model modifies <code class="docutils literal notranslate"><span class="pre">nn.Module</span></code> buffers during the forward pass (which would cause silent errors with CUDA graphs).</p></li>
+</ol>
+</section>
+<section id="custom-op-registration">
+<h3>Custom Op Registration<a class="headerlink" href="#custom-op-registration" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">direct_register_custom_op()</span></code> in <code class="docutils literal notranslate"><span class="pre">atom/utils/custom_register.py</span></code> registers custom operators with PyTorch’s <code class="docutils literal notranslate"><span class="pre">torch.library</span></code> system:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">direct_register_custom_op</span><span class="p">(</span>
+    <span class="n">op_name</span><span class="o">=</span><span class="s2">&quot;my_op&quot;</span><span class="p">,</span>
+    <span class="n">op_func</span><span class="o">=</span><span class="n">my_kernel</span><span class="p">,</span>
+    <span class="n">mutates_args</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">],</span>
+    <span class="n">fake_impl</span><span class="o">=</span><span class="n">my_fake_impl</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>This registers the op under the <code class="docutils literal notranslate"><span class="pre">&quot;aiter&quot;</span></code> library namespace (e.g., <code class="docutils literal notranslate"><span class="pre">aiter.my_op</span></code>), making it visible to Dynamo’s tracing. The <code class="docutils literal notranslate"><span class="pre">fake_impl</span></code> is used during tracing to compute output shapes without executing the real kernel. The <code class="docutils literal notranslate"><span class="pre">dispatch_key</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">&quot;CUDA&quot;</span></code> for GPU operations.</p>
+<p>Registered custom ops can be used as <code class="docutils literal notranslate"><span class="pre">splitting_ops</span></code> in piecewise compilation (e.g., <code class="docutils literal notranslate"><span class="pre">&quot;aiter.unified_attention_with_output&quot;</span></code>).</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="configuration-options">
+<h2>7. Configuration Options<a class="headerlink" href="#configuration-options" title="Link to this heading"></a></h2>
+<p>All compilation-related configuration fields from <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">level</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Compilation level (0-3). See Section 1.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">use_cudagraph</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">True</span></code></p></td>
+<td><p>Whether CUDA graph capture is enabled.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cudagraph_capture_sizes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[list[int]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Explicit list of batch sizes to capture. Overrides <code class="docutils literal notranslate"><span class="pre">cuda_graph_sizes</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cuda_graph_sizes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">list[int]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[512]</span></code></p></td>
+<td><p>Controls auto-generated capture sizes. 1 value = generate pattern; &gt;1 values = use directly.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cudagraph_mode</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[CUDAGraphMode]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>CUDA graph mode. Set to <code class="docutils literal notranslate"><span class="pre">PIECEWISE</span></code> automatically at level 3.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">splitting_ops</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[list[str]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Operations that split the graph for piecewise compilation. Auto-set at level 3.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cudagraph_copy_inputs</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Copy input tensors to static buffers for CUDA graph address stability. Only effective in <code class="docutils literal notranslate"><span class="pre">PIECEWISE</span></code> mode.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">use_inductor</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">True</span></code></p></td>
+<td><p>Whether to use the Inductor compiler backend.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">compile_sizes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[list[Union[int,</span> <span class="pre">str]]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Specific sizes to compile with Inductor. Supports <code class="docutils literal notranslate"><span class="pre">&quot;cudagraph_capture_sizes&quot;</span></code> string.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">inductor_compile_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dict</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
+<td><p>Additional Inductor configuration (e.g., <code class="docutils literal notranslate"><span class="pre">max_autotune</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">debug_dump_path</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code></p></td>
+<td><p>Path to dump debug information (traced graphs, decompiled code).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cache_dir</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code></p></td>
+<td><p>Custom cache directory. Auto-generated if empty (<code class="docutils literal notranslate"><span class="pre">~/.cache/atom/torch_compile_cache/&lt;hash&gt;/</span></code>).</p></td>
+</tr>
+</tbody>
+</table>
+<p>Related fields on <code class="docutils literal notranslate"><span class="pre">Config</span></code>:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enforce_eager</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Force eager execution, skip all compilation and CUDA graphs.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">graph_bs</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[list[int]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Final list of batch sizes for CUDA graph capture (computed from <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">compilation_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilationConfig()</span></code></p></td>
+<td><p>The compilation configuration dataclass.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="decision-tree">
+<h2>8. Decision Tree<a class="headerlink" href="#decision-tree" title="Link to this heading"></a></h2>
+<p>Use this decision tree to select the right compilation level and CUDA graph mode for your workload:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Is the model supported by torch.compile?
+|
++-- No --&gt; Level 0 (NO_COMPILATION)
+|          enforce_eager=True
+|
++-- Yes
+    |
+    +-- Debugging / profiling?
+    |   |
+    |   +-- Yes --&gt; Level 0 (NO_COMPILATION)
+    |
+    +-- Quick compatibility check?
+    |   |
+    |   +-- Yes --&gt; Level 1 (DYNAMO_AS_IS)
+    |
+    +-- Want Inductor optimization without CUDA graphs?
+    |   |
+    |   +-- Yes --&gt; Level 2 (DYNAMO_ONCE)
+    |
+    +-- Production deployment
+        |
+        +-- Level 3 (PIECEWISE) [recommended]
+            |
+            +-- Standard serving --&gt; cudagraph_mode=PIECEWISE (default)
+            |
+            +-- Small model / uniform batches --&gt; cudagraph_mode=FULL
+            |
+            +-- P/D disaggregated (decode instance) --&gt; cudagraph_mode=FULL_DECODE_ONLY
+            |
+            +-- Maximum performance --&gt; cudagraph_mode=FULL_AND_PIECEWISE
+</pre></div>
+</div>
+<section id="common-configurations">
+<h3>Common Configurations<a class="headerlink" href="#common-configurations" title="Link to this heading"></a></h3>
+<p><strong>Default production setup</strong> (level 3, piecewise CUDA graphs):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">CompilationConfig</span><span class="p">(</span><span class="n">level</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<span class="c1"># Automatically sets:</span>
+<span class="c1">#   splitting_ops = [&quot;aiter.unified_attention_with_output&quot;, &quot;aiter.mla_attention&quot;]</span>
+<span class="c1">#   cudagraph_mode = CUDAGraphMode.PIECEWISE</span>
+<span class="c1">#   cuda_graph_sizes = [512]</span>
+<span class="c1">#   graph_bs = [1, 2, 4, 8, 16, 32, ..., 512]</span>
+</pre></div>
+</div>
+<p><strong>Custom capture sizes</strong>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">CompilationConfig</span><span class="p">(</span><span class="n">level</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">cudagraph_capture_sizes</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">])</span>
+</pre></div>
+</div>
+<p><strong>Debugging with full eager execution</strong>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">Config</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span> <span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="c1"># or</span>
+<span class="n">CompilationConfig</span><span class="p">(</span><span class="n">level</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Inductor with debug dump</strong>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">CompilationConfig</span><span class="p">(</span><span class="n">level</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">debug_dump_path</span><span class="o">=</span><span class="s2">&quot;/tmp/atom_debug&quot;</span><span class="p">)</span>
+<span class="c1"># Dumps traced graphs and decompiled code to /tmp/atom_debug/rank_0/</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="source-files">
+<h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code>, <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code>, <code class="docutils literal notranslate"><span class="pre">Config.__post_init__</span></code> (compilation setup)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/utils/cuda_graph.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUDAGraphEntry</span></code>, <code class="docutils literal notranslate"><span class="pre">CUDAGraphOptions</span></code>, <code class="docutils literal notranslate"><span class="pre">CUDAGraphWrapper</span></code>, <code class="docutils literal notranslate"><span class="pre">BatchDescriptor</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/utils/backends.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilerManager</span></code>, <code class="docutils literal notranslate"><span class="pre">VllmBackend</span></code>, <code class="docutils literal notranslate"><span class="pre">SplitItem</span></code>, <code class="docutils literal notranslate"><span class="pre">split_graph()</span></code>, <code class="docutils literal notranslate"><span class="pre">PiecewiseCompileInterpreter</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/utils/forward_context.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ForwardContext</span></code>, <code class="docutils literal notranslate"><span class="pre">Context</span></code>, <code class="docutils literal notranslate"><span class="pre">AttentionMetaData</span></code>, <code class="docutils literal notranslate"><span class="pre">DPMetadata</span></code>, <code class="docutils literal notranslate"><span class="pre">set_forward_context()</span></code>, <code class="docutils literal notranslate"><span class="pre">get_forward_context()</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/utils/compiler_inferface.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompilerInterface</span></code>, <code class="docutils literal notranslate"><span class="pre">InductorAdaptor</span></code>, <code class="docutils literal notranslate"><span class="pre">InductorStandaloneAdaptor</span></code>, <code class="docutils literal notranslate"><span class="pre">AlwaysHitShapeEnv</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/utils/cuda_piecewise_backend.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">PiecewiseBackend</span></code>, <code class="docutils literal notranslate"><span class="pre">ConcreteSizeEntry</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/utils/decorators.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&#64;support_torch_compile</span></code>, <code class="docutils literal notranslate"><span class="pre">TorchCompileWrapperWithCustomDispatcher</span></code>, <code class="docutils literal notranslate"><span class="pre">start_monitoring_torch_compile</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/utils/custom_register.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">direct_register_custom_op()</span></code>, <code class="docutils literal notranslate"><span class="pre">aiter_lib</span></code> (Library instance)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_engine/model_runner.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ModelRunner.capture_cudagraph()</span></code>, <code class="docutils literal notranslate"><span class="pre">ModelRunner.run_model()</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="distributed_guide.html" class="btn btn-neutral float-left" title="ATOM Distributed Inference Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="serving_benchmarking_guide.html" class="btn btn-neutral float-right" title="ATOM Serving &amp; Benchmarking Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

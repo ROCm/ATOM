@@ -1,0 +1,1691 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ATOM Serving &amp; Benchmarking Guide &mdash; ATOM 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="vLLM-ATOM Backend" href="vllm_plugin_backend_guide.html" />
+    <link rel="prev" title="ATOM Compilation &amp; CUDA Graphs Guide" href="compilation_cudagraph_guide.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            ATOM
+              <img src="_static/atom_logo.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#docker-installation">Docker Installation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#serving-a-model">Serving a Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#batch-inference">Batch Inference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#distributed-serving">Distributed Serving</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-server">API Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#performance-tips">Performance Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model Run Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_run_guide.html#vllm-plugin-backend">vLLM Plugin Backend</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live Dashboard</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="architecture_guide.html">ATOM Architecture Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#system-overview">1. System Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#component-architecture">2. Component Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#request-lifecycle">3. Request Lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#forward-context-pattern">4. Forward Context Pattern</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#multi-process-architecture">5. Multi-Process Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#sequence-lifecycle">6. Sequence Lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#speculative-decoding-mtp-eagle">7. Speculative Decoding (MTP / EAGLE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#supported-mtp-architectures">Supported MTP architectures</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#weight-sharing">Weight sharing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#propose-loop-mha-vs-mla-branching">Propose loop: MHA vs MLA branching</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#prepare-mtp-decode"><code class="docutils literal notranslate"><span class="pre">prepare_mtp_decode()</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="configuration_guide.html">ATOM Configuration Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#master-configuration-config">1. Master Configuration (<code class="docutils literal notranslate"><span class="pre">Config</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#compilation-configuration-compilationconfig">2. Compilation Configuration (<code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilation-levels-compilationlevel">2.1 Compilation Levels (<code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilationconfig-fields">2.2 <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#cuda-graph-mode-cudagraphmode">2.3 CUDA Graph Mode (<code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quantization-configuration-quantizationconfig-layerquantconfig">3. Quantization Configuration (<code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> &amp; <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layerquantconfig-fields">3.1 <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quantizationconfig-attributes">3.2 <code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> Attributes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quanttype-values-from-aiter">3.3 <code class="docutils literal notranslate"><span class="pre">QuantType</span></code> Values (from AITER)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#supported-quantization-dtypes">3.4 Supported Quantization Dtypes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#auto-detection-from-huggingface">3.5 Auto-Detection from HuggingFace</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layer-level-quantization-dispatch">3.6 Layer-Level Quantization Dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#online-quantization-at-load-time">3.7 Online Quantization at Load Time</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#parallel-configuration-parallelconfig">4. Parallel Configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#speculative-decoding-configuration-speculativeconfig">5. Speculative Decoding Configuration (<code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#table-driven-mtp-config">5.1 Table-Driven MTP Config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#post-init-behaviour-hf-config-override">5.2 Post-init behaviour (<code class="docutils literal notranslate"><span class="pre">hf_config_override</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#sampling-parameters-samplingparams">6. Sampling Parameters (<code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#cli-arguments-engineargs">7. CLI Arguments (<code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#environment-variables">8. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#variables-registered-in-atom-utils-envs-py">8.1 Variables Registered in <code class="docutils literal notranslate"><span class="pre">atom/utils/envs.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#additional-environment-variables-used-outside-envs-py">8.2 Additional Environment Variables (Used Outside <code class="docutils literal notranslate"><span class="pre">envs.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#decision-tree-choosing-a-compilation-level">9. Decision Tree – Choosing a Compilation Level</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_support_guide.html">ATOM Model Support Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#supported-model-architectures">1. Supported Model Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-architecture-details">2. Model Architecture Details</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-qwen3forcausallm">Qwen3 (<code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qwen3moeforcausallm">Qwen3-MoE (<code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-llamaforcausallm">Llama (<code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#mixtral-mixtralforcausallm">Mixtral (<code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-v2-v3-deepseekv2forcausallm">DeepSeek V2/V3 (<code class="docutils literal notranslate"><span class="pre">DeepseekV2ForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-mtp-deepseekmtp">DeepSeek MTP (<code class="docutils literal notranslate"><span class="pre">DeepSeekMTP</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#gpt-oss-gptossforcausallm">GPT-OSS (<code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#glm-5-glmmoedsa-glmmoedsaforcausallm">GLM-5 / GlmMoeDsa (<code class="docutils literal notranslate"><span class="pre">GlmMoeDsaForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#glm4-moe-glm4moeforcausallm">GLM4-MoE (<code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-next-qwen3nextforcausallm">Qwen3-Next (<code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-5-qwen3-5forconditionalgeneration-and-qwen3-5moeforconditionalgeneration">Qwen3.5 (<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code> and <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-5-mtp-qwen3-5mtp">Qwen3.5 MTP (<code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#weight-loading">3. Weight Loading</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#function-signature">Function Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#loading-flow">Loading Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#batched-expert-staging">Batched Expert Staging</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#layers-beyond-num-hidden-layers">Layers Beyond <code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#adding-a-new-model">4. Adding a New Model</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-1-create-the-model-file">Step 1: Create the Model File</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-2-implement-layer-classes">Step 2: Implement Layer Classes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-3-implement-the-model-and-causallm-classes">Step 3: Implement the Model and CausalLM Classes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-4-register-the-model">Step 4: Register the Model</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-5-handle-weight-loading">Step 5: Handle Weight Loading</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-specific-optimizations">5. Model-Specific Optimizations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-fused-rmsnorm-quant-and-silu-mul-quant">Llama: Fused RMSNorm+Quant and SiLU+Mul+Quant</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-v2-v3-mla-fused-input-norm-qk-norm-fusion">DeepSeek V2/V3: MLA + Fused Input Norm + QK Norm Fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qk-norm-rope-cache-quant-fusion">Qwen3-MoE: QK Norm + RoPE + Cache + Quant Fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#mtp-multi-token-prediction-speculative-decoding">MTP: Multi-Token Prediction (Speculative Decoding)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_ops_guide.html">ATOM Model Operations Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#aiter-integration-overview">1. AITER Integration Overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#aiter-kernel-mapping-table">AITER Kernel Mapping Table</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#linear-operations">2. Linear Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#class-hierarchy">2.1 Class Hierarchy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#quantization-dispatch">2.2 Quantization Dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#tensor-parallel-sharding">2.3 Tensor Parallel Sharding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#weight-processing">2.4 Weight Processing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#attention-operations">3. Attention Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#base-attention-base-attention-py">3.1 Base: <code class="docutils literal notranslate"><span class="pre">Attention</span></code> (<code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#multi-head-attention-attention-mha-py">3.2 Multi-Head Attention (<code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#multi-head-latent-attention-attention-mla-py">3.3 Multi-head Latent Attention (<code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#backend-abstraction-attentions-backends-py">3.4 Backend Abstraction (<code class="docutils literal notranslate"><span class="pre">attentions/backends.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#kv-cache-operations">3.5 KV Cache Operations</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#mixture-of-experts-moe">4. Mixture of Experts (MoE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#fusedmoe-class-moe-py">4.1 <code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code> Class (<code class="docutils literal notranslate"><span class="pre">moe.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#quantization-methods">4.2 Quantization Methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#topk-routing-topk-py">4.3 TopK Routing (<code class="docutils literal notranslate"><span class="pre">topK.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#fusedmoeparallelconfig">4.4 <code class="docutils literal notranslate"><span class="pre">FusedMoEParallelConfig</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#mori-integration-fused-moe-mori-prepare-finalize-py">4.5 MORI Integration (<code class="docutils literal notranslate"><span class="pre">fused_moe/mori_prepare_finalize.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#moe-quantization-config-fused-moe-config-py">4.6 MoE Quantization Config (<code class="docutils literal notranslate"><span class="pre">fused_moe/config.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#triton-moe-fallback-fused-moe-triton-py">4.7 Triton MoE Fallback (<code class="docutils literal notranslate"><span class="pre">fused_moe_triton.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#normalization">5. Normalization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rmsnorm-layernorm-py">5.1 <code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#layernorm-layernorm-py">5.2 <code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#activation-functions">6. Activation Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#siluandmul-activation-py">6.1 <code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code> (<code class="docutils literal notranslate"><span class="pre">activation.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#embedding-output-head">7. Embedding &amp; Output Head</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#vocabparallelembedding-embed-head-py">7.1 <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#parallellmhead-embed-head-py">7.2 <code class="docutils literal notranslate"><span class="pre">ParallelLMHead</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#rotary-position-embedding-rope">8. Rotary Position Embedding (RoPE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rotaryembedding-rotary-embedding-py">8.1 <code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">rotary_embedding.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#get-rope-factory">8.2 <code class="docutils literal notranslate"><span class="pre">get_rope()</span></code> Factory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#integration-in-attention">8.3 Integration in Attention</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#sampling">9. Sampling</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#sampler-sampler-py">9.1 <code class="docutils literal notranslate"><span class="pre">Sampler</span></code> (<code class="docutils literal notranslate"><span class="pre">sampler.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rejectionsampler-rejection-sampler-py">9.2 <code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code> (<code class="docutils literal notranslate"><span class="pre">rejection_sampler.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#fused-kernel-chains">10. Fused Kernel Chains</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#source-files">Source Files</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops-attentions"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/attentions/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops-fused-moe"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/fused_moe/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-utils"><code class="docutils literal notranslate"><span class="pre">atom/utils/</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="scheduling_kv_cache_guide.html">ATOM Scheduling &amp; KV Cache Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduling-algorithm">1. Scheduling Algorithm</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduler-initialization">1.1 Scheduler Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#schedule-flow">1.2 Schedule Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#delay-factor">1.3 Delay Factor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#preemption">1.4 Preemption</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduledbatch-structure">2. ScheduledBatch Structure</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#constructor-signature">2.1 Constructor Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#fields">2.2 Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduledbatchoutput">2.3 ScheduledBatchOutput</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#block-manager">3. Block Manager</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#block-class">3.1 Block Class</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#blockmanager-initialization">3.2 BlockManager Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#allocation-allocate">3.3 Allocation (<code class="docutils literal notranslate"><span class="pre">allocate</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#deallocation-deallocate">3.4 Deallocation (<code class="docutils literal notranslate"><span class="pre">deallocate</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#can-allocate-and-can-append-checks">3.5 Can-Allocate and Can-Append Checks</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#may-append-decode-extension">3.6 May-Append (Decode Extension)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#prefix-caching">4. Prefix Caching</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#hash-function">4.1 Hash Function</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#hash-chaining">4.2 Hash Chaining</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#cache-lookup-during-allocation">4.3 Cache Lookup During Allocation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#reference-counting">4.4 Reference Counting</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#enabling-prefix-caching">4.5 Enabling Prefix Caching</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#postprocessing">5. Postprocessing</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#signature">5.1 Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#token-appending">5.2 Token Appending</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#stop-condition-checking">5.3 Stop Condition Checking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#stream-output">5.4 Stream Output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequence-cleanup">5.5 Sequence Cleanup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#placeholder-insertion">5.6 Placeholder Insertion</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#speculative-decoding-integration">6. Speculative Decoding Integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduler-tracking">6.1 Scheduler Tracking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#draft-tokens-in-scheduling">6.2 Draft Tokens in Scheduling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#acceptance-statistics">6.3 Acceptance Statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#draft-token-storage-on-sequences">6.4 Draft Token Storage on Sequences</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequence-management">7. Sequence Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#constructor">7.1 Constructor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#core-fields">7.2 Core Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#timing-fields">7.3 Timing Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#computed-properties">7.4 Computed Properties</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#num-tokens-setter">7.5 num_tokens Setter</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#lifecycle">7.6 Lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequencestatus-enum">7.7 SequenceStatus Enum</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequencetype-enum">7.8 SequenceType Enum</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="distributed_guide.html">ATOM Distributed Inference Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#tensor-parallelism-tp">1. Tensor Parallelism (TP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#weight-sharding">Weight Sharding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#process-group-initialization">Process Group Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#allreduce">AllReduce</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#configuration">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#data-parallelism-dp">2. Data Parallelism (DP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#architecture">Architecture</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-process-group-initialization">DP Process Group Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#synchronized-busy-loop">Synchronized Busy Loop</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dummy-batch-execution">Dummy Batch Execution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#device-assignment">Device Assignment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dpmetadata">DPMetadata</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#coremanager-dp-orchestration">CoreManager (DP Orchestration)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id1">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#expert-parallelism-ep">3. Expert Parallelism (EP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#fusedmoeparallelconfig">FusedMoEParallelConfig</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#expert-distribution">Expert Distribution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#mori-communication">MORI Communication</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id2">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#environment-variables">4. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#multi-gpu-deployment-examples">5. Multi-GPU Deployment Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#deepseek-r1-on-8-gpus-tp8">DeepSeek-R1 on 8 GPUs (TP8)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#qwen3-235b-a22b-on-8-gpus-tp8-ep">Qwen3-235B-A22B on 8 GPUs (TP8 + EP)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#kimi-k2-thinking-on-4-gpus-tp4">Kimi-K2-Thinking on 4 GPUs (TP4)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#combined-parallelism-strategies">6. Combined Parallelism Strategies</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-only-dense-models">TP Only (Dense Models)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-ep-moe-models">TP + EP (MoE Models)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-dense-throughput">TP + DP (Dense Throughput)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-ep-moe-throughput">TP + DP + EP (MoE Throughput)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-attention-mode">DP Attention Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="compilation_cudagraph_guide.html">ATOM Compilation &amp; CUDA Graphs Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-levels">1. Compilation Levels</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-0-no-compilation">Level 0 – NO_COMPILATION</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-1-dynamo-as-is">Level 1 – DYNAMO_AS_IS</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-2-dynamo-once">Level 2 – DYNAMO_ONCE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-3-piecewise-production-default">Level 3 – PIECEWISE (Production Default)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-modes">2. CUDA Graph Modes</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#none-value-0">NONE (value: 0)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#piecewise-value-1">PIECEWISE (value: 1)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-value-2">FULL (value: 2)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-decode-only-value-full-none">FULL_DECODE_ONLY (value: (FULL, NONE))</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-and-piecewise-value-full-piecewise">FULL_AND_PIECEWISE (value: (FULL, PIECEWISE))</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#helper-methods">Helper Methods</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-capture">3. CUDA Graph Capture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#capture-flow">Capture Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-keying">Graph Keying</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-pool-sharing">Graph Pool Sharing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#default-capture-sizes">Default Capture Sizes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-replay-in-run-model">Graph Replay in run_model()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#piecewise-compilation">4. Piecewise Compilation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#splitting-operations">Splitting Operations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-pipeline">Compilation Pipeline</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#cache-management">Cache Management</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#forward-context-stateless-dispatch">5. Forward Context &amp; Stateless Dispatch</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#forwardcontext-fields">ForwardContext Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#lifecycle">Lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#context-dataclass">Context Dataclass</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#integration-with-cuda-graphs">Integration with CUDA Graphs</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compiler-backend">6. Compiler Backend</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilermanager">CompilerManager</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilerinterface">CompilerInterface</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#inductoradaptor">InductorAdaptor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#inductorstandaloneadaptor">InductorStandaloneAdaptor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#vllmbackend">VllmBackend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#support-torch-compile-decorator">&#64;support_torch_compile Decorator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#custom-op-registration">Custom Op Registration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#configuration-options">7. Configuration Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#decision-tree">8. Decision Tree</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#common-configurations">Common Configurations</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">ATOM Serving &amp; Benchmarking Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#openai-compatible-server">1. OpenAI-Compatible Server</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#endpoints">1.1 Endpoints</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#request-models">1.2 Request Models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#response-models">1.3 Response Models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#server-startup">1.4 Server Startup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#example-curl">1.5 Example: curl</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#programmatic-api-llmengine">2. Programmatic API (LLMEngine)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#initialization">2.1 Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#samplingparams">2.2 SamplingParams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#core-methods">2.3 Core Methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#synchronous-generation-example">2.4 Synchronous Generation Example</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#asynchronous-streaming-usage">2.5 Asynchronous / Streaming Usage</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#simple-inference">3. Simple Inference</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#usage">3.1 Usage</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#what-it-does">3.2 What It Does</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#benchmarking">4. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#metrics">4.1 Metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#key-cli-arguments">4.2 Key CLI Arguments</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#backend-request-functions">4.3 Backend Request Functions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#full-benchmark-example">4.4 Full Benchmark Example</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#profiling">5. Profiling</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#configuration">5.1 Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#online-profiling-http">5.2 Online Profiling (HTTP)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#programmatic-profiling">5.3 Programmatic Profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#offline-profiling-script">5.4 Offline Profiling Script</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#profiling-during-benchmarks">5.5 Profiling During Benchmarks</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#speculative-decoding-mtp">6. Speculative Decoding (MTP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#architecture">6.1 Architecture</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id1">6.2 Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#mtp-statistics">6.3 MTP Statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#how-rejection-sampling-works">6.4 How Rejection Sampling Works</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#deployment-examples">7. Deployment Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#single-gpu">7.1 Single-GPU</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#multi-gpu-with-tensor-parallelism">7.2 Multi-GPU with Tensor Parallelism</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#docker-deployment">7.3 Docker Deployment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#engine-cli-arguments-engineargs">7.4 Engine CLI Arguments (EngineArgs)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#accuracy-validation">8. Accuracy Validation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#setup">8.1 Setup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#run-evaluation">8.2 Run Evaluation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Framework Integrations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">vLLM-ATOM Backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#architecture">1. Architecture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#design-overview">1.1 Design overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-it-works">1.2 How it works</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#plugin-lifecycle">1.3 Plugin lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#key-modules">1.4 Key Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#component-diagram">1.5 Component Diagram</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#configuration-translation">2. Configuration Translation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#pluginconfig-fields">2.1 <code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#vllm-config-mapping">2.2 vLLM Config Mapping</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#attention-integration">3. Attention Integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-the-backend-is-selected">3.1 How the Backend Is Selected</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#supported-models">4. Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#installation-and-quick-start">5. Installation and Quick Start</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#prerequisites">5.1 Prerequisites</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#set-up-the-environment">5.2 Set Up the Environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#launch-vllm-with-atom-plugin">5.3 Launch vLLM with ATOM Plugin</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#benchmark-serving">5.4 Benchmark Serving</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#enable-profiling">5.5 Enable Profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#disable-atom-plugin">5.6 Disable ATOM Plugin</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">6. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#online-quantization">Online quantization</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/serving.html">Serving API</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#llmengine-class">LLMEngine Class</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/serving.html#methods">Methods</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="api/serving.html#generate">generate()</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#samplingparams">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#return-values">Return Values</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#example">Example</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/models.html">Supported Models</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#llama-models">Llama Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#gpt-models">GPT Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#mixtral">Mixtral</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#other-architectures">Other Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#model-configuration">Model Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#performance-by-model-size">Performance by Model Size</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#quantization">Quantization</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">ATOM</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">ATOM Serving &amp; Benchmarking Guide</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/serving_benchmarking_guide.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="atom-serving-benchmarking-guide">
+<h1>ATOM Serving &amp; Benchmarking Guide<a class="headerlink" href="#atom-serving-benchmarking-guide" title="Link to this heading"></a></h1>
+<p>ATOM (AiTer Optimized Model) is AMD’s lightweight LLM inference engine built on
+<a class="reference external" href="https://github.com/ROCm/aiter">AITER</a> kernels for ROCm/HIP GPUs.  This guide
+covers the OpenAI-compatible serving API, programmatic engine usage, benchmarking
+tools, profiling, and speculative decoding.</p>
+<hr class="docutils" />
+<section id="quick-reference">
+<h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Start the OpenAI-compatible server</span>
+python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span>--model<span class="w"> </span>&lt;model_name_or_path&gt;<span class="w"> </span>--kv_cache_dtype<span class="w"> </span>fp8
+
+<span class="c1"># Run the online serving benchmark</span>
+python<span class="w"> </span>-m<span class="w"> </span>atom.benchmarks.benchmark_serving<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>vllm<span class="w"> </span>--model<span class="w"> </span>&lt;model_name_or_path&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--base-url<span class="w"> </span>http://localhost:8000<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset-name<span class="w"> </span>random<span class="w"> </span>--random-input-len<span class="w"> </span><span class="m">1024</span><span class="w"> </span>--random-output-len<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-prompts<span class="w"> </span><span class="m">1000</span><span class="w"> </span>--request-rate<span class="w"> </span>inf<span class="w"> </span>--ignore-eos
+
+<span class="c1"># Simple inference example</span>
+python<span class="w"> </span>-m<span class="w"> </span>atom.examples.simple_inference<span class="w"> </span>--model<span class="w"> </span>&lt;model_name_or_path&gt;<span class="w"> </span>--kv_cache_dtype<span class="w"> </span>fp8
+
+<span class="c1"># Offline profiling</span>
+python<span class="w"> </span>-m<span class="w"> </span>atom.examples.profile_offline<span class="w"> </span>--model<span class="w"> </span>&lt;model_name_or_path&gt;<span class="w"> </span>--kv_cache_dtype<span class="w"> </span>fp8
+
+<span class="c1"># Accuracy validation with lm-eval</span>
+lm_eval<span class="w"> </span>--model<span class="w"> </span>local-completions<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_args<span class="w"> </span><span class="nv">model</span><span class="o">=</span>&lt;model&gt;,base_url<span class="o">=</span>http://localhost:8000/v1/completions,num_concurrent<span class="o">=</span><span class="m">64</span>,max_retries<span class="o">=</span><span class="m">3</span>,tokenized_requests<span class="o">=</span>False<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tasks<span class="w"> </span>gsm8k<span class="w"> </span>--num_fewshot<span class="w"> </span><span class="m">5</span>
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="openai-compatible-server">
+<h2>1. OpenAI-Compatible Server<a class="headerlink" href="#openai-compatible-server" title="Link to this heading"></a></h2>
+<p>The server is implemented in <code class="docutils literal notranslate"><span class="pre">atom/entrypoints/openai_server.py</span></code> using FastAPI
+and Uvicorn.  It exposes OpenAI-compatible HTTP endpoints so that existing
+clients (curl, OpenAI SDK, lm-eval) work without modification.</p>
+<section id="endpoints">
+<h3>1.1 Endpoints<a class="headerlink" href="#endpoints" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>Path</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code></p></td>
+<td><p>Chat completion (ChatCompletionRequest -&gt; ChatCompletionResponse)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/v1/completions</span></code></p></td>
+<td><p>Text completion (CompletionRequest -&gt; CompletionResponse)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GET</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/v1/models</span></code></p></td>
+<td><p>List available models</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GET</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/health</span></code></p></td>
+<td><p>Health check (returns <code class="docutils literal notranslate"><span class="pre">{&quot;status&quot;:</span> <span class="pre">&quot;ok&quot;}</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/start_profile</span></code></p></td>
+<td><p>Start torch profiler on the engine</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code></p></td>
+<td><p>Stop torch profiler and flush traces</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="request-models">
+<h3>1.2 Request Models<a class="headerlink" href="#request-models" title="Link to this heading"></a></h3>
+<p><strong>ChatCompletionRequest</strong> fields:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[str]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Model name (validated against the loaded model)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">messages</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[ChatMessage]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>List of chat messages (<code class="docutils literal notranslate"><span class="pre">role</span></code>, <code class="docutils literal notranslate"><span class="pre">content</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prompt</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[ChatMessage]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Alias for <code class="docutils literal notranslate"><span class="pre">messages</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
+<td><p>Sampling temperature</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">top_p</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
+<td><p>Nucleus sampling threshold</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_tokens</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<td><p>Maximum tokens to generate</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">stop</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[str]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Stop strings</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[bool]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Ignore end-of-sequence token</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">stream</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[bool]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Enable server-sent events streaming</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">seed</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Random seed</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>CompletionRequest</strong> fields:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[str]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Model name</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prompt</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p>(required)</p></td>
+<td><p>Text prompt</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
+<td><p>Sampling temperature</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">top_p</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
+<td><p>Nucleus sampling threshold</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_tokens</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<td><p>Maximum tokens to generate</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stop</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[str]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Stop strings</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[bool]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Ignore end-of-sequence token</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stream</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[bool]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Enable SSE streaming</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="response-models">
+<h3>1.3 Response Models<a class="headerlink" href="#response-models" title="Link to this heading"></a></h3>
+<p>Both <code class="docutils literal notranslate"><span class="pre">ChatCompletionResponse</span></code> and <code class="docutils literal notranslate"><span class="pre">CompletionResponse</span></code> include:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">id</span></code> – unique request identifier (e.g. <code class="docutils literal notranslate"><span class="pre">chatcmpl-&lt;uuid&gt;</span></code> or <code class="docutils literal notranslate"><span class="pre">cmpl-&lt;uuid&gt;</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">object</span></code> – <code class="docutils literal notranslate"><span class="pre">&quot;chat.completion&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;text_completion&quot;</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">created</span></code> – Unix timestamp</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">model</span></code> – model name</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">choices</span></code> – list of generated completions</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">usage</span></code> – token counts (<code class="docutils literal notranslate"><span class="pre">prompt_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">completion_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code>)
+plus <code class="docutils literal notranslate"><span class="pre">ttft_s</span></code>, <code class="docutils literal notranslate"><span class="pre">tpot_s</span></code>, and <code class="docutils literal notranslate"><span class="pre">latency_s</span></code> timing fields</p></li>
+</ul>
+<p>Streaming responses use the SSE (Server-Sent Events) protocol with
+<code class="docutils literal notranslate"><span class="pre">data:</span> <span class="pre">[DONE]\n\n</span></code> as the termination signal.</p>
+</section>
+<section id="server-startup">
+<h3>1.4 Server Startup<a class="headerlink" href="#server-startup" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>&lt;model_name_or_path&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--server-port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p>Server-specific CLI arguments:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--host</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.0.0.0</span></code></p></td>
+<td><p>Bind address</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--server-port</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8000</span></code></p></td>
+<td><p>HTTP port (note: <code class="docutils literal notranslate"><span class="pre">--port</span></code> is for internal engine communication)</p></td>
+</tr>
+</tbody>
+</table>
+<p>All <code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code> arguments are also accepted (see Section 7 for the full list).</p>
+</section>
+<section id="example-curl">
+<h3>1.5 Example: curl<a class="headerlink" href="#example-curl" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Non-streaming chat completion</span>
+curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;model&quot;: &quot;deepseek-ai/DeepSeek-R1&quot;,</span>
+<span class="s1">    &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Hello!&quot;}],</span>
+<span class="s1">    &quot;max_tokens&quot;: 128</span>
+<span class="s1">  }&#39;</span>
+
+<span class="c1"># Streaming text completion</span>
+curl<span class="w"> </span>http://localhost:8000/v1/completions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;prompt&quot;: &quot;The capital of France is&quot;,</span>
+<span class="s1">    &quot;max_tokens&quot;: 64,</span>
+<span class="s1">    &quot;stream&quot;: true</span>
+<span class="s1">  }&#39;</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="programmatic-api-llmengine">
+<h2>2. Programmatic API (LLMEngine)<a class="headerlink" href="#programmatic-api-llmengine" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">LLMEngine</span></code> class in <code class="docutils literal notranslate"><span class="pre">atom/model_engine/llm_engine.py</span></code> provides a
+Python-native interface for inference without running an HTTP server.</p>
+<section id="initialization">
+<h3>2.1 Initialization<a class="headerlink" href="#initialization" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">atom</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLMEngine</span><span class="p">,</span> <span class="n">SamplingParams</span>
+
+<span class="n">engine</span> <span class="o">=</span> <span class="n">LLMEngine</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;deepseek-ai/DeepSeek-R1&quot;</span><span class="p">,</span> <span class="n">kv_cache_dtype</span><span class="o">=</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span>
+                   <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">LLMEngine.__init__(model,</span> <span class="pre">**kwargs)</span></code> accepts all <code class="docutils literal notranslate"><span class="pre">Config</span></code> field names as
+keyword arguments (e.g. <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_cache_dtype</span></code>,
+<code class="docutils literal notranslate"><span class="pre">max_model_len</span></code>, <code class="docutils literal notranslate"><span class="pre">data_parallel_size</span></code>, <code class="docutils literal notranslate"><span class="pre">gpu_memory_utilization</span></code>).</p>
+</section>
+<section id="samplingparams">
+<h3>2.2 SamplingParams<a class="headerlink" href="#samplingparams" title="Link to this heading"></a></h3>
+<p>Defined in <code class="docutils literal notranslate"><span class="pre">atom/sampling_params.py</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">SamplingParams</span><span class="p">:</span>
+    <span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
+    <span class="n">max_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>
+    <span class="n">ignore_eos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">stop_strings</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+</section>
+<section id="core-methods">
+<h3>2.3 Core Methods<a class="headerlink" href="#core-methods" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>Signature</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">generate</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(prompts:</span> <span class="pre">list[str],</span> <span class="pre">sampling_params)</span> <span class="pre">-&gt;</span> <span class="pre">list[dict]</span></code></p></td>
+<td><p>Synchronous batch generation; blocks until all prompts complete</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">add_request</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(prompt_or_tokens_list,</span> <span class="pre">sampling_params_list,</span> <span class="pre">stream_callback=None)</span></code></p></td>
+<td><p>Submit requests for asynchronous processing</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">step</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">()</span> <span class="pre">-&gt;</span> <span class="pre">list[Sequence]</span></code></p></td>
+<td><p>Retrieve completed sequences</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">is_finished</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">()</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code></p></td>
+<td><p>Check whether all pending requests have completed</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">start_profile</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">()</span></code></p></td>
+<td><p>Start torch profiler on all workers</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stop_profile</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">()</span></code></p></td>
+<td><p>Stop torch profiler and write traces</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">print_mtp_statistics</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">()</span></code></p></td>
+<td><p>Print speculative decoding acceptance statistics</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="synchronous-generation-example">
+<h3>2.4 Synchronous Generation Example<a class="headerlink" href="#synchronous-generation-example" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">atom</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLMEngine</span><span class="p">,</span> <span class="n">SamplingParams</span>
+
+<span class="n">engine</span> <span class="o">=</span> <span class="n">LLMEngine</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;meta-llama/Meta-Llama-3-8B&quot;</span><span class="p">,</span> <span class="n">kv_cache_dtype</span><span class="o">=</span><span class="s2">&quot;fp8&quot;</span><span class="p">)</span>
+<span class="n">params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.6</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">256</span><span class="p">)</span>
+
+<span class="n">outputs</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Explain quantum computing in simple terms.&quot;</span><span class="p">],</span> <span class="n">params</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">out</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">])</span>
+</pre></div>
+</div>
+<p>Each output dictionary contains: <code class="docutils literal notranslate"><span class="pre">text</span></code>, <code class="docutils literal notranslate"><span class="pre">token_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">latency</span></code>,
+<code class="docutils literal notranslate"><span class="pre">finish_reason</span></code>, <code class="docutils literal notranslate"><span class="pre">num_tokens_input</span></code>, <code class="docutils literal notranslate"><span class="pre">num_tokens_output</span></code>, <code class="docutils literal notranslate"><span class="pre">ttft</span></code>, and <code class="docutils literal notranslate"><span class="pre">tpot</span></code>.</p>
+</section>
+<section id="asynchronous-streaming-usage">
+<h3>2.5 Asynchronous / Streaming Usage<a class="headerlink" href="#asynchronous-streaming-usage" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">engine</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span>
+    <span class="n">prompt_or_tokens_list</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;Hello world&quot;</span><span class="p">,</span> <span class="s2">&quot;How are you?&quot;</span><span class="p">],</span>
+    <span class="n">sampling_params_list</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">128</span><span class="p">),</span>
+    <span class="n">stream_callback</span><span class="o">=</span><span class="n">my_callback</span><span class="p">,</span>  <span class="c1"># called per-token with RequestOutput</span>
+<span class="p">)</span>
+
+<span class="k">while</span> <span class="ow">not</span> <span class="n">engine</span><span class="o">.</span><span class="n">is_finished</span><span class="p">():</span>
+    <span class="n">completed</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+    <span class="c1"># process completed sequences</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="simple-inference">
+<h2>3. Simple Inference<a class="headerlink" href="#simple-inference" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">atom/examples/simple_inference.py</span></code> script provides a quick way to validate
+model loading and generation.</p>
+<section id="usage">
+<h3>3.1 Usage<a class="headerlink" href="#usage" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.examples.simple_inference<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>meta-llama/Meta-Llama-3-8B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--temperature<span class="w"> </span><span class="m">0</span>.6
+</pre></div>
+</div>
+</section>
+<section id="what-it-does">
+<h3>3.2 What It Does<a class="headerlink" href="#what-it-does" title="Link to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>Parses all <code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code> plus <code class="docutils literal notranslate"><span class="pre">--temperature</span></code> (default <code class="docutils literal notranslate"><span class="pre">0.6</span></code>).</p></li>
+<li><p>Creates an <code class="docutils literal notranslate"><span class="pre">LLMEngine</span></code> via <code class="docutils literal notranslate"><span class="pre">EngineArgs.from_cli_args(args).create_engine()</span></code>.</p></li>
+<li><p>Applies the model’s chat template to four built-in prompts (English and
+Chinese) with <code class="docutils literal notranslate"><span class="pre">enable_thinking=True</span></code>.</p></li>
+<li><p>Runs a warmup generation, then generates completions for the batch.</p></li>
+<li><p>Calls <code class="docutils literal notranslate"><span class="pre">llm.print_mtp_statistics()</span></code> to report speculative decoding stats
+(if MTP is enabled).</p></li>
+</ol>
+</section>
+</section>
+<hr class="docutils" />
+<section id="benchmarking">
+<h2>4. Benchmarking<a class="headerlink" href="#benchmarking" title="Link to this heading"></a></h2>
+<p>ATOM ships a comprehensive online serving benchmark in
+<code class="docutils literal notranslate"><span class="pre">atom/benchmarks/benchmark_serving.py</span></code> (adapted from vLLM’s benchmarking
+tooling).</p>
+<section id="metrics">
+<h3>4.1 Metrics<a class="headerlink" href="#metrics" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">BenchmarkMetrics</span></code> dataclass tracks:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Abbreviation</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Time to First Token</p></td>
+<td><p><strong>TTFT</strong></p></td>
+<td><p>Latency from request submission to the first generated token</p></td>
+</tr>
+<tr class="row-odd"><td><p>Time per Output Token</p></td>
+<td><p><strong>TPOT</strong></p></td>
+<td><p>Average latency per output token (excluding the first)</p></td>
+</tr>
+<tr class="row-even"><td><p>Inter-Token Latency</p></td>
+<td><p><strong>ITL</strong></p></td>
+<td><p>Latency between successive output tokens</p></td>
+</tr>
+<tr class="row-odd"><td><p>End-to-End Latency</p></td>
+<td><p><strong>E2EL</strong></p></td>
+<td><p>Total latency from request send to full response receipt</p></td>
+</tr>
+<tr class="row-even"><td><p>Request Throughput</p></td>
+<td><p>–</p></td>
+<td><p>Completed requests per second</p></td>
+</tr>
+<tr class="row-odd"><td><p>Output Token Throughput</p></td>
+<td><p>–</p></td>
+<td><p>Generated tokens per second</p></td>
+</tr>
+<tr class="row-even"><td><p>Total Token Throughput</p></td>
+<td><p>–</p></td>
+<td><p>(input + output) tokens per second</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Goodput</p></td>
+<td><p>–</p></td>
+<td><p>Requests per second meeting SLO targets</p></td>
+</tr>
+</tbody>
+</table>
+<p>For each latency metric, mean, median, standard deviation, and configurable
+percentiles (default: P99) are reported.</p>
+</section>
+<section id="key-cli-arguments">
+<h3>4.2 Key CLI Arguments<a class="headerlink" href="#key-cli-arguments" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--backend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">vllm</span></code></p></td>
+<td><p>Backend type. Choices: <code class="docutils literal notranslate"><span class="pre">tgi</span></code>, <code class="docutils literal notranslate"><span class="pre">vllm</span></code>, <code class="docutils literal notranslate"><span class="pre">lmdeploy</span></code>, <code class="docutils literal notranslate"><span class="pre">deepspeed-mii</span></code>, <code class="docutils literal notranslate"><span class="pre">openai</span></code>, <code class="docutils literal notranslate"><span class="pre">openai-chat</span></code>, <code class="docutils literal notranslate"><span class="pre">tensorrt-llm</span></code>, <code class="docutils literal notranslate"><span class="pre">scalellm</span></code>, <code class="docutils literal notranslate"><span class="pre">sglang</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--model</span></code></p></td>
+<td><p>(required)</p></td>
+<td><p>Model name or path</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--base-url</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Server base URL (e.g. <code class="docutils literal notranslate"><span class="pre">http://localhost:8000</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--host</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">127.0.0.1</span></code></p></td>
+<td><p>Server host (used when <code class="docutils literal notranslate"><span class="pre">--base-url</span></code> is not set)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--port</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8000</span></code></p></td>
+<td><p>Server port (used when <code class="docutils literal notranslate"><span class="pre">--base-url</span></code> is not set)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--endpoint</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/v1/completions</span></code></p></td>
+<td><p>API endpoint path</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--dataset-name</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">sharegpt</span></code></p></td>
+<td><p>Dataset type: <code class="docutils literal notranslate"><span class="pre">sharegpt</span></code>, <code class="docutils literal notranslate"><span class="pre">burstgpt</span></code>, <code class="docutils literal notranslate"><span class="pre">sonnet</span></code>, <code class="docutils literal notranslate"><span class="pre">random</span></code>, <code class="docutils literal notranslate"><span class="pre">hf</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--dataset-path</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Path to dataset file or HuggingFace dataset ID</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--num-prompts</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1000</span></code></p></td>
+<td><p>Number of prompts to benchmark</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--request-rate</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">inf</span></code></p></td>
+<td><p>Requests per second (<code class="docutils literal notranslate"><span class="pre">inf</span></code> = send all at once)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--burstiness</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
+<td><p>Burstiness factor (1.0 = Poisson process)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--max-concurrency</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Maximum concurrent requests</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--ignore-eos</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Ignore EOS token in generation</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--save-result</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Save results to JSON</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--result-dir</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Directory for result JSON files</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--result-filename</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Custom filename for results</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--percentile-metrics</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ttft,tpot,itl</span></code></p></td>
+<td><p>Comma-separated metrics to report percentiles for</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--metric-percentiles</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">99</span></code></p></td>
+<td><p>Comma-separated percentile values (e.g. <code class="docutils literal notranslate"><span class="pre">25,50,75,99</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--goodput</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>SLO targets as <code class="docutils literal notranslate"><span class="pre">KEY:VALUE</span></code> pairs (e.g. <code class="docutils literal notranslate"><span class="pre">ttft:100</span> <span class="pre">tpot:50</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--profile</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Enable torch profiler during the benchmark run</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tokenizer</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Custom tokenizer name or path</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--seed</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Random seed</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Random dataset options:</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--random-input-len</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1024</span></code></p></td>
+<td><p>Input token length</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--random-output-len</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
+<td><p>Output token length</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--random-range-ratio</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
+<td><p>Length variation ratio</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--random-prefix-len</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Fixed prefix token length</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--use-chat-template</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Apply chat template to random prompts</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="backend-request-functions">
+<h3>4.3 Backend Request Functions<a class="headerlink" href="#backend-request-functions" title="Link to this heading"></a></h3>
+<p>Defined in <code class="docutils literal notranslate"><span class="pre">atom/benchmarks/backend_request_func.py</span></code>:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Backend Key</p></th>
+<th class="head"><p>Function</p></th>
+<th class="head"><p>Protocol</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vllm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_openai_completions</span></code></p></td>
+<td><p>OpenAI Completions API (streaming)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">openai</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_openai_completions</span></code></p></td>
+<td><p>OpenAI Completions API (streaming)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">openai-chat</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_openai_chat_completions</span></code></p></td>
+<td><p>OpenAI Chat Completions API (streaming)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tgi</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_tgi</span></code></p></td>
+<td><p>TGI <code class="docutils literal notranslate"><span class="pre">generate_stream</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tensorrt-llm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_trt_llm</span></code></p></td>
+<td><p>TRT-LLM <code class="docutils literal notranslate"><span class="pre">generate_stream</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">deepspeed-mii</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_deepspeed_mii</span></code></p></td>
+<td><p>DeepSpeed-MII</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lmdeploy</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_openai_completions</span></code></p></td>
+<td><p>OpenAI Completions API</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scalellm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_openai_completions</span></code></p></td>
+<td><p>OpenAI Completions API</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sglang</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">async_request_openai_completions</span></code></p></td>
+<td><p>OpenAI Completions API</p></td>
+</tr>
+</tbody>
+</table>
+<p>Each function uses <code class="docutils literal notranslate"><span class="pre">RequestFuncInput</span></code> and returns a <code class="docutils literal notranslate"><span class="pre">RequestFuncOutput</span></code> with
+timing data (<code class="docutils literal notranslate"><span class="pre">ttft</span></code>, <code class="docutils literal notranslate"><span class="pre">itl</span></code>, <code class="docutils literal notranslate"><span class="pre">latency</span></code>, <code class="docutils literal notranslate"><span class="pre">tpot</span></code>).</p>
+</section>
+<section id="full-benchmark-example">
+<h3>4.4 Full Benchmark Example<a class="headerlink" href="#full-benchmark-example" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># 1. Start the server</span>
+python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span>-tp<span class="w"> </span><span class="m">8</span><span class="w"> </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-R1
+
+<span class="c1"># 2. Run benchmark</span>
+<span class="nv">MODEL</span><span class="o">=</span>deepseek-ai/DeepSeek-R1
+<span class="nv">ISL</span><span class="o">=</span><span class="m">1024</span>
+<span class="nv">OSL</span><span class="o">=</span><span class="m">1024</span>
+<span class="nv">CONC</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">PORT</span><span class="o">=</span><span class="m">8000</span>
+<span class="nv">RESULT_FILENAME</span><span class="o">=</span>Deepseek-R1-result
+
+python<span class="w"> </span>-m<span class="w"> </span>atom.benchmarks.benchmark_serving<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="o">=</span><span class="nv">$MODEL</span><span class="w"> </span>--backend<span class="o">=</span>vllm<span class="w"> </span>--base-url<span class="o">=</span>http://localhost:<span class="nv">$PORT</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset-name<span class="o">=</span>random<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-input-len<span class="o">=</span><span class="nv">$ISL</span><span class="w"> </span>--random-output-len<span class="o">=</span><span class="nv">$OSL</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-range-ratio<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-prompts<span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="nv">$CONC</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-concurrency<span class="o">=</span><span class="nv">$CONC</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--request-rate<span class="o">=</span>inf<span class="w"> </span>--ignore-eos<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--save-result<span class="w"> </span>--percentile-metrics<span class="o">=</span><span class="s2">&quot;ttft,tpot,itl,e2el&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--result-dir<span class="o">=</span>./<span class="w"> </span>--result-filename<span class="o">=</span><span class="nv">$RESULT_FILENAME</span>.json
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="profiling">
+<h2>5. Profiling<a class="headerlink" href="#profiling" title="Link to this heading"></a></h2>
+<p>ATOM supports PyTorch profiling via environment variables, HTTP endpoints, and
+the programmatic API.</p>
+<section id="configuration">
+<h3>5.1 Configuration<a class="headerlink" href="#configuration" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Mechanism</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--torch-profiler-dir</span> <span class="pre">&lt;dir&gt;</span></code></p></td>
+<td><p>CLI arg to set the trace output directory</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_TORCH_PROFILER_DIR</span></code> env var</p></td>
+<td><p>Sets the default <code class="docutils literal notranslate"><span class="pre">torch_profiler_dir</span></code> in <code class="docutils literal notranslate"><span class="pre">Config</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_PROFILER_MORE=1</span></code> env var</p></td>
+<td><p>Enables detailed profiling: <code class="docutils literal notranslate"><span class="pre">record_shapes</span></code>, <code class="docutils literal notranslate"><span class="pre">with_stack</span></code>, <code class="docutils literal notranslate"><span class="pre">profile_memory</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_PROFILER_TIMEOUT=&lt;seconds&gt;</span></code> env var</p></td>
+<td><p>Overrides the <code class="docutils literal notranslate"><span class="pre">stop_profile</span></code> timeout; default is 300 seconds</p></td>
+</tr>
+</tbody>
+</table>
+<p>When a profiler directory is configured, each worker saves traces to a
+rank-specific subdirectory:</p>
+<ul class="simple">
+<li><p>Multi-GPU with DP: <code class="docutils literal notranslate"><span class="pre">{profiler_dir}/dp{dp_rank}_tp{rank}/</span></code></p></li>
+<li><p>Single-GPU / TP-only: <code class="docutils literal notranslate"><span class="pre">{profiler_dir}/rank_{rank}/</span></code></p></li>
+</ul>
+<p>Traces are saved in gzip-compressed TensorBoard format and can be viewed with
+<code class="docutils literal notranslate"><span class="pre">tensorboard</span> <span class="pre">--logdir</span> <span class="pre">&lt;profiler_dir&gt;</span></code> or Chrome’s <code class="docutils literal notranslate"><span class="pre">chrome://tracing</span></code>.</p>
+</section>
+<section id="online-profiling-http">
+<h3>5.2 Online Profiling (HTTP)<a class="headerlink" href="#online-profiling-http" title="Link to this heading"></a></h3>
+<p>While the server is running, start and stop profiling with HTTP requests:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Start profiling</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-S<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://127.0.0.1:8000/start_profile
+
+<span class="c1"># ... run your workload ...</span>
+
+<span class="c1"># Stop profiling and flush traces</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-S<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://127.0.0.1:8000/stop_profile
+</pre></div>
+</div>
+<p>The server must be started with <code class="docutils literal notranslate"><span class="pre">--torch-profiler-dir</span></code> or with
+<code class="docutils literal notranslate"><span class="pre">ATOM_TORCH_PROFILER_DIR</span></code> set for these endpoints to produce traces.
+For large traces, set <code class="docutils literal notranslate"><span class="pre">ATOM_PROFILER_TIMEOUT</span></code> higher before starting the server.</p>
+</section>
+<section id="programmatic-profiling">
+<h3>5.3 Programmatic Profiling<a class="headerlink" href="#programmatic-profiling" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">engine</span> <span class="o">=</span> <span class="n">LLMEngine</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen/Qwen3-0.6B&quot;</span><span class="p">,</span> <span class="n">torch_profiler_dir</span><span class="o">=</span><span class="s2">&quot;./traces&quot;</span><span class="p">)</span>
+
+<span class="n">engine</span><span class="o">.</span><span class="n">start_profile</span><span class="p">()</span>
+<span class="n">outputs</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="n">engine</span><span class="o">.</span><span class="n">stop_profile</span><span class="p">()</span>
+<span class="c1"># Traces written to ./traces/rank_0/</span>
+</pre></div>
+</div>
+</section>
+<section id="offline-profiling-script">
+<h3>5.4 Offline Profiling Script<a class="headerlink" href="#offline-profiling-script" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">atom/examples/profile_offline.py</span></code> provides a self-contained offline profiling
+workflow:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.examples.profile_offline<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>Qwen/Qwen3-0.6B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--torch-profiler-dir<span class="w"> </span>./profiler_traces<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--input-length<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-length<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--bs<span class="w"> </span><span class="m">4</span>
+</pre></div>
+</div>
+<p>Script-specific arguments:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--input-length</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
+<td><p>Approximate input prompt length in tokens</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--output-length</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">32</span></code></p></td>
+<td><p>Output generation length in tokens</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--bs</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Batch size (number of parallel requests)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--random-input</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Use random token input instead of predefined text</p></td>
+</tr>
+</tbody>
+</table>
+<p>If <code class="docutils literal notranslate"><span class="pre">--torch-profiler-dir</span></code> is not specified, the script defaults to
+<code class="docutils literal notranslate"><span class="pre">./profiler_traces</span></code>.</p>
+</section>
+<section id="profiling-during-benchmarks">
+<h3>5.5 Profiling During Benchmarks<a class="headerlink" href="#profiling-during-benchmarks" title="Link to this heading"></a></h3>
+<p>The benchmark tool can trigger profiling automatically via <code class="docutils literal notranslate"><span class="pre">--profile</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.benchmarks.benchmark_serving<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>&lt;model&gt;<span class="w"> </span>--backend<span class="w"> </span>vllm<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--base-url<span class="w"> </span>http://localhost:8000<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset-name<span class="w"> </span>random<span class="w"> </span>--num-prompts<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--profile
+</pre></div>
+</div>
+<p>This sends <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/start_profile</span></code> before the benchmark and
+<code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/stop_profile</span></code> after completion.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="speculative-decoding-mtp">
+<h2>6. Speculative Decoding (MTP)<a class="headerlink" href="#speculative-decoding-mtp" title="Link to this heading"></a></h2>
+<p>ATOM supports Multi-Token Prediction (MTP) for DeepSeek models using the
+Eagle-style speculative decoding framework.</p>
+<section id="architecture">
+<h3>6.1 Architecture<a class="headerlink" href="#architecture" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>EagleProposer</strong> (<code class="docutils literal notranslate"><span class="pre">atom/spec_decode/eagle.py</span></code>): Loads and runs the draft
+(MTP) model to propose speculative tokens.  Supports the <code class="docutils literal notranslate"><span class="pre">DeepSeekMTPModel</span></code>
+architecture via <code class="docutils literal notranslate"><span class="pre">DeepSeekMTP</span></code>.</p></li>
+<li><p><strong>RejectionSampler</strong> (<code class="docutils literal notranslate"><span class="pre">atom/model_ops/rejection_sampler.py</span></code>): Implements
+greedy rejection sampling with a Triton kernel.  Compares draft token IDs
+against target model argmax and accepts matching prefixes; appends a bonus
+token if all drafts are accepted.</p></li>
+</ul>
+</section>
+<section id="id1">
+<h3>6.2 Configuration<a class="headerlink" href="#id1" title="Link to this heading"></a></h3>
+<p>Enable MTP via CLI arguments:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-R1<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span>-tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--method<span class="w"> </span>mtp<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-speculative-tokens<span class="w"> </span><span class="m">1</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--method</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Speculative method: <code class="docutils literal notranslate"><span class="pre">mtp</span></code> (DeepSeek MTP) or <code class="docutils literal notranslate"><span class="pre">eagle3</span></code> (EAGLE 3 / EAGLE 3.1 — see <a class="reference internal" href="eagle3_speculative_decoding.html"><span class="std std-doc"><code class="docutils literal notranslate"><span class="pre">eagle3_speculative_decoding.md</span></code></span></a>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--num-speculative-tokens</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Number of draft tokens per iteration (draft model runs this many autoregressive steps)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--draft-model</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Path or HF repo of the speculative draft model. Required for <code class="docutils literal notranslate"><span class="pre">--method</span> <span class="pre">eagle3</span></code>; the draft’s <code class="docutils literal notranslate"><span class="pre">config.json</span></code> drives EAGLE 3 vs EAGLE 3.1 toggles automatically</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="mtp-statistics">
+<h3>6.3 MTP Statistics<a class="headerlink" href="#mtp-statistics" title="Link to this heading"></a></h3>
+<p>ATOM tracks acceptance statistics at runtime:</p>
+<ul class="simple">
+<li><p><strong>total_draft_tokens</strong>: Total number of draft tokens proposed</p></li>
+<li><p><strong>total_accepted_tokens</strong>: Number of draft tokens accepted by rejection sampling</p></li>
+<li><p><strong>acceptance_rate</strong>: Ratio of accepted to draft tokens</p></li>
+</ul>
+<p>Statistics are logged every 1000 draft tokens and can be printed on demand:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">engine</span><span class="o">.</span><span class="n">print_mtp_statistics</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>Example output:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">MTP</span> <span class="n">Statistics</span><span class="p">:</span>
+  <span class="n">Total</span> <span class="n">draft</span> <span class="n">tokens</span><span class="p">:</span> <span class="mi">5000</span>
+  <span class="n">Accepted</span> <span class="n">tokens</span><span class="p">:</span>    <span class="mi">4250</span>
+  <span class="n">Acceptance</span> <span class="n">rate</span><span class="p">:</span>    <span class="mf">85.00</span><span class="o">%</span>
+</pre></div>
+</div>
+</section>
+<section id="how-rejection-sampling-works">
+<h3>6.4 How Rejection Sampling Works<a class="headerlink" href="#how-rejection-sampling-works" title="Link to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>The draft model generates <code class="docutils literal notranslate"><span class="pre">num_speculative_tokens</span></code> token predictions
+autoregressively using argmax.</p></li>
+<li><p>The target model verifies all draft tokens in a single forward pass.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">rejection_greedy_sample_kernel</span></code> (Triton) compares each draft token
+against the target model’s argmax:</p>
+<ul class="simple">
+<li><p>If they match, the token is accepted.</p></li>
+<li><p>On the first mismatch, the target model’s token replaces it and all
+subsequent draft tokens are discarded.</p></li>
+<li><p>If all draft tokens match, a bonus token from the target model is
+appended.</p></li>
+</ul>
+</li>
+</ol>
+</section>
+</section>
+<hr class="docutils" />
+<section id="deployment-examples">
+<h2>7. Deployment Examples<a class="headerlink" href="#deployment-examples" title="Link to this heading"></a></h2>
+<section id="single-gpu">
+<h3>7.1 Single-GPU<a class="headerlink" href="#single-gpu" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>Qwen/Qwen3-0.6B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8
+</pre></div>
+</div>
+</section>
+<section id="multi-gpu-with-tensor-parallelism">
+<h3>7.2 Multi-GPU with Tensor Parallelism<a class="headerlink" href="#multi-gpu-with-tensor-parallelism" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-R1<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-tp<span class="w"> </span><span class="m">8</span>
+</pre></div>
+</div>
+</section>
+<section id="docker-deployment">
+<h3>7.3 Docker Deployment<a class="headerlink" href="#docker-deployment" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Pull the ROCm PyTorch image</span>
+docker<span class="w"> </span>pull<span class="w"> </span>rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+
+<span class="c1"># Launch container</span>
+docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span>--network<span class="o">=</span>host<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--device<span class="o">=</span>/dev/kfd<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--device<span class="o">=</span>/dev/dri<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--group-add<span class="w"> </span>video<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--cap-add<span class="o">=</span>SYS_PTRACE<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--security-opt<span class="w"> </span><span class="nv">seccomp</span><span class="o">=</span>unconfined<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-v<span class="w"> </span><span class="nv">$HOME</span>:/home/<span class="nv">$USER</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-v<span class="w"> </span>/mnt:/mnt<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-v<span class="w"> </span>/data:/data<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--shm-size<span class="o">=</span>16G<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+
+<span class="c1"># Inside the container</span>
+pip<span class="w"> </span>install<span class="w"> </span>amd-aiter
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/ROCm/ATOM.git<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>ATOM<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>.
+
+<span class="c1"># Start serving</span>
+python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-R1<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span>-tp<span class="w"> </span><span class="m">8</span>
+</pre></div>
+</div>
+</section>
+<section id="engine-cli-arguments-engineargs">
+<h3>7.4 Engine CLI Arguments (EngineArgs)<a class="headerlink" href="#engine-cli-arguments-engineargs" title="Link to this heading"></a></h3>
+<p>These arguments are available for all entrypoints (server, examples, and any
+script using <code class="docutils literal notranslate"><span class="pre">EngineArgs.add_cli_args</span></code>):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--model</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-0.6B</span></code></p></td>
+<td><p>Model name or path</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--trust-remote-code</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Trust remote code from HuggingFace</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tensor-parallel-size</span></code>, <code class="docutils literal notranslate"><span class="pre">-tp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Tensor parallel size</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--data-parallel-size</span></code>, <code class="docutils literal notranslate"><span class="pre">-dp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Data parallel size</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enforce-eager</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Disable CUDA graph capture; use eager execution</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--enable_prefix_caching</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Enable prefix caching</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--port</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8006</span></code></p></td>
+<td><p>Internal engine communication port</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--kv_cache_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bf16</span></code></p></td>
+<td><p>KV cache dtype: <code class="docutils literal notranslate"><span class="pre">bf16</span></code> or <code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--block-size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16</span></code></p></td>
+<td><p>KV cache block size</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--max-model-len</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Maximum context length (defaults to HF config)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--max-num-batched-tokens</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16384</span></code></p></td>
+<td><p>Maximum tokens per batch</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--max-num-seqs</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">512</span></code></p></td>
+<td><p>Maximum sequences per batch</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--gpu-memory-utilization</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.9</span></code></p></td>
+<td><p>GPU memory utilization (0.0 to 1.0)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--scheduler-delay-factor</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.0</span></code></p></td>
+<td><p>Delay factor before scheduling next prompt</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--cudagraph-capture-sizes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[1,2,4,...,256]</span></code></p></td>
+<td><p>Batch sizes for CUDA graph capture</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--level</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">3</span></code></p></td>
+<td><p>Compilation level (0-3); 3 = torch.compile</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--load_dummy</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Dummy weights (no checkpoint read). Bare flag / <code class="docutils literal notranslate"><span class="pre">=empty</span></code>: skip load (uninitialized). <code class="docutils literal notranslate"><span class="pre">=zero</span></code>: all-zero. <code class="docutils literal notranslate"><span class="pre">=xavier</span></code>: xavier for bf16, constant target magnitude for fp4/fp8</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-expert-parallel</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Enable expert parallelism for MoE</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-dp-attention</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Enable data-parallel attention</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--torch-profiler-dir</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Directory for torch profiler traces</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--method</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Speculative decoding method (<code class="docutils literal notranslate"><span class="pre">mtp</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--num-speculative-tokens</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Number of speculative tokens per step</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<hr class="docutils" />
+<section id="accuracy-validation">
+<h2>8. Accuracy Validation<a class="headerlink" href="#accuracy-validation" title="Link to this heading"></a></h2>
+<p>ATOM supports accuracy validation through the
+<a class="reference external" href="https://github.com/EleutherAI/lm-evaluation-harness">lm-eval</a> framework via
+the OpenAI-compatible API.</p>
+<section id="setup">
+<h3>8.1 Setup<a class="headerlink" href="#setup" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>lm-eval<span class="o">[</span>api<span class="o">]</span>
+</pre></div>
+</div>
+</section>
+<section id="run-evaluation">
+<h3>8.2 Run Evaluation<a class="headerlink" href="#run-evaluation" title="Link to this heading"></a></h3>
+<p>Start an ATOM server, then run lm-eval against it:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Start server</span>
+python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>meta-llama/Meta-Llama-3-8B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8
+
+<span class="c1"># Run evaluation</span>
+lm_eval<span class="w"> </span>--model<span class="w"> </span>local-completions<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_args<span class="w"> </span><span class="nv">model</span><span class="o">=</span>meta-llama/Meta-Llama-3-8B,base_url<span class="o">=</span>http://localhost:8000/v1/completions,num_concurrent<span class="o">=</span><span class="m">64</span>,max_retries<span class="o">=</span><span class="m">3</span>,tokenized_requests<span class="o">=</span>False<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tasks<span class="w"> </span>gsm8k<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num_fewshot<span class="w"> </span><span class="m">5</span>
+</pre></div>
+</div>
+<p>Any lm-eval task can be used.  The <code class="docutils literal notranslate"><span class="pre">local-completions</span></code> model type sends
+requests to the <code class="docutils literal notranslate"><span class="pre">/v1/completions</span></code> endpoint, making it compatible with the ATOM
+server without modification.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="source-files">
+<h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/entrypoints/openai_server.py</span></code></p></td>
+<td><p>OpenAI-compatible API server (FastAPI + Uvicorn)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_engine/llm_engine.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LLMEngine</span></code> programmatic API</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/sampling_params.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code> dataclass</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_engine/arg_utils.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code> CLI argument definitions and engine factory</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/examples/simple_inference.py</span></code></p></td>
+<td><p>Simple batch inference example</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/examples/profile_offline.py</span></code></p></td>
+<td><p>Offline profiling tool</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/benchmarks/benchmark_serving.py</span></code></p></td>
+<td><p>Online serving benchmark (<code class="docutils literal notranslate"><span class="pre">BenchmarkMetrics</span></code>, dataset sampling, result reporting)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/benchmarks/backend_request_func.py</span></code></p></td>
+<td><p>Async HTTP request functions for each backend (<code class="docutils literal notranslate"><span class="pre">RequestFuncInput</span></code>, <code class="docutils literal notranslate"><span class="pre">RequestFuncOutput</span></code>, <code class="docutils literal notranslate"><span class="pre">ASYNC_REQUEST_FUNCS</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/benchmarks/benchmark_utils.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">convert_to_pytorch_benchmark_format</span></code> utility</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/spec_decode/eagle.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EagleProposer</span></code> – MTP draft model for DeepSeek speculative decoding</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_ops/rejection_sampler.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code> with Triton greedy rejection kernel</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Config</span></code>, <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code> dataclasses</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_engine/model_runner.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ModelRunner</span></code> with <code class="docutils literal notranslate"><span class="pre">start_profiler</span></code>/<code class="docutils literal notranslate"><span class="pre">stop_profiler</span></code> and MTP statistics</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="compilation_cudagraph_guide.html" class="btn btn-neutral float-left" title="ATOM Compilation &amp; CUDA Graphs Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="vllm_plugin_backend_guide.html" class="btn btn-neutral float-right" title="vLLM-ATOM Backend" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

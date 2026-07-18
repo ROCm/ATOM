@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ATOM Documentation &mdash; ATOM 0.1.0 documentation</title>
+  <title>vLLM-ATOM Backend &mdash; ATOM 0.1.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
@@ -19,7 +19,8 @@
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Installation" href="installation.html" /> 
+    <link rel="next" title="Serving API" href="api/serving.html" />
+    <link rel="prev" title="ATOM Serving &amp; Benchmarking Guide" href="serving_benchmarking_guide.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -30,7 +31,7 @@
 
           
           
-          <a href="#" class="icon icon-home">
+          <a href="index.html" class="icon icon-home">
             ATOM
               <img src="_static/atom_logo.png" class="logo" alt="Logo"/>
           </a>
@@ -465,37 +466,37 @@
 </li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Framework Integrations</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">vLLM-ATOM Backend</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#architecture">1. Architecture</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#design-overview">1.1 Design overview</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-it-works">1.2 How it works</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#plugin-lifecycle">1.3 Plugin lifecycle</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#key-modules">1.4 Key Modules</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#component-diagram">1.5 Component Diagram</a></li>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">vLLM-ATOM Backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#architecture">1. Architecture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#design-overview">1.1 Design overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#how-it-works">1.2 How it works</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#plugin-lifecycle">1.3 Plugin lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#key-modules">1.4 Key Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#component-diagram">1.5 Component Diagram</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#configuration-translation">2. Configuration Translation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#pluginconfig-fields">2.1 <code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code> Fields</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#vllm-config-mapping">2.2 vLLM Config Mapping</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#configuration-translation">2. Configuration Translation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#pluginconfig-fields">2.1 <code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#vllm-config-mapping">2.2 vLLM Config Mapping</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#attention-integration">3. Attention Integration</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-the-backend-is-selected">3.1 How the Backend Is Selected</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#attention-integration">3. Attention Integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#how-the-backend-is-selected">3.1 How the Backend Is Selected</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#supported-models">4. Supported Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#installation-and-quick-start">5. Installation and Quick Start</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#prerequisites">5.1 Prerequisites</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#set-up-the-environment">5.2 Set Up the Environment</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#launch-vllm-with-atom-plugin">5.3 Launch vLLM with ATOM Plugin</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#benchmark-serving">5.4 Benchmark Serving</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#enable-profiling">5.5 Enable Profiling</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#disable-atom-plugin">5.6 Disable ATOM Plugin</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#supported-models">4. Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#installation-and-quick-start">5. Installation and Quick Start</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#prerequisites">5.1 Prerequisites</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#set-up-the-environment">5.2 Set Up the Environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#launch-vllm-with-atom-plugin">5.3 Launch vLLM with ATOM Plugin</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#benchmark-serving">5.4 Benchmark Serving</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#enable-profiling">5.5 Enable Profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#disable-atom-plugin">5.6 Disable ATOM Plugin</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">6. Environment Variables</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#online-quantization">Online quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#environment-variables">6. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#online-quantization">Online quantization</a></li>
 </ul>
 </li>
 </ul>
@@ -534,17 +535,17 @@
 
     <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
           <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
-          <a href="#">ATOM</a>
+          <a href="index.html">ATOM</a>
       </nav>
 
       <div class="wy-nav-content">
         <div class="rst-content">
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
-      <li><a href="#" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">ATOM Documentation</li>
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">vLLM-ATOM Backend</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="_sources/index.rst.txt" rel="nofollow"> View page source</a>
+            <a href="_sources/vllm_plugin_backend_guide.md.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -552,254 +553,456 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="atom-documentation">
-<h1>ATOM Documentation<a class="headerlink" href="#atom-documentation" title="Link to this heading"></a></h1>
-<p><strong>ATOM</strong> (Accelerated Training and Optimization for Models) is AMD’s high-performance LLM serving framework optimized for ROCm platforms.</p>
-<a class="reference internal image-reference" href="_images/atom_logo.png"><img alt="_images/atom_logo.png" class="align-center" src="_images/atom_logo.png" style="width: 400px;" />
-</a>
-<div class="toctree-wrapper compound">
-<p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#serving-a-model">Serving a Model</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#batch-inference">Batch Inference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#distributed-serving">Distributed Serving</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-server">API Server</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#performance-tips">Performance Tips</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model Run Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live Dashboard</a></li>
-</ul>
-</li>
-</ul>
-</div>
-<div class="toctree-wrapper compound">
-<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="architecture_guide.html">ATOM Architecture Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#system-overview">1. System Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#component-architecture">2. Component Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#request-lifecycle">3. Request Lifecycle</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#forward-context-pattern">4. Forward Context Pattern</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#multi-process-architecture">5. Multi-Process Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#sequence-lifecycle">6. Sequence Lifecycle</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#speculative-decoding-mtp-eagle">7. Speculative Decoding (MTP / EAGLE)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="configuration_guide.html">ATOM Configuration Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#master-configuration-config">1. Master Configuration (<code class="docutils literal notranslate"><span class="pre">Config</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#compilation-configuration-compilationconfig">2. Compilation Configuration (<code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quantization-configuration-quantizationconfig-layerquantconfig">3. Quantization Configuration (<code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> &amp; <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#parallel-configuration-parallelconfig">4. Parallel Configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#speculative-decoding-configuration-speculativeconfig">5. Speculative Decoding Configuration (<code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#sampling-parameters-samplingparams">6. Sampling Parameters (<code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#cli-arguments-engineargs">7. CLI Arguments (<code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#environment-variables">8. Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#decision-tree-choosing-a-compilation-level">9. Decision Tree – Choosing a Compilation Level</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="model_support_guide.html">ATOM Model Support Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#supported-model-architectures">1. Supported Model Architectures</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-architecture-details">2. Model Architecture Details</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#weight-loading">3. Weight Loading</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#adding-a-new-model">4. Adding a New Model</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-specific-optimizations">5. Model-Specific Optimizations</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="model_ops_guide.html">ATOM Model Operations Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#aiter-integration-overview">1. AITER Integration Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#linear-operations">2. Linear Operations</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#attention-operations">3. Attention Operations</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#mixture-of-experts-moe">4. Mixture of Experts (MoE)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#normalization">5. Normalization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#activation-functions">6. Activation Functions</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#embedding-output-head">7. Embedding &amp; Output Head</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#rotary-position-embedding-rope">8. Rotary Position Embedding (RoPE)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#sampling">9. Sampling</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#fused-kernel-chains">10. Fused Kernel Chains</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="scheduling_kv_cache_guide.html">ATOM Scheduling &amp; KV Cache Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduling-algorithm">1. Scheduling Algorithm</a></li>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduledbatch-structure">2. ScheduledBatch Structure</a></li>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#block-manager">3. Block Manager</a></li>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#prefix-caching">4. Prefix Caching</a></li>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#postprocessing">5. Postprocessing</a></li>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#speculative-decoding-integration">6. Speculative Decoding Integration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequence-management">7. Sequence Management</a></li>
-<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="distributed_guide.html">ATOM Distributed Inference Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#tensor-parallelism-tp">1. Tensor Parallelism (TP)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#data-parallelism-dp">2. Data Parallelism (DP)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#expert-parallelism-ep">3. Expert Parallelism (EP)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#environment-variables">4. Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#multi-gpu-deployment-examples">5. Multi-GPU Deployment Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#combined-parallelism-strategies">6. Combined Parallelism Strategies</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="compilation_cudagraph_guide.html">ATOM Compilation &amp; CUDA Graphs Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-levels">1. Compilation Levels</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-modes">2. CUDA Graph Modes</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-capture">3. CUDA Graph Capture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#piecewise-compilation">4. Piecewise Compilation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#forward-context-stateless-dispatch">5. Forward Context &amp; Stateless Dispatch</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compiler-backend">6. Compiler Backend</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#configuration-options">7. Configuration Options</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#decision-tree">8. Decision Tree</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#source-files">Source Files</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="serving_benchmarking_guide.html">ATOM Serving &amp; Benchmarking Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#openai-compatible-server">1. OpenAI-Compatible Server</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-api-llmengine">2. Programmatic API (LLMEngine)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#simple-inference">3. Simple Inference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#benchmarking">4. Benchmarking</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#profiling">5. Profiling</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#speculative-decoding-mtp">6. Speculative Decoding (MTP)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#deployment-examples">7. Deployment Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#accuracy-validation">8. Accuracy Validation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#source-files">Source Files</a></li>
-</ul>
-</li>
-</ul>
-</div>
-<div class="toctree-wrapper compound">
-<p class="caption" role="heading"><span class="caption-text">Framework Integrations</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">vLLM-ATOM Backend</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#architecture">1. Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#configuration-translation">2. Configuration Translation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#attention-integration">3. Attention Integration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#supported-models">4. Supported Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#installation-and-quick-start">5. Installation and Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">6. Environment Variables</a></li>
-</ul>
-</li>
-</ul>
-</div>
-<div class="toctree-wrapper compound">
-<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="api/serving.html">Serving API</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/serving.html#llmengine-class">LLMEngine Class</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/serving.html#samplingparams">SamplingParams</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/serving.html#return-values">Return Values</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/serving.html#example">Example</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="api/models.html">Supported Models</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#llama-models">Llama Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#gpt-models">GPT Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#mixtral">Mixtral</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#other-architectures">Other Architectures</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#model-configuration">Model Configuration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#performance-by-model-size">Performance by Model Size</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#quantization">Quantization</a></li>
-</ul>
-</li>
-</ul>
-</div>
-<section id="features">
-<h2>Features<a class="headerlink" href="#features" title="Link to this heading"></a></h2>
-<ul class="simple">
-<li><p><strong>High Performance</strong>: Optimized kernels for AMD Instinct GPUs</p></li>
-<li><p><strong>Model Support</strong>: Wide range of LLM architectures (Llama, GPT, etc.)</p></li>
-<li><p><strong>Distributed Serving</strong>: Multi-GPU and multi-node deployment</p></li>
-<li><p><strong>Compilation</strong>: CUDAGraph and ROCm optimizations</p></li>
-<li><p><strong>Benchmarking</strong>: Built-in performance measurement tools</p></li>
-</ul>
-</section>
-<section id="supported-gpus">
-<h2>Supported GPUs<a class="headerlink" href="#supported-gpus" title="Link to this heading"></a></h2>
+  <section id="vllm-atom-backend">
+<h1>vLLM-ATOM Backend<a class="headerlink" href="#vllm-atom-backend" title="Link to this heading"></a></h1>
+<p>ATOM can work as the vLLM-ATOM out-of-tree (OOT) backend — installed as a separate Python package and plugged into vLLM through vLLM’s official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.</p>
+<p>This integration follows the direction described in the <a class="reference external" href="https://github.com/ROCm/ATOM/issues/201">RFC to enable ATOM as a vLLM out-of-tree platform</a>. The high-level idea is that vLLM remains the framework-level runtime, while ATOM focuses on model-level and kernel-level optimization for AMD GPUs. In this mode, ATOM serves as the optimized execution backend and an incubation layer for new kernels, fusions, and model implementations before they are mature enough to be upstreamed.</p>
+<section id="architecture">
+<h2>1. Architecture<a class="headerlink" href="#architecture" title="Link to this heading"></a></h2>
+<section id="design-overview">
+<h3>1.1 Design overview<a class="headerlink" href="#design-overview" title="Link to this heading"></a></h3>
+<p>In practice, the responsibilities are split as follows:</p>
 <table class="docutils align-default">
-<colgroup>
-<col style="width: 30.0%" />
-<col style="width: 20.0%" />
-<col style="width: 20.0%" />
-<col style="width: 30.0%" />
-</colgroup>
 <thead>
-<tr class="row-odd"><th class="head"><p>GPU</p></th>
-<th class="head"><p>Architecture</p></th>
-<th class="head"><p>Memory</p></th>
-<th class="head"><p>Status</p></th>
+<tr class="row-odd"><th class="head"><p>Layer</p></th>
+<th class="head"><p>Responsibility</p></th>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>AMD Instinct MI355X</p></td>
-<td><p>CDNA 4 (gfx950)</p></td>
-<td><p>288 GB HBM3e</p></td>
-<td><p>✅ Fully Supported (primary CI target)</p></td>
+<tr class="row-even"><td><p>vLLM</p></td>
+<td><p>API server, CLI, engine, scheduler, worker orchestration, cache management, and framework-level features</p></td>
 </tr>
-<tr class="row-odd"><td><p>AMD Instinct MI300X</p></td>
-<td><p>CDNA 3 (gfx942)</p></td>
-<td><p>192 GB HBM3</p></td>
-<td><p>✅ Fully Supported</p></td>
+<tr class="row-odd"><td><p>ATOM</p></td>
+<td><p>Platform plugin, model registry overrides, model wrappers, attention backends, and the optimized execution path built around ATOM/AITER integrations</p></td>
 </tr>
-<tr class="row-even"><td><p>AMD Instinct MI250X</p></td>
-<td><p>CDNA 2 (gfx90a)</p></td>
-<td><p>128 GB HBM2e</p></td>
-<td><p>✅ Fully Supported</p></td>
+<tr class="row-even"><td><p>Integration boundary</p></td>
+<td><p>vLLM calls the official plugin hooks, while ATOM implements the required platform and model interfaces without changing vLLM source</p></td>
+</tr>
+</tbody>
+</table>
+<p>This relationship is important: ATOM is not replacing vLLM as a serving framework. Instead, ATOM plugs optimized model execution components into the extension points that vLLM already exposes.</p>
+</section>
+<section id="how-it-works">
+<h3>1.2 How it works<a class="headerlink" href="#how-it-works" title="Link to this heading"></a></h3>
+<p>When the <code class="docutils literal notranslate"><span class="pre">atom</span></code> package is installed in the same Python environment as <code class="docutils literal notranslate"><span class="pre">vllm</span></code>, two entry points are exposed following the official vLLM plugin convention:</p>
+<div class="highlight-toml notranslate"><div class="highlight"><pre><span></span><span class="k">[project.entry-points.</span><span class="s2">&quot;vllm.platform_plugins&quot;</span><span class="k">]</span>
+<span class="n">atom</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;atom.plugin.vllm.register:register_platform&quot;</span>
+
+<span class="k">[project.entry-points.</span><span class="s2">&quot;vllm.general_plugins&quot;</span><span class="k">]</span>
+<span class="n">atom_model_registry</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;atom.plugin.vllm.register:register_model&quot;</span>
+</pre></div>
+</div>
+<p>During <code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code> startup, vLLM scans installed Python packages, loads these entry points, and activates the ATOM hooks:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">register_platform()</span></code> returns <code class="docutils literal notranslate"><span class="pre">atom.plugin.vllm.platform.ATOMPlatform</span></code>, so vLLM resolves <code class="docutils literal notranslate"><span class="pre">current_platform</span></code> to the ATOM platform.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">register_model()</span></code> updates selected vLLM <code class="docutils literal notranslate"><span class="pre">ModelRegistry</span></code> entries to ATOM wrappers such as <code class="docutils literal notranslate"><span class="pre">ATOMForCausalLM</span></code> and <code class="docutils literal notranslate"><span class="pre">ATOMMoEForCausalLM</span></code>.</p></li>
+<li><p>When vLLM constructs attention layers, <code class="docutils literal notranslate"><span class="pre">ATOMPlatform.get_attn_backend_cls()</span></code> returns <code class="docutils literal notranslate"><span class="pre">atom.model_ops.attentions.aiter_attention.AiterBackend</span></code> or <code class="docutils literal notranslate"><span class="pre">atom.model_ops.attentions.aiter_mla.AiterMLABackend</span></code>.</p></li>
+<li><p>When a supported model is instantiated, the ATOM wrapper creates the ATOM plugin config, initializes the ATOM/AITER runtime state, and constructs the ATOM model implementation.</p></li>
+<li><p>vLLM continues to drive request scheduling and serving, while the hot model execution path runs through ATOM model code, ATOM attention backends, and AITER-backed kernels.</p></li>
+</ul>
+</section>
+<section id="plugin-lifecycle">
+<h3>1.3 Plugin lifecycle<a class="headerlink" href="#plugin-lifecycle" title="Link to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>vLLM startup
+│
+├─ 1. register_platform()
+│     ├─ _set_framework_backbone(&quot;vllm&quot;)
+│     └─ return &quot;atom.plugin.vllm.platform.ATOMPlatform&quot;
+│
+├─ 2. register_model()
+│     └─ Override ModelRegistry for supported architectures
+│
+├─ 3. vLLM loads model → ATOMModelBase.__init__()
+│     ├─ generate_atom_config_for_plugin_mode(vllm_config)
+│     │     └─ _generate_atom_config_from_vllm_config()
+│     │           ├─ Build PluginConfig (vLLM-specific fields)
+│     │           └─ Build ATOM Config (model, TP, KV cache, etc.)
+│     ├─ Attention dispatcher selects AttentionForVllm
+│     ├─ init_aiter_dist() → initialize AITER distributed env
+│     └─ Construct ATOM model (e.g., DeepseekV3ForCausalLM)
+│
+├─ 4. AttentionForVllm layer construction
+│     ├─ MLA model → AiterMlaBackendForVllm
+│     └─ MHA model → AiterMhaBackendForVllm
+│
+└─ 5. Forward pass
+      ├─ vLLM calls ATOMModelBase.forward()
+      ├─ Delegates to self.model(input_ids, positions, ...)
+      └─ AttentionForVllm uses ATOM&#39;s AITER kernels
+</pre></div>
+</div>
+</section>
+<section id="key-modules">
+<h3>1.4 Key Modules<a class="headerlink" href="#key-modules" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Module</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom.plugin.vllm.register</span></code></p></td>
+<td><p>vLLM plugin entry points for platform and model registration</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom.plugin.vllm.platform</span></code></p></td>
+<td><p>The ATOM platform class exposed to vLLM</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom.plugin.vllm.model_wrapper</span></code></p></td>
+<td><p>ATOM model wrappers used by vLLM model construction</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom.plugin.vllm.attention</span></code></p></td>
+<td><p>vLLM-specific ATOM attention layers, backends, metadata, and impls</p></td>
 </tr>
 </tbody>
 </table>
 </section>
-<section id="quick-links">
-<h2>Quick Links<a class="headerlink" href="#quick-links" title="Link to this heading"></a></h2>
-<ul class="simple">
-<li><p><strong>GitHub</strong>: <a class="reference external" href="https://github.com/ROCm/ATOM">https://github.com/ROCm/ATOM</a></p></li>
-<li><p><strong>ROCm Documentation</strong>: <a class="reference external" href="https://rocm.docs.amd.com">https://rocm.docs.amd.com</a></p></li>
-<li><p><strong>Issues</strong>: <a class="reference external" href="https://github.com/ROCm/ATOM/issues">https://github.com/ROCm/ATOM/issues</a></p></li>
+<section id="component-diagram">
+<h3>1.5 Component Diagram<a class="headerlink" href="#component-diagram" title="Link to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>atom/plugin/
+├── __init__.py              # Public API: is_vllm, is_plugin_mode
+├── prepare.py               # Framework detection and state management
+├── config.py                # PluginConfig + vLLM-to-ATOM config translation
+├── register.py              # set_attn_cls, init_aiter_dist
+└── vllm/
+    ├── __init__.py           # vLLM sub-package exports
+    ├── register.py           # register_platform(), register_model()
+    ├── platform.py           # ATOMPlatform (RocmPlatform subclass)
+    ├── model_wrapper.py      # ATOMModelBase, ATOMForCausalLM, ATOMMoEForCausalLM
+    ├── moe.py                # vLLM-specific FusedMoE name adaptation
+    └── attention/            # vLLM-specific ATOM attention stack
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="configuration-translation">
+<h2>2. Configuration Translation<a class="headerlink" href="#configuration-translation" title="Link to this heading"></a></h2>
+<p>When vLLM constructs an ATOM model, <code class="docutils literal notranslate"><span class="pre">generate_atom_config_for_plugin_mode()</span></code> translates
+vLLM’s <code class="docutils literal notranslate"><span class="pre">VllmConfig</span></code> into an ATOM <code class="docutils literal notranslate"><span class="pre">Config</span></code>. The translation preserves vLLM’s
+scheduling, caching, and parallelism decisions while injecting ATOM-specific
+compilation and plugin settings.</p>
+<section id="pluginconfig-fields">
+<h3>2.1 <code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code> Fields<a class="headerlink" href="#pluginconfig-fields" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Any</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>vLLM’s model config object</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">rank</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Current process rank</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">is_plugin_mode</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>Always <code class="docutils literal notranslate"><span class="pre">True</span></code> when running as a plugin</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">is_vllm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">True</span></code> when running inside vLLM</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vllm_scheduler_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Any</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>vLLM scheduler config</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vllm_cache_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Any</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>vLLM cache config</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vllm_quant_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Any</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>vLLM quantization config</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="vllm-config-mapping">
+<h3>2.2 vLLM Config Mapping<a class="headerlink" href="#vllm-config-mapping" title="Link to this heading"></a></h3>
+<p>The following table shows how vLLM config fields map to ATOM <code class="docutils literal notranslate"><span class="pre">Config</span></code> fields:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>ATOM <code class="docutils literal notranslate"><span class="pre">Config</span></code> Field</p></th>
+<th class="head"><p>Source (vLLM)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">model_config.model</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_num_batched_tokens</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.max_num_batched_tokens</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_num_seqs</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.max_num_seqs</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_model_len</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">model_config.max_model_len</span></code> (or <code class="docutils literal notranslate"><span class="pre">scheduler_config.max_model_len</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gpu_memory_utilization</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache_config.gpu_memory_utilization</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">parallel_config.tensor_parallel_size</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_block_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache_config.block_size</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_kvcache_blocks</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache_config.num_gpu_blocks</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache_config.cache_dtype</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_prefix_caching</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache_config.enable_prefix_caching</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_expert_parallel</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">parallel_config.enable_expert_parallel</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">compilation_config.level</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">compilation_config.mode</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enforce_eager</span></code></p></td>
+<td><p>Always <code class="docutils literal notranslate"><span class="pre">True</span></code> (ATOM does not use its own CUDA graph logic in plugin mode)</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>CUDA graphs vs torch.compile:</strong></p>
+<ul>
+<li><p><strong>CUDA graphs</strong> — In plugin mode, ATOM sets <code class="docutils literal notranslate"><span class="pre">enforce_eager=True</span></code> and
+<code class="docutils literal notranslate"><span class="pre">use_cudagraph=False</span></code> in its own <code class="docutils literal notranslate"><span class="pre">Config</span></code>, meaning ATOM’s CUDA graph capture
+and replay logic are completely disabled. CUDA graph management is fully
+delegated to vLLM — vLLM decides when to capture, which batch sizes to graph,
+and how to replay. ATOM’s attention backends cooperate by implementing
+<code class="docutils literal notranslate"><span class="pre">build_for_cudagraph_capture()</span></code> so that vLLM can capture ATOM kernels inside
+its own CUDA graphs.</p></li>
+<li><p><strong>torch.compile</strong> — In contrast, torch.compile is handled entirely by ATOM,
+not by vLLM. ATOM’s <code class="docutils literal notranslate"><span class="pre">&#64;support_torch_compile</span></code> decorator wraps each model’s
+<code class="docutils literal notranslate"><span class="pre">forward</span></code> method and routes compilation through ATOM’s own <code class="docutils literal notranslate"><span class="pre">VllmBackend</span></code>.
+The compilation level is derived from vLLM’s <code class="docutils literal notranslate"><span class="pre">compilation_config.mode</span></code>
+(e.g., <code class="docutils literal notranslate"><span class="pre">PIECEWISE</span></code>), but the actual compilation pipeline — including graph
+splitting, Inductor invocation, and compiled-graph caching — is ATOM’s own
+implementation.</p>
+<p>Graph splitting is a key difference: ATOM splits the <code class="docutils literal notranslate"><span class="pre">torch.fx</span></code> graph at
+attention boundaries (the <code class="docutils literal notranslate"><span class="pre">unified_attention</span></code> op registered by vLLM) so that
+each piecewise subgraph can be compiled and cached independently. This split
+strategy is defined in ATOM’s <code class="docutils literal notranslate"><span class="pre">split_graph()</span></code> / <code class="docutils literal notranslate"><span class="pre">_split_judge_func()</span></code> and is
+independent of vLLM’s compilation backend.</p>
+</li>
 </ul>
 </section>
-<section id="getting-help">
-<h2>Getting Help<a class="headerlink" href="#getting-help" title="Link to this heading"></a></h2>
-<ul class="simple">
-<li><p><strong>Documentation</strong>: <a class="reference external" href="https://rocm.github.io/ATOM/">https://rocm.github.io/ATOM/</a></p></li>
-<li><p><strong>GitHub Issues</strong>: <a class="reference external" href="https://github.com/ROCm/ATOM/issues">https://github.com/ROCm/ATOM/issues</a></p></li>
-<li><p><strong>ROCm Community</strong>: <a class="reference external" href="https://github.com/ROCm/ROCm/discussions">https://github.com/ROCm/ROCm/discussions</a></p></li>
-</ul>
+</section>
+<hr class="docutils" />
+<section id="attention-integration">
+<h2>3. Attention Integration<a class="headerlink" href="#attention-integration" title="Link to this heading"></a></h2>
+<p>ATOM’s vLLM plugin constructs ATOM-owned attention layers directly from the
+ATOM model implementation. These layers implement vLLM’s <code class="docutils literal notranslate"><span class="pre">AttentionLayerBase</span></code>
+contract and return their ATOM-vLLM backend via <code class="docutils literal notranslate"><span class="pre">get_attn_backend()</span></code>.</p>
+<section id="how-the-backend-is-selected">
+<h3>3.1 How the Backend Is Selected<a class="headerlink" href="#how-the-backend-is-selected" title="Link to this heading"></a></h3>
+<p>When vLLM discovers attention-like layers through <code class="docutils literal notranslate"><span class="pre">static_forward_context</span></code>, each
+ATOM-vLLM attention layer returns its backend based on the model’s attention type:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model Attention Type</p></th>
+<th class="head"><p>Returned Backend</p></th>
+<th class="head"><p>Example Models</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>MLA (<code class="docutils literal notranslate"><span class="pre">use_mla</span> <span class="pre">==</span> <span class="pre">True</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AiterMlaBackendForVllm</span></code></p></td>
+<td><p>DeepSeek-R1, Kimi-K2</p></td>
+</tr>
+<tr class="row-odd"><td><p>Standard MHA</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AiterMhaBackendForVllm</span></code></p></td>
+<td><p>Qwen3, Llama</p></td>
+</tr>
+</tbody>
+</table>
+<p>ATOM-vLLM no longer constructs vLLM’s standard <code class="docutils literal notranslate"><span class="pre">Attention</span></code> / <code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code>, so
+there is no supported mode to disable only ATOM attention while keeping ATOM
+models active. Use <code class="docutils literal notranslate"><span class="pre">ATOM_DISABLE_VLLM_PLUGIN=1</span></code> for pure vLLM.</p>
 </section>
 </section>
-<section id="indices-and-tables">
-<h1>Indices and tables<a class="headerlink" href="#indices-and-tables" title="Link to this heading"></a></h1>
+<section id="supported-models">
+<h2>4. Supported Models<a class="headerlink" href="#supported-models" title="Link to this heading"></a></h2>
+<p>Currently, the plugin backend supports the following model architectures:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>HF architecture</p></th>
+<th class="head"><p>ATOM model implementation</p></th>
+<th class="head"><p>Model family example</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atom.models.qwen3.Qwen3ForCausalLM</span></code></p></td>
+<td><p>Qwen3 dense</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atom.models.qwen3_moe.Qwen3MoeForCausalLM</span></code></p></td>
+<td><p>Qwen3 MoE</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atom.models.gpt_oss.GptOssForCausalLM</span></code></p></td>
+<td><p>GPT-OSS</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV3ForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atom.models.deepseek_v2.DeepseekV3ForCausalLM</span></code></p></td>
+<td><p>DeepSeek-R1 / DeepSeek V3 / Kimi-K2 style models</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atom.models.glm4_moe.Glm4MoeForCausalLM</span></code></p></td>
+<td><p>GLM-4-MoE</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">Kimi-K2</span></code> is also supported. Although it is usually loaded with <code class="docutils literal notranslate"><span class="pre">--trust-remote-code</span></code>, it shares the same DeepSeek-style MLA+MoE architecture path and reuses <code class="docutils literal notranslate"><span class="pre">atom.models.deepseek_v2.DeepseekV3ForCausalLM</span></code> in the ATOM vLLM OOT backend.</p>
+</section>
+<hr class="docutils" />
+<section id="installation-and-quick-start">
+<h2>5. Installation and Quick Start<a class="headerlink" href="#installation-and-quick-start" title="Link to this heading"></a></h2>
+<section id="prerequisites">
+<h3>5.1 Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading"></a></h3>
 <ul class="simple">
-<li><p><a class="reference internal" href="genindex.html"><span class="std std-ref">Index</span></a></p></li>
-<li><p><a class="reference internal" href="search.html"><span class="std std-ref">Search Page</span></a></p></li>
+<li><p>AMD Instinct MI300X / MI300A / MI355X GPUs</p></li>
 </ul>
+</section>
+<section id="set-up-the-environment">
+<h3>5.2 Set Up the Environment<a class="headerlink" href="#set-up-the-environment" title="Link to this heading"></a></h3>
+<p>The recommended approach is to pull an official ATOM + vLLM Docker image from
+<a class="reference external" href="https://hub.docker.com/r/rocm/atom-dev/tags?name=vllm">Docker Hub</a>. These
+images ship with ROCm, PyTorch, AITER, ATOM, and a compatible vLLM build
+pre-installed — no manual dependency management is required.</p>
+<p>Pull the latest OOT image:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>rocm/atom-dev:vllm-latest
+</pre></div>
+</div>
+<p>If you need an OOT docker image for a specific vLLM version or a specific release date, browse the available tags on <a class="reference external" href="https://hub.docker.com/r/rocm/atom-dev/tags">Docker Hub</a> and pull the exact tag you need there. For example, to pull the OOT docker adapted to vLLM <code class="docutils literal notranslate"><span class="pre">0.17.0</span></code> on <code class="docutils literal notranslate"><span class="pre">2026-03-15</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>rocm/atom-dev:vllm-v0.17.0-nightly_20260315
+</pre></div>
+</div>
+</section>
+<section id="launch-vllm-with-atom-plugin">
+<h3>5.3 Launch vLLM with ATOM Plugin<a class="headerlink" href="#launch-vllm-with-atom-plugin" title="Link to this heading"></a></h3>
+<p>The vLLM-ATOM backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options, OpenAI-compatible API usage, and client patterns, refer to the <a class="reference external" href="https://docs.vllm.ai/en/latest/">official vLLM documentation</a>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>vllm<span class="w"> </span>serve<span class="w"> </span><span class="si">${</span><span class="nv">model</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--host<span class="w"> </span>localhost<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tensor-parallel-size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-expert-parallel<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpu_memory_utilization<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--async-scheduling<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--compilation-config<span class="w"> </span><span class="s1">&#39;{&quot;cudagraph_mode&quot;: &quot;FULL_AND_PIECEWISE&quot;}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv-cache-dtype<span class="w"> </span>fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--no-enable-prefix-caching
+</pre></div>
+</div>
+<p>ATOM will log its activation at startup:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">INFO</span> <span class="n">atom</span><span class="p">:</span> <span class="n">Register</span> <span class="n">model</span> <span class="n">DeepseekV3ForCausalLM</span> <span class="n">to</span> <span class="n">vLLM</span> <span class="k">with</span> <span class="n">atom</span><span class="o">.</span><span class="n">plugin</span><span class="o">.</span><span class="n">vllm</span><span class="o">.</span><span class="n">model_wrapper</span><span class="p">:</span><span class="n">ATOMMoEForCausalLM</span>
+<span class="n">INFO</span> <span class="n">atom</span><span class="p">:</span> <span class="n">Use</span> <span class="n">atom</span> <span class="n">attention</span> <span class="n">backend</span>
+</pre></div>
+</div>
+</section>
+<section id="benchmark-serving">
+<h3>5.4 Benchmark Serving<a class="headerlink" href="#benchmark-serving" title="Link to this heading"></a></h3>
+<p>Users can use the default vllm bench commands for performance benchmarking.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>vllm<span class="w"> </span>bench<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--host<span class="w"> </span>localhost<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span><span class="si">${</span><span class="nv">model</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset-name<span class="w"> </span>random<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-input-len<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-output-len<span class="w"> </span><span class="m">1000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-concurrency<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-prompts<span class="w"> </span><span class="m">640</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--percentile-metrics<span class="w"> </span>ttft,tpot,itl,e2el
+</pre></div>
+</div>
+</section>
+<section id="enable-profiling">
+<h3>5.5 Enable Profiling<a class="headerlink" href="#enable-profiling" title="Link to this heading"></a></h3>
+<p>If you want to collect profiles, add the recommended commands by vLLM with <code class="docutils literal notranslate"><span class="pre">--profiler-config</span> <span class="pre">&quot;$profiler_config&quot;</span></code>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">profiler_dir</span><span class="o">=</span>./
+
+<span class="nv">profiler_config</span><span class="o">=</span><span class="k">$(</span><span class="nb">printf</span><span class="w"> </span><span class="s1">&#39;{&quot;profiler&quot;:&quot;torch&quot;,&quot;torch_profiler_dir&quot;:&quot;%s&quot;,&quot;torch_profiler_with_stack&quot;:true,&quot;torch_profiler_record_shapes&quot;:true}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">profiler_dir</span><span class="si">}</span><span class="s2">&quot;</span><span class="k">)</span>
+</pre></div>
+</div>
+</section>
+<section id="disable-atom-plugin">
+<h3>5.6 Disable ATOM Plugin<a class="headerlink" href="#disable-atom-plugin" title="Link to this heading"></a></h3>
+<p>This is intended for <strong>debugging only</strong>. When the ATOM plugin is disabled, vLLM
+falls back to its built-in ROCm path, which may encounter version mismatches
+with the AITER library bundled in the environment. To run pure vLLM without ATOM,
+set environment variables before launching:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Disable the entire ATOM plugin (platform + models)</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">ATOM_DISABLE_VLLM_PLUGIN</span><span class="o">=</span><span class="m">1</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="environment-variables">
+<h2>6. Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_DISABLE_VLLM_PLUGIN</span></code></p></td>
+<td><p>bool</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (false)</p></td>
+<td><p>Set to <code class="docutils literal notranslate"><span class="pre">1</span></code> to disable the entire ATOM vLLM plugin (platform + model registration). vLLM runs in pure ROCm mode.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION</span></code></p></td>
+<td><p>bool</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (false)</p></td>
+<td><p>Enable QK-norm + RoPE + cache + quant fusion in attention. Recommended for Qwen3-MoE models.</p></td>
+</tr>
+</tbody>
+</table>
+<section id="online-quantization">
+<h3>Online quantization<a class="headerlink" href="#online-quantization" title="Link to this heading"></a></h3>
+<p>Online (load-time) quantization is supported in plugin mode. Since <code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>
+cannot take ATOM’s <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> CLI flag, pass the same JSON through
+vLLM’s <code class="docutils literal notranslate"><span class="pre">--additional-config</span></code> under the <code class="docutils literal notranslate"><span class="pre">online_quant_config</span></code> key:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>vllm<span class="w"> </span>serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span>...<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--additional-config<span class="w"> </span><span class="s1">&#39;{&quot;online_quant_config&quot;: {&quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;, &quot;layer_quant_config&quot;: {&quot;*expert*&quot;: &quot;mxfp4&quot;}, &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]}}&#39;</span>
+</pre></div>
+</div>
+<p>See the <a class="reference internal" href="online_quantization_guide.html#35-plugin-mode-vllm-serve"><span class="std std-ref">online quantization guide</span></a> for the full schema.</p>
+</section>
+</section>
 </section>
 
 
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="installation.html" class="btn btn-neutral float-right" title="Installation" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="serving_benchmarking_guide.html" class="btn btn-neutral float-left" title="ATOM Serving &amp; Benchmarking Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="api/serving.html" class="btn btn-neutral float-right" title="Serving API" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

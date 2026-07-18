@@ -1,0 +1,1615 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ATOM Model Operations Guide &mdash; ATOM 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="ATOM Scheduling &amp; KV Cache Guide" href="scheduling_kv_cache_guide.html" />
+    <link rel="prev" title="ATOM Model Support Guide" href="model_support_guide.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            ATOM
+              <img src="_static/atom_logo.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#docker-installation">Docker Installation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#serving-a-model">Serving a Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#batch-inference">Batch Inference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#distributed-serving">Distributed Serving</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-server">API Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#performance-tips">Performance Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model Run Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_run_guide.html#vllm-plugin-backend">vLLM Plugin Backend</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live Dashboard</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="architecture_guide.html">ATOM Architecture Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#system-overview">1. System Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#component-architecture">2. Component Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#request-lifecycle">3. Request Lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#forward-context-pattern">4. Forward Context Pattern</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#multi-process-architecture">5. Multi-Process Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#sequence-lifecycle">6. Sequence Lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#speculative-decoding-mtp-eagle">7. Speculative Decoding (MTP / EAGLE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#supported-mtp-architectures">Supported MTP architectures</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#weight-sharing">Weight sharing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#propose-loop-mha-vs-mla-branching">Propose loop: MHA vs MLA branching</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#prepare-mtp-decode"><code class="docutils literal notranslate"><span class="pre">prepare_mtp_decode()</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="configuration_guide.html">ATOM Configuration Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#master-configuration-config">1. Master Configuration (<code class="docutils literal notranslate"><span class="pre">Config</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#compilation-configuration-compilationconfig">2. Compilation Configuration (<code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilation-levels-compilationlevel">2.1 Compilation Levels (<code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilationconfig-fields">2.2 <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#cuda-graph-mode-cudagraphmode">2.3 CUDA Graph Mode (<code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quantization-configuration-quantizationconfig-layerquantconfig">3. Quantization Configuration (<code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> &amp; <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layerquantconfig-fields">3.1 <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quantizationconfig-attributes">3.2 <code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> Attributes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quanttype-values-from-aiter">3.3 <code class="docutils literal notranslate"><span class="pre">QuantType</span></code> Values (from AITER)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#supported-quantization-dtypes">3.4 Supported Quantization Dtypes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#auto-detection-from-huggingface">3.5 Auto-Detection from HuggingFace</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layer-level-quantization-dispatch">3.6 Layer-Level Quantization Dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#online-quantization-at-load-time">3.7 Online Quantization at Load Time</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#parallel-configuration-parallelconfig">4. Parallel Configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#speculative-decoding-configuration-speculativeconfig">5. Speculative Decoding Configuration (<code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#table-driven-mtp-config">5.1 Table-Driven MTP Config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#post-init-behaviour-hf-config-override">5.2 Post-init behaviour (<code class="docutils literal notranslate"><span class="pre">hf_config_override</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#sampling-parameters-samplingparams">6. Sampling Parameters (<code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#cli-arguments-engineargs">7. CLI Arguments (<code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#environment-variables">8. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#variables-registered-in-atom-utils-envs-py">8.1 Variables Registered in <code class="docutils literal notranslate"><span class="pre">atom/utils/envs.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#additional-environment-variables-used-outside-envs-py">8.2 Additional Environment Variables (Used Outside <code class="docutils literal notranslate"><span class="pre">envs.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#decision-tree-choosing-a-compilation-level">9. Decision Tree – Choosing a Compilation Level</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_support_guide.html">ATOM Model Support Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#supported-model-architectures">1. Supported Model Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-architecture-details">2. Model Architecture Details</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-qwen3forcausallm">Qwen3 (<code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qwen3moeforcausallm">Qwen3-MoE (<code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-llamaforcausallm">Llama (<code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#mixtral-mixtralforcausallm">Mixtral (<code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-v2-v3-deepseekv2forcausallm">DeepSeek V2/V3 (<code class="docutils literal notranslate"><span class="pre">DeepseekV2ForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-mtp-deepseekmtp">DeepSeek MTP (<code class="docutils literal notranslate"><span class="pre">DeepSeekMTP</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#gpt-oss-gptossforcausallm">GPT-OSS (<code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#glm-5-glmmoedsa-glmmoedsaforcausallm">GLM-5 / GlmMoeDsa (<code class="docutils literal notranslate"><span class="pre">GlmMoeDsaForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#glm4-moe-glm4moeforcausallm">GLM4-MoE (<code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-next-qwen3nextforcausallm">Qwen3-Next (<code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-5-qwen3-5forconditionalgeneration-and-qwen3-5moeforconditionalgeneration">Qwen3.5 (<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code> and <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-5-mtp-qwen3-5mtp">Qwen3.5 MTP (<code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#weight-loading">3. Weight Loading</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#function-signature">Function Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#loading-flow">Loading Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#batched-expert-staging">Batched Expert Staging</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#layers-beyond-num-hidden-layers">Layers Beyond <code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#adding-a-new-model">4. Adding a New Model</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-1-create-the-model-file">Step 1: Create the Model File</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-2-implement-layer-classes">Step 2: Implement Layer Classes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-3-implement-the-model-and-causallm-classes">Step 3: Implement the Model and CausalLM Classes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-4-register-the-model">Step 4: Register the Model</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-5-handle-weight-loading">Step 5: Handle Weight Loading</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-specific-optimizations">5. Model-Specific Optimizations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-fused-rmsnorm-quant-and-silu-mul-quant">Llama: Fused RMSNorm+Quant and SiLU+Mul+Quant</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-v2-v3-mla-fused-input-norm-qk-norm-fusion">DeepSeek V2/V3: MLA + Fused Input Norm + QK Norm Fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qk-norm-rope-cache-quant-fusion">Qwen3-MoE: QK Norm + RoPE + Cache + Quant Fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#mtp-multi-token-prediction-speculative-decoding">MTP: Multi-Token Prediction (Speculative Decoding)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">ATOM Model Operations Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#aiter-integration-overview">1. AITER Integration Overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#aiter-kernel-mapping-table">AITER Kernel Mapping Table</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#linear-operations">2. Linear Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#class-hierarchy">2.1 Class Hierarchy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#quantization-dispatch">2.2 Quantization Dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensor-parallel-sharding">2.3 Tensor Parallel Sharding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#weight-processing">2.4 Weight Processing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#attention-operations">3. Attention Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#base-attention-base-attention-py">3.1 Base: <code class="docutils literal notranslate"><span class="pre">Attention</span></code> (<code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#multi-head-attention-attention-mha-py">3.2 Multi-Head Attention (<code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#multi-head-latent-attention-attention-mla-py">3.3 Multi-head Latent Attention (<code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#backend-abstraction-attentions-backends-py">3.4 Backend Abstraction (<code class="docutils literal notranslate"><span class="pre">attentions/backends.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#kv-cache-operations">3.5 KV Cache Operations</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#mixture-of-experts-moe">4. Mixture of Experts (MoE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#fusedmoe-class-moe-py">4.1 <code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code> Class (<code class="docutils literal notranslate"><span class="pre">moe.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#quantization-methods">4.2 Quantization Methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#topk-routing-topk-py">4.3 TopK Routing (<code class="docutils literal notranslate"><span class="pre">topK.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#fusedmoeparallelconfig">4.4 <code class="docutils literal notranslate"><span class="pre">FusedMoEParallelConfig</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#mori-integration-fused-moe-mori-prepare-finalize-py">4.5 MORI Integration (<code class="docutils literal notranslate"><span class="pre">fused_moe/mori_prepare_finalize.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#moe-quantization-config-fused-moe-config-py">4.6 MoE Quantization Config (<code class="docutils literal notranslate"><span class="pre">fused_moe/config.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#triton-moe-fallback-fused-moe-triton-py">4.7 Triton MoE Fallback (<code class="docutils literal notranslate"><span class="pre">fused_moe_triton.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#normalization">5. Normalization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#rmsnorm-layernorm-py">5.1 <code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#layernorm-layernorm-py">5.2 <code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#activation-functions">6. Activation Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#siluandmul-activation-py">6.1 <code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code> (<code class="docutils literal notranslate"><span class="pre">activation.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#embedding-output-head">7. Embedding &amp; Output Head</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#vocabparallelembedding-embed-head-py">7.1 <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#parallellmhead-embed-head-py">7.2 <code class="docutils literal notranslate"><span class="pre">ParallelLMHead</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#rotary-position-embedding-rope">8. Rotary Position Embedding (RoPE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#rotaryembedding-rotary-embedding-py">8.1 <code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">rotary_embedding.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#get-rope-factory">8.2 <code class="docutils literal notranslate"><span class="pre">get_rope()</span></code> Factory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#integration-in-attention">8.3 Integration in Attention</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#sampling">9. Sampling</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#sampler-sampler-py">9.1 <code class="docutils literal notranslate"><span class="pre">Sampler</span></code> (<code class="docutils literal notranslate"><span class="pre">sampler.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#rejectionsampler-rejection-sampler-py">9.2 <code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code> (<code class="docutils literal notranslate"><span class="pre">rejection_sampler.py</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#fused-kernel-chains">10. Fused Kernel Chains</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#atom-model-ops"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#atom-model-ops-attentions"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/attentions/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#atom-model-ops-fused-moe"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/fused_moe/</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#atom-utils"><code class="docutils literal notranslate"><span class="pre">atom/utils/</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="scheduling_kv_cache_guide.html">ATOM Scheduling &amp; KV Cache Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduling-algorithm">1. Scheduling Algorithm</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduler-initialization">1.1 Scheduler Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#schedule-flow">1.2 Schedule Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#delay-factor">1.3 Delay Factor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#preemption">1.4 Preemption</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduledbatch-structure">2. ScheduledBatch Structure</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#constructor-signature">2.1 Constructor Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#fields">2.2 Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduledbatchoutput">2.3 ScheduledBatchOutput</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#block-manager">3. Block Manager</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#block-class">3.1 Block Class</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#blockmanager-initialization">3.2 BlockManager Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#allocation-allocate">3.3 Allocation (<code class="docutils literal notranslate"><span class="pre">allocate</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#deallocation-deallocate">3.4 Deallocation (<code class="docutils literal notranslate"><span class="pre">deallocate</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#can-allocate-and-can-append-checks">3.5 Can-Allocate and Can-Append Checks</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#may-append-decode-extension">3.6 May-Append (Decode Extension)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#prefix-caching">4. Prefix Caching</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#hash-function">4.1 Hash Function</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#hash-chaining">4.2 Hash Chaining</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#cache-lookup-during-allocation">4.3 Cache Lookup During Allocation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#reference-counting">4.4 Reference Counting</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#enabling-prefix-caching">4.5 Enabling Prefix Caching</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#postprocessing">5. Postprocessing</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#signature">5.1 Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#token-appending">5.2 Token Appending</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#stop-condition-checking">5.3 Stop Condition Checking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#stream-output">5.4 Stream Output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequence-cleanup">5.5 Sequence Cleanup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#placeholder-insertion">5.6 Placeholder Insertion</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#speculative-decoding-integration">6. Speculative Decoding Integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#scheduler-tracking">6.1 Scheduler Tracking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#draft-tokens-in-scheduling">6.2 Draft Tokens in Scheduling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#acceptance-statistics">6.3 Acceptance Statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#draft-token-storage-on-sequences">6.4 Draft Token Storage on Sequences</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequence-management">7. Sequence Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#constructor">7.1 Constructor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#core-fields">7.2 Core Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#timing-fields">7.3 Timing Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#computed-properties">7.4 Computed Properties</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#num-tokens-setter">7.5 num_tokens Setter</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#lifecycle">7.6 Lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequencestatus-enum">7.7 SequenceStatus Enum</a></li>
+<li class="toctree-l3"><a class="reference internal" href="scheduling_kv_cache_guide.html#sequencetype-enum">7.8 SequenceType Enum</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="scheduling_kv_cache_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="distributed_guide.html">ATOM Distributed Inference Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#tensor-parallelism-tp">1. Tensor Parallelism (TP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#weight-sharding">Weight Sharding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#process-group-initialization">Process Group Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#allreduce">AllReduce</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#configuration">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#data-parallelism-dp">2. Data Parallelism (DP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#architecture">Architecture</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-process-group-initialization">DP Process Group Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#synchronized-busy-loop">Synchronized Busy Loop</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dummy-batch-execution">Dummy Batch Execution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#device-assignment">Device Assignment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dpmetadata">DPMetadata</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#coremanager-dp-orchestration">CoreManager (DP Orchestration)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id1">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#expert-parallelism-ep">3. Expert Parallelism (EP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#fusedmoeparallelconfig">FusedMoEParallelConfig</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#expert-distribution">Expert Distribution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#mori-communication">MORI Communication</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id2">Configuration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#environment-variables">4. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#multi-gpu-deployment-examples">5. Multi-GPU Deployment Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#deepseek-r1-on-8-gpus-tp8">DeepSeek-R1 on 8 GPUs (TP8)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#qwen3-235b-a22b-on-8-gpus-tp8-ep">Qwen3-235B-A22B on 8 GPUs (TP8 + EP)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#kimi-k2-thinking-on-4-gpus-tp4">Kimi-K2-Thinking on 4 GPUs (TP4)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#combined-parallelism-strategies">6. Combined Parallelism Strategies</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-only-dense-models">TP Only (Dense Models)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-ep-moe-models">TP + EP (MoE Models)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-dense-throughput">TP + DP (Dense Throughput)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-ep-moe-throughput">TP + DP + EP (MoE Throughput)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-attention-mode">DP Attention Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="compilation_cudagraph_guide.html">ATOM Compilation &amp; CUDA Graphs Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-levels">1. Compilation Levels</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-0-no-compilation">Level 0 – NO_COMPILATION</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-1-dynamo-as-is">Level 1 – DYNAMO_AS_IS</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-2-dynamo-once">Level 2 – DYNAMO_ONCE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-3-piecewise-production-default">Level 3 – PIECEWISE (Production Default)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-modes">2. CUDA Graph Modes</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#none-value-0">NONE (value: 0)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#piecewise-value-1">PIECEWISE (value: 1)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-value-2">FULL (value: 2)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-decode-only-value-full-none">FULL_DECODE_ONLY (value: (FULL, NONE))</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-and-piecewise-value-full-piecewise">FULL_AND_PIECEWISE (value: (FULL, PIECEWISE))</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#helper-methods">Helper Methods</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-capture">3. CUDA Graph Capture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#capture-flow">Capture Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-keying">Graph Keying</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-pool-sharing">Graph Pool Sharing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#default-capture-sizes">Default Capture Sizes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-replay-in-run-model">Graph Replay in run_model()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#piecewise-compilation">4. Piecewise Compilation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#splitting-operations">Splitting Operations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-pipeline">Compilation Pipeline</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#cache-management">Cache Management</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#forward-context-stateless-dispatch">5. Forward Context &amp; Stateless Dispatch</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#forwardcontext-fields">ForwardContext Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#lifecycle">Lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#context-dataclass">Context Dataclass</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#integration-with-cuda-graphs">Integration with CUDA Graphs</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compiler-backend">6. Compiler Backend</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilermanager">CompilerManager</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilerinterface">CompilerInterface</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#inductoradaptor">InductorAdaptor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#inductorstandaloneadaptor">InductorStandaloneAdaptor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#vllmbackend">VllmBackend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#support-torch-compile-decorator">&#64;support_torch_compile Decorator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#custom-op-registration">Custom Op Registration</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#configuration-options">7. Configuration Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#decision-tree">8. Decision Tree</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#common-configurations">Common Configurations</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="serving_benchmarking_guide.html">ATOM Serving &amp; Benchmarking Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#openai-compatible-server">1. OpenAI-Compatible Server</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#endpoints">1.1 Endpoints</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#request-models">1.2 Request Models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#response-models">1.3 Response Models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#server-startup">1.4 Server Startup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#example-curl">1.5 Example: curl</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-api-llmengine">2. Programmatic API (LLMEngine)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#initialization">2.1 Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#samplingparams">2.2 SamplingParams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#core-methods">2.3 Core Methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#synchronous-generation-example">2.4 Synchronous Generation Example</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#asynchronous-streaming-usage">2.5 Asynchronous / Streaming Usage</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#simple-inference">3. Simple Inference</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#usage">3.1 Usage</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#what-it-does">3.2 What It Does</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#benchmarking">4. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#metrics">4.1 Metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#key-cli-arguments">4.2 Key CLI Arguments</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#backend-request-functions">4.3 Backend Request Functions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#full-benchmark-example">4.4 Full Benchmark Example</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#profiling">5. Profiling</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#configuration">5.1 Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#online-profiling-http">5.2 Online Profiling (HTTP)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-profiling">5.3 Programmatic Profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#offline-profiling-script">5.4 Offline Profiling Script</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#profiling-during-benchmarks">5.5 Profiling During Benchmarks</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#speculative-decoding-mtp">6. Speculative Decoding (MTP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#architecture">6.1 Architecture</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#id1">6.2 Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#mtp-statistics">6.3 MTP Statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#how-rejection-sampling-works">6.4 How Rejection Sampling Works</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#deployment-examples">7. Deployment Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#single-gpu">7.1 Single-GPU</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#multi-gpu-with-tensor-parallelism">7.2 Multi-GPU with Tensor Parallelism</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#docker-deployment">7.3 Docker Deployment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#engine-cli-arguments-engineargs">7.4 Engine CLI Arguments (EngineArgs)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#accuracy-validation">8. Accuracy Validation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#setup">8.1 Setup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#run-evaluation">8.2 Run Evaluation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#source-files">Source Files</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Framework Integrations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">vLLM-ATOM Backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#architecture">1. Architecture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#design-overview">1.1 Design overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-it-works">1.2 How it works</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#plugin-lifecycle">1.3 Plugin lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#key-modules">1.4 Key Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#component-diagram">1.5 Component Diagram</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#configuration-translation">2. Configuration Translation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#pluginconfig-fields">2.1 <code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code> Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#vllm-config-mapping">2.2 vLLM Config Mapping</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#attention-integration">3. Attention Integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-the-backend-is-selected">3.1 How the Backend Is Selected</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#supported-models">4. Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#installation-and-quick-start">5. Installation and Quick Start</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#prerequisites">5.1 Prerequisites</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#set-up-the-environment">5.2 Set Up the Environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#launch-vllm-with-atom-plugin">5.3 Launch vLLM with ATOM Plugin</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#benchmark-serving">5.4 Benchmark Serving</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#enable-profiling">5.5 Enable Profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#disable-atom-plugin">5.6 Disable ATOM Plugin</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">6. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#online-quantization">Online quantization</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/serving.html">Serving API</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#llmengine-class">LLMEngine Class</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/serving.html#methods">Methods</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="api/serving.html#generate">generate()</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#samplingparams">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#return-values">Return Values</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#example">Example</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/models.html">Supported Models</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#llama-models">Llama Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#gpt-models">GPT Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#mixtral">Mixtral</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#other-architectures">Other Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#model-configuration">Model Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#performance-by-model-size">Performance by Model Size</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#quantization">Quantization</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">ATOM</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">ATOM Model Operations Guide</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/model_ops_guide.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="atom-model-operations-guide">
+<h1>ATOM Model Operations Guide<a class="headerlink" href="#atom-model-operations-guide" title="Link to this heading"></a></h1>
+<p>ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions for LLM inference on AMD ROCm/HIP GPUs. This guide documents every operator class in <code class="docutils literal notranslate"><span class="pre">atom/model_ops/</span></code>, their AITER kernel mappings, quantization paths, and fused kernel chains.</p>
+<hr class="docutils" />
+<section id="quick-reference">
+<h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>ATOM Class</p></th>
+<th class="head"><p>File</p></th>
+<th class="head"><p>AITER Kernel / Import</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LinearBase</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">linear.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tgemm.mm</span></code>, <code class="docutils literal notranslate"><span class="pre">gemm_a8w8</span></code>, <code class="docutils literal notranslate"><span class="pre">gemm_a8w8_bpreshuffle</span></code>, <code class="docutils literal notranslate"><span class="pre">gemm_a8w8_blockscale_bpreshuffle</span></code>, <code class="docutils literal notranslate"><span class="pre">gemm_a4w4</span></code></p></td>
+<td><p>Quantized linear dispatch</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">linear.py</span></code></p></td>
+<td><p>(inherits <code class="docutils literal notranslate"><span class="pre">LinearBase</span></code>)</p></td>
+<td><p>Column-sharded TP linear</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">linear.py</span></code></p></td>
+<td><p>(inherits <code class="docutils literal notranslate"><span class="pre">LinearBase</span></code>)</p></td>
+<td><p>Row-sharded TP linear</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">linear.py</span></code></p></td>
+<td><p>(inherits <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code>)</p></td>
+<td><p>Fused Q/K/V projection</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">linear.py</span></code></p></td>
+<td><p>(inherits <code class="docutils literal notranslate"><span class="pre">LinearBase</span></code>)</p></td>
+<td><p>Merged gate+up projection</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Attention</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">unified_attention_with_output_base</span></code> (custom op)</p></td>
+<td><p>Unified attention entry</p></td>
+</tr>
+<tr class="row-even"><td><p>MHA <code class="docutils literal notranslate"><span class="pre">Attention</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">flash_attn_varlen_func</span></code>, <code class="docutils literal notranslate"><span class="pre">pa_fwd_asm</span></code>, <code class="docutils literal notranslate"><span class="pre">pa_persistent_fwd</span></code>, <code class="docutils literal notranslate"><span class="pre">pa_decode_gluon</span></code></p></td>
+<td><p>Multi-head attention</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mla_decode_fwd</span></code>, <code class="docutils literal notranslate"><span class="pre">mla_prefill_fwd</span></code>, <code class="docutils literal notranslate"><span class="pre">concat_and_cache_mla</span></code>, <code class="docutils literal notranslate"><span class="pre">fused_qk_rope_concat_and_cache_mla</span></code></p></td>
+<td><p>Multi-head latent attention</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">moe.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.fused_moe.fused_moe</span></code>, <code class="docutils literal notranslate"><span class="pre">asm_moe</span></code></p></td>
+<td><p>Mixture of experts</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rmsnorm2d_fwd</span></code>, <code class="docutils literal notranslate"><span class="pre">rmsnorm2d_fwd_with_add</span></code>, <code class="docutils literal notranslate"><span class="pre">fused_add_rmsnorm_pad</span></code></p></td>
+<td><p>RMS normalization</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">layernorm2d_fwd</span></code>, <code class="docutils literal notranslate"><span class="pre">layernorm2d_fwd_with_add</span></code></p></td>
+<td><p>Layer normalization</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">activation.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.silu_and_mul</span></code></p></td>
+<td><p>SiLU gated activation</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">F.embedding</span></code> + TP all-reduce</p></td>
+<td><p>Vocab embedding</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ParallelLMHead</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tgemm.mm</span></code> + <code class="docutils literal notranslate"><span class="pre">tensor_model_parallel_all_gather</span></code></p></td>
+<td><p>LM output head</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rotary_embedding.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.rope_cached_positions_2c_fwd_inplace</span></code></p></td>
+<td><p>Rotary position embedding</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Sampler</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">sampler.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.mixed_sample_outer_exponential</span></code>, <code class="docutils literal notranslate"><span class="pre">aiter.ops.triton.topk.topk</span></code>, <code class="docutils literal notranslate"><span class="pre">aiter.ops.triton.softmax.softmax</span></code></p></td>
+<td><p>Token sampling</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rejection_sampler.py</span></code></p></td>
+<td><p>Triton <code class="docutils literal notranslate"><span class="pre">rejection_greedy_sample_kernel</span></code></p></td>
+<td><p>Speculative decoding</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="aiter-integration-overview">
+<h2>1. AITER Integration Overview<a class="headerlink" href="#aiter-integration-overview" title="Link to this heading"></a></h2>
+<p>ATOM is a thin model-level inference engine. Every compute-heavy operation delegates to an AITER kernel. The general pattern is:</p>
+<ol class="arabic simple">
+<li><p>An ATOM <code class="docutils literal notranslate"><span class="pre">nn.Module</span></code> owns model weights and configuration.</p></li>
+<li><p>Its <code class="docutils literal notranslate"><span class="pre">forward()</span></code> method selects the appropriate AITER function based on quantization type, parallelism settings, and phase (prefill vs. decode).</p></li>
+<li><p>Results are optionally reduced across tensor-parallel (TP) or data-parallel (DP) groups.</p></li>
+</ol>
+<section id="aiter-kernel-mapping-table">
+<h3>AITER Kernel Mapping Table<a class="headerlink" href="#aiter-kernel-mapping-table" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>ATOM Wrapper</p></th>
+<th class="head"><p>AITER Function / Import Path</p></th>
+<th class="head"><p>Backend Type</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LinearBase.forward</span></code> (No quant)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.tuned_gemm.tgemm.mm</span></code></p></td>
+<td><p>hipBLASLt</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LinearBase.forward</span></code> (per_Tensor FP8)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.tuned_gemm.tgemm.mm</span></code> with scales</p></td>
+<td><p>hipBLASLt</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LinearBase.forward</span></code> (per_Token INT8)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.gemm_a8w8</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LinearBase.forward</span></code> (per_Token FP8)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.gemm_a8w8_bpreshuffle</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LinearBase.forward</span></code> (per_1x128 FP8)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.gemm_a8w8_blockscale_bpreshuffle</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LinearBase.forward</span></code> (per_1x32 MXFP4)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.gemm_a4w4</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-even"><td><p>MHA prefill</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.flash_attn_varlen_func</span></code></p></td>
+<td><p>ASM / CK</p></td>
+</tr>
+<tr class="row-odd"><td><p>MHA decode (ASM)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.pa_fwd_asm</span></code></p></td>
+<td><p>ASM</p></td>
+</tr>
+<tr class="row-even"><td><p>MHA decode (persistent ASM)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.pa_persistent_fwd</span></code></p></td>
+<td><p>ASM</p></td>
+</tr>
+<tr class="row-odd"><td><p>MHA decode (Triton)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.ops.triton.gluon.pa_decode_gluon</span></code></p></td>
+<td><p>Triton</p></td>
+</tr>
+<tr class="row-even"><td><p>MHA prefill (Triton unified)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.ops.triton.unified_attention.unified_attention</span></code></p></td>
+<td><p>Triton</p></td>
+</tr>
+<tr class="row-odd"><td><p>MLA decode</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.mla.mla_decode_fwd</span></code></p></td>
+<td><p>ASM</p></td>
+</tr>
+<tr class="row-even"><td><p>MLA prefill</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.mla.mla_prefill_fwd</span></code></p></td>
+<td><p>ASM</p></td>
+</tr>
+<tr class="row-odd"><td><p>MLA KV cache</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.concat_and_cache_mla</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-even"><td><p>RoPE</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.rope_cached_positions_2c_fwd_inplace</span></code></p></td>
+<td><p>Triton</p></td>
+</tr>
+<tr class="row-odd"><td><p>RMSNorm</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.rmsnorm2d_fwd</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-even"><td><p>SiLU+Mul</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.silu_and_mul</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-odd"><td><p>TopK routing</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.topk_softmax</span></code>, <code class="docutils literal notranslate"><span class="pre">aiter.grouped_topk</span></code>, <code class="docutils literal notranslate"><span class="pre">aiter.biased_grouped_topk</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-even"><td><p>Sampling</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.mixed_sample_outer_exponential</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-odd"><td><p>FusedMoE</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.fused_moe.fused_moe</span></code></p></td>
+<td><p>CK</p></td>
+</tr>
+<tr class="row-even"><td><p>ASM MoE</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.fused_moe_bf16_asm.asm_moe</span></code></p></td>
+<td><p>ASM</p></td>
+</tr>
+<tr class="row-odd"><td><p>Quantization</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.get_hip_quant(QuantType)</span></code></p></td>
+<td><p>CK / Triton</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<hr class="docutils" />
+<section id="linear-operations">
+<h2>2. Linear Operations<a class="headerlink" href="#linear-operations" title="Link to this heading"></a></h2>
+<p>All linear layers inherit from <code class="docutils literal notranslate"><span class="pre">LinearBase</span></code> in <code class="docutils literal notranslate"><span class="pre">atom/model_ops/linear.py</span></code>.</p>
+<section id="class-hierarchy">
+<h3>2.1 Class Hierarchy<a class="headerlink" href="#class-hierarchy" title="Link to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">LinearBase</span> <span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">)</span>
+  <span class="o">+--</span> <span class="n">ReplicatedLinear</span>          <span class="c1"># No TP sharding</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">MergedReplicatedLinear</span>
+  <span class="o">+--</span> <span class="n">ColumnParallelLinear</span>      <span class="c1"># tp_dim=0, shard output</span>
+  <span class="o">|</span>     <span class="o">+--</span> <span class="n">QKVParallelLinear</span>   <span class="c1"># Fused Q/K/V with per-head sharding</span>
+  <span class="o">+--</span> <span class="n">MergedColumnParallelLinear</span> <span class="c1"># tp_dim=0, merged gate+up</span>
+  <span class="o">+--</span> <span class="n">RowParallelLinear</span>          <span class="c1"># tp_dim=1, shard input, optional all-reduce</span>
+</pre></div>
+</div>
+</section>
+<section id="quantization-dispatch">
+<h3>2.2 Quantization Dispatch<a class="headerlink" href="#quantization-dispatch" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">LinearBase.forward()</span></code> dispatches to different GEMM kernels based on <code class="docutils literal notranslate"><span class="pre">QuantType</span></code>:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">QuantType</span></code></p></th>
+<th class="head"><p>Weight dtype</p></th>
+<th class="head"><p>GEMM Kernel</p></th>
+<th class="head"><p>Scale Shape</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">No</span></code></p></td>
+<td><p>BF16/FP16</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tgemm.mm</span></code> (hipBLASLt)</p></td>
+<td><p>None</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">per_Tensor</span></code></p></td>
+<td><p>FP8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tgemm.mm</span></code> with <code class="docutils literal notranslate"><span class="pre">scale_a</span></code>, <code class="docutils literal notranslate"><span class="pre">scale_b</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[num_partitions,</span> <span class="pre">1]</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">per_Token</span></code> (INT8)</p></td>
+<td><p>INT8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">gemm_a8w8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[output_size,</span> <span class="pre">1]</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">per_Token</span></code> (FP8)</p></td>
+<td><p>FP8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">gemm_a8w8_bpreshuffle</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[output_size,</span> <span class="pre">1]</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">per_1x128</span></code></p></td>
+<td><p>FP8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">gemm_a8w8_blockscale_bpreshuffle</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[ceil(N/128),</span> <span class="pre">ceil(K/128)]</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">per_1x32</span></code></p></td>
+<td><p>MXFP4 (<code class="docutils literal notranslate"><span class="pre">fp4x2</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">gemm_a4w4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[N,</span> <span class="pre">ceil(K/32)]</span></code> (e8m0)</p></td>
+</tr>
+</tbody>
+</table>
+<p>When <code class="docutils literal notranslate"><span class="pre">x_scale</span></code> is not provided, the input is dynamically quantized via <code class="docutils literal notranslate"><span class="pre">get_hip_quant(quant_type)</span></code>.</p>
+</section>
+<section id="tensor-parallel-sharding">
+<h3>2.3 Tensor Parallel Sharding<a class="headerlink" href="#tensor-parallel-sharding" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>ColumnParallelLinear</strong> (<code class="docutils literal notranslate"><span class="pre">tp_dim=0</span></code>): Shards weight rows (output dimension) across GPUs. Each GPU owns <code class="docutils literal notranslate"><span class="pre">output_size</span> <span class="pre">/</span> <span class="pre">tp_size</span></code> rows.</p></li>
+<li><p><strong>RowParallelLinear</strong> (<code class="docutils literal notranslate"><span class="pre">tp_dim=1</span></code>): Shards weight columns (input dimension). If <code class="docutils literal notranslate"><span class="pre">reduce_results=True</span></code>, output is all-reduced across TP group.</p></li>
+<li><p><strong>QKVParallelLinear</strong>: Extends <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code> with per-head sharding. Q heads are evenly divided; KV heads are either divided or replicated when <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span> <span class="pre">&lt;</span> <span class="pre">tp_size</span></code>.</p></li>
+<li><p><strong>MergedColumnParallelLinear</strong>: Handles gate and up projections merged into a single weight with <code class="docutils literal notranslate"><span class="pre">output_sizes</span></code> as a list (e.g., <code class="docutils literal notranslate"><span class="pre">[intermediate_size,</span> <span class="pre">intermediate_size]</span></code>).</p></li>
+</ul>
+</section>
+<section id="weight-processing">
+<h3>2.4 Weight Processing<a class="headerlink" href="#weight-processing" title="Link to this heading"></a></h3>
+<p>After loading, <code class="docutils literal notranslate"><span class="pre">process_weights_after_loading()</span></code> handles:</p>
+<ul class="simple">
+<li><p><strong>e4m3fn to e4m3fnuz normalization</strong> (AMD FP8 format conversion).</p></li>
+<li><p><strong>Weight reshuffling</strong> via <code class="docutils literal notranslate"><span class="pre">shuffle_weights()</span></code> for pre-shuffled GEMM kernels.</p></li>
+<li><p><strong>Scale reshuffling</strong> via <code class="docutils literal notranslate"><span class="pre">fp4_utils.e8m0_shuffle()</span></code> for MXFP4 block scales.</p></li>
+<li><p><strong>Per-tensor requantization</strong> via <code class="docutils literal notranslate"><span class="pre">requantize_with_max_scale()</span></code> when multiple output partitions have separate scales.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="attention-operations">
+<h2>3. Attention Operations<a class="headerlink" href="#attention-operations" title="Link to this heading"></a></h2>
+<section id="base-attention-base-attention-py">
+<h3>3.1 Base: <code class="docutils literal notranslate"><span class="pre">Attention</span></code> (<code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code>)<a class="headerlink" href="#base-attention-base-attention-py" title="Link to this heading"></a></h3>
+<p>The top-level <code class="docutils literal notranslate"><span class="pre">Attention</span></code> class in <code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code> is a dispatcher. It:</p>
+<ol class="arabic simple">
+<li><p>Selects the backend via <code class="docutils literal notranslate"><span class="pre">get_attn_backend()</span></code> from <code class="docutils literal notranslate"><span class="pre">atom/utils/selector.py</span></code>.</p></li>
+<li><p>Instantiates the backend’s implementation class (<code class="docutils literal notranslate"><span class="pre">impl_cls</span></code>).</p></li>
+<li><p>Registers itself in <code class="docutils literal notranslate"><span class="pre">compilation_config.static_forward_context</span></code> under <code class="docutils literal notranslate"><span class="pre">layer_name</span></code>.</p></li>
+<li><p>On <code class="docutils literal notranslate"><span class="pre">forward()</span></code>, calls <code class="docutils literal notranslate"><span class="pre">torch.ops.aiter.unified_attention_with_output_base</span></code>, which is a custom op decorated with <code class="docutils literal notranslate"><span class="pre">&#64;mark_spliting_op</span></code> – this prevents <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> from tracing into attention internals, enabling full-graph capture.</p></li>
+</ol>
+<p>Backend selection logic (in <code class="docutils literal notranslate"><span class="pre">selector.py</span></code>):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Condition</p></th>
+<th class="head"><p>Backend Class</p></th>
+<th class="head"><p>Implementation</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">use_mla=True</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AiterMLABackend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code> from <code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">use_mla=False</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AiterBackend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Attention</span></code> from <code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="multi-head-attention-attention-mha-py">
+<h3>3.2 Multi-Head Attention (<code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code>)<a class="headerlink" href="#multi-head-attention-attention-mha-py" title="Link to this heading"></a></h3>
+<p>The MHA <code class="docutils literal notranslate"><span class="pre">Attention</span></code> class handles standard models (Llama, Qwen3, Mixtral, etc.).</p>
+<p><strong>Forward flow:</strong></p>
+<ol class="arabic simple">
+<li><p>Reshape Q, K, V to <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">num_heads,</span> <span class="pre">head_dim]</span></code>.</p></li>
+<li><p>Apply RoPE + KV cache write via <code class="docutils literal notranslate"><span class="pre">rope_cache()</span></code>.</p></li>
+<li><p>Dispatch to the appropriate backend via <code class="docutils literal notranslate"><span class="pre">dispatch_backend()</span></code>.</p></li>
+</ol>
+<p><strong>RoPE + KV cache paths:</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Condition</p></th>
+<th class="head"><p>Kernel Chain</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">q_norm</span></code> + <code class="docutils literal notranslate"><span class="pre">k_norm</span></code> + <code class="docutils literal notranslate"><span class="pre">rotary_emb</span></code> present</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_qk_norm_rope_cache_quant_shuffle</span></code> (single fused kernel for QK norm, RoPE, cache write, optional FP8 quant)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Triton path (<code class="docutils literal notranslate"><span class="pre">sliding_window</span> <span class="pre">!=</span> <span class="pre">-1</span></code> or <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">!=</span> <span class="pre">128</span></code>) + <code class="docutils literal notranslate"><span class="pre">rotary_emb</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_qk_rope_reshape_and_cache</span></code> (Triton fused RoPE + reshape + cache)</p></td>
+</tr>
+<tr class="row-even"><td><p>ASM path + <code class="docutils literal notranslate"><span class="pre">rotary_emb</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rotary_emb(position,</span> <span class="pre">q,</span> <span class="pre">k)</span></code> then <code class="docutils literal notranslate"><span class="pre">reshape_and_cache</span></code> or <code class="docutils literal notranslate"><span class="pre">reshape_and_cache_with_pertoken_quant</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Attention dispatch:</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Phase</p></th>
+<th class="head"><p>Condition</p></th>
+<th class="head"><p>Method</p></th>
+<th class="head"><p>AITER Kernel</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Prefill</p></td>
+<td><p>Always</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prefill_attention</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.flash_attn_varlen_func</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Decode</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">use_triton_attn=True</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">paged_attention_triton</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.ops.aiter.pa_decode_gluon</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Decode</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">block_size</span> <span class="pre">==</span> <span class="pre">1024</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">paged_attention_persistent_asm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.pa_persistent_fwd</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Decode</p></td>
+<td><p>Default</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">paged_attention_asm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.pa_fwd_asm</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>The <code class="docutils literal notranslate"><span class="pre">use_triton_attn</span></code> flag is set when <code class="docutils literal notranslate"><span class="pre">sliding_window</span> <span class="pre">!=</span> <span class="pre">-1</span></code> or <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">!=</span> <span class="pre">128</span></code>.</p>
+</section>
+<section id="multi-head-latent-attention-attention-mla-py">
+<h3>3.3 Multi-head Latent Attention (<code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code>)<a class="headerlink" href="#multi-head-latent-attention-attention-mla-py" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code> implements DeepSeek’s MLA with a compressed KV representation. Key data structures:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">MLAModules</span><span class="p">:</span>
+    <span class="n">q_lora_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">kv_lora_rank</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">qk_nope_head_dim</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">qk_rope_head_dim</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">qk_head_dim</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">v_head_dim</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">rotary_emb</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span>
+    <span class="n">q_proj</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">]</span>
+    <span class="n">kv_b_proj</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span>
+    <span class="n">o_proj</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span>
+    <span class="n">indexer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">]</span>
+</pre></div>
+</div>
+<p><strong>Forward flow:</strong></p>
+<ol class="arabic simple">
+<li><p>If prefill and not sparse: Standard MHA-style prefill with <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen_func</span></code>, preceded by <code class="docutils literal notranslate"><span class="pre">kv_b_proj</span></code> GEMM to produce K_nope and V from compressed <code class="docutils literal notranslate"><span class="pre">kv_c_normed</span></code>.</p></li>
+<li><p>Otherwise: Fused Q projection + K up-projection via batched FP8/FP4 BMM (<code class="docutils literal notranslate"><span class="pre">_q_proj_and_k_up_proj</span></code>), then:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">fused_qk_rope_concat_and_cache_mla</span></code> writes to KV cache.</p></li>
+<li><p>Decode: <code class="docutils literal notranslate"><span class="pre">mla_decode_fwd</span></code> (ASM persistent MLA kernel).</p></li>
+<li><p>Prefill (sparse): <code class="docutils literal notranslate"><span class="pre">mla_prefill_fwd</span></code>.</p></li>
+</ul>
+</li>
+<li><p>V up-projection + O projection via batched BMM (<code class="docutils literal notranslate"><span class="pre">_v_up_proj_and_o_proj</span></code>).</p></li>
+</ol>
+<p><strong>Batched GEMM backends for MLA projections:</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Condition</p></th>
+<th class="head"><p>Kernel</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_USE_TRITON_MXFP4_BMM=True</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">batched_gemm_a16wfp4</span></code> (Triton FP4 BMM)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Default</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant</span></code> (Triton FP8 BMM)</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Prefill GEMM optimizations</strong> (for <code class="docutils literal notranslate"><span class="pre">kv_b_proj</span></code>):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Condition</p></th>
+<th class="head"><p>Kernel</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_USE_TRITON_GEMM=True</span></code> + FP4 weights</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_gemm_afp4wfp4_preshuffle_split_cat</span></code> (GEMM + split K/V + cat rope in one kernel)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_USE_TRITON_GEMM=True</span></code> + FP8 weights</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_gemm_a8w8_blockscale_preshuffle_split_cat</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Default</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">kv_b_proj(kv_c_normed)</span></code> then manual split + cat</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="backend-abstraction-attentions-backends-py">
+<h3>3.4 Backend Abstraction (<code class="docutils literal notranslate"><span class="pre">attentions/backends.py</span></code>)<a class="headerlink" href="#backend-abstraction-attentions-backends-py" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code> abstract class defines three required methods:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">get_name()</span></code> – Returns backend identifier string.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_builder_cls()</span></code> – Returns the <code class="docutils literal notranslate"><span class="pre">AttentionMetadataBuilder</span></code> subclass.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_impl_cls()</span></code> – Returns the attention implementation class.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">CommonAttentionBuilder</span></code> provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both <code class="docutils literal notranslate"><span class="pre">AiterBackend</span></code> and <code class="docutils literal notranslate"><span class="pre">AiterMLABackend</span></code>.</p>
+</section>
+<section id="kv-cache-operations">
+<h3>3.5 KV Cache Operations<a class="headerlink" href="#kv-cache-operations" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Operation</p></th>
+<th class="head"><p>AITER Kernel</p></th>
+<th class="head"><p>Used By</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Standard KV cache write</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.reshape_and_cache</span></code></p></td>
+<td><p>MHA (BF16 KV)</p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 KV cache write</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.reshape_and_cache_with_pertoken_quant</span></code></p></td>
+<td><p>MHA (FP8 KV)</p></td>
+</tr>
+<tr class="row-even"><td><p>MLA KV cache write</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.concat_and_cache_mla</span></code></p></td>
+<td><p>MLA prefill</p></td>
+</tr>
+<tr class="row-odd"><td><p>Fused QK RoPE + MLA cache</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.fused_qk_rope_concat_and_cache_mla</span></code></p></td>
+<td><p>MLA decode</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<hr class="docutils" />
+<section id="mixture-of-experts-moe">
+<h2>4. Mixture of Experts (MoE)<a class="headerlink" href="#mixture-of-experts-moe" title="Link to this heading"></a></h2>
+<section id="fusedmoe-class-moe-py">
+<h3>4.1 <code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code> Class (<code class="docutils literal notranslate"><span class="pre">moe.py</span></code>)<a class="headerlink" href="#fusedmoe-class-moe-py" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code> is the top-level MoE module. It handles:</p>
+<ul class="simple">
+<li><p>Expert routing via <code class="docutils literal notranslate"><span class="pre">select_experts()</span></code>.</p></li>
+<li><p>Weight creation and quantization dispatch via <code class="docutils literal notranslate"><span class="pre">quant_method</span></code>.</p></li>
+<li><p>Tensor/Expert/Data parallelism via <code class="docutils literal notranslate"><span class="pre">FusedMoEParallelConfig</span></code>.</p></li>
+<li><p>Optional shared expert fusion and MORI communication.</p></li>
+</ul>
+<p><strong>Constructor parameters:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">FusedMoE</span><span class="p">(</span>
+    <span class="n">num_experts</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>        <span class="c1"># Global number of experts</span>
+    <span class="n">top_k</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>              <span class="c1"># Experts per token</span>
+    <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>        <span class="c1"># Input hidden dimension</span>
+    <span class="n">intermediate_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>  <span class="c1"># Expert intermediate dimension</span>
+    <span class="n">reduce_results</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>    <span class="c1"># Whether to all-reduce output</span>
+    <span class="n">renormalize</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>       <span class="c1"># Renormalize routing weights</span>
+    <span class="n">use_grouped_topk</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>  <span class="c1"># Use grouped top-k (DeepSeek)</span>
+    <span class="n">activation</span><span class="p">:</span> <span class="n">ActivationType</span><span class="p">,</span>  <span class="c1"># Silu, Gelu, Swiglu, etc.</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="quantization-methods">
+<h3>4.2 Quantization Methods<a class="headerlink" href="#quantization-methods" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code> selects a <code class="docutils literal notranslate"><span class="pre">quant_method</span></code> at construction time:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Quant Config</p></th>
+<th class="head"><p>Method Class</p></th>
+<th class="head"><p>GEMM Kernel</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">QuantType.No</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">UnquantizedFusedMoEMethod</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.fused_moe.fused_moe</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 (<code class="docutils literal notranslate"><span class="pre">dtypes.fp8</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Fp8MoEMethod</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.fused_moe.fused_moe</span></code> with quant_type</p></td>
+</tr>
+<tr class="row-even"><td><p>FP8 compressed-tensors</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CompressedTensorsFp8MoEMethod</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.fused_moe.fused_moe</span></code> or <code class="docutils literal notranslate"><span class="pre">asm_moe</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>MXFP4 (<code class="docutils literal notranslate"><span class="pre">dtypes.fp4x2</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Mxfp4MoEMethod</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.fused_moe.fused_moe</span></code> or Triton <code class="docutils literal notranslate"><span class="pre">triton_kernel_moe_forward</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>The ASM MoE path (<code class="docutils literal notranslate"><span class="pre">asm_moe</span></code> from <code class="docutils literal notranslate"><span class="pre">aiter.fused_moe_bf16_asm</span></code>) is used by FP8 methods and supports <code class="docutils literal notranslate"><span class="pre">a16</span></code> mode where activations remain in BF16/FP16 while weights are FP8/INT8.</p>
+</section>
+<section id="topk-routing-topk-py">
+<h3>4.3 TopK Routing (<code class="docutils literal notranslate"><span class="pre">topK.py</span></code>)<a class="headerlink" href="#topk-routing-topk-py" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Routing Function</p></th>
+<th class="head"><p>AITER Kernel</p></th>
+<th class="head"><p>Used For</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">rocm_aiter_topk_softmax</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.topk_softmax</span></code></p></td>
+<td><p>Standard top-k (Mixtral)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">rocm_aiter_grouped_topk</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.grouped_topk</span></code></p></td>
+<td><p>Grouped top-k (DeepSeek)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">rocm_aiter_biased_grouped_topk</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.biased_grouped_topk</span></code></p></td>
+<td><p>Biased grouped top-k (DeepSeek V3)</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Shared expert fusion:</strong> When <code class="docutils literal notranslate"><span class="pre">is_rocm_aiter_fusion_shared_expert_enabled()</span></code> returns <code class="docutils literal notranslate"><span class="pre">True</span></code>, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via <code class="docutils literal notranslate"><span class="pre">init_aiter_topK_meta_data()</span></code>.</p>
+</section>
+<section id="fusedmoeparallelconfig">
+<h3>4.4 <code class="docutils literal notranslate"><span class="pre">FusedMoEParallelConfig</span></code><a class="headerlink" href="#fusedmoeparallelconfig" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">FusedMoEParallelConfig</span><span class="p">:</span>
+    <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span>       <span class="c1"># Tensor parallel size</span>
+    <span class="n">dp_size</span><span class="p">:</span> <span class="nb">int</span>       <span class="c1"># Data parallel size</span>
+    <span class="n">ep_size</span><span class="p">:</span> <span class="nb">int</span>       <span class="c1"># Expert parallel size</span>
+    <span class="n">tp_rank</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">dp_rank</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">ep_rank</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">use_ep</span><span class="p">:</span> <span class="nb">bool</span>       <span class="c1"># Whether expert parallelism is active</span>
+    <span class="n">local_ep_size</span><span class="p">:</span> <span class="nb">int</span> <span class="c1"># Local EP size (GPUs per node * TP)</span>
+</pre></div>
+</div>
+<p>Key properties:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">use_all2all_kernels</span></code>: <code class="docutils literal notranslate"><span class="pre">True</span></code> when <code class="docutils literal notranslate"><span class="pre">dp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, EP is enabled, and MORI is available.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">use_mori_kernels</span></code>: Always <code class="docutils literal notranslate"><span class="pre">True</span></code> (currently).</p></li>
+</ul>
+</section>
+<section id="mori-integration-fused-moe-mori-prepare-finalize-py">
+<h3>4.5 MORI Integration (<code class="docutils literal notranslate"><span class="pre">fused_moe/mori_prepare_finalize.py</span></code>)<a class="headerlink" href="#mori-integration-fused-moe-mori-prepare-finalize-py" title="Link to this heading"></a></h3>
+<p>MORI (MoE Router Infrastructure) provides all-to-all communication kernels for expert parallelism. <code class="docutils literal notranslate"><span class="pre">MoriPrepareAndFinalize</span></code> implements:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">prepare()</span></code>: Dispatches tokens to remote experts via <code class="docutils literal notranslate"><span class="pre">mori_op.dispatch()</span></code>. Optionally quantizes activations to FP8 before dispatch.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">finalize()</span></code>: Combines expert outputs via <code class="docutils literal notranslate"><span class="pre">mori_op.combine()</span></code> and copies results back.</p></li>
+</ul>
+<p>The <code class="docutils literal notranslate"><span class="pre">FusedMoEModularKernel</span></code> orchestrates the prepare-compute-finalize pipeline.</p>
+</section>
+<section id="moe-quantization-config-fused-moe-config-py">
+<h3>4.6 MoE Quantization Config (<code class="docutils literal notranslate"><span class="pre">fused_moe/config.py</span></code>)<a class="headerlink" href="#moe-quantization-config-fused-moe-config-py" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">FusedMoEQuantConfig</span></code> describes activation and weight quantization for MoE layers:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">FusedMoEQuantConfig</span><span class="p">:</span>
+    <span class="n">_a1</span><span class="p">:</span> <span class="n">FusedMoEQuantDesc</span>   <span class="c1"># First activation (input to gate_up)</span>
+    <span class="n">_a2</span><span class="p">:</span> <span class="n">FusedMoEQuantDesc</span>   <span class="c1"># Second activation (input to down_proj)</span>
+    <span class="n">_w1</span><span class="p">:</span> <span class="n">FusedMoEQuantDesc</span>   <span class="c1"># gate_up_proj weights</span>
+    <span class="n">_w2</span><span class="p">:</span> <span class="n">FusedMoEQuantDesc</span>   <span class="c1"># down_proj weights</span>
+</pre></div>
+</div>
+<p>Factory functions:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">fp8_w8a8_moe_quant_config()</span></code> – FP8 weights and activations.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mxfp4_w4a16_moe_quant_config()</span></code> – MXFP4 weights, unquantized activations.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">FUSED_MOE_UNQUANTIZED_CONFIG</span></code> – No quantization.</p></li>
+</ul>
+</section>
+<section id="triton-moe-fallback-fused-moe-triton-py">
+<h3>4.7 Triton MoE Fallback (<code class="docutils literal notranslate"><span class="pre">fused_moe_triton.py</span></code>)<a class="headerlink" href="#triton-moe-fallback-fused-moe-triton-py" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">triton_kernel_moe_forward()</span></code> provides a Triton-based MoE path using the <code class="docutils literal notranslate"><span class="pre">triton_kernels</span></code> library. It uses <code class="docutils literal notranslate"><span class="pre">routing()</span></code> for expert assignment and <code class="docutils literal notranslate"><span class="pre">matmul_ogs()</span></code> for the expert GEMM. This path is currently used for MXFP4 MoE on GFX94x hardware.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="normalization">
+<h2>5. Normalization<a class="headerlink" href="#normalization" title="Link to this heading"></a></h2>
+<section id="rmsnorm-layernorm-py">
+<h3>5.1 <code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)<a class="headerlink" href="#rmsnorm-layernorm-py" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> supports multiple forward paths depending on configuration flags:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Condition</p></th>
+<th class="head"><p>Kernel / Path</p></th>
+<th class="head"><p>Returns</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">x_pad_to_multiple</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>, no residual</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_rmsnorm_pad_</span></code> (Triton <code class="docutils literal notranslate"><span class="pre">fused_add_rmsnorm_pad</span></code>)</p></td>
+<td><p>Padded output</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">x_pad_to_multiple</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>, with residual</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_add_rmsnorm_pad_</span></code></p></td>
+<td><p>(output, residual)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused_allreduce=True</span></code> and <code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tensor_model_parallel_fused_allreduce_rmsnorm</span></code></p></td>
+<td><p>(output, residual)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fused_quant=True</span></code> and <code class="docutils literal notranslate"><span class="pre">x_scale</span></code> provided</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_rms_fp8_per_tensor_static_quant</span></code></p></td>
+<td><p>(FP8 output, scale)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused_quant=True</span></code> and <code class="docutils literal notranslate"><span class="pre">per_1x32</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_rms_mxfp4_quant</span></code></p></td>
+<td><p>(MXFP4 output, scale)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Default, no residual</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rmsnorm2d_fwd</span></code></p></td>
+<td><p>Output</p></td>
+</tr>
+<tr class="row-even"><td><p>Default, with residual</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rmsnorm2d_fwd_with_add</span></code></p></td>
+<td><p>(output, residual)</p></td>
+</tr>
+</tbody>
+</table>
+<p>Constructor parameters:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">RMSNorm</span><span class="p">(</span>
+    <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">,</span>
+    <span class="n">x_pad_to_multiple</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+    <span class="n">fused_allreduce</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">fused_quant</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantizationConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="layernorm-layernorm-py">
+<h3>5.2 <code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)<a class="headerlink" href="#layernorm-layernorm-py" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> wraps <code class="docutils literal notranslate"><span class="pre">layernorm2d_fwd</span></code> and <code class="docutils literal notranslate"><span class="pre">layernorm2d_fwd_with_add</span></code> (with bias support):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">)</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Without residual: <code class="docutils literal notranslate"><span class="pre">layernorm2d_fwd(x,</span> <span class="pre">weight,</span> <span class="pre">bias,</span> <span class="pre">eps)</span></code></p></li>
+<li><p>With residual: <code class="docutils literal notranslate"><span class="pre">layernorm2d_fwd_with_add(out,</span> <span class="pre">x,</span> <span class="pre">residual,</span> <span class="pre">residual_out,</span> <span class="pre">weight,</span> <span class="pre">bias,</span> <span class="pre">eps)</span></code></p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="activation-functions">
+<h2>6. Activation Functions<a class="headerlink" href="#activation-functions" title="Link to this heading"></a></h2>
+<section id="siluandmul-activation-py">
+<h3>6.1 <code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code> (<code class="docutils literal notranslate"><span class="pre">activation.py</span></code>)<a class="headerlink" href="#siluandmul-activation-py" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code> computes <code class="docutils literal notranslate"><span class="pre">SiLU(x_first_half)</span> <span class="pre">*</span> <span class="pre">x_second_half</span></code>. It splits the last dimension in half.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Condition</p></th>
+<th class="head"><p>Kernel</p></th>
+<th class="head"><p>Output</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused_quant=True</span></code> + <code class="docutils literal notranslate"><span class="pre">x_scale</span></code> provided (FP8)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_silu_mul_fp8_per_tensor_static_quant</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(FP8</span> <span class="pre">output,</span> <span class="pre">scale)</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fused_quant=True</span></code> + <code class="docutils literal notranslate"><span class="pre">per_1x32</span></code> (MXFP4)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_reduce_act_mul_and_mxfp4_quant</span></code> (via <code class="docutils literal notranslate"><span class="pre">mxfp4_act_mul_quant_fuse</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(MXFP4</span> <span class="pre">output,</span> <span class="pre">scale)</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Default</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter.silu_and_mul(out,</span> <span class="pre">x)</span></code></p></td>
+<td><p>BF16 output</p></td>
+</tr>
+</tbody>
+</table>
+<p>Constructor:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">SiluAndMul</span><span class="p">(</span>
+    <span class="n">fused_quant</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantizationConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="embedding-output-head">
+<h2>7. Embedding &amp; Output Head<a class="headerlink" href="#embedding-output-head" title="Link to this heading"></a></h2>
+<section id="vocabparallelembedding-embed-head-py">
+<h3>7.1 <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)<a class="headerlink" href="#vocabparallelembedding-embed-head-py" title="Link to this heading"></a></h3>
+<p>Partitions the vocabulary across TP ranks. Each rank holds <code class="docutils literal notranslate"><span class="pre">num_embeddings</span> <span class="pre">/</span> <span class="pre">tp_size</span></code> rows.</p>
+<p><strong>Forward:</strong></p>
+<ol class="arabic simple">
+<li><p>Mask input token IDs to this rank’s partition range <code class="docutils literal notranslate"><span class="pre">[vocab_start_idx,</span> <span class="pre">vocab_end_idx)</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">F.embedding()</span></code> on local partition.</p></li>
+<li><p>Zero out out-of-range positions.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">all_reduce()</span></code> across TP group.</p></li>
+</ol>
+</section>
+<section id="parallellmhead-embed-head-py">
+<h3>7.2 <code class="docutils literal notranslate"><span class="pre">ParallelLMHead</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)<a class="headerlink" href="#parallellmhead-embed-head-py" title="Link to this heading"></a></h3>
+<p>Extends <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> for the output projection. Key differences:</p>
+<ul class="simple">
+<li><p><strong>Forward</strong> extracts only the last token per sequence during prefill (via <code class="docutils literal notranslate"><span class="pre">cu_seqlens_q[1:]</span> <span class="pre">-</span> <span class="pre">1</span></code>).</p></li>
+<li><p>Uses <code class="docutils literal notranslate"><span class="pre">tgemm.mm(x,</span> <span class="pre">self.weight,</span> <span class="pre">self.bias)</span></code> for the logit computation (not <code class="docutils literal notranslate"><span class="pre">F.linear</span></code>).</p></li>
+<li><p>Calls <code class="docutils literal notranslate"><span class="pre">tensor_model_parallel_all_gather()</span></code> to gather logits across TP ranks.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="rotary-position-embedding-rope">
+<h2>8. Rotary Position Embedding (RoPE)<a class="headerlink" href="#rotary-position-embedding-rope" title="Link to this heading"></a></h2>
+<section id="rotaryembedding-rotary-embedding-py">
+<h3>8.1 <code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">rotary_embedding.py</span></code>)<a class="headerlink" href="#rotaryembedding-rotary-embedding-py" title="Link to this heading"></a></h3>
+<p>Precomputes cos/sin caches at initialization and applies RoPE in-place.</p>
+<p><strong>Constructor:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">RotaryEmbedding</span><span class="p">(</span>
+    <span class="n">head_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">rotary_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">base</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">is_neox_style</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Forward:</strong> Calls <code class="docutils literal notranslate"><span class="pre">aiter.rope_cached_positions_2c_fwd_inplace(query_,</span> <span class="pre">key_,</span> <span class="pre">cos,</span> <span class="pre">sin,</span> <span class="pre">positions,</span> <span class="pre">rotate_style,</span> <span class="pre">...)</span></code> which applies RoPE to Q and K tensors in-place using precomputed caches indexed by position IDs.</p>
+</section>
+<section id="get-rope-factory">
+<h3>8.2 <code class="docutils literal notranslate"><span class="pre">get_rope()</span></code> Factory<a class="headerlink" href="#get-rope-factory" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">get_rope</span><span class="p">(</span><span class="n">head_size</span><span class="p">,</span> <span class="n">rotary_dim</span><span class="p">,</span> <span class="n">max_position</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span> <span class="n">rope_scaling</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Returns a cached <code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code> instance. Currently <code class="docutils literal notranslate"><span class="pre">rope_scaling</span></code> must be <code class="docutils literal notranslate"><span class="pre">None</span></code>.</p>
+</section>
+<section id="integration-in-attention">
+<h3>8.3 Integration in Attention<a class="headerlink" href="#integration-in-attention" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>MHA</strong> (<code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code>): RoPE is applied during the <code class="docutils literal notranslate"><span class="pre">rope_cache()</span></code> phase, either via the fused <code class="docutils literal notranslate"><span class="pre">fused_qk_norm_rope_cache_quant_shuffle</span></code> kernel, via <code class="docutils literal notranslate"><span class="pre">fused_qk_rope_reshape_and_cache</span></code>, or via standalone <code class="docutils literal notranslate"><span class="pre">rotary_emb(position,</span> <span class="pre">q,</span> <span class="pre">k)</span></code>.</p></li>
+<li><p><strong>MLA</strong> (<code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code>): RoPE is applied to <code class="docutils literal notranslate"><span class="pre">q_pe</span></code> and <code class="docutils literal notranslate"><span class="pre">k_rope</span></code> tensors. During decode, this is fused into <code class="docutils literal notranslate"><span class="pre">fused_qk_rope_concat_and_cache_mla</span></code>. During prefill, it is applied via <code class="docutils literal notranslate"><span class="pre">self.rotary_emb(positions,</span> <span class="pre">prefill_q_pe,</span> <span class="pre">k_rope)</span></code>.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="sampling">
+<h2>9. Sampling<a class="headerlink" href="#sampling" title="Link to this heading"></a></h2>
+<section id="sampler-sampler-py">
+<h3>9.1 <code class="docutils literal notranslate"><span class="pre">Sampler</span></code> (<code class="docutils literal notranslate"><span class="pre">sampler.py</span></code>)<a class="headerlink" href="#sampler-sampler-py" title="Link to this heading"></a></h3>
+<p>Unified sampling supporting both greedy (temperature=0) and random (temperature&gt;0) sampling in a single kernel call.</p>
+<p><strong>Forward:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">logits</span><span class="p">,</span> <span class="n">temperatures</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">sampled_tokens</span><span class="p">:</span>
+    <span class="n">mixed_sample_outer_exponential</span><span class="p">(</span><span class="n">sampled_tokens</span><span class="p">,</span> <span class="n">logits</span><span class="p">,</span> <span class="n">exponential</span><span class="p">,</span> <span class="n">temperatures</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">aiter.mixed_sample_outer_exponential</span></code> performs temperature-scaled exponential sampling: it divides logits by temperature, then uses the Gumbel-max trick with pre-generated exponential random variates.</p>
+<p><strong>Fallback methods</strong> (currently unreachable due to early return):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">greedy_sample()</span></code>: <code class="docutils literal notranslate"><span class="pre">aiter.ops.triton.topk.topk(logits,</span> <span class="pre">1)</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">random_sample()</span></code>: <code class="docutils literal notranslate"><span class="pre">aiter.ops.triton.softmax.softmax(logits)</span></code> followed by exponential sampling and <code class="docutils literal notranslate"><span class="pre">topk</span></code>.</p></li>
+</ul>
+</section>
+<section id="rejectionsampler-rejection-sampler-py">
+<h3>9.2 <code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code> (<code class="docutils literal notranslate"><span class="pre">rejection_sampler.py</span></code>)<a class="headerlink" href="#rejectionsampler-rejection-sampler-py" title="Link to this heading"></a></h3>
+<p>Implements rejection sampling for speculative decoding (MTP). Given draft token IDs and target model logits:</p>
+<ol class="arabic simple">
+<li><p>Computes <code class="docutils literal notranslate"><span class="pre">target_argmax</span> <span class="pre">=</span> <span class="pre">target_logits.argmax(dim=-1)</span></code>.</p></li>
+<li><p>Runs a Triton kernel <code class="docutils literal notranslate"><span class="pre">rejection_greedy_sample_kernel</span></code> that sequentially compares draft tokens against target argmax, accepting until first mismatch.</p></li>
+<li><p>On full acceptance, appends the bonus token.</p></li>
+<li><p>Returns <code class="docutils literal notranslate"><span class="pre">(output_token_ids,</span> <span class="pre">num_bonus_tokens)</span></code>.</p></li>
+</ol>
+</section>
+</section>
+<hr class="docutils" />
+<section id="fused-kernel-chains">
+<h2>10. Fused Kernel Chains<a class="headerlink" href="#fused-kernel-chains" title="Link to this heading"></a></h2>
+<p>ATOM uses fused kernels to reduce memory traffic by combining multiple operations into a single kernel launch.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Fused Operation</p></th>
+<th class="head"><p>Components</p></th>
+<th class="head"><p>Controlled By</p></th>
+<th class="head"><p>AITER Kernel</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>RMSNorm + FP8 quant</p></td>
+<td><p>RMSNorm, per-tensor FP8 static quant</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RMSNorm(fused_quant=True)</span></code> + <code class="docutils literal notranslate"><span class="pre">x_scale</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_rms_fp8_per_tensor_static_quant</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>RMSNorm + MXFP4 quant</p></td>
+<td><p>RMSNorm, per-1x32 MXFP4 quant</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RMSNorm(fused_quant=True)</span></code> + <code class="docutils literal notranslate"><span class="pre">QuantType.per_1x32</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_rms_mxfp4_quant</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>RMSNorm + add + pad</p></td>
+<td><p>Residual add, RMSNorm, output padding</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RMSNorm(x_pad_to_multiple&gt;0)</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_add_rmsnorm_pad</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>AllReduce + RMSNorm</p></td>
+<td><p>TP all-reduce, RMSNorm</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RMSNorm(fused_allreduce=True)</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tensor_model_parallel_fused_allreduce_rmsnorm</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>SiLU + mul + FP8 quant</p></td>
+<td><p>SiLU activation, multiply, FP8 quant</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">SiluAndMul(fused_quant=True)</span></code> + <code class="docutils literal notranslate"><span class="pre">x_scale</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_silu_mul_fp8_per_tensor_static_quant</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>SiLU + mul + MXFP4 quant</p></td>
+<td><p>SiLU activation, multiply, MXFP4 quant</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">SiluAndMul(fused_quant=True)</span></code> + <code class="docutils literal notranslate"><span class="pre">QuantType.per_1x32</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_reduce_act_mul_and_mxfp4_quant</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>QK norm + RoPE + cache + quant</p></td>
+<td><p>Q/K norm, RoPE, KV cache write, optional FP8 quant, weight shuffle</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">q_norm</span></code> + <code class="docutils literal notranslate"><span class="pre">k_norm</span></code> + <code class="docutils literal notranslate"><span class="pre">rotary_emb</span></code> all present</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_qk_norm_rope_cache_quant_shuffle</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>RoPE + reshape + cache</p></td>
+<td><p>RoPE, K reshape, KV cache write</p></td>
+<td><p>Triton attention path</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_qk_rope_reshape_and_cache</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>QK RoPE + MLA cache</p></td>
+<td><p>Q RoPE, KV concat, MLA cache write, FP8 quant</p></td>
+<td><p>MLA decode path</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_qk_rope_concat_and_cache_mla</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>GEMM + split + cat (FP4)</p></td>
+<td><p>KV_b_proj GEMM, split K_nope/V, cat K_rope</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ATOM_USE_TRITON_GEMM=True</span></code> + FP4 weights</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_gemm_afp4wfp4_preshuffle_split_cat</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>GEMM + split + cat (FP8)</p></td>
+<td><p>KV_b_proj GEMM, split K_nope/V, cat K_rope</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ATOM_USE_TRITON_GEMM=True</span></code> + FP8 weights</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_gemm_a8w8_blockscale_preshuffle_split_cat</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 BMM + RoPE + cache (MLA)</p></td>
+<td><p>Batched FP8 BMM, RoPE, MLA KV cache write</p></td>
+<td><p>MLA decode with FP8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_fp8_bmm_rope_cat_and_cache_mla</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>FP4 BMM + RoPE + cache (MLA)</p></td>
+<td><p>Batched FP4 BMM, RoPE, MLA KV cache write</p></td>
+<td><p>MLA decode with MXFP4</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_fp4_bmm_rope_cat_and_cache_mla</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="source-files">
+<h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
+<section id="atom-model-ops">
+<h3><code class="docutils literal notranslate"><span class="pre">atom/model_ops/</span></code><a class="headerlink" href="#atom-model-ops" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">linear.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LinearBase</span></code>, <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">ReplicatedLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">MergedReplicatedLinear</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">activation.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code> with fused FP8/MXFP4 quantization</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code>, <code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> with fused allreduce/quant/pad variants</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code></p></td>
+<td><p>Top-level <code class="docutils literal notranslate"><span class="pre">Attention</span></code> dispatcher with custom op registration</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code></p></td>
+<td><p>MHA implementation: prefill (flash), decode (ASM/Triton paged attention)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code>, <code class="docutils literal notranslate"><span class="pre">MLAModules</span></code> – DeepSeek MLA with compressed KV</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">moe.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code>, <code class="docutils literal notranslate"><span class="pre">FusedMoEParallelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">UnquantizedFusedMoEMethod</span></code>, <code class="docutils literal notranslate"><span class="pre">Fp8MoEMethod</span></code>, <code class="docutils literal notranslate"><span class="pre">Mxfp4MoEMethod</span></code>, <code class="docutils literal notranslate"><span class="pre">CompressedTensorsFp8MoEMethod</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fused_moe_triton.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">triton_kernel_moe_forward</span></code> – Triton MoE via <code class="docutils literal notranslate"><span class="pre">triton_kernels</span></code> library</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelLMHead</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">rotary_embedding.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code>, <code class="docutils literal notranslate"><span class="pre">get_rope</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">topK.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rocm_aiter_topk_softmax</span></code>, <code class="docutils literal notranslate"><span class="pre">rocm_aiter_grouped_topk</span></code>, <code class="docutils literal notranslate"><span class="pre">init_aiter_topK_meta_data</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sampler.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Sampler</span></code> – unified greedy/random sampling</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">rejection_sampler.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code> – speculative decoding rejection sampling</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">base_config.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">QuantizeMethodBase</span></code> abstract class</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">utils.py</span></code></p></td>
+<td><p>Helper utilities: <code class="docutils literal notranslate"><span class="pre">shuffle_weights</span></code>, <code class="docutils literal notranslate"><span class="pre">normalize_e4m3fn_to_e4m3fnuz</span></code>, <code class="docutils literal notranslate"><span class="pre">per_tensor_dequantize</span></code>, etc.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="atom-model-ops-attentions">
+<h3><code class="docutils literal notranslate"><span class="pre">atom/model_ops/attentions/</span></code><a class="headerlink" href="#atom-model-ops-attentions" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">backends.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code>, <code class="docutils literal notranslate"><span class="pre">AttentionMetadataBuilder</span></code>, <code class="docutils literal notranslate"><span class="pre">CommonAttentionBuilder</span></code>, <code class="docutils literal notranslate"><span class="pre">AttentionImpl</span></code> abstract classes</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">aiter_attention.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AiterBackend</span></code>, <code class="docutils literal notranslate"><span class="pre">AiterAttentionMetadataBuilder</span></code> – MHA backend with persistent ASM paged attention support</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">aiter_mla.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AiterMLABackend</span></code>, <code class="docutils literal notranslate"><span class="pre">AiterMLAMetadataBuilder</span></code> – MLA backend with sparse attention support</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="atom-model-ops-fused-moe">
+<h3><code class="docutils literal notranslate"><span class="pre">atom/model_ops/fused_moe/</span></code><a class="headerlink" href="#atom-model-ops-fused-moe" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">config.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FusedMoEConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">FusedMoEQuantConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">FusedMoEQuantDesc</span></code>, <code class="docutils literal notranslate"><span class="pre">GroupShape</span></code>, factory functions (<code class="docutils literal notranslate"><span class="pre">fp8_w8a8_moe_quant_config</span></code>, <code class="docutils literal notranslate"><span class="pre">mxfp4_w4a16_moe_quant_config</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">modular_kernel.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FusedMoEModularKernel</span></code>, <code class="docutils literal notranslate"><span class="pre">FusedMoEPrepareAndFinalize</span></code>, <code class="docutils literal notranslate"><span class="pre">ExpertTokensMetadata</span></code> – modular MoE kernel pipeline</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mori_prepare_finalize.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MoriPrepareAndFinalize</span></code> – MORI all-to-all dispatch/combine for expert parallelism</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">utils.py</span></code></p></td>
+<td><p>MoE utility functions</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="atom-utils">
+<h3><code class="docutils literal notranslate"><span class="pre">atom/utils/</span></code><a class="headerlink" href="#atom-utils" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">selector.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">get_attn_backend()</span></code> – selects <code class="docutils literal notranslate"><span class="pre">AiterBackend</span></code> or <code class="docutils literal notranslate"><span class="pre">AiterMLABackend</span></code> based on <code class="docutils literal notranslate"><span class="pre">use_mla</span></code> flag</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="model_support_guide.html" class="btn btn-neutral float-left" title="ATOM Model Support Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="scheduling_kv_cache_guide.html" class="btn btn-neutral float-right" title="ATOM Scheduling &amp; KV Cache Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
