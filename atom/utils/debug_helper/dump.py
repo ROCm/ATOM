@@ -116,6 +116,31 @@ def install_block_forward_hooks(model: torch.nn.Module) -> int:
             t = output[0] if isinstance(output, tuple) else output
             if not isinstance(t, torch.Tensor):
                 return
+            if envs.ATOM_FWD_DUMP_STATS_ONLY:
+                t_float = t.detach().float()
+                finite = torch.isfinite(t_float)
+                finite_vals = t_float[finite]
+                if finite_vals.numel() > 0:
+                    stats = {
+                        "mean": float(finite_vals.mean().item()),
+                        "std": float(finite_vals.std(unbiased=False).item()),
+                        "min": float(finite_vals.min().item()),
+                        "max": float(finite_vals.max().item()),
+                    }
+                else:
+                    stats = {"mean": None, "std": None, "min": None, "max": None}
+                torch.save(
+                    {
+                        "shape": tuple(t.shape),
+                        "dtype": str(t.dtype),
+                        "numel": int(t.numel()),
+                        "finite_ratio": float(finite.float().mean().item()),
+                        "zero_ratio": float((t_float == 0).float().mean().item()),
+                        **stats,
+                    },
+                    fname,
+                )
+                return
             torch.save(
                 {"hidden": t.detach().cpu(), "shape": tuple(t.shape)},
                 fname,

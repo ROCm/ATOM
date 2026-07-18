@@ -144,6 +144,23 @@ def safetensors_weights_iterator(
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     logger.info(f"disable_mmap: {disable_mmap}")
+    use_fastsafetensors = envs.ATOM_USE_FASTSAFETENSORS and not disable_mmap
+    fastsafe_open = None
+    if use_fastsafetensors:
+        try:
+            from fastsafetensors import fastsafe_open as _fastsafe_open
+
+            fastsafe_open = _fastsafe_open
+            logger.info(
+                "Using fastsafetensors for safetensors reads "
+                f"(nogds={envs.ATOM_FASTSAFETENSORS_NOGDS})"
+            )
+        except ImportError:
+            use_fastsafetensors = False
+            logger.warning(
+                "ATOM_USE_FASTSAFETENSORS=1 but fastsafetensors is not installed; "
+                "falling back to safetensors.safe_open"
+            )
     path = (
         model_name_or_path
         if os.path.isdir(model_name_or_path)
@@ -164,6 +181,24 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm,
     )
     for st_file in iters:
+        if use_fastsafetensors and fastsafe_open is not None:
+            try:
+                with fastsafe_open(
+                    filenames=[st_file],
+                    framework="pt",
+                    device="cpu",
+                    nogds=envs.ATOM_FASTSAFETENSORS_NOGDS,
+                    debug_log=envs.ATOM_FASTSAFETENSORS_DEBUG,
+                ) as f:
+                    for name in f.keys():
+                        yield name, f.get_tensor(name)
+                    continue
+            except Exception:
+                logger.exception(
+                    "fastsafetensors failed for %s; falling back to safe_open",
+                    st_file,
+                )
+
         # Advise kernel for sequential read-ahead (mmap optimization)
         if not disable_mmap and hasattr(os, "posix_fadvise"):
             try:
@@ -404,6 +439,12 @@ def load_model(
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
     use_threadpool = envs.ATOM_LOADER_USE_THREADPOOL
+    if envs.ATOM_USE_FASTSAFETENSORS and use_threadpool:
+        logger.warning(
+            "Disabling ATOM_LOADER_USE_THREADPOOL because fastsafetensors "
+            "tensors must be consumed before their file context closes."
+        )
+        use_threadpool = False
     if use_threadpool:
         max_workers = int(os.getenv("ATOM_LOADER_THREADPOOL_WORKERS", "0"))
         executor = concurrent.futures.ThreadPoolExecutor(
