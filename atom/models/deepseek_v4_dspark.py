@@ -566,6 +566,13 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor at
         # allocate_kv_cache) — aligned with the V4 target / MTP. No private
         # buffer here; see precompute_context_kv / dspark_attention.
+        #
+        # DSpark reads/writes swa_kv as a single bf16 [pages, head_dim] tensor
+        # (rope kept inline). It does NOT implement the target's native 2buff
+        # fp8 SWA layout (nope-fp8 swa_kv + bf16 swa_kv_rope), so mark this
+        # attn to get a private bf16 SWA pool from build_kv_cache_tensor even
+        # when --kv_cache_dtype fp8 puts the target on the 2buff path.
+        self.attn.dspark_bf16_swa = True
 
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
         """No-op: draft KV is paged into the shared pool (bound at
