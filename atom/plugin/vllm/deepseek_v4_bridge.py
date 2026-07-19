@@ -606,18 +606,20 @@ class _V4DecodeMetaBuffers:
             make_compress_plans as _mcp,
         )
 
+        # Decode CG plan slicing is `graph_bs * per_seq_bound` (computed inside
+        # make_compress_plans from these two scalars). graph_bs == num_slots
+        # (padded decode batch); max_q_len == 1 + max_spec_steps.
+        self.decode_graph_bs = S
+        self.decode_q_len = max(1, T // S)
         self.plan_buffers: dict[int, dict] = {}
-        self.decode_compress_cap: dict[int, int] = {}
-        spec_plus_one = max(1, T // S)
         for ratio, is_overlap in ratios_overlap:
             ratio = int(ratio)
-            per_seq = (spec_plus_one + ratio - 1) // ratio
+            per_seq = (self.decode_q_len + ratio - 1) // ratio
             cap = max(1, S * per_seq)
             self.plan_buffers[ratio] = {
                 "compress": i32(cap, 4),
                 "write": i32(max(1, T), 4),
             }
-            self.decode_compress_cap[ratio] = cap
 
     def stage(self, buf, arr_np):
         """Copy ``arr_np`` into the head of CpuGpuBuffer ``buf`` and return the
@@ -884,12 +886,11 @@ def _make_compress_plans(
         context_lens_cpu,
         ratios,
         plan_buffers=plan_buffers,
-        decode_capacity_per_ratio=None,
     )
-    # Preserve the bridge eager path's old variable-grid behavior. Native
-    # make_compress_plans returns a sentinel-padded write buffer, while the
-    # previous bridge helper launched update_compressor_states with exactly
-    # num_write rows. Graph decode uses _make_decode_compress_plans instead.
+    # Eager path (graph_bs unset): make_compress_plans returns a full-buffer
+    # write slice (sentinel-padded). The eager bridge launches
+    # update_compressor_states with exactly num_write rows, so re-slice down.
+    # Graph decode uses _make_decode_compress_plans (fixed graph_bs slice).
     for plan in plans.values():
         plan.write_plan_gpu = plan.write_plan_gpu[: plan.num_write]
     return plans
@@ -1302,7 +1303,8 @@ def _make_decode_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         ratios_overlap,
         plan_buffers=bufs.plan_buffers,
-        decode_capacity_per_ratio=bufs.decode_compress_cap,
+        graph_bs=bufs.decode_graph_bs,
+        max_q_len=bufs.decode_q_len,
     )
 
 

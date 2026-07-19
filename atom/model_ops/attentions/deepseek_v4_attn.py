@@ -1372,7 +1372,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         compress_plans = self._build_compress_plans(
             extend_lens_np,
             context_lens_np,
-            for_decode_cg=True,
+            graph_bs=bs,
+            max_q_len=max_seqlen_q,
         )
 
         # ---- sync, build attn_metadata, per-fwd meta ----
@@ -1549,7 +1550,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             compress_plans = self._build_compress_plans(
                 extend_lens_np,
                 ctx_for_plan,
-                for_decode_cg=True,
+                graph_bs=padded_bs,
+                max_q_len=max_seqlen_q,
                 buf_prefix_ubatch=p,
             )
 
@@ -1664,7 +1666,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             var["context_lens"].np[:scheduled_bs], dtype=np.int32
         )
         attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np, context_lens_np, for_decode_cg=False
+            extend_lens_np, context_lens_np
         )
         # Prefill goes through eager (no CG): defaults make padded_total_tokens
         # collapse to total_tokens — no padding logic kicks in. Must still run
@@ -1883,14 +1885,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # Per-ubatch plan buffers — sharing the main pool would let
             # ubatch 1's CPU build overwrite ubatch 0's before ubatch 0
             # launches its compressor kernel. TBO prefill is eager-only,
-            # so `decode_capacity_per_ratio=None` (tight n_compress slice).
+            # so leave graph_bs/max_q_len unset (tight n_compress/n_write).
             ub_plan_buffers = self._get_ubatch_compress_plan_buffers(ubatch_idx)
             ub_attn.compress_plans = make_compress_plans(
                 np.ascontiguousarray(extend_lens_np, dtype=np.int32),
                 np.ascontiguousarray(context_lens_np, dtype=np.int32),
                 self._unique_compress_ratios_overlap,
                 plan_buffers=ub_plan_buffers,
-                decode_capacity_per_ratio=None,
             )
         else:
             ub_attn.compress_plans = {}
@@ -2601,7 +2602,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         extend_lens_np,
         context_lens_np,
         *,
-        for_decode_cg: bool,
+        graph_bs: int | None = None,
+        max_q_len: int | None = None,
         buf_prefix_ubatch: str = "",
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
@@ -2616,10 +2618,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         (fixed pointers for CUDAGraph capture); the kernels skip
         sentinel-marked tail rows.
 
-        `for_decode_cg`: True for decode runtime AND decode CG capture —
-        the returned plan_gpu is sliced to a fixed `_decode_compress_cap`
-        per ratio so capture/replay shapes match. False for eager prefill —
-        the plan_gpu is sliced to the actual `n_compress` (smallest grid).
+        `graph_bs` / `max_q_len`: set BOTH for decode runtime AND decode CG
+        capture — the returned compress/write plan_gpu are sliced to fixed
+        `graph_bs * per_seq_bound` capacities (per ratio) so capture/replay
+        shapes match, with `[bs, graph_bs)` padding rows sentinel-filled.
+        Leave both None for eager prefill — the plan_gpu are sliced to the
+        actual `n_compress` / `n_write` (smallest grid, no padding).
         """
         from atom.model_ops.v4_kernels import make_compress_plans
 
@@ -2648,9 +2652,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens_np,
             self._unique_compress_ratios_overlap,
             plan_buffers=plan_buffers,
-            decode_capacity_per_ratio=(
-                self._decode_compress_cap if for_decode_cg else None
-            ),
+            graph_bs=graph_bs,
+            max_q_len=max_q_len,
         )
 
     def _populate_block_tables(
@@ -2738,12 +2741,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         grid=(bs, write_per_batch) with bs baked at capture and write_per_batch a
         `constexpr`; rows past each seq's actual token count sentinel-skip.
         `update_compressor_states` launches grid=(write_plan.shape[0],) — the
-        plan-buffer capacity fixed at builder init, NOT the per-fwd num_write —
-        and inactive rows carry `position=-1` and bail (see state_writes.py). So
-        model.forward inside torch.cuda.graph does NOT hit a variable-grid launch
-        here. (`fused_compress_attn` is likewise CG-safe: launches at the
-        decode-tight slice `_decode_compress_cap[ratio]` baked at capture and
-        sentinel-skips inactive rows for both BF16 Main and FP8 Indexer paths.)
+        decode-tight slice `graph_bs * min(qlen, K_pool)` baked at capture, NOT
+        the per-fwd num_write — and inactive rows carry `position=-1` and bail
+        (see state_writes.py). So model.forward inside torch.cuda.graph does NOT
+        hit a variable-grid launch here. (`fused_compress_attn` is likewise
+        CG-safe: launches at the decode-tight compress slice `graph_bs *
+        ceil(qlen/ratio)` baked at capture and sentinel-skips inactive rows for
+        both BF16 Main and FP8 Indexer paths.)
         """
         var = self.model_runner.forward_vars
         # Honor MTP at capture time: V4-Pro `mtp_k=1` → 2 tokens/req. The
@@ -2811,7 +2815,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # helpers used at runtime — guarantees addresses match.
         extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
         attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np, context_lens_np, for_decode_cg=True
+            extend_lens_np, context_lens_np, graph_bs=bs, max_q_len=max_q_len
         )
         # Capture: padded_bs == scheduled_bs == bs (synthetic batch is full).
         # Must run BEFORE `_attach_v4_indexer_meta` so the indexer-side meta
@@ -2970,16 +2974,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # The decode CG path uses a much tighter capacity than the prefill
         # worst case — the kernel grid is dictated by the slice of this
         # buffer that we hand to the kernel, and decode only ever needs
-        # `bs * ceil((1 + max_spec_steps) / ratio)` rows (vs `mnbt // ratio
-        # + bs` for prefill, which is ~13× larger at typical config). We
+        # `graph_bs * ceil((1 + max_spec_steps) / ratio)` compress rows (vs
+        # `mnbt // ratio + bs` for prefill, ~13× larger at typical config). We
         # still allocate the full prefill capacity (eager prefill needs it),
-        # but both decode capture and replay slice down to
-        # `_decode_compress_cap` so the captured grid is the decode-tight
-        # bound. capture and replay MUST use the same value (CG kernel call
-        # args are baked).
-        self._decode_compress_cap: dict[int, int] = {}
+        # but decode capture/replay slice down via `make_compress_plans(
+        # graph_bs=, max_q_len=)`, which computes the per-graph-tight caps
+        # `graph_bs * per_seq_bound` internally (see compress_plan.py).
         for ratio, is_overlap in self._unique_compress_ratios_overlap:
-            # NOTE: this is the pool-window size (algorithm constant), NOT the
+            # NOTE: K_pool is the pool-window size (algorithm constant), NOT the
             # state ring buffer size. The ring buffer is K_pool + max_spec_steps
             # (see csa_main_state_shape comment for the slot-aliasing argument),
             # but write_plan still emits ≤ K_pool rows per seq per fwd because
@@ -2995,20 +2997,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"v4_compress_plan_{ratio}"].copy_to_gpu()
             bufs[f"v4_write_plan_{ratio}"].cpu.fill_(-1)
             bufs[f"v4_write_plan_{ratio}"].copy_to_gpu()
-            # Decode-tight bound: each seq's qlen-token window contains at
-            # most ceil(qlen / ratio) ratio-aligned boundaries (qlen =
-            # 1 + max_spec_steps), so total ≤ bs * ceil(qlen / ratio).
-            # The integer expression `(max_spec_steps + ratio) // ratio`
-            # is ceil((1 + max_spec_steps) / ratio).
-            #
-            # Tighter than the old `max_decode_tokens // ratio + max_bs`:
-            #   CSA r=4 MTP3 bs=256:  256 vs 512 (2× smaller)
-            #   HCA r=128 MTP3 bs=256: 256 vs 264 (8 smaller)
-            #
-            # Smaller plan slice → fewer sentinel rows the kernel skips →
-            # smaller grid → less launch + scheduling overhead.
-            per_seq_max = (self.max_spec_steps + ratio) // ratio
-            self._decode_compress_cap[ratio] = bs * per_seq_max
 
         if getattr(self.model_runner.config, "enable_tbo_decode", False):
             self._alloc_v4_ubatch_decode_buffers(bufs, i32, i64)
