@@ -7,6 +7,7 @@ from itertools import count
 from typing import Any, Callable, Optional
 
 import numpy as np
+
 from atom.sampling_params import SamplingParams
 
 
@@ -56,6 +57,7 @@ class Sequence:
         multimodal_data: Optional[dict] = None,
         mrope_positions: Optional[np.ndarray] = None,
         mrope_position_delta: int = 0,
+        target_dp_rank: Optional[int] = None,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -143,6 +145,8 @@ class Sequence:
         # to safe values for single-sample requests.
         self.parent_request_id = parent_request_id
         self.sibling_index = sibling_index
+        # Explicitly requested DP rank, e.g. for cache aware DP routing
+        self.target_dp_rank = target_dp_rank
 
     def __len__(self):
         return self._num_tokens

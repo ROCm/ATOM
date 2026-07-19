@@ -121,6 +121,7 @@ class ChatCompletionRequest(BaseModel):
     n: Optional[int] = 1
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: Optional[Dict[str, Any]] = None
+    data_parallel_rank: Optional[int] = None
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""

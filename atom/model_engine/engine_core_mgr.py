@@ -12,6 +12,7 @@ from typing import List
 
 import zmq
 import zmq.asyncio
+
 from atom.config import Config
 from atom.model_engine.engine_core import EngineCore, EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
@@ -393,19 +394,22 @@ class CoreManager:
                 copy=False,
             )
         else:
-            # DP ranks: honor an explicit atomesh DPA routing hint when present;
-            # otherwise keep the existing round-robin behavior.
+            # DP ranks. A seq with an explicit target_dp_rank (set by an
+            # external cache-aware router) is dispatched to that rank so it
+            # lands on the DP rank holding its prefix cache. Seqs without a
+            # target fall back to round-robin load balancing.
             dp_seqs = [[] for _ in range(self.local_engine_count)]
             for seq in seqs:
-                requested_dp_rank = getattr(seq, "data_parallel_rank", None)
-                if requested_dp_rank is not None:
-                    dp_rank = int(requested_dp_rank)
-                    if not 0 <= dp_rank < self.local_engine_count:
-                        raise ValueError(
-                            f"Invalid data_parallel_rank={dp_rank}; "
-                            f"local_engine_count={self.local_engine_count}"
-                        )
+                target = seq.target_dp_rank
+                if target is not None and 0 <= target < self.local_engine_count:
+                    dp_rank = target
                 else:
+                    if target is not None:
+                        logger.warning(
+                            f"{self.label}: seq {seq.id} target_dp_rank {target} "
+                            f"out of range [0, {self.local_engine_count}); "
+                            f"falling back to round-robin"
+                        )
                     dp_rank = self._rr_counter % self.local_engine_count
                     self._rr_counter += 1
                 dp_seqs[dp_rank].append(seq)
