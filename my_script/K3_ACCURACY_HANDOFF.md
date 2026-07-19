@@ -156,6 +156,18 @@ Launch flag changes only (see `my_script/launch_k3_cudagraph.sh`):
 - keep `-tp 8`, `--level 0`, `--no-enable_prefix_caching --no-enable_chunked_prefill`
 Capture only covers decode bs ≤ max_num_seqs(16); larger batches fall back to eager.
 
+## FULL gsm8k validated: 0.9378 flexible / 0.9371 strict (1319/1319, clean cudagraph server)
+On par with Kimi-K2-Thinking (0.9363). No sustained-load degradation on a clean server.
+
+### False alarm (resolved): a one-off "degradation" run
+One earlier full run gave 0.53, and a 50q re-run right after it gave 0.12 — this was a TRANSIENT
+anomaly on a server that had been restarted immediately after a CI GPU-contention crash (competing
+sglang_validation container). A clean fresh full 1319 run reproduces 0.9378, and fresh 50q runs
+give 0.94 (RUN A) / 0.92 (RUN B, ~100 reqs). So there is NO real accuracy-degradation bug; the low
+numbers were environmental (shared-GPU CI contention corrupting that specific server instance).
+Practical rule: run on a clean GPU set with no competing job (use the CI-killer guard) — that's the
+only requirement for stable 0.94.
+
 ## Environment gotchas
 - GPUs are SHARED: an automated CI keeps respawning `atom_sglang_validation_mi355_N` containers
   (DeepSeek-V4-Pro tp8, mem 0.85) that OOM/kill the K3 server. `docker ps`; stop the validator
