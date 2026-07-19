@@ -674,6 +674,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             runner._kv_layer_cache_store.append(
                 (k_cache, v_cache, module.k_scale, module.v_scale)
             )
+        elif getattr(runner, "is_kimi_linear", lambda: False)():
+            # Kimi-K3 full-attn (MLA-as-MHA) layers run at head_dim=192, which is
+            # non-power-of-2. The aiter SHUFFLE paged read mis-indexes the 5D
+            # SHUFFLE V/K cache at 192 (~100% error), so bind these layers in the
+            # 4D FLASH layout [num_blocks, block_size, num_kv_heads, head_dim]
+            # instead. unified_attention(shuffled_kv_cache=False) reads it
+            # correctly at 192; writes go through reshape_and_cache_flash. The
+            # backing storage runner.kv_cache[k/v, attn_idx] is already exactly
+            # this 4D shape, so no reshape is needed.
+            k_cache = runner.kv_cache[0, attn_idx]
+            v_cache = runner.kv_cache[1, attn_idx]
+            module.impl.use_flash_layout = True
+            if config.kv_cache_dtype == "fp8":
+                module.k_scale = runner.kv_scale[0, attn_idx]
+                module.v_scale = runner.kv_scale[1, attn_idx]
         else:
             x = 16 // runner.kv_cache.element_size()
             k_cache = runner.kv_cache[0, attn_idx].view(
