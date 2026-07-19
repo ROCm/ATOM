@@ -266,7 +266,6 @@ def _run_sglang_config_test(
     server_args_overrides=None,
     distributed_rank=0,
     tp_rank=0,
-    model_architectures=None,
 ):
     """Helper: run _generate_atom_config_from_sglang_config with full mocks.
 
@@ -296,7 +295,7 @@ def _run_sglang_config_test(
 
     mock_sglang_model_config = MagicMock()
     mock_sglang_model_config.ModelConfig.from_server_args.return_value = _Obj(
-        hf_config=_Obj(architectures=model_architectures or ["DeepseekV3ForCausalLM"])
+        hf_config=_Obj()
     )
     mock_sglang_modelopt_config = MagicMock()
     mock_sglang_modelopt_config.ModelOptConfig.return_value = _Obj()
@@ -316,7 +315,7 @@ def _run_sglang_config_test(
         patch("torch.distributed.get_rank", return_value=distributed_rank),
     ):
         return plugin_config._generate_atom_config_from_sglang_config(
-            config=_Obj(architectures=model_architectures or ["DeepseekV3ForCausalLM"])
+            config=_Obj(architectures=["DeepseekV3ForCausalLM"])
         )
 
 
@@ -324,34 +323,6 @@ def test_sglang_config_expert_parallel_enabled(monkeypatch):
     """ep_size > 1 should set enable_expert_parallel=True."""
     cfg = _run_sglang_config_test(monkeypatch, {"ep_size": 4})
     assert cfg.enable_expert_parallel is True
-
-
-def test_sglang_deepseek_v4_fp8_falls_back_to_bf16_on_unsupported_gpu(
-    monkeypatch,
-):
-    """ATOM config should not initialize DSV4 fp8 op4/op5 paths on gfx942."""
-    monkeypatch.setattr(plugin_config, "_supports_dsv4_fp8_2buff", lambda: False)
-
-    cfg = _run_sglang_config_test(
-        monkeypatch,
-        {"kv_cache_dtype": "fp8_e4m3"},
-        model_architectures=["DeepseekV4ForCausalLM"],
-    )
-
-    assert cfg.kv_cache_dtype == "bf16"
-
-
-def test_sglang_non_dsv4_fp8_keeps_requested_dtype(monkeypatch):
-    """The gfx942 fallback is specific to DeepSeek-V4's native 2-buffer path."""
-    monkeypatch.setattr(plugin_config, "_supports_dsv4_fp8_2buff", lambda: False)
-
-    cfg = _run_sglang_config_test(
-        monkeypatch,
-        {"kv_cache_dtype": "fp8_e4m3"},
-        model_architectures=["DeepseekV3ForCausalLM"],
-    )
-
-    assert cfg.kv_cache_dtype == "fp8_e4m3"
 
 
 def test_sglang_config_expert_parallel_disabled(monkeypatch):

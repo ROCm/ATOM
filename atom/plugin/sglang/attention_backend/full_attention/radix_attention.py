@@ -20,22 +20,6 @@ from atom.plugin.prepare import is_plugin_mode, is_sglang
 from atom.models.utils import maybe_prefix
 
 
-def _resolve_forward_context_input_dtype():
-    try:
-        from sglang.srt.model_executor.forward_context import (
-            get_attn_backend,
-            has_forward_context,
-        )
-
-        if has_forward_context():
-            backend = get_attn_backend()
-        else:
-            backend = None
-    except Exception:
-        backend = None
-    return getattr(backend, "input_dtype", torch.bfloat16)
-
-
 class RadixAttention(BaseAttention):
     """Attention wrapper for sglang plugin mode.
 
@@ -199,6 +183,16 @@ class RadixAttention(BaseAttention):
                     forward_sparse_mla_for_sglang,
                 )
 
+                try:
+                    from sglang.srt.model_executor.forward_context import (
+                        get_attn_backend,
+                        has_forward_context,
+                    )
+
+                    attn_backend = get_attn_backend() if has_forward_context() else None
+                except Exception:
+                    attn_backend = None
+
                 return forward_sparse_mla_for_sglang(
                     query,
                     key,
@@ -207,7 +201,7 @@ class RadixAttention(BaseAttention):
                     forward_batch,
                     save_kv_cache=save_kv_cache,
                     topk_indices=topk_indices,
-                    input_dtype=_resolve_forward_context_input_dtype(),
+                    input_dtype=getattr(attn_backend, "input_dtype", torch.bfloat16),
                     q_scale=q_scale,
                 )
 
