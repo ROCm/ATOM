@@ -129,6 +129,8 @@ def triton_kernel_moe_forward(
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
 ) -> torch.Tensor:
     routing_data, gather_idx, scatter_idx = routing(
         gating_output, topk, sm_first=not renormalize
@@ -159,6 +161,8 @@ def triton_kernel_moe_forward(
         global_num_experts=global_num_experts,
         expert_map=expert_map,
         act_quant=act_quant,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -188,6 +192,8 @@ def triton_kernel_fused_experts(
     expert_map: torch.Tensor | None = None,
     intermediate_cache: torch.Tensor | None = None,
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -338,13 +344,28 @@ def triton_kernel_fused_experts(
 
         raw_2d = raw_intermediate.view(M * topk, N)
         intermediate_cache = intermediate_cache.view(M * topk, half_N)
-        fused_clamp_act_mul(
-            raw_2d,
-            out=intermediate_cache,
-            swiglu_limit=swiglu_limit,
-            activation="silu",
-            dtype_quant=None,
-        )
+        if activation == ActivationType.Situv2:
+            # Kimi situ: beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta).
+            # fused_clamp_act_mul only implements silu/gelu (act(gate)*up), which
+            # is NOT situ, so compute it in fp32 here. situ ~= silu for small
+            # activations but diverges as tanh saturates, so the silu shortcut
+            # corrupts large-magnitude expert outputs.
+            gate = raw_2d[:, :half_N].float()
+            up = raw_2d[:, half_N:].float()
+            beta = float(situ_beta) if situ_beta is not None else 1.0
+            situ_gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+            if situ_linear_beta is not None:
+                lbeta = float(situ_linear_beta)
+                up = lbeta * torch.tanh(up / lbeta)
+            intermediate_cache.copy_((situ_gate * up).to(intermediate_cache.dtype))
+        else:
+            fused_clamp_act_mul(
+                raw_2d,
+                out=intermediate_cache,
+                swiglu_limit=swiglu_limit,
+                activation="silu",
+                dtype_quant=None,
+            )
 
         if act_quant == MoEActivationQuant.FP4:
             intermediate_fp4, intermediate_mx_scale = mxfp4_quant(intermediate_cache)
