@@ -395,6 +395,7 @@ class KimiFullAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        self.layer_num = _extract_layer_idx(prefix)
         self.attn = Attention(
             self.num_local_heads,
             self.q_head_dim,
@@ -403,10 +404,92 @@ class KimiFullAttention(nn.Module):
             kv_cache_dtype=atom_config.kv_cache_dtype,
             quant_config=quant_config,
             use_mla=False,
-            layer_num=_extract_layer_idx(prefix),
+            layer_num=self.layer_num,
             config=atom_config,
             prefix=prefix,
         )
+
+    def _prefill_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-sequence SDPA over the in-batch Q/K/V (unpadded V).
+
+        The paged/unified attention prefill kernel faults on multi-sequence
+        varlen batches at head_dim=192 (Kimi MLA-as-MHA), so run SDPA per
+        sequence instead. The paged KV cache is populated separately via
+        ``_write_kv_cache`` so decode can read the prompt K/V.
+        """
+        fwd_ctx = get_forward_context()
+        cu_seqlens = getattr(fwd_ctx.attn_metadata, "cu_seqlens_q", None)
+        out = torch.empty_like(v)
+        if cu_seqlens is None:
+            spans = [(0, q.shape[0])]
+        else:
+            starts = cu_seqlens[:-1].tolist()
+            ends = cu_seqlens[1:].tolist()
+            spans = list(zip(starts, ends))
+        for start, end in spans:
+            if end <= start:
+                continue
+            out_seq = F.scaled_dot_product_attention(
+                q[start:end].transpose(0, 1).unsqueeze(0),
+                k[start:end].transpose(0, 1).unsqueeze(0),
+                v[start:end].transpose(0, 1).unsqueeze(0),
+                dropout_p=0.0,
+                is_causal=True,
+                scale=self.scaling,
+            )
+            out[start:end].copy_(out_seq.squeeze(0).transpose(0, 1))
+        return out.reshape(-1, self.local_v_size)
+
+    def _write_kv_cache(self, k: torch.Tensor, v_padded: torch.Tensor) -> None:
+        """Write prefill K/V into the paged KV cache in the same layout the
+        decode path (self.attn -> rope_cache -> reshape_and_cache) reads."""
+        import aiter
+
+        fwd_ctx = get_forward_context()
+        # Dummy warmup runs have no populated KV cache / slot mapping.
+        if fwd_ctx.context.is_dummy_run or fwd_ctx.kv_cache_data is None:
+            return
+        attn_metadata = fwd_ctx.attn_metadata
+        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache, v_cache = cache.k_cache, cache.v_cache
+        k_r = k.view(-1, self.num_local_heads, self.q_head_dim)
+        v_r = v_padded.view(-1, self.num_local_heads, self.q_head_dim)
+        # The full-attn layers are bound in the 4D FLASH layout (see
+        # aiter_attention.build_kv_cache_tensor): [num_blocks, block_size,
+        # num_kv_heads, head_dim]. Write prefill K/V with reshape_and_cache_flash
+        # so it matches what decode's unified_attention(shuffled_kv_cache=False)
+        # reads. head_dim=192 mis-indexes under the 5D SHUFFLE read, hence flash.
+        if v_cache.dim() == 4:
+            flash_scale = self.attn.impl._pa_decode_bf16_asm_scale
+            aiter.reshape_and_cache_flash(
+                k_r,
+                v_r,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                "auto",
+                flash_scale,
+                flash_scale,
+            )
+        else:
+            # Legacy SHUFFLE fallback (asm layout when V cache is 5-D).
+            asm_layout = not (v_cache.dim() != 5)
+            aiter.reshape_and_cache(
+                k_r,
+                v_r,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                kv_cache_dtype="auto",
+                k_scale=None,
+                v_scale=None,
+                asm_layout=asm_layout,
+            )
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
@@ -424,22 +507,32 @@ class KimiFullAttention(nn.Module):
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_rope = k_rope.unsqueeze(1).expand(-1, self.num_local_heads, -1)
 
-        q = torch.cat((q_nope, q_rope), dim=-1).reshape(-1, self.local_q_size)
-        k = torch.cat((k_nope, k_rope), dim=-1).reshape(-1, self.local_q_size)
+        q = torch.cat((q_nope, q_rope), dim=-1)
+        k = torch.cat((k_nope, k_rope), dim=-1)
         # Kimi MLA is stored in the standard paged-MHA cache: pad V to the query
         # head dim so K and V share a cache entry, then slice V back afterwards.
         v_padded = F.pad(v, (0, self.q_head_dim - self.v_head_dim)).reshape(
             -1, self.local_q_size
         )
-        # self.attn writes K/V into the paged KV cache (via slot_mapping) *and*
-        # runs attention, for both prefill and decode. Kimi MLA uses NoPE, so no
-        # rotary is applied here and the same path is correct for both phases.
-        # (A previous prefill-only SDPA shortcut skipped the cache write, leaving
-        # the prompt KV empty and producing garbled decode output.)
-        attn_out = self.attn(q, k, v_padded)
-        attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
-            :, :, : self.v_head_dim
-        ].reshape(-1, self.local_v_size)
+
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.context.is_prefill:
+            # SDPA compute (handles multi-sequence varlen at head_dim=192) plus an
+            # explicit cache write so decode can read the prompt K/V. Routing
+            # prefill through self.attn instead faults on batched varlen prefill.
+            attn_out = self._prefill_sdpa(q, k, v)
+            self._write_kv_cache(
+                k.reshape(-1, self.local_q_size), v_padded
+            )
+        else:
+            attn_out = self.attn(
+                q.reshape(-1, self.local_q_size),
+                k.reshape(-1, self.local_q_size),
+                v_padded,
+            )
+            attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
+                :, :, : self.v_head_dim
+            ].reshape(-1, self.local_v_size)
         attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))
         return self.o_proj(attn_out)
 

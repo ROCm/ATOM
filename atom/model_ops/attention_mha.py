@@ -331,6 +331,33 @@ class PagedAttentionImpl(nn.Module):
                 output_zeros=False,
             )
             self._cache_format = "NHD"
+        elif self.use_flash_layout:
+            # 4D FLASH layout [num_blocks, block_size, num_kv_heads, head_dim].
+            # Used by Kimi-K3 full-attn (MLA-as-MHA, head_dim=192) so decode
+            # reads via unified_attention(shuffled_kv_cache=False), which reads
+            # the non-power-of-2 head_dim correctly (SHUFFLE read is broken at
+            # 192). Write the new (decode) token(s) with reshape_and_cache_flash.
+            if self.rotary_emb is not None:
+                assert position is not None
+                q, k = self.rotary_emb(position, q, k)
+            if self.q_norm is not None:
+                q = self.q_norm(q)
+            if self.k_norm is not None:
+                k = self.k_norm(k)
+            # reshape_and_cache_flash dereferences k_scale/v_scale even for the
+            # "auto" (bf16) path; pass the pre-allocated on-device 1.0 scale.
+            flash_scale = self._pa_decode_bf16_asm_scale
+            aiter.reshape_and_cache_flash(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                ("auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype),
+                flash_scale,
+                flash_scale,
+            )
+            self._cache_format = "NHD"
         else:
             # for asm paged attention
             asm_layout = True
