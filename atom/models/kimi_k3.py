@@ -298,9 +298,27 @@ class KimiSparseMoeBlock(nn.Module):
         )
         routed_output = self.experts(routed_input, router_logits)
         if self.use_latent_moe:
+            # self.experts runs with reduce_results=False, so routed_output is a
+            # TP-partial sum over the sharded expert intermediate. routed_expert_norm
+            # is a (nonlinear) RMSNorm, so it must operate on the FULL sum:
+            # sum_r norm(partial_r) != norm(sum_r partial_r). All-reduce here first;
+            # routed_expert_norm/up_proj are replicated, so the result stays full.
+            if self.tp_size > 1:
+                routed_output = tensor_model_parallel_all_reduce(routed_output)
             if self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
             routed_output = self.routed_expert_up_proj(routed_output)
+            if self.shared_experts is not None:
+                # Shared branch is TP-partial (down_proj is row-parallel); reduce
+                # it separately and add to the already-full routed output.
+                shared_output = self.shared_experts(identity)
+                if self.tp_size > 1:
+                    shared_output = tensor_model_parallel_all_reduce(shared_output)
+                routed_output = routed_output + shared_output
+            return routed_output
+        # Non-latent path: routed experts and shared experts are both TP-partial
+        # and everything after them is linear, so a single deferred all-reduce
+        # over their sum is correct.
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(identity)
         if self.tp_size > 1:
@@ -390,41 +408,6 @@ class KimiFullAttention(nn.Module):
             prefix=prefix,
         )
 
-    def _prefill_sdpa(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> torch.Tensor:
-        fwd_ctx = get_forward_context()
-        attn_metadata = fwd_ctx.attn_metadata
-        cu_seqlens = getattr(attn_metadata, "cu_seqlens_q", None)
-        out = torch.empty_like(v)
-
-        if cu_seqlens is None:
-            spans = [(0, q.shape[0])]
-        else:
-            starts = cu_seqlens[:-1].tolist()
-            ends = cu_seqlens[1:].tolist()
-            spans = list(zip(starts, ends))
-
-        for start, end in spans:
-            if end <= start:
-                continue
-            q_seq = q[start:end].transpose(0, 1).unsqueeze(0)
-            k_seq = k[start:end].transpose(0, 1).unsqueeze(0)
-            v_seq = v[start:end].transpose(0, 1).unsqueeze(0)
-            out_seq = F.scaled_dot_product_attention(
-                q_seq,
-                k_seq,
-                v_seq,
-                dropout_p=0.0,
-                is_causal=True,
-                scale=self.scaling,
-            )
-            out[start:end].copy_(out_seq.squeeze(0).transpose(0, 1))
-        return out.reshape(-1, self.local_v_size)
-
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(-1, self.num_local_heads, self.q_head_dim)
@@ -441,22 +424,22 @@ class KimiFullAttention(nn.Module):
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_rope = k_rope.unsqueeze(1).expand(-1, self.num_local_heads, -1)
 
-        q = torch.cat((q_nope, q_rope), dim=-1)
-        k = torch.cat((k_nope, k_rope), dim=-1)
-
-        fwd_ctx = get_forward_context()
-        if fwd_ctx.context.is_prefill:
-            attn_out = self._prefill_sdpa(q, k, v)
-        else:
-            q_flat = q.reshape(-1, self.local_q_size)
-            k_flat = k.reshape(-1, self.local_q_size)
-            v_padded = F.pad(v, (0, self.q_head_dim - self.v_head_dim)).reshape(
-                -1, self.local_q_size
-            )
-            attn_out = self.attn(q_flat, k_flat, v_padded)
-            attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
-                :, :, : self.v_head_dim
-            ].reshape(-1, self.local_v_size)
+        q = torch.cat((q_nope, q_rope), dim=-1).reshape(-1, self.local_q_size)
+        k = torch.cat((k_nope, k_rope), dim=-1).reshape(-1, self.local_q_size)
+        # Kimi MLA is stored in the standard paged-MHA cache: pad V to the query
+        # head dim so K and V share a cache entry, then slice V back afterwards.
+        v_padded = F.pad(v, (0, self.q_head_dim - self.v_head_dim)).reshape(
+            -1, self.local_q_size
+        )
+        # self.attn writes K/V into the paged KV cache (via slot_mapping) *and*
+        # runs attention, for both prefill and decode. Kimi MLA uses NoPE, so no
+        # rotary is applied here and the same path is correct for both phases.
+        # (A previous prefill-only SDPA shortcut skipped the cache write, leaving
+        # the prompt KV empty and producing garbled decode output.)
+        attn_out = self.attn(q, k, v_padded)
+        attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
+            :, :, : self.v_head_dim
+        ].reshape(-1, self.local_v_size)
         attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))
         return self.o_proj(attn_out)
 
