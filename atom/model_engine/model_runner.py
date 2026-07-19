@@ -1523,10 +1523,6 @@ class ModelRunner:
                 overhead / (1 << 30),
             )
             return overhead
-        # CUDA graph pool overhead is roughly 20% of single-pass activation
-        # memory due to pooling across captured batch sizes. Measured on MI355
-        # V4-Pro TP8: a single q-bucket graph set across all bs adds
-        # only ~1.4GB reserved, well under 0.2*act.
         overhead = activation_bytes * 0.2
         # DSpark RAGGED captures one graph set PER q-bucket, so scale by the
         # number of captured buckets (the pool grows ~linearly with bucket
@@ -2170,14 +2166,14 @@ class ModelRunner:
             return
         full_q = self.drafter.mtp_k + 1
 
-        # {req_id: ell} from the PREVIOUS step's propose() (confidence_scheduler,
+        # {req_id: ell} from the PREVIOUS step's propose() (verify_scheduler,
         # same process). The worker batch copy has req_ids but NOT the
         # scheduler-side `seqs` dict, so look ell up by req_id. A request with no
         # prior ell (new this step) -> full length (never under-verify).
-        confidence_scheduler = self.drafter.confidence_scheduler
+        verify_scheduler = self.drafter.verify_scheduler
         by_req = (
-            confidence_scheduler.ell_by_req
-            if confidence_scheduler is not None
+            verify_scheduler.ell_by_req
+            if verify_scheduler is not None
             else None
         ) or {}
         if not by_req:
@@ -2927,12 +2923,12 @@ class ModelRunner:
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
         # ordering ambiguity). The worker already fired this map in propose() via
-        # confidence_scheduler.record_ell(batch.req_ids).
+        # verify_scheduler.record_ell(batch.req_ids).
         dspark_ell = None
         drafter = getattr(self, "drafter", None)
-        confidence_scheduler = getattr(drafter, "confidence_scheduler", None)
-        if confidence_scheduler is not None:
-            dspark_ell = confidence_scheduler.ell_nonblocking()
+        verify_scheduler = getattr(drafter, "verify_scheduler", None)
+        if verify_scheduler is not None:
+            dspark_ell = verify_scheduler.ell_nonblocking()
 
         return ScheduledBatchOutput(
             req_ids=req_ids_out,
@@ -3017,11 +3013,9 @@ class ModelRunner:
         # (cu_seqlens_q[1:]), so offset = full_q - num_bonus = 1 + num_reject.
         last_token_offset = 1 + num_reject_tokens
 
-        # DSpark q-shrink: cu_seqlens_q segments are length q (<full_q) but
-        # num_reject_tokens is measured against the full block, so the end-relative
-        # offset over-counts by (full_q-q) -> index_select OOB. Subtract the shrink
-        # so the anchor lands at segment_start+num_bonus. No-op when q==full_q or
-        # on prefill/mixed steps.
+        # DSpark q-shrink: segments are length q<full_q but the end-relative
+        # offset is measured against full_q, over-counting by (full_q-q) -> OOB.
+        # Subtract the shrink. No-op when q==full_q or on prefill/mixed steps.
         ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
         if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
             # RAGGED: each seg has its own len_i; anchor offset = len_i - num_bonus_i
@@ -3063,9 +3057,9 @@ class ModelRunner:
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
         # reordered) batch. Keying by req_id (not batch position) is required:
         # continuous batching reorders requests between steps.
-        confidence_scheduler = getattr(self.drafter, "confidence_scheduler", None)
-        if confidence_scheduler is not None:
-            confidence_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
+        verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
+        if verify_scheduler is not None:
+            verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     @torch.inference_mode()
@@ -3257,9 +3251,7 @@ class ModelRunner:
 
         # Memory guard slope: capture footprint grows ~linearly with hidden size.
         # Empirically ~600 bytes/token per hidden-dim (0.004GB/token measured at
-        # hidden=7168 -> 0.004*2**30/7168 = 599B, rounded). DP amplifies the
-        # retained per-token footprint (MoE all_gather ~dp_size x tokens); scale
-        # by dp**0.6 to match _estimate_cudagraph_overhead.
+        # hidden=7168 -> 0.004*2**30/7168 = 599B, rounded).
         _GUARD_BYTES_PER_TOKEN_PER_DIM = 600
         slope = _GUARD_BYTES_PER_TOKEN_PER_DIM * self.config.hf_config.hidden_size
         if dp_size > 1:
@@ -3576,8 +3568,8 @@ class ModelRunner:
         drafter = getattr(self, "drafter", None)
         if drafter is None or not getattr(drafter, "use_dspark", False):
             return
-        confidence_scheduler = getattr(drafter, "confidence_scheduler", None)
-        if confidence_scheduler is None:
+        verify_scheduler = getattr(drafter, "verify_scheduler", None)
+        if verify_scheduler is None:
             return
         if not getattr(self, "graphs", None):
             return
@@ -3588,15 +3580,12 @@ class ModelRunner:
         from atom.spec_decode.dspark_scheduler import build_sps_table
 
         # DSpark RAGGED graph: replay-based SPS calibration is UNSAFE here. Each
-        # `graph.replay()` runs the FULL decode graph — including the SWA/KV-cache
-        # ring writes — with synthetic data at real per-req cache slots [0:bs],
-        # polluting the KV cache that the first real requests then read (garbage
-        # → GPU faults / wrong output). It also leaves the shared forward_vars in
-        # a stale layout. The scheduler only needs a monotone SPS(B) shape, so we
-        # build a synthetic table instead of timing replays (matches the proven
-        # DISABLE_SPS_CALIB path that runs lossless at GSM8K 0.95). Timed
-        # calibration for the ragged graph is a follow-up (needs a scratch KV
-        # pool + buffer save/restore around the replays).
+        # `graph.replay()` runs the FULL decode graph (incl. SWA/KV writes) with
+        # synthetic data at real cache slots [0:bs], polluting the KV cache real
+        # requests then read. The scheduler only needs a monotone SPS(B) shape,
+        # so use a synthetic table instead (matches the proven DISABLE_SPS_CALIB
+        # path). Timed ragged calibration is a follow-up (needs a scratch KV pool
+        # + buffer save/restore around the replays).
         if self.config.dspark.ragged:
             logger.info(
                 "DSpark SPS calibration skipped under RAGGED graph "
@@ -3636,7 +3625,7 @@ class ModelRunner:
 
         max_b = self.config.max_num_seqs * max_q_len
         sps_table = build_sps_table(token_points, sps_points, max_b).to(self.device)
-        confidence_scheduler.sps_table = sps_table
+        verify_scheduler.sps_table = sps_table
         logger.info(
             "DSpark SPS calibrated over %d points (B=%d..%d), table size %d.",
             len(token_points),

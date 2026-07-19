@@ -784,24 +784,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         swa_pages = self.model_runner.num_swa_blocks * self.block_size
 
         if isinstance(module, _V4Attention):
-            # DSpark draft layer: it reads/writes swa_kv as a single bf16
-            # [pages, head_dim] tensor (rope inline) and does NOT implement the
-            # target's native 2buff fp8 SWA layout. Give it a private bf16 SWA
-            # pool (content-addressed by the same swa_block_tables) so an fp8
-            # target KV cache doesn't corrupt the draft window. Small pool
-            # (swa_pages rows); draft KV never needs fp8's memory savings.
-            if getattr(module, "dspark_bf16_swa", False):
-                module.swa_kv = torch.zeros(
-                    (swa_pages, self.head_dim),
-                    dtype=torch.bfloat16,
-                    device=self.model_runner.device,
-                )
-                module.swa_block_size = self.block_size
-                module.kv_fp8 = False
-                module.unified_kv = None
-                module.unified_kv_rope = None
-                module.swa_kv_rope = None
-                return None
             # Bind both:
             #   - `attn.unified_kv`: the full per-layer pool (paged_decode reads).
             #   - `attn.swa_kv`: the flat [num_swa_blocks*block_size, head_dim]

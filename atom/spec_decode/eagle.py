@@ -16,7 +16,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.model_loader.loader import load_model
-from atom.spec_decode.confidence_scheduler import ConfidenceScheduler
+from atom.spec_decode.verify_scheduler import VerifyScheduler
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils import envs
 from atom.utils.forward_context import (
@@ -246,13 +246,13 @@ class EagleProposer:
             )
             # Phase 2: confidence-scheduled verification (Level B, variable-length
             # verify). The ell (per-request verify length) machinery lives in a
-            # reusable ConfidenceScheduler; propose() feeds it the confidence head
+            # reusable VerifyScheduler; propose() feeds it the confidence head
             # and the next step's calc_spec_decode_metadata consumes the ell map.
             self.dspark_confidence_schedule = bool(
                 self.config.dspark.confidence_schedule
             )
-            self.confidence_scheduler = (
-                ConfidenceScheduler(runner) if self.dspark_confidence_schedule else None
+            self.verify_scheduler = (
+                VerifyScheduler(runner) if self.dspark_confidence_schedule else None
             )
         else:
             self.mtp_k: int = self.speculative_config.num_speculative_tokens or 0
@@ -532,12 +532,12 @@ class EagleProposer:
         # actual variable-length verification (Level B) is applied downstream by
         # truncating each request's scheduled spec tokens to ell_r, which frees
         # batch capacity instead of the no-op in-block masking of Level A.
-        if self.confidence_scheduler is not None and confidence is not None:
-            self.confidence_scheduler.set_last_ell(
-                self.confidence_scheduler.compute_ell(confidence[:, : self.mtp_k])
+        if self.verify_scheduler is not None and confidence is not None:
+            self.verify_scheduler.set_last_ell(
+                self.verify_scheduler.compute_ell(confidence[:, : self.mtp_k])
             )
-        elif self.confidence_scheduler is not None:
-            self.confidence_scheduler.set_last_ell(None)
+        elif self.verify_scheduler is not None:
+            self.verify_scheduler.set_last_ell(None)
         return draft_token_ids
 
     def propose(

@@ -83,8 +83,7 @@ def rejection_sample(
     # Create output buffer. Each kernel program writes positions
     # [0 .. num_draft_tokens] for its request and fills the unwritten tail
     # [num_draft_tokens+1 .. num_spec_steps] with the -1 truncation sentinel
-    # itself (variable-length verification / DSpark Phase 2), so torch.empty is
-    # safe and avoids an extra full()/memset launch.
+    # itself (variable-length verification / DSpark Phase 2), so modify triton kernel
     output_token_ids = torch.empty(
         (batch_size, num_spec_steps + 1),
         dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.

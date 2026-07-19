@@ -7,7 +7,7 @@ import torch
 logger = logging.getLogger("atom")
 
 
-class ConfidenceScheduler:
+class VerifyScheduler:
     """Hardware-Aware Prefix Scheduler for confidence-scheduled block drafting.
 
     Owns the per-request verify-length (``ell``) machinery shared by any
@@ -15,6 +15,10 @@ class ConfidenceScheduler:
     drafter next). Given the draft confidence head output it picks each request's
     verify length ``ell_r`` (paper Algorithm 1), then carries that ell across
     steps keyed by req_id (continuous batching reorders the batch between steps).
+
+    Named for its product (the per-request verify length) rather than its input
+    signal: the confidence head is one input to the schedule, but the class's job
+    is to decide how many draft tokens each request verifies next step.
 
     The cost model inputs (``sps_table`` throughput profile, ``sts_temperatures``)
     are bound later by the runner's warmup/calibration; until then a synthetic

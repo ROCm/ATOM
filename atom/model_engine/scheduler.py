@@ -344,25 +344,22 @@ class ScheduledBatch:
         self.num_spec_step = num_spec_step
 
         # num_spec_query_tokens: SINGLE SOURCE OF TRUTH for this step's per-seq
-        # decode query length (= anchor + verified drafts). Sibling of
-        # num_spec_step. Default = num_spec_step + 1 (full MTP block). DSpark
-        # plan Y's `_dspark_apply_q_bucket` overwrites this with
-        # the chosen q-bucket when it shrinks the batch. EVERY consumer that
-        # needs "how many tokens per decode seq this step" (input_ids build,
-        # positions, ForwardMode bs recovery, draft anchor offset, ...) MUST
-        # read this field instead of re-deriving num_scheduled_tokens.max() or
-        # hardcoding mtp_k+1 — that scattered re-derivation was the source of a
-        # whole family of q-shrink desync bugs. For plain MTP (no shrink) the
-        # value stays num_spec_step + 1, so all consumers are unchanged.
+        # decode query length (= anchor + verified drafts). Default = num_spec_step
+        # + 1 (full MTP block); DSpark's `_dspark_apply_q_bucket` overwrites it
+        # with the chosen q-bucket on shrink. EVERY "tokens per decode seq"
+        # consumer (input_ids, positions, ForwardMode bs recovery, draft anchor,
+        # ...) MUST read this instead of re-deriving it — scattered re-derivation
+        # was a whole family of q-shrink desync bugs. Plain MTP keeps num_spec_step
+        # + 1, so consumers are unchanged.
         self.num_spec_query_tokens = num_spec_step + 1
         # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
         # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when
-        # set, consumers must use it (per-seq) instead of the scalar above.
+        # set, consumers use it (per-seq) instead of the scalar above.
         self.dynamic_spec_query_tokens_per_req = None
 
         # DSpark DP graph-shape sync (see model_runner._apply_dspark_shape_max):
-        # the DP-max decode bs / ragged token total this step, so every DP rank
-        # replays the same cudagraph shape. None outside DSpark-under-DP steps.
+        # DP-max decode bs / ragged token total, so every DP rank replays the same
+        # cudagraph shape. None outside DSpark-under-DP steps.
         self.dspark_dp_bs = None
         self.dspark_dp_total_tokens = None
 
