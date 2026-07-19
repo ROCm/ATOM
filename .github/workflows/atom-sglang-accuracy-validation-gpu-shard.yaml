@@ -495,6 +495,19 @@ jobs:
 
           echo "Waiting for SGLANG accuracy driver to finish..."
           while true; do
+            container_running="$(
+              $CONTAINER_ENGINE inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo "missing"
+            )"
+            if [ "${container_running}" != "true" ]; then
+              echo "ERROR: validation container is not running (state=${container_running})."
+              echo "========== Container inspect =========="
+              $CONTAINER_ENGINE inspect "$CONTAINER_NAME" || true
+              echo "========== Container logs =========="
+              $CONTAINER_ENGINE logs "$CONTAINER_NAME" || true
+              emit_driver_logs || true
+              exit 1
+            fi
+
             if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '[ -f /tmp/atom_sglang_accuracy_driver.done ]'; then
               emit_driver_logs
               break
