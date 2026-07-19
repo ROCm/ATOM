@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+ATOM_DEEPSEEK_V4_FP8_PACKED_DIM = 512
 
 
 def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
@@ -228,7 +229,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
             swa_bytes = (
                 self.num_slots
                 * self.swa_cache_size
-                * (self.qk_nope_head_dim + self.qk_rope_head_dim * 2)
+                * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
             )
         else:
             swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
@@ -240,7 +241,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                     total += (
                         self.num_blocks
                         * k
-                        * (self.qk_nope_head_dim + self.qk_rope_head_dim * 2)
+                        * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
                     )
                 else:
                     total += self.num_blocks * k * self.head_dim * 2
@@ -251,7 +252,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                     total += (
                         self.num_blocks
                         * k
-                        * (self.qk_nope_head_dim + self.qk_rope_head_dim * 2)
+                        * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
                     )
                 else:
                     total += self.num_blocks * k * self.head_dim * 2
@@ -291,7 +292,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
 
                 nope_start = offset
                 swa_nope_bytes = (
-                    self.num_slots * self.swa_cache_size * self.qk_nope_head_dim
+                    self.num_slots
+                    * self.swa_cache_size
+                    * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
                 )
                 swa_view = (
                     self._take(offset, swa_nope_bytes)
@@ -299,22 +302,28 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                     .view(
                         self.num_slots,
                         self.swa_cache_size,
-                        self.qk_nope_head_dim,
+                        ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
                     )
                 )
                 offset += swa_nope_bytes
 
                 main_view = None
                 if ratio in (4, 128):
-                    main_nope_bytes = self.num_blocks * k * self.qk_nope_head_dim
+                    main_nope_bytes = (
+                        self.num_blocks * k * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
+                    )
                     main_view = (
                         self._take(offset, main_nope_bytes)
                         .view(fp8_dtype)
                         .as_strided(
-                            size=(self.num_blocks, k, self.qk_nope_head_dim),
+                            size=(
+                                self.num_blocks,
+                                k,
+                                ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+                            ),
                             stride=(
-                                k * self.qk_nope_head_dim,
-                                self.qk_nope_head_dim,
+                                k * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+                                ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
                                 1,
                             ),
                         )
@@ -324,7 +333,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 unified.append(
                     self.raw_arena[nope_start:offset]
                     .view(fp8_dtype)
-                    .view(num_pages, self.qk_nope_head_dim)
+                    .view(num_pages, ATOM_DEEPSEEK_V4_FP8_PACKED_DIM)
                 )
 
                 rope_start = offset
