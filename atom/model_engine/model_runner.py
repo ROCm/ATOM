@@ -3,6 +3,7 @@
 
 import bisect
 import gc
+import inspect
 import logging
 import math
 import os
@@ -2172,9 +2173,7 @@ class ModelRunner:
         # prior ell (new this step) -> full length (never under-verify).
         verify_scheduler = self.drafter.verify_scheduler
         by_req = (
-            verify_scheduler.ell_by_req
-            if verify_scheduler is not None
-            else None
+            verify_scheduler.ell_by_req if verify_scheduler is not None else None
         ) or {}
         if not by_req:
             return
@@ -3366,6 +3365,12 @@ class ModelRunner:
         if q_buckets != [full_q_len]:
             logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
 
+        # Whether this backend's capture builder supports a dynamic (per-bucket)
+        build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
+        supports_dynamic_q_len = (
+            "max_q_len" in inspect.signature(build_capture).parameters
+        )
+
         with pause_gc(), graph_capture() as capture_ctx:
             for max_q_len in q_buckets:
                 capture_range = (
@@ -3388,11 +3393,12 @@ class ModelRunner:
                     self.forward_vars["positions"].np[:num_tokens] = (
                         np.arange(num_tokens, dtype=np.int64) % max_q_len
                     )
-                    attn_metadata, context = (
-                        self.attn_metadata_builder.build_for_cudagraph_capture(
+                    if supports_dynamic_q_len:
+                        attn_metadata, context = build_capture(
                             bs=bs, max_q_len=max_q_len
                         )
-                    )
+                    else:
+                        attn_metadata, context = build_capture(bs=bs)
                     if self.use_mrope:
                         mrope_positions = self._mrope_positions_view(num_tokens)
                         mrope_positions.copy_(
