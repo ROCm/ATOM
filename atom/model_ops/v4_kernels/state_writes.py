@@ -776,7 +776,9 @@ def dspark_paged_window_gather_2buff(
         V4_TILE,
     )
 
-    assert swa_region_nope.dim() == 2 and swa_region_nope.shape[1] == V4_DIM_QK_PACKED, (
+    assert (
+        swa_region_nope.dim() == 2 and swa_region_nope.shape[1] == V4_DIM_QK_PACKED
+    ), (
         f"swa_region_nope must be [P,{V4_DIM_QK_PACKED}] fp8, "
         f"got {tuple(swa_region_nope.shape)}"
     )

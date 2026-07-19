@@ -1075,6 +1075,14 @@ class DSparkConfig:
         q-bucket verify path (independent of the ragged path).
       - disable_sps_calib: skip SPS calibration (replays captured graphs at
         warmup); fall back to the synthetic SPS stub.
+      - fp8_swa: opt in to the native 2buff fp8 draft SWA window under
+        --kv_cache_dtype fp8. DEFAULT False: the draft window stays bf16 (private
+        pool) even when the target KV cache is fp8. DSpark's block attention is
+        bf16, so an fp8 draft window only saves a little gather bandwidth while
+        paying quant(write)+dequant(read) — net-negative on the small draft
+        window in practice. Kept behind this flag for A/B and for a future fused
+        fp8 draft-attention kernel that would make it pay off. The target KV
+        cache dtype is unaffected (still --kv_cache_dtype).
     """
 
     confidence_schedule: bool = False
@@ -1082,6 +1090,7 @@ class DSparkConfig:
     ragged_graph_sizes: str = ""
     q_buckets: str = ""
     disable_sps_calib: bool = False
+    fp8_swa: bool = False
 
     @classmethod
     def from_dict(cls, cfg: Optional[dict]) -> "DSparkConfig":

@@ -566,22 +566,22 @@ class DSparkLayer(Block):  # type: ignore[misc]
             )
             self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
-        # PAGED-SWA: draft window KV lives in the shared paged pool
-        # (`self.attn.swa_kv` slice of `unified_kv`, bound by
+        # PAGED-SWA: draft window KV lives in a paged pool bound by
         # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor at
-        # allocate_kv_cache) — aligned with the V4 target / MTP. No private
-        # buffer here; see precompute_context_kv / dspark_attention.
+        # allocate_kv_cache; see precompute_context_kv / dspark_attention.
         #
-        # The draft window follows the SAME KV-cache dtype decision as the V4
-        # target (no draft-only override): build_kv_cache_tensor binds it off the
-        # builder's `_kv_fp8` — which is `--kv_cache_dtype fp8` AND gated to the
-        # archs that support the aiter 2buff ops, auto-falling back to bf16
-        # otherwise. So the draft is fp8 exactly when the target is:
-        #   fp8  → `swa_kv` (nope-fp8 [pages,512]) + `swa_kv_rope` (bf16 [pages,64]);
-        #          precompute_context_kv quantizes via quantize_bf16_to_v4_2buff +
-        #          swa_write_2buff_prepacked, dspark_attention reads via
-        #          dspark_paged_window_gather_2buff (dequant back to bf16).
-        #   bf16 → single-pool bf16 `swa_kv` (swa_kv_rope=None), rope inline.
+        # Mark this attn as a DSpark draft layer so the builder can choose the
+        # draft window dtype INDEPENDENTLY of the target KV cache:
+        #   - DEFAULT (config.dspark.fp8_swa False): a PRIVATE bf16 SWA pool, even
+        #     when the target is fp8. DSpark's block attention is bf16, so an fp8
+        #     draft window only saves a little gather bandwidth while paying
+        #     quant(write)+dequant(read) — net-negative on the small draft window.
+        #   - fp8_swa True AND target fp8: the SHARED native 2buff fp8 pool
+        #     (`swa_kv` nope-fp8 + `swa_kv_rope` bf16), same as the target — kept
+        #     for A/B and a future fused fp8 draft-attention kernel.
+        # The runtime read/write paths key off module.kv_fp8 / swa_kv_rope (set by
+        # the builder), so bf16 vs fp8 is fully determined at bind time.
+        self.attn.dspark_draft = True
 
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
         """No-op: draft KV is paged into the shared pool (bound at
