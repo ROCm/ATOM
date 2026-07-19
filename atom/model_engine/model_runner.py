@@ -2098,6 +2098,9 @@ class ModelRunner:
             is_dummy=context.is_dummy_run,
             tbo_on=forward_context.ubatch_slices is not None,
             bs=bs,
+            # The CUDAGraph replays a padded batch (context.graph_bs); pass it so
+            # the label shows bs=<real>/<graph> when they differ.
+            graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
             batch=batch,
         )
 
