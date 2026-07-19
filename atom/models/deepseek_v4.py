@@ -1810,7 +1810,7 @@ class DeepseekV4Attention(nn.Module):
         # asm decode). Dynamo specializes on this constant so the bf16 path
         # traces unchanged. The rope buffers (swa_kv_rope / unified_kv_rope) are
         # bound onto the module by DeepseekV4AttentionMetadataBuilder.
-        self.kv_fp8 = atom_config.kv_cache_dtype == "fp8"
+        self.kv_fp8 = str(atom_config.kv_cache_dtype).startswith("fp8")
 
     def process_weights_after_loading(self) -> None:
         """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
