@@ -170,3 +170,85 @@ def test_vmm_fabric_cross_process_transfer():
     assert cons.exitcode == 0, "consumer process crashed"
     assert prod.exitcode == 0, "producer process crashed"
     assert result.get(timeout=5) is True, "fabric peer-copied data mismatch"
+
+
+# --- fabric write path: importer writes INTO the mapping --------------------
+# This is the direction the native connector actually drives: the consumer
+# exports its staging buffer and the *producer* imports it and gathers KV into
+# the imported fabric mapping (kernel write); the exporter then reads its own
+# buffer locally. Modeled here as exporter(GPU0) <- importer(GPU1) writes.
+
+
+def _producer_fabric_write(port, device, ready, result):
+    from atom.kv_transfer.disaggregation.native import VmmBuffer
+
+    torch.cuda.set_device(device)
+    buf = VmmBuffer.alloc(NBYTES, device, fabric=True)
+    kv = buf.tensor(torch.bfloat16, (NB, BE))
+    kv.fill_(-1.0)  # sentinel: importer must overwrite every block
+    torch.cuda.synchronize()
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(1)
+    ready.set()
+    conn, _ = srv.accept()
+    conn.sendall(buf.export_fabric())
+    conn.recv(1)  # importer signals write completion
+    torch.cuda.synchronize()
+    ok = all(kv[i][0].item() == float(i % 128) for i in range(NB))
+    result.put(bool(ok))
+    conn.close()
+    srv.close()
+
+
+def _consumer_fabric_write(port, device, ready):
+    from atom.kv_transfer.disaggregation.native import VmmBuffer, vmm
+
+    torch.cuda.set_device(device)
+    ready.wait(60)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(("127.0.0.1", port))
+    handle = b""
+    while len(handle) < 64:
+        handle += s.recv(64 - len(handle))
+
+    peer_buf = VmmBuffer.import_fabric(handle, NBYTES, device)
+    local = torch.empty(NB, BE, dtype=torch.bfloat16, device=device)
+    for i in range(NB):
+        local[i].fill_(float(i % 128))
+    torch.cuda.synchronize()
+    # write INTO the imported fabric mapping (kernel, never hipMemcpy)
+    vmm.copy_kernel(peer_buf.data_ptr, local.data_ptr(), NBYTES)
+    torch.cuda.synchronize()
+    s.send(b"d")
+    s.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="requires >= 2 GPUs",
+)
+def test_vmm_fabric_write_back():
+    """Importer-side write into a fabric mapping (producer gather direction)."""
+    from atom.kv_transfer.disaggregation.native import supported_fabric
+
+    if not supported_fabric(0) or not supported_fabric(1):
+        pytest.skip("HIP VMM fabric handles not supported on these devices")
+
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    result = ctx.Queue()
+    port = 53792
+
+    prod = ctx.Process(target=_producer_fabric_write, args=(port, 0, ready, result))
+    cons = ctx.Process(target=_consumer_fabric_write, args=(port, 1, ready))
+    prod.start()
+    cons.start()
+    cons.join(180)
+    prod.join(30)
+
+    assert cons.exitcode == 0, "consumer process crashed"
+    assert prod.exitcode == 0, "producer process crashed"
+    assert result.get(timeout=5) is True, "fabric write-back data mismatch"
