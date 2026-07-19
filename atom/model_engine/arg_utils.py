@@ -8,7 +8,7 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, SpeculativeConfig
+from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
 
 logger = logging.getLogger("atom")
 
@@ -36,6 +36,7 @@ class EngineArgs:
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: Optional[str] = None
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
@@ -47,7 +48,8 @@ class EngineArgs:
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
-    load_dummy: bool = False
+    cudagraph_mode: str = "FULL"
+    load_dummy: Optional[str] = None
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
@@ -60,6 +62,10 @@ class EngineArgs:
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        if self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -114,11 +120,21 @@ class EngineArgs:
             help="Engine internal port",
         )
         parser.add_argument(
+            "--kv-cache-dtype",
             "--kv_cache_dtype",
+            dest="kv_cache_dtype",
             choices=["bf16", "fp8"],
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'.",
+        )
+        parser.add_argument(
+            "--index-cache-dtype",
+            "--index_cache_dtype",
+            choices=["bf16", "fp8"],
+            type=str,
+            default=None,
+            help="Index cache type. Defaults to --kv_cache_dtype.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -139,7 +155,25 @@ class EngineArgs:
             "--level", type=int, default=3, help="The level of compilation (0-3)."
         )
         parser.add_argument(
-            "--load_dummy", action="store_true", help="Skip loading model weights."
+            "--cudagraph-mode",
+            type=str,
+            default="FULL",
+            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+            help="CUDA graph runtime mode. FULL = manual whole-forward capture "
+            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
+            "attention eager (requires --level 3).",
+        )
+        parser.add_argument(
+            "--load_dummy",
+            nargs="?",
+            const="empty",
+            default=None,
+            choices=["empty", "zero", "xavier"],
+            help="Use dummy weights instead of reading the checkpoint. Bare flag "
+            "or '=empty': skip loading (uninitialized, legacy behavior). '=zero': "
+            "all weights 0. '=xavier': xavier_uniform_ for bf16 weights and a "
+            "constant target magnitude for fp4/fp8 packed weights (finite, "
+            "roughly real-scale; fp4 is the validated path).",
         )
         parser.add_argument(
             "--enable-expert-parallel",
@@ -319,6 +353,7 @@ class EngineArgs:
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
+            cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],
             cudagraph_capture_sizes=(
                 parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
                 if self.cudagraph_capture_sizes

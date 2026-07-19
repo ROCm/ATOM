@@ -116,6 +116,11 @@ class EngineCore:
             config.num_per_req_cache_groups = block_info.get(
                 "num_per_req_cache_groups", 0
             )
+            # paged-SWA: propagate SWA pool sizing from the runner subprocess
+            # so BlockManager (built in Scheduler below) sees the same value as
+            # the runner's attn builder (else swa_enabled=False vs the SWA pool).
+            config.num_swa_blocks = block_info.get("num_swa_blocks", 0)
+            config.swa_window_size = block_info.get("swa_window_size", 0)
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -198,6 +203,16 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        # Bind this EngineCore's lifetime to its parent (the server /
+        # CoreManager): if the parent exits, have the kernel reap this process —
+        # and, transitively, the ModelRunner workers it spawns — instead of
+        # leaving them orphaned. Orphans keep pinning GPU VRAM + the custom
+        # all-reduce IPC handles / rendezvous TCPStore, which makes the next
+        # restart reuse a stale hipIpc handle and crash. See
+        # atom.utils.enable_orphan_reaping for the full rationale.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
         engine: EngineCore = None
         try:
             if config.parallel_config.data_parallel_size > 1:
@@ -470,9 +485,14 @@ class DPEngineCoreProc(EngineCore):
                 PrefillDelayer(
                     dp_size=config.parallel_config.data_parallel_size,
                     cpu_group=self.dp_group,
-                    max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
-                    max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 )
             )
 

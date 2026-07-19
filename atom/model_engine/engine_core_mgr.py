@@ -45,8 +45,6 @@ class CoreManager:
         self.stream_outputs_queue = queue.Queue()
         self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
-        # Batched stream-flush hook, resolved lazily (avoids import cycle).
-        self._flush_stream_batch_fn = None
         self.engine_core_processes = []
         self.input_sockets = []
         self.output_sockets = []
@@ -232,16 +230,18 @@ class CoreManager:
                             f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
                         )
                         self.stream_outputs_queue.put_nowait(stream_outputs)
-                        # Run per-seq callbacks (decode + buffer), then flush
-                        # the whole step in one scheduled call — avoids a
-                        # per-token call_soon_threadsafe storm on the API loop.
-                        any_callback = False
+                        # Also call callbacks if registered
                         for seq_id, request_output in stream_outputs:
                             callback = self._seq_id_to_callback.get(seq_id)
+                            logger.debug(
+                                f"{self.label}: seq_id={seq_id}, callback={'found' if callback is not None else 'NOT FOUND'}, tokens={request_output.output_tokens}"
+                            )
                             if callback is not None:
-                                any_callback = True
                                 try:
                                     callback(request_output)
+                                    logger.debug(
+                                        f"{self.label}: Successfully called callback for seq_id={seq_id}"
+                                    )
                                 except Exception as e:
                                     logger.warning(
                                         f"Error calling stream_callback for sequence {seq_id}: {e}",
@@ -249,12 +249,8 @@ class CoreManager:
                                     )
                             if request_output.finished:
                                 self._seq_id_to_callback.pop(seq_id, None)
-                        if any_callback:
-                            try:
-                                self._flush_stream_batch()
-                            except Exception:
-                                logger.exception(
-                                    f"{self.label}: flush_stream_batch failed"
+                                logger.debug(
+                                    f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                 )
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self.utility_response_queue.put_nowait(data)
@@ -397,17 +393,32 @@ class CoreManager:
                 copy=False,
             )
         else:
-            # DP ranks, round-robin with counter for load balancing for atom server
+            # DP ranks: honor an explicit atomesh DPA routing hint when present;
+            # otherwise keep the existing round-robin behavior.
             dp_seqs = [[] for _ in range(self.local_engine_count)]
             for seq in seqs:
-                dp_rank = self._rr_counter % self.local_engine_count
+                requested_dp_rank = getattr(seq, "data_parallel_rank", None)
+                if requested_dp_rank is not None:
+                    dp_rank = int(requested_dp_rank)
+                    if not 0 <= dp_rank < self.local_engine_count:
+                        raise ValueError(
+                            f"Invalid data_parallel_rank={dp_rank}; "
+                            f"local_engine_count={self.local_engine_count}"
+                        )
+                else:
+                    dp_rank = self._rr_counter % self.local_engine_count
+                    self._rr_counter += 1
                 dp_seqs[dp_rank].append(seq)
-                self._rr_counter += 1
 
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if rank_seqs:
-                    logger.debug(
-                        f"{self.label}: Add {len(rank_seqs)} requests to DP rank {dp_rank}"
+                    request_ids = [seq.id for seq in rank_seqs]
+                    logger.info(
+                        "%s: Add %d request(s) to DP rank %d, sequence ids: %s",
+                        self.label,
+                        len(rank_seqs),
+                        dp_rank,
+                        request_ids,
                     )
                     self.input_sockets[dp_rank].send_multipart(
                         [
@@ -416,20 +427,6 @@ class CoreManager:
                         ],
                         copy=False,
                     )
-
-    def _flush_stream_batch(self):
-        """Flush this step's buffered stream chunks (see flush_stream_batch).
-        Resolved lazily to avoid an import cycle; no-op without the entrypoint."""
-        fn = self._flush_stream_batch_fn
-        if fn is None:
-            try:
-                from atom.entrypoints.openai.api_server import flush_stream_batch
-
-                fn = self._flush_stream_batch_fn = flush_stream_batch
-            except Exception:
-                self._flush_stream_batch_fn = lambda: None  # resolve to no-op
-                return
-        fn()
 
     def get_stream_outputs(self):
         try:
@@ -462,6 +459,18 @@ class CoreManager:
                 ],
                 copy=False,
             )
+
+    def abort_request(self, req_id):
+        """Tell the engine core(s) to drop a request (client disconnected).
+
+        Broadcast to every DP rank (only the one holding ``req_id`` acts). The
+        scheduler finishes the seq at its next step via the normal stop path,
+        freeing its KV blocks. Fire-and-forget; safe if the seq already finished.
+        """
+        try:
+            self.broadcast_utility_command("abort_request", req_id=req_id)
+        except Exception as e:
+            logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
 
     def broadcast_utility_command(self, cmd: str, **kwargs):
         payload = {"cmd": cmd, **kwargs}

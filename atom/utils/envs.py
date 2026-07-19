@@ -32,6 +32,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
+        os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
@@ -44,6 +47,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
+    == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
@@ -72,14 +77,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
+    # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
+    # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
+    # max_num_batched_tokens, so a concurrency burst of long-context requests
+    # can drive a single allocation to tens of GiB (see GLM-5.2 OOM #1376).
+    # Target peak (in MiB) for the indexer's dense fp32 logits buffer during
+    # prefill. The indexer chunks along the query (Q) dimension so the buffer
+    # stays ~[q_chunk, total_kv] with q_chunk = budget_bytes // (total_kv * 4);
+    # q_chunk shrinks automatically as total_kv (the unbounded KV dimension)
+    # grows. Under chunked prefill num_rows is already capped by
+    # max_num_batched_tokens, so a fixed row count would not adapt to total_kv
+    # (see GLM-5.2 OOM #1376) — a memory budget does. Each chunk still scores
+    # the full KV, so every row's top-k is exact (no cross-chunk merge). Set to
+    # 0 to disable chunking (always single-shot).
+    "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
+        os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
+    ),
+    # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
+    # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
+    # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
+    # identical to V3.2, so the fusion is math-equivalent to the unfused path. Set to
+    # "0" to fall back to the per-op Python path if a regression is suspected.
+    "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
+        os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
-    # Replicate the EAGLE3 draft vocab embedding on every TP rank (full table per
-    # rank, local lookup) instead of sharding it — eliminates the post-embedding
-    # all-reduce. The draft embed is independent of the (sharded) lm_head.
-    "ATOM_EAGLE_REPLICATE_EMBED": lambda: (
-        os.getenv("ATOM_EAGLE_REPLICATE_EMBED", "1") == "1"
+    # Replicate the vocab embedding on every TP rank (full table per rank, purely
+    # local lookup) instead of TP-sharding it — eliminates the post-embedding
+    # all-reduce. Applies to BOTH the main/target model and the speculative draft
+    # (EAGLE3 head + MTP draft steps), so the collective is dropped on every embed
+    # on the critical path. Only used where the embedding is independent of the
+    # still TP-sharded lm_head (EAGLE3 draft; GLM-5.2 target+MTP, whose
+    # tie_word_embeddings=False), so the lookup is bit-identical to the sharded
+    # masked-embedding + all-reduce path. Trades (tp-1)/tp of the embedding's
+    # memory per rank for one fewer collective per embed. Default on; set "0" to
+    # fall back to the sharded VocabParallelEmbedding.
+    "ATOM_REPLICATE_VOCAB_EMBED": lambda: (
+        os.getenv("ATOM_REPLICATE_VOCAB_EMBED", "1") == "1"
     ),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
@@ -103,11 +140,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
-    # Use a thread pool for weight loading instead of main-process sequential I/O.
-    # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
-    "ATOM_LOADER_USE_THREADPOOL": lambda: (
-        os.getenv("ATOM_LOADER_USE_THREADPOOL", "1") == "1"
-    ),
+    # Worker threads for weight loading. >1 (default 16) enables the batched
+    # parallel loader (per-fused-param CPU staging flushed with one H2D copy)
+    # with that many threads; set to 1 to fall back to the original sequential
+    # per-expert path.
+    "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
@@ -213,24 +250,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
+    # The delayer is a prefill COALESCER: it holds back prefill admission under
+    # DP-attention until the accumulated prefill fills a worthwhile forward, so
+    # fragmented short-input prefills / small partial tail chunks batch into one
+    # forward instead of firing many tiny ones.
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
         os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
     ),
-    # Max consecutive scheduler passes the delayer is allowed to suppress
-    # prefill admission while waiting for cross-DP alignment.
-    "ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES", "30")
+    # Fill target: release prefill once accumulated pending tokens reach
+    # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
+    # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT
+    # cost. Default 0.7.
+    "ATOM_PREFILL_DELAYER_TARGET_FILL": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.7")
     ),
-    # Wall-clock cap (milliseconds) on a single delay window.
-    "ATOM_PREFILL_DELAYER_MAX_DELAY_MS": lambda: float(
-        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_MS", "5000")
+    # TTFT bound: max consecutive scheduler ticks a held prefill waits before
+    # force-release (deterministic across ranks; replaces the old wall-clock +
+    # pass-count pair).
+    "ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "30")
     ),
-    # Optional KV-usage low watermark below which delaying is allowed.
-    # Empty string => None (use PrefillDelayer's internal default).
+    # Tight bound (ticks) for a held mid-chunked-prefill: a partial holds already
+    # allocated KV, so it force-releases sooner than a fresh prefill.
+    "ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "8")
+    ),
+    # Consecutive non-growing ticks after which the coalescer gives up waiting
+    # (burst ended, more won't come) and releases.
+    "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "3")
+    ),
+    # KV high watermark: at/above this KV usage a prefillable rank force-releases
+    # (can't accumulate a bigger batch anyway).
+    "ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK", "0.9")
+    ),
+    # Optional KV-usage low watermark: below it a prefillable rank force-releases
+    # (GPU starving — feed it). Empty string => None => disabled.
     "ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": lambda: (
         None
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
+    # TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued
+    # (since arrival) >= this many ms, force-release regardless of the fill
+    # target. Bounds worst-case TTFT. Empty string => None => disabled (set this
+    # to your TTFT budget in ms to activate; a small value under heavy backlog
+    # will fire every tick and defeat coalescing, so size it to the SLA).
+    "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS": lambda: (
+        None
+        if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
+        else float(os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS"))
     ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
@@ -238,6 +308,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default on; set "0" to fall back to the request-boundary balanced split.
     "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
         os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
+    ),
+    # Minimum prefill tokens (per rank) required to TBO-split.
+    "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores

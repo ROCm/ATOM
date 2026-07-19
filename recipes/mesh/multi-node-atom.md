@@ -65,7 +65,7 @@ python3 -m atom.entrypoints.openai_server \
     --kv_cache_dtype fp8 \
     --block-size 16 \
     --gpu-memory-utilization 0.85 \
-    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"'"${PREFILL_IP}"'","handshake_port":6301}' \
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}' \
     2>&1 | tee /workspace/logs/prefill.log
 ```
 
@@ -104,13 +104,12 @@ python3 -m atom.entrypoints.openai_server \
     --kv_cache_dtype fp8 \
     --block-size 16 \
     --gpu-memory-utilization 0.85 \
-    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"'"${DECODE_IP}"'","handshake_port":6301}' \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
     2>&1 | tee /workspace/logs/decode.log
 ```
 
 Key differences from prefill:
 - `kv_role: kv_consumer` — receives KV cache from the prefill node
-- `proxy_ip` — set to the decode node's own IP
 
 ## Step 5: Verify KV Transfer Info
 

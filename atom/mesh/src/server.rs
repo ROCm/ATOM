@@ -23,7 +23,7 @@ use wfaas::LoggingSubscriber;
 
 use crate::{
     app_context::AppContext,
-    config::RouterConfig,
+    config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
         steps::{TokenizerConfigRequest, WorkflowEngines},
@@ -59,6 +59,32 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+}
+
+fn configured_worker_urls(config: &RouterConfig) -> Vec<String> {
+    match &config.mode {
+        RoutingMode::Regular { worker_urls } => worker_urls.clone(),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => prefill_urls
+            .iter()
+            .map(|(url, _)| url.clone())
+            .chain(decode_urls.iter().cloned())
+            .collect(),
+    }
+}
+
+fn has_registered_worker_for_url(registered_urls: &[String], configured_url: &str) -> bool {
+    let configured = configured_url.trim_end_matches('/');
+    registered_urls.iter().any(|url| {
+        let registered = url.trim_end_matches('/');
+        registered == configured
+            || registered
+                .strip_prefix(configured)
+                .map_or(false, |suffix| suffix.starts_with('@'))
+    })
 }
 
 async fn parse_function_call(
@@ -657,23 +683,31 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // so we poll until all expected workers appear in the registry.
     let expected_workers = config.router_config.mode.worker_count();
     if expected_workers > 0 {
+        let expected_worker_urls = configured_worker_urls(&config.router_config);
         let max_wait = Duration::from_secs(config.router_config.worker_startup_timeout_secs + 60);
         let poll_interval = Duration::from_millis(500);
         let start = std::time::Instant::now();
         loop {
             let current = app_context.worker_registry.len();
-            if current >= expected_workers {
+            let registered_urls = app_context.worker_registry.get_all_urls();
+            let missing_worker_urls: Vec<&str> = expected_worker_urls
+                .iter()
+                .map(String::as_str)
+                .filter(|url| !has_registered_worker_for_url(&registered_urls, url))
+                .collect();
+            if current >= expected_workers && missing_worker_urls.is_empty() {
                 info!(
-                    "All {} expected workers registered (took {:?})",
+                    "All {} expected worker endpoint(s) registered as {} worker(s) (took {:?})",
                     expected_workers,
+                    current,
                     start.elapsed()
                 );
                 break;
             }
             if start.elapsed() > max_wait {
                 warn!(
-                    "Timed out waiting for workers: {} of {} registered after {:?}",
-                    current, expected_workers, max_wait
+                    "Timed out waiting for workers: {} worker(s) registered, expected {} endpoint(s), missing {:?} after {:?}",
+                    current, expected_workers, missing_worker_urls, max_wait
                 );
                 break;
             }

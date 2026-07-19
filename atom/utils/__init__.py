@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import signal
 import socket
+import sys
 import tempfile
 import time
 from functools import lru_cache
@@ -223,6 +224,73 @@ def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
             proc.close()
         except (ValueError, OSError):
             pass
+
+
+def enable_orphan_reaping(sig: int = signal.SIGKILL) -> bool:
+    """Arm the kernel to reap *this* process if its parent ever exits.
+
+    ATOM runs a tree of processes: the server (main) -> one ``EngineCore``
+    process per DP rank -> ``tensor_parallel_size`` ``ModelRunner`` worker
+    processes.  Each worker holds a large slice of GPU VRAM plus the custom
+    all-reduce IPC resources (``hipIpcGetMemHandle`` handles + the rendezvous
+    ``TCPStore`` bound to ``MASTER_PORT``).
+
+    If a parent exits abnormally (OOM-kill, segfault, ``SIGKILL``,
+    ``docker stop``) the kernel does not clean up its children: the worker's
+    ``busy_loop`` blocks forever on the shared-memory RPC dequeue and the
+    EngineCore blocks on its input queue.  These orphans keep the VRAM and the
+    IPC/TCP resources pinned, so a subsequent restart either fails to bind the
+    rendezvous port or, worse, opens a *stale* IPC mem handle exported by the
+    dead run -> the ``hipIpcGetMemHandle`` all-reduce crash operators work
+    around with ``docker rm -f`` + a lowered ``--gpu-memory-utilization``.
+
+    This helper wires up ``prctl(PR_SET_PDEATHSIG)`` so the kernel delivers
+    ``sig`` to the caller the instant its parent exits, for *any* reason --
+    turning a silent orphan into an immediate, self-reaping exit that releases
+    every GPU and IPC resource it held.  The setting is per-thread and is
+    cleared across ``execve``, so it cannot be inherited: each process must arm
+    itself early in its entrypoint, before any GPU / IPC state is created.
+
+    Linux-only (no-op elsewhere).  Returns ``True`` when reaping is armed and
+    ``False`` if it could not be set.  If the parent is found to be already gone
+    at arm time, it does not return: it calls ``os._exit(1)`` rather than let the
+    process linger as the orphan this is meant to prevent.
+
+    Caveat: ``PR_SET_PDEATHSIG`` fires when the *thread that created this
+    process* exits, not when the parent process as a whole exits.  Arm it only
+    from a process whose creating thread lives for the process's lifetime --
+    ATOM spawns workers from the main thread, so this holds; a short-lived
+    creator thread could otherwise trigger a premature kill.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+
+        PR_SET_PDEATHSIG = 1
+        # Resolve libc from the already-loaded image (``CDLL(None)``) rather than
+        # hard-coding ``libc.so.6``; this works on glibc and musl (e.g. Alpine)
+        # alike, where the soname differs.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
+            err = ctypes.get_errno()
+            logger.warning("prctl(PR_SET_PDEATHSIG) failed: errno=%d", err)
+            return False
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not arm orphan reaping: %s", e)
+        return False
+
+    # The parent can die between spawning us and this call -- before or after the
+    # prctl above -- so PR_SET_PDEATHSIG may never fire.  Detect it unambiguously
+    # via multiprocessing's parent handle (a sentinel pipe): unlike
+    # ``getppid() == 1``, this is not fooled by a parent that legitimately runs
+    # as PID 1 (ATOM's server is PID 1 in the container).  If the parent is
+    # already gone, exit now rather than linger as the orphan this prevents.
+    parent = multiprocessing.parent_process()
+    if parent is not None and not parent.is_alive():
+        logger.warning("Parent already exited while arming orphan reaping; exiting.")
+        os._exit(1)
+    return True
 
 
 def kill_process_tree(pid: int):
@@ -559,14 +627,102 @@ def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
     return torch_version >= version.parse(target)
 
 
+# Lazily-compiled fallback weak-ref op. vLLM ships a `torch.ops._C.weak_ref_tensor`
+# (csrc/libtorch_stable/ops.h) that returns a tensor SHARING the input's memory
+# but NOT owning its storage — so once the original tensor is freed the
+# CUDACachingAllocator block is reclaimable and a cudagraph memory pool can
+# OVERLAY it across shapes. That op is absent in some ROCm builds (no vLLM _C),
+# and a pure-Python weak ref is impossible: dlpack / set_(untyped_storage) both
+# share the Storage object and thus KEEP it alive -> the pool cannot reuse the
+# memory -> every captured piece's output accumulates (35GB+ on DSV4 TP8
+# PIECEWISE). We therefore JIT-compile a tiny `at::from_blob(..., no-op deleter)`
+# equivalent once (cached under ~/.cache/torch_extensions) so PIECEWISE cudagraph
+# pools overlay exactly like upstream vLLM.
+_ATOM_WEAKREF_OP = None  # None = not attempted, False = unavailable, else callable
+
+
+def _get_weak_ref_op():
+    global _ATOM_WEAKREF_OP
+    if _ATOM_WEAKREF_OP is not None:
+        return _ATOM_WEAKREF_OP or None
+
+    # 1) Prefer a native op if this build already registered one (e.g. vLLM _C).
+    try:
+        op = torch.ops._C.weak_ref_tensor
+        # Probe that it is actually callable / registered.
+        op  # noqa: B018
+        _ATOM_WEAKREF_OP = op
+        return op
+    except (AttributeError, RuntimeError):
+        pass
+
+    # 2) JIT-compile a minimal from_blob weak ref (no-op deleter => shares memory
+    #    without owning the allocator block). One-time compile, then cached.
+    try:
+        import os as _os
+
+        if _os.environ.get("ATOM_DISABLE_JIT_WEAKREF", "0") == "1":
+            _ATOM_WEAKREF_OP = False
+            return None
+        from torch.utils.cpp_extension import load_inline
+
+        _cpp = r"""
+#include <torch/extension.h>
+at::Tensor atom_weak_ref_tensor(at::Tensor input) {
+  TORCH_CHECK(input.is_cuda(), "weak_ref_tensor: input must be CUDA");
+  void* data_ptr = input.data_ptr();
+  auto options = at::TensorOptions()
+                     .dtype(input.scalar_type())
+                     .device(input.device());
+  // Empty deleter: the returned tensor shares `input`'s memory but does NOT own
+  // the CUDACachingAllocator block, so freeing `input` lets the pool reclaim it.
+  return at::from_blob(data_ptr, input.sizes(), input.strides(),
+                       [](void*) {}, options);
+}
+"""
+        _mod = load_inline(
+            name="atom_weakref",
+            cpp_sources=[_cpp],
+            functions=["atom_weak_ref_tensor"],
+            with_cuda=True,
+            verbose=False,
+        )
+        _ATOM_WEAKREF_OP = _mod.atom_weak_ref_tensor
+        return _ATOM_WEAKREF_OP
+    except Exception as _e:  # noqa: BLE001
+        # Any build/compile failure -> disable (return-as-is is functionally
+        # correct, just uses more memory). Logged once.
+        try:
+            from aiter import logger as _logger
+
+            _logger.warning(
+                "atom weak_ref_tensor JIT compile failed (%s); PIECEWISE "
+                "cudagraph pools will NOT overlay -> higher memory. Set "
+                "ATOM_DISABLE_JIT_WEAKREF=1 to silence.",
+                _e,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        _ATOM_WEAKREF_OP = False
+        return None
+
+
 def weak_ref_tensor(tensor: Any) -> Any:
     """
     Create a weak reference to a tensor.
-    The new tensor will share the same data as the original tensor,
-    but will not keep the original tensor alive.
+    The new tensor shares the same data as the original tensor but does NOT keep
+    the original tensor's storage alive — essential for cudagraph memory pools to
+    overlay captured outputs across shapes. Falls back to returning the tensor
+    unchanged (functionally correct, more memory) if no weak-ref op is available.
     """
-    if isinstance(tensor, torch.Tensor):
-        return torch.ops._C.weak_ref_tensor(tensor)
+    if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+        op = _get_weak_ref_op()
+        if op is not None:
+            try:
+                return op(tensor)
+            except (AttributeError, RuntimeError):
+                return tensor
+        return tensor
     else:
         return tensor
 

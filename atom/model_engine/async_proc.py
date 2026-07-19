@@ -72,6 +72,17 @@ class AsyncIOProc:
         *args,
         **kwargs,
     ):
+        # Bind this worker's lifetime to its parent EngineCore: if the parent
+        # exits for any reason, have the kernel reap this process immediately
+        # instead of leaving it orphaned. A ModelRunner worker holds a large GPU
+        # allocation and the custom all-reduce IPC resources; an orphan blocks
+        # forever in busy_loop() on the shm dequeue while keeping those pinned,
+        # causing the stale-IPC all-reduce crash on the next restart. Must be
+        # armed here, before any GPU / IPC state is created.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
+
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by
         # ATOM_NUMA_BIND. Must run before any large allocation / native

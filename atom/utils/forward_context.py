@@ -377,6 +377,10 @@ class AttentionMetaData:
     cu_seqlen_ks: Optional[torch.Tensor] = None
     cu_seqlen_ke: Optional[torch.Tensor] = None
     sparse_kv_indptr: Optional[torch.Tensor] = None
+    # Last-page lens for sparse (DSA) attention: all 1s, one per query token in
+    # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
+    # (the dense per-seq buffer) so the two never clobber each other.
+    sparse_kv_last_page_lens: Optional[torch.Tensor] = None
 
     work_meta_data: Optional[torch.Tensor] = None
     work_indptr: Optional[torch.Tensor] = None
@@ -544,6 +548,13 @@ class ForwardContext:
     # deadlock the hipStream queue. Replay does not re-execute Python
     # forward, so it ignores the flag entirely.
     in_hipgraph: bool = False
+
+    # Piecewise-cudagraph dispatch, read per forward by CUDAGraphWrapper:
+    # cudagraph_runtime_mode picks the capture/replay mode, batch_descriptor is
+    # the key (num_tokens). None defaults keep wrappers inert until model_runner
+    # sets them. Typed Any to dodge a CUDAGraphMode circular import.
+    cudagraph_runtime_mode: Any = None
+    batch_descriptor: Optional[Any] = None
 
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:

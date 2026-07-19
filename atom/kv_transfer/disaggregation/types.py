@@ -42,6 +42,10 @@ class KVTransferTensors:
     slot_regions: list[KVTransferRegion]
     num_blocks: int
     num_slots: int = 0
+    # paged-SWA: SWA lives in a SEPARATE pool addressed by seq.swa_block_table
+    # (not the compressed block_table), so these regions are transferred keyed by
+    # swa_block_table — only the live window (last ~128-token block) per request.
+    swa_block_regions: list[KVTransferRegion] = field(default_factory=list)
     staging_region: KVTransferRegion | None = None
     staging_pool_size: int = 0
     gather_slot: Callable[[int, int], None] | None = None
@@ -61,6 +65,8 @@ class KVConnectorOutput:
         finished_recving: Request IDs whose KV receive completed on this worker.
         failed_recving: Request IDs whose KV receive failed on this worker.
         finished_saving: Request IDs whose local fire-and-forget save completed.
+        finished_loading: Request IDs whose local/offload KV load completed.
+        failed_loading: Request IDs whose local/offload KV load failed.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -69,6 +75,8 @@ class KVConnectorOutput:
     finished_recving: set[ReqId] = field(default_factory=set)
     failed_recving: set[ReqId] = field(default_factory=set)
     finished_saving: set[ReqId] = field(default_factory=set)
+    finished_loading: set[ReqId] = field(default_factory=set)
+    failed_loading: set[ReqId] = field(default_factory=set)
     expected_finished_count: int = 0
 
     def is_empty(self) -> bool:
@@ -78,6 +86,8 @@ class KVConnectorOutput:
             and not self.finished_recving
             and not self.failed_recving
             and not self.finished_saving
+            and not self.finished_loading
+            and not self.failed_loading
         )
 
     def __repr__(self) -> str:
@@ -85,7 +95,9 @@ class KVConnectorOutput:
             f"KVConnectorOutput(sending={self.finished_sending}, "
             f"recving={self.finished_recving}, "
             f"failed_recving={self.failed_recving}, "
-            f"finished_saving={self.finished_saving})"
+            f"finished_saving={self.finished_saving}, "
+            f"loading={self.finished_loading}, "
+            f"failed_loading={self.failed_loading})"
         )
 
 
@@ -108,6 +120,10 @@ class ReqMeta:
     remote_dp_rank: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
+    # paged-SWA: parallel block ids into the SEPARATE SWA pool. Empty for
+    # non-V4 backends. -1 entries are window-freed and skipped by the transfer.
+    local_swa_block_ids: list[int] = field(default_factory=list)
+    remote_swa_block_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -151,11 +167,14 @@ class ConnectorMetadata:
         req_id: ReqId,
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
+        local_swa_block_ids: list[int] | None = None,
     ) -> ReqMeta:
         """Construct a :class:`ReqMeta` from raw transfer parameters."""
         return ReqMeta(
             local_block_ids=local_block_ids,
             remote_block_ids=kv_transfer_params.get("remote_block_ids"),
+            local_swa_block_ids=local_swa_block_ids or [],
+            remote_swa_block_ids=kv_transfer_params.get("remote_swa_block_ids", []),
             remote_engine_id=kv_transfer_params.get("remote_engine_id"),
             remote_host=kv_transfer_params.get("remote_host"),
             remote_port=kv_transfer_params.get("remote_port"),
@@ -176,9 +195,10 @@ class ConnectorMetadata:
         request_id: ReqId,
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
+        local_swa_block_ids: list[int] | None = None,
     ) -> None:
         self.reqs_to_save[request_id] = self._build_req_meta(
-            request_id, local_block_ids, kv_transfer_params
+            request_id, local_block_ids, kv_transfer_params, local_swa_block_ids
         )
 
     def add_new_req_to_recv(
@@ -186,7 +206,8 @@ class ConnectorMetadata:
         request_id: ReqId,
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
+        local_swa_block_ids: list[int] | None = None,
     ) -> None:
         self.reqs_to_recv[request_id] = self._build_req_meta(
-            request_id, local_block_ids, kv_transfer_params
+            request_id, local_block_ids, kv_transfer_params, local_swa_block_ids
         )

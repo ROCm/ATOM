@@ -507,6 +507,28 @@ def _v4_round_to_cudagraph_bucket(n: int, sizes) -> int:
     return n
 
 
+def _build_swa_ring_block_tables(
+    state_slot_gpu: torch.Tensor, max_blocks: int, out_gpu=None
+) -> torch.Tensor:
+    """Ring-emulating SWA block table for the paged SWA ABI (project 024).
+
+    ATOM #1423 made the shared V4 SWA path content-addressed via
+    ``swa_block_tables``:
+    ``swa_kv[swa_block_tables[bid, pos // block_size] * block_size + pos % block_size]``.
+    The vllm plugin keeps the per-request ring pool (correct without prefix
+    reuse). Mapping every logical block of a request to its ring slot and passing
+    ``block_size = cs`` collapses the paged offset to the ring
+    ``slot * cs + pos % cs`` — no shared-kernel change needed. ``out_gpu`` (a
+    persistent buffer) is filled in place for CUDA-graph capture safety.
+    """
+    bs = int(state_slot_gpu.shape[0])
+    src = state_slot_gpu.view(bs, 1).expand(bs, max_blocks)
+    if out_gpu is not None:
+        out_gpu[:bs, :max_blocks].copy_(src)
+        return out_gpu[:bs, :max_blocks]
+    return src.contiguous()
+
+
 class _V4DecodeMetaBuffers:
     """Persistent, fixed-address scratch for the V4 *decode* attention metadata.
 
@@ -531,6 +553,7 @@ class _V4DecodeMetaBuffers:
         max_committed_hca: int,
         ratios_overlap,
         device: torch.device,
+        max_blocks: int = 1,
     ):
         from atom.utils import CpuGpuBuffer
 
@@ -543,12 +566,17 @@ class _V4DecodeMetaBuffers:
         hca = int(max_committed_hca)
         self.num_slots = S
         self.max_decode_tokens = T
+        self.max_blocks = max(1, int(max_blocks))
 
         def i32(*shape):
             return CpuGpuBuffer(*shape, dtype=torch.int32, device=device)
 
         # Per-seq scalars (sized to padded request count == num_slots).
         self.state_slot = i32(S)
+        # Ring-emulating SWA block table (project 024): [S, max_blocks], every
+        # column = the request's ring slot; paged block_size = cs. Persistent so
+        # its address is stable across CUDA-graph replay.
+        self.swa_block_tables = i32(S, self.max_blocks)
         self.n_csa = i32(S)
         self.n_hca = i32(S)
         # Per-token mapping (sized to padded token count). int32: accepted by
@@ -649,7 +677,13 @@ def bind_deepseek_v4_proxy_cache_views(
         layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
         ratio = int(attn.compress_ratio)
         attn.unified_kv = views["unified"][layer_id]
-        attn.swa_kv = views["swa"][layer_id]
+        # paged SWA ABI (#1423): shared _attn_core / swa_write treat swa_kv as a
+        # flat [pages, head_dim] region addressed by swa_block_tables. Plugin keeps
+        # the ring pool but exposes it flat with block_size = cs, so a ring-slot
+        # block table reduces the paged offset to `slot*cs + pos%cs` (project 024).
+        swa_view = views["swa"][layer_id]
+        attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
+        attn.swa_block_size = int(win_with_spec)
         if ratio == 4:
             csa_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
@@ -697,6 +731,7 @@ def bind_deepseek_v4_proxy_cache_views(
             max_committed_hca=max_committed_hca,
             ratios_overlap=ratios_overlap,
             device=proxy.kv_cache.device,
+            max_blocks=max_committed_hca,
         )
     model._atom_vllm_v4_proxy_cache_ptr = ptr
     return True
@@ -1119,6 +1154,11 @@ def build_atom_v4_attention_metadata(
         bufs = decode_bufs
         md.state_slot_mapping_cpu = slot_arr
         md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr)
+        # Ring-emulating SWA block table for the paged write in _attn_core
+        # (capture-safe persistent buffer). block_size = cs at bind time.
+        md.swa_block_tables = _build_swa_ring_block_tables(
+            md.state_slot_mapping, bufs.max_blocks, out_gpu=bufs.swa_block_tables.gpu
+        )
         # Per-token seq map padded to T_pad with the -1 sentinel tail.
         if total:
             bufs.batch_id.np[:total] = batch_np
@@ -1176,6 +1216,9 @@ def build_atom_v4_attention_metadata(
     # ---- eager path: prefill, or decode without persistent buffers ----
     md.state_slot_mapping = torch.from_numpy(slot_arr).to(device)
     md.state_slot_mapping_cpu = slot_arr
+    md.swa_block_tables = _build_swa_ring_block_tables(
+        md.state_slot_mapping, int(common_attn_metadata.block_table_tensor.shape[1])
+    )
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
     md.n_committed_hca_per_seq = torch.from_numpy(n_hca_cpu).to(device)
@@ -1523,6 +1566,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         state_slot_per_seq=md.state_slot_mapping[:num_reqs],
         n_committed_hca_per_seq=n_hca_seq_g,
         block_tables=common.block_table_tensor[:num_reqs],
+        swa_block_tables=md.swa_block_tables[:num_reqs],
         extend_indptr=ext_indptr,
         prefix_swa_indptr=swa_indptr,
         prefix_csa_indptr=csa_indptr,
@@ -1533,7 +1577,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        cs=cs,
+        block_size=cs,
         swa_pages=swa_pages,
     )
     md.kv_indices_extend = ext_indices[:ext_total]
@@ -1588,7 +1632,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
     hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
     write_v4_paged_decode_indices(
-        state_slot_per_seq=md.state_slot_mapping,
+        block_tables=md.swa_block_tables,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
@@ -1599,7 +1643,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         hca_indices=hca_indices,
         T=T,
         win=win,
-        cs=cs,
+        block_size=cs,
     )
     write_v4_decode_hca_compress_tail(
         batch_id_per_token=md.batch_id_per_token,

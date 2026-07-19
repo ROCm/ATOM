@@ -318,6 +318,11 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
+        # paged-SWA: parallel SWA block table (independent physical pool;
+        # -1 sentinels for window-freed blocks). Same filter as block_tables.
+        self.swa_block_tables = [
+            seq.swa_block_table for seq in seqs.values() if seq.block_table
+        ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
@@ -442,11 +447,6 @@ class Scheduler:
         # Latency of the last prompt step
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
-        self.prefill_batch_token_threshold = self.max_num_batched_tokens
-        self._prefill_hold_passes = 0
-        self._prefill_hold_max_passes = 30
-        _pc = getattr(config, "parallel_config", None)
-        self._prefill_gate_enabled = getattr(_pc, "data_parallel_size", 1) > 1
 
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
@@ -460,42 +460,13 @@ class Scheduler:
             CacheStats() if config.enable_prefix_caching else None
         )
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        # V4 SWA correctness on a prefix-cache hit. V4's sliding-window state is
-        # a per-request ring (NOT shared across blocks), so on a hit the new
-        # request's ring is empty and a tail token whose SWA window reaches back
-        # into the cached region would read garbage. Fix: pull the forward start
-        # back by enough whole blocks that the last `window` cached tokens are
-        # re-forwarded, repopulating the ring. The compressed-KV hit (n_committed
-        # = context_len // ratio) is UNAFFECTED because context_lens =
-        # num_cached + num_scheduled is invariant under this shift. Only V4 needs
-        # this; 0 disables (e.g. once SWA gets per-block shared storage, "fix C").
-        # See docs / plan: V4 prefix cache fix B'.
-        # NOTE: V4 detection must use `architectures`, not `model_type` — the
-        # config registry maps "deepseek_v4" -> "deepseek_v3" so model_type
-        # reads as v3 (same reason config.py:1118 uses architectures).
-        self._v4_swa_warmup_blocks = 0
-        _hf = getattr(config, "hf_config", None)
-        _arches = getattr(_hf, "architectures", None) or []
-        _is_v4 = any("DeepseekV4" in str(a) for a in _arches)
-        if config.enable_prefix_caching and _is_v4:
-            import math as _math
-
-            window = int(getattr(_hf, "sliding_window", 128) or 128)
-            # The SWA ring's physical stride is `win_with_spec = window + mtp_k`
-            # (MTP draft tokens get their own ring slots). A tail token's window
-            # can reach back `win_with_spec - 1` ring slots, so the re-forwarded
-            # region must cover that many tokens — not just `window`. Verified:
-            # with mtp_k=1, rolling back only `window`(128) leaves the deepest
-            # reach-back (r=4) reading one stale slot -> DIVERGE.
-            mtp_k = (
-                config.speculative_config.num_speculative_tokens
-                if config.speculative_config is not None
-                else 0
-            )
-            win_with_spec = window + int(mtp_k or 0)
-            self._v4_swa_warmup_blocks = _math.ceil(
-                win_with_spec / self.block_manager.block_size
-            )
+        # V4 SWA correctness on a prefix-cache hit is now handled entirely in
+        # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
+        # trailing window is SWA-present, and `allocate` marks out-of-window
+        # blocks -1. The old `_v4_swa_warmup_blocks` (re-forward the tail to
+        # repopulate the per-request ring) was a pre-paged-ring workaround and is
+        # removed — the paged content-addressed SWA pool reuses the tail window
+        # directly. See PLAN_swa_prefix_cache_tail_gate.md.
         # Number of running seqs currently mid-prefill (per-seq state lives in
         # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
         # of `schedule()` can skip the running-queue scan entirely on
@@ -588,77 +559,112 @@ class Scheduler:
             return True
         return False
 
-    def _waiting_prefill_tokens(self) -> int:
-        """Sum of admissible new-prefill tokens sitting in the waiting queue,
-        capped at max_num_batched_tokens (we only care whether a *dense* batch
-        can be filled). Skips unschedulable / remote-KV-waiting entries and
-        clamps each seq to the chunked-prefill / budget limit, mirroring the
-        Phase-2 admission math so the count reflects what would actually pack
-        into one prefill step."""
-        total = 0
-        cap = self.max_num_batched_tokens
-        for seq in self.waiting:
-            if self._unschedulable_reason(seq) is not None:
-                continue
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                continue
-            n = seq.num_tokens - seq.num_cached_tokens
-            if (
-                self.enable_chunked_prefill
-                and 0 < self.long_prefill_token_threshold < n
-            ):
-                n = self.long_prefill_token_threshold
-            if n > cap:
-                n = cap
-            total += n
-            if total >= cap:
-                return cap
-        return total
-
-    def _prefill_batch_ready(self) -> bool:
-        """Gate for firing a NEW prefill step (dense-batch requirement).
-
-        The threshold is max_num_batched_tokens (a full prefill batch).
-
-        Returns True (allow prefill) when:
-          - the waiting queue can fill a dense batch (>= threshold tokens), or
-          - there is nothing left to decode (running empty) — tail escape so a
-            partial final batch still goes out, or
-          - we've suppressed prefill for too many consecutive passes
-            (_prefill_hold_max_passes) — starvation bound.
-
-        Otherwise returns False (keep decoding) and advances the hold counter.
-        The counter resets whenever prefill is allowed to fire.
-        """
-        # Gate only applies under DP (>1); otherwise never hold (legacy path).
-        if not self._prefill_gate_enabled:
-            return True
-        # Tail escape: no decode work left — never hold, or we'd deadlock.
-        if not self.running:
-            self._prefill_hold_passes = 0
-            return True
-        if self._waiting_prefill_tokens() >= self.prefill_batch_token_threshold:
-            self._prefill_hold_passes = 0
-            return True
-        # Under-full: hold prefill (keep decoding) up to the pass budget.
-        self._prefill_hold_passes += 1
-        if self._prefill_hold_passes >= self._prefill_hold_max_passes:
-            self._prefill_hold_passes = 0
-            return True
-        return False
-
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
 
-        Used as the `token_usage` signal for PrefillDelayer's low-watermark
-        safety valve. Derived from BlockManager bookkeeping; cheap (no
-        traversal of seq tables).
+        The `kv_usage` signal for PrefillDelayer's KV watermark bounds — both the
+        high watermark (near-full → release, can't accumulate more) and the
+        optional low watermark (GPU starving → release, feed it). Derived from
+        BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
         bm = self.block_manager
         total = len(bm.blocks)
         if total <= 0:
             return 0.0
         return len(bm.used_block_ids) / total
+
+    def _waiting_new_token_count(self) -> int:
+        """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
+        saturated at `max_num_batched_tokens`.
+
+        Feeds PrefillDelayer's coalescer fill signal (accumulate a full prefill
+        batch before releasing, instead of firing many tiny fragments). The cap
+        early-exits the scan: one batch's worth is all the coalescer compares
+        against, so there's no point summing a deep queue.
+
+        Skips the same non-admittable seqs as `_can_admit_head_prefill` —
+        unschedulable, WAITING_FOR_REMOTE_KVS, and oversized-when-chunking-off —
+        so the "queued work" signal counts only tokens this rank could actually
+        prefill this step. Counting remote-KV / unschedulable tokens here would
+        inflate the cross-rank aggregate and reach the fill target before a real
+        batch has accumulated. The `num_cached_tokens` discount is best-effort:
+        an un-admitted seq has not been probed against the prefix cache yet, so
+        this is an upper bound on new tokens for cache-hit prompts.
+        """
+        cap = self.max_num_batched_tokens
+        total = 0
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            if (
+                not self.enable_chunked_prefill
+                and num_new_tokens > self.max_num_batched_tokens
+            ):
+                continue
+            total += max(0, num_new_tokens)
+            if total >= cap:
+                return cap
+        return total
+
+    def _partial_prefill_remaining_tokens(self) -> int:
+        """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill
+        seqs in `running`, saturated at `max_num_batched_tokens`.
+
+        Folded into the coalescer's pending-token signal so a small partial tail
+        chunk does not force its own tiny prefill forward — it accumulates with
+        fresh prefills instead, bounded by the coalescer's partial deadline.
+        Skipped entirely in the common steady-state (no partial) via the
+        `_partial_prefill_count` counter, and stops scanning once all
+        `_partial_prefill_count` partials have been summed.
+
+        This is an UPPER BOUND on what a partial can actually contribute in one
+        forward: `remaining = num_tokens - num_cached_tokens` does NOT apply the
+        per-step `long_prefill_token_threshold` chunk clamp that Phase-1
+        scheduling uses, so when that threshold is set the coalescer fill signal
+        may read slightly high. Acceptable for a coalescing heuristic; consistent
+        with `_waiting_new_token_count`'s best-effort estimate.
+        """
+        if self._partial_prefill_count == 0:
+            return 0
+        cap = self.max_num_batched_tokens
+        total = 0
+        seen = 0
+        for seq in self.running:
+            if not seq.is_partial_prefill:
+                continue
+            total += max(0, seq.num_tokens - seq.num_cached_tokens)
+            if total >= cap:
+                return cap
+            seen += 1
+            if seen >= self._partial_prefill_count:
+                break  # all partials summed; skip the rest of the decode tail
+        return total
+
+    def _oldest_waiting_prefill_age_ms(self) -> float:
+        """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
+        or 0.0 if none.
+
+        Feeds PrefillDelayer's TTFT SLA guard: if this exceeds max_queue_ms the
+        coalescer force-releases so a request never starves in the queue. Uses
+        `seq.arrive_time` (wall-clock seconds, stamped at engine entry) — the
+        true end-to-end wait, including backlog and coalescer holds. Skips the
+        same non-admittable seqs as `_can_admit_head_prefill` (unschedulable,
+        WAITING_FOR_REMOTE_KVS) so a permanently-stuck seq can't peg the guard.
+        """
+        oldest_arrive = None
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if oldest_arrive is None or seq.arrive_time < oldest_arrive:
+                oldest_arrive = seq.arrive_time
+        if oldest_arrive is None:
+            return 0.0
+        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -807,34 +813,42 @@ class Scheduler:
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
 
-        # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
-        _delayer_allows_prefill = True
+        # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
+        # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
-            # A rank counts as "prefillable" for cross-DP alignment only if it
-            # can admit a prefill AND has a full batch's worth of waiting tokens.
-            # This makes all ranks align on firing dense prefills together
-            # instead of straggling partials.
-            _local_prefillable = self._can_admit_head_prefill() and (
-                self._waiting_prefill_tokens() >= self.prefill_batch_token_threshold
+            # pending = fresh waiting new-tokens + resumable partials' remaining,
+            # capped at the batch budget: the coalescer's accumulation signal.
+            pending_tokens = min(
+                self._waiting_new_token_count()
+                + self._partial_prefill_remaining_tokens(),
+                self.max_num_batched_tokens,
             )
-            _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
-                local_prefillable=_local_prefillable,
-                token_usage=self._kv_usage(),
+            delayer_allows = self.prefill_delayer.should_allow_prefill(
+                prefillable=self._can_admit_head_prefill(),
+                pending_tokens=pending_tokens,
+                # decode-only: self.running also holds mid-chunked-prefill seqs,
+                # which are NOT decode load — counting them would defeat the
+                # coalescer's "no decode → fire" fast path.
+                running_decode_batch=max(
+                    0, len(self.running) - self._partial_prefill_count
+                ),
+                kv_usage=self._kv_usage(),
+                has_partial=self._partial_prefill_count > 0,
+                oldest_waiting_age_ms=self._oldest_waiting_prefill_age_ms(),
             )
+        else:
+            delayer_allows = True
 
         if not self.running and not self.waiting:
             return None
 
-        _new_prefill_allowed = _delayer_allows_prefill and self._prefill_batch_ready()
-
         # ---- Phase 1: resume partial prefills from running ----
-        # Gated by `_delayer_allows_prefill` so cross-DP alignment still
-        # holds when one rank is mid-chunked-prefill: a delayer veto skips
-        # both Phase 1 and Phase 2 in lockstep. Inside that, skip the
-        # running-queue scan entirely when no seq is mid-prefill — the
-        # common steady-state decode case — using the counter maintained by
-        # postprocess / preempt / finished-removal.
-        if _delayer_allows_prefill and self._partial_prefill_count > 0:
+        # Gated by `delayer_allows` so cross-DP alignment still holds when one
+        # rank is mid-chunked-prefill: a delayer veto skips both Phase 1 and
+        # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
+        # when no seq is mid-prefill — the common steady-state decode case —
+        # using the counter maintained by postprocess / preempt / finished-removal.
+        if delayer_allows and self._partial_prefill_count > 0:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
@@ -855,13 +869,25 @@ class Scheduler:
 
         # ---- Phase 2: new requests from waiting ----
         while (
-            _new_prefill_allowed
+            delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
         ):
             seq = self.waiting.popleft()
+
+            # Client disconnected before this seq ever ran: it holds no KV yet
+            # and needs no forward pass, so finish it outright and route via
+            # `_rejected` (emits a finished RequestOutput through the same
+            # output_queue). Must intercept here BEFORE the waiting->running
+            # promotion below, which would overwrite ABORTED with RUNNING and
+            # lose the abort intent.
+            if seq.status == SequenceStatus.ABORTED:
+                seq.status = SequenceStatus.FINISHED
+                seq.leave_reason = "aborted"
+                self._rejected.append(seq)
+                continue
 
             # Drop seqs the static-capacity check at submit-time flagged as
             # permanently unschedulable (oversized prompt, exhausted pool,
@@ -920,21 +946,13 @@ class Scheduler:
                 continue
 
             # Probe cache hits FIRST so budget check sees the real
-            # (post-prefix-cache) remaining token count.
+            # (post-prefix-cache) remaining token count. V4 SWA correctness is
+            # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
+            # where the trailing-window SWA is present); no post-hoc warmup trim.
             num_cached_blocks = self.block_manager.can_allocate(seq)
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
-
-            # V4 SWA fix (B'): drop the last `_v4_swa_warmup_blocks` hit blocks so
-            # those tokens are re-forwarded, repopulating the per-request SWA
-            # ring (see __init__). Compressed-KV n_committed is unaffected
-            # (context_lens = cached + scheduled stays = prompt length). Only
-            # fires on a real hit (>0); a full miss is untouched.
-            if self._v4_swa_warmup_blocks and num_cached_blocks > 0:
-                num_cached_blocks = max(
-                    0, num_cached_blocks - self._v4_swa_warmup_blocks
-                )
 
             # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
             # their decoded tokens — preempt() frees their KV blocks but keeps
@@ -973,6 +991,12 @@ class Scheduler:
             )
 
             if needs_remote_load:
+                # PD: the consumer runs no prefill forward (so ensure_swa is
+                # never called) and its first may_append is skipped. Materialize
+                # the trailing-window SWA blocks now — matching the producer's
+                # post-free swa_block_table positions — so the RDMA transfer has
+                # real dst slots to write the sliding-window KV into.
+                self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
@@ -998,6 +1022,17 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
+            # chunked-prefill: materialize the SWA pool blocks this chunk's
+            # tokens touch BEFORE the forward writes SWA. allocate() left uncached
+            # SWA slots as -1 placeholders; fill the current chunk's logical
+            # range in-place (out-of-window blocks are freed in postprocess after
+            # num_cached_tokens advances). scheduled_seqs / num_scheduled_tokens
+            # are index-aligned; all seqs here are PREFILL.
+            if self.block_manager.swa_enabled:
+                for seq, chunk in zip(scheduled_seqs.values(), num_scheduled_tokens):
+                    self.block_manager.swa.ensure_for_tokens(
+                        seq, seq.num_cached_tokens, chunk
+                    )
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
@@ -1150,7 +1185,7 @@ class Scheduler:
             return None
 
         seq.status = SequenceStatus.WAITING
-        if self._is_offload_connector():
+        if self._connector_flag("is_offload"):
             self._mark_offload_load_ready(seq)
             return False
         return True
@@ -1189,7 +1224,7 @@ class Scheduler:
         allocated before it parked for the LMCache load.
         """
         return (
-            self._is_offload_connector()
+            self._connector_flag("is_offload")
             and (
                 getattr(seq, "offload_loaded", False)
                 or getattr(seq, "offload_load_failed", False)
@@ -1358,6 +1393,11 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
+                # chunked-prefill: reclaim SWA blocks that just fell out of
+                # the window, using the computed-so-far length
+                # (num_cached_tokens). Bounds peak SWA to ~window during prefill
+                # instead of waiting for the first decode step's may_append.
+                self.block_manager.swa.free_after_prefill_chunk(seq)
                 # Prefill is partial until the whole PROMPT's KV is computed.
                 # Compare against num_prompt_tokens, not num_tokens: once a
                 # completion token is appended (this step's sampled token, or an
@@ -1512,6 +1552,11 @@ class Scheduler:
 
             num_tokens = seq.num_tokens - self.mtp_k - num_rejected
             leave_reason = None
+            # Client disconnected -> finish now via the normal stop path (frees
+            # KV blocks, emits a finished RequestOutput). A natural stop below
+            # may still overwrite the reason; either way the seq terminates.
+            if seq.status == SequenceStatus.ABORTED:
+                leave_reason = "aborted"
             # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
             # only compares draft vs target_argmax for acceptance. So when
             # the verified token is EOS the kernel still emits 1+ accepted
@@ -1662,13 +1707,8 @@ class Scheduler:
             self.running.remove(seq)
         return finished_seqs
 
-    def _is_offload_connector(self) -> bool:
-        """True when the active KV connector is the CPU/NVMe offload backend.
-
-        Offload wakes a parked seq into a SUFFIX prefill (not the P/D decode
-        jump). Connectors set ``is_offload = True`` to opt into this path.
-        """
-        return getattr(self.kv_connector, "is_offload", False)
+    def _connector_flag(self, name: str) -> bool:
+        return bool(getattr(self.kv_connector, name, False))
 
     @staticmethod
     def _has_req_id(req_ids: list, seq_id) -> bool:
@@ -1815,19 +1855,33 @@ class Scheduler:
             except (TypeError, ValueError):
                 return None
 
+        is_producer = self._connector_flag("is_producer")
+        is_offload = self._connector_flag("is_offload")
+
         for req_id in kv_connector_output.finished_recving or ():
-            assert (
-                not self.kv_connector.is_producer
-            ), "Only consumer should update recving KV status"
+            assert not is_producer, "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_recving or ():
-            assert (
-                not self.kv_connector.is_producer
-            ), "Only consumer should update failed KV recv status"
+            assert not is_producer, "Only consumer should update failed KV recv status"
             logger.warning(
                 "KV receive failed for request %s; falling back to prefill.", req_id
+            )
+            self.failed_recving_kv_req_ids.append(req_id)
+
+        for req_id in kv_connector_output.finished_loading or ():
+            assert is_offload, "Only offload connector should update loading KV status"
+            logger.debug("Finished offload KV load for request %s", req_id)
+            self.finished_recving_kv_req_ids.append(req_id)
+
+        for req_id in kv_connector_output.failed_loading or ():
+            assert (
+                is_offload
+            ), "Only offload connector should update failed KV load status"
+            logger.warning(
+                "Offload KV load failed for request %s; falling back to prefill.",
+                req_id,
             )
             self.failed_recving_kv_req_ids.append(req_id)
 

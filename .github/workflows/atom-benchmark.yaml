@@ -10,10 +10,6 @@ on:
     - cron: '12 16 * * *'
   workflow_dispatch:
     inputs:
-      deepseek-r1-0528:
-        description: "Benchmark DeepSeek-R1-0528 (+ MTP3)"
-        type: boolean
-        default: true
       deepseek-v4-pro:
         description: "Benchmark DeepSeek-V4-Pro"
         type: boolean

@@ -10,6 +10,58 @@ import torch
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
 
 
+def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
+    """Resolve the indexer width from the active ATOM model configuration.
+
+    The first eager SGLang metadata batch is built before proxy cache views are
+    bound to the model, so it cannot rely on ``model._atom_v4_meta_params``.
+    ATOM's active config is available then and carries the same Hugging Face
+    ``index_topk`` value used to construct the indexer.
+    """
+    value = None
+    source = None
+    if model is not None:
+        value = getattr(getattr(model, "args", None), "index_topk", None)
+        source = "model.args.index_topk"
+        if value is None:
+            value = getattr(
+                getattr(getattr(model, "atom_config", None), "hf_config", None),
+                "index_topk",
+                None,
+            )
+            source = "model.atom_config.hf_config.index_topk"
+    cached = (
+        getattr(proxy_pool, "_atom_v4_index_topk", None)
+        if proxy_pool is not None
+        else None
+    )
+    if value is None and cached is not None:
+        value = cached
+        source = "proxy_pool._atom_v4_index_topk"
+    if value is None:
+        from atom.config import get_current_atom_config
+
+        atom_config = get_current_atom_config()
+        value = getattr(getattr(atom_config, "hf_config", None), "index_topk", None)
+        source = "current_atom_config.hf_config.index_topk"
+    if value is None:
+        value = 1024
+        source = "DeepSeek-V4 default"
+    value = int(value)
+    if value <= 0:
+        raise ValueError(
+            f"DeepSeek-V4 index_topk must be positive, got {value} from {source}"
+        )
+    if cached is not None and int(cached) != value:
+        raise RuntimeError(
+            "DeepSeek-V4 index_topk mismatch: "
+            f"resolved={value} ({source}), proxy={int(cached)}"
+        )
+    if proxy_pool is not None:
+        proxy_pool._atom_v4_index_topk = value
+    return value
+
+
 def _aligned_index_dim(index_head_dim: int) -> int:
     # extra 4 bytes for scale, then 16-byte alignment.
     return ((int(index_head_dim) + 4 + 15) // 16) * 16
@@ -446,6 +498,7 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
     """
     if not getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
         return False
+    index_topk = _resolve_v4_index_topk(model=model, proxy_pool=proxy_pool)
     ptr = proxy_pool.raw_arena.untyped_storage().data_ptr()
     if getattr(model, "_atom_sglang_v4_proxy_cache_ptr", None) == ptr:
         return True
@@ -456,8 +509,21 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
         attn = block.attn
         ratio = int(attn.compress_ratio)
         attn.unified_kv = proxy_pool.views["unified"][local_layer_id]
-        attn.swa_kv = proxy_pool.views["swa"][local_layer_id]
+        # paged SWA ABI (#1423): the shared _attn_core / swa_write treat swa_kv as
+        # a flat [pages, head_dim] region content-addressed by swa_block_tables.
+        # Plugin keeps the ring pool but exposes it flat with block_size = cs, so
+        # `swa_block_tables[bid,*] = slot` reduces the paged offset to the ring
+        # `slot*cs + pos%cs`. See _build_swa_ring_block_tables.
+        swa_view = proxy_pool.views["swa"][local_layer_id]
+        attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
+        attn.swa_block_size = proxy_pool.swa_cache_size
         if ratio == 4:
+            indexer_topk = int(attn.indexer.index_topk)
+            if indexer_topk != index_topk:
+                raise RuntimeError(
+                    "DeepSeek-V4 index_topk mismatch at layer "
+                    f"{local_layer_id}: metadata={index_topk}, indexer={indexer_topk}"
+                )
             _bind_compressor_state(
                 attn.compressor,
                 proxy_pool.views["csa_main"][csa_i],
@@ -488,7 +554,7 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
         num_slots=proxy_pool.num_slots,
         window_size=proxy_pool.window_size,
         cs=proxy_pool.swa_cache_size,
-        index_topk=int(getattr(model.args, "index_topk", 1024)),
+        index_topk=index_topk,
     )
     return True
 
@@ -678,6 +744,10 @@ class _V4SGLangDecodeGraphBuffers:
         self.n_hca = i32(s)
         self.batch_id = CpuGpuBuffer(t, dtype=torch.int32, device=device)
         self.block_tables = i32(s, self.max_blocks)
+        # Ring-emulating SWA block table (project 024): [s, max_blocks], every
+        # column = the request's ring slot; paged block_size = cs. Persistent so
+        # its address is stable across CUDA-graph replay.
+        self.swa_block_tables = i32(s, self.max_blocks)
         self.indptr_swa = i32(t + 1)
         self.indptr_csa = i32(t + 1)
         self.indptr_hca = i32(t + 1)
@@ -752,6 +822,10 @@ class _V4SGLangVerifyGraphBuffers:
         self.n_hca = i32(s)
         self.batch_id = i32(t)
         self.block_tables = i32(s, self.max_blocks)
+        # Ring-emulating SWA block table (project 024): [s, max_blocks], every
+        # column = the request's ring slot; paged block_size = cs. Persistent so
+        # its address is stable across CUDA-graph replay.
+        self.swa_block_tables = i32(s, self.max_blocks)
 
         self.indptr_extend = i32(t + 1)
         self.indptr_prefix_swa = i32(t + 1)
@@ -968,6 +1042,35 @@ def _build_block_tables(
     ).to(torch.int32)
 
 
+def _build_swa_ring_block_tables(
+    state_slot_gpu: torch.Tensor,
+    max_blocks: int,
+    out_gpu: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Ring-emulating SWA block table for the paged SWA ABI (project 024).
+
+    ATOM #1423 rewrote the shared V4 SWA path (index kernels, ``swa_write`` and
+    the model ``_attn_core``) to content-address SWA via ``swa_block_tables``:
+    ``swa_kv[swa_block_tables[bid, pos // block_size] * block_size + pos % block_size]``.
+    The sglang/vllm plugins keep the original per-request **ring** pool (a small
+    ``[num_slots, cs]`` buffer, correct without radix cache). To speak the new
+    paged ABI without changing any shared kernel, map every logical block of a
+    request to that request's single ring slot and pass ``block_size = cs``:
+    the paged offset then collapses to the exact ring ``slot * cs + pos % cs``.
+
+    Returns an ``[bs, max_blocks]`` int32 table with every column equal to the
+    request's ``state_slot``. ``out_gpu`` (a persistent buffer) is filled in
+    place for CUDA-graph capture safety; otherwise a contiguous tensor is
+    allocated (eager path).
+    """
+    bs = int(state_slot_gpu.shape[0])
+    src = state_slot_gpu.view(bs, 1).expand(bs, max_blocks)
+    if out_gpu is not None:
+        out_gpu[:bs, :max_blocks].copy_(src)
+        return out_gpu[:bs, :max_blocks]
+    return src.contiguous()
+
+
 def build_atom_v4_decode_graph_metadata_from_sglang(
     forward_batch,
     positions: torch.Tensor,
@@ -987,6 +1090,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_hca_compress_tail
     from atom.utils.forward_context import AttentionMetaData, AttnState
 
+    index_topk = _resolve_v4_index_topk(model=model, proxy_pool=proxy_pool)
     device = positions.device
     bs = int(forward_batch.batch_size)
     seq_np = _get_seq_lens_cpu(forward_batch)[:bs]
@@ -1018,12 +1122,13 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         or bufs.num_slots < bs
         or bufs.max_blocks < max_blocks
         or bufs.max_decode_tokens < total
+        or bufs.index_topk != index_topk
     ):
         bufs = proxy_pool._atom_v4_decode_graph_buffers = _V4SGLangDecodeGraphBuffers(
             num_slots=proxy_pool.num_slots,
             max_decode_tokens=max(proxy_pool.num_slots, bs, total),
             window=proxy_pool.window_size,
-            index_topk=1024,
+            index_topk=index_topk,
             max_committed_hca=max_blocks,
             max_blocks=max_blocks,
             device=device,
@@ -1058,7 +1163,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size
-    md.index_topk = 1024
+    md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
 
     if total:
@@ -1102,6 +1207,11 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.reset_slots = set()
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr, bs)
+    # Ring-emulating SWA block table (paged ABI, block_size = cs). Filled into
+    # the persistent buffer so the captured decode graph replays a stable addr.
+    md.swa_block_tables = _build_swa_ring_block_tables(
+        md.state_slot_mapping, bufs.max_blocks, out_gpu=bufs.swa_block_tables.gpu
+    )
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_pad, t_pad)
     n_csa = (seq_np // 4).astype(np.int32)
@@ -1140,7 +1250,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
 
     positions_gpu = positions[:t_pad]
     write_v4_paged_decode_indices(
-        state_slot_per_seq=md.state_slot_mapping,
+        block_tables=md.swa_block_tables,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
@@ -1151,7 +1261,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         hca_indices=bufs.idx_hca.gpu,
         T=t_pad,
         win=win,
-        cs=int(md.swa_cs),
+        block_size=int(md.swa_cs),
     )
     write_v4_decode_hca_compress_tail(
         batch_id_per_token=md.batch_id_per_token,
@@ -1209,6 +1319,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
     from atom.utils.forward_context import AttentionMetaData, AttnState
 
+    index_topk = _resolve_v4_index_topk(model=model, proxy_pool=proxy_pool)
     device = positions.device
     bs = int(forward_batch.batch_size)
     seq_np = _get_seq_lens_cpu(forward_batch)[:bs]
@@ -1268,12 +1379,13 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         or bufs.num_slots < bs
         or bufs.max_blocks < max_blocks
         or bufs.max_verify_tokens < total
+        or bufs.index_topk != index_topk
     ):
         bufs = _V4SGLangVerifyGraphBuffers(
             num_slots=proxy_pool.num_slots,
             max_verify_tokens=max(proxy_pool.num_slots, total),
             window=proxy_pool.window_size,
-            index_topk=1024,
+            index_topk=index_topk,
             max_committed_hca=max_blocks,
             max_blocks=max_blocks,
             device=device,
@@ -1308,7 +1420,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size
-    md.index_topk = 1024
+    md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
     # Target verify is extend-shaped for attention/compressor state, but the
     # indexer needs the fixed-shape decode scorer to be graph-safe.
@@ -1357,6 +1469,9 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.reset_slots = set()
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = bufs.state_slot.gpu[:bs]
+    md.swa_block_tables = _build_swa_ring_block_tables(
+        md.state_slot_mapping, bufs.max_blocks, out_gpu=bufs.swa_block_tables.gpu
+    )
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_np, total)
 
@@ -1410,6 +1525,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         state_slot_per_seq=md.state_slot_mapping,
         n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=block_tables,
+        swa_block_tables=md.swa_block_tables,
         extend_indptr=ext_indptr,
         prefix_swa_indptr=swa_indptr,
         prefix_csa_indptr=csa_indptr,
@@ -1420,7 +1536,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         prefix_hca_indices=bufs.idx_prefix_hca.gpu,
         T=total,
         win=win,
-        cs=cs,
+        block_size=cs,
         swa_pages=int(md.swa_pages),
     )
     md.kv_indices_extend = bufs.idx_extend.gpu
@@ -1474,6 +1590,7 @@ def build_atom_v4_attention_metadata_from_sglang(
     """
     from atom.utils.forward_context import AttentionMetaData
 
+    index_topk = _resolve_v4_index_topk(proxy_pool=proxy_pool)
     state = _infer_atom_attn_state(forward_batch)
     device = positions.device
     num_reqs = int(forward_batch.batch_size)
@@ -1561,7 +1678,7 @@ def build_atom_v4_attention_metadata_from_sglang(
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size
-    md.index_topk = 1024
+    md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
 
     if is_draft_extend:
@@ -1591,6 +1708,10 @@ def build_atom_v4_attention_metadata_from_sglang(
         )
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device=device)
+    # Ring-emulating SWA block table for the paged ABI (eager path: alloc ok).
+    md.swa_block_tables = _build_swa_ring_block_tables(
+        md.state_slot_mapping, int(block_tables.shape[1])
+    )
     md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
     md.n_committed_hca_per_seq_cpu = (seq_np // 128).astype(np.int32)
     md.n_committed_csa_per_seq = torch.from_numpy(md.n_committed_csa_per_seq_cpu).to(
@@ -1650,7 +1771,7 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device
     )
     write_v4_paged_decode_indices(
-        state_slot_per_seq=md.state_slot_mapping,
+        block_tables=md.swa_block_tables,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
@@ -1661,7 +1782,7 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         hca_indices=hca_indices,
         T=len(batch_np),
         win=win,
-        cs=cs,
+        block_size=cs,
     )
     # Fill HCA compressed section on CPU for the first-cut eager bridge.
     # `write_v4_paged_decode_indices` writes the SWA prefix at the TAIL of each
@@ -1752,6 +1873,7 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         state_slot_per_seq=md.state_slot_mapping,
         n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=block_tables,
+        swa_block_tables=md.swa_block_tables,
         extend_indptr=t(ext_indptr_np),
         prefix_swa_indptr=t(swa_indptr_np),
         prefix_csa_indptr=t(csa_indptr_np),
@@ -1762,7 +1884,7 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        cs=cs,
+        block_size=cs,
         swa_pages=int(md.swa_pages),
     )
     md.kv_indices_extend = ext_indices[: int(ext_indptr_np[-1])]
