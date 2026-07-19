@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -19,6 +20,7 @@ from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import (
     envs,
+    get_hf_text_config,
     init_exit_handler,
     make_zmq_socket,
     set_process_title,
@@ -120,6 +122,20 @@ class EngineCore:
             if not good:
                 self._finalizer()
 
+        hf_text_config = get_hf_text_config(config.hf_config)
+        arches = getattr(hf_text_config, "architectures", None) or []
+        is_kimi_kda_hybrid = any("KimiK3" in str(a) for a in arches) or (
+            getattr(hf_text_config, "model_type", None) == "kimi_linear"
+            and hasattr(hf_text_config, "full_attn_layer_ids")
+        )
+        if is_kimi_kda_hybrid and config.enable_prefix_caching:
+            logger.info(
+                "%s: Kimi-K3 KDA hybrid disables prefix caching engine-wide "
+                "because recurrent attention state is per request.",
+                self.label,
+            )
+            config.enable_prefix_caching = False
+
         self.scheduler = Scheduler(config)
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
@@ -172,7 +188,15 @@ class EngineCore:
         self.output_thread.join(timeout=0.5)
 
     @staticmethod
-    def run_engine(config: Config, input_address: str, output_address: str):
+    def run_engine(
+        config: Config,
+        input_address: str,
+        output_address: str,
+        env_snapshot: dict[str, str] | None = None,
+    ):
+        if env_snapshot:
+            os.environ.update(env_snapshot)
+
         # Bind this EngineCore's lifetime to its parent (the server /
         # CoreManager): if the parent exits, have the kernel reap this process —
         # and, transitively, the ModelRunner workers it spawns — instead of

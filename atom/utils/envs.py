@@ -158,18 +158,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
     # Use the optional fastsafetensors package for safetensors file reads.
-    # The current ATOM native loader still consumes CPU tensors, so this only
-    # swaps the file reader; GPU-direct sharded loading needs a deeper loader
-    # integration.
     "ATOM_USE_FASTSAFETENSORS": lambda: (
         os.getenv("ATOM_USE_FASTSAFETENSORS", "0") == "1"
+    ),
+    # Split safetensors shard ownership across TP ranks when using
+    # fastsafetensors. This reduces disk/GDS read amplification while keeping
+    # the existing ATOM weight-loader semantics.
+    "ATOM_FASTSAFETENSORS_DIST_LOAD": lambda: (
+        os.getenv("ATOM_FASTSAFETENSORS_DIST_LOAD", "0") == "1"
     ),
     "ATOM_FASTSAFETENSORS_NOGDS": lambda: (
         os.getenv("ATOM_FASTSAFETENSORS_NOGDS", "1") == "1"
     ),
+    # fastsafetensors target device. Keep "cpu" as the conservative default;
+    # set to "cuda" to read tensors directly onto the current rank's GPU.
+    "ATOM_FASTSAFETENSORS_DEVICE": lambda: os.getenv(
+        "ATOM_FASTSAFETENSORS_DEVICE", "cpu"
+    ),
     "ATOM_FASTSAFETENSORS_DEBUG": lambda: (
         os.getenv("ATOM_FASTSAFETENSORS_DEBUG", "0") == "1"
     ),
+    # Force MoE grouped topK routing through the torch reference path. Useful
+    # when aiter.jit.module_moe_asm cannot compile for the current ROCm/CK arch.
+    "AITER_USE_TORCH_TOPK": lambda: os.getenv("AITER_USE_TORCH_TOPK", "0") == "1",
+    # Force sampling through PyTorch instead of aiter.jit.module_sample.
+    "ATOM_USE_TORCH_SAMPLER": lambda: os.getenv("ATOM_USE_TORCH_SAMPLER", "0") == "1",
+    # Force bf16 KV cache insert through PyTorch instead of aiter.jit.module_cache.
+    "ATOM_USE_TORCH_CACHE": lambda: os.getenv("ATOM_USE_TORCH_CACHE", "0") == "1",
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

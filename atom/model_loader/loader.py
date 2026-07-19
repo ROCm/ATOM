@@ -6,10 +6,11 @@ import json
 import os
 import logging
 import re
+import sys
 import threading
 import time
 from glob import glob
-from typing import Generator, Tuple
+from typing import Callable, Generator, Tuple
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -149,19 +150,35 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 def safetensors_weights_iterator(
     model_name_or_path: str,
     disable_mmap: bool = False,
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
+) -> Generator[Tuple[str, Callable[[], torch.Tensor]], None, None]:
     """Iterate over the weights in the model safetensor files."""
     logger.info(f"disable_mmap: {disable_mmap}")
     use_fastsafetensors = envs.ATOM_USE_FASTSAFETENSORS and not disable_mmap
     fastsafe_open = None
+    fastsafetensors_device = "cpu"
     if use_fastsafetensors:
         try:
             from fastsafetensors import fastsafe_open as _fastsafe_open
 
             fastsafe_open = _fastsafe_open
+            requested_device = envs.ATOM_FASTSAFETENSORS_DEVICE.lower()
+            if requested_device == "auto":
+                requested_device = (
+                    "cuda" if not envs.ATOM_FASTSAFETENSORS_NOGDS else "cpu"
+                )
+            if requested_device == "cuda":
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "ATOM_FASTSAFETENSORS_DEVICE=cuda requested but CUDA/HIP "
+                        "is not available"
+                    )
+                fastsafetensors_device = f"cuda:{torch.cuda.current_device()}"
+            elif requested_device != "cpu":
+                fastsafetensors_device = requested_device
             logger.info(
                 "Using fastsafetensors for safetensors reads "
-                f"(nogds={envs.ATOM_FASTSAFETENSORS_NOGDS})"
+                f"(nogds={envs.ATOM_FASTSAFETENSORS_NOGDS}, "
+                f"device={fastsafetensors_device})"
             )
         except ImportError:
             use_fastsafetensors = False
@@ -182,55 +199,121 @@ def safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+    tp_group = None
+    tp_world_size = 1
+    tp_rank = 0
+    fastsafe_dist_load = False
+    if use_fastsafetensors and envs.ATOM_FASTSAFETENSORS_DIST_LOAD:
+        try:
+            tp_group = get_tp_group()
+            tp_world_size = tp_group.world_size
+            tp_rank = tp_group.rank_in_group
+            fastsafe_dist_load = tp_world_size > 1
+        except Exception:
+            logger.exception(
+                "ATOM_FASTSAFETENSORS_DIST_LOAD=1 but TP group is unavailable; "
+                "falling back to per-rank fastsafetensors loading"
+            )
+    if fastsafe_dist_load and tp_rank == 0:
+        logger.info(
+            "Using distributed fastsafetensors shard loading across %d TP ranks",
+            tp_world_size,
+        )
 
-    iters = tqdm(
-        hf_weights_files,
+    pbar = tqdm(
+        total=len(hf_weights_files),
         desc=f"Loading safetensors shards[{model_name_or_path}]",
-        disable=not enable_tqdm,
+        disable=not enable_tqdm or not sys.stderr.isatty(),
     )
-    for st_file in iters:
+
+    def lazy_tensor_getter(reader, name: str) -> Callable[[], torch.Tensor]:
+        tensor: torch.Tensor | None = None
+
+        def get_tensor() -> torch.Tensor:
+            nonlocal tensor
+            if tensor is None:
+                tensor = reader.get_tensor(name)
+            return tensor
+
+        return get_tensor
+
+    batch_size = tp_world_size if fastsafe_dist_load else 1
+    for batch_start in range(0, len(hf_weights_files), batch_size):
+        st_files = hf_weights_files[batch_start : batch_start + batch_size]
         if use_fastsafetensors and fastsafe_open is not None:
             try:
+                fastsafe_filenames = st_files
+                fastsafe_pg = None
+                if fastsafe_dist_load:
+                    fastsafe_filenames = {
+                        rank: ([st_files[rank]] if rank < len(st_files) else [])
+                        for rank in range(tp_world_size)
+                    }
+                    fastsafe_pg = tp_group.device_group
+                shard_start = time.perf_counter()
                 with fastsafe_open(
-                    filenames=[st_file],
+                    filenames=fastsafe_filenames,
                     framework="pt",
-                    device="cpu",
+                    pg=fastsafe_pg,
+                    device=fastsafetensors_device,
                     nogds=envs.ATOM_FASTSAFETENSORS_NOGDS,
                     debug_log=envs.ATOM_FASTSAFETENSORS_DEBUG,
                 ) as f:
                     for name in f.keys():
-                        yield name, f.get_tensor(name)
-                    continue
+                        yield name, lazy_tensor_getter(f, name)
+                pbar.update(len(st_files))
+                if enable_tqdm:
+                    logger.info(
+                        "Finished safetensors shards %d-%d/%d in %.2fs: %s",
+                        batch_start + 1,
+                        batch_start + len(st_files),
+                        len(hf_weights_files),
+                        time.perf_counter() - shard_start,
+                        ", ".join(os.path.basename(st_file) for st_file in st_files),
+                    )
+                continue
             except Exception:
                 logger.exception(
                     "fastsafetensors failed for %s; falling back to safe_open",
-                    st_file,
+                    ", ".join(st_files),
                 )
 
-        # Advise kernel for sequential read-ahead (mmap optimization)
-        if not disable_mmap and hasattr(os, "posix_fadvise"):
-            try:
-                fd = os.open(st_file, os.O_RDONLY)
-                file_size = os.fstat(fd).st_size
-                os.posix_fadvise(
-                    fd,
-                    0,
-                    file_size,
-                    os.POSIX_FADV_SEQUENTIAL | os.POSIX_FADV_WILLNEED,
-                )
-                os.close(fd)
-            except OSError:
-                pass
+        for st_file in st_files:
+            shard_start = time.perf_counter()
+            # Advise kernel for sequential read-ahead (mmap optimization)
+            if not disable_mmap and hasattr(os, "posix_fadvise"):
+                try:
+                    fd = os.open(st_file, os.O_RDONLY)
+                    file_size = os.fstat(fd).st_size
+                    os.posix_fadvise(
+                        fd,
+                        0,
+                        file_size,
+                        os.POSIX_FADV_SEQUENTIAL | os.POSIX_FADV_WILLNEED,
+                    )
+                    os.close(fd)
+                except OSError:
+                    pass
 
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-                for name, param in result.items():
-                    yield name, param
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in f.keys():
-                    yield name, f.get_tensor(name)
+            if disable_mmap:
+                with open(st_file, "rb") as f:
+                    result = safetensors.torch.load(f.read())
+                    for name, param in result.items():
+                        yield name, lambda param=param: param
+            else:
+                with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                    for name in f.keys():
+                        yield name, lazy_tensor_getter(f, name)
+            pbar.update(1)
+            if enable_tqdm:
+                logger.info(
+                    "Finished safetensors shard %d/%d in %.2fs: %s",
+                    batch_start + 1,
+                    len(hf_weights_files),
+                    time.perf_counter() - shard_start,
+                    os.path.basename(st_file),
+                )
+    pbar.close()
 
 
 # when plugin mode, model loader method is bind to model implementation
@@ -655,17 +738,21 @@ def load_model(
 
     try:
         disable_mmap = envs.ATOM_DISABLE_MMAP
-        for name, weight_tensor in safetensors_weights_iterator(
-            model_name_or_path, disable_mmap=disable_mmap
-        ):
+        if load_dummy:
+            logger.info("load_dummy=True: skipping checkpoint weight iteration")
+            loaded_weights_record.update(prefix + name for name in params_dict)
+            weight_iter = ()
+        else:
+            weight_iter = safetensors_weights_iterator(
+                model_name_or_path, disable_mmap=disable_mmap
+            )
+        for name, get_weight_tensor in weight_iter:
             _orig_ckpt_name = name  # preserve for ckpt-side coverage report
             if weights_mapper is not None:
                 mapped_name = weights_mapper._map_name(name)
                 if mapped_name is None:
                     continue
                 name = mapped_name
-            if load_dummy:
-                continue
             # Draft models may remap ckpt-side `mtp.*` entries into params
             # whose names do not themselves contain `mtp` (e.g. Qwen3.5 MTP
             # rewrites `mtp.*` -> `model.*`). Gate only on `spec_decode`,
@@ -754,7 +841,12 @@ def load_model(
                                     )
                                     continue
                                 weight_loader = getattr(param, "weight_loader")
-                                _submit(weight_loader, param, weight_tensor, shard_idx)
+                                _submit(
+                                    weight_loader,
+                                    param,
+                                    get_weight_tensor(),
+                                    shard_idx,
+                                )
                                 loaded_weights_record.add(prefix + param_name)
                     else:
                         # Checkpoint has separate weights, load into fused param
@@ -768,7 +860,12 @@ def load_model(
                                 dropped_ckpt_keys.append((_orig_ckpt_name, param_name))
                                 break
                             weight_loader = getattr(param, "weight_loader")
-                            _submit(weight_loader, param, weight_tensor, shard_id)
+                            _submit(
+                                weight_loader,
+                                param,
+                                get_weight_tensor(),
+                                shard_id,
+                            )
                             loaded_weights_record.add(prefix + param_name)
                     break
             else:
@@ -804,7 +901,7 @@ def load_model(
                                 name,  # Original checkpoint name
                                 name_mapped,  # Mapped parameter name
                                 params_dict,
-                                weight_tensor,
+                                get_weight_tensor(),
                                 shard_id,
                                 num_experts,
                             )
@@ -852,7 +949,7 @@ def load_model(
                         _submit(
                             weight_loader,
                             param,
-                            weight_tensor,
+                            get_weight_tensor(),
                             name,
                             shard_id,
                             expert_id,
@@ -876,7 +973,7 @@ def load_model(
                             _submit(
                                 weight_loader,
                                 param,
-                                weight_tensor,
+                                get_weight_tensor(),
                                 "",  # use merged moe loader
                                 "",
                                 expert_id,
@@ -891,7 +988,7 @@ def load_model(
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        _submit(weight_loader, param, weight_tensor)
+                        _submit(weight_loader, param, get_weight_tensor())
                         loaded_weights_record.add(prefix + name)
                 else:
                     # Model doesn't have expert mapping, use generic loading
@@ -903,7 +1000,7 @@ def load_model(
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    _submit(weight_loader, param, weight_tensor)
+                    _submit(weight_loader, param, get_weight_tensor())
                     loaded_weights_record.add(prefix + name)
 
         if executor is not None:

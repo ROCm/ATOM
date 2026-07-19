@@ -19,7 +19,7 @@ set -euo pipefail
 CONTAINER_NAME=zxb_kimi3
 IMAGE=docker.io/rocm/fw-bringup:gfx1250-atom-dev-20260715-tp4_pro_flash
 NFS_SOURCE=172.16.1.6:/helios_msft_shared
-MODEL_DIR=/mnt/models/Kimi-K3
+MODEL_DIR=/data/models/Kimi-K3
 HOSTNAME_ALIAS="$(hostname)"
 
 if ! mount | rg -q "${NFS_SOURCE} on /mnt "; then
