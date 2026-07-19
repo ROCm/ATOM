@@ -28,6 +28,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Token-equivalent cost of one in-flight request for the "least_tokens" DP
+    # load-balance strategy. The per-rank load score is
+    #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests
+    # so a larger value biases routing toward request-count balance (decode
+    # pressure) and a smaller value toward prompt-token balance (prefill
+    # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
+    "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # --- Compilation & Execution ---

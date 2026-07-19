@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from atom import LLMEngine
 from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
+from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
 logger = logging.getLogger("atom")
 
@@ -53,6 +54,7 @@ class EngineArgs:
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
+    dp_load_balance: str = DP_LB_DEFAULT
     enable_tbo: Optional[str] = None
     all2all_backend: Optional[str] = None
     method: Optional[str] = None
@@ -190,6 +192,20 @@ class EngineArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enable DP attention.",
+        )
+        parser.add_argument(
+            "--dp-load-balance",
+            type=str,
+            default=DP_LB_DEFAULT,
+            choices=list(DP_LB_STRATEGIES),
+            help="Strategy the CoreManager uses to route a request to a DP "
+            "engine rank. 'round_robin': legacy request-count-agnostic "
+            "rotation. 'least_requests' (default): route to the rank with the "
+            "fewest in-flight requests, breaking ties by the lighter in-flight "
+            "prompt-token load. 'least_tokens': route to the rank with "
+            "the lowest combined in-flight token load (prompt tokens + "
+            "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(
             "--enable-tbo",
