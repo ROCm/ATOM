@@ -11,6 +11,15 @@ ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
 ATOM_DEEPSEEK_V4_FP8_PACKED_DIM = 512
 
 
+def _supports_dsv4_fp8_2buff() -> bool:
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx() in ("gfx950", "gfx1250")
+    except Exception:
+        return True
+
+
 def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
     """Resolve the indexer width from the active ATOM model configuration.
 
@@ -156,6 +165,11 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 )
             except Exception:
                 pass
+        # aiter DSV4 native 2-buffer fp8 op4/op5 kernels are not shipped for
+        # MI308/gfx942.  Match the native ATOM builder: keep gfx950/gfx1250 on
+        # the fp8 fast path and fall back to the bf16/Triton path elsewhere.
+        if self.use_fp8_kv and not _supports_dsv4_fp8_2buff():
+            self.use_fp8_kv = False
         del c4_state_pool_size, c128_state_pool_size, dtype, state_dtype
         del c4_state_dtype, c128_state_dtype, sliding_window
         del enable_memory_saver, enable_hisparse, online_mtp_max_draft_tokens
@@ -703,6 +717,7 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
         ratio = int(attn.compress_ratio)
         attn.unified_kv = proxy_pool.views["unified"][local_layer_id]
         attn.unified_kv_rope = proxy_pool.views["unified_rope"][local_layer_id]
+        attn.kv_fp8 = bool(proxy_pool.use_fp8_kv)
         # paged SWA ABI (#1423): the shared _attn_core / swa_write treat swa_kv as
         # a flat [pages, head_dim] region content-addressed by swa_block_tables.
         # Plugin keeps the ring pool but exposes it flat with block_size = cs, so
