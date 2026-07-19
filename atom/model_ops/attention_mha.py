@@ -26,6 +26,50 @@ from atom.model_ops.base_attention import (
 )
 
 
+def _torch_reshape_and_cache(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    slots = slot_mapping.flatten().to(torch.long)
+    valid = slots >= 0
+    if not valid.all():
+        slots = slots[valid]
+        k = k[valid]
+        v = v[valid]
+    if slots.numel() == 0:
+        return
+
+    if k_cache.dim() == 5:
+        x = k_cache.shape[-1]
+        block_size = k_cache.shape[-2]
+        block_idx = slots // block_size
+        block_offset = slots % block_size
+        k_cache[block_idx, :, :, block_offset, :] = k.reshape(
+            k.shape[0], k.shape[1], k.shape[2] // x, x
+        )
+        if v_cache.dim() == 5:
+            v_x = v_cache.shape[-1]
+            v_cache[
+                block_idx,
+                :,
+                block_offset // v_x,
+                :,
+                block_offset % v_x,
+            ] = v
+        else:
+            v_cache[block_idx, :, :, block_offset] = v
+        return
+
+    block_size = k_cache.shape[1]
+    block_idx = slots // block_size
+    block_offset = slots % block_size
+    k_cache[block_idx, block_offset] = k
+    v_cache[block_idx, block_offset] = v
+
+
 @cache
 def use_pa_decode_bf16_asm() -> bool:
     return (
@@ -344,19 +388,24 @@ class PagedAttentionImpl(nn.Module):
                 q = self.q_norm(q)
             if self.k_norm is not None:
                 k = self.k_norm(k)
-            # reshape_and_cache_flash dereferences k_scale/v_scale even for the
-            # "auto" (bf16) path; pass the pre-allocated on-device 1.0 scale.
-            flash_scale = self._pa_decode_bf16_asm_scale
-            aiter.reshape_and_cache_flash(
-                k,
-                v,
-                k_cache,
-                v_cache,
-                attn_metadata.slot_mapping,
-                ("auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype),
-                flash_scale,
-                flash_scale,
-            )
+            if envs.ATOM_USE_TORCH_CACHE:
+                _torch_reshape_and_cache(
+                    k, v, k_cache, v_cache, attn_metadata.slot_mapping
+                )
+            else:
+                # reshape_and_cache_flash dereferences k_scale/v_scale even for the
+                # "auto" bf16 path; pass the pre-allocated on-device 1.0 scale.
+                flash_scale = self._pa_decode_bf16_asm_scale
+                aiter.reshape_and_cache_flash(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    attn_metadata.slot_mapping,
+                    ("auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype),
+                    flash_scale,
+                    flash_scale,
+                )
             self._cache_format = "NHD"
         else:
             # for asm paged attention
@@ -382,17 +431,22 @@ class PagedAttentionImpl(nn.Module):
                     asm_layout=asm_layout,
                 )
             else:
-                aiter.reshape_and_cache(
-                    k,
-                    v,
-                    k_cache,
-                    v_cache,
-                    attn_metadata.slot_mapping,
-                    kv_cache_dtype="auto",
-                    k_scale=None,
-                    v_scale=None,
-                    asm_layout=asm_layout,
-                )
+                if envs.ATOM_USE_TORCH_CACHE:
+                    _torch_reshape_and_cache(
+                        k, v, k_cache, v_cache, attn_metadata.slot_mapping
+                    )
+                else:
+                    aiter.reshape_and_cache(
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.slot_mapping,
+                        kv_cache_dtype="auto",
+                        k_scale=None,
+                        v_scale=None,
+                        asm_layout=asm_layout,
+                    )
             self._cache_format = "SHUFFLE" if asm_layout else "NHD"
 
         # NOTE: on a prefix-cache hit the cached+new KV is gathered into a dense

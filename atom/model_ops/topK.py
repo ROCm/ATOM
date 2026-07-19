@@ -8,6 +8,7 @@ import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 
@@ -213,6 +214,7 @@ def rocm_aiter_biased_grouped_topk_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     from aiter import biased_grouped_topk
+    from aiter.ops.topk import biased_grouped_topk_torch
 
     token = gating_output.shape[0]
     device = gating_output.device
@@ -237,6 +239,20 @@ def rocm_aiter_biased_grouped_topk_impl(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+    if envs.AITER_USE_TORCH_TOPK:
+        torch_weights, torch_ids = biased_grouped_topk_torch(
+            gating_output,
+            correction_bias,
+            topk,
+            need_renorm,
+            num_expert_group,
+            topk_group,
+        )
+        topk_weights.copy_(torch_weights * routed_scaling_factor)
+        topk_ids.copy_(torch_ids)
+        if num_fused_shared_experts > 0:
+            return total_topk_weights, total_topk_ids
+        return topk_weights, topk_ids
     biased_grouped_topk(
         gating_output,
         correction_bias,
@@ -314,6 +330,7 @@ def rocm_aiter_grouped_topk_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     from aiter import grouped_topk
+    from aiter.ops.topk import grouped_topk_torch
 
     token = gating_output.shape[0]
     device = gating_output.device
@@ -338,6 +355,20 @@ def rocm_aiter_grouped_topk_impl(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+    if envs.AITER_USE_TORCH_TOPK:
+        torch_weights, torch_ids = grouped_topk_torch(
+            gating_output,
+            topk,
+            need_renorm,
+            num_expert_group,
+            topk_group,
+            scoring_func,
+        )
+        topk_weights.copy_(torch_weights * routed_scaling_factor)
+        topk_ids.copy_(torch_ids)
+        if num_fused_shared_experts > 0:
+            return total_topk_weights, total_topk_ids
+        return topk_weights, topk_ids
     grouped_topk(
         gating_output,
         topk_weights,

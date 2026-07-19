@@ -1424,6 +1424,15 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
+            # A disconnected client may abort a seq while its current forward is
+            # still in flight. Do not try to backfill deferred placeholders for
+            # that seq: aborted partial-prefill requests may not have any
+            # output_tokens placeholder to overwrite.
+            if seq.status == SequenceStatus.ABORTED:
+                seq.leave_reason = "aborted"
+                seq.status = SequenceStatus.FINISHED
+                finished_seqs.append(seq)
+                continue
             # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:

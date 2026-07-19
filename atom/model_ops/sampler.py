@@ -7,6 +7,7 @@ import torch
 from aiter import mixed_sample_outer_exponential
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
+from atom.utils import envs
 from torch import nn
 
 # Try to import aiter top-k/top-p sampling ops
@@ -73,6 +74,11 @@ class Sampler(nn.Module):
         Returns:
             Sampled token IDs (num_tokens,)
         """
+        if envs.ATOM_DEBUG_TOPK > 0:
+            from atom.utils.debug_helper import maybe_log_topk
+
+            maybe_log_topk(logits, prefix="sampler ")
+
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             return self._temperature_sample(
@@ -126,6 +132,19 @@ class Sampler(nn.Module):
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
             )
+        if envs.ATOM_USE_TORCH_SAMPLER:
+            greedy_mask = temperatures <= self.eps
+            sampled = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
+            if greedy_mask.any():
+                sampled[greedy_mask] = logits[greedy_mask].argmax(dim=-1).to(torch.int)
+            if (~greedy_mask).any():
+                rows = ~greedy_mask
+                scaled_logits = logits[rows] / temperatures[rows].unsqueeze(-1)
+                probs = torch.softmax(scaled_logits, dim=-1, dtype=torch.float32)
+                sampled[rows] = torch.multinomial(probs, num_samples=1).squeeze(-1).to(
+                    torch.int
+                )
+            return sampled
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
@@ -163,7 +182,7 @@ class Sampler(nn.Module):
         has_topk = top_ks is not None
         has_topp = top_ps is not None
 
-        if AITER_TOPK_TOPP_AVAILABLE:
+        if AITER_TOPK_TOPP_AVAILABLE and not envs.ATOM_USE_TORCH_SAMPLER:
             return self._aiter_sample(
                 probs, top_ks, top_ps, has_topk, has_topp, temperatures
             )

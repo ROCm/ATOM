@@ -10,6 +10,7 @@ the same object hierarchy and skips the vision tower/projector tensors.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Union
 
 import torch
@@ -38,6 +39,7 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from atom.model_ops.attention_mha import _torch_reshape_and_cache
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -47,6 +49,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -464,7 +467,11 @@ class KimiFullAttention(nn.Module):
         # num_kv_heads, head_dim]. Write prefill K/V with reshape_and_cache_flash
         # so it matches what decode's unified_attention(shuffled_kv_cache=False)
         # reads. head_dim=192 mis-indexes under the 5D SHUFFLE read, hence flash.
-        if v_cache.dim() == 4:
+        if v_cache.dim() == 4 and envs.ATOM_USE_TORCH_CACHE:
+            _torch_reshape_and_cache(
+                k_r, v_r, k_cache, v_cache, attn_metadata.slot_mapping
+            )
+        elif v_cache.dim() == 4:
             flash_scale = self.attn.impl._pa_decode_bf16_asm_scale
             aiter.reshape_and_cache_flash(
                 k_r,
@@ -752,8 +759,25 @@ class KimiKDAAttention(nn.Module):
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
             initial = ssm_state[state_indices].contiguous()
             initial[~gdn_metadata.has_initial_state, ...] = 0
+            # gfx1250 workaround: chunk_kda NaNs on short prompts (seq < chunk
+            # size) and its `transpose_state_layout` output can mismatch the
+            # decode-time fused_recurrent_kda reader, producing NaN on the first
+            # decode step. Forcing the recurrent path for prefill keeps the KDA
+            # state layout consistent across prefill/decode. Env-gated so the
+            # fast chunk path stays default on archs where it is correct.
+            _kda_force_recurrent = (
+                os.getenv("ATOM_KDA_FORCE_RECURRENT", "0") == "1"
+            )
             kda_out, last_state = self._run_kda(
-                q, k, v, gate, beta, initial, query_start_loc, True, recurrent=False
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                initial,
+                query_start_loc,
+                True,
+                recurrent=_kda_force_recurrent,
             )
             ssm_state[state_indices] = last_state.to(ssm_state.dtype)
             out.copy_(kda_out.squeeze(0))

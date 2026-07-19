@@ -41,6 +41,17 @@ from torch import nn
 
 logger = logging.getLogger("atom")
 
+_FP32_ALLREDUCE = False
+
+
+def set_fp32_allreduce(enable: bool):
+    global _FP32_ALLREDUCE
+    _FP32_ALLREDUCE = enable
+
+
+def fp32_allreduce_enabled() -> bool:
+    return _FP32_ALLREDUCE
+
 
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
@@ -904,7 +915,12 @@ class LinearBase(nn.Module):
                 if self.bias is not None:
                     y += self.bias
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
-            y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
+            if _FP32_ALLREDUCE:
+                y32 = y.float()
+                torch.distributed.all_reduce(y32, group=get_tp_group().device_group)
+                y = y32.to(y.dtype)
+            else:
+                y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 
 

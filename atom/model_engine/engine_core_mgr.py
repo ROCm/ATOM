@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import multiprocessing
+import os
 import pickle
 import queue
 import weakref
@@ -578,6 +579,7 @@ def launch_engine_core(config: Config, dp_rank: int = 0):
             "config": config,
             "input_address": input_address,
             "output_address": output_address,
+            "env_snapshot": dict(os.environ),
         },
     )
 

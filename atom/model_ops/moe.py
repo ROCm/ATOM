@@ -3582,9 +3582,16 @@ class FusedMoE(torch.nn.Module):
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
-            final_hidden_states = get_tp_group().all_reduce(
-                final_hidden_states, ca_fp8_quant=False
-            )
+            from atom.model_ops.linear import fp32_allreduce_enabled
+
+            if fp32_allreduce_enabled():
+                hs32 = final_hidden_states.float()
+                torch.distributed.all_reduce(hs32, group=get_tp_group().device_group)
+                final_hidden_states = hs32.to(final_hidden_states.dtype)
+            else:
+                final_hidden_states = get_tp_group().all_reduce(
+                    final_hidden_states, ca_fp8_quant=False
+                )
 
         return final_hidden_states
 
@@ -3634,9 +3641,16 @@ class FusedMoE(torch.nn.Module):
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
-            final_hidden_states = get_tp_group().all_reduce(
-                final_hidden_states, ca_fp8_quant=False
-            )
+            from atom.model_ops.linear import fp32_allreduce_enabled
+
+            if fp32_allreduce_enabled():
+                hs32 = final_hidden_states.float()
+                torch.distributed.all_reduce(hs32, group=get_tp_group().device_group)
+                final_hidden_states = hs32.to(final_hidden_states.dtype)
+            else:
+                final_hidden_states = get_tp_group().all_reduce(
+                    final_hidden_states, ca_fp8_quant=False
+                )
 
         return final_hidden_states
 
