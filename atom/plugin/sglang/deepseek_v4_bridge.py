@@ -944,6 +944,8 @@ class _V4SGLangDecodeGraphBuffers:
         self.indptr_swa = i32(t + 1)
         self.indptr_csa = i32(t + 1)
         self.indptr_hca = i32(t + 1)
+        self.qo_indptr = i32(t + 1)
+        self.kv_last_page_lens = i32(t)
         self.idx_swa = i32(t * max(1, win))
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
@@ -1067,6 +1069,25 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         plan_buffers=bufs.plan_buffers,
         decode_capacity_per_ratio=bufs.decode_compress_cap,
     )
+
+
+def _stage_decode_fp8_page_metadata(md, total: int, padded_total: int, *, bufs=None):
+    """Populate per-token page metadata for the DeepSeek-V4 FP8 decode kernel."""
+    total = max(0, int(total))
+    padded_total = max(total, int(padded_total))
+    qo_indptr_np = np.empty(padded_total + 1, dtype=np.int32)
+    qo_indptr_np[: total + 1] = np.arange(total + 1, dtype=np.int32)
+    if padded_total > total:
+        qo_indptr_np[total + 1 :] = total
+    if bufs is not None:
+        md.qo_indptr = bufs.stage(bufs.qo_indptr, qo_indptr_np, padded_total + 1)
+        bufs.kv_last_page_lens.np[:padded_total] = 1
+        md.kv_last_page_lens = bufs.kv_last_page_lens.copy_to_gpu(padded_total)
+        return
+
+    device = md.cu_seqlens_q.device
+    md.qo_indptr = torch.from_numpy(qo_indptr_np).to(device=device, dtype=torch.int32)
+    md.kv_last_page_lens = torch.ones(padded_total, dtype=torch.int32, device=device)
 
 
 def _get_extend_lens_cpu(
@@ -1473,6 +1494,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.kv_indptr_swa = swa_indptr
     md.kv_indptr_csa = csa_indptr
     md.kv_indptr_hca = hca_indptr
+    _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
     cu_committed_cpu = np.concatenate(
         [
             np.zeros(1, dtype=np.int32),
@@ -1917,6 +1939,7 @@ def build_atom_v4_attention_metadata_from_sglang(
 
     if is_decode:
         _populate_decode_indices(md, block_tables, pos_np, device)
+        _stage_decode_fp8_page_metadata(md, total, total)
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
     _populate_indexer(md, batch_np, positions[:total], device)

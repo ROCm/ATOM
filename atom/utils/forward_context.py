@@ -373,6 +373,7 @@ class AttentionMetaData:
 
     kv_indptr: Optional[torch.Tensor] = None
     kv_indices: Optional[torch.Tensor] = None
+    qo_indptr: Optional[torch.Tensor] = None
     kv_last_page_lens: Optional[torch.Tensor] = None
     cu_seqlen_ks: Optional[torch.Tensor] = None
     cu_seqlen_ke: Optional[torch.Tensor] = None
@@ -409,6 +410,7 @@ class AttentionMetaData:
         state: AttnState = AttnState.PREFILL_NATIVE,
         kv_indptr: Optional[torch.Tensor] = None,
         kv_indices: Optional[torch.Tensor] = None,
+        qo_indptr: Optional[torch.Tensor] = None,
         kv_last_page_lens: Optional[torch.Tensor] = None,
         cu_seqlen_ks: Optional[torch.Tensor] = None,
         cu_seqlen_ke: Optional[torch.Tensor] = None,
@@ -442,6 +444,7 @@ class AttentionMetaData:
         self.state = state
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
+        self.qo_indptr = qo_indptr
         self.kv_last_page_lens = kv_last_page_lens
         self.cu_seqlen_ks = cu_seqlen_ks
         self.cu_seqlen_ke = cu_seqlen_ke
