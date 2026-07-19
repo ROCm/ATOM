@@ -135,7 +135,7 @@
     "model_name": "Qwen3.5-35B-A3B TP2",
     "model_path": "Qwen/Qwen3.5-35B-A3B",
     "extraArgs": "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
-    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nATOM_LOADER_NUM_THREADS=1",
     "runner": "atom-mi355-8gpu-conductor-sgl-runner",
     "test_level": "nightly",
     "accuracy_threshold": 0.83,
