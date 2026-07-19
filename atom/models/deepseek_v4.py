@@ -1159,7 +1159,6 @@ class Compressor(nn.Module):
             self.kv_state,
             self.score_state,
             write_plan=plan.write_plan_gpu,
-            num_write=plan.num_write,
             state_slot_mapping=state_slot_mapping,
             ratio=ratio,
             overlap=overlap,

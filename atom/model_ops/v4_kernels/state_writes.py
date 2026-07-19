@@ -429,7 +429,6 @@ def update_compressor_states(
     score_state: torch.Tensor,
     *,
     write_plan: torch.Tensor,  # [num_write, 4] int32
-    num_write: int,
     state_slot_mapping: torch.Tensor,  # [bs] int32 — per-seq state slot
     ratio: int,
     overlap: bool,
@@ -456,10 +455,13 @@ def update_compressor_states(
       kv_state:     [num_slots, S, dim] in-place ring buffer. S ≥ K_pool;
                     V4-Pro: S = K_pool + max_spec_steps.
       score_state:  same shape as kv_state.
-      write_plan:   [num_write, 4] int32 — packed (ragged_id, batch_id,
-                    position, _); each row = one token to write.
-      num_write:    grid size (CPU scalar, == write_plan.shape[0] but kept
-                    explicit to avoid GPU sync).
+      write_plan:   [grid, 4] int32 — packed (ragged_id, batch_id, position, _);
+                    each active row = one token to write. `grid` (== shape[0])
+                    is the caller-supplied slice length: the decode-tight
+                    `graph_bs * min(qlen, K_pool)` on the CUDAGraph path, tight
+                    `num_write` on the eager path, or the full buffer capacity
+                    for the extend-shaped verify path. Inactive tail rows carry
+                    sentinel `position=-1` and are skipped.
       state_slot_mapping: [bs] int32 — per-seq state cache slot.
       ratio, overlap: compress geometry.
     """
@@ -475,11 +477,10 @@ def update_compressor_states(
     assert write_plan.dim() == 2 and write_plan.shape[1] == 4
     assert write_plan.dtype == torch.int32
     assert state_slot_mapping.dim() == 1 and state_slot_mapping.dtype == torch.int32
-    # Grid = plan buffer capacity (fixed at builder __init__ time), NOT the
-    # per-fwd `num_write`. Inactive rows past `num_write` carry sentinel
-    # `position=-1` (filled host-side in `make_compress_plans`); the kernel
-    # bails on those, so this is functionally identical to the variable-grid
-    # version while keeping the launch CUDAGraph-capturable.
+    # Grid = the write-plan slice length (fixed at capture on the CUDAGraph
+    # path). Inactive tail rows carry sentinel `position=-1` (filled host-side
+    # in `make_compress_plans`); the kernel bails on those, so a padded slice is
+    # functionally identical to a tight one while staying CUDAGraph-capturable.
     grid_size = write_plan.shape[0]
     if grid_size == 0:
         return
