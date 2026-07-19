@@ -71,7 +71,7 @@ A request flows through the system in ten steps:
 
 2. **`InputOutputProcessor.preprocess()`** -- each prompt is tokenized via the HuggingFace tokenizer. A `Sequence` object is created to track the request's state, timing, and block allocation. `arrive_time` is recorded.
 
-3. **`CoreManager.add_request()`** -- the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are distributed round-robin.
+3. **`CoreManager.add_request()`** -- the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` also available).
 
 4. **`EngineCore.process_input_sockets()`** -- an I/O thread on the `EngineCore` process receives the serialized data on a ZMQ `DEALER` socket, deserializes it, and places the sequences into the `input_queue`.
 
@@ -273,7 +273,7 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 |------|-------------|
 | `atom/model_engine/llm_engine.py` | `LLMEngine` user-facing API, `InputOutputProcessor` for tokenization/detokenization and TTFT/TPOT statistics |
 | `atom/model_engine/engine_core.py` | `EngineCore` main execution loop, `DPEngineCoreProc` data-parallel variant, `EngineCoreRequestType` message protocol |
-| `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, round-robin DP dispatch |
+| `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |

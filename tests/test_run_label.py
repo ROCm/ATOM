@@ -167,5 +167,105 @@ class TestFields:
         assert lbl == "decode[bs=16]"
 
 
+class TestGraphBs:
+    def test_padded_graph_shows_real_over_graph(self):
+        # CUDAGraph replays bs=128 for a real batch of 117 → "bs=117/128".
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=True,
+            is_dummy=False,
+            tbo_on=False,
+            bs=117,
+            graph_bs=128,
+            batch=decode_batch(117, d=117),
+        )
+        assert lbl.startswith("decode[bs=117/128 ")
+
+    def test_matching_graph_bs_omits_slash(self):
+        # No padding (graph bs == real bs) → plain "bs=128".
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=True,
+            is_dummy=False,
+            tbo_on=False,
+            bs=128,
+            graph_bs=128,
+            batch=decode_batch(128, d=128),
+        )
+        assert lbl.startswith("decode[bs=128 ")
+        assert "/" not in lbl
+
+    def test_graph_bs_below_real_bs_omits_slash(self):
+        # Guard is "graph padded ABOVE real" (graph_bs > bs). A graph_bs < bs
+        # never happens in production (the cudagraph path always has
+        # graph_bs >= bs), but if it did we keep the plain real bs rather than
+        # emit a misleading "bs=128/64".
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=True,
+            is_dummy=False,
+            tbo_on=False,
+            bs=128,
+            graph_bs=64,
+            batch=decode_batch(128, d=128),
+        )
+        assert lbl.startswith("decode[bs=128 ")
+        assert "/" not in lbl
+
+    def test_graph_bs_none_is_backward_compatible(self):
+        # Omitting graph_bs keeps the legacy single-number form.
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=True,
+            is_dummy=False,
+            tbo_on=False,
+            bs=64,
+            batch=decode_batch(64, d=64),
+        )
+        assert lbl.startswith("decode[bs=64 ")
+
+    def test_dummy_decode_padded(self):
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=True,
+            is_dummy=True,
+            tbo_on=False,
+            bs=1,
+            graph_bs=8,
+            batch=decode_batch(1, d=1),
+        )
+        assert lbl.startswith("dummy_decode[bs=1/8 ")
+
+    def test_graph_bs_ignored_on_eager_path(self):
+        # graph_bs only applies to the CUDAGraph path; eager decode ignores it.
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=False,
+            is_dummy=False,
+            tbo_on=False,
+            bs=300,
+            graph_bs=512,
+            batch=decode_batch(300, d=300),
+        )
+        assert lbl.startswith("eager_decode[bs=300 ")
+        assert "/" not in lbl
+
+    def test_parse_trace_regex_extracts_real_bs(self):
+        # tools/parse_trace.py uses re.search(r"bs=(\d+)"), which must still pull
+        # the REAL batch (117), not the graph pad (128), from "bs=117/128".
+        import re
+
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=True,
+            is_dummy=False,
+            tbo_on=False,
+            bs=117,
+            graph_bs=128,
+            batch=decode_batch(117, d=117),
+        )
+        assert int(re.search(r"bs=(\d+)", lbl).group(1)) == 117
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

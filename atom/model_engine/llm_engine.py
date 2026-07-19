@@ -197,8 +197,9 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         request_ids: Optional[list[str]] = None,
     ) -> list[str]:
-        # Reset round-robin counter to ensure consistent DP not core dump
-        self.core_mgr._rr_counter = 0
+        # Reset DP routing state (round-robin cursor + in-flight load) so a
+        # fresh batch gets deterministic DP assignment and no leaked counts.
+        self.core_mgr.reset_dp_router()
 
         self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
@@ -219,7 +220,7 @@ class LLMEngine:
         multimodal_data_list: list[dict],
     ) -> list[dict]:
         """Generate completions for multimodal inputs (token IDs + vision data)."""
-        self.core_mgr._rr_counter = 0
+        self.core_mgr.reset_dp_router()
         self.add_request(
             token_ids_list,
             sampling_params,
