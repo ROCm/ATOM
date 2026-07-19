@@ -55,6 +55,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `master_addr` | `str` | `"127.0.0.1"` | Master address for distributed communication |
 | `graph_bs` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
 | `enable_dp_attention` | `bool` | `False` | Enable data-parallel attention |
+| `dp_load_balance` | `str` | `"least_requests"` | DP request-routing strategy: `"round_robin"` (legacy), `"least_requests"` (default; fewest in-flight requests, ties broken by lighter in-flight prompt-token load), or `"least_tokens"` (lowest `sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs`). Only effective when >1 DP rank. See distributed guide §2 |
 | `torch_dtype` | `torch.dtype` | *(computed)* | Inferred from `hf_config.torch_dtype`; falls back to `torch.bfloat16` |
 | `speculative_config` | `Optional[SpeculativeConfig]` | `None` | Speculative decoding configuration (see Section 5) |
 | `bos_token_id` | `int` | `-1` | Beginning-of-sequence token ID (`-1` = use model default) |

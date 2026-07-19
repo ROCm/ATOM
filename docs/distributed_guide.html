@@ -320,6 +320,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#device-assignment">Device Assignment</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#dpmetadata">DPMetadata</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#coremanager-dp-orchestration">CoreManager (DP Orchestration)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#dp-request-load-balancing">DP Request Load Balancing</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#id1">Configuration</a></li>
 </ul>
 </li>
@@ -772,7 +773,7 @@
 <li><p>For each DP rank, it creates a <code class="docutils literal notranslate"><span class="pre">Config</span></code> copy with the appropriate <code class="docutils literal notranslate"><span class="pre">data_parallel_rank</span></code> and <code class="docutils literal notranslate"><span class="pre">data_parallel_rank_local</span></code>.</p></li>
 <li><p>Launches each <code class="docutils literal notranslate"><span class="pre">EngineCore</span></code> in a separate <code class="docutils literal notranslate"><span class="pre">multiprocessing.Process</span></code>.</p></li>
 <li><p>Uses ZMQ (ROUTER/DEALER) sockets for input distribution and ZMQ (PUSH/PULL) for output collection.</p></li>
-<li><p>Distributes incoming requests across DP ranks via round-robin load balancing.</p></li>
+<li><p>Distributes incoming requests across DP ranks via a configurable load-balancing strategy (see below).</p></li>
 <li><p>Waits for READY signals from all ranks before accepting requests.</p></li>
 </ol>
 <p>When <code class="docutils literal notranslate"><span class="pre">enable_dp_attention</span></code> is set, <code class="docutils literal notranslate"><span class="pre">CoreManager</span></code> flattens TP into DP:</p>
@@ -783,13 +784,71 @@
 </pre></div>
 </div>
 </section>
+<section id="dp-request-load-balancing">
+<h3>DP Request Load Balancing<a class="headerlink" href="#dp-request-load-balancing" title="Link to this heading"></a></h3>
+<p>Because the DP busy loop is <strong>lockstep</strong> (all ranks <code class="docutils literal notranslate"><span class="pre">AllReduce</span></code> <code class="docutils literal notranslate"><span class="pre">has_unfinished</span></code>
+each step, and an idle rank runs <code class="docutils literal notranslate"><span class="pre">_execute_dummy_batch()</span></code> when any other rank is
+busy), an unbalanced request distribution directly wastes GPU: the step time is
+bounded by the busiest rank while lighter ranks burn cycles on dummy batches.
+<code class="docutils literal notranslate"><span class="pre">CoreManager</span></code> therefore routes each request to the <em>least-loaded</em> rank rather
+than blindly rotating.</p>
+<p>The strategy is selected with <code class="docutils literal notranslate"><span class="pre">--dp-load-balance</span></code> (<code class="docutils literal notranslate"><span class="pre">Config.dp_load_balance</span></code>):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Strategy</p></th>
+<th class="head"><p>Signal</p></th>
+<th class="head"><p>Selection</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">round_robin</span></code></p></td>
+<td><p>none</p></td>
+<td><p>Load-agnostic rotation (<code class="docutils literal notranslate"><span class="pre">cursor</span> <span class="pre">%</span> <span class="pre">n</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">least_requests</span></code> <strong>(default)</strong></p></td>
+<td><p>in-flight request count, then prompt-token load</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">argmin((num_in_flight_reqs,</span> <span class="pre">in_flight_prompt_tokens))</span></code> — request count is primary; ties broken by the lighter prompt-token load, then the rotation cursor.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">least_tokens</span></code></p></td>
+<td><p>combined token load per rank</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">argmin(sum_prompt_tokens</span> <span class="pre">+</span> <span class="pre">ATOM_DP_LB_REQ_EQUIV</span> <span class="pre">*</span> <span class="pre">num_reqs)</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">least_requests</span></code> (the default) keeps the number of in-flight requests even
+across ranks — the dominant lever for DP-lockstep efficiency (equal request
+counts keep ranks in prefill/decode phase). When ranks are tied on request
+count (the common case under saturation), it breaks the tie by the lighter
+in-flight prompt-token load, so pending prefill work is packed evenly across the
+equal-request ranks. <code class="docutils literal notranslate"><span class="pre">least_tokens</span></code>
+additionally weights by prompt-token load across <em>all</em> ranks, mirroring production guidance from the
+<a class="reference external" href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">DeepSeek-V3/R1 inference system</a>
+(prefill balances on input-token count, decode balances on request count) the <code class="docutils literal notranslate"><span class="pre">ATOM_DP_LB_REQ_EQUIV</span></code> request-equivalent term captures
+decode-slot pressure. It helps most with heterogeneous prompt lengths under
+moderate load; with uniform-length requests it degenerates to <code class="docutils literal notranslate"><span class="pre">least_requests</span></code>.
+All strategies break ties with a round-robin cursor.</p>
+<p>Bookkeeping is maintained entirely inside <code class="docutils literal notranslate"><span class="pre">CoreManager</span></code> (no engine-core protocol
+change): for the load-aware strategies, load is charged on dispatch and released
+when a sequence finishes (STREAM <code class="docutils literal notranslate"><span class="pre">finished</span></code> / offline <code class="docutils literal notranslate"><span class="pre">ADD</span></code> output) or is aborted
+— all idempotent under <code class="docutils literal notranslate"><span class="pre">_lb_lock</span></code>, since dispatch runs on the request thread and
+release on the per-rank output threads. Explicit <code class="docutils literal notranslate"><span class="pre">data_parallel_rank</span></code> hints are
+validated up front (a bad hint rejects the whole batch before any charge, so no
+partial load leaks) and, when valid, take priority but are still charged so they
+participate in balancing. <code class="docutils literal notranslate"><span class="pre">round_robin</span></code> skips this bookkeeping entirely. An
+invalid <code class="docutils literal notranslate"><span class="pre">dp_load_balance</span></code> value fails fast at <code class="docutils literal notranslate"><span class="pre">CoreManager</span></code> construction rather
+than silently defaulting. <code class="docutils literal notranslate"><span class="pre">reset_dp_router()</span></code> (called at the start of an offline
+<code class="docutils literal notranslate"><span class="pre">generate()</span></code> batch) assumes the previous batch has drained and warns if it is
+invoked while requests are still charged.</p>
+</section>
 <section id="id1">
 <h3>Configuration<a class="headerlink" href="#id1" title="Link to this heading"></a></h3>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">ParallelConfig.data_parallel_size</span></code> (int, default <code class="docutils literal notranslate"><span class="pre">1</span></code>): Number of DP replicas.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">ParallelConfig.data_parallel_rank</span></code> (int, default <code class="docutils literal notranslate"><span class="pre">0</span></code>): This rank’s DP index.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">ParallelConfig.data_parallel_rank_local</span></code> (int, default <code class="docutils literal notranslate"><span class="pre">None</span></code>): Local DP rank on this node.</p></li>
-<li><p>CLI: <code class="docutils literal notranslate"><span class="pre">--data-parallel-size</span> <span class="pre">N</span></code> or <code class="docutils literal notranslate"><span class="pre">-dp</span> <span class="pre">N</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Config.dp_load_balance</span></code> (str, default <code class="docutils literal notranslate"><span class="pre">&quot;least_requests&quot;</span></code>): DP routing strategy.</p></li>
+<li><p>CLI: <code class="docutils literal notranslate"><span class="pre">--data-parallel-size</span> <span class="pre">N</span></code> or <code class="docutils literal notranslate"><span class="pre">-dp</span> <span class="pre">N</span></code>; <code class="docutils literal notranslate"><span class="pre">--dp-load-balance</span> <span class="pre">{round_robin,least_requests,least_tokens}</span></code></p></li>
+<li><p>Env: <code class="docutils literal notranslate"><span class="pre">ATOM_DP_LB_REQ_EQUIV</span></code> (int, default <code class="docutils literal notranslate"><span class="pre">512</span></code>): token-equivalent cost of one in-flight request for <code class="docutils literal notranslate"><span class="pre">least_tokens</span></code>.</p></li>
 </ul>
 </section>
 </section>
@@ -918,12 +977,17 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">29500</span></code></p></td>
 <td><p>Port for DP Gloo rendezvous</p></td>
 </tr>
-<tr class="row-odd"><td><p>~~<code class="docutils literal notranslate"><span class="pre">ATOM_ENFORCE_EAGER</span></code>~~</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_DP_LB_REQ_EQUIV</span></code></p></td>
+<td><p>int</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">512</span></code></p></td>
+<td><p>Token-equivalent cost of one in-flight request for the <code class="docutils literal notranslate"><span class="pre">least_tokens</span></code> DP load-balance strategy</p></td>
+</tr>
+<tr class="row-even"><td><p>~~<code class="docutils literal notranslate"><span class="pre">ATOM_ENFORCE_EAGER</span></code>~~</p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p>Removed. Use CLI flag <code class="docutils literal notranslate"><span class="pre">--enforce-eager</span></code> instead.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION</span></code></p></td>
 <td><p>bool</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
 <td><p>Fuse QK-norm + RoPE + cache quant (for Qwen3-MoE)</p></td>
@@ -1024,7 +1088,7 @@ python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_
 python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span>--model<span class="w"> </span>meta-llama/Meta-Llama-3-8B<span class="w"> </span>-tp<span class="w"> </span><span class="m">4</span><span class="w"> </span>-dp<span class="w"> </span><span class="m">2</span>
 </pre></div>
 </div>
-<p>Each DP replica independently processes a subset of requests. The <code class="docutils literal notranslate"><span class="pre">CoreManager</span></code> distributes requests via round-robin. Device mapping:</p>
+<p>Each DP replica independently processes a subset of requests. The <code class="docutils literal notranslate"><span class="pre">CoreManager</span></code> distributes requests via a configurable load-balancing strategy (<code class="docutils literal notranslate"><span class="pre">least_requests</span></code> by default; see <a class="reference internal" href="#dp-request-load-balancing"><span class="xref myst">DP Request Load Balancing</span></a>). Device mapping:</p>
 <ul class="simple">
 <li><p>DP rank 0, TP ranks 0-3 –&gt; GPUs 0-3</p></li>
 <li><p>DP rank 1, TP ranks 0-3 –&gt; GPUs 4-7</p></li>

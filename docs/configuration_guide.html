@@ -320,6 +320,7 @@
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#device-assignment">Device Assignment</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dpmetadata">DPMetadata</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#coremanager-dp-orchestration">CoreManager (DP Orchestration)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-request-load-balancing">DP Request Load Balancing</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id1">Configuration</a></li>
 </ul>
 </li>
@@ -738,27 +739,32 @@ controls ATOM’s runtime behaviour.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
 <td><p>Enable data-parallel attention</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">torch_dtype</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dp_load_balance</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;least_requests&quot;</span></code></p></td>
+<td><p>DP request-routing strategy: <code class="docutils literal notranslate"><span class="pre">&quot;round_robin&quot;</span></code> (legacy), <code class="docutils literal notranslate"><span class="pre">&quot;least_requests&quot;</span></code> (default; fewest in-flight requests, ties broken by lighter in-flight prompt-token load), or <code class="docutils literal notranslate"><span class="pre">&quot;least_tokens&quot;</span></code> (lowest <code class="docutils literal notranslate"><span class="pre">sum_prompt_tokens</span> <span class="pre">+</span> <span class="pre">ATOM_DP_LB_REQ_EQUIV</span> <span class="pre">*</span> <span class="pre">num_reqs</span></code>). Only effective when &gt;1 DP rank. See distributed guide §2</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">torch_dtype</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch.dtype</span></code></p></td>
 <td><p><em>(computed)</em></p></td>
 <td><p>Inferred from <code class="docutils literal notranslate"><span class="pre">hf_config.torch_dtype</span></code>; falls back to <code class="docutils literal notranslate"><span class="pre">torch.bfloat16</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[SpeculativeConfig]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
 <td><p>Speculative decoding configuration (see Section 5)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">bos_token_id</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">bos_token_id</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">-1</span></code></p></td>
 <td><p>Beginning-of-sequence token ID (<code class="docutils literal notranslate"><span class="pre">-1</span></code> = use model default)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">eos_token_id</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">eos_token_id</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">-1</span></code></p></td>
 <td><p>End-of-sequence token ID (<code class="docutils literal notranslate"><span class="pre">-1</span></code> = use model default)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">stop_token_ids</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stop_token_ids</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">list[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">[]</span></code></p></td>
 <td><p>Additional stop token IDs; populated from <code class="docutils literal notranslate"><span class="pre">GenerationConfig.eos_token_id</span></code> during init</p></td>

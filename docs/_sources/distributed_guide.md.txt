@@ -183,7 +183,7 @@ dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
 1. For each DP rank, it creates a `Config` copy with the appropriate `data_parallel_rank` and `data_parallel_rank_local`.
 2. Launches each `EngineCore` in a separate `multiprocessing.Process`.
 3. Uses ZMQ (ROUTER/DEALER) sockets for input distribution and ZMQ (PUSH/PULL) for output collection.
-4. Distributes incoming requests across DP ranks via round-robin load balancing.
+4. Distributes incoming requests across DP ranks via a configurable load-balancing strategy (see below).
 5. Waits for READY signals from all ranks before accepting requests.
 
 When `enable_dp_attention` is set, `CoreManager` flattens TP into DP:
@@ -195,12 +195,57 @@ if config.enable_dp_attention:
     config.tensor_parallel_size = 1
 ```
 
+### DP Request Load Balancing
+
+Because the DP busy loop is **lockstep** (all ranks `AllReduce` `has_unfinished`
+each step, and an idle rank runs `_execute_dummy_batch()` when any other rank is
+busy), an unbalanced request distribution directly wastes GPU: the step time is
+bounded by the busiest rank while lighter ranks burn cycles on dummy batches.
+`CoreManager` therefore routes each request to the *least-loaded* rank rather
+than blindly rotating.
+
+The strategy is selected with `--dp-load-balance` (`Config.dp_load_balance`):
+
+| Strategy | Signal | Selection |
+|----------|--------|-----------|
+| `round_robin` | none | Load-agnostic rotation (`cursor % n`). |
+| `least_requests` **(default)** | in-flight request count, then prompt-token load | `argmin((num_in_flight_reqs, in_flight_prompt_tokens))` — request count is primary; ties broken by the lighter prompt-token load, then the rotation cursor. |
+| `least_tokens` | combined token load per rank | `argmin(sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs)`. |
+
+`least_requests` (the default) keeps the number of in-flight requests even
+across ranks — the dominant lever for DP-lockstep efficiency (equal request
+counts keep ranks in prefill/decode phase). When ranks are tied on request
+count (the common case under saturation), it breaks the tie by the lighter
+in-flight prompt-token load, so pending prefill work is packed evenly across the
+equal-request ranks. `least_tokens`
+additionally weights by prompt-token load across *all* ranks, mirroring production guidance from the
+[DeepSeek-V3/R1 inference system](https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md)
+(prefill balances on input-token count, decode balances on request count) the `ATOM_DP_LB_REQ_EQUIV` request-equivalent term captures
+decode-slot pressure. It helps most with heterogeneous prompt lengths under
+moderate load; with uniform-length requests it degenerates to `least_requests`.
+All strategies break ties with a round-robin cursor.
+
+Bookkeeping is maintained entirely inside `CoreManager` (no engine-core protocol
+change): for the load-aware strategies, load is charged on dispatch and released
+when a sequence finishes (STREAM `finished` / offline `ADD` output) or is aborted
+— all idempotent under `_lb_lock`, since dispatch runs on the request thread and
+release on the per-rank output threads. Explicit `data_parallel_rank` hints are
+validated up front (a bad hint rejects the whole batch before any charge, so no
+partial load leaks) and, when valid, take priority but are still charged so they
+participate in balancing. `round_robin` skips this bookkeeping entirely. An
+invalid `dp_load_balance` value fails fast at `CoreManager` construction rather
+than silently defaulting. `reset_dp_router()` (called at the start of an offline
+`generate()` batch) assumes the previous batch has drained and warns if it is
+invoked while requests are still charged.
+
 ### Configuration
 
 - `ParallelConfig.data_parallel_size` (int, default `1`): Number of DP replicas.
 - `ParallelConfig.data_parallel_rank` (int, default `0`): This rank's DP index.
 - `ParallelConfig.data_parallel_rank_local` (int, default `None`): Local DP rank on this node.
-- CLI: `--data-parallel-size N` or `-dp N`
+- `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
+- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens}`
+- Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
 
 ---
 
@@ -306,6 +351,7 @@ The block configuration adapts to the batch type: prefill uses `block_num=128, w
 | `ATOM_DP_SIZE` | int | `1` | Total number of data parallel replicas |
 | `ATOM_DP_MASTER_IP` | str | `127.0.0.1` | IP address for DP Gloo rendezvous |
 | `ATOM_DP_MASTER_PORT` | int | `29500` | Port for DP Gloo rendezvous |
+| `ATOM_DP_LB_REQ_EQUIV` | int | `512` | Token-equivalent cost of one in-flight request for the `least_tokens` DP load-balance strategy |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `False` | Fuse QK-norm + RoPE + cache quant (for Qwen3-MoE) |
 
@@ -401,7 +447,7 @@ For throughput scaling with dense models, run multiple DP replicas:
 python -m atom.entrypoints.openai_server --model meta-llama/Meta-Llama-3-8B -tp 4 -dp 2
 ```
 
-Each DP replica independently processes a subset of requests. The `CoreManager` distributes requests via round-robin. Device mapping:
+Each DP replica independently processes a subset of requests. The `CoreManager` distributes requests via a configurable load-balancing strategy (`least_requests` by default; see [DP Request Load Balancing](#dp-request-load-balancing)). Device mapping:
 - DP rank 0, TP ranks 0-3 --> GPUs 0-3
 - DP rank 1, TP ranks 0-3 --> GPUs 4-7
 
