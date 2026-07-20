@@ -45,7 +45,7 @@ jobs:
             page_name=$(basename "$dir")
             git rm -r --quiet "$page_name" 2>/dev/null || true
             mkdir -p "$page_name"
-            cp -r "$dir"* "$page_name/"
+            cp -r "$dir/." "$page_name/"
             git add "$page_name/"
             echo "Deployed: $page_name"
           done
