@@ -105,6 +105,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SWA_TAIL_BUDGET_FRAC": lambda: float(
         os.getenv("ATOM_SWA_TAIL_BUDGET_FRAC", "0.2")
     ),
+    # DeepSeek-V4 paged-SWA sparse checkpoint retention (only with
+    # ATOM_SWA_FULL_RETAIN=1). Tokens per retained SWA-tail checkpoint: 0 = dense
+    # (retain every written tail, relies on pool size — floods a small pool);
+    # >0 = keep a tail only once per this-many-tokens segment plus at each prompt
+    # boundary, and PIN those so live-window churn cannot overwrite them (mirrors
+    # vLLM VLLM_PREFIX_CACHE_RETENTION_INTERVAL / SlidingWindowManager sparse
+    # reachable_block_mask). Should be a multiple of the KV block size; 32768
+    # matches the vLLM trace-replay tuning. Default 0 (dense).
+    "ATOM_SWA_RETENTION_INTERVAL": lambda: int(
+        os.getenv("ATOM_SWA_RETENTION_INTERVAL", "0")
+    ),
+    # Fraction of the SWA pool that pinned checkpoint tails may occupy (LRU-capped)
+    # when sparse retention is on; the rest stays free for live-window churn.
+    "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(
+        os.getenv("ATOM_SWA_CHECKPOINT_FRAC", "0.5")
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
