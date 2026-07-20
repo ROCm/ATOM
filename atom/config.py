@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, ClassVar, Optional, Union
 
 import torch
@@ -910,6 +910,19 @@ class SpeculativeConfig:
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
     }
 
+    def use_dspark(self) -> bool:
+        """DeepSeek-V4 DSpark semi-autoregressive block drafter.
+
+        DSpark ships inside the V4 checkpoint under the same `mtp.*` namespace as
+        serial MTP, but it is a parallel block drafter (parallel backbone +
+        Markov sequential head + confidence head), NOT serial MTP. We detect it
+        by the DSpark-only `dspark_block_size` config field and route it to its
+        own draft model class. We intentionally never silently fall back to MTP:
+        a wrong fallback loads cleanly but measures the wrong algorithm.
+        """
+        cfg = self.draft_model_hf_config
+        return self.method == "dspark" or bool(getattr(cfg, "dspark_block_size", None))
+
     def __post_init__(self):
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
@@ -949,6 +962,22 @@ class SpeculativeConfig:
             hf_config.architectures = ["Eagle3LlamaModel"]
         elif arch == "Eagle3DeepseekV2ForCausalLM":
             hf_config.architectures = ["Eagle3DeepseekMLAModel"]
+
+        # DSpark detection (before MTP rewrite): the V4 DSpark checkpoint has
+        # model_type=deepseek_v4 just like serial MTP, but carries DSpark-only
+        # config fields. Route it to the DSpark draft model and skip the MTP
+        # n_predict=1 rewrite (DSpark uses dspark_block_size, not n_predict).
+        if getattr(hf_config, "dspark_block_size", None):
+            hf_config.model_type = "deepseek_v4_dspark"
+            hf_config.architectures = ["DeepseekV4DSparkModel"]
+            logger.info(
+                "Detected DeepSeek-V4 DSpark drafter "
+                f"(block_size={hf_config.dspark_block_size}, "
+                f"markov_rank={getattr(hf_config, 'dspark_markov_rank', None)}, "
+                f"target_layers={getattr(hf_config, 'dspark_target_layer_ids', None)})"
+            )
+            _normalize_moe_config_fields(hf_config, model_path)
+            return
 
         # Step 1: resolve model_type → mtp model_type
         mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
@@ -1025,6 +1054,53 @@ class KVEventsConfig:
 
 
 @dataclass
+class DSparkConfig:
+    """Runtime configuration for DSpark speculative verification.
+
+    Single source of truth for the DSpark knobs read across the model runner,
+    the V4 attention op, and the Eagle proposer. It is built ONCE in the parent
+    process from the ``--dspark-config`` JSON dict (see :meth:`from_dict`), then
+    pickled into every engine-core worker subprocess as part of :class:`Config`,
+    so all read sites observe the same resolved values via ``config.dspark.*``
+    (no ``os.environ`` lookups).
+
+    Fields:
+      - confidence_schedule: use the DSpark confidence head to pick a per-request
+        verify length ell_r (paper Algorithm 1) + variable-length verification.
+      - ragged: per-request ragged verify (§5.2 avoid-padding); each decode seq
+        forwards its own ell_r+1 tokens (no batch-level q padding).
+      - ragged_graph_sizes: comma-separated per-seq CUDA-graph query-length
+        buckets to capture for the ragged path (e.g. "1,3,6" or "8").
+      - q_buckets: CUDA-graph query-length buckets for the (older) batch-uniform
+        q-bucket verify path (independent of the ragged path).
+      - disable_sps_calib: skip SPS calibration (replays captured graphs at
+        warmup); fall back to the synthetic SPS stub.
+    """
+
+    confidence_schedule: bool = False
+    ragged: bool = False
+    ragged_graph_sizes: str = ""
+    q_buckets: str = ""
+    disable_sps_calib: bool = False
+
+    @classmethod
+    def from_dict(cls, cfg: Optional[dict]) -> "DSparkConfig":
+        """Build from the ``--dspark-config`` JSON dict.
+
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --dspark-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
@@ -1047,6 +1123,7 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     port: int = 8006
@@ -1057,11 +1134,18 @@ class Config:
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
     mark_trace: bool = False
-    load_dummy: bool = False
+    load_dummy: Optional[str] = None
     enable_expert_parallel: bool = False
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
+    # DP request-routing strategy used by CoreManager to pick an engine rank:
+    # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
+    # effect when more than one DP engine rank is launched. See
+    # atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked. The literal
+    # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
+    # cannot import it without a cycle: engine_core_mgr imports Config).
+    dp_load_balance: str = "least_requests"
     # MoE expert-parallel layout policy. When True, MoE EP computes ranks in the
     # flattened DP x TP device space (and shared-expert fusion is disabled,
     # because the fused shared expert assumes the per-DP MoE layout). The vLLM
@@ -1073,6 +1157,10 @@ class Config:
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
+    # DSpark runtime knobs. Built once in the parent from --dspark-config (see
+    # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
+    # (no os.environ lookups). Defaults to all-off.
+    dspark: DSparkConfig = field(default_factory=DSparkConfig)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -1098,6 +1186,9 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
+        if self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
+
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
         # assert os.path.isdir(self.model)
@@ -1218,9 +1309,23 @@ class Config:
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
-            if num_spec is None or num_spec < 1 or num_spec > 4:
+            # DSpark is a parallel block drafter: the whole block is produced in
+            # one backbone pass. dspark_block_size (5 for V4-Pro-DSpark) is only
+            # the TRAINING default draft width, NOT a hard ceiling: the DSpark
+            # weights are draft-width-agnostic (no parameter shape depends on it),
+            # so a wider verify horizon is drafted in the same single pass, with
+            # positions past block_size RoPE-extrapolated. The real ceiling is the
+            # rolling target-KV window (sliding_window=128), beyond which the
+            # [window ++ draft] block attention no longer fits its context.
+            is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
+            draft_cfg = self.speculative_config.draft_model_hf_config
+            max_spec = (
+                int(getattr(draft_cfg, "sliding_window", 128)) if is_dspark else 4
+            )
+            if num_spec is None or num_spec < 1 or num_spec > max_spec:
                 raise ValueError(
-                    f"num_speculative_tokens must be between 1 and 4, got {num_spec}."
+                    f"num_speculative_tokens must be between 1 and {max_spec}, "
+                    f"got {num_spec}."
                 )
 
         # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
@@ -1266,7 +1371,17 @@ class Config:
 
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
+        # PCP changes the compiled graph: when pcp>1 the indexer runs through the
+        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
+        # query) and the indexer takes the round-robin all-gather / separate-rope
+        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # identically, so without this factor pcp2 loads pcp1's cached artifact
+        # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
+        # runtime — the same stale-artifact hazard documented for the vocab-embed
+        # flag below.
+        factors.append(self.prefill_context_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(self.index_cache_dtype)
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (

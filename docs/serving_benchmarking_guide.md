@@ -588,7 +588,7 @@ script using `EngineArgs.add_cli_args`):
 | `--scheduler-delay-factor` | `0.0` | Delay factor before scheduling next prompt |
 | `--cudagraph-capture-sizes` | `[1,2,4,...,256]` | Batch sizes for CUDA graph capture |
 | `--level` | `3` | Compilation level (0-3); 3 = torch.compile |
-| `--load_dummy` | `False` | Skip loading model weights (for testing) |
+| `--load_dummy` | `None` | Dummy weights (no checkpoint read). Bare flag / `=empty`: skip load (uninitialized). `=zero`: all-zero. `=xavier`: xavier for bf16, constant target magnitude for fp4/fp8 |
 | `--enable-expert-parallel` | `False` | Enable expert parallelism for MoE |
 | `--enable-dp-attention` | `False` | Enable data-parallel attention |
 | `--torch-profiler-dir` | `None` | Directory for torch profiler traces |

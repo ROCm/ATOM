@@ -1,51 +1,74 @@
 """
-PrefillDelayer — cross-DP-rank prefill alignment for ATOM.
+PrefillDelayer — a cross-DP-rank prefill *coalescer* for ATOM.
 
-Direct port of SGLang's PrefillDelayer (refactored form, post #16269), keeping
-the "mixed prefillable status → delay" core that fixes our 1k/1k workload's
-~81% pad_waste during prefill forwards.
+Purpose
+-------
+Under DP-attention each rank schedules independently. Left alone, ranks fire
+many prefill forwards that each carry only a handful of tokens (a short fresh
+prompt, or the small tail chunk of a chunked prefill). Every prefill forward
+has ~fixed cost (kernel launch, pad-to-shape, the lockstep MoE all-to-all), so a
+forward carrying 500 of a 16384-token budget wastes ~97% of that forward.
 
-Mechanism (per scheduler tick):
-  1. Each DP rank reports its local state via cpu all_gather:
-       (local_prefillable, watermark_force_allow)
-  2. Compute `prefillable_status` ∈ {all, none, mixed}:
-       - "all"   → every rank has a new prefill ready  → allow (8-way aligned)
-       - "none"  → no rank has any prefill             → allow (vacuous)
-       - "mixed" → only some ranks have prefill ready  → DELAY
-  3. In "mixed", refuse the prefill (return False from `should_allow_prefill`)
-     for up to `max_delay_passes` consecutive ticks (default 30, ≈ 255ms at
-     8.5ms/decode-tick) OR `max_delay_ms` wall-clock (default 5000ms),
-     whichever comes first. After timeout, force-allow to bound worst-case
-     TTFT.
-  4. Safety valve: if local KV-cache usage drops below
-     `token_usage_low_watermark`, the rank reports "force_allow" and the
-     delayer falls through immediately (the GPU is idling, don't delay).
+The delayer's single job: **hold back prefill admission until the accumulated
+prefill is worth a forward, then release** — Nagle's algorithm for prefill.
+While it holds, decode keeps running (nothing is wasted); TTFT is bounded so a
+held request never starves.
 
-Why this fixes our problem:
-  Today (no delayer) — when 1 rank has a new prefill and 7 have decodes,
-  ATOM runs eager forward NOW. MoE all_to_all is bottlenecked by the
-  prefill rank's ~1000 tokens, costing all 8 ranks ~118ms (a1.log: 81.7%
-  pad_waste, 67% of wall in moe.gather). 57 such mixed forwards = 6.7s.
-  With delayer — the prefilling rank waits up to 255ms for sibling ranks'
-  waiting queues to also gain prefills, then all 8 ranks do prefill
-  simultaneously (balanced all_to_all). 57 mixed forwards → ~8 aligned
-  forwards × ~140ms = 1.1s. Expected: ~5.6s saved per request burst.
+It is NOT about mixing prefill+decode in one forward. It DOES preserve cross-DP
+phase alignment: it only releases when every rank is prefill-ready (so all ranks
+enter prefill together and the MoE collective stays aligned), except when a
+must-fire bound forces release regardless.
 
-What's intentionally NOT ported from SGL (HEAD):
-  - prometheus / observability hooks (ATOM has dp_timing instead)
-  - NCCL gather path (ATOM's dp_group is gloo cpu_group; sufficient)
-  - TBO / hisparse / dllm / spec interactions (N/A)
-  - `queue_min_ratio` adaptive trigger (added 2026-05; defer until baseline)
-  - `slot_condition` (max_running_requests - global_running_bs check):
-        ATOM steady-state running_bs ≈ 16 vs max_num_seqs ≈ 256+, condition
-        never true → omitted to keep code simple
+Decision (evaluated every tick, on every rank, in lockstep)
+-----------------------------------------------------------
+Each rank reports local state; a single cpu ``all_reduce(SUM)`` reduces it; then
+every rank computes the SAME FIRE/HOLD from the reduced values:
+
+  n_prefillable   = #ranks with admittable prefill (SUM of a 0/1 flag)
+  G_pending       = total pending prefill tokens across ranks (fresh + partial
+                    remaining, each rank capped at the token budget)
+  G_running_dec   = total decode seqs across ranks
+  any_kv_high/low = any prefillable rank at/above / below a KV watermark
+  any_partial     = any rank mid-chunked-prefill
+
+  if n_prefillable == 0:                          FIRE   # nothing to do (vacuous)
+  # -- must-fire bounds (release even if unaligned / underfilled) --
+  if G_running_dec == 0:                          FIRE   # no decode to hide the wait behind
+  if any_kv_high or any_kv_low:                   FIRE   # KV pressure / starvation
+  if hold_ticks >= ttft_max_ticks:                FIRE   # TTFT bound
+  if any_partial and hold_ticks >= partial_max_ticks: FIRE  # partial holds KV — tight bound
+  # -- alignment gate: never fire while some rank lacks prefill (anti-skew) --
+  if n_prefillable < dp_size:                     HOLD
+  # -- goal: fire once the aggregate fills a worthwhile forward --
+  fill = G_pending / (n_prefillable * budget)
+  if fill >= target_fill:                         FIRE
+  # -- adaptive give-up: queue stopped growing, waiting longer is futile --
+  if G_pending <= prev_G_pending:  stall += 1  else  stall = 0
+  if stall >= stall_ticks:                        FIRE
+  HOLD
+
+Why SUM (not MAX)
+-----------------
+A MAX ("fire as soon as the busiest rank is ready") drags quiet ranks into
+firing tiny prefills. A SUM/aggregate-fill target holds until the forward is
+collectively worthwhile, so quiet ranks keep accumulating during the hold and
+fire larger when release finally happens. Under-balanced load a quiet rank still
+fires smaller — that is a request-routing problem, out of scope here.
+
+Cross-DP comms
+--------------
+Single ``all_reduce(SUM)`` over a 6-int64 cpu buffer (gloo-safe). Booleans are
+encoded as 0/1 and read back as ``sum > 0`` (logical OR). All timing is
+tick-based (``hold_ticks``), which is deterministic across ranks — no per-rank
+wall-clock, so ranks never diverge on a timeout boundary. Fail-open on a
+collective error (a peer dying should not crash schedule()); the guarded
+DP-state barrier drives shutdown.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import Optional
 
 import torch
@@ -59,17 +82,30 @@ class PrefillDelayer:
     __slots__ = (
         "dp_size",
         "cpu_group",
-        "max_delay_passes",
-        "max_delay_ms",
+        "max_num_batched_tokens",
+        "target_fill",
+        "ttft_max_ticks",
+        "partial_max_ticks",
+        "stall_ticks",
+        "kv_high_watermark",
         "token_usage_low_watermark",
+        "max_queue_ms",
+        # buffer / episode state
         "_reduce_buf",
-        "_delayed_count",
-        "_delay_start_ts",
-        "_skip_first",
-        "_stat_allow",
-        "_stat_delay",
-        "_stat_timeout",
-        "_stat_watermark",
+        "_hold_ticks",
+        "_stall_count",
+        "_prev_pending",
+        "_first",
+        # stats
+        "_stat_fire_fill",
+        "_stat_fire_stall",
+        "_stat_fire_ttft",
+        "_stat_fire_kv",
+        "_stat_fire_partial",
+        "_stat_fire_nodecode",
+        "_stat_fire_queue_ms",
+        "_stat_fire_vacuous",
+        "_stat_hold",
         "_stat_log_every",
     )
 
@@ -77,173 +113,310 @@ class PrefillDelayer:
         self,
         dp_size: int,
         cpu_group,
-        max_delay_passes: int = 30,
+        max_num_batched_tokens: int,
+        target_fill: float = 0.7,
+        ttft_max_ticks: int = 30,
+        partial_max_ticks: int = 8,
+        stall_ticks: int = 3,
+        kv_high_watermark: float = 0.9,
         token_usage_low_watermark: Optional[float] = None,
-        max_delay_ms: float = 5000.0,
+        max_queue_ms: Optional[float] = None,
     ):
         self.dp_size = dp_size
         self.cpu_group = cpu_group
-        self.max_delay_passes = max_delay_passes
-        self.max_delay_ms = max_delay_ms
+        self.max_num_batched_tokens = max_num_batched_tokens
+
+        # target_fill is the fraction of a full prefill batch that must be
+        # accumulated (across prefillable ranks) before we release. Must be in
+        # (0, 1]: <= 0 would fire every tick (no coalescing); > 1 is unreachable
+        # (fill is capped at 1) and would degrade to stall/timeout-only. Clamp.
+        if target_fill <= 0.0:
+            logger.warning(
+                f"target_fill={target_fill} <= 0 disables coalescing "
+                "(fires every tick); clamping to a small positive 0.05."
+            )
+            target_fill = 0.05
+        elif target_fill > 1.0:
+            logger.warning(
+                f"target_fill={target_fill} > 1.0 is unreachable (fill is capped "
+                "at 1.0); clamping to 1.0."
+            )
+            target_fill = 1.0
+        self.target_fill = target_fill
+
+        # Tick bounds must be >= 1. 0 would make the corresponding `>=` fire on
+        # the first tick, defeating the bound.
+        self.ttft_max_ticks = self._clamp_ticks("ttft_max_ticks", ttft_max_ticks)
+        self.partial_max_ticks = self._clamp_ticks(
+            "partial_max_ticks", partial_max_ticks
+        )
+        self.stall_ticks = self._clamp_ticks("stall_ticks", stall_ticks)
+        self.kv_high_watermark = kv_high_watermark
         self.token_usage_low_watermark = token_usage_low_watermark
+        # TTFT SLA guard: if any rank's oldest schedulable waiting-prefill has
+        # queued (since arrival) >= this many ms, force release regardless of the
+        # fill target. None disables it. Wall-clock, but lockstep-safe: each rank
+        # compares its OWN requests' ages to the threshold locally (disjoint
+        # request sets across ranks), and only the OR of those per-rank booleans
+        # crosses the collective — so all ranks act on the identical result the
+        # same tick. (Contrast the removed per-rank hold-clock E1, which compared
+        # each rank's own clock to a threshold for a GLOBAL decision → skew.)
+        self.max_queue_ms = max_queue_ms
 
-        # 3-slot MAX-reduce buffer (gloo-friendly; mirrors the proven
-        # `_sync_dp_state` all_reduce path in engine_core.py rather than
-        # relying on all_gather_into_tensor — the stateless gloo group's
-        # docstring warns broadcast-like ops are unreliable, and the
-        # initial hang we saw with all_gather_into_tensor was consistent
-        # with this caveat).
-        #
-        # Encoding:
-        #   slot 0 = local_prefillable          (MAX → "any rank prefillable")
-        #   slot 1 = local_force                (MAX → "any rank forces allow")
-        #   slot 2 = NOT local_prefillable      (MAX → "any rank lacks prefill")
-        # Then prefillable_status:
-        #   any_prefillable AND any_not_prefillable → "mixed"
-        #   any_prefillable AND NOT any_not_prefillable → "all"
-        #   NOT any_prefillable → "none"
-        # Single all_reduce, 3 int64s on cpu — negligible overhead.
-        self._reduce_buf = torch.zeros(3, dtype=torch.int64, device="cpu")
+        # 7-slot SUM-reduce buffer (gloo-safe). Encoding:
+        #   slot 0 = prefillable        (SUM → n_prefillable)
+        #   slot 1 = pending_tokens     (SUM → G_pending; fresh + partial remain)
+        #   slot 2 = running_decode     (SUM → G_running_dec)
+        #   slot 3 = kv_high flag       (SUM>0 → any prefillable rank KV-high)
+        #   slot 4 = kv_low flag        (SUM>0 → any prefillable rank KV-low)
+        #   slot 5 = has_partial flag   (SUM>0 → any rank mid-chunked-prefill)
+        #   slot 6 = queue_hot flag     (SUM>0 → any rank's oldest waiting prefill
+        #                                aged past max_queue_ms; TTFT SLA guard)
+        self._reduce_buf = torch.zeros(7, dtype=torch.int64, device="cpu")
 
-        self._delayed_count: int = 0
-        self._delay_start_ts: float = 0.0
-        # Skip first negotiation: during warmup / first burst we want
-        # decode batch_size to grow as fast as possible. Mirrors SGL
-        # PR #19836 (`skip_first_delayer`).
-        self._skip_first: bool = True
+        # Episode state. All ticks decide FIRE/HOLD in lockstep, so these evolve
+        # identically on every rank (deterministic).
+        self._hold_ticks = 0
+        self._stall_count = 0
+        self._prev_pending = -1
+        # First call fires immediately to seed the initial decode batch build-up
+        # (mirrors SGL PR #19836's skip_first).
+        self._first = True
 
-        # Aggregate counters for periodic logging
-        self._stat_allow = 0
-        self._stat_delay = 0
-        self._stat_timeout = 0
-        self._stat_watermark = 0
+        # Per-exit fire counters + hold counter for periodic logging. Each exit
+        # is counted separately so the log shows WHICH reason released prefill —
+        # a high fire_stall/fire_ttft vs fire_fill means the queue rarely reaches
+        # target and the coalescer is mostly giving up rather than batching.
+        self._stat_fire_fill = 0
+        self._stat_fire_stall = 0
+        self._stat_fire_ttft = 0
+        self._stat_fire_kv = 0
+        self._stat_fire_partial = 0
+        self._stat_fire_nodecode = 0
+        self._stat_fire_queue_ms = 0
+        self._stat_fire_vacuous = 0
+        self._stat_hold = 0
         self._stat_log_every = int(
             os.environ.get("ATOM_PREFILL_DELAYER_LOG_EVERY", "1000")
         )
 
         logger.info(
             f"PrefillDelayer initialized: dp_size={dp_size} "
-            f"max_delay_passes={max_delay_passes} "
-            f"max_delay_ms={max_delay_ms} "
-            f"watermark={token_usage_low_watermark}"
+            f"max_num_batched_tokens={max_num_batched_tokens} "
+            f"target_fill={self.target_fill} "
+            f"ttft_max_ticks={self.ttft_max_ticks} "
+            f"partial_max_ticks={self.partial_max_ticks} "
+            f"stall_ticks={self.stall_ticks} "
+            f"kv_high_watermark={kv_high_watermark} "
+            f"token_usage_low_watermark={token_usage_low_watermark} "
+            f"max_queue_ms={max_queue_ms}"
         )
+
+    @staticmethod
+    def _clamp_ticks(name: str, value: int) -> int:
+        if value < 1:
+            logger.warning(
+                f"{name}={value} < 1 would fire on the first tick (bound "
+                "disabled); clamping to 1."
+            )
+            return 1
+        return value
 
     def should_allow_prefill(
         self,
-        local_prefillable: bool,
-        token_usage: float,
+        prefillable: bool,
+        pending_tokens: int,
+        running_decode_batch: int = 0,
+        kv_usage: float = 0.0,
+        has_partial: bool = False,
+        oldest_waiting_age_ms: float = 0.0,
     ) -> bool:
-        """
-        Returns True iff this rank is allowed to admit new prefills this tick.
+        """Return True iff this rank may admit new prefills this tick (FIRE).
+
+        MUST be called every tick on every DP rank (it runs a cross-DP
+        all_reduce) so ranks stay in lockstep.
 
         Args:
-            local_prefillable: this rank has at least one new prefill ready
-                (i.e. self.waiting non-empty and admission would succeed).
-            token_usage: fraction of KV cache blocks currently in use
-                (used_blocks / total_blocks ∈ [0, 1]). Used by the
-                low-watermark safety valve.
+            prefillable: this rank has admittable prefill work (fresh head that
+                can allocate, or a resumable partial). Only prefillable ranks
+                count toward the fill target and the alignment gate.
+            pending_tokens: this rank's accumulated prefill tokens — fresh
+                waiting new-tokens PLUS the remaining tokens of resumable
+                partials — already capped at max_num_batched_tokens by the
+                caller. The coalescer's fill signal.
+            running_decode_batch: decode seqs running on this rank (NOT counting
+                mid-chunked-prefill seqs). If no rank has decode, holding wastes
+                GPU → fire.
+            kv_usage: fraction of KV cache blocks in use ∈ [0, 1]. Drives the
+                KV-high (can't accumulate more) and KV-low (GPU starving) bounds.
+            has_partial: this rank has a mid-chunked-prefill seq in flight. Its
+                remaining tokens are in pending_tokens; a partial only forces
+                release once held for partial_max_ticks (it holds KV).
+            oldest_waiting_age_ms: age (ms since arrival) of this rank's oldest
+                schedulable waiting prefill. If it reaches max_queue_ms, this
+                rank flags the TTFT SLA guard and all ranks release. 0 / no
+                waiting prefill / max_queue_ms=None → guard inactive.
         """
-        # Local "force allow" if KV cache is underutilized — don't delay
-        # when GPU is starving. Only meaningful if this rank actually has
-        # a prefill to push through (otherwise force_allow is a no-op).
-        force = False
-        if (
-            self.token_usage_low_watermark is not None
-            and local_prefillable
-            and token_usage < self.token_usage_low_watermark
-        ):
-            force = True
+        # First call fires unconditionally (one-time warmup seed); not counted in
+        # the per-exit stats so `fire_vacuous` stays exactly "n_prefillable == 0".
+        if self._first:
+            self._first = False
+            self._reset()
+            return True
 
-        # Cross-DP MAX-reduce: 3 booleans encoded as int64.
-        self._reduce_buf[0] = 1 if local_prefillable else 0
-        self._reduce_buf[1] = 1 if force else 0
-        self._reduce_buf[2] = 0 if local_prefillable else 1
-        torch.distributed.all_reduce(
-            self._reduce_buf,
-            op=torch.distributed.ReduceOp.MAX,
-            group=self.cpu_group,
+        # KV + queue-age bounds are gated on this rank actually having prefill to
+        # push (firing when this rank can't admit anything would be a no-op).
+        low = self.token_usage_low_watermark
+        kv_high = prefillable and kv_usage >= self.kv_high_watermark
+        kv_low = prefillable and low is not None and kv_usage < low
+        queue_hot = (
+            prefillable
+            and self.max_queue_ms is not None
+            and oldest_waiting_age_ms >= self.max_queue_ms
         )
-        any_prefillable = int(self._reduce_buf[0].item()) > 0
-        force_max = int(self._reduce_buf[1].item())
-        any_not_prefillable = int(self._reduce_buf[2].item()) > 0
 
-        # Derive 3-way status: all / none / mixed.
-        prefillable_max = 1 if any_prefillable else 0
-        prefillable_min = 0 if any_not_prefillable else 1
+        self._reduce_buf[0] = 1 if prefillable else 0
+        self._reduce_buf[1] = int(pending_tokens)
+        self._reduce_buf[2] = int(running_decode_batch)
+        self._reduce_buf[3] = 1 if kv_high else 0
+        self._reduce_buf[4] = 1 if kv_low else 0
+        self._reduce_buf[5] = 1 if has_partial else 0
+        self._reduce_buf[6] = 1 if queue_hot else 0
+        try:
+            torch.distributed.all_reduce(
+                self._reduce_buf,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.cpu_group,
+            )
+        except RuntimeError:
+            logger.warning(
+                "PrefillDelayer all_reduce failed (peer down?); admitting prefill "
+                "and deferring to the DP-state shutdown barrier."
+            )
+            self._reset()
+            return True
 
-        # Watermark short-circuit: ANY rank below the watermark forces all
-        # ranks to allow this tick. Without this the delayer can stall a
-        # rank with a fresh prefill while the cluster is underloaded.
-        if force_max > 0:
-            self._stat_watermark += 1
-            self._reset_delay()
+        # One host<-device readback for all 7 slots (a single .tolist() beats
+        # seven .item() boundary crossings on this per-tick hot path).
+        (
+            n_prefillable,
+            g_pending,
+            g_running_dec,
+            kv_high_n,
+            kv_low_n,
+            partial_n,
+            queue_hot_n,
+        ) = self._reduce_buf.tolist()
+        any_kv_high = kv_high_n > 0
+        any_kv_low = kv_low_n > 0
+        any_partial = partial_n > 0
+        any_queue_hot = queue_hot_n > 0
+
+        # Nothing to prefill anywhere → allow (vacuous), reset the episode.
+        if n_prefillable == 0:
+            self._reset()
+            self._stat_fire_vacuous += 1
             self._maybe_log()
             return True
 
-        # Skip first call to maximize initial decode batch size build-up.
-        if self._skip_first:
-            self._skip_first = False
-            self._reset_delay()
-            self._stat_allow += 1
-            self._maybe_log()
-            return True
+        # ---- must-fire bounds (release even if unaligned / underfilled) ----
+        if g_running_dec == 0:
+            return self._fire("nodecode", g_pending)
+        if any_kv_high or any_kv_low:
+            return self._fire("kv", g_pending)
+        # TTFT SLA guard: a real request has queued (since arrival) past the
+        # threshold — release now regardless of fill/alignment. This is the
+        # end-to-end wait (includes backlog + coalescer holds), unlike the
+        # tick-based ttft bound below which only caps a single hold episode.
+        if any_queue_hot:
+            return self._fire("queue_ms", g_pending)
+        if self._hold_ticks >= self.ttft_max_ticks:
+            return self._fire("ttft", g_pending)
+        if any_partial and self._hold_ticks >= self.partial_max_ticks:
+            return self._fire("partial", g_pending)
 
-        # status = "all" or "none" → no skew, just allow
-        if prefillable_min == prefillable_max:
-            self._reset_delay()
-            self._stat_allow += 1
-            self._maybe_log()
-            return True
+        # ---- alignment gate: never fire while a rank lacks prefill (anti-skew).
+        # Hold to let stragglers catch up; the ttft bound above bounds the wait.
+        if n_prefillable < self.dp_size:
+            return self._hold(g_pending)
 
-        # status = "mixed" → delay if still within budget
-        if self._delayed_count == 0:
-            self._delay_start_ts = time.perf_counter()
-        elapsed_ms = (time.perf_counter() - self._delay_start_ts) * 1000.0
+        # ---- goal: fire once the aggregate fills a worthwhile forward ----
+        budget = n_prefillable * self.max_num_batched_tokens
+        fill = g_pending / budget if budget > 0 else 1.0
+        if fill >= self.target_fill:
+            return self._fire("fill", g_pending)
 
-        if (
-            self._delayed_count < self.max_delay_passes
-            and elapsed_ms < self.max_delay_ms
-        ):
-            self._delayed_count += 1
-            self._stat_delay += 1
-            if _DEBUG:
-                logger.info(
-                    f"[PrefillDelayer] DELAY: count={self._delayed_count} "
-                    f"elapsed={elapsed_ms:.1f}ms "
-                    f"any_prefillable={any_prefillable} "
-                    f"any_not_prefillable={any_not_prefillable}"
-                )
-            self._maybe_log()
-            return False
+        # ---- adaptive give-up: queue stopped growing → waiting is futile ----
+        if g_pending <= self._prev_pending:
+            self._stall_count += 1
+        else:
+            self._stall_count = 0
+        self._prev_pending = g_pending
+        if self._stall_count >= self.stall_ticks:
+            return self._fire("stall", g_pending)
 
-        # Timed out — force allow to bound worst-case TTFT
-        self._stat_timeout += 1
+        return self._hold(g_pending)
+
+    def _fire(self, reason: str, g_pending: int) -> bool:
+        # reason ∈ {fill, stall, ttft, kv, partial, nodecode, vacuous}; each maps
+        # to a dedicated _stat_fire_<reason> slot so the log shows what released.
+        attr = f"_stat_fire_{reason}"
+        setattr(self, attr, getattr(self, attr) + 1)
         if _DEBUG:
             logger.info(
-                f"[PrefillDelayer] TIMEOUT: count={self._delayed_count} "
-                f"elapsed={elapsed_ms:.1f}ms force-allow"
+                f"[PrefillDelayer] FIRE ({reason}): g_pending={g_pending} "
+                f"hold_ticks={self._hold_ticks} stall={self._stall_count}"
             )
-        self._reset_delay()
+        self._reset()
         self._maybe_log()
         return True
 
-    def _reset_delay(self):
-        self._delayed_count = 0
-        self._delay_start_ts = 0.0
+    def _hold(self, g_pending: int) -> bool:
+        self._hold_ticks += 1
+        self._stat_hold += 1
+        if _DEBUG:
+            logger.info(
+                f"[PrefillDelayer] HOLD: g_pending={g_pending} "
+                f"hold_ticks={self._hold_ticks} stall={self._stall_count} "
+                f"target_fill={self.target_fill}"
+            )
+        self._maybe_log()
+        return False
 
-    def _maybe_log(self):
+    def _reset(self) -> None:
+        self._hold_ticks = 0
+        self._stall_count = 0
+        self._prev_pending = -1
+
+    def _maybe_log(self) -> None:
+        # Cheap guard first — skip the counter sum entirely when logging is
+        # disabled (this runs on every FIRE/HOLD tick).
+        if self._stat_log_every <= 0:
+            return
         total = (
-            self._stat_allow
-            + self._stat_delay
-            + self._stat_timeout
-            + self._stat_watermark
+            self._stat_fire_fill
+            + self._stat_fire_stall
+            + self._stat_fire_ttft
+            + self._stat_fire_kv
+            + self._stat_fire_partial
+            + self._stat_fire_nodecode
+            + self._stat_fire_queue_ms
+            + self._stat_fire_vacuous
+            + self._stat_hold
         )
-        if self._stat_log_every <= 0 or total == 0:
+        if total == 0:
             return
         if total % self._stat_log_every == 0:
             logger.info(
                 f"[PrefillDelayer stats] total={total} "
-                f"allow={self._stat_allow} delay={self._stat_delay} "
-                f"timeout={self._stat_timeout} watermark={self._stat_watermark} "
-                f"(delay_rate={self._stat_delay/total:.2%})"
+                f"fire_fill={self._stat_fire_fill} "
+                f"fire_stall={self._stat_fire_stall} "
+                f"fire_ttft={self._stat_fire_ttft} "
+                f"fire_kv={self._stat_fire_kv} "
+                f"fire_partial={self._stat_fire_partial} "
+                f"fire_nodecode={self._stat_fire_nodecode} "
+                f"fire_queue_ms={self._stat_fire_queue_ms} "
+                f"fire_vacuous={self._stat_fire_vacuous} "
+                f"hold={self._stat_hold} "
+                f"(hold_rate={self._stat_hold / total:.2%})"
             )

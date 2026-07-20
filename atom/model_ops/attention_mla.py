@@ -40,6 +40,11 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 )
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_is_enabled,
+)
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
@@ -1127,6 +1132,46 @@ class MLAAttention(nn.Module):
 
         return self._v_up_proj_and_o_proj(o)
 
+    def _pcp_write_full_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
+        """Write an already-roped full k (kv_lora + rope) into the k-cache.
+
+        Used by the PCP prefill path to materialise the full sequence's KV after
+        the fused MLA kernel produced q_out on 1/pcp queries. Mirrors the
+        non-fused k-writes used by the dense (`not use_prefill_mla`) prefill
+        branch so the physical cache layout matches exactly. `k_rope` must
+        already be rotary-embedded.
+        """
+        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            shuffled_cache = self._shuffled_kv_view(kv_cache)
+            triton_cat_and_cache_mla(
+                k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+                k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                shuffled_cache,
+                slot_mapping.flatten(),
+                self._k_scale,
+                apply_scale=True,
+                shuffled_kv_cache=True,
+            )
+        elif self.use_seg_mla:
+            kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+            concat_and_cache_mla_seg(
+                k_nope,
+                k_rope.squeeze(1),
+                kv_cache_seg,
+                slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+        else:
+            concat_and_cache_mla(
+                k_nope,
+                k_rope.squeeze(1),
+                kv_cache,
+                slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -1217,6 +1262,30 @@ class MLAAttention(nn.Module):
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
+            # ---- Prefill Context Parallel --------------------------------
+            # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
+            # the k-cache must hold the FULL sequence (every rank keeps full KV).
+            # The fused MLA kernel below couples q_out with the k-write on one
+            # token count, so under PCP it runs on the owned slots (q_out is
+            # correct; its k-write is throwaway) and the full k-cache is written
+            # afterwards from the all-gathered k. Gather the raw (un-roped) k and
+            # key positions BEFORE the fused kernel ropes k in place.
+            pcp = (
+                pcp_is_enabled()
+                and context.is_prefill
+                and not context.is_dummy_run
+                and use_prefill_mla
+            )
+            if pcp:
+                pcp_ws = get_pcp_world_size()
+                n_real = attn_metadata.slot_mapping.shape[0]
+                k_nope_full = pcp_allgather_rerange(k_nope, pcp_ws)[:n_real]
+                k_rope_full = pcp_allgather_rerange(k_rope, pcp_ws)[:n_real]
+                positions_full = pcp_allgather_rerange(positions, pcp_ws)[:n_real]
+                write_slot_mapping = attn_metadata.slot_mapping_owned
+            else:
+                write_slot_mapping = attn_metadata.slot_mapping
+
             if self.use_seg_mla:
                 # Seg path: allocate q_out with a padded last dim so each head row
                 # has a 768-byte stride (required by the gfx1250 decode asm). The
@@ -1250,7 +1319,7 @@ class MLAAttention(nn.Module):
                         k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
                         k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
                         shuffled_cache,
-                        attn_metadata.slot_mapping,
+                        write_slot_mapping,
                         positions,
                         self.rotary_emb.cos_cache,
                         self.rotary_emb.sin_cache,
@@ -1271,7 +1340,7 @@ class MLAAttention(nn.Module):
                         # Flat seg layout: [num_blocks, page_size*(kv_lora + pe)].
                         kv_cache_seg,
                         q_out,
-                        attn_metadata.slot_mapping,
+                        write_slot_mapping,
                         self._k_scale,
                         self._q_scale,
                         positions,
@@ -1291,7 +1360,7 @@ class MLAAttention(nn.Module):
                             self.kv_lora_rank + self.qk_rope_head_dim,
                         ),
                         q_out,
-                        attn_metadata.slot_mapping,
+                        write_slot_mapping,
                         self._k_scale,
                         self._q_scale,
                         positions,
@@ -1301,6 +1370,22 @@ class MLAAttention(nn.Module):
                         is_nope_first=True,
                     )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
+
+                if pcp:
+                    # Complete the full k-cache: rope the gathered full k (in
+                    # place) then write every real slot, overwriting the fused
+                    # kernel's throwaway owned-slot write. The rope kernel is
+                    # 2-component and needs a non-None partner, so pass a
+                    # throwaway query of matching length.
+                    self.rotary_emb(
+                        positions_full, k_rope_full, torch.empty_like(k_rope_full)
+                    )
+                    self._pcp_write_full_kv(
+                        kv_cache,
+                        k_nope_full,
+                        k_rope_full,
+                        attn_metadata.slot_mapping,
+                    )
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)

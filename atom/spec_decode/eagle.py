@@ -8,7 +8,15 @@ import torch.nn as nn
 from aiter import dtypes
 from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config, KVCacheTensor
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_pad_dense,
+    pcp_pad_len,
+    pcp_round_robin_split,
+)
 from atom.model_loader.loader import load_model
+from atom.spec_decode.verify_scheduler import VerifyScheduler
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils import envs
 from atom.utils.forward_context import (
@@ -24,6 +32,7 @@ logger = logging.getLogger("atom")
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
+    "DeepseekV4DSparkModel": "atom.models.deepseek_v4_dspark.DeepseekV4DSpark",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
     "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
@@ -31,6 +40,21 @@ support_eagle_model_arch_dict = {
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
 }
+
+
+def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
+    # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
+    from atom.models.deepseek_v2 import _pcp_active
+
+    if _pcp_active():
+        return True
+
+    if draft_model.__class__.__name__ != "DeepseekV4MTP":
+        return False
+
+    from atom.models.deepseek_v4 import _pcp_active as _pcp_active_v4
+
+    return _pcp_active_v4()
 
 
 class Eagle3DraftBuilder:
@@ -207,7 +231,31 @@ class EagleProposer:
     ):
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
-        self.mtp_k: int = self.speculative_config.num_speculative_tokens or 0
+        # DSpark is a parallel block drafter: the verify length is the draft
+        # block size, drafted in a single backbone pass (not mtp_k serial steps).
+        self.use_dspark = bool(
+            getattr(self.speculative_config, "use_dspark", lambda: False)()
+        )
+        if self.use_dspark:
+            draft_cfg = self.speculative_config.draft_model_hf_config
+            self.dspark_block_size = int(getattr(draft_cfg, "dspark_block_size"))
+            # num_speculative_tokens may be unset for DSpark; default to the
+            # full block (Phase 1 uses a static verify length == block size).
+            self.mtp_k: int = (
+                self.speculative_config.num_speculative_tokens or self.dspark_block_size
+            )
+            # Phase 2: confidence-scheduled verification (Level B, variable-length
+            # verify). The ell (per-request verify length) machinery lives in a
+            # reusable VerifyScheduler; propose() feeds it the confidence head
+            # and the next step's calc_spec_decode_metadata consumes the ell map.
+            self.dspark_confidence_schedule = bool(
+                self.config.dspark.confidence_schedule
+            )
+            self.verify_scheduler = (
+                VerifyScheduler(runner) if self.dspark_confidence_schedule else None
+            )
+        else:
+            self.mtp_k: int = self.speculative_config.num_speculative_tokens or 0
 
         self.runner = runner
         self.dtype = self.config.torch_dtype
@@ -322,6 +370,12 @@ class EagleProposer:
         # their own setattr-rebinding and short-circuit the default path.
         if hasattr(self.model, "share_with_target"):
             self.model.share_with_target(target_base, loaded)
+            if self.use_dspark and hasattr(self.model, "reset_kv_cache"):
+                # Allocate DSpark's private rolling target-KV window now that the
+                # device/dtype and max concurrency are known.
+                self.model.reset_kv_cache(
+                    self.config.max_num_seqs, self.device, self.dtype
+                )
             return
 
         # Share embed_tokens with the target model. Match on the *logical* vocab
@@ -386,6 +440,106 @@ class EagleProposer:
             num_local_tokens,
         )
 
+    def _propose_dspark(
+        self,
+        *,
+        target_token_ids: torch.Tensor,  # [num_tokens]
+        target_positions: torch.Tensor,  # [num_tokens]
+        num_reject_tokens: torch.Tensor,  # [batch]
+        next_token_ids: torch.Tensor,  # [batch] verified anchor token x0
+        last_token_indices: torch.Tensor,  # [batch] flat index of each anchor row
+        aux_hidden_states: Optional[list[torch.Tensor]],
+    ) -> torch.Tensor:
+        """DSpark block drafting: ONE parallel backbone pass + Markov sampling.
+
+        Unlike the serial Eagle/MTP path (a python loop running the draft model
+        mtp_k times), DSpark generates the whole block in a single forward_spec
+        call. The sequential dependency lives inside the lightweight Markov head,
+        not in repeated heavyweight backbone passes.
+
+        GPU-VERIFY: this path needs an MI3xx run against the reference DSpark to
+        confirm (a) the rolling target-KV window is populated correctly across
+        prefix-cache hits, and (b) the sampled block matches the reference.
+        """
+        forward_context = get_forward_context()
+        context = forward_context.context
+        attn_metadata = forward_context.attn_metadata
+        context.is_draft = True
+        bs = context.batch_size
+
+        if aux_hidden_states is None:
+            raise RuntimeError(
+                "DSpark requires target auxiliary hidden states from "
+                "dspark_target_layer_ids; none were captured."
+            )
+        # Concatenate the configured target layers -> [num_tokens, dim*L].
+        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+
+        # Anchor token x0 per request = the just-verified target token, located
+        # at last_token_indices in the flat batch.
+        anchor_ids = next_token_ids
+        anchor_positions = torch.index_select(target_positions, 0, last_token_indices)
+        main_hidden = torch.index_select(main_hidden_all, 0, last_token_indices)
+        state_slot = getattr(attn_metadata, "state_slot_mapping", None)
+        if state_slot is not None:
+            cache_indices = state_slot[:bs].to(torch.long)
+        else:
+            cache_indices = torch.arange(bs, device=anchor_ids.device, dtype=torch.long)
+
+        # Prefill warmup: seed each request's rolling window with the last
+        # min(seq_len, window) target tokens BEFORE drafting. Right after
+        # prefill the window is otherwise empty (only the anchor would be
+        # written), so the first draft block sees almost no target context and
+        # rejects early. Writing the prefill tail lifts first-block acceptance
+        # to the steady-state level. Decode steps skip this (the ring buffer is
+        # already populated from prior steps).
+        if context.is_prefill:
+            cu_seqlens_q = getattr(attn_metadata, "cu_seqlens_q", None)
+            if cu_seqlens_q is not None:
+                window = int(self.model.model.mtp[0].window_size)
+                seqlens = cu_seqlens_q[1 : bs + 1] - cu_seqlens_q[:bs]
+                write_per_batch = int(min(int(seqlens.max().item()), window))
+                self.model.precompute_context_kv(
+                    main_hidden_all,
+                    target_positions,
+                    cache_indices,
+                    cu_seqlens_q=cu_seqlens_q[: bs + 1],
+                    write_per_batch=write_per_batch,
+                )
+
+        # Refresh the rolling target-KV window with the new anchor row, then
+        # draft the block in a single backbone pass.
+        self.model.precompute_context_kv(main_hidden, anchor_positions, cache_indices)
+        # Draft width = the verify horizon mtp_k (num_speculative_tokens). This
+        # may exceed dspark_block_size (the training default); DSpark weights are
+        # draft-width-agnostic so the wider block is drafted in one pass, with
+        # positions past block_size RoPE-extrapolated. Capped at the rolling
+        # window so [window ++ draft] KV stays bounded.
+        window = int(self.model.model.mtp[0].window_size)
+        num_draft = min(self.mtp_k, window)
+        self._refresh_dp_metadata(forward_context, bs * num_draft)
+        draft_token_ids, confidence = self.model.forward_spec(
+            anchor_ids,
+            main_hidden,
+            anchor_positions,
+            cache_indices,
+            num_draft=num_draft,
+        )
+        draft_token_ids = draft_token_ids[:, : self.mtp_k]
+        # Phase 2: confidence-scheduled verification. The hardware-aware prefix
+        # scheduler consumes the confidence head to pick a
+        # per-request verify length ell_r. We compute ell here and stash it; the
+        # actual variable-length verification (Level B) is applied downstream by
+        # truncating each request's scheduled spec tokens to ell_r, which frees
+        # batch capacity instead of the no-op in-block masking of Level A.
+        if self.verify_scheduler is not None and confidence is not None:
+            self.verify_scheduler.set_last_ell(
+                self.verify_scheduler.compute_ell(confidence[:, : self.mtp_k])
+            )
+        elif self.verify_scheduler is not None:
+            self.verify_scheduler.set_last_ell(None)
+        return draft_token_ids
+
     def propose(
         self,
         # [num_tokens]
@@ -400,6 +554,16 @@ class EagleProposer:
         last_token_indices: torch.Tensor,
         aux_hidden_states: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
+
+        if self.use_dspark:
+            return self._propose_dspark(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                num_reject_tokens=num_reject_tokens,
+                next_token_ids=next_token_ids,
+                last_token_indices=last_token_indices,
+                aux_hidden_states=aux_hidden_states,
+            )
 
         forward_context = get_forward_context()
         context = forward_context.context
@@ -451,11 +615,45 @@ class EagleProposer:
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
                 # Re-sync DP token
                 self._refresh_dp_metadata(forward_context, input_ids.shape[0])
+                # ---- Prefill Context Parallel (draft i==0 prefill) --------
+                # The draft's first pass is a prefill that reuses the target's
+                # 1/pcp-reindexed attn_metadata, so it must run on this rank's
+                # 1/pcp query shard (input_ids / positions / previous hidden) and
+                # all-gather the draft hidden back to full token order before the
+                # last-token sampling gather. Later draft steps are decode
+                # (is_prefill False) and run full — identical to the non-PCP path.
+                # `input_ids` / `positions` / `hidden_states` themselves stay full
+                # so the post-i==0 decode-metadata setup (which indexes with the
+                # full `last_token_indices`) is unchanged.
+                pcp_draft_prefill = i == 0 and _pcp_active_for_draft_model(self.model)
+                if pcp_draft_prefill:
+                    pcp_ws = get_pcp_world_size()
+                    n_global_draft = input_ids.shape[0]
+                    n_pad = pcp_pad_len(n_global_draft, pcp_ws) - n_global_draft
+                    d_input_ids = pcp_round_robin_split(
+                        pcp_pad_dense(input_ids, n_pad), pcp_ws
+                    )
+                    d_positions = pcp_round_robin_split(
+                        pcp_pad_dense(positions, n_pad), pcp_ws
+                    )
+                    d_hidden = pcp_round_robin_split(
+                        pcp_pad_dense(hidden_states, n_pad), pcp_ws
+                    )
+                else:
+                    d_input_ids, d_positions, d_hidden = (
+                        input_ids,
+                        positions,
+                        hidden_states,
+                    )
                 ret_hidden_states = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    hidden_states=hidden_states,
+                    input_ids=d_input_ids,
+                    positions=d_positions,
+                    hidden_states=d_hidden,
                 )
+                if pcp_draft_prefill:
+                    ret_hidden_states = pcp_allgather_rerange(
+                        ret_hidden_states, pcp_ws
+                    )[:n_global_draft]
 
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
@@ -598,6 +796,19 @@ class EagleProposer:
 
         token_indices = cu_seqlens_q[1:] - last_token_offset
 
+        # Defensive clamp to the valid flat-token range [0, total_tokens-1].
+        # Under DSpark flat-ragged CUDA graph, the drain-phase corner (tiny /
+        # mixed batches) can drive an anchor index just out of range; the anchor
+        # only seeds the DRAFT (a wrong anchor lowers acceptance but never
+        # corrupts the verified/target output — losslessness is preserved), so
+        # clamping is safe and avoids an index_select GPU fault. No-op on the
+        # normal path where indices are already in range.
+
+        if self.use_dspark:
+            total_tokens = int(cu_seqlens_q[-1])
+            if total_tokens > 0:
+                token_indices = token_indices.clamp_(0, total_tokens - 1)
+
         return token_indices
 
     def calc_spec_decode_metadata(
@@ -607,7 +818,16 @@ class EagleProposer:
         input_ids: torch.Tensor,
     ) -> SpecDecodeMetadata:
         scheduled_bs = len(num_sampled_tokens)
-        sum_drafted_tokens = self.mtp_k * scheduled_bs
+
+        # num_draft = num_sampled - 1 per request. num_sampled_tokens is the
+        # per-seq token count for THIS forward (anchor + drafts). In Phase 1 that
+        # is mtp_k+1 (full). With DSpark plan Y the q-bucket already shrank it to
+        # q (uniform), so deriving num_draft from num_sampled keeps draft / target
+        # / bonus indices consistent with the actual forward layout — no separate
+        # mtp_k constant that could desync (the A-bug: 98%->52%).
+        num_draft_tokens = np.asarray(num_sampled_tokens, dtype=np.int32) - 1
+        np.clip(num_draft_tokens, 0, self.mtp_k, out=num_draft_tokens)
+        sum_drafted_tokens = int(num_draft_tokens.sum())
 
         # Compute the bonus logits indices.
         bonus_logits_indices = cu_num_sampled_tokens - 1
@@ -615,7 +835,6 @@ class EagleProposer:
         # Compute the draft logits indices.
         # cu_num_draft_tokens: [3, 3, 5, 5, 6]
         # arange: [0, 1, 2, 0, 1, 0]
-        num_draft_tokens = np.full(scheduled_bs, self.mtp_k, dtype=np.int32)
         cu_num_draft_tokens, arange = self.runner._get_cumsum_and_arange(
             num_draft_tokens, cumsum_dtype=np.int32
         )

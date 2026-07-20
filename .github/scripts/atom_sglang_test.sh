@@ -107,17 +107,10 @@ emit_new_sglang_logs() {
 }
 
 wait_server_ready() {
+  local expected_model_path="${1:-}"
   echo ""
   echo "========== Waiting for SGLang server (${MODEL_NAME}) =========="
   for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
-    if curl -fsS "http://127.0.0.1:${SGLANG_PORT}/v1/models" >/dev/null 2>&1; then
-      emit_new_sglang_logs
-      echo "SGLang server is ready for ${MODEL_NAME}."
-      return 0
-    fi
-
-    emit_new_sglang_logs
-
     if [[ -f "${SGLANG_PID_FILE}" ]]; then
       local pid
       pid=$(cat "${SGLANG_PID_FILE}")
@@ -129,6 +122,45 @@ wait_server_ready() {
       fi
     fi
 
+    local models_response
+    models_response=$(curl -fsS "http://127.0.0.1:${SGLANG_PORT}/v1/models" 2>/dev/null || true)
+    if [[ -n "${models_response}" ]]; then
+      if [[ -z "${expected_model_path}" ]] || \
+        MODELS_RESPONSE="${models_response}" EXPECTED_MODEL_PATH="${expected_model_path}" python3 - <<'PY'
+import json
+import os
+import sys
+
+
+def normalize_model_id(model_id: str) -> str:
+    model_id = model_id.rstrip("/")
+    if model_id.startswith("/models/"):
+        return model_id[len("/models/") :]
+    return model_id
+
+
+expected_model = normalize_model_id(os.environ["EXPECTED_MODEL_PATH"])
+try:
+    payload = json.loads(os.environ["MODELS_RESPONSE"])
+except Exception:
+    sys.exit(1)
+
+served_models = {
+    normalize_model_id(item.get("id", ""))
+    for item in payload.get("data", [])
+    if isinstance(item, dict) and isinstance(item.get("id"), str)
+}
+
+sys.exit(0 if expected_model in served_models else 1)
+PY
+      then
+        emit_new_sglang_logs
+        echo "SGLang server is ready for ${MODEL_NAME}."
+        return 0
+      fi
+    fi
+
+    emit_new_sglang_logs
     echo "Waiting for SGLang server... (${i}/${MAX_WAIT_RETRIES})"
     sleep "${WAIT_INTERVAL_SEC}"
   done
@@ -217,7 +249,7 @@ PY
   echo "Server PID: $(cat "${SGLANG_PID_FILE}")"
 
   if [[ "${wait_for_ready}" == "1" ]]; then
-    wait_server_ready
+    wait_server_ready "${resolved_model_path}"
   fi
 }
 
