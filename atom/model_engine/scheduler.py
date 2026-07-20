@@ -139,9 +139,11 @@ class CacheStats:
         "total_requests",
         "total_cached_tokens",
         "total_full_tokens",
+        "total_compressed_tokens",
         "_interval_requests",
         "_interval_cached_tokens",
         "_interval_full_tokens",
+        "_interval_compressed_tokens",
     )
 
     def __init__(self, log_interval: int = 100):
@@ -149,18 +151,29 @@ class CacheStats:
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
+        # Pre-SWA-gate compressed-prefix hit tokens. total - cached separates
+        # reuse lost to the SWA tail gate from reuse lost to compressed eviction.
+        self.total_compressed_tokens: int = 0
         self._interval_requests: int = 0
         self._interval_cached_tokens: int = 0
         self._interval_full_tokens: int = 0
+        self._interval_compressed_tokens: int = 0
 
-    def update(self, num_cached_tokens: int, num_full_tokens: int) -> None:
+    def update(
+        self,
+        num_cached_tokens: int,
+        num_full_tokens: int,
+        num_compressed_tokens: int = 0,
+    ) -> None:
         """Record cache stats for one prefill sequence."""
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
         self.total_full_tokens += num_full_tokens
+        self.total_compressed_tokens += num_compressed_tokens
         self._interval_requests += 1
         self._interval_cached_tokens += num_cached_tokens
         self._interval_full_tokens += num_full_tokens
+        self._interval_compressed_tokens += num_compressed_tokens
 
         if self.total_requests % self._log_interval == 0:
             self._log()
@@ -176,22 +189,40 @@ class CacheStats:
         self._interval_requests = 0
         self._interval_cached_tokens = 0
         self._interval_full_tokens = 0
+        self._interval_compressed_tokens = 0
+
+    @staticmethod
+    def _rate(num: int, den: int) -> float:
+        return num / den if den > 0 else 0.0
 
     def _log(self) -> None:
-        iv_rate = (
-            self._interval_cached_tokens / self._interval_full_tokens
-            if self._interval_full_tokens > 0
-            else 0.0
+        # compressed = pre-SWA-gate prefix hit; cached = post-gate (admitted).
+        # (compressed - cached) is reuse lost to a missing SWA tail; (full -
+        # compressed) is reuse lost to compressed eviction / no logical reuse.
+        iv_hit = self._rate(self._interval_cached_tokens, self._interval_full_tokens)
+        iv_comp = self._rate(
+            self._interval_compressed_tokens, self._interval_full_tokens
+        )
+        iv_gate = self._rate(
+            self._interval_compressed_tokens - self._interval_cached_tokens,
+            self._interval_full_tokens,
         )
         logger.info(
             f"[Cache Stats Interval] Reqs: {self._interval_requests}, "
-            f"Cached/Total tokens: {self._interval_cached_tokens}/{self._interval_full_tokens}, "
-            f"Hit rate: {iv_rate:.2%}"
+            f"Cached/Total: {self._interval_cached_tokens}/{self._interval_full_tokens}, "
+            f"Hit: {iv_hit:.2%}, Compressed-hit: {iv_comp:.2%}, "
+            f"Lost-to-SWA-gate: {iv_gate:.2%}"
+        )
+        tot_comp = self._rate(self.total_compressed_tokens, self.total_full_tokens)
+        tot_gate = self._rate(
+            self.total_compressed_tokens - self.total_cached_tokens,
+            self.total_full_tokens,
         )
         logger.info(
             f"[Cache Stats         ] Reqs: {self.total_requests}, "
-            f"Cached/Total tokens: {self.total_cached_tokens}/{self.total_full_tokens}, "
-            f"Hit rate: {self.hit_rate:.2%}"
+            f"Cached/Total: {self.total_cached_tokens}/{self.total_full_tokens}, "
+            f"Hit: {self.hit_rate:.2%}, Compressed-hit: {tot_comp:.2%}, "
+            f"Lost-to-SWA-gate: {tot_gate:.2%}"
         )
 
 
@@ -1329,7 +1360,11 @@ class Scheduler:
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
         if self.cache_stats:
-            self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
+            self.cache_stats.update(
+                seq.num_cached_tokens,
+                seq.num_tokens,
+                seq.num_compressed_hit_blocks * self.block_manager.block_size,
+            )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
