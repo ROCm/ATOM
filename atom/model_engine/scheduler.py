@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.utils import envs as _envs
 
 logger = logging.getLogger("atom")
 
@@ -473,8 +474,6 @@ class Scheduler:
         # pure-decode steps (the common case).
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
-
-        from atom.utils import envs as _envs
 
         _cap = _envs.ATOM_PD_MAX_INFLIGHT_LOADS
         self._max_inflight_remote_loads: int = _cap if _cap > 0 else config.max_num_seqs
