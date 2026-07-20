@@ -376,6 +376,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -622,6 +623,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -798,6 +800,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
         self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
+        self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -830,7 +833,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
 
         mxfp4_block = 32
-        pad_align = 256
+        pad_align = self.pad_align
 
         intermediate_size_per_partition_after_pad = (
             (intermediate_size_per_partition + pad_align - 1) // pad_align * pad_align
@@ -1122,7 +1125,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
-    @mark_trace(prefix="mxfp4_moe", torch_compile=False)
+    @mark_trace
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1141,13 +1144,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
             # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
+            from aiter.ops.triton.moe.moe_routing.routing import routing
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts_a8w4_silu_gguu,
             )
-            from aiter.ops.triton.moe.moe_routing.routing import routing
 
             n_expts_act = top_k
 
@@ -1760,6 +1764,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         """Apply compressed-tensors FP8 MoE computation."""
         # Select top-k experts using router logits
@@ -2197,6 +2202,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -2384,6 +2390,7 @@ class FusedMoE(torch.nn.Module):
         shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
         shared_expert_prefix: Optional[str] = None,
+        pad_align: Optional[int] = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -2558,6 +2565,12 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
+
+        # Override weight padding alignment before create_weights consumes it.
+        # Must happen here (pre-create_weights) — setting it on quant_method
+        # after FusedMoE construction is a no-op since weights are already sized.
+        if pad_align is not None:
+            self.quant_method.pad_align = pad_align
 
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.moe_quant_params = {
@@ -3186,6 +3199,127 @@ class FusedMoE(torch.nn.Module):
                 narrow_weight = loaded_weight
             target_param[: narrow_weight.shape[0]].copy_(narrow_weight)
 
+    def _copy_expert_shard(
+        self,
+        param: torch.nn.Parameter,
+        expert_data: torch.Tensor,
+        shard_id: str,
+        shard_dim: int,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+    ) -> bool:
+        """Copy one expert's shard into ``expert_data``. Shared by
+        ``weight_loader`` (GPU dest) and ``stage_expert_weight`` (CPU staging
+        dest) so the two paths can't drift. Returns False for cases the batched
+        path can't handle (per-Tensor scale, ``weight_shape``); caller falls back.
+        """
+        # scales / zero-points / offset (group + per-channel)
+        if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
+            quant_method = self.layer_quant_config.quant_type
+            if quant_method == QuantType.per_Token:
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
+                return True
+            if quant_method in (QuantType.per_1x128, QuantType.per_1x32):
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    load_full=getattr(param, "load_full_w2", False),
+                )
+                return True
+            return False
+
+        # model weights; `weight_shape` shares the substring but isn't batchable
+        if "weight" in weight_name and "weight_shape" not in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=self.tp_rank,
+            )
+            return True
+
+        return False
+
+    def stage_expert_weight(
+        self,
+        param: torch.nn.Parameter,
+        staging: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        local_expert_id: int,
+        shard_id: str,
+        weight_name: str,
+    ) -> bool:
+        # Cases not handled by the batched path — caller falls back.
+        if (
+            "input_scale" in weight_name
+            or "g_idx" in weight_name
+            or "weight_shape" in weight_name
+            or weight_name == ""
+        ):
+            return False
+        if shard_id not in ("w1", "w2", "w3"):
+            return False
+
+        # compressed-tensors packed-weight flip (matches weight_loader)
+        if self.quant_method.__class__.__name__ in (
+            "CompressedTensorsWNA16MarlinMoEMethod",
+            "CompressedTensorsWNA16MoEMethod",
+        ):
+            loaded_weight = loaded_weight.t().contiguous()
+
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        is_transposed = getattr(param, "is_transposed", False)
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+        if is_transposed:
+            shard_dim = int(not shard_dim)
+
+        if len(loaded_weight.shape) == 3:
+            return False
+
+        expert_data = staging[local_expert_id]
+
+        if (
+            staging.dtype == torch.uint8
+            and param.data.dtype == dtypes.fp4x2
+            and loaded_weight.dtype == dtypes.fp4x2
+        ):
+            loaded_weight = loaded_weight.view(torch.uint8)
+
+        return self._copy_expert_shard(
+            param=param,
+            expert_data=expert_data,
+            shard_id=shard_id,
+            shard_dim=shard_dim,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+        )
+
+    def expected_batched_arrivals(self, param: torch.nn.Parameter) -> Optional[int]:
+        w13_batchable = [getattr(self, "w13_weight", None)]
+        w2_batchable = [getattr(self, "w2_weight", None)]
+        if self.layer_quant_config.quant_type in (
+            QuantType.per_Token,
+            QuantType.per_1x128,
+            QuantType.per_1x32,
+        ):
+            w13_batchable.append(getattr(self, "w13_weight_scale", None))
+            w2_batchable.append(getattr(self, "w2_weight_scale", None))
+        if any(param is p for p in w13_batchable if p is not None):
+            return self.local_num_experts * 2
+        if any(param is p for p in w2_batchable if p is not None):
+            return self.local_num_experts
+        return None
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -3265,35 +3399,22 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        # Case weight scales, zero_points and offset
+        # Group/per-channel scales and model weights share one copy path with
+        # the batched loader (_copy_expert_shard).
+        # TODO @dsikka: once hardened, refactor to use vLLM Parameters.
+        if self._copy_expert_shard(
+            param=param,
+            expert_data=expert_data,
+            shard_id=shard_id,
+            shard_dim=shard_dim,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+        ):
+            return
+
+        # Case per-Tensor weight scale
         if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
-            # load the weight scales and zp based on the quantization scheme
-            # supported weight scales/zp can be found in
-            # FusedMoeWeightScaleSupported
-            # TODO @dsikka: once hardened, refactor to use vLLM Parameters
-            # specific to each case
-            quant_method = self.layer_quant_config.quant_type
-            if quant_method == QuantType.per_Token:
-                self._load_per_channel_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                )
-            elif quant_method in [
-                QuantType.per_1x128,
-                QuantType.per_1x32,
-            ]:
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                    load_full=getattr(param, "load_full_w2", False),
-                )
-            elif quant_method == QuantType.per_Tensor:
+            if self.layer_quant_config.quant_type == QuantType.per_Tensor:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
@@ -3307,17 +3428,6 @@ class FusedMoE(torch.nn.Module):
             # only required by compressed-tensors
             self._load_single_value(
                 param=param, loaded_weight=loaded_weight, expert_id=expert_id
-            )
-            return
-
-        # Case model weights
-        if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=self.tp_rank,
             )
             return
 
@@ -3510,6 +3620,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            prefix=f"{self.prefix}.fused_moe",
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -3568,6 +3679,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            prefix=f"{self.prefix}.fused_moe",
         )
 
         dp_group = get_dp_group()

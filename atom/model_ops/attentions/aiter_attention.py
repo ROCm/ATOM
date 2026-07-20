@@ -42,6 +42,19 @@ def _is_indexed_sparse_attention(module) -> bool:
     return bool(getattr(impl, "is_indexed_sparse_attention", False))
 
 
+def _resolve_index_cache_dtype(config) -> torch.dtype:
+    from aiter import dtypes
+
+    index_cache_dtype = getattr(config, "index_cache_dtype", None)
+    if index_cache_dtype is None:
+        index_cache_dtype = getattr(config, "kv_cache_dtype", "bf16")
+    if index_cache_dtype in ("bf16", "fp8"):
+        return dtypes.d_dtypes[index_cache_dtype]
+    raise ValueError(
+        "index_cache_dtype must be 'bf16' or 'fp8', " f"got {index_cache_dtype!r}"
+    )
+
+
 @triton.jit
 def _mtp_prepare_decode_metadata_kernel(
     context_lens_ptr,
@@ -480,11 +493,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
             )
             index_dim = sparse_cfg["sparse_index_dim"]
+            index_cache_dtype = _resolve_index_cache_dtype(config)
             block_bytes += (
                 sparse_layers
                 * runner.physical_block_size
                 * index_dim
-                * torch.empty((), dtype=config.torch_dtype).element_size()
+                * torch.empty((), dtype=index_cache_dtype).element_size()
             )
         return block_bytes
 
@@ -540,12 +554,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             sparse_layers = sum(
                 1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
             )
+            index_cache_dtype = _resolve_index_cache_dtype(config)
             tensors["sparse_attention_index_cache"] = torch.zeros(
                 sparse_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
                 sparse_cfg["sparse_index_dim"],
-                dtype=config.torch_dtype,
+                dtype=index_cache_dtype,
                 device="cuda",
             )
             tensors["_sparse_attention_cache_next"] = 0

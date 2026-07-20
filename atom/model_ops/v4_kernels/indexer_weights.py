@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 
 @triton.jit
 def _scale_indexer_weights_kernel(
@@ -26,11 +28,13 @@ def _scale_indexer_weights_kernel(
     tl.store(out_ptr + offsets, weights * q_scale * weights_scale, mask=mask)
 
 
+@mark_trace
 def scale_indexer_weights(
     weights: torch.Tensor,
     q_scale: torch.Tensor,
     weights_scale: float,
     block_size: int = 1024,
+    prefix: str = "",
 ) -> torch.Tensor:
     """Apply `weights * q_scale.squeeze(-1) * weights_scale` in one Triton launch."""
     assert weights.dim() == 2, f"weights must be [T, H], got {tuple(weights.shape)}"

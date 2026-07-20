@@ -28,6 +28,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Token-equivalent cost of one in-flight request for the "least_tokens" DP
+    # load-balance strategy. The per-rank load score is
+    #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests
+    # so a larger value biases routing toward request-count balance (decode
+    # pressure) and a smaller value toward prompt-token balance (prefill
+    # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
+    "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # --- Compilation & Execution ---
@@ -140,11 +147,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
-    # Use a thread pool for weight loading instead of main-process sequential I/O.
-    # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
-    "ATOM_LOADER_USE_THREADPOOL": lambda: (
-        os.getenv("ATOM_LOADER_USE_THREADPOOL", "1") == "1"
-    ),
+    # Worker threads for weight loading. >1 (default 16) enables the batched
+    # parallel loader (per-fused-param CPU staging flushed with one H2D copy)
+    # with that many threads; set to 1 to fall back to the original sequential
+    # per-expert path.
+    "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

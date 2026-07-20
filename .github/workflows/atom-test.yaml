@@ -119,6 +119,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
       - name: Prefer latest main aiter wheel manifest and fallback to artifact
+        timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/download_aiter_wheel.sh
