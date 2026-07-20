@@ -38,12 +38,12 @@ on:
         default: true
         type: boolean
       model_names:
-        description: 'Optional when run_all_models=false. Comma-separated: DeepSeek-V4-Pro,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'Optional when run_all_models=false. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
       case_names:
-        description: 'Overrides model_names. Comma-separated: ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-2p1d-dpa-tp8,kimi-k25-1p1d-tp4,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3'
+        description: 'Overrides model_names. Comma-separated: ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-2p1d-dpa-tp8,glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,kimi-k25-1p1d-tp4,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3'
         required: false
         default: ''
         type: string
@@ -130,6 +130,93 @@ jobs:
       - name: Install YAML parser
         run: python3 -m pip install pyyaml
 
+      - name: Find ATOMesh latest nightly image
+        id: image
+        env:
+          INPUT_ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          import yaml
+
+          cfg = yaml.safe_load(Path(".github/benchmark/models_atomesh.yaml").read_text(encoding="utf-8")) or {}
+          default_image = str(cfg.get("backends", {}).get("atom", {}).get("image", "")).strip()
+          image = os.environ.get("INPUT_ATOMESH_IMAGE", "").strip() or default_image
+
+          def docker_tags(prefix: str) -> list[dict]:
+              url = (
+                  "https://hub.docker.com/v2/repositories/rocm/atom-dev/tags?"
+                  + urllib.parse.urlencode({"page_size": 100, "name": prefix})
+              )
+              tags = []
+              while url:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      data = json.load(response)
+                  tags.extend(
+                      tag for tag in data.get("results", [])
+                      if str(tag.get("name", "")).startswith(prefix)
+                  )
+                  url = data.get("next")
+              return tags
+
+          def latest_nightly_for(day) -> str | None:
+              prefix = f"nightly_{day:%Y%m%d}"
+              tags = docker_tags(prefix)
+              if not tags:
+                  return None
+              tags.sort(
+                  key=lambda tag: (str(tag.get("last_updated", "")), str(tag.get("name", ""))),
+                  reverse=True,
+              )
+              return f"rocm/atom-dev:{tags[0]['name']}"
+
+          def docker_tag_digest(tag_name: str) -> str:
+              url = f"https://hub.docker.com/v2/repositories/rocm/atom-dev/tags/{urllib.parse.quote(tag_name)}"
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  data = json.load(response)
+              if data.get("digest"):
+                  return str(data["digest"])
+              for image_info in data.get("images", []):
+                  if image_info.get("digest"):
+                      return str(image_info["digest"])
+              return ""
+
+          resolved_image = image
+          if image == "rocm/atom-dev:latest":
+              beijing_tz = timezone(timedelta(hours=8))
+              today = datetime.now(beijing_tz).date()
+              resolved_image = latest_nightly_for(today)
+              if resolved_image is None:
+                  resolved_image = latest_nightly_for(today - timedelta(days=1))
+              if resolved_image is None:
+                  print("::warning::Cannot find rocm/atom-dev nightly tag for today or yesterday; falling back to rocm/atom-dev:latest.")
+                  resolved_image = image
+
+          image_digest = ""
+          if resolved_image == "rocm/atom-dev:latest":
+              image_digest = docker_tag_digest("latest")
+              if image_digest:
+                  print(f"ATOMesh image digest: {image_digest}")
+              else:
+                  print("::warning::Cannot resolve digest for rocm/atom-dev:latest.")
+
+          print(f"ATOMesh image: {image} -> {resolved_image}")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"image={resolved_image}\n")
+              output.write(f"image_digest={image_digest}\n")
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary and image_digest:
+              with Path(step_summary).open("a", encoding="utf-8") as summary:
+                  summary.write(f"ATOMesh image digest: `{image_digest}`\n")
+          PY
+
       - name: Build benchmark matrix
         id: matrix
         env:
@@ -137,7 +224,7 @@ jobs:
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
-          ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+          ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
         run: |
@@ -221,6 +308,59 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Print benchmark config
+        env:
+          CELL_JSON: ${{ toJson(matrix) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          cell = json.loads(os.environ["CELL_JSON"])
+
+          def get(path, default=""):
+              cur = cell
+              for key in path.split("."):
+                  if not isinstance(cur, dict) or key not in cur:
+                      return default
+                  cur = cur[key]
+              return cur
+
+          summary = {
+              "id": get("id"),
+              "suite": get("suite"),
+              "model": get("model"),
+              "case": get("name"),
+              "image": get("image"),
+              "model_path": get("model_path"),
+              "precision": get("precision"),
+              "runner": get("runner.slurm_submit_runner"),
+              "slurm_account": get("runner.slurm_account"),
+              "slurm_partition": get("runner.slurm_partition"),
+              "log_root": get("runner.log_root"),
+              "nodes": ",".join(get("nodes", [])),
+              "num_nodes": get("num_nodes"),
+              "topology": get("topology"),
+              "pd_worker_layout": get("pd_worker_layout"),
+              "prefill": get("service.prefill"),
+              "decode": get("service.decode"),
+              "router": get("service.router"),
+              "server_args": get("server_args"),
+              "isl": get("isl"),
+              "osl": get("osl"),
+              "concurrency": get("concurrency"),
+              "run_eval": get("run_eval"),
+          }
+
+          print("=== ATOMesh benchmark config summary ===")
+          for key, value in summary.items():
+              print(f"{key}: {value}")
+
+          print("=== ATOMesh benchmark full cell JSON ===")
+          print(json.dumps(cell, indent=2, sort_keys=True))
+          PY
+
       - name: Run Slurm benchmark cell
         env:
           CELL_JSON: ${{ toJson(matrix) }}
@@ -243,20 +383,33 @@ jobs:
           fi
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
           SLURM_CANCEL_HELPER="${RESULT_DIR}/${{ matrix.id }}.slurm-cancel.sh"
-          cancel_slurm_from_wrapper() {
+          PD_SUBMIT_PID=""
+          cleanup_slurm_from_wrapper() {
             local rc=$?
-            if [[ "${rc}" -ne 0 && -x "${SLURM_CANCEL_HELPER}" ]]; then
+            trap - EXIT HUP INT TERM
+            if [[ "${rc}" -ne 0 ]]; then
               echo "=== cancelling Slurm job from workflow wrapper rc=${rc} ==="
-              bash "${SLURM_CANCEL_HELPER}" || true
+              if [[ -x "${SLURM_CANCEL_HELPER}" ]]; then
+                bash "${SLURM_CANCEL_HELPER}" || true
+              else
+                echo "Slurm cancel helper is not available yet"
+              fi
+            fi
+            if [[ -n "${PD_SUBMIT_PID}" ]] && kill -0 "${PD_SUBMIT_PID}" 2>/dev/null; then
+              kill "${PD_SUBMIT_PID}" 2>/dev/null || true
+              wait "${PD_SUBMIT_PID}" 2>/dev/null || true
             fi
             exit "${rc}"
           }
-          trap cancel_slurm_from_wrapper EXIT
+          trap cleanup_slurm_from_wrapper EXIT
+          trap 'exit 129' HUP
           trap 'exit 130' INT
           trap 'exit 143' TERM
           bash .github/scripts/atomesh/pd_submit.sh \
             --cell-json "$CELL_JSON" \
-            --result-dir "$RESULT_DIR"
+            --result-dir "$RESULT_DIR" &
+          PD_SUBMIT_PID=$!
+          wait "${PD_SUBMIT_PID}"
 
       - name: Summarize ${{ matrix.id }} benchmark result
         if: always()

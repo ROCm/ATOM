@@ -1666,16 +1666,40 @@ async def get_mtp_stats():
         )
 
 
+def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
+    kv_role = kv_cfg.get("kv_role")
+    handshake_port = kv_cfg.get("handshake_port", 6301)
+    if kv_role is not None or kv_cfg.get("kv_connector") != "multi":
+        return kv_role, handshake_port
+
+    # MultiConnector wraps the real transfer connector. Surface the producer
+    # role so atomesh can recognize multi[mooncake-producer + offload] as a
+    # prefill node.
+    fallback_role = None
+    fallback_port = handshake_port
+    for sub_cfg in kv_cfg.get("connectors", []):
+        sub_role = sub_cfg.get("kv_role")
+        if sub_role is None:
+            continue
+        if fallback_role is None:
+            fallback_role = sub_role
+            fallback_port = sub_cfg.get("handshake_port", handshake_port)
+        if sub_role == "kv_producer":
+            return sub_role, sub_cfg.get("handshake_port", handshake_port)
+    return fallback_role, fallback_port
+
+
 @app.get("/kv_transfer_info")
 async def kv_transfer_info():
     global engine
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
+    kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
     return {
         "tp_size": cfg.tensor_parallel_size,
         "dp_size": cfg.parallel_config.data_parallel_size,
-        "kv_role": kv_cfg.get("kv_role"),
-        "handshake_port": kv_cfg.get("handshake_port", 6301),
+        "kv_role": kv_role,
+        "handshake_port": handshake_port,
     }
 
 

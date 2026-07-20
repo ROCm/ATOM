@@ -1047,6 +1047,7 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     port: int = 8006
@@ -1057,11 +1058,18 @@ class Config:
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
     mark_trace: bool = False
-    load_dummy: bool = False
+    load_dummy: Optional[str] = None
     enable_expert_parallel: bool = False
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
+    # DP request-routing strategy used by CoreManager to pick an engine rank:
+    # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
+    # effect when more than one DP engine rank is launched. See
+    # atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked. The literal
+    # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
+    # cannot import it without a cycle: engine_core_mgr imports Config).
+    dp_load_balance: str = "least_requests"
     # MoE expert-parallel layout policy. When True, MoE EP computes ranks in the
     # flattened DP x TP device space (and shared-expert fusion is disabled,
     # because the fused shared expert assumes the per-DP MoE layout). The vLLM
@@ -1098,6 +1106,9 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
+        if self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
+
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
         # assert os.path.isdir(self.model)
@@ -1266,7 +1277,17 @@ class Config:
 
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
+        # PCP changes the compiled graph: when pcp>1 the indexer runs through the
+        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
+        # query) and the indexer takes the round-robin all-gather / separate-rope
+        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # identically, so without this factor pcp2 loads pcp1's cached artifact
+        # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
+        # runtime — the same stale-artifact hazard documented for the vocab-embed
+        # flag below.
+        factors.append(self.prefill_context_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(self.index_cache_dtype)
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
@@ -1292,6 +1313,13 @@ class Config:
                 ),
             )
         )
+        # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
+        # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
+        # F.embedding vs masked-embedding + all-reduce), so it alters the compiled
+        # graph and MUST be part of its key. Without this, toggling the flag — or
+        # deploying it on top of a cache built with the other setting — reuses a
+        # stale artifact and trips assert_size_stride at runtime.
+        factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

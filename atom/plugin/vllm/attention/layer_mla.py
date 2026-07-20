@@ -1309,13 +1309,20 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 transpose_bm=True,
             )
 
+        # Fuse the q fp8-quant into the aiter rope+concat+cache kernel by
+        # allocating q_out as fp8 directly (matches the dense decode path,
+        # forward_impl's decode_only branch). The kernel quantizes q
+        # with self._q_scale on write, so the separate vllm scaled_fp8_quant
+        # below is no longer needed — it saved nothing but an extra
+        # vllm::scaled_fp8_quant kernel launch + a bf16->fp8 pass over q every
+        # decode step. Non-fp8 attention keeps the bf16 output unchanged.
         q_out = torch.empty(
             (
                 ql_nope.shape[0],
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ),
-            dtype=ql_nope.dtype,
+            dtype=dtypes.fp8 if fp8_attention else ql_nope.dtype,
             device=ql_nope.device,
         )
         if kv_cache.numel() > 0:
@@ -1341,15 +1348,6 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
 
-        if fp8_attention:
-            from vllm import _custom_ops as ops
-
-            # Reshape to 2D for scaled_fp8_quant, then restore
-            q_flat, _ = ops.scaled_fp8_quant(
-                q_out.reshape(q_out.shape[0], -1),
-                self._q_scale,
-            )
-            q_out = q_flat.reshape(q_out.shape)
         attn_out = self._forward_sparse_bf16_kv(q_out, kv_cache, attn_metadata)
 
         # V up-projection

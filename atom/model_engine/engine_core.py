@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import enum
 import logging
 import pickle
 import queue
@@ -14,6 +13,7 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
@@ -30,28 +30,6 @@ from atom.utils.distributed.utils import (
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 
 logger = logging.getLogger("atom")
-
-
-class EngineCoreRequestType(enum.Enum):
-    """
-    Request types defined as hex byte strings, so it can be sent over sockets
-    without separate encoding step.
-    """
-
-    ADD = b"\x00"
-    ABORT = b"\x01"
-    START_DP_WAVE = b"\x02"
-    UTILITY = b"\x03"
-    # Sentinel used within EngineCoreProc.
-    EXECUTOR_FAILED = b"\x04"
-    # Sentinel used within EngineCore.
-    SHUTDOWN = b"\x05"
-    # Stream output for callbacks
-    STREAM = b"\x06"
-    # Signal that EngineCore is fully initialized and ready
-    READY = b"\x07"
-    # Response to a synchronous utility command
-    UTILITY_RESPONSE = b"\x08"
 
 
 class EngineCore:
@@ -485,9 +463,14 @@ class DPEngineCoreProc(EngineCore):
                 PrefillDelayer(
                     dp_size=config.parallel_config.data_parallel_size,
                     cpu_group=self.dp_group,
-                    max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
-                    max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 )
             )
 
