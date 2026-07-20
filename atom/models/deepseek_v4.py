@@ -2393,9 +2393,11 @@ class DeepseekV4Attention(nn.Module):
                 # (trailing `window` tokens) — see the OPT note above. Pairs with
                 # SlidingWindowPool.ensure_for_tokens materializing all chunk
                 # blocks (free_before=0) so every dst block is valid here.
-                attn_md.max_seqlen_q
-                if _V4_SWA_FULL_RETAIN
-                else min(self.window_size, attn_md.max_seqlen_q),
+                (
+                    attn_md.max_seqlen_q
+                    if _V4_SWA_FULL_RETAIN
+                    else min(self.window_size, attn_md.max_seqlen_q)
+                ),
                 k_packed=qkn.k_packed,
                 k_rope=qkn.k_rope,
                 swa_region_rope=self.swa_kv_rope,
