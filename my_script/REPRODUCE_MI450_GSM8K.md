@@ -1,7 +1,7 @@
-# Reproduce Kimi-K3 gsm8k on MI455 (gfx1250 ×4, ATOM)
+# Reproduce Kimi-K3 gsm8k on MI450 (gfx1250 ×4, ATOM)
 
 End-to-end steps to reproduce the accuracy of Kimi-K3 (`Kimi-K3` /
-`Minimax-m3-xiaobing`) served by ATOM on **AMD MI455 (gfx1250)**, `-tp 4`.
+`Minimax-m3-xiaobing`) served by ATOM on **AMD MI450 (gfx1250)**, `-tp 4`.
 
 **Validated (5-shot, base completions, tp4, CUDA-graph decode):**
 - **serial (num_concurrent=1): flexible/strict ≈ 0.98** (100q) — on par with / above

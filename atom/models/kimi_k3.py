@@ -122,6 +122,10 @@ class SituAndMul(nn.Module):
         self.linear_beta = linear_beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if os.environ.get("ATOM_K3_FUSED", "1") == "1":
+            from atom.models.kimi_k3_fused import situ_and_mul
+
+            return situ_and_mul(x, self.beta, self.linear_beta)
         gate, up = x.chunk(2, dim=-1)
         gate_f = gate.float()
         up_f = up.float()
@@ -138,6 +142,10 @@ class KimiRMSNormGated(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        if os.environ.get("ATOM_K3_FUSED", "1") == "1":
+            from atom.models.kimi_k3_fused import rmsnorm_gated
+
+            return rmsnorm_gated(x, self.weight, gate, self.variance_epsilon)
         dtype = x.dtype
         x_f = x.float()
         var = x_f.pow(2).mean(dim=-1, keepdim=True)
@@ -949,6 +957,13 @@ def _apply_attn_res(
     proj: ReplicatedLinear,
     norm: RMSNorm,
 ) -> torch.Tensor:
+    eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
+    if os.environ.get("ATOM_K3_FUSED", "1") == "1":
+        from atom.models.kimi_k3_fused import apply_attn_res
+
+        return apply_attn_res(
+            prefix_sum, block_residual, proj.weight.squeeze(0), norm.weight, eps
+        )
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     values_f = values.float()
     var = values_f.pow(2).mean(-1, keepdim=True)
