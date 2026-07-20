@@ -36,11 +36,18 @@ class SlidingWindowPool:
         block_size: int,
         max_num_batched_tokens: int,
         mtp_k: int,
+        full_retain: bool = False,
     ):
         self.enabled: bool = num_blocks > 0
         self.window: int = window
         self.block_size: int = block_size
         self.max_num_batched_tokens: int = max_num_batched_tokens
+        # Full-retention mode (ATOM_SWA_FULL_RETAIN): write + materialize EVERY
+        # SWA block of a prefill chunk (not only the trailing window), so the
+        # content-addressed cache holds the full history for cross-request replay
+        # hits. The live sliding-window free stays on (bounds active refs); the
+        # larger pool keeps freed-but-cached blocks resident until reuse.
+        self.full_retain: bool = bool(full_retain)
         # Prefix-cache hit gate: a hit only needs the trailing window before the
         # boundary to be SWA-present (SWA is local). `tail_blocks` = contiguous
         # blocks covering win_with_spec = window + mtp_k (spec-decode tail tokens
@@ -100,6 +107,15 @@ class SlidingWindowPool:
         `seq.num_blocks` since SWA is filled incrementally + window-freed."""
         if not self.enabled:
             return 0
+        if self.full_retain:
+            # Full-retain materializes the whole current chunk (ensure_for_tokens
+            # free_before=0), so the peak concurrent footprint per prefill step is
+            # the chunk's block span (bounded by max_num_batched_tokens), NOT the
+            # trailing window. Freed after each chunk, so this is the per-step peak
+            # not the whole prompt. Capped by the prompt's block count.
+            bs = self.block_size
+            chunk_peak = (self.max_num_batched_tokens + bs - 1) // bs + 1
+            return min(chunk_peak, seq.num_blocks)
         cap = self.tail_blocks + 1
         return min(cap, seq.num_blocks)
 
@@ -194,7 +210,11 @@ class SlidingWindowPool:
         # matching free_out_of_window's sentinel. Cuts prefill SWA allocation
         # from O(chunk_len/bs) to O(window/bs) — pairs with the window-only
         # swa_write in deepseek_v4.py. free_before mirrors free_out_of_window.
-        free_before = max(0, (seq_len - self.window) // bs)
+        # Full-retain: materialize every block of this chunk (free_before=0) so
+        # the full-chunk swa_write below has a valid physical dst for every token,
+        # and every block gets published for cross-request reuse. Default:
+        # window-only (only the trailing-window blocks the SWA read touches).
+        free_before = 0 if self.full_retain else max(0, (seq_len - self.window) // bs)
         start_blk = max(start_blk, free_before)
         table = seq.swa_block_table
         for i in range(start_blk, end_blk + 1):

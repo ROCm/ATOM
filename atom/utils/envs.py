@@ -84,6 +84,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # DeepSeek-V4 paged-SWA: retain the FULL sliding-window KV history in the
+    # content-addressed SWA cache instead of the default window-only prefill
+    # write. Default OFF preserves the window-only optimization (writes only each
+    # prefill chunk's trailing `window` tokens). When ON, swa_write persists the
+    # whole chunk and ensure_for_tokens materializes every block, so cross-request
+    # prefix hits can reuse the middle SWA blocks (agentic branch/replay reuse) —
+    # the live sliding-window free is UNCHANGED (out-of-window refs still released
+    # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
+    # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
+    # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
+    "ATOM_SWA_FULL_RETAIN": lambda: (
+        os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
