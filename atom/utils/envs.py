@@ -95,6 +95,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
     # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
     "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
+    # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
+    # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
+    # the bytes of one compressed block, so a 1:1 mirror starves the compressed
+    # prefix index; a small fraction keeps compressed near full while retaining
+    # the hot-boundary tail working set (LRU-evicted). Only consulted when
+    # ATOM_SWA_FULL_RETAIN=1. Default 0.2; tune 0.15-0.25 with cache-hit
+    # instrumentation. Clamped to (0, 0.9).
+    "ATOM_SWA_TAIL_BUDGET_FRAC": lambda: float(
+        os.getenv("ATOM_SWA_TAIL_BUDGET_FRAC", "0.2")
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
