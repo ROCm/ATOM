@@ -334,14 +334,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
-    # --- PD Disaggregation ---
-    # Cap concurrent in-flight remote-KV loads on a decode (consumer) node.
-    # Requests beyond this limit stay in the waiting queue without allocating
-    # dst KV blocks, preventing HSA resource exhaustion under burst traffic.
-    # 0 = use max_num_seqs as cap (default).
-    "ATOM_PD_MAX_INFLIGHT_LOADS": lambda: int(
-        os.getenv("ATOM_PD_MAX_INFLIGHT_LOADS", "0")
-    ),
 }
 
 

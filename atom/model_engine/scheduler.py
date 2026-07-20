@@ -29,7 +29,6 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.utils import envs as _envs
 
 logger = logging.getLogger("atom")
 
@@ -475,8 +474,7 @@ class Scheduler:
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
 
-        _cap = _envs.ATOM_PD_MAX_INFLIGHT_LOADS
-        self._max_inflight_remote_loads: int = _cap if _cap > 0 else config.max_num_seqs
+        self._max_inflight_remote_loads: int = config.max_num_seqs
         self._num_parked_remote_kv: int = 0
 
         from atom.utils.forward_context import get_kvconnector
