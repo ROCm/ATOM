@@ -61,7 +61,7 @@ LLMEngine (user-facing API)
 
 A request flows through the system in ten steps:
 
-1. **`LLMEngine.add_request()` / `generate()`** — the user submits a list of prompts (strings or pre-tokenized token IDs) together with `SamplingParams`.
+1. **`LLMEngine.add_request()` / `generate()`** — you submit a list of prompts (strings or pre-tokenized token IDs) together with `SamplingParams`.
 
 2. **`InputOutputProcessor.preprocess()`** — each prompt is tokenized via the HuggingFace tokenizer. A `Sequence` object is created to track the request's state, timing, and block allocation. `arrive_time` is recorded.
 

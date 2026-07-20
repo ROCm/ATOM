@@ -123,7 +123,7 @@ def preempt(self, seq: Sequence):
     self.waiting.appendleft(seq)
 ```
 
-The preempted sequence is pushed to the front of the waiting queue and its blocks are fully deallocated, so it will be re-prefilled on the next scheduling cycle.
+The scheduler pushes the preempted sequence to the front of the waiting queue, fully deallocates its blocks, and re-prefills it on the next scheduling cycle.
 
 **MTP placeholder stripping:** When speculative decoding is active (`mtp_k > 0`), `postprocess()` appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is `mtp_k + seq.num_rejected` — this accounts for both the `mtp_k` placeholder slots and any tokens that were rejected during the last verification step. The method deletes that many trailing entries from both `seq.token_ids` and `seq.output_tokens` and decrements `seq.num_tokens` accordingly.
 

@@ -179,7 +179,7 @@ dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
 1. For each DP rank, it creates a `Config` copy with the appropriate `data_parallel_rank` and `data_parallel_rank_local`.
 2. Launches each `EngineCore` in a separate `multiprocessing.Process`.
 3. Uses ZMQ (ROUTER/DEALER) sockets for input distribution and ZMQ (PUSH/PULL) for output collection.
-4. Distributes incoming requests across DP ranks via a configurable load-balancing strategy (see below).
+4. Distributes incoming requests across DP ranks via a configurable load-balancing strategy (see [DP request load balancing](#dp-request-load-balancing)).
 5. Waits for READY signals from all ranks before accepting requests.
 
 When `enable_dp_attention` is set, `CoreManager` flattens TP into DP:

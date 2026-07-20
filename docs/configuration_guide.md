@@ -91,7 +91,7 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
-| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see below); set to `PIECEWISE` automatically at level 3 |
+| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `PIECEWISE` automatically at level 3 |
 | `splitting_ops` | `Optional[list[str]]` | `None` | Ops that split the graph into sub-graphs for piecewise compilation; auto-populated at level 3 with `["aiter.unified_attention_with_output", "aiter.mla_attention"]` |
 | `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; only effective in PIECEWISE mode |
 | `compile_sizes` | `Optional[list[Union[int, str]]]` | `None` | Sizes to compile for inductor; accepts integers and the string `"cudagraph_capture_sizes"` |
@@ -128,7 +128,7 @@ Defined in `atom/config.py` and `atom/quant_spec.py`. The quantization system us
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `quant_type` | `QuantType` | `QuantType.No` | Quantization granularity (see below) |
+| `quant_type` | `QuantType` | `QuantType.No` | Quantization granularity (see [`QuantType` values](#quanttype-values-from-aiter)) |
 | `quant_dtype` | `torch.dtype` | `torch.bfloat16` | Data type for quantized weights |
 | `is_dynamic` | `bool` | `True` | Use dynamic quantization (scales computed at runtime) |
 | `quant_method` | `str` | `""` | Quantization method (e.g., `"quark"`, `"compressed-tensors"`) |

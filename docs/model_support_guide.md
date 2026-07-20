@@ -156,7 +156,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 
 ## Weight loading
 
-Weight loading is handled by `load_model()` in `atom/model_loader/loader.py`.
+`load_model()` in `atom/model_loader/loader.py` handles weight loading.
 
 ### Function signature
 
@@ -172,7 +172,7 @@ def load_model(
 
 ### Loading flow
 
-1. **SafeTensors iteration:** `safetensors_weights_iterator()` discovers and iterates over all `*.safetensors` files in the model directory (or downloads them from HuggingFace Hub via `download_weights_from_hf()`). Duplicate files are filtered using the `model.safetensors.index.json` weight map. Memory-mapped loading is used by default; set `ATOM_DISABLE_MMAP=true` to disable.
+1. **SafeTensors iteration:** `safetensors_weights_iterator()` discovers and iterates over all `*.safetensors` files in the model directory (or downloads them from HuggingFace Hub via `download_weights_from_hf()`). Duplicate files are filtered using the `model.safetensors.index.json` weight map. ATOM uses memory-mapped loading by default; set `ATOM_DISABLE_MMAP=true` to disable.
 
 2. **Weight name rewriting:** Each weight name goes through several transformations:
    - `weight_scale_inv` is renamed to `weight_scale`.
