@@ -24,7 +24,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
-from atom.utils.cuda_graph import BatchDescriptor
+from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -43,8 +43,18 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.kv_transfer.disaggregation import KVConnectorOutput
-from atom.utils.forward_context import get_kvconnector
+from atom.utils.cuda_graph import BatchDescriptor
+from atom.utils.forward_context import (
+    Context,
+    DPMetadata,
+    ForwardMode,
+    get_forward_context,
+    get_kvconnector,
+    reset_forward_context,
+    set_forward_context,
+    set_kv_cache_data,
+)
+from atom.utils.selector import get_attn_backend
 from atom.utils.tbo import (
     UBatchSlice,
     UBatchWrapper,
@@ -58,16 +68,6 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_split,
 )
-from atom.utils.forward_context import (
-    Context,
-    DPMetadata,
-    ForwardMode,
-    get_forward_context,
-    reset_forward_context,
-    set_forward_context,
-    set_kv_cache_data,
-)
-from atom.utils.selector import get_attn_backend
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -834,9 +834,7 @@ class ModelRunner:
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
         if self.attn_metadata_builder.compute_per_req_cache_bytes() > 0:
-            from atom.model_engine.llm_engine import (
-                InputOutputProcessor as _IOProc,
-            )
+            from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
             known = _IOProc._per_req_cache_model_types()  # noqa: SLF001
@@ -1569,24 +1567,17 @@ class ModelRunner:
         free, total = torch.cuda.mem_get_info()
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-
-        # Peak PyTorch usage (high watermark during warmup) — this is memory
-        # consumed by THIS process only (model weights + peak activations).
+        # weights + peak activation tensors (PyTorch allocator high-water).
         peak_torch = max(peak, current)
+        # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
+        # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
+        non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
 
-        # CUDA graph capture overhead estimate
         cudagraph_overhead = self._estimate_cudagraph_overhead()
-
-        # Safety margin (2% of total)
         safety_margin = int(total * 0.02)
 
-        # Budget: this server may use up to gpu_memory_utilization * total.
-        # Subtract our own PyTorch usage + CUDA graph estimate + safety.
-        # This is independent of other processes on the GPU.
         budget = int(total * config.gpu_memory_utilization)
-        # Fixed (utilization-independent) overhead of this process: model
-        # weights + peak activations + CUDA graph capture + safety margin.
-        non_kv_overhead = peak_torch + cudagraph_overhead + safety_margin
+        non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
         available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
@@ -1714,6 +1705,7 @@ class ModelRunner:
             f"utilization={config.gpu_memory_utilization}, "
             f"budget={budget / (1 << 30):.2f}GB, "
             f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
@@ -1769,6 +1761,7 @@ class ModelRunner:
             f"but available_for_kv={available_for_kv / (1 << 20):.2f}MB "
             f"(budget={budget / (1 << 30):.2f}GB, "
             f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
