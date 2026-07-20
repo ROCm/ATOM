@@ -1447,16 +1447,30 @@ class ModelRunner:
         b = self.attn_metadata_builder
         swa_block_bytes = b.swa_pool_block_bytes()
         if swa_block_bytes > 0:
-            num_swa_blocks = b.swa_pool_num_blocks(
-                config.max_num_seqs, config.max_model_len
-            )
-            swa_reserved = num_swa_blocks * swa_block_bytes
             # block_bytes (from _compute_block_bytes) currently includes the SWA
             # term; strip it so the compressed pool is sized on compressed bytes.
             compressed_block_bytes = block_bytes - swa_block_bytes
-            num_kvcache_blocks = max(
-                0, (available_for_pool - swa_reserved) // compressed_block_bytes
-            )
+            if envs.ATOM_SWA_FULL_RETAIN:
+                # Full-retain: the SWA cache mirrors the compressed cache one-for-
+                # one (every compressed block has a paired SWA block used in
+                # lockstep), so size BOTH pools equally from the shared budget by
+                # the combined per-block bytes. This is memory-bounded like vLLM's
+                # unified block pool — NOT max_num_seqs * ceil(max_model_len/bs),
+                # which explodes to ~TB at DSV4's 1M max_position_embeddings.
+                # Live SWA footprint stays ~window/seq (window-free is kept); the
+                # extra blocks hold lazily-freed-but-cached tails for cross-request
+                # replay reuse, capacity == the compressed prefix cache.
+                num_kvcache_blocks = available_for_pool // block_bytes
+                num_swa_blocks = num_kvcache_blocks
+                swa_reserved = num_swa_blocks * swa_block_bytes
+            else:
+                num_swa_blocks = b.swa_pool_num_blocks(
+                    config.max_num_seqs, config.max_model_len
+                )
+                swa_reserved = num_swa_blocks * swa_block_bytes
+                num_kvcache_blocks = max(
+                    0, (available_for_pool - swa_reserved) // compressed_block_bytes
+                )
             config.num_swa_blocks = int(num_swa_blocks)
             config.swa_window_size = int(
                 getattr(hf_config, "sliding_window", 128) or 128
