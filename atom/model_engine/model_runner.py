@@ -1976,6 +1976,10 @@ class ModelRunner:
             tbo_collective_active,
             ub_max_tokens_across_dp,
         ) = self._preprocess(batch, num_scheduled_tokens=num_scheduled_tokens)
+
+        if not tbo_collective_active:
+            self._pcp_tbo_balanced_active = False
+
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
 
         forward_mode = ForwardMode.decide(
