@@ -1946,6 +1946,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 block_tables_gpu=ub_block_tables_gpu,
             )
         finally:
+            # Helpers above launch async H2D from the shared pinned forward_vars
+            # buffers we overwrote (context_lens/block_tables). Drain before the
+            # restore (and next ubatch) clobbers those sources mid-copy -> OOB
+            # index bounds. Replaces the .item() syncs the host-scalar path removed.
+            torch.cuda.current_stream().synchronize()
             bt[:ub_num_reqs] = saved_bt
             var["context_lens"].np[:ub_num_reqs] = saved_ctx
 
@@ -2501,7 +2506,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         hca_total = int(hca_indptr_np[T])
 
         # ----- H2D: 4 indptrs + 2 per-seq scalars -----
-        # All non-blocking; bounded by `total ≤ T*max_per_tok`.
+        # All non-blocking; sources are per-call temp np arrays, so not a
+        # cross-ubatch race source (the shared-pinned-buffer race is handled by
+        # the stream sync before build_ubatch_prefill_metadata's finally).
         chunk_start_per_seq_gpu = torch.from_numpy(chunk_start_per_seq_np).to(
             device, non_blocking=True
         )
