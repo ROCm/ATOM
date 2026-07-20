@@ -472,6 +472,13 @@ class Scheduler:
         # of `schedule()` can skip the running-queue scan entirely on
         # pure-decode steps (the common case).
         self._partial_prefill_count: int = 0
+        self._schedule_tick: int = 0
+
+        from atom.utils import envs as _envs
+
+        _cap = _envs.ATOM_PD_MAX_INFLIGHT_LOADS
+        self._max_inflight_remote_loads: int = _cap if _cap > 0 else config.max_num_seqs
+        self._num_parked_remote_kv: int = 0
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -803,6 +810,7 @@ class Scheduler:
         Tries prefill first; if no new prefills are ready, falls back to
         decoding already-running sequences.
         """
+        self._schedule_tick += 1
         scheduled_seqs = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
@@ -884,6 +892,7 @@ class Scheduler:
             # promotion below, which would overwrite ABORTED with RUNNING and
             # lose the abort intent.
             if seq.status == SequenceStatus.ABORTED:
+                self._uncount_inflight_load(seq)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = "aborted"
                 self._rejected.append(seq)
@@ -904,6 +913,21 @@ class Scheduler:
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 self._rejected.append(seq)
                 continue
+
+            # Concurrency cap: keep resident sequences at or below max_num_seqs.
+            # Both fresh prefills (_schedule_prefill_seq) and PD consumers
+            # promoted to first-decode (_schedule_first_decode_after_remote_kv)
+            # append to self.running immediately, so len(self.running) already
+            # reflects every seq admitted earlier this tick as well as those
+            # carried over from prior ticks. The pre-existing per-step gate
+            # (num_seqs_prefill < max_num_seqs) only bounds admissions within a
+            # single tick, so without this check running grows unbounded across
+            # ticks — most visibly for a PD decode consumer whose short prompt
+            # passes the admission-time KV check, which then thrashes (preempt ->
+            # full recompute) once decode growth exhausts KV.
+            if len(self.running) >= self.max_num_seqs:
+                self.waiting.appendleft(seq)
+                break
 
             remote_ready_for_decode = self._resolve_waiting_remote_kv(
                 seq, skipped_waiting_requests
@@ -945,6 +969,13 @@ class Scheduler:
                 )
                 continue
 
+            if (
+                needs_remote_load
+                and self._num_parked_remote_kv >= self._max_inflight_remote_loads
+            ):
+                self.waiting.appendleft(seq)
+                break
+
             # Probe cache hits FIRST so budget check sees the real
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
@@ -975,15 +1006,6 @@ class Scheduler:
                 break
             self.block_manager.allocate(seq, num_cached_blocks)
 
-            # Snapshot the genuine prefix-cache hit at admission. After this,
-            # num_cached_tokens is repurposed to track chunked-prefill progress
-            # (it grows to the full prompt length in postprocess), so it can't be
-            # used to report the cache hit. Set once per seq (Phase-2 admission
-            # only); Phase-1 resume doesn't recompute num_cached_blocks.
-            seq.prefix_cache_hit_tokens = (
-                num_cached_blocks * self.block_manager.block_size
-            )
-
             self._notify_connector_after_prefill_alloc(seq)
 
             needs_remote_load = self._confirm_remote_load_after_alloc(
@@ -999,6 +1021,17 @@ class Scheduler:
                 self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
+
+            # Snapshot the genuine prefix-cache hit at admission. After this,
+            # num_cached_tokens is repurposed to track chunked-prefill progress
+            # (it grows to the full prompt length in postprocess), so it can't be
+            # used to report the cache hit. Set once per seq (Phase-2 admission
+            # only); Phase-1 resume doesn't recompute num_cached_blocks. Skipped
+            # for a PD decode consumer, which parks above and keeps the producer's
+            # hit count inherited via kv_transfer_params.
+            seq.prefix_cache_hit_tokens = (
+                num_cached_blocks * self.block_manager.block_size
+            )
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
 
@@ -1018,6 +1051,17 @@ class Scheduler:
                 len(skipped_waiting_requests),
             )
             self.waiting.extend(skipped_waiting_requests)
+
+        if self._num_parked_remote_kv > 0 and self._schedule_tick % 100 == 0:
+            logger.info(
+                "PD backpressure: parked=%d/%d, waiting=%d, running=%d, "
+                "kv_usage=%.2f",
+                self._num_parked_remote_kv,
+                self._max_inflight_remote_loads,
+                len(self.waiting),
+                len(self.running),
+                self._kv_usage(),
+            )
 
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
@@ -1188,6 +1232,7 @@ class Scheduler:
         if self._connector_flag("is_offload"):
             self._mark_offload_load_ready(seq)
             return False
+        self._uncount_inflight_load(seq)
         return True
 
     def _consume_failed_remote_kv(self, seq: Sequence) -> bool:
@@ -1197,6 +1242,7 @@ class Scheduler:
         if self.kv_connector is not None and hasattr(self.kv_connector, "load_failed"):
             self.kv_connector.load_failed(seq.id)
         seq.status = SequenceStatus.WAITING
+        self._uncount_inflight_load(seq)
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_failed = True
@@ -1325,6 +1371,13 @@ class Scheduler:
     ) -> None:
         skipped_waiting_requests.append(seq)
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        self._num_parked_remote_kv += 1
+        seq._counted_as_inflight_load = True
+
+    def _uncount_inflight_load(self, seq: Sequence) -> None:
+        if getattr(seq, "_counted_as_inflight_load", False):
+            self._num_parked_remote_kv -= 1
+            seq._counted_as_inflight_load = False
 
     def _adjust_prefill_chunk_after_alloc(self, seq: Sequence, chunk: int) -> int:
         if self.kv_connector is not None and hasattr(

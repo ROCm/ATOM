@@ -91,6 +91,41 @@ class TestSchedule:
         batch, _ = sched.schedule()
         assert batch.total_seqs_num_prefill == 2
 
+    def test_remote_kv_decode_promotion_respects_max_num_seqs(self, seq_factory):
+        """A PD consumer ready for first-decode must NOT be promoted into a full
+        running queue — the bug that let decode-side running climb to 2x
+        max_num_seqs and thrash (preempt -> full recompute) at KV exhaustion."""
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2, max_num_batched_tokens=1000, num_kvcache_blocks=100
+            )
+        )
+        # Fill running to the cap with two decode seqs.
+        r0, r1 = seq_factory([1, 2, 3, 4]), seq_factory([5, 6, 7, 8])
+        for r in (r0, r1):
+            r.status = SequenceStatus.RUNNING
+            r.type = SequenceType.DECODE
+        sched.running = deque([r0, r1])
+        # A consumer whose remote KV has arrived and is ready for first decode.
+        consumer = seq_factory([9, 10, 11, 12])
+        consumer.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.waiting = deque([consumer])
+
+        promoted = []
+        with (
+            mock.patch.object(sched, "_resolve_waiting_remote_kv", return_value=True),
+            mock.patch.object(
+                sched,
+                "_schedule_first_decode_after_remote_kv",
+                side_effect=lambda s: promoted.append(s),
+            ),
+        ):
+            sched.schedule()
+
+        assert promoted == []  # capped out, not promoted
+        assert consumer in sched.waiting  # requeued for a later tick
+        assert len(sched.running) <= sched.max_num_seqs
+
     def test_prefill_respects_max_batched_tokens(self, seq_factory):
         sched = Scheduler(
             MockConfig(
