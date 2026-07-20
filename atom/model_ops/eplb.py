@@ -1471,10 +1471,17 @@ class ExpertLoadMonitor:
                 tuple(topk_physical.shape),
             )
 
-    def on_forward_end(self, is_dummy_run: bool) -> None:
+    def on_forward_end(self, is_dummy_run: bool, is_pure_prefill: bool = True) -> None:
+        # Non-pure-prefill forwards (decode, DP-mixed) are treated like dummy
+        # runs: on_forward_pass_end still advances the rebalance step to keep all
+        # ranks lockstep, but their load is NOT committed to the window -- EPLB
+        # balances on prefill load only. Committing is a purely local op, so
+        # skipping it per-rank never desyncs the (step-driven, collective)
+        # rebalance.
         if (
             not self.enabled
             or is_dummy_run
+            or not is_pure_prefill
             or self._cur_pass_count is None
             or self._expert_load_window is None
         ):
@@ -2316,7 +2323,15 @@ def with_eplb_forward_monitor(fn):
             return fn(self, batch, *args, **kwargs)
         finally:
             is_dummy_run = getattr(batch, "is_dummy_run", False)
-            monitor.on_forward_end(is_dummy_run)
+            # Pure-prefill = has prefill tokens and no decode tokens (batches are
+            # not mixed today; the decode==0 check also future-proofs the TODO
+            # mixed batch). Local per-rank signal -- no DP sync needed, since only
+            # the (non-collective) window commit is gated; the step still advances.
+            is_pure_prefill = (
+                getattr(batch, "total_tokens_num_prefill", 0) > 0
+                and getattr(batch, "total_tokens_num_decode", 0) == 0
+            )
+            monitor.on_forward_end(is_dummy_run, is_pure_prefill)
             manager.on_forward_pass_end(is_dummy_run)
 
     return wrapper
