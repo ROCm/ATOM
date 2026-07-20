@@ -1,0 +1,33 @@
+{
+  "name": "http_regular_completion",
+  "model": "hf-internal-testing/llama-tokenizer",
+  "endpoint": "/v1/completions",
+  "route": {
+    "worker_kind": "regular",
+    "connection_mode": "http"
+  },
+  "request": {
+    "prompt": "Once upon a time",
+    "max_tokens": 16,
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "body": {
+      "id": "cmpl-test",
+      "object": "text_completion",
+      "model": "hf-internal-testing/llama-tokenizer",
+      "choices": [
+        {
+          "index": 0,
+          "text": "there was a virtual worker.",
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  },
+  "simulation": {
+    "ttft_ms": 0,
+    "chunk_interval_ms": 0
+  }
+}

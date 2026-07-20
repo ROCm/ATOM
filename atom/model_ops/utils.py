@@ -7,7 +7,7 @@ from functools import cache
 from typing import List, Optional, Tuple, Union
 
 import torch
-from aiter import QuantType, per_tensor_quant
+from aiter import QuantType, dtypes, per_tensor_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
@@ -42,11 +42,6 @@ def _has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
 
-def has_triton_kernels() -> bool:
-    """Whether the optional `triton_kernels` package is available."""
-    return _has_module("triton_kernels")
-
-
 MXFP4_QUANT_BLOCK_SIZE = 32
 
 
@@ -63,6 +58,17 @@ def normalize_e4m3fn_to_e4m3fnuz(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def _double_scale(scale: torch.Tensor) -> torch.Tensor:
+        if scale.dtype == dtypes.fp8_e8m0:
+            scale_u8 = scale.view(torch.uint8)
+            doubled = torch.where(
+                (scale_u8 == 0) | (scale_u8 == 0xFF),
+                scale_u8,
+                torch.clamp(scale_u8.to(torch.int16) + 1, max=0xFE).to(torch.uint8),
+            )
+            return doubled.view(dtypes.fp8_e8m0)
+        return scale * 2.0
+
     # assert weight.dtype == torch.float8_e4m3fn
     # The bits pattern 10000000(-128) represents zero in e4m3fn
     # but NaN in e4m3fnuz. So here we set it to 0.
@@ -76,9 +82,9 @@ def normalize_e4m3fn_to_e4m3fnuz(
     # the e4m3fn value, so we should double the scaling factor to
     # get the same dequantized value.
     # https://onnx.ai/onnx/technical/float8.html
-    weight_scale = weight_scale * 2.0
+    weight_scale = _double_scale(weight_scale)
     if input_scale is not None:
-        input_scale = input_scale * 2.0
+        input_scale = _double_scale(input_scale)
     return weight, weight_scale, input_scale
 
 
@@ -112,7 +118,11 @@ def requantize_with_max_scale(
         start = 0
         for idx, logical_width in enumerate(logical_widths):
             end = start + logical_width
-            weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
+            if weight_scale.ndim > 0 and weight_scale.shape[0] == weight.shape[0]:
+                shard_scale = weight_scale[start:end, :]
+            else:
+                shard_scale = weight_scale[idx]
+            weight_dq = per_tensor_dequantize(weight[start:end, :], shard_scale)
             weight.view(quant_dtype)[start:end, :], _ = per_tensor_quant(
                 weight_dq, max_w_scale, quant_dtype=quant_dtype
             )

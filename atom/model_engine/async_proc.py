@@ -32,8 +32,10 @@ from atom.utils import (
     init_exit_handler,
     make_zmq_socket,
     resolve_obj_by_qualname,
+    set_process_title,
     shutdown_all_processes,
 )
+from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
 
@@ -66,10 +68,46 @@ class AsyncIOProc:
         runner_qualname: str,
         rank: int,
         kv_output_addr: str | None = None,
+        all_ranks_barrier=None,
         *args,
         **kwargs,
     ):
+        # Bind this worker's lifetime to its parent EngineCore: if the parent
+        # exits for any reason, have the kernel reap this process immediately
+        # instead of leaving it orphaned. A ModelRunner worker holds a large GPU
+        # allocation and the custom all-reduce IPC resources; an orphan blocks
+        # forever in busy_loop() on the shm dequeue while keeping those pinned,
+        # causing the stale-IPC all-reduce crash on the next restart. Must be
+        # armed here, before any GPU / IPC state is created.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
+
+        # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
+        # Auto-detects the GPU's local node by default; gated by
+        # ATOM_NUMA_BIND. Must run before any large allocation / native
+        # (mooncake) thread spawn so the mask is inherited by child threads and
+        # first-touch lands memory locally. The global GPU index is
+        # dp_rank*tp_size+tp_rank (engine_core_mgr GPU assignment).
+        try:
+            cfg = args[0]
+            gpu = (
+                cfg.parallel_config.data_parallel_rank * cfg.tensor_parallel_size + rank
+            )
+            numa_bind_to_node(gpu, label)
+        except Exception as e:
+            logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
+        # Set process title so this GPU worker is distinguishable by rank in
+        # ps/top/rocm-smi (otherwise all workers show as "python").
+        try:
+            cfg = args[0]
+            if cfg.parallel_config.data_parallel_size > 1:
+                set_process_title(f"DP{cfg.parallel_config.data_parallel_rank}TP{rank}")
+            else:
+                set_process_title(f"TP{rank}")
+        except Exception:
+            set_process_title(f"TP{rank}")
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads: list[threading.Thread] = []
@@ -106,6 +144,8 @@ class AsyncIOProc:
             )
             t.start()
             self.io_threads.append(t)
+
+        self.all_ranks_barrier = all_ranks_barrier
 
         runner_class = resolve_obj_by_qualname(runner_qualname)
         self.runners: list[object] = []
@@ -162,15 +202,22 @@ class AsyncIOProc:
                 serialized_obj = pickle.dumps(result)
                 socket.send(serialized_obj)
 
+    # Functions that require all TP ranks to synchronize via barrier before
+    # rank 0 returns, so the caller can safely reuse/overwrite shared buffers.
+    _BARRIER_FUNCS = {"update_weights_from_ipc", "update_weights_from_shm"}
+
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
             func_name, args = self.get_func()
+            need_barrier = func_name in self._BARRIER_FUNCS
             for runner in self.runners:
                 func = getattr(runner, func_name, None)
                 if func is None:
                     continue
                 out = func(*args)
+                if need_barrier and self.all_ranks_barrier is not None:
+                    self.all_ranks_barrier.wait()
                 if out is not None:
                     if (
                         self.io_addrs[1] is not None
@@ -179,7 +226,6 @@ class AsyncIOProc:
                         self.io_queues[1].put_nowait(out)
                     if self.kv_queue is not None and func_name in self._KV_FUNC_NAMES:
                         self.kv_queue.put_nowait(out)
-
             if func_name == "exit":
                 break
         logger.debug(f"{self.label}: exit busy_loop...")
@@ -227,6 +273,7 @@ class AsyncIOProcManager:
         import atexit
 
         atexit.register(self._cleanup_shared_memory)
+        self.all_ranks_barrier = ctx.Barrier(proc_num)
         init_exit_handler(self)
 
         # KV output aggregation infrastructure
@@ -252,6 +299,7 @@ class AsyncIOProcManager:
                     runner,
                     i,
                     self.kv_output_addrs[i],
+                    self.all_ranks_barrier,
                     *args,
                 ),
             )

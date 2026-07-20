@@ -13,8 +13,18 @@
 
 ## 📢 News
 
+- **[2026/06]** ATOM now supports **MiniMax-M3** inference on the native OpenAI-compatible server path, including MXFP4/MXFP8 checkpoints, FP8 KV cache, and EAGLE3 speculative decoding. See [MiniMax-M3 recipe](recipes/MiniMax-M3.md).
+- **[2026/06] Featured ROCm Blog:** [DP Attention and TBO for DeepSeek-V4 on MI355X](https://rocm.blogs.amd.com/software-tools-optimization/atom-optimiztion/README.html) highlights how ATOM optimizes DeepSeek-V4 inference on AMD Instinct MI355X GPUs with DP Attention using all-gather/reduce-scatter and Two-Batch Overlap, achieving strongly competitive DeepSeek-V4 inference performance.
+- **[2026/06] Featured ROCm Blog:** [ATOMesh: Unlocking AMD Hardware for Scalable LLM Serving](https://rocm.blogs.amd.com/software-tools-optimization/atomesh-inference/README.html) explains how ATOMesh orchestrates distributed inference on AMD GPUs with ATOM, AITER, MORI, and RCCL.
+- **[2026/06] Featured ROCm Blog:** [ATOM: Unlocking Extreme AMD Instinct Inference with Software-Hardware Co-Optimization](https://rocm.blogs.amd.com/software-tools-optimization/atom-inference-engine/README.html) covers ATOM architecture, feature scope, model coverage, and benchmark dashboard usage.
+- **[2026/06]** Experimental **Navi 4 (RDNA4 / gfx1201)** support — AMD Radeon RX 9070 / RX 9070 XT and Radeon AI PRO R9700. See the [Qwen3-8B-FP8](recipes/Qwen3-8B-FP8.md) and [Ministral-3-8B](recipes/Ministral-3-8B.md) recipes.
+- **[2026/06]** ATOM now supports **GLM-5.2** (`glm_moe_dsa`) in FP8, including the new **IndexShare** DSA schedule (shared layers reuse the preceding full layer's indexer). See [GLM-5.2 recipe](recipes/GLM-5.md#glm-52-indexshare).
+- **[2026/05] Featured ROCm Blog:** [vLLM-ATOM: Unlocking Native AMD Performance in the vLLM Ecosystem](https://rocm.blogs.amd.com/software-tools-optimization/vllm-atom/README.html) shows how ATOM integrates with vLLM as an AMD-optimized plugin path.
+- **[2026/05]** ATOM now supports **Qwen3.5 multimodal image+text inference** on the native engine and OpenAI-compatible chat API. See [Qwen3.5 multimodal recipe](recipes/Qwen3.5_multimodel.md).
+- **[2026/05]** ATOM now supports **online quantization** — re-quantize unquantized or FP8-block source checkpoints to PTPC-FP8 / MXFP4 mixed precision at load time via `--online_quant_config`, no offline re-packing required. See [online quantization guide](docs/online_quantization_guide.md).
 - **[2026/05]** [Dissecting DeepSeek V4 Compressor](https://rocm.github.io/ATOM/dissecting_dsv4_compressor) — interactive animation visualizing how the CSA/HCA compressor state cache works (overlap mechanism, prefill vs decode, bulk compression vs sequential accumulation).
-- **[2026/05]** ATOM now supports **Prefill/Decode (P/D) disaggregation** with [Mooncake](https://github.com/kvcache-ai/Mooncake) RDMA push-mode KV cache transfer. See [PD disaggregation guide](docs/pd_disaggregation_guide.md).
+- **[2026/05]** **DeepSeek V4-Pro PD disaggregation** — Prefill/Decode separation now supports DeepSeek V4-Pro with Mooncake RDMA KV cache transfer. See [V4 recipe](recipes/DeepSeek-V4.md#pd-disaggregation-with-mooncake-prefill-decode-separation) and [PD guide](recipes/pd_disaggregation_guide.md).
+- **[2026/05]** ATOM now supports **Prefill/Decode (P/D) disaggregation** with [Mooncake](https://github.com/kvcache-ai/Mooncake) RDMA push-mode KV cache transfer. See [PD disaggregation guide](recipes/pd_disaggregation_guide.md).
 - **[2026/03]** ATOM now supports **Prefill/Decode (P/D) disaggregation** — run prefill and decode on separate GPU nodes with RDMA-based KV cache transfer via [MORI-IO](https://github.com/ROCm/mori). See [disaggregation docs](atom/kv_transfer/disaggregation/README.md).
 
 ## 🚀 Features
@@ -39,10 +49,10 @@
 | [DeepSeek V2/V3](https://huggingface.co/deepseek-ai) | `DeepseekV3ForCausalLM` | MoE | MLA attention, MTP speculative decoding |
 | [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1) | `MixtralForCausalLM` | MoE | 8 experts, top-2 routing |
 | [GLM-4-MoE](https://huggingface.co/THUDM) | `Glm4MoeForCausalLM` | MoE | |
-| [GLM-5](https://huggingface.co/zai-org/GLM-5-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA attention, similar to DeepSeek V3.2. See [recipe](recipes/GLM-5.md) |
+| [GLM-5 / GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA + DSA sparse attention, similar to DeepSeek V3.2; GLM-5.2 adds IndexShare. See [recipe](recipes/GLM-5.md) |
 | [GPT-OSS](https://huggingface.co/openai) | `GptOssForCausalLM` | MoE | Sliding window + attention sinks |
 | [Kimi-K2](https://huggingface.co/moonshotai/Kimi-K2-Thinking) | via `--trust-remote-code` | MoE | See [recipe](recipes/Kimi-K2-Thinking.md) |
-| [MiMo-V2-Flash](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash) | `MiMoV2FlashForCausalLM` | MoE | Hybrid full + SWA attention, 3-layer MTP. See [recipe](recipes/MiMo-V2-Flash.md) |
+| [MiMo V2/V2.5](https://huggingface.co/XiaomiMiMo) | `MiMoV2ForCausalLM` | MoE | Hybrid full + SWA attention, 3-layer MTP. See [recipe](recipes/MiMo-V2.md) |
 
 ## 📋 Requirements
 
@@ -116,7 +126,7 @@ hf auth login
 The default optimization level is 3 (piecewise torch.compile with CUDA graphs).
 
 ```bash
-python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --kv_cache_dtype fp8
+python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --kv-cache-dtype fp8
 ```
 
 > **Note:** First-time execution may take approximately 10 minutes for model compilation.
@@ -127,13 +137,13 @@ Start an OpenAI-compatible server:
 
 ```bash
 # Single GPU
-python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --kv_cache_dtype fp8
+python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --kv-cache-dtype fp8
 
 # Multi-GPU with tensor parallelism
-python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8
+python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv-cache-dtype fp8 -tp 8
 
 # With MTP speculative decoding
-python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8 \
+python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv-cache-dtype fp8 -tp 8 \
   --method mtp --num-speculative-tokens 3
 ```
 
@@ -181,7 +191,7 @@ Launch the server with `--torch-profiler-dir` and `--mark-trace`:
 
 ```bash
 python -m atom.entrypoints.openai_server \
-  --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8 \
+  --model deepseek-ai/DeepSeek-R1 --kv-cache-dtype fp8 -tp 8 \
   --torch-profiler-dir ./trace --mark-trace
 ```
 
@@ -255,6 +265,7 @@ lm_eval --model local-completions \
 - [GLM-5](recipes/GLM-5.md) — FP8 MoE with MLA on 8 GPUs
 - [GPT-OSS-120B](recipes/GPT-OSS.md) — Single GPU or DP+EP on 2 GPUs
 - [TBO (Two-Batch Overlap)](recipes/TBO.md) — Compute-communication overlap for MoE models with DP attention
+- [PD Disaggregation (Mooncake)](recipes/pd_disaggregation_guide.md) — Prefill/Decode separation with RDMA KV cache transfer (DeepSeek-R1, DeepSeek-V4-Pro)
 
 **Framework Integration:**
 

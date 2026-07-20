@@ -10,15 +10,19 @@
 import warnings
 
 import torch
+import triton
 from einops import rearrange
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
+from .fused_cumsum_kkt import fused_cumsum_kkt
+from .fused_merge_recompute import fused_merge_recompute
+from .index import prepare_chunk_indices
 from .l2norm import l2norm_fwd
-from .solve_tril import solve_tril
-from .utils import SUPPRESS_LEVEL, input_guard
+from .solve_tril import solve_tril, solve_tril_16x16_kernel
+from .utils import SUPPRESS_LEVEL, input_guard, is_amd
 from .wy_fast import recompute_w_u_fwd
 
 
@@ -32,21 +36,51 @@ def chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
+    o: torch.Tensor | None = None,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
-    )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-    )
+    B, T = q.shape[0], q.shape[1]
+    Hv = g.shape[2]
+
+    if is_amd and T >= 64:
+        # OP-B: HIP fast path. 3 fused kernels replace 4-step:
+        # chunk_local_cumsum + chunk_scaled_dot_kkt → fused_cumsum_kkt
+        # solve_tril(BT=64) (full inverse) → solve_tril_16x16 (diag only)
+        # recompute_w_u_fwd → fused_merge_recompute (cross-block inverse + w/u in SMEM)
+        g, A = fused_cumsum_kkt(g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens)
+        chunk_indices_16 = (
+            prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
+        )
+        NT_16 = len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
+        Ai16 = torch.empty(B, T, Hv, 16, device=A.device, dtype=torch.float32)
+        solve_tril_16x16_kernel[(NT_16, B * Hv)](
+            A=A,
+            Ai=Ai16,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_16,
+            T=T,
+            H=Hv,
+            BT=64,
+            USE_TMA=False,
+            DOT_PRECISION="ieee",
+        )
+        w, u = fused_merge_recompute(
+            k, v, beta, g, A, Ai16, chunk_size=64, cu_seqlens=cu_seqlens
+        )
+    else:
+        g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+        # obtain WY representation. u is actually the new v.
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+        )
+        A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+        )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -64,6 +98,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        o=o,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
@@ -87,11 +122,15 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        o: torch.Tensor | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
+        # NOTE: input_guard calls .contiguous() on every Tensor arg including
+        # o. The public chunk_gated_delta_rule entry point pre-asserts o is
+        # contiguous before .apply() so this can't silently clone.
         g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -102,10 +141,15 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            o=o,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        return o.to(q.dtype), final_state
+        # Skip the dtype cast when it's a no-op so the caller's buffer is
+        # the literal returned tensor (preserves the inplace contract).
+        if o.dtype != q.dtype:
+            o = o.to(q.dtype)
+        return o, final_state
 
 
 @torch.compiler.disable
@@ -121,6 +165,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    o: torch.Tensor | None = None,
 ):
     r"""
     Args:
@@ -193,6 +238,17 @@ def chunk_gated_delta_rule(
         len(beta.shape) == 3
     ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
+    if o is not None and head_first:
+        # head_first=True + o= would route the kernel output through a
+        # rearrange("b t h ... -> b h t ...") below, producing a
+        # non-contiguous view of the caller's storage and silently
+        # breaking the inplace contract. Reject up front BEFORE the
+        # existing head_first DeprecationWarning so callers see the more
+        # specific error.
+        raise NotImplementedError(
+            "chunk_gated_delta_rule(o=...) does not support head_first=True"
+        )
+
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
@@ -223,6 +279,23 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if o is not None:
+        # Pre-check contiguity HERE — input_guard inside
+        # ChunkGatedDeltaRuleFunction.forward will call .contiguous() on
+        # every Tensor arg including o, silently cloning a non-contiguous
+        # caller buffer and writing the kernel output into the clone
+        # instead of the caller's storage. Asserting before .apply() is
+        # the only place where we can catch that loudly.
+        assert o.shape == v.shape, (
+            f"chunk_gated_delta_rule: o.shape {tuple(o.shape)} != v.shape "
+            f"{tuple(v.shape)}"
+        )
+        assert (
+            o.dtype == v.dtype
+        ), f"chunk_gated_delta_rule: o.dtype {o.dtype} != v.dtype {v.dtype}"
+        assert (
+            o.is_contiguous()
+        ), "chunk_gated_delta_rule: caller-provided o must be contiguous"
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -234,6 +307,7 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        o,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

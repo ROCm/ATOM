@@ -3,16 +3,19 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
 
+if TYPE_CHECKING:
+    from atom.kv_transfer.disaggregation.types import KVTransferTensors
+
+import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
-from atom.utils.forward_context import AttentionMetaData
+from atom.utils.forward_context import AttentionMetaData, AttnState
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -135,6 +138,19 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return {}
 
+    def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
+        """Return RDMA transfer regions for PD disaggregation.
+
+        Each attention backend overrides this to describe its block-indexed
+        and slot-indexed tensor regions.  The KV connector uses the result
+        to register RDMA memory and compute transfer offsets without knowing
+        the backend's internal layout.
+
+        Returns ``None`` when KV transfer is not configured or tensors have
+        not been allocated yet.
+        """
+        return None
+
     def compute_block_bytes(self) -> int:
         """Per-block bytes contributed by this attention type's primary KV
         tensors (kv_cache + kv_scale + any side caches like the V3.2
@@ -149,6 +165,28 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
         Default returns 0 (no primary KV pool).
         """
+        return 0
+
+    # ------------------------------------------------------------------ #
+    # Paged sliding-window (SWA) pool — a separate, window-freed KV pool  #
+    # some attention types carve out of the main KV budget.              #
+    # ------------------------------------------------------------------ #
+    # ModelRunner queries these at startup to decide, model-agnostically,
+    # whether to reserve a `num_swa_blocks`-sized SWA pool and deduct its
+    # bytes from the main (compressed) KV pool. A builder that returns >0
+    # from `swa_pool_block_bytes()` opts into the pool; the default 0 means
+    # no separate SWA pool (standard attentions keep all KV in one pool).
+    # This keeps the arch-specific decision inside the builder, not in the
+    # runner.
+
+    def swa_pool_block_bytes(self) -> int:
+        """Bytes of ONE physical SWA-pool block across all attention layers,
+        or 0 (default) if this attention type has no separate paged-SWA pool."""
+        return 0
+
+    def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
+        """Number of blocks to reserve for the paged-SWA pool, or 0 (default).
+        Only consulted when `swa_pool_block_bytes()` > 0."""
         return 0
 
     def allocate_kv_cache_tensors(
@@ -240,12 +278,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
             "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
         }
-        if self.block_ratio > 1:
-            attn_metadata["block_tables_converted"] = CpuGpuBuffer(
-                self.max_bs,
-                self.max_num_blocks_per_seq,
-                **i32_kwargs,
-            )
 
         attn_metadata["cu_seqlens_q"].cpu.copy_(
             torch.arange(0, self.max_bs + 1, step=1, dtype=torch.int32)
@@ -262,6 +294,85 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         for i, block_table in enumerate(batch.block_tables):
             block_tables[i] = 0
             block_tables[i, : len(block_table)] = block_table
+        # paged-SWA: fill the parallel SWA block table in lockstep (decode
+        # path). -1 sentinels (window-freed) are copied verbatim but never
+        # indexed by the SWA kernels.
+        swa_buf = var.get("swa_block_tables")
+        swa_tables = getattr(batch, "swa_block_tables", None)
+        if swa_buf is not None and swa_tables is not None:
+            swa_np = swa_buf.np
+            for i, swa_table in enumerate(swa_tables):
+                swa_np[i] = 0
+                if len(swa_table):
+                    # Clamp window-freed sentinels (-1) to 0: those blocks are
+                    # out of window and never indexed by the SWA kernels, but a
+                    # raw -1 phys would compute a negative paged offset → OOB.
+                    swa_np[i, : len(swa_table)] = [max(0, b) for b in swa_table]
+
+    def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
+        return (
+            self.model_runner.forward_vars["mrope_positions"]
+            .np.reshape(-1)[: 3 * num_tokens]
+            .reshape(3, num_tokens)
+        )
+
+    def _copy_mrope_to_gpu(self, num_tokens: int) -> torch.Tensor:
+        buf = self.model_runner.forward_vars["mrope_positions"]
+        buf.gpu.reshape(-1)[: 3 * num_tokens].copy_(
+            buf.cpu.reshape(-1)[: 3 * num_tokens], non_blocking=True
+        )
+        return self.model_runner._mrope_positions_view(num_tokens)
+
+    def _build_mrope_prefill_positions(
+        self, batch: ScheduledBatch
+    ) -> torch.Tensor | None:
+        if not getattr(self.model_runner, "use_mrope", False):
+            return None
+
+        total_tokens = batch.total_tokens_num_prefill
+        positions = self._mrope_cpu_view(total_tokens)
+        offset = 0
+        for req_id, seqlen, cached_seqlen in zip(
+            batch.req_ids, batch.context_lens, batch.num_cached_tokens
+        ):
+            num_tokens = int(seqlen) - int(cached_seqlen)
+            mrope_positions = batch.mrope_positions_by_req.get(req_id)
+            if mrope_positions is None:
+                positions[:, offset : offset + num_tokens] = np.arange(
+                    cached_seqlen, seqlen, dtype=np.int64
+                )[None, :]
+            else:
+                positions[:, offset : offset + num_tokens] = mrope_positions[
+                    :, cached_seqlen:seqlen
+                ]
+            offset += num_tokens
+
+        return self._copy_mrope_to_gpu(total_tokens)
+
+    def _build_mrope_decode_positions(
+        self,
+        batch: ScheduledBatch,
+        context_lens: np.ndarray,
+        max_seqlen_q: int,
+    ) -> torch.Tensor | None:
+        if not getattr(self.model_runner, "use_mrope", False):
+            return None
+
+        total_tokens = batch.total_tokens_num_decode
+        positions = self._mrope_cpu_view(total_tokens)
+        offset = 0
+        for req_id, context_len in zip(batch.req_ids, context_lens):
+            start = int(context_len) - max_seqlen_q
+            stop = int(context_len)
+            delta = batch.mrope_position_deltas.get(req_id)
+            if delta is None:
+                base = np.arange(start, stop, dtype=np.int64)
+            else:
+                base = np.arange(start + int(delta), stop + int(delta), dtype=np.int64)
+            positions[:, offset : offset + max_seqlen_q] = base[None, :]
+            offset += max_seqlen_q
+
+        return self._copy_mrope_to_gpu(total_tokens)
 
     def prepare_prefill(self, batch: ScheduledBatch):
         bs = batch.total_seqs_num_prefill
@@ -290,8 +401,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not batch.block_tables:
                 continue
-            block_size = self.model_runner.block_size
             block_table = batch.block_tables[i]
+            block_size = self.model_runner.block_size
             if self.dcp_world_size > 1:
                 virtual_block_size = block_size * self.dcp_world_size
                 for pos in range(cached_seqlen, seqlen):
@@ -305,16 +416,23 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                     else:
                         slot_mapping.append(-1)
             else:
-                num_blocks = (seqlen + block_size - 1) // block_size
-                num_cached_blocks = (cached_seqlen + block_size - 1) // block_size
-                last_block_tokens = batch.last_block_num_tokens[i]
-                for blk_idx in range(num_cached_blocks, num_blocks):
-                    start = block_table[blk_idx] * block_size
-                    if blk_idx != num_blocks - 1:
-                        end = start + block_size
-                    else:
-                        end = start + last_block_tokens
-                    slot_mapping.extend(list(range(start, end)))
+                first_blk = cached_seqlen // block_size
+                last_blk = (seqlen - 1) // block_size
+                for blk_idx in range(first_blk, last_blk + 1):
+                    blk_start = block_table[blk_idx] * block_size
+                    # Offset within block: skip already-cached prefix in first block
+                    off_start = (
+                        cached_seqlen % block_size if blk_idx == first_blk else 0
+                    )
+                    # End within block: partial last block
+                    off_end = (
+                        ((seqlen - 1) % block_size) + 1
+                        if blk_idx == last_blk
+                        else block_size
+                    )
+                    slot_mapping.extend(
+                        range(blk_start + off_start, blk_start + off_end)
+                    )
         if has_cached:
             self.prepare_block_tables(batch)
         # Validate metadata consistency
@@ -333,12 +451,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
         var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
         var["cu_seqlens_k"].np[: bs + 1] = cu_seqlens_k
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
         var["context_lens"].np[:bs] = batch.context_lens[:bs]
         min_seqlen_q = 0
         dropout_p = 0.0
         vars_used = [
             ("cu_seqlens_q", bs + 1),
+            ("cu_seqlens_k", bs + 1),
             ("slot_mapping", sum_scheduled_tokens),
             ("context_lens", bs),
         ]
@@ -347,14 +465,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             vars_used.append(("seq_starts", bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        if self.block_ratio > 1 and "block_tables" in ctx:
-            block_table_convert_triton(
-                var["block_tables"].gpu[:bs],
-                var["block_tables_converted"].gpu[:bs],
-                var["context_lens"].gpu[:bs],
-                self.block_ratio,
-            )
-            ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         num_cached_tokens = None
         if has_cached:
             num_cached_tokens = torch.tensor(
@@ -363,27 +473,35 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             total_tokens = sum(batch.context_lens[:bs])
         total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
-            cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            min_seqlen_q=min_seqlen_q,
+            # Cast to python int — numpy.int32 leaks in via batch.context_lens
+            # (numpy array) and breaks downstream Triton kernel constexpr
+            # binding (`tl.minimum` rejects numpy scalars).
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            min_seqlen_q=int(min_seqlen_q),
             dropout_p=dropout_p,
             has_cached=has_cached,
-            total_kv=total_kv,
+            total_kv=int(total_kv),
             num_cached_tokens=num_cached_tokens,
+            state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
         )
-        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        mrope_positions = self._build_mrope_prefill_positions(batch)
+        if mrope_positions is not None:
+            positions = mrope_positions
+        else:
+            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
         return attn_metadata, positions
-        # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
     def build_ubatch_prefill_metadata(
         self,
         attn_metadata: AttentionMetaData,
         ub_slice: UBatchSlice,
         padded_bs: int,
+        ubatch_idx: int = 0,
     ) -> AttentionMetaData:
+        del ubatch_idx  # only used by builders with per-ubatch plan buffers
         return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
 
     def build(self, batch: ScheduledBatch, bs: int):

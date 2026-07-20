@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # Usage:
+#   .github/scripts/atom_oot_test.sh start <mode> [model_name]
 #   .github/scripts/atom_oot_test.sh launch <mode> [model_name]
+#   .github/scripts/atom_oot_test.sh client <mode> [model_name]
 #   .github/scripts/atom_oot_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
@@ -12,8 +14,10 @@ set -euo pipefail
 #   LM_EVAL_NUM_FEWSHOT
 #
 # TYPE:
+#   start    - launch vLLM server in the background and return immediately
 #   launch   - launch vLLM server and wait until ready
-#   accuracy - run gsm8k accuracy test and save result JSON
+#   client   - run gsm8k accuracy against an existing server
+#   accuracy - launch server, run gsm8k accuracy, and save result JSON
 #
 # MODE:
 #   ci    - workflow-provided OOT CI model entry
@@ -26,8 +30,8 @@ TYPE=${1:-launch}
 MODE=${2:-ci}
 SELECTED_MODEL=${3:-}
 
-if [[ "$TYPE" != "launch" && "$TYPE" != "accuracy" ]]; then
-  echo "Invalid TYPE: $TYPE. Expected: launch or accuracy"
+if [[ "$TYPE" != "start" && "$TYPE" != "launch" && "$TYPE" != "client" && "$TYPE" != "accuracy" ]]; then
+  echo "Invalid TYPE: $TYPE. Expected: start, launch, client, or accuracy"
   exit 2
 fi
 
@@ -38,6 +42,13 @@ fi
 
 MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
+# Fatal server-log markers: if any appears while waiting for the server, abort
+# immediately instead of burning the full MAX_WAIT_RETRIES budget (which keeps the
+# GPU runner occupied long after init has already crashed). These are unambiguously
+# terminal — e.g. NCCL "unhandled cuda error" corrupts the CUDA context and never
+# recovers. The recoverable "tp_group_reuse failed ... will fall back" warning is
+# intentionally NOT matched. Override via FATAL_LOG_PATTERNS; set empty to disable.
+FATAL_LOG_PATTERNS=${FATAL_LOG_PATTERNS:-'unhandled cuda error|uncorrectable ECC|EngineCore[_ ][A-Za-z0-9]* died|Engine core proc.* died|EngineCore failed to start|Failed to initialize EngineCore'}
 VLLM_PORT=${VLLM_PORT:-8000}
 VLLM_HOST=${VLLM_HOST:-localhost}
 VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
@@ -99,6 +110,13 @@ emit_new_vllm_logs() {
   LAST_VLLM_LOG_LINE=${current_line_count}
 }
 
+# Scan the server log for a fatal marker. Prints the first matching line and
+# returns 0 when a fatal error is present, 1 otherwise.
+detect_fatal_log() {
+  [[ -n "${FATAL_LOG_PATTERNS}" && -f "${VLLM_LOG_FILE}" ]] || return 1
+  grep -E -m1 "${FATAL_LOG_PATTERNS}" "${VLLM_LOG_FILE}" 2>/dev/null
+}
+
 wait_server_ready() {
   local model_name="$1"
   echo ""
@@ -111,6 +129,15 @@ wait_server_ready() {
     fi
 
     emit_new_vllm_logs
+
+    local fatal_line
+    if fatal_line=$(detect_fatal_log); then
+      echo "Detected fatal server error for ${model_name}; aborting wait early instead of retrying:"
+      echo "  ${fatal_line}"
+      emit_new_vllm_logs
+      tail -n 200 "${VLLM_LOG_FILE}" || true
+      return 1
+    fi
 
     if [[ -f "${VLLM_PID_FILE}" ]]; then
       local pid
@@ -142,10 +169,75 @@ stop_server() {
   fi
 }
 
+# Scrape MTP/speculative-decode acceptance from the live vLLM /metrics endpoint
+# and store overall + per-position acceptance into the result JSON. Must be
+# called while the server is still running. No-op for non-speculative runs
+# (the spec_decode counters are absent). The workflow's "Check OOT MTP
+# acceptance rate" step reads these values to gate against regressions —
+# gsm8k accuracy alone cannot, since spec decoding is lossless w.r.t. the
+# target model and a broken draft head only craters acceptance/throughput.
+record_mtp_acceptance() {
+  local result_file="$1"
+  local metrics_file="/tmp/oot_spec_metrics.txt"
+
+  if ! curl -fsS "http://127.0.0.1:${VLLM_PORT}/metrics" -o "${metrics_file}" 2>/dev/null; then
+    echo "MTP acceptance: /metrics not reachable (skipping)."
+    return 0
+  fi
+
+  RESULT_FILE="${result_file}" METRICS_FILE="${metrics_file}" python3 - <<'PY'
+import json, os, re
+
+with open(os.environ["METRICS_FILE"], encoding="utf-8", errors="replace") as f:
+    metrics = f.read()
+
+def sum_counter(name):
+    # Sum a Prometheus counter across all label series; tolerate the `_total`
+    # suffix and optional `{labels}`. Anchored so e.g. num_accepted_tokens does
+    # not also match num_accepted_tokens_per_pos.
+    pat = rf'^{re.escape(name)}(?:_total)?(?:\{{[^}}]*\}})?\s+([0-9eE+.\-]+)\s*$'
+    vals = [float(m.group(1)) for m in re.finditer(pat, metrics, re.M)]
+    return sum(vals) if vals else None
+
+accepted = sum_counter("vllm:spec_decode_num_accepted_tokens")
+draft_tokens = sum_counter("vllm:spec_decode_num_draft_tokens")
+num_drafts = sum_counter("vllm:spec_decode_num_drafts")
+
+per_pos_counts = {}
+for m in re.finditer(
+    r'vllm:spec_decode_num_accepted_tokens_per_pos(?:_total)?\{([^}]*)\}\s+([0-9eE+.\-]+)',
+    metrics,
+):
+    pm = re.search(r'position="(\d+)"', m.group(1))
+    if pm:
+        i = int(pm.group(1))
+        per_pos_counts[i] = per_pos_counts.get(i, 0.0) + float(m.group(2))
+
+if not draft_tokens:
+    print("MTP acceptance: no spec-decode metrics found (non-MTP run).")
+else:
+    overall = accepted / draft_tokens
+    per_pos = []
+    if num_drafts and per_pos_counts:
+        per_pos = [per_pos_counts[i] / num_drafts for i in sorted(per_pos_counts)]
+    rf = os.environ["RESULT_FILE"]
+    with open(rf, encoding="utf-8") as f:
+        data = json.load(f)
+    meta = data.setdefault("atom_ci_metadata", {})
+    meta["mtp_acceptance_overall"] = overall
+    meta["mtp_per_pos_acceptance"] = per_pos
+    with open(rf, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print("MTP acceptance overall: %.4f, per-position: %s" % (
+        overall, ", ".join("%.4f" % r for r in per_pos) if per_pos else "n/a"))
+PY
+}
+
 launch_one_model() {
   local model_name="$1"
   local model_path="$2"
   local extra_args="$3"
+  local wait_for_ready="${4:-1}"
   local -a extra_arg_array=()
 
   local resolved_model_path
@@ -203,7 +295,9 @@ PY
   echo $! > "${VLLM_PID_FILE}"
   echo "Server PID: $(cat "${VLLM_PID_FILE}")"
 
-  wait_server_ready "${model_name}"
+  if [[ "${wait_for_ready}" == "1" ]]; then
+    wait_server_ready "${model_name}"
+  fi
 }
 
 accuracy_one_model() {
@@ -380,6 +474,9 @@ PY
 )
   fi
 
+  # Capture MTP acceptance from /metrics while the server is still alive.
+  record_mtp_acceptance "${result_file}"
+
   echo "Result file: ${result_file}"
   echo "Flexible extract value: ${value}"
 }
@@ -396,8 +493,18 @@ run_for_models() {
     fi
     matched=1
 
+    if [[ "${action}" == "start" ]]; then
+      launch_one_model "${model_name}" "${model_path}" "${extra_args}" "0"
+      break
+    fi
+
     if [[ "${action}" == "launch" ]]; then
       launch_one_model "${model_name}" "${model_path}" "${extra_args}"
+      break
+    fi
+
+    if [[ "${action}" == "client" ]]; then
+      accuracy_one_model "${model_name}" "${model_path}" "${extra_args}" "${client_command}"
       break
     fi
 
@@ -414,7 +521,7 @@ run_for_models() {
 }
 
 cleanup_on_exit() {
-  if [[ "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ]]; then
+  if [[ "${TYPE}" == "start" || ( "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ) ]]; then
     echo "Keeping vLLM server alive for follow-up steps."
     return 0
   fi
@@ -423,8 +530,12 @@ cleanup_on_exit() {
 
 trap 'cleanup_on_exit' EXIT
 
-if [[ "${TYPE}" == "launch" ]]; then
+if [[ "${TYPE}" == "start" ]]; then
+  run_for_models "start"
+elif [[ "${TYPE}" == "launch" ]]; then
   run_for_models "launch"
+elif [[ "${TYPE}" == "client" ]]; then
+  run_for_models "client"
 else
   run_for_models "accuracy"
 fi

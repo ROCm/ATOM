@@ -6,17 +6,24 @@ import torch
 import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
+from atom.model_ops.layernorm import RMSNorm, fused_dual_rmsnorm_cat
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
 
 from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
-from .deepseek_v2 import DeepseekV2DecoderLayer
+from .deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    _can_fuse_indexer_wk_weights_proj,
+    use_replicated_vocab_embed,
+)
 from .utils import ckpt_has_tensor_suffix, maybe_prefix
 
 
@@ -46,7 +53,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         atom_config: Config,
         prefix: str,
         layer_idx: int,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
 
@@ -63,20 +70,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             prefix=maybe_prefix(prefix, "eh_proj"),
         )
 
-        if hasattr(config, "index_topk"):
-            max_num_batched_tokens = getattr(
-                atom_config, "max_num_batched_tokens", atom_config.max_num_seqs
-            )
-            buffer_device = getattr(atom_config, "device", "cuda")
-            topk_indices_buffer = torch.empty(
-                max_num_batched_tokens,
-                config.index_topk,
-                dtype=torch.int32,
-                device=buffer_device,
-            )
-        else:
-            topk_indices_buffer = None
-
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
         )
@@ -90,7 +83,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
-            topk_indices_buffer=topk_indices_buffer,
+            alt_stream=alt_stream,
         )
 
     def forward(
@@ -102,13 +95,17 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        masked_inputs_embeds = inputs_embeds
-        inputs_embeds = self.enorm(masked_inputs_embeds)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
-
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        # Fused enorm(inputs_embeds) ++ hnorm(previous_hidden_states) in a single
+        # Triton launch (folds the two RMSNorms + the torch.cat; enorm and hnorm
+        # share eps=rms_norm_eps). bf16-identical to the separate path.
+        eh_input = fused_dual_rmsnorm_cat(
+            inputs_embeds,
+            self.enorm.weight,
+            previous_hidden_states,
+            self.hnorm.weight,
+            self.enorm.eps,
         )
+        hidden_states = self.eh_proj(eh_input)
 
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
@@ -125,12 +122,17 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         *,
         atom_config: Config,
         prefix: str = "",
-        topk_indices_buffer: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         config = atom_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
+        self.alt_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream()
+            if torch.cuda.is_available()
+            and getattr(config, "n_shared_experts", None) is not None
+            else None
+        )
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
@@ -138,7 +140,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                     atom_config,
                     f"{prefix}.layers.{idx}",
                     layer_idx=idx,
-                    topk_indices_buffer=topk_indices_buffer,
+                    alt_stream=self.alt_stream,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -146,10 +148,18 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 )
             }
         )
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+        if use_replicated_vocab_embed(config):
+            # GLM-5.2 MTP: full table per rank, no post-embedding all-reduce.
+            # (Shared with the target's replicated embed by EagleProposer at load.)
+            self.embed_tokens = ReplicatedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
 
     def forward(
         self,
@@ -179,6 +189,24 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         logits = mtp_layer.shared_head.head(mtp_layer.shared_head(hidden_states))
         return logits
+
+    def compute_draft_token(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token via distributed argmax over the TP-sharded vocab —
+        avoids all-gathering the full [N, vocab] logits every draft step.
+
+        Mirrors compute_logits() (same norm + shared head), but reduces each
+        rank's logit shard to (max_val, global_idx) and all-gathers only [N, 2]
+        instead of the O(vocab) logits. Token-identical to
+        compute_logits(...).argmax(-1).
+        """
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        normed = mtp_layer.shared_head(hidden_states)
+        return mtp_layer.shared_head.head.compute_argmax_token(normed)
 
 
 @support_torch_compile
@@ -215,20 +243,31 @@ class DeepSeekMTP(nn.Module):
                 "up_proj": ("gate_up_proj", 1),
             }
 
+        model_prefix = maybe_prefix(prefix, "model")
         if hasattr(self.config, "index_topk"):
-            topk_indices_buffer = torch.empty(
-                atom_config.max_num_batched_tokens,
-                self.config.index_topk,
-                dtype=torch.int32,
-                device="cuda",
-            )
-        else:
-            topk_indices_buffer = None
+            indexer_prefixes = [
+                f"{model_prefix}.layers.{idx}.self_attn.indexer"
+                for idx in range(
+                    self.config.num_hidden_layers,
+                    self.config.num_hidden_layers
+                    + self.config.num_nextn_predict_layers,
+                )
+            ]
+            if _can_fuse_indexer_wk_weights_proj(
+                self.config,
+                atom_config.quant_config,
+                indexer_prefixes,
+            ):
+                self.packed_modules_mapping.update(
+                    {
+                        "indexer.wk": ("indexer.wk_weights_proj", 0),
+                        "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
+                    }
+                )
 
         self.model = DeepSeekMultiTokenPredictor(
             atom_config=atom_config,
-            prefix=maybe_prefix(prefix, "model"),
-            topk_indices_buffer=topk_indices_buffer,
+            prefix=model_prefix,
         )
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
@@ -258,6 +297,20 @@ class DeepSeekMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
+    def compute_draft_token(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
+
+        EagleProposer picks this over compute_logits().argmax(-1) when present
+        (``_draft_argmax_fused``), so the draft never all-gathers the full
+        [N, vocab] logits — it all-gathers only the packed [N, 2] per-rank
+        reductions. See DeepSeekMultiTokenPredictor.compute_draft_token.
+        """
+        return self.model.compute_draft_token(hidden_states, spec_step_idx)
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -266,11 +319,7 @@ class DeepSeekMTP(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            + (self.config.n_shared_experts or 0),
         )
 
 

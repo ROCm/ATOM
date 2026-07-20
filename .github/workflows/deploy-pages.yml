@@ -16,6 +16,9 @@ on:
 
 jobs:
   deploy-pages:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write

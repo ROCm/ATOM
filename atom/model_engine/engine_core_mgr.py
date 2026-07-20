@@ -43,6 +43,7 @@ class CoreManager:
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[List[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
+        self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
         self.engine_core_processes = []
         self.input_sockets = []
@@ -251,6 +252,8 @@ class CoreManager:
                                 logger.debug(
                                     f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                 )
+                    elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
+                        self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:
                         # logger.info(f"Engine core output sequence id: {seq.id}")
                         seqs = data
@@ -390,17 +393,32 @@ class CoreManager:
                 copy=False,
             )
         else:
-            # DP ranks, round-robin with counter for load balancing for atom server
+            # DP ranks: honor an explicit atomesh DPA routing hint when present;
+            # otherwise keep the existing round-robin behavior.
             dp_seqs = [[] for _ in range(self.local_engine_count)]
             for seq in seqs:
-                dp_rank = self._rr_counter % self.local_engine_count
+                requested_dp_rank = getattr(seq, "data_parallel_rank", None)
+                if requested_dp_rank is not None:
+                    dp_rank = int(requested_dp_rank)
+                    if not 0 <= dp_rank < self.local_engine_count:
+                        raise ValueError(
+                            f"Invalid data_parallel_rank={dp_rank}; "
+                            f"local_engine_count={self.local_engine_count}"
+                        )
+                else:
+                    dp_rank = self._rr_counter % self.local_engine_count
+                    self._rr_counter += 1
                 dp_seqs[dp_rank].append(seq)
-                self._rr_counter += 1
 
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if rank_seqs:
-                    logger.debug(
-                        f"{self.label}: Add {len(rank_seqs)} requests to DP rank {dp_rank}"
+                    request_ids = [seq.id for seq in rank_seqs]
+                    logger.info(
+                        "%s: Add %d request(s) to DP rank %d, sequence ids: %s",
+                        self.label,
+                        len(rank_seqs),
+                        dp_rank,
+                        request_ids,
                     )
                     self.input_sockets[dp_rank].send_multipart(
                         [
@@ -441,6 +459,59 @@ class CoreManager:
                 ],
                 copy=False,
             )
+
+    def abort_request(self, req_id):
+        """Tell the engine core(s) to drop a request (client disconnected).
+
+        Broadcast to every DP rank (only the one holding ``req_id`` acts). The
+        scheduler finishes the seq at its next step via the normal stop path,
+        freeing its KV blocks. Fire-and-forget; safe if the seq already finished.
+        """
+        try:
+            self.broadcast_utility_command("abort_request", req_id=req_id)
+        except Exception as e:
+            logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
+
+    def broadcast_utility_command(self, cmd: str, **kwargs):
+        payload = {"cmd": cmd, **kwargs}
+        # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
+        serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
+        for rank in range(self.local_engine_count):
+            logger.debug(
+                f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
+            )
+            self.input_sockets[rank].send_multipart(
+                [
+                    self.engine_core_identities[rank],
+                    serialized_payload,
+                ],
+                copy=True,  # Use copy=True since we're reusing the same buffer
+            )
+
+    def broadcast_utility_command_sync(
+        self, cmd: str, timeout: float = 300.0, **kwargs
+    ):
+        # Drain any stale responses that might be left over
+        while not self.utility_response_queue.empty():
+            try:
+                self.utility_response_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.broadcast_utility_command(cmd, **kwargs)
+
+        # Collect one response per DP rank
+        responses = []
+        for _ in range(self.local_engine_count):
+            try:
+                resp = self.utility_response_queue.get(timeout=timeout)
+                responses.append(resp)
+            except queue.Empty:
+                raise TimeoutError(
+                    f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
+                    f"for command '{cmd}' (timeout={timeout}s)"
+                )
+        return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
         if dp_rank >= len(self.engine_core_processes):

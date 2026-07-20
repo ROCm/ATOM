@@ -2,7 +2,7 @@ name: Nightly Docker Release
 
 on:
   schedule:
-    - cron: '0 14 * * *'  # Every day at 22:00 Beijing Time (UTC+8)
+    - cron: '48 13 * * *'  # Every day at 21:48 Beijing Time (UTC+8)
   workflow_dispatch:
     inputs:
       base_image:
@@ -11,8 +11,7 @@ on:
         default: "rocm/pytorch:latest"
         options:
           - rocm/pytorch:latest
-          - rocm/pytorch-nightly:latest
-          - rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.10.0
+          - rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
@@ -35,11 +34,11 @@ on:
         description: "SGLang repo"
         default: "https://github.com/sgl-project/sglang.git"
       sglang_ref:
-        description: "SGLang git ref"
-        default: "v0.5.10"
+        description: "SGLang git ref. Leave empty to use the workflow default."
+        default: ""
       sglang_version:
-        description: "SGLang version used in the published tag"
-        default: "0.5.10"
+        description: "SGLang version used in the published tag. Leave empty to use the workflow default."
+        default: ""
       runner:
         description: "Runner label to use"
         type: choice
@@ -52,6 +51,9 @@ on:
         description: "Skip test step"
         type: boolean
         default: false
+      custom_tag:
+        description: "Custom tag for the native Docker image (e.g. 'my-feature'). Produces rocm/atom-dev:<custom_tag>. When set, branch-based tagging and 'latest' update are skipped."
+        default: ""
       build_oot_image:
         description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
         type: boolean
@@ -63,13 +65,13 @@ on:
         description: "Build SGLang+ATOM image for manual runs (scheduled nightly runs always build SGLang+ATOM; default enabled so manual releases also publish SGLang+ATOM)"
         type: boolean
         default: true
+      sglang_tag_suffix:
+        description: "Optional suffix appended to the SGLang nightly tag for manual runs. Example: custom -> rocm/atom-dev:sglang-v<version>-nightly_<date>-custom. When set, sglang-latest is not updated."
+        default: ""
       only_release_oot:
         description: "Release the OOT vLLM image (skips native image test/push). If both this and SGLang are checked, both will be released."
         type: boolean
         default: false
-      custom_tag:
-        description: "Custom tag for the native Docker image (e.g. 'my-feature'). Produces rocm/atom-dev:<custom_tag>. When set, branch-based tagging and 'latest' update are skipped."
-        default: ""
       only_release_sglang:
         description: "Release the SGLang+ATOM image (skips native image test/push). If both this and OOT are checked, both will be released."
         type: boolean
@@ -78,7 +80,7 @@ on:
 jobs:
   docker-release:
     name: Nightly Docker Release
-    runs-on: ${{ inputs.runner || 'linux-atom-mi355-1' }}
+    runs-on: ${{ inputs.runner || 'linux-atom-mi35x-1' }}
     strategy:
       fail-fast: false
       matrix:
@@ -93,11 +95,11 @@ jobs:
       RCCL_REPO: "https://github.com/ROCm/rccl.git"
       RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
       GPU_ARCH: "gfx942;gfx950"
-      VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
-      VLLM_VERSION: "0.19.0"
+      VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
+      VLLM_VERSION: "0.22.0"
       SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
-      SGLANG_REF: "v0.5.10"
-      SGLANG_VERSION: "0.5.10"
+      SGLANG_REF: "v0.5.12"
+      SGLANG_VERSION: "0.5.12"
 
     steps:
       - name: Set HF_TOKEN
@@ -107,8 +109,23 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Login to Docker Hub
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Compute push gates
+        # Single source of truth for which images get pushed. The build,
+        # re-login, and push steps below all read these outputs instead of each
+        # duplicating the same long boolean, so the conditions can't drift.
+        id: gates
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+          set -euo pipefail
+          {
+            echo "main=${{ inputs.only_release_oot != true && inputs.only_release_sglang != true }}"
+            echo "oot=${{ inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true)) }}"
+            echo "sglang=${{ inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true)) }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Echo environment variables
         run: |
@@ -120,10 +137,12 @@ jobs:
           echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
           echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
           echo "OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}"
+          echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
           echo "CUSTOM_TAG: ${{ inputs.custom_tag || '' }}"
           echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
           echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
           echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
+          echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
 
       - name: Build Docker image
         timeout-minutes: 180
@@ -150,7 +169,7 @@ jobs:
           docker inspect atom_release:ci
 
       - name: Test Docker image
-        if: ${{ inputs.skip_tests != true && inputs.only_release_oot != true && inputs.only_release_sglang != true }}
+        if: ${{ success() && steps.gates.outputs.main == 'true' && inputs.skip_tests != true }}
         timeout-minutes: 60
         run: |
           echo "Clean up containers..."
@@ -198,8 +217,19 @@ jobs:
             echo "Output matches golden outputs."
           fi
 
+      - name: Re-login to Docker Hub before push
+        # The initial login happens before a ~1h image build, so its auth token
+        # is stale by the time this push finalizes (multi-GB push of a large
+        # image), causing "unauthorized: authentication required" on the manifest
+        # PUT. Re-authenticate immediately before pushing to get a fresh token.
+        if: ${{ success() && steps.gates.outputs.main == 'true' }}
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Push Docker image
-        if: ${{ success() && inputs.only_release_oot != true && inputs.only_release_sglang != true }}
+        if: ${{ success() && steps.gates.outputs.main == 'true' }}
         run: |
           CUSTOM_TAG="${{ inputs.custom_tag || '' }}"
           if [ -n "${CUSTOM_TAG}" ]; then
@@ -229,7 +259,7 @@ jobs:
           fi
 
       - name: Build OOT Docker image
-        if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
+        if: ${{ success() && steps.gates.outputs.oot == 'true' }}
         timeout-minutes: 180
         run: |
           OOT_BASE_IMAGE="atom_release:ci"
@@ -244,8 +274,17 @@ jobs:
             -f docker/Dockerfile .
           docker inspect atom_oot_release:ci
 
+      - name: Re-login to Docker Hub before OOT push
+        # Fresh token before this push: the OOT build above adds even more time
+        # since the initial login, so the auth token is stale by push time.
+        if: ${{ success() && steps.gates.outputs.oot == 'true' }}
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Push OOT Docker image
-        if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
+        if: ${{ success() && steps.gates.outputs.oot == 'true' }}
         run: |
           set -euo pipefail
           VLLM_VER="${{ env.VLLM_VERSION }}"
@@ -269,7 +308,7 @@ jobs:
           fi
 
       - name: Build SGLang Docker image
-        if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
+        if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
         timeout-minutes: 180
         run: |
           SGLANG_BASE_IMAGE="atom_release:ci"
@@ -283,16 +322,38 @@ jobs:
             -f docker/Dockerfile .
           docker inspect atom_sglang_release:ci
 
+      - name: Re-login to Docker Hub before SGLang push
+        # Fresh token before this push: the SGLang build above adds even more
+        # time since the initial login, so the auth token is stale by push time.
+        if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Push SGLang+ATOM Docker image
-        if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
+        if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
         run: |
+          set -euo pipefail
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
+          SGLANG_TAG_SUFFIX="${{ inputs.sglang_tag_suffix || '' }}"
           SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
           SGLANG_LATEST_TAG="sglang-latest"
+          if [ -n "${SGLANG_TAG_SUFFIX}" ]; then
+            if [[ ! "${SGLANG_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid sglang_tag_suffix '${SGLANG_TAG_SUFFIX}'. Allowed characters: letters, numbers, '.', '_' and '-'."
+              exit 1
+            fi
+            SGLANG_TAG="${SGLANG_TAG}-${SGLANG_TAG_SUFFIX}"
+          fi
           docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_TAG}
           docker push rocm/atom-dev:${SGLANG_TAG}
-          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
-          docker push rocm/atom-dev:${SGLANG_LATEST_TAG}
+          if [ -z "${SGLANG_TAG_SUFFIX}" ]; then
+            docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
+            docker push rocm/atom-dev:${SGLANG_LATEST_TAG}
+          else
+            echo "Custom SGLang tag suffix '${SGLANG_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${SGLANG_LATEST_TAG} update."
+          fi
 
       - name: Clean Up
         if: always()

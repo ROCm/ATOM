@@ -63,11 +63,10 @@ python -m atom.benchmarks.benchmark_serving \
 
 We verified the lm_eval accuracy on gsm8k dataset with command:
 ```bash
-lm_eval \
-  --model local-completions \
-  --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
-  --tasks gsm8k \
-  --num_fewshot 3
+lm_eval --model local-chat-completions --apply_chat_template \
+        --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False \
+        --tasks gsm8k \
+        --num_fewshot 3
 ```
 
 CI accuracy threshold: `flexible-extract ≥ 0.88`.

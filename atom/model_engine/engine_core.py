@@ -14,9 +14,15 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import init_exit_handler, make_zmq_socket
+from atom.utils import (
+    envs,
+    init_exit_handler,
+    make_zmq_socket,
+    set_process_title,
+)
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -44,6 +50,8 @@ class EngineCoreRequestType(enum.Enum):
     STREAM = b"\x06"
     # Signal that EngineCore is fully initialized and ready
     READY = b"\x07"
+    # Response to a synchronous utility command
+    UTILITY_RESPONSE = b"\x08"
 
 
 class EngineCore:
@@ -54,6 +62,14 @@ class EngineCore:
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
+        # Queue for utility commands (processed in busy_loop to avoid thread contention)
+        self.utility_queue = queue.Queue()
+        self._has_pending_utility = (
+            False  # Flag to avoid checking empty queue every loop
+        )
+        self._is_rl_weights_offloaded = (
+            False  # True when weights are offloaded for RL training
+        )
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -81,12 +97,17 @@ class EngineCore:
         # Initialize model runner processes
         try:
             good = False
+            # Number of worker processes = full model-parallel world size.
+            # PCP is an independent dimension (world = tp x pcp), so spawn
+            # tp x pcp workers; otherwise init_dist_env (which expects a world
+            # of tp x pcp) would hang waiting for the PCP ranks.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tensor_parallel_size,
-                "atom.model_engine.model_runner.ModelRunner",
+                config.tensor_parallel_size * config.prefill_context_parallel_size,
+                config.runner_qualname,
                 config,
             )
+
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
             num_blocks = block_info["num_kvcache_blocks"]
             config.per_req_cache_equiv_blocks = block_info.get(
@@ -95,6 +116,11 @@ class EngineCore:
             config.num_per_req_cache_groups = block_info.get(
                 "num_per_req_cache_groups", 0
             )
+            # paged-SWA: propagate SWA pool sizing from the runner subprocess
+            # so BlockManager (built in Scheduler below) sees the same value as
+            # the runner's attn builder (else swa_enabled=False vs the SWA pool).
+            config.num_swa_blocks = block_info.get("num_swa_blocks", 0)
+            config.swa_window_size = block_info.get("swa_window_size", 0)
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -132,6 +158,13 @@ class EngineCore:
                 world_size=config.tensor_parallel_size
             )
 
+        self.utility_handler = EngineUtilityHandler(
+            self.runner_mgr,
+            self.output_queue,
+            label=self.label,
+            scheduler=self.scheduler,
+        )
+
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
 
@@ -145,6 +178,9 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        if not hasattr(self, "runner_mgr"):
+            self._send_engine_dead()
+            return
         self.runner_mgr.keep_monitoring = False
         try:
             self.runner_mgr.call_func("exit")
@@ -167,11 +203,25 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        # Bind this EngineCore's lifetime to its parent (the server /
+        # CoreManager): if the parent exits, have the kernel reap this process —
+        # and, transitively, the ModelRunner workers it spawns — instead of
+        # leaving them orphaned. Orphans keep pinning GPU VRAM + the custom
+        # all-reduce IPC handles / rendezvous TCPStore, which makes the next
+        # restart reuse a stale hipIpc handle and crash. See
+        # atom.utils.enable_orphan_reaping for the full rationale.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
         engine: EngineCore = None
         try:
             if config.parallel_config.data_parallel_size > 1:
+                set_process_title(
+                    f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
+                )
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
+                set_process_title("EngineCore")
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:
@@ -181,16 +231,51 @@ class EngineCore:
             if engine is not None:
                 engine.exit()
 
+    def _is_idle_rl_weights_offloaded(self) -> bool:
+        """Check if weights are offloaded for RL training.
+
+        When offloaded, busy-wait with a short delay to avoid CPU spin.
+        Returns True if the caller should skip model execution this tick.
+        """
+        if self._is_rl_weights_offloaded:
+            time.sleep(0.01)
+            return True
+        return False
+
     def busy_loop(self):
         shutdown = False
-        while True:
-            shutdown = shutdown or self.pull_and_process_input_queue()
-            if shutdown:
-                break
-            if not self.scheduler.is_finished():
-                self._process_engine_step()
+        try:
+            while True:
+                self.utility_handler.process_queue(self.utility_queue, self)
+                shutdown = shutdown or self.pull_and_process_input_queue()
+                if shutdown:
+                    break
+                if self._is_idle_rl_weights_offloaded():
+                    continue
+                if not self.scheduler.is_finished():
+                    self._process_engine_step()
+        finally:
+            # Teardown runs even on exceptions so the sender thread/socket
+            # don't leak. Isolate the final publish so a publisher hiccup
+            # cannot skip shutdown_kv_events().
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish during shutdown failed")
+            self.scheduler.shutdown_kv_events()
 
     def _process_engine_step(self):
+        try:
+            return self._process_engine_step_inner()
+        finally:
+            # Swallow publisher errors so they cannot mask an exception from
+            # the engine step itself.
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish in engine-step finally failed")
+
+    def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -202,11 +287,13 @@ class EngineCore:
             self.output_queue.put_nowait(rejected)
 
         if result is None:
+            self._advance_idle_kv_transfer()
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
+            self._advance_idle_kv_transfer()
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
@@ -226,11 +313,7 @@ class EngineCore:
             )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        if self.kv_transfer_enabled:
-            kvoutput = self.runner_mgr.call_func_with_aggregation(
-                "async_proc_aggregation"
-            )
-            self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
@@ -239,7 +322,10 @@ class EngineCore:
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
-            seqs, fwd_out, stream_output_queue=self.stream_output_queue
+            seqs,
+            fwd_out,
+            stream_output_queue=self.stream_output_queue,
+            batch=scheduled_batch,
         )
 
         # Send stream outputs to main process via output_queue
@@ -253,7 +339,31 @@ class EngineCore:
 
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
+
         return True
+
+    def _advance_idle_kv_transfer(self) -> None:
+        # No forward batch will run this tick, but offload load/save work may
+        # still need to be dispatched or reported back to the scheduler.
+        self._dispatch_idle_offload_work()
+        self._poll_kv_transfer_progress()
+
+    def _poll_kv_transfer_progress(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+    def _dispatch_idle_offload_work(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not getattr(connector, "is_offload", False):
+            return
+        meta = connector.build_connector_meta()
+        if meta is None or not getattr(meta, "requests", None):
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", meta)
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
@@ -296,15 +406,10 @@ class EngineCore:
                         )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
-                        # Handle utility commands like start_profile/stop_profile
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
-                        if cmd == "start_profile":
-                            self.start_profiler()
-                        elif cmd == "stop_profile":
-                            self.stop_profiler()
-                        elif cmd == "get_mtp_stats":
-                            self.print_mtp_statistics()
+                        self.utility_queue.put_nowait((cmd, reqs))
+                        self._has_pending_utility = True
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
@@ -336,6 +441,15 @@ class EngineCore:
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
 
+                if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
+                    # Send utility command response back to CoreManager
+                    response_data = item[1]
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.UTILITY_RESPONSE, response_data)
+                    )
+                    socket.send(serialized_obj)
+                    continue
+
                 # Regular finished sequences
                 seqs = item
                 valid_seqs = [
@@ -353,25 +467,6 @@ class EngineCore:
                     )
                     break
 
-    def start_profiler(self):
-        if self.profile_enbaled:
-            self.runner_mgr.call_func("start_profiler", wait_out=True)
-
-    def stop_profiler(self):
-        if self.profile_enbaled:
-            logger.info("Profiler stopping...")
-            t0 = time.monotonic()
-            self.runner_mgr.call_func("stop_profiler", wait_out=True)
-            logger.info("Profiler stopped in %.1fs", time.monotonic() - t0)
-
-    def print_mtp_statistics(self):
-        if self.scheduler.spec_stats is not None:
-            self.scheduler.spec_stats._log()
-        else:
-            logger.info(
-                "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"
-            )
-
 
 class DPEngineCoreProc(EngineCore):
     def __init__(self, config: Config, input_address: str, output_address: str):
@@ -382,6 +477,24 @@ class DPEngineCoreProc(EngineCore):
         # Initialize to True so first iteration reaches all_reduce
         self.engines_running = True
         self._shutting_down = False
+
+        if envs.ATOM_ENABLE_PREFILL_DELAYER:
+            from atom.model_engine.prefill_delayer import PrefillDelayer
+
+            self.scheduler.set_prefill_delayer(
+                PrefillDelayer(
+                    dp_size=config.parallel_config.data_parallel_size,
+                    cpu_group=self.dp_group,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                )
+            )
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -394,6 +507,10 @@ class DPEngineCoreProc(EngineCore):
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()
+        # NOTE: PrefillDelayer attachment lives in __init__ (after
+        # super().__init__ creates self.scheduler) — not here. This
+        # function runs during super().__init__, before self.scheduler
+        # exists.
 
     def exit(self):
         super().exit()
@@ -402,102 +519,67 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
-        while True:
-            shutdown = shutdown or self.pull_and_process_input_queue()
-
-            local_is_prefill, local_num_tokens, local_num_reqs = (
-                self.scheduler.get_next_batch_info()
-            )
-            local_unfinished = not self.scheduler.is_finished()
-
-            (
-                global_has_prefill,
-                global_max_tokens,
-                global_max_reqs,
-                global_has_unfinished,
-                global_shutdown,
-            ) = self._sync_dp_state(
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_unfinished,
-                shutdown,
-            )
-
-            if global_shutdown and not global_has_unfinished:
-                logger.info(
-                    f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+        try:
+            while True:
+                self.utility_handler.process_queue(self.utility_queue, self)
+                shutdown = shutdown or self.pull_and_process_input_queue()
+                local_unfinished = (
+                    not self.scheduler.is_finished()
+                    and not self._is_rl_weights_offloaded
                 )
-                break
 
-            if not global_has_unfinished and not self.engines_running:
-                self.engines_running = False
-                continue
-
-            if global_has_prefill and not local_is_prefill:
-                # We must do dummy prefill to sync here
-                # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
-                dummy_reqs = min(
-                    global_max_reqs, 2
-                )  # dummy reqs at 2: just enough for TBO agreement, avoid wasting compute.
-                logger.info(
-                    f"{self.label}: Running dummy prefill ({global_max_tokens} tokens, {dummy_reqs} reqs) "
-                    f"to sync with other DP ranks doing prefill"
+                global_has_unfinished, global_shutdown, global_offloaded = (
+                    self._sync_dp_state(
+                        local_unfinished, shutdown, self._is_rl_weights_offloaded
+                    )
                 )
-                self._execute_dummy_prefill(global_max_tokens, dummy_reqs)
-            else:
+
+                if global_shutdown and not global_has_unfinished:
+                    logger.info(
+                        f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+                    )
+                    break
+
+                if global_offloaded:
+                    time.sleep(0.01)
+                    continue
+
+                if not global_has_unfinished and not self.engines_running:
+                    self.engines_running = False
+                    continue
+
                 executed = self._process_engine_step()
                 if not executed:
-                    if global_has_prefill:
-                        # get_next_batch_info predicted prefill but schedule()
-                        # skipped it (e.g. WAITING_FOR_REMOTE_KVS).  Other DP
-                        # ranks already committed to dummy_prefill, so we must
-                        # match to keep the all-reduce in sync.
-                        logger.info(
-                            f"{self.label}: Predicted prefill was not scheduled, "
-                            f"falling back to dummy prefill ({global_max_tokens} "
-                            f"tokens) to stay in sync with other DP ranks"
-                        )
-                        self._execute_dummy_prefill(global_max_tokens)
-                    else:
-                        self._execute_dummy_batch()
+                    self._execute_dummy_batch()
 
-            self.engines_running = global_has_unfinished
+                self.engines_running = global_has_unfinished
+        finally:
+            # Isolate the final publish so a publisher hiccup cannot skip
+            # shutdown_kv_events() (which closes the sender thread/socket).
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish during DP shutdown failed")
+            self.scheduler.shutdown_kv_events()
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
 
-    def _execute_dummy_prefill(self, num_tokens: int, num_reqs: int = 1):
-        return self.runner_mgr.call_func(
-            "dummy_prefill_execution", num_tokens, num_reqs, wait_out=True
-        )
-
     def _sync_dp_state(
         self,
-        local_is_prefill: bool,
-        local_num_tokens: int,
-        local_num_reqs: int,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-    ) -> tuple[bool, int, int, bool, bool]:
+        local_offloaded: bool = False,
+    ) -> tuple[bool, bool, bool]:
         if self._shutting_down:
-            return (
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_has_unfinished,
-                True,
-            )
+            return local_has_unfinished, True, local_offloaded
 
         try:
-            # Pack all state: [is_prefill, num_tokens, num_reqs, has_unfinished, shutdown]
             state_tensor = torch.tensor(
                 [
-                    1 if local_is_prefill else 0,
-                    local_num_tokens,
-                    local_num_reqs,
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
+                    1 if local_offloaded else 0,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -505,29 +587,14 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            global_has_prefill = state_tensor[0].item() == 1
-            global_max_tokens = state_tensor[1].item()
-            global_max_reqs = state_tensor[2].item()
-            global_has_unfinished = state_tensor[3].item() == 1
-            global_shutdown = state_tensor[4].item() == 1
-            return (
-                global_has_prefill,
-                global_max_tokens,
-                global_max_reqs,
-                global_has_unfinished,
-                global_shutdown,
-            )
+            global_has_unfinished = state_tensor[0].item() == 1
+            global_shutdown = state_tensor[1].item() == 1
+            global_offloaded = state_tensor[2].item() == 1
+            return global_has_unfinished, global_shutdown, global_offloaded
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
-            # If sync fails, assume shutdown to prevent hang
             self._shutting_down = True
-            return (
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_has_unfinished,
-                True,
-            )
+            return local_has_unfinished, True, local_offloaded
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:

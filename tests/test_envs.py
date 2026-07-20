@@ -16,14 +16,15 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
+    "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_PROFILER_MORE",
+    "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
     "ATOM_DISABLE_VLLM_PLUGIN",
-    "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
 ]
@@ -73,6 +74,9 @@ class TestEnvsDefaults:
     def test_profiler_more_default(self):
         assert _get_envs().ATOM_PROFILER_MORE is False
 
+    def test_profiler_timeout_default(self):
+        assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
+
     def test_log_more_default(self):
         assert _get_envs().ATOM_LOG_MORE is False
 
@@ -82,11 +86,11 @@ class TestEnvsDefaults:
     def test_disable_vllm_plugin_default(self):
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is False
 
-    def test_disable_vllm_plugin_attention_default(self):
-        assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN_ATTENTION is False
-
     def test_atom_enable_relaxed_mtp_default(self):
         assert _get_envs().ATOM_ENABLE_RELAXED_MTP is False
+
+    def test_atom_enable_gdn_decode_lossy_fast_default(self):
+        assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
@@ -112,6 +116,10 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
         assert _get_envs().ATOM_PROFILER_MORE is True
 
+    def test_profiler_timeout_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")
+        assert _get_envs().ATOM_PROFILER_TIMEOUT == 900.0
+
     def test_log_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_LOG_MORE", "1")
         assert _get_envs().ATOM_LOG_MORE is True
@@ -132,13 +140,13 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN", "1")
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is True
 
-    def test_disable_vllm_plugin_attention_enabled(self, monkeypatch):
-        monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "1")
-        assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN_ATTENTION is True
-
     def test_atom_enable_relaxed_mtp_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "1")
         assert _get_envs().ATOM_ENABLE_RELAXED_MTP is True
+
+    def test_atom_enable_gdn_decode_lossy_fast_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
+        assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
 
 
 class TestIsSet:

@@ -8,9 +8,21 @@ import torch.nn as nn
 from aiter import dtypes
 from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config, KVCacheTensor
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_pad_dense,
+    pcp_pad_len,
+    pcp_round_robin_split,
+)
 from atom.model_loader.loader import load_model
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
-from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
+from atom.utils import envs
+from atom.utils.forward_context import (
+    DPMetadata,
+    SpecDecodeMetadata,
+    get_forward_context,
+)
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -20,10 +32,27 @@ support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
-    "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
+    "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
+    "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
+    "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
 }
+
+
+def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
+    # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
+    from atom.models.deepseek_v2 import _pcp_active
+
+    if _pcp_active():
+        return True
+
+    if draft_model.__class__.__name__ != "DeepseekV4MTP":
+        return False
+
+    from atom.models.deepseek_v4 import _pcp_active as _pcp_active_v4
+
+    return _pcp_active_v4()
 
 
 class Eagle3DraftBuilder:
@@ -152,6 +181,43 @@ class Eagle3DraftBuilder:
             v_scale=getattr(module, "v_scale", None),
         )
 
+    def get_kv_transfer_tensors(self) -> list:
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        runner = self.model_runner
+        if not hasattr(runner, "eagle3_kv_cache"):
+            return []
+
+        regions: list[KVTransferRegion] = []
+        cache = runner.eagle3_kv_cache
+        for layer_id in range(self.num_layers):
+            for kv in range(2):
+                t = cache[kv, layer_id]
+                regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=t.stride(0) * t.element_size(),
+                    )
+                )
+        scale = runner.eagle3_kv_scale
+        if (
+            self.model_runner.config.kv_cache_dtype == "fp8"
+            and scale is not None
+            and scale.numel() > 0
+        ):
+            for layer_id in range(self.num_layers):
+                for kv in range(2):
+                    t = scale[kv, layer_id]
+                    regions.append(
+                        KVTransferRegion(
+                            base_addr=t.data_ptr(),
+                            total_bytes=t.numel() * t.element_size(),
+                            unit_bytes=t.stride(0) * t.element_size(),
+                        )
+                    )
+        return regions
+
 
 class EagleProposer:
 
@@ -183,12 +249,19 @@ class EagleProposer:
         model_class = resolve_obj_by_qualname(support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]])  # type: ignore
 
         if self.speculative_config.method == "eagle3":
-            # Eagle3 draft model has its own architecture (Llama, not MLA),
-            # so it must be constructed with the draft model's hf_config.
-            # Also disable torch.compile for the draft model to avoid
+            # Eagle3 draft has its own architecture, so build it from the
+            # draft hf_config. Disable torch.compile for the draft to avoid
             # Dynamo tracing issues with the separate KV cache binding.
-            draft_atom_config = copy.deepcopy(atom_config)
+            # Shallow-copy instead of deepcopy: with MLA targets (K2.6), the
+            # atom_config holds non-picklable cuda.Stream objects under
+            # downstream fields that deepcopy can't traverse. We only mutate
+            # hf_config and compilation_config.level on the draft, so
+            # isolating just those two attrs is sufficient.
+            draft_atom_config = copy.copy(atom_config)
             draft_atom_config.hf_config = draft_model_hf_config
+            draft_atom_config.compilation_config = copy.copy(
+                atom_config.compilation_config
+            )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
@@ -196,15 +269,20 @@ class EagleProposer:
                 draft_atom_config,
                 layer_offset=atom_config.hf_config.num_hidden_layers,
             )
-            # Attach the draft's KV-cache builder to the runner. ModelRunner
-            # consults `runner.eagle3_draft_builder` from `_compute_block_bytes`
-            # / `allocate_kv_cache` to size + allocate + bind the draft's
-            # independent non-MLA cache through the standard builder protocol.
-            runner.eagle3_draft_builder = Eagle3DraftBuilder(
-                runner, draft_model_hf_config
-            )
+            # MHA draft (e.g. K2.5 LlamaForCausalLMEagle3): owns an independent
+            # non-MLA KV cache via Eagle3DraftBuilder, attached to the runner.
+            # MLA draft (e.g. K2.6 EAGLE 3.1): same MLA shape as target, so
+            # it piggybacks on the target's MLA pool (model_runner accounts
+            # for the +1 draft layer via num_nextn_predict_layers default).
+            draft_is_mla = bool(getattr(draft_model_hf_config, "kv_lora_rank", None))
+            if not draft_is_mla:
+                runner.eagle3_draft_builder = Eagle3DraftBuilder(
+                    runner, draft_model_hf_config
+                )
         else:
             self.model = model_class(self.config)
+
+        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
@@ -234,8 +312,6 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         if self.speculative_config.method == "eagle3":
-            # Eagle3: load from a separate draft model checkpoint with
-            # independent embed_tokens and lm_head (no sharing).
             load_model(
                 self.model,
                 self.speculative_config.model,
@@ -270,11 +346,21 @@ class EagleProposer:
             self.model.share_with_target(target_base, loaded)
             return
 
-        # Share embed_tokens with the target model
+        # Share embed_tokens with the target model. Match on the *logical* vocab
+        # (num_embeddings) and hidden dim rather than the stored weight shape, so a
+        # replicated target embed ([vocab, hidden], ATOM_REPLICATE_VOCAB_EMBED) is
+        # still shared onto a TP-sharded draft embed ([vocab/tp, hidden]) — the
+        # draft then reuses the target's replicated table (no post-embed
+        # all-reduce). When both are sharded this is identical to the old check.
+        draft_embed = self.model.model.embed_tokens
+        target_embed = target_base.model.embed_tokens
+        draft_vocab = getattr(draft_embed, "num_embeddings", None)
+        target_vocab = getattr(target_embed, "num_embeddings", None)
         if (
             get_pp_group().world_size == 1
-            and self.model.model.embed_tokens.weight.shape
-            == target_base.model.embed_tokens.weight.shape
+            and draft_vocab is not None
+            and draft_vocab == target_vocab
+            and draft_embed.weight.shape[1] == target_embed.weight.shape[1]
         ):
             logger.info(
                 "Assuming the EAGLE head shares the same vocab embedding"
@@ -312,6 +398,16 @@ class EagleProposer:
             "lm_head",
         )
 
+    def _refresh_dp_metadata(self, forward_context, num_local_tokens: int) -> None:
+        parallel_config = self.config.parallel_config
+        if parallel_config.data_parallel_size <= 1:
+            return
+        forward_context.context.dp_uniform_decode = False
+        forward_context.dp_metadata = DPMetadata.make(
+            parallel_config,
+            num_local_tokens,
+        )
+
     def propose(
         self,
         # [num_tokens]
@@ -334,6 +430,7 @@ class EagleProposer:
         context.is_draft = True
 
         assert self.runner is not None
+
         input_ids = target_token_ids
         # input_ids[last_token_indices] = next_token_ids
         input_ids.scatter_(0, last_token_indices, next_token_ids)
@@ -349,20 +446,21 @@ class EagleProposer:
         draft_token_ids = torch.empty(
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
+        if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL:
+            draft_token_ids.fill_(-1)
         var = self.runner.forward_vars
         target_uses_mla = self.runner.use_mla
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
 
-        # Eagle3 MLA: re-slice slot_mapping to len(input_ids).
-        # Target's MLA prepare_decode sized it
-        # to bs*max_q_len; after rejection len(input_ids) may be smaller,
-        # and the MHA cache-write kernel asserts slot_mapping <= q.
-        # Other fields (block_tables, context_lens, slot_mapping values
-        # themselves) are already in a draft-compatible format because
-        # MLA's prepare_decode uses the same runner.block_size as the draft.
+        # Eagle3 MHA reuses target metadata, but the target may be MLA.  Keep
+        # write slots sized to this draft pass, and when prefix cache is active
+        # restore logical block ids: MLA prefill expands block_tables by
+        # block_ratio for its physical block_size=1 pool, while the draft MHA
+        # cache is indexed by runner.block_size blocks.
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
+            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
 
         # Backends that expose flat per-seq kv_indices/kv_indptr (MLA, MHA)
         # wire them through eagle's mid-step block; V4 has block_tables +
@@ -373,27 +471,60 @@ class EagleProposer:
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
-                model_output = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    hidden_states=hidden_states,
-                )
-                # Eagle3 draft (the only draft_uses_mha case under narrow
-                # semantics) returns (post_norm, pre_norm); MTP drafts return
-                # a single hidden tensor.
-                if draft_uses_mha:
-                    ret_hidden_states, ret_hidden_prenorm = model_output
+                # Re-sync DP token
+                self._refresh_dp_metadata(forward_context, input_ids.shape[0])
+                # ---- Prefill Context Parallel (draft i==0 prefill) --------
+                # The draft's first pass is a prefill that reuses the target's
+                # 1/pcp-reindexed attn_metadata, so it must run on this rank's
+                # 1/pcp query shard (input_ids / positions / previous hidden) and
+                # all-gather the draft hidden back to full token order before the
+                # last-token sampling gather. Later draft steps are decode
+                # (is_prefill False) and run full — identical to the non-PCP path.
+                # `input_ids` / `positions` / `hidden_states` themselves stay full
+                # so the post-i==0 decode-metadata setup (which indexes with the
+                # full `last_token_indices`) is unchanged.
+                pcp_draft_prefill = i == 0 and _pcp_active_for_draft_model(self.model)
+                if pcp_draft_prefill:
+                    pcp_ws = get_pcp_world_size()
+                    n_global_draft = input_ids.shape[0]
+                    n_pad = pcp_pad_len(n_global_draft, pcp_ws) - n_global_draft
+                    d_input_ids = pcp_round_robin_split(
+                        pcp_pad_dense(input_ids, n_pad), pcp_ws
+                    )
+                    d_positions = pcp_round_robin_split(
+                        pcp_pad_dense(positions, n_pad), pcp_ws
+                    )
+                    d_hidden = pcp_round_robin_split(
+                        pcp_pad_dense(hidden_states, n_pad), pcp_ws
+                    )
                 else:
-                    ret_hidden_states = model_output
-                    ret_hidden_prenorm = None
+                    d_input_ids, d_positions, d_hidden = (
+                        input_ids,
+                        positions,
+                        hidden_states,
+                    )
+                ret_hidden_states = self.model(
+                    input_ids=d_input_ids,
+                    positions=d_positions,
+                    hidden_states=d_hidden,
+                )
+                if pcp_draft_prefill:
+                    ret_hidden_states = pcp_allgather_rerange(
+                        ret_hidden_states, pcp_ws
+                    )[:n_global_draft]
 
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
                     if i == 0
                     else ret_hidden_states
                 )
-                logits = self.model.compute_logits(sample_hidden_states)
-                new_draft_ids = logits.argmax(dim=-1)
+                # Distributed argmax (all-gather [N, 2] not [N, vocab]) when the
+                # draft supports it; token-identical to compute_logits().argmax().
+                if self._draft_argmax_fused:
+                    new_draft_ids = self.model.compute_draft_token(sample_hidden_states)
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -419,6 +550,18 @@ class EagleProposer:
                         if target_uses_mla:
                             kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
                             attn_metadata.kv_last_page_lens = kv_last_page_lens
+                            # Sparse (DSA) MLA decode packs KV per token at
+                            # page_size=1, so it reads the all-1s
+                            # sparse_kv_last_page_lens (NOT the dense per-block
+                            # buffer, which makes the asm kernel over-read past
+                            # the written sparse-index region -> illegal access).
+                            # The draft reuses the target's attn_metadata but
+                            # drops to max_seqlen_q=1, so it must re-point this to
+                            # the per-seq all-1s slice itself.
+                            if "sparse_kv_last_page_lens" in var:
+                                attn_metadata.sparse_kv_last_page_lens = var[
+                                    "sparse_kv_last_page_lens"
+                                ].gpu[:bs]
                         # block_tables, context_lens, and sparse_kv_indptr are
                         # needed by both MHA and MLA+sparse attention
                         attn_metadata.block_tables = var["block_tables"].gpu[:bs]
@@ -433,14 +576,35 @@ class EagleProposer:
                             kv_indptr[1 : bs + 1] -= torch.cumsum(
                                 num_reject_tokens, dim=0
                             )
-                        positions = torch.gather(positions, 0, last_token_indices)
+                        if positions.ndim == 1:
+                            positions = torch.index_select(
+                                positions, 0, last_token_indices
+                            )
+                        else:
+                            # MRoPE positions keep the token axis last (e.g.
+                            # [3, num_tokens] for Qwen3.5), so select columns
+                            # instead of indexing dim 0.
+                            positions = torch.index_select(
+                                positions, positions.ndim - 1, last_token_indices
+                            )
                         context.is_prefill = False
 
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
-                    # Update context_lens for each draft step (needed by both
-                    # MHA attention and MLA+sparse indexer)
-                    attn_metadata.context_lens[:bs] += 1
+                    fuse_mtp = positions.ndim == 1 and getattr(
+                        self.runner.attn_metadata_builder,
+                        "fuse_mtp_decode_position_update",
+                        False,
+                    )
+                    if fuse_mtp:
+                        mtp_decode_kwargs = {
+                            "update_context_lens": True,
+                            "positions_out": positions,
+                        }
+                    else:
+                        attn_metadata.context_lens[:bs] += 1
+                        positions += 1
+                        mtp_decode_kwargs = {}
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
@@ -449,30 +613,19 @@ class EagleProposer:
                             else i0_max_seqlen_q
                         ),
                         attn_metadata.max_seqlen_k,
+                        positions,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
+                        **mtp_decode_kwargs,
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
-                    if has_flat_kv:
+                    if has_flat_kv and "slot_mapping" not in workinfos:
                         # MLA/MHA path: slot derived from flat kv_indices.
-                        # V4 doesn't expose flat kv_indices and its kernels
-                        # don't read attn_metadata.slot_mapping (state-ring +
-                        # swa_write_indices instead), so the update is skipped.
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
-                    positions += 1
-                    if ret_hidden_prenorm is not None:
-                        hidden_states = (
-                            torch.index_select(
-                                ret_hidden_prenorm, 0, last_token_indices
-                            )
-                            if i == 0
-                            else ret_hidden_prenorm
-                        )
-                    else:
-                        hidden_states = sample_hidden_states
+                    hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]

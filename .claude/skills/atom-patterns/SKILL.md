@@ -1,8 +1,9 @@
 ---
 name: atom-patterns
 description: Coding patterns and architecture index for the ATOM LLM inference engine
-version: 1.1.0
-source: local-git-analysis
+version: 1.2.0
+scope: ATOM repo on AMD ROCm
+last_updated: 2026-05-20
 ---
 
 # ATOM Patterns
@@ -28,12 +29,9 @@ atom/
 │   ├── attention_mla.py       # MLA attention (DeepSeek)
 │   ├── attention_mha.py       # Standard MHA attention
 │   └── paged_attention.py     # Paged attention backend
-├── models/                    # Model implementations
-│   ├── deepseek_v2.py         # DeepSeek V3/V3.2/GLM-5 (shared)
-│   ├── deepseek_v4.py         # DeepSeek V4 (HC, sparse attn, FP4 MoE)
-│   ├── deepseek_mtp.py        # DeepSeek MTP (speculative)
-│   ├── llama.py               # Llama family
-│   └── qwen3*.py              # Qwen3 variants
+├── models/                    # Model implementations (one file per family;
+│                              # `*_mtp.py` for MTP / speculative variants —
+│                              # run `ls atom/models/` for the current set)
 ├── spec_decode/
 │   └── eagle.py               # MTP proposer (speculative decoding)
 ├── plugin/                    # vLLM/SGLang plugin adapters
@@ -73,10 +71,11 @@ support_model_arch_dict = {
 
 ### Model Reuse Relationships
 
-- `deepseek_v2.py` ← DeepSeek V3, V3.2, GLM-5
-- `deepseek_v4.py` ← DeepSeek V4 (standalone, uses HC + sparse attn)
-- `deepseek_mtp.py` ← DeepSeek MTP models
-- `qwen3_5_mtp.py` ← Qwen3.5 MTP (hybrid GDN + full attention)
+One model file often serves multiple HuggingFace `model_type`s when their architecture is identical or a strict subset. The mapping lives in `atom/model_engine/model_runner.py:support_model_arch_dict` — that's the authoritative source. Common patterns:
+
+- A shared base file covers a family of closely-related releases (e.g. DeepSeek V3 / V3.2 / GLM-5 all dispatch to one `deepseek_v2.py`).
+- A standalone file when the architecture diverges enough that sharing causes branching everywhere (e.g. DeepSeek V4's hot-cold sparse attention + FP4 MoE).
+- An `_mtp.py` companion when the spec-decode head differs from the base model.
 
 ### TP Parallel Linear Pattern
 
@@ -129,21 +128,11 @@ MoE pattern: FusedMoE + shared_experts both use `reduce_results=False`, parent d
 
 ## Environment Variables
 
-All defined in `atom/utils/envs.py` as lazy lambdas:
-
-```python
-"ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
-```
-
-Key vars:
-- `AITER_LOG_LEVEL=WARNING` — suppress kernel log flooding
-- `ATOM_USE_TRITON_MOE=1` — triton MoE for V4
-- `ATOM_V4_TORCH_MOE=1` — torch fallback MoE for V4
-- `ATOM_V4_DIAG=1` — V4 diagnostic prints
+Authoritative list: `atom/utils/envs.py` (all `ATOM_*` defined as lazy lambdas). To read what an env var does, grep the file for its name — the lambda and the call site comment describe the behavior. Required per-model env vars are listed in `.github/benchmark/models.json` and `.github/benchmark/models_accuracy.json`.
 
 ## CI/CD
 
-- Accuracy tests: `.github/benchmark/models_accuracy.json` (model matrix)
-- Benchmark: `.github/benchmark/models.json`
-- Dashboard: `.github/dashboard/index.html` (gh-pages)
-- Docker: `docker login --password-stdin`, `checkout@v6`, `upload-artifact@v7`
+- Accuracy tests: `.github/benchmark/models_accuracy.json` (model matrix, thresholds, baselines).
+- Benchmark: `.github/benchmark/models.json` (server args, bench args, runner pinning).
+- Dashboard: `.github/dashboard/index.html` (gh-pages).
+- Workflows + action versions: `.github/workflows/*.yaml` is the source of truth (action versions pinned per workflow).

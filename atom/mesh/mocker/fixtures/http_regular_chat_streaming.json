@@ -1,0 +1,36 @@
+{
+  "name": "http_regular_chat_streaming",
+  "model": "hf-internal-testing/llama-tokenizer",
+  "endpoint": "/v1/chat/completions",
+  "route": {
+    "worker_kind": "regular",
+    "connection_mode": "http"
+  },
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "stream a short answer"
+      }
+    ],
+    "stream": true
+  },
+  "expected_response": {
+    "status": 200,
+    "body": {
+      "object": "chat.completion.chunk",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "Hello from the streaming virtual worker."
+          }
+        }
+      ]
+    }
+  },
+  "simulation": {
+    "ttft_ms": 0,
+    "chunk_interval_ms": 0
+  }
+}

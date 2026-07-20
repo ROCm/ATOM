@@ -82,10 +82,15 @@ def build_entries(
             continue
 
         model = derive_model_name(result_path, payload)
+        backend = str(
+            payload.get("dashboard_backend")
+            or payload.get("benchmark_backend")
+            or default_backend
+        )
         isl = int(payload.get("random_input_len", 0))
         osl = int(payload.get("random_output_len", 0))
         conc = int(payload.get("max_concurrency", 0))
-        label_prefix = f"{default_backend}::{model} {isl}/{osl} c={conc}"
+        label_prefix = f"{backend}::{model} {isl}/{osl} c={conc}"
         extra = f"Run: {run_url}" if run_url else ""
         gpu_name = payload.get("gpu_name", "")
         gpu_vram = payload.get("gpu_vram_gb", 0)

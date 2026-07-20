@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 
 @dataclass
@@ -19,6 +19,7 @@ class SamplingParams:
     # same prompt; each uses independent random noise at the sampler so
     # outputs diverge when temperature > 0.
     n: int = 1
+    logprobs: Optional[Union[bool, int]] = None
 
     def __post_init__(self):
         if self.top_k != -1 and self.top_k < 1:

@@ -1,0 +1,3 @@
+# Rust formatting configuration
+reorder_imports = true
+reorder_modules = true

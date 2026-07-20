@@ -16,14 +16,17 @@ GPT-OSS-120B is a single-GPU model, so `--tensor-parallel-size` defaults to 1 an
 
 ```bash
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1 \
+VLLM_ROCM_USE_AITER=1 \
+VLLM_USE_V2_MODEL_RUNNER=1 \
 vllm serve openai/gpt-oss-120b \
     --host localhost \
     --port 8000 \
-    --kv-cache-dtype fp8 \
     --async-scheduling \
     --load-format fastsafetensors \
     --trust-remote-code \
+    --kv-cache-dtype fp8 \
     --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.5 \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
@@ -33,18 +36,23 @@ vllm serve openai/gpt-oss-120b \
 ## Step 3: Performance Benchmark
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
     --backend vllm \
     --base-url http://127.0.0.1:8000 \
     --endpoint /v1/completions \
     --model openai/gpt-oss-120b \
     --dataset-name random \
-    --random-input-len 1000 \
-    --random-output-len 100 \
-    --max-concurrency 4 \
-    --num-prompts 40 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --max-concurrency "${CONC}" \
+    --num-prompts "$(( CONC * 8 ))" \
     --trust_remote_code \
-    --num-warmups 8 \
+    --num-warmups "${CONC}" \
     --request-rate inf \
     --ignore-eos \
     --disable-tqdm \
@@ -63,8 +71,16 @@ profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_p
 ## Step 4: Accuracy Validation
 
 ```bash
-lm_eval --model local-completions \
-        --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+lm_eval --model local-chat-completions --apply_chat_template \
+        --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
+```
+
+Here is the reference value:
+```bash
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value|   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|----:|---|-----:|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  | 0.88|±  |0.0088|
+|     |       |strict-match    |     3|exact_match|↑  | 0.31|±  |0.0128|
 ```

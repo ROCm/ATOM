@@ -35,6 +35,14 @@ from atom.model_ops.v4_kernels.paged_decode_indices import (
     write_v4_paged_decode_indices,
     write_v4_paged_decode_indices_reference,
 )
+from atom.model_ops.v4_kernels.paged_prefill_indices import (
+    write_v4_paged_prefill_indices,
+    write_v4_paged_prefill_indices_reference,
+)
+from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
+    qk_norm_rope_maybe_quant,
+    qk_norm_rope_maybe_quant_reference,
+)
 from atom.model_ops.v4_kernels.state_writes import update_compressor_states, swa_write
 
 __all__ = [
@@ -54,4 +62,8 @@ __all__ = [
     "scale_indexer_weights",
     "write_v4_paged_decode_indices",
     "write_v4_paged_decode_indices_reference",
+    "write_v4_paged_prefill_indices",
+    "write_v4_paged_prefill_indices_reference",
+    "qk_norm_rope_maybe_quant",
+    "qk_norm_rope_maybe_quant_reference",
 ]

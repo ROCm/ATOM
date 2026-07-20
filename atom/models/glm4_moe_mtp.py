@@ -2,18 +2,23 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.parallel_state import get_tp_group
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
 from transformers import PretrainedConfig
 
 from .deepseek_mtp import rewrite_spec_layer_name
 
-from .glm4_moe import Glm4MoeDecoderLayer, get_spec_layer_idx_from_weight_name
+from .glm4_moe import (
+    ENABLE_ALLREDUCE_RMSNORM_FUSION,
+    Glm4MoeDecoderLayer,
+    get_spec_layer_idx_from_weight_name,
+)
 from .utils import maybe_prefix
 
 
@@ -58,6 +63,8 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
             prefix=prefix,
         )
 
+        self.tp_size = get_tp_group().world_size
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -78,6 +85,17 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
+        # When allreduce+RMSNorm fusion is on, Glm4MoeDecoderLayer leaves its
+        # final MoE down_proj output as an un-reduced TP partial sum, deferring
+        # the all-reduce to the *next* layer's fused input_layernorm. The MTP
+        # block is the last layer, so there is no next layer to complete it --
+        # we must reduce explicitly here (mirrors DeepSeek/MiMo MTP). When the
+        # fusion is off the MoE already reduced internally, so adding one here
+        # would double-reduce; hence the gate. No extra communication is
+        # introduced versus a correct fused path (the reduce is required either
+        # way), so performance is preserved.
+        if ENABLE_ALLREDUCE_RMSNORM_FUSION and self.tp_size > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -191,15 +209,10 @@ class Glm4MoeMTP(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        num_experts = self.config.n_routed_experts
-        if (
-            is_rocm_aiter_fusion_shared_expert_enabled()
-            and self.config.n_shared_experts
-        ):
-            num_experts += self.config.n_shared_experts
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=num_experts,
+            num_experts=self.config.n_routed_experts
+            + (self.config.n_shared_experts or 0),
         )

@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from .prefill_token_split import (
+    StraddleSplitInfo,
+    TokenSplitPrefillState,
+    compute_straddle_split_info,
+)
 from .ubatch_splitting import (
     UBatchSlice,
     maybe_create_ubatch_slices,
@@ -8,7 +13,10 @@ from .ubatch_splitting import (
 )
 from .ubatch_wrapper import UBatchWrapper
 from .ubatching import (
+    DPSyncResult,
     TBOContext,
+    local_tbo_precompute,
+    sync_dp_for_tbo,
     tbo_overlap_enabled,
     make_tbo_contexts,
     tbo_enabled,
@@ -27,9 +35,15 @@ from .ubatching import (
 )
 
 __all__ = [
+    "DPSyncResult",
+    "StraddleSplitInfo",
     "TBOContext",
+    "TokenSplitPrefillState",
     "UBatchSlice",
     "UBatchWrapper",
+    "compute_straddle_split_info",
+    "local_tbo_precompute",
+    "sync_dp_for_tbo",
     "tbo_overlap_enabled",
     "make_tbo_contexts",
     "maybe_create_ubatch_slices",

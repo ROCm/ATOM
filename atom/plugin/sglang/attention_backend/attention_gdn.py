@@ -164,7 +164,7 @@ class SGLangGDNForwardContext:
     def build(
         cls, forward_batch_or_metadata: Any
     ) -> Optional["SGLangGDNForwardContext"]:
-        from atom.plugin.sglang.models.base_model_wrapper import (
+        from atom.plugin.sglang.runtime import (
             SGLangForwardBatchMetadata,
         )
 

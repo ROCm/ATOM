@@ -8,17 +8,14 @@ Inputs are flat batched tensors; per-token slot/position lookups happen
 inside the kernel — no `.item()` syncs.
 
 Currently implemented:
-- `swa_write`: writes `swa_kv[state_slot_per_seq[batch_id_per_token[t]],
-  positions[t] % cache_size, :] = kv[t, :]` for each src row id `t` selected
-  by `write_indices`. The kernel does ALL gathers (kv row, position, batch
-  id, state slot) itself — caller passes only stable forward_vars buffers
-  (full `kv`, full `positions`, full `batch_id_per_token`, per-seq
-  `state_slot`). Race-free for long prefill via the `write_indices` filter
-  (only the last `cache_size` tokens per seq selected); CUDAGraph-safe via
-  sentinel skip (`write_indices[pid] < 0` → bail). `cache_size` is
-  `window_size + max_spec_steps` — for non-MTP this reduces to `window_size`
-  (no behavioral change); for MTP-k draft tokens get their own ring slots
-  separate from the verified token's slot.
+- `swa_write`: writes the LAST `min(tok_n_b, write_per_batch)` tokens of
+  every seq `b ∈ [0, bs)` into `swa_kv[state_slot_per_seq[b],
+  positions[src] % cache_size, :] = kv[src, :]`. `src_id` is derived inside
+  the kernel from `cu_seqlens_q + row_in_batch` — no shared per-token
+  `write_indices` GPU buffer (which had a DMA-tear race when the next fwd's
+  CPU rewrite landed mid-H2D). `cache_size = window_size + max_spec_steps`
+  — for non-MTP this reduces to `window_size`; for MTP-k draft tokens get
+  their own ring slots separate from the verified token's slot.
 - `update_compressor_states`: unified in-place update of Compressor's
   per-request `kv_state` + `score_state` ring buffers, covering both prefill
   (B-side overlap context + tail) and decode (every token at `pos % STATE_SIZE`
@@ -32,23 +29,26 @@ Currently implemented:
 
 Caller contract (`swa_write`):
 - `kv`                  [T, head_dim] flat — full per-fwd KV (forward_vars).
-- `write_indices`       [W] int — src row ids into `kv` / `positions` /
-                        `batch_id_per_token`. Sentinel = -1 → kernel skips.
-                        For long prefill (`seqlen > cache_size`) builder
-                        pre-filters to the last `cache_size` rows per seq to
-                        avoid `pos % cache_size` collisions. For decode/MTP
-                        every row is written.
 - `positions`           [T] int — full positions buffer (forward_vars).
-- `batch_id_per_token`  [T] int — Phase-B `v4_batch_id_per_token` mapping;
-                        kernel does `state_slot_per_seq[batch_id]` for the
-                        per-seq state-cache slot. Single per-token mapping
-                        principle (no per-token slot alias).
+- `cu_seqlens_q`        [bs+1] int — per-fwd cumulative seqlens (so
+                        seq `i` covers token rows `[cu_seqlens_q[i], cu_seqlens_q[i+1])`
+                        in `kv` / `positions`). Per-seq token count is
+                        derived inside the kernel as `cu_seqlens_q[i+1] -
+                        cu_seqlens_q[i]`.
 - `state_slot_per_seq`  [bs] int — `state_slot_mapping_gpu_i32`.
 - `swa_kv`              [num_slots, cache_size, head_dim] in-place buffer.
 - `cache_size`          int ring-slot count = `window_size + max_spec_steps`
                         (e.g. 128 + 0 = 128 non-MTP; 128 + 1 = 129 MTP-1).
+- `write_per_batch`     int — max tokens to write per seq this fwd
+                        (= `min(max_q_len, cache_size)`). Used as Triton
+                        `constexpr` for grid sizing.
 
-Grid = `write_indices.shape[0]`; each program processes one src row id.
+Grid = `(bs, write_per_batch)`; each program writes one (seq, row-in-seq)
+token. Per-seq actual count is `min(token_num_per_seq[bs], write_per_batch)`;
+threads whose `row_in_batch >= actual_count` bail. The kernel derives
+`src_id = cu_seqlens_q[i+1] - actual_count + row_in_batch` — selects the
+LAST `actual_count` tokens of seq `i` in `kv` / `positions`, no shared
+GPU index buffer needed (no DMA race window).
 """
 
 import torch
@@ -59,31 +59,51 @@ import triton.language as tl
 @triton.jit
 def _swa_write_kernel(
     kv_ptr,  # [T, head_dim]
-    write_indices_ptr,  # [W] int — src row id; sentinel=-1 → skip
     positions_ptr,  # [T] int — full positions
-    batch_id_per_token_ptr,  # [T] int — v4_batch_id_per_token
-    state_slot_per_seq_ptr,  # [bs] int — state_slot_mapping_gpu_i32
-    swa_kv_ptr,  # [num_slots, cache_size, head_dim]
-    swa_kv_slot_stride,  # = cache_size * head_dim
-    swa_kv_pos_stride,  # = head_dim
+    cu_seqlens_q_ptr,  # [bs+1] int — per-seq cumulative seqlens
+    block_tables_ptr,  # [bs, max_blocks_per_seq] int32 — logical→physical
+    block_tables_stride,  # = max_blocks_per_seq (row stride)
+    swa_region_ptr,  # [num_pages, head_dim] flat SWA region of unified_kv
+    swa_region_row_stride,  # = head_dim
     head_dim,
-    cache_size,
+    block_size,
+    WRITE_PER_BATCH: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """One program per write_indices entry. Sentinel skip via write_indices < 0.
+    """paged-SWA write. 2D grid `(bs, WRITE_PER_BATCH)`. Program `(b, r)`
+    writes the `r`-th of the last-N tokens of seq `b`, where
+    `N = min(tok_n_b, WRITE_PER_BATCH)` and
+    `tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`. Threads with `r >= N` bail.
 
-    Reads kv row + position + batch_id by indirection through `write_indices`,
-    then looks up state slot via `state_slot_per_seq[batch_id]`. All four
-    source tensors are stable forward_vars buffers; no captured-region alloc.
+    `src_id = cu_seqlens_q[b+1] - N + r` — selects directly from `kv` /
+    `positions` with NO shared GPU index buffer (no DMA race window).
+
+    The destination is content-addressed by `block_tables` (same physical
+    block id the compressed cache uses), so a cross-request prefix-cache hit
+    reads the original request's SWA from the cached physical block instead of
+    a stale per-request ring (issue #1417):
+        blk      = pos // block_size
+        phys     = block_tables[b, blk]
+        dst_row  = phys * block_size + (pos % block_size)
     """
-    pid = tl.program_id(0)
-    src_id = tl.load(write_indices_ptr + pid)
-    if src_id < 0:
+    batch_idx = tl.program_id(0)
+    row_in_batch = tl.program_id(1)
+
+    cu_start = tl.load(cu_seqlens_q_ptr + batch_idx)
+    cu_end = tl.load(cu_seqlens_q_ptr + batch_idx + 1)
+    tok_n = cu_end - cu_start
+    if tok_n <= 0:
         return
+    write_n = tl.minimum(tok_n, WRITE_PER_BATCH)
+    if row_in_batch >= write_n:
+        return
+
+    src_id = cu_end - write_n + row_in_batch
+
     pos = tl.load(positions_ptr + src_id)
-    bid = tl.load(batch_id_per_token_ptr + src_id)
-    slot = tl.load(state_slot_per_seq_ptr + bid)
-    ring_idx = pos % cache_size
+    blk = pos // block_size
+    phys = tl.load(block_tables_ptr + batch_idx * block_tables_stride + blk)
+    dst_row = phys * block_size + (pos % block_size)
 
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < head_dim
@@ -92,112 +112,114 @@ def _swa_write_kernel(
         kv_ptr + src_id * head_dim + d_offsets,
         mask=d_mask,
     )
-    dst = (
-        swa_kv_ptr
-        + slot * swa_kv_slot_stride
-        + ring_idx * swa_kv_pos_stride
-        + d_offsets
-    )
+    dst = swa_region_ptr + dst_row * swa_region_row_stride + d_offsets
     tl.store(dst, src, mask=d_mask)
 
 
 def swa_write(
     kv: torch.Tensor,
-    write_indices: torch.Tensor,
     positions: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
-    state_slot_per_seq: torch.Tensor,
-    swa_kv: torch.Tensor,
-    cache_size: int,
+    cu_seqlens_q: torch.Tensor,
+    block_tables: torch.Tensor,
+    swa_region: torch.Tensor,
+    block_size: int,
+    write_per_batch: int,
 ) -> None:
-    """In-place write
-    `swa_kv[state_slot_per_seq[bid], pos % cache_size, :] = kv[r, :]` for
-    each `r = write_indices[pid]` (skip pid where `write_indices[pid] < 0`).
+    """paged-SWA in-place write. For the last
+    `min(tok_n_b, write_per_batch)` tokens of every seq `b ∈ [0, bs)` this fwd
+    (`tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`, `bs = block_tables.shape[0]`),
+    write `kv[r]` to the content-addressed SWA region:
+        swa_region[block_tables[b, pos//block_size] * block_size
+                   + pos % block_size, :] = kv[r, :]
 
-    Per-token quantities (`pos`, `bid`) are gathered inside the kernel via
-    `positions[r]` / `batch_id_per_token[r]`; per-seq `state_slot_per_seq`
-    is looked up via `bid`. Caller passes only stable forward_vars buffers
-    (no captured-region alloc, no per-token slot alias).
+    Replaces the per-request ring (`swa_kv[slot, pos % cache_size]`). The
+    physical block id is the SAME one the compressed cache uses, so a
+    cross-request prefix-cache hit reads the original request's SWA from the
+    cached block instead of a stale ring (issue #1417).
 
     Args:
-        kv: [T, head_dim] full per-fwd KV (BF16). Stable buffer (slice or alias).
-        write_indices: [W] int — src row ids to write. Sentinel=-1 skipped.
-            `W` may be `total_tokens` (decode/MTP, every row real) or
-            `num_write` (long-prefill compact) or padded with -1 trailing
-            sentinels (CG fixed-grid).
-        positions: [T] int — full forward_vars["positions"].
-        batch_id_per_token: [T] int — v4_batch_id_per_token mapping.
-        state_slot_per_seq: [bs] int — per-seq state cache slot.
-        swa_kv: [num_slots, cache_size, head_dim] in-place ring buffer.
-        cache_size: ring-slot count = `window_size + max_spec_steps`.
-            For non-MTP this equals `window_size` and the kernel is bytewise
-            identical to the pre-MTP behavior.
+        kv: [T, head_dim] per-fwd KV (BF16). `T = cu_seqlens_q[bs]`.
+        positions: [T'] int — full forward_vars["positions"] (`T' >= T`).
+        cu_seqlens_q: [bs+1] int — exact size (`bs == block_tables.shape[0]`).
+        block_tables: [bs, max_blocks_per_seq] int32 — logical→physical block.
+            Its `shape[0]` is the grid X dim and source-of-truth for `bs`.
+        swa_region: [num_pages, head_dim] flat SWA region of `unified_kv`
+            (= `unified_kv[:swa_pages]`), `num_pages = num_blocks * block_size`.
+        block_size: tokens per block (= V4 block_size, 128).
+        write_per_batch: `min(max_q_len, block_size_window)` — max tokens
+            written per seq this fwd (grid y dim, kernel `constexpr`).
     """
     assert kv.dim() == 2, f"kv must be [T, D], got {kv.shape}"
-    assert write_indices.dim() == 1
     assert positions.dim() == 1
-    assert batch_id_per_token.dim() == 1
-    assert state_slot_per_seq.dim() == 1
-    assert swa_kv.dim() == 3, f"swa_kv must be [S, C, D], got {swa_kv.shape}"
+    assert (
+        block_tables.dim() == 2
+    ), f"block_tables must be [bs, MB], got {block_tables.shape}"
+    bs = block_tables.shape[0]
+    assert cu_seqlens_q.dim() == 1 and cu_seqlens_q.shape[0] >= bs + 1
+    assert swa_region.dim() == 2, f"swa_region must be [P, D], got {swa_region.shape}"
     T, head_dim = kv.shape
     assert positions.shape[0] >= T, f"positions {positions.shape[0]} < kv T={T}"
+    assert swa_region.shape[1] == head_dim
+    assert kv.is_contiguous() and swa_region.is_contiguous()
     assert (
-        batch_id_per_token.shape[0] >= T
-    ), f"batch_id_per_token {batch_id_per_token.shape[0]} < kv T={T}"
-    assert (
-        swa_kv.shape[1] == cache_size
-    ), f"swa_kv ring dim {swa_kv.shape[1]} != cache_size {cache_size}"
-    assert swa_kv.shape[2] == head_dim
-    assert kv.is_contiguous() and swa_kv.is_contiguous()
-
-    W = write_indices.shape[0]
-    if W == 0:
-        return
+        bs > 0 and write_per_batch > 0
+    ), f"bs={bs}, write_per_batch={write_per_batch} must be positive"
 
     # head_dim is small (e.g. 64-128 for V4 SWA layer), so a single Triton
     # block per token covers it. Round up to the next power of two for tl.
     BLOCK_D = triton.next_power_of_2(head_dim)
-    grid = (W,)
+    grid = (bs, write_per_batch)
 
     _swa_write_kernel[grid](
         kv,
-        write_indices,
         positions,
-        batch_id_per_token,
-        state_slot_per_seq,
-        swa_kv,
-        swa_kv.stride(0),
-        swa_kv.stride(1),
+        cu_seqlens_q,
+        block_tables,
+        block_tables.stride(0),
+        swa_region,
+        swa_region.stride(0),
         head_dim,
-        cache_size,
+        block_size,
+        WRITE_PER_BATCH=write_per_batch,
         BLOCK_D=BLOCK_D,
     )
 
 
 def swa_write_reference(
     kv: torch.Tensor,
-    write_indices: torch.Tensor,
     positions: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
-    state_slot_per_seq: torch.Tensor,
-    swa_kv: torch.Tensor,
-    cache_size: int,
+    cu_seqlens_q: torch.Tensor,
+    block_tables: torch.Tensor,
+    swa_region: torch.Tensor,
+    block_size: int,
+    write_per_batch: int,
 ) -> None:
-    """Pure-PyTorch reference equivalent of `swa_write`. For tests / dump-bisect.
+    """Pure-PyTorch reference equivalent of `swa_write` (paged). For tests.
 
-    Mirrors the kernel: filter sentinel rows, gather kv/positions/batch_id by
-    write_indices, look up state slot via batch_id, ring-buffer write.
+    Mirrors the kernel: for each seq `b ∈ [0, bs)`
+    (`bs = block_tables.shape[0]`), take the last
+    `min(cu_seqlens_q[b+1] - cu_seqlens_q[b], write_per_batch)` rows of `kv`
+    for that seq, translate each token's position through `block_tables`, and
+    write to the content-addressed SWA region.
     """
-    keep = write_indices >= 0
-    src_ids = write_indices[keep].long()
-    if src_ids.numel() == 0:
-        return
-    src_kv = kv[src_ids]
-    src_pos = positions[src_ids]
-    bids = batch_id_per_token[src_ids].long()
-    slots = state_slot_per_seq[bids].long()
-    ring_idx = src_pos % cache_size
-    swa_kv[slots, ring_idx] = src_kv
+    bs = block_tables.shape[0]
+    cu_cpu = cu_seqlens_q[: bs + 1].tolist()
+    for b in range(bs):
+        cu_start = int(cu_cpu[b])
+        cu_end = int(cu_cpu[b + 1])
+        tok_n = cu_end - cu_start
+        write_n = min(tok_n, write_per_batch)
+        if write_n <= 0:
+            continue
+        src_ids = torch.arange(
+            cu_end - write_n, cu_end, dtype=torch.long, device=kv.device
+        )
+        src_kv = kv[src_ids]
+        src_pos = positions[src_ids].to(torch.long)
+        blk = src_pos // block_size
+        phys = block_tables[b, blk].to(torch.long)
+        dst_row = phys * block_size + (src_pos % block_size)
+        swa_region[dst_row] = src_kv
 
 
 # === Unified Compressor state save (plan path) ==========================
@@ -222,20 +244,22 @@ def swa_write_reference(
 @triton.jit
 def _update_compressor_states_kernel(
     kv_ptr,  # [N, dim] (strided allowed)
-    kv_row_stride,
+    kv_row_stride: tl.constexpr,
     score_ptr,  # [N, dim] (strided allowed)
-    score_row_stride,
+    score_row_stride: tl.constexpr,
     ape_ptr,  # [RATIO, dim]
     write_plan_ptr,  # [num_write, 4] int32 (ragged_id, batch_id, position, _)
     state_slot_mapping_ptr,  # [bs] int32 — per-seq state cache slot
     kv_state_ptr,
-    kv_state_slot_stride,
-    kv_state_pos_stride,
+    kv_state_slot_stride: tl.constexpr,
+    kv_state_pos_stride: tl.constexpr,
     score_state_ptr,
-    score_state_slot_stride,
-    score_state_pos_stride,
-    dim,
-    STATE_SIZE: tl.constexpr,  # = 2*RATIO if OVERLAP else RATIO
+    score_state_slot_stride: tl.constexpr,
+    score_state_pos_stride: tl.constexpr,
+    dim: tl.constexpr,
+    STATE_SIZE: tl.constexpr,  # ring buffer modulo = kv_state.shape[1] (≥ K_pool;
+    #   V4-Pro spec decode: K_pool + max_spec_steps to keep R's rejected writes
+    #   out of R+1's read window; non-spec or pre-spec models: exactly K_pool)
     OVERLAP: tl.constexpr,
     RATIO: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -305,20 +329,25 @@ def update_compressor_states(
     overlap: bool,
 ) -> None:
     """In-place update of Compressor's per-request `kv_state`/`score_state`
-    ring buffer (size `2*ratio` for overlap CSA, `ratio` for HCA), driven by
-    a SGLang-style packed `write_plan`.
+    ring buffer (size ≥ `K_pool = (1+overlap)*ratio`; V4-Pro widens to
+    `K_pool + max_spec_steps` for spec decode, keeps `K_pool` for non-spec),
+    driven by a SGLang-style packed `write_plan`.
 
     The plan is pre-filtered on the host to include only tokens whose
-    `position` falls in the per-seq "last STATE_SIZE absolute positions"
-    window — the kernel writes unconditionally, no in-kernel mask.
+    `position` falls in the per-seq "last K_pool absolute positions" window
+    (`write_starts = max(0, context_lens - K_pool)` in `make_compress_plans`)
+    — the kernel writes unconditionally, no in-kernel mask. Note that the
+    write window is K_pool, NOT STATE_SIZE; the extra STATE_SIZE - K_pool
+    slots exist purely as aliasing slack for spec rollback (see
+    `csa_main_state_shape` comment in `deepseek_v4_attn.py`).
 
     Args:
       kv:           [N, dim] flat batched KV (typically fp32 or bf16, cast inside).
       score:        [N, dim] flat batched score (NOT pre-added with ape;
                     kernel fuses ape addition).
       ape:          [ratio, dim] absolute position embedding.
-      kv_state:     [num_slots, S, dim] in-place ring buffer.
-                    S = 2*ratio if overlap else ratio.
+      kv_state:     [num_slots, S, dim] in-place ring buffer. S ≥ K_pool;
+                    V4-Pro: S = K_pool + max_spec_steps.
       score_state:  same shape as kv_state.
       write_plan:   [num_write, 4] int32 — packed (ragged_id, batch_id,
                     position, _); each row = one token to write.
@@ -396,6 +425,11 @@ def update_compressor_states_reference(
     slot_map_cpu = state_slot_mapping.detach().cpu()
     for i in range(plan_cpu.shape[0]):
         ragged_id, batch_id, position, _ = plan_cpu[i].tolist()
+        # Skip sentinel rows (position = -1) exactly like the kernel. Without
+        # this, Python's negative modulo (`-1 % state_size == state_size-1`)
+        # would silently write a garbage row into the ring.
+        if position < 0:
+            continue
         slot = int(slot_map_cpu[batch_id].item())
         dst = position % state_size
         kv_state[slot, dst] = kv[ragged_id]

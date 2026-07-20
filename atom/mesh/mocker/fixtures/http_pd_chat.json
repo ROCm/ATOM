@@ -1,0 +1,40 @@
+{
+  "name": "http_pd_chat",
+  "model": "hf-internal-testing/llama-tokenizer",
+  "endpoint": "/v1/chat/completions",
+  "route": {
+    "worker_kind": "prefill_decode",
+    "connection_mode": "http"
+  },
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hello pd atomesh"
+      }
+    ],
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-pd-test",
+      "object": "chat.completion",
+      "model": "hf-internal-testing/llama-tokenizer",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hello from the PD virtual worker."
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  },
+  "simulation": {
+    "ttft_ms": 0,
+    "chunk_interval_ms": 0
+  }
+}

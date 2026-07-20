@@ -89,11 +89,13 @@ def _setup_ca_comm_signal(adapter: Any, tensor_model_parallel_size: int) -> None
     ca_comm.register_input_buffer(signal)
 
 
-def init_aiter_tp_from_vllm(tensor_model_parallel_size: int) -> bool:
+def init_aiter_dist_from_vllm(tensor_model_parallel_size: int) -> bool:
     """
-    Initialize aiter's TP group by reusing vLLM's TP and injecting aiter's ca_comm.
+    Initialize aiter's distributed groups by reusing vLLM's, and inject aiter's
+    ca_comm into the TP group.
 
-    Also sets _PP from vLLM so get_pp_group() works (required by model_wrapper).
+    Reuses vLLM's TP/PP/DP groups (and EP when present) so get_tp_group() /
+    get_pp_group() / get_dp_group() work without a duplicate IPC init.
 
     Returns True if reuse succeeded, False if fallback to init_aiter_dist is needed.
     """

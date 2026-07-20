@@ -250,6 +250,198 @@ def fused_recurrent_gated_delta_rule_fwd(
     return o, final_state
 
 
+@triton.jit
+def gdn_decode_update_lossy_fast_fwd_kernel(
+    A_log,
+    a,
+    dt_bias,
+    q,
+    k,
+    v,
+    b,
+    out,
+    state,
+    state_indices,
+    scale: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    HEADS_PER_V: tl.constexpr,
+):
+    i_k = tl.program_id(0)
+    i_v = tl.program_id(1)
+    i_nh = tl.program_id(2)
+    i_n = i_nh // HV
+    i_hv = i_nh - i_n * HV
+    i_h = i_hv // HEADS_PER_V
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    state_idx = tl.load(state_indices + i_n).to(tl.int64)
+    if state_idx < 0:
+        # Padded / idle slot (e.g. PAD_SLOT_ID = -1 from SGLang's
+        # mamba_cache_indices). Skip the state load/store and write zeros so
+        # downstream ops that consume the full out buffer do not see
+        # uninitialized memory.
+        out_offsets = (i_n * HV + i_hv) * V + o_v
+        tl.store(
+            out + out_offsets,
+            tl.zeros([BV], dtype=out.dtype.element_ty),
+            mask=mask_v,
+        )
+        return
+
+    state_base = ((state_idx * HV + i_hv) * K) * V
+    state_offsets = state_base + o_k[:, None] * V + o_v[None, :]
+    h = tl.load(
+        state + state_offsets,
+        mask=mask_h,
+        other=0.0,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+
+    q_offsets = (i_n * H + i_h) * K + o_k
+    k_offsets = (i_n * H + i_h) * K + o_k
+    v_offsets = (i_n * HV + i_hv) * V + o_v
+    q_vec = tl.load(
+        q + q_offsets,
+        mask=mask_k,
+        other=0.0,
+        cache_modifier=".ca",
+    ).to(tl.float32)
+    k_vec = tl.load(
+        k + k_offsets,
+        mask=mask_k,
+        other=0.0,
+        cache_modifier=".ca",
+    ).to(tl.float32)
+    v_vec = tl.load(
+        v + v_offsets,
+        mask=mask_v,
+        other=0.0,
+        cache_modifier=".ca",
+    ).to(tl.float32)
+
+    x = tl.load(a + i_n * HV + i_hv).to(tl.float32) + tl.load(dt_bias + i_hv).to(
+        tl.float32
+    )
+    softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+    gate = -tl.exp(tl.load(A_log + i_hv).to(tl.float32)) * softplus_x
+    beta_val = tl.sigmoid(tl.load(b + i_n * HV + i_hv).to(tl.float32))
+
+    q_vec = q_vec * tl.rsqrt(tl.sum(q_vec * q_vec, axis=0) + 1.0e-6)
+    k_vec = k_vec * tl.rsqrt(tl.sum(k_vec * k_vec, axis=0) + 1.0e-6)
+    q_vec = q_vec * scale
+
+    h = h * tl.exp(gate)
+    v_vec = (v_vec - tl.sum(h * k_vec[:, None], axis=0)) * beta_val
+    h = h + k_vec[:, None] * v_vec[None, :]
+    out_vec = tl.sum(h * q_vec[:, None], axis=0)
+
+    out_offsets = (i_n * HV + i_hv) * V + o_v
+    tl.store(out + out_offsets, out_vec.to(out.dtype.element_ty), mask=mask_v)
+    tl.store(
+        state + state_offsets,
+        h.to(state.dtype.element_ty),
+        mask=mask_h,
+        cache_modifier=".cg",
+    )
+
+
+def gdn_decode_update_lossy_fast(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Approximate decode fast path that fuses gating and recurrent update.
+
+    This path updates ``initial_state`` in place and returns the same tensor as
+    the final state. The kernel expects a contiguous state cache with layout
+    ``[slot, value_head, key_dim, value_dim]``.
+    """
+    if beta != 1.0 or threshold != 20.0:
+        raise ValueError(
+            "gdn_decode_update_lossy_fast supports beta=1.0 and threshold=20.0"
+        )
+    if not use_qk_l2norm_in_kernel:
+        raise ValueError("gdn_decode_update_lossy_fast requires QK L2 norm in kernel")
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    else:
+        assert scale > 0, "scale must be positive"
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    A_log = A_log.contiguous()
+    a = a.contiguous()
+    b = b.contiguous()
+    dt_bias = dt_bias.contiguous()
+    ssm_state_indices = ssm_state_indices.contiguous()
+
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    HV = v.shape[2]
+    assert B == 1, "decode fast path expects B == 1"
+    assert a.shape == (T, HV), "decode fast path expects a shaped [T, HV]"
+    assert b.shape == (T, HV), "decode fast path expects b shaped [T, HV]"
+    if HV < H or HV % H != 0:
+        raise ValueError(
+            "decode fast path expects value heads to be a multiple of heads"
+        )
+    if initial_state.ndim != 4 or initial_state.shape[1:] != (HV, K, V):
+        raise ValueError(
+            "decode fast path expects initial_state shaped "
+            f"[num_slots, {HV}, {K}, {V}]"
+        )
+    if not initial_state.is_contiguous():
+        raise ValueError("decode fast path expects contiguous initial_state")
+
+    BK = triton.next_power_of_2(K)
+    BV = 64
+    out = torch.empty_like(v).squeeze(0)
+    grid = (triton.cdiv(K, BK), triton.cdiv(V, BV), T * HV)
+    gdn_decode_update_lossy_fast_fwd_kernel[grid](
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        out,
+        initial_state,
+        ssm_state_indices,
+        scale,
+        H,
+        HV,
+        K,
+        V,
+        BK,
+        BV,
+        HV // H,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out.unsqueeze(0), initial_state
+
+
 class FusedRecurrentFunction(torch.autograd.Function):
     @staticmethod
     def forward(

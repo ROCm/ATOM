@@ -90,14 +90,11 @@ class MoRIIOConnector(KVConnectorBase):
 
         kv_transfer_config = config.kv_transfer_config
         self.local_ip = get_ip()
-        self._local_ping_port = get_open_port()
 
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.http_port = kv_transfer_config.get("http_port", 8000)
-        self.proxy_ping_port = kv_transfer_config.get("proxy_ping_port", 36367)
-        self.proxy_ip = kv_transfer_config.get("proxy_ip")
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.base_handshake_port = kv_transfer_config.get(
             "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
@@ -187,17 +184,12 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
-        # Start service-discovery ping (only on rank 0)
-        if self.tp_rank == 0 and self.dp_rank == 0:
-            self._ping_thread = threading.Thread(
-                target=self._service_discovery_ping,
-                args=(self.zmq_context,),
-                daemon=True,
-                name="kv-connector-ping",
-            )
-            self._ping_thread.start()
-
-    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, Any],
+        transfer_tensors: Any = None,
+        num_blocks: int | None = None,
+    ) -> None:
         """Register all KV cache tensors for RDMA and start the handshake listener.
 
         Must be called after model loading and KV cache allocation, before any
@@ -636,67 +628,6 @@ class MoRIIOConnector(KVConnectorBase):
             notify_port,
         )
 
-    def _service_discovery_ping(self, zmq_context: zmq.Context) -> None:
-        """Periodically register with the proxy for service discovery (rank 0 only)."""
-        http_endpoint = f"http://{self.request_address}/v1/completions"
-        role_code = "P" if self.is_producer else "D"
-        retry_count = 0
-        msg_index = 1
-        proxy_path = f"tcp://{self.proxy_ip}:{self.proxy_ping_port}"
-
-        with zmq_context.socket(zmq.DEALER) as sock:
-            sock.connect(proxy_path)
-
-            while True:
-                try:
-                    registration_data = {
-                        "type": "register",
-                        "role": role_code,
-                        "index": str(msg_index),
-                        "request_address": http_endpoint,
-                        "handshake_port": self.base_handshake_port,
-                        "dp_size": self.dp_size,
-                        "tp_size": self.tp_size,
-                        "transfer_mode": "read",
-                    }
-                    sock.send(msgpack.dumps(registration_data))
-                    logger.debug(
-                        "Ping #%d sent to %s (role=%s)",
-                        msg_index,
-                        proxy_path,
-                        role_code,
-                    )
-                    retry_count = 0
-
-                except ConnectionRefusedError:
-                    logger.info(
-                        "Proxy connection refused: %s:%s -> %s",
-                        self.local_ip,
-                        self._local_ping_port,
-                        proxy_path,
-                    )
-                    retry_count += 1
-
-                except OSError as e:
-                    logger.info("OS error during ping: %s", e)
-                    retry_count += 1
-
-                except Exception as e:
-                    logger.info("Unexpected ping error: %s", e)
-                    retry_count += 1
-                    if retry_count >= MoRIIOConstants.MAX_PING_RETRIES:
-                        logger.error(
-                            "Ping failed after %d retries, aborting",
-                            MoRIIOConstants.MAX_PING_RETRIES,
-                        )
-                        raise RuntimeError(
-                            f"Service discovery ping failed after {retry_count} retries"
-                        ) from e
-
-                finally:
-                    time.sleep(MoRIIOConstants.PING_INTERVAL_SECONDS)
-                    msg_index += 1
-
     def _handshake_listener(
         self,
         metadata: MoRIIOAgentMetadata,
@@ -953,6 +884,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.handshake_port = get_open_port()
+        self.base_handshake_port = kv_transfer_config.get(
+            "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
+        )
         self.engine_id = "None"
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.parallel_config.data_parallel_size
@@ -1042,6 +976,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         """
         # Attach output metadata for the proxy to relay
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
+        drafts = getattr(seq, "spec_token_ids", None)
+        draft_token_ids = (
+            [int(x) for x in drafts] if drafts is not None and len(drafts) else []
+        )
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -1049,10 +987,12 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
+            "remote_handshake_port": self.base_handshake_port,
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
+            "draft_token_ids": draft_token_ids,
         }
 
         # Clean up transfer ID mapping on the consumer side

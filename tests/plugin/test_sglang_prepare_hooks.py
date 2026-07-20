@@ -11,7 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from atom.plugin import prepare as plugin_prepare
+from atom.plugin import prepare as plugin_runtime
+from atom.plugin.sglang import prepare as sglang_prepare
 
 
 class _Obj:
@@ -44,27 +45,33 @@ def _module(name: str, **attrs) -> ModuleType:
     return module
 
 
+def _make_fake_runtime_module(model_arch: str, prepare_config):
+    module = ModuleType("atom.plugin.sglang.runtime")
+    module.get_model_arch_spec = MagicMock(
+        return_value=_Obj(prepare_config=prepare_config)
+    )
+    return module
+
+
 @pytest.fixture(autouse=True)
 def _reset_framework_state():
-    plugin_prepare._set_framework_backbone("atom")
+    plugin_runtime._set_framework_backbone("atom")
     yield
-    plugin_prepare._set_framework_backbone("atom")
+    plugin_runtime._set_framework_backbone("atom")
 
 
 @pytest.mark.parametrize(
-    "model_arch,expect_register_ops",
+    "model_arch",
     (
-        ("Qwen3_5ForConditionalGeneration", False),
-        ("Qwen3_5MoeForConditionalGeneration", False),
-        ("Qwen3NextForCausalLM", False),
-        ("DeepseekV3ForCausalLM", True),
-        ("Qwen3MoeForCausalLM", True),
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3NextForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "Qwen3MoeForCausalLM",
     ),
 )
-def test_prepare_model_register_ops_gate(
-    model_arch: str,
-    expect_register_ops: bool,
-):
+def test_prepare_model_register_ops_gate(model_arch: str):
     fake_atom_config = _Obj(plugin_config=_Obj(is_plugin_mode=True))
     fake_register, _fake_model, fake_model_cls = _make_fake_register_module(model_arch)
     fake_config_mod = MagicMock()
@@ -75,29 +82,34 @@ def test_prepare_model_register_ops_gate(
         "atom.plugin.sglang.models.qwen3_5",
         apply_prepare_model_adaptations=MagicMock(),
     )
+    prepare_config = (
+        fake_qwen35_mod.apply_prepare_model_adaptations
+        if model_arch
+        in {
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        }
+        else None
+    )
+    fake_runtime_mod = _make_fake_runtime_module(model_arch, prepare_config)
 
     with patch.dict(
         sys.modules,
         {
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
+            "atom.plugin.sglang.runtime": fake_runtime_mod,
             "atom.plugin.sglang.models.qwen3_5": fake_qwen35_mod,
             "atom.plugin.sglang.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },
     ):
-        plugin_prepare.prepare_model(
-            config=_Obj(architectures=[model_arch]),
-            engine="sglang",
-        )
+        sglang_prepare.prepare_model(config=_Obj(architectures=[model_arch]))
 
-    if expect_register_ops:
-        fake_register.register_ops_to_sglang.assert_called_once_with(
-            atom_config=fake_atom_config
-        )
-    else:
-        fake_register.register_ops_to_sglang.assert_not_called()
+    fake_register.register_ops_to_sglang.assert_called_once_with(
+        atom_config=fake_atom_config
+    )
     if model_arch in {
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",

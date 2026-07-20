@@ -21,32 +21,35 @@ huggingface-cli login
 ### Llama-3.1-8B-Instruct (TP=1)
 
 ```bash
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 
 vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 1 \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching
 ```
 
 ### Meta-Llama-3.1-405B-Instruct-FP8/ (TP=8)
 
 ```bash
-vllm serve meta-llama/Llama-3.1-405B-Instruct-FP8/ \
+vllm serve Meta-Llama-3.1-405B-Instruct-FP8/ \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 8 \
-    --load-format safetensors \
-    --allow-deprecated-quantization \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format safetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 8 \
+    --allow-deprecated-quantization \
+    --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching
 ```
 
@@ -55,17 +58,27 @@ vllm serve meta-llama/Llama-3.1-405B-Instruct-FP8/ \
 Users can use the default `vllm bench` command for performance benchmarking:
 
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
-    --trust-remote-code \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --max-concurrency "${CONC}" \
+    --num-prompts "$(( CONC * 8 ))" \
+    --trust_remote_code \
+    --num-warmups "${CONC}" \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
@@ -80,7 +93,7 @@ lm_eval --model local-completions \
         --num_fewshot 3
 ```
 
-Measured result (2026-04-03, TP=1, `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`):
+Measured result (2026-04-03, TP=1):
 
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
@@ -92,7 +105,7 @@ Measured result (2026-04-03, TP=1, `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`):
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=meta-llama/Llama-3.1-405B-Instruct-FP8/,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+        --model_args model=Meta-Llama-3.1-405B-Instruct-FP8/,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
 ```
@@ -107,5 +120,5 @@ Measured result (2026-04-07, TP=8, plain vLLM baseline with `VLLM_PLUGINS=''`, `
 
 ## CI Alignment Notes
 
-- `Llama-3.1-8B-Instruct` uses TP=1 in nightly accuracy (`RUN_LLAMA8_TP1`) with `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`.
+- `Llama-3.1-8B-Instruct` uses TP=1 in nightly accuracy (`RUN_LLAMA8_TP1`).
 - `Meta-Llama-3.1-405B-Instruct-FP8/` uses TP=8 in nightly accuracy (`RUN_LLAMA405_FP8_TP8`).

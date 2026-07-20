@@ -15,18 +15,65 @@ All the operations below will be executed inside the container.
 ### FP8 on 8xMI355X GPUs (TP8 + FP8 KV Cache)
 
 ```bash
-ATOM_USE_TRITON_MOE=1 \
+AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model deepseek-ai/DeepSeek-V4-Pro \
   --kv_cache_dtype fp8 -tp 8
 ```
 
 Tips on server configuration:
-- **`ATOM_USE_TRITON_MOE=1` is required.** V4-Pro routes 6 experts out of 384 with hash-based selection; the triton MoE backend is the only path that handles the FP8 E4M3 + UE8M0 block-scaled weights correctly. Launching without this env silently falls back to a numerically incorrect path and GSM8K accuracy drops from ~0.95 to ~0.6.
+- **MoE backend**: V4-Pro routes 6 experts out of 384 with hash-based selection. The default fused MoE path with `AITER_BF16_FP8_MOE_BOUND=0` + `ATOM_MOE_GU_ITLV=1` handles the FP4 e2m1 microscaling weights correctly — measured GSM8K (1319 samples, 3-shot flexible-extract) = 0.9522 on MI355X/gfx950.
 - Use `--kv_cache_dtype fp8` for memory efficiency. The CSA indexer's compressed K cache is stored separately in FP8 regardless.
 - Set `AITER_LOG_LEVEL=WARNING` before starting to suppress aiter kernel log noise.
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 - V4-Pro reuses the DeepSeek-V3 config schema; V4-specific fields (compress ratios, hash layers, index head dims) are read from the HF config automatically.
+
+### FP8 on MI308 / gfx942 (V4-Flash-Base, FP8 per-block routed experts)
+
+[DeepSeek-V4-Flash-Base](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base) ships the same V4 architecture (mHC + CSA + HCA + sparse attn + MTP) as V4-Pro, but **routed experts are FP8 e4m3 per-block 128×128** (instead of V4-Pro's FP4 e2m1 microscaling). This trades a small expert-memory increase for end-to-end ROCm `gfx942` (MI308) compatibility — `aiter`'s FP8 grouped GEMM has been tuned for `gfx942`, while the FP4 path was authored for `gfx950` (MI355X).
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-V4-Flash-Base \
+  --kv_cache_dtype fp8 -tp 8
+```
+
+**The routed-expert quant scheme is auto-detected** from the HF `quantization_config` dict:
+
+| Field | V4-Pro (FP4) | V4-Flash-Base (FP8) |
+|---|---|---|
+| `quant_method` | `quark` (with FP4 layer pattern) | `fp8` |
+| `fmt` | `e2m1` | `e4m3` |
+| `weight_block_size` | (per_1x32, microscaling) | `[128, 128]` |
+| `scale_fmt` | `ue8m0` | `ue8m0` |
+
+Override knobs (escape hatches, normally not needed):
+
+- **`ATOM_USE_TRITON_MOE=1`** — `gfx942` defaults to Triton MoE automatically (no need to set), but it doesn't hurt to set explicitly. On `gfx950`, V4-Pro uses the fused MoE path by default (see V4-Pro section above); Triton MoE remains available as an alternative backend.
+
+#### Auto-detection logic
+
+The routed-expert quant spec is resolved in this priority order (see [`_detect_v4_routed_quant_spec`](../atom/models/deepseek_v4.py)):
+
+1. **HF config `expert_dtype`** — if `config.json` declares `expert_dtype` (e.g. `"fp8"` / `"fp4"`), use it directly.
+2. **Parser-derived layer spec** — if the ckpt's `quantization_config.layer_quant_config` (Quark) or global config (compressed-tensors / generic) directly produces a per-layer spec for `ffn.experts.*.w*`, that wins.
+3. **Heuristic from `quant_method` / `fmt`** — strings containing `fp8` → FP8 block; `fp4` / `mxfp4` → FP4.
+4. **V4-Pro fallback** — historical default.
+
+For V4-Flash-Base's HF `quantization_config = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128], "scale_fmt": "ue8m0"}`, the GenericParser (regex `block|1x128`) extracts `(per_1x128, fp8)` global spec, and step 2 hits → routed expert spec is `(QuantType.per_1x128, dtypes.fp8)`. `dtypes.fp8` from `aiter` resolves to `float8_e4m3fnuz` on `gfx942` and `float8_e4m3fn` on `gfx950` — picked correctly per platform without code changes.
+
+#### MI308 specifics
+
+- KV pool slot sizes are identical to V4-Pro (584 B per token, FP8 NoPE 448 B + BF16 RoPE 128 B + 8 B UE8M0 scales).
+- The CSA indexer's K cache stays FP8 (132 B / token) regardless of routed-expert dtype.
+- Compressor / Indexer Triton kernels (`fused_compress_attn`, `sparse_attn_v4_paged_decode`) are SKU-agnostic.
+- Three-stream concurrency (main / alt / compress) works identically.
+- TP / EP sharding follows V4-Pro layout — `n_routed_experts=256, top-k=6` matches the standard FusedMoE expert-shard math.
+
+### PD Disaggregation
+
+For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without MTP), see
+[recipes/mesh/DeepSeek-V4.md](mesh/DeepSeek-V4.md).
 
 ## Performance baseline
 
@@ -45,24 +92,40 @@ python -m atom.benchmarks.benchmark_serving \
 ```
 
 Performance on 8xMI355X GPUs with the following environment:
-- Date measured: 2026-05-07.
+- Date measured: 2026-05-23.
 - Docker image: rocm/atom:latest.
-- ATOM: main branch (commit 33c54649).
+- ATOM: `feat/v4-swa-write-tok-n-guard-opus-default` branch (commit bf9b133e).
 - `ATOM_USE_TRITON_MOE=1`, `--kv_cache_dtype fp8`.
 
 The numbers below are a snapshot. For the latest data tracked across commits, see [rocm.github.io/ATOM/benchmark-dashboard](https://rocm.github.io/ATOM/benchmark-dashboard/).
 
-### FP8 (TP8, FP8 KV Cache)
+### FP8 (TP8, FP8 KV Cache) — no MTP
 
 | ISL  | OSL  | Concurrency | Num Prompts | Output Throughput (tok/s) | Total Throughput (tok/s) | Mean TPOT (ms) |
 | ---- | ---- | ----------- | ----------- | ------------------------- | ------------------------ | -------------- |
-| 1024 | 1024 | 4           | 40          | 111.03                    | 222.06                   | 35.67          |
-| 1024 | 1024 | 8           | 80          | 196.19                    | 392.39                   | 40.25          |
-| 1024 | 1024 | 16          | 160         | 369.79                    | 739.59                   | 42.36          |
-| 1024 | 1024 | 32          | 320         | 660.31                    | 1320.62                  | 46.85          |
-| 1024 | 1024 | 64          | 640         | 1138.68                   | 2277.37                  | 53.64          |
-| 1024 | 1024 | 128         | 1280        | 1888.45                   | 3776.90                  | 63.41          |
-| 1024 | 1024 | 256         | 2560        | 2926.71                   | 5853.41                  | 79.66          |
+| 1024 | 1024 | 4           | 40          | 195.31                    | 392.53                   | 19.66          |
+| 1024 | 1024 | 8           | 80          | 367.43                    | 732.14                   | 21.09          |
+| 1024 | 1024 | 16          | 160         | 668.02                    | 1343.15                  | 23.19          |
+| 1024 | 1024 | 32          | 320         | 1145.71                   | 2287.81                  | 26.90          |
+| 1024 | 1024 | 64          | 640         | 1808.69                   | 3618.19                  | 33.96          |
+| 1024 | 1024 | 128         | 1280        | 2847.24                   | 5700.73                  | 43.26          |
+| 1024 | 1024 | 256         | 2560        | 4289.93                   | 8575.71                  | 57.55          |
+
+### FP8 (TP8, FP8 KV Cache) — MTP-3
+
+Add `--method mtp --num-speculative-tokens 3` to the server launch. MTP-3
+trades a small amount of memory for ~1.5–2× lower TPOT and ~1.3–1.5×
+higher total throughput at the same concurrency.
+
+| ISL  | OSL  | Concurrency | Num Prompts | Output Throughput (tok/s) | Total Throughput (tok/s) | Mean TPOT (ms) |
+| ---- | ---- | ----------- | ----------- | ------------------------- | ------------------------ | -------------- |
+| 1024 | 1024 | 4           | 40          | 528.46                    | 1061.26                  | 7.25           |
+| 1024 | 1024 | 8           | 80          | 907.09                    | 1806.44                  | 8.17           |
+| 1024 | 1024 | 16          | 160         | 1391.13                   | 2795.02                  | 10.95          |
+| 1024 | 1024 | 32          | 320         | 2159.04                   | 4308.13                  | 14.01          |
+| 1024 | 1024 | 64          | 640         | 3222.33                   | 6441.40                  | 18.75          |
+| 1024 | 1024 | 128         | 1280        | 4376.29                   | 8755.90                  | 27.77          |
+| 1024 | 1024 | 256         | 2560        | 5701.20                   | 11388.96                 | 43.06          |
 
 Here are the steps to reinstall ATOM/AITER in the docker, if you are trying to verify with other specific commits:
 ```bash
@@ -93,7 +156,18 @@ lm_eval \
   --num_fewshot 5
 ```
 
-Reference accuracy on 8xMI355X GPUs (FP8, FP8 KV Cache, `ATOM_USE_TRITON_MOE=1`):
+Reference accuracy on 8xMI355X GPUs (FP8, FP8 KV Cache, `ATOM_USE_TRITON_MOE=1`,
+measured 2026-05-23 at commit bf9b133e):
+
+**no MTP**:
+```
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9553|±  |0.0057|
+|     |       |strict-match    |     5|exact_match|↑  |0.9560|±  |0.0056|
+```
+
+**MTP-3** (`--method mtp --num-speculative-tokens 3`, average acceptance ≈ 64.5%):
 ```
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|

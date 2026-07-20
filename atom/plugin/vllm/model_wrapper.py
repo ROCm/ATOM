@@ -2,6 +2,8 @@ from collections.abc import Iterable
 
 import functools
 import importlib
+import json
+import os
 import types
 import torch
 import torch.nn as nn
@@ -28,7 +30,10 @@ from vllm.forward_context import (
 )
 
 import atom  # noqa: F401
-from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.plugin.config import (
+    _generate_atom_config_from_vllm_config,
+    generate_atom_config_for_plugin_mode,
+)
 from atom.plugin.prepare import _set_framework_backbone
 
 import logging
@@ -37,7 +42,90 @@ logger = logging.getLogger("atom")
 
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
+    "Glm4MoeMTPModel",
 }
+_MTP_DRAFT_MODEL_ARCHES: set[str] = {
+    "DeepSeekMTPModel",
+    "DeepSeekV4MTPModel",
+    "DeepseekV4MTPModel",
+    "Qwen3NextMTP",
+    "Glm4MoeMTPModel",
+}
+# DeepSeek-V4 is a native ATOM model whose forward reads ATOM's own forward
+# context (not vLLM's). It needs the V4 proxy-cache bridge wired in the plugin
+# wrapper (register at init, bind + enter context per forward); see `forward`.
+_DEEPSEEK_V4_ARCH = "DeepseekV4ForCausalLM"
+_DEEPSEEK_V4_ARCHES: set[str] = {
+    _DEEPSEEK_V4_ARCH,
+    "DeepSeekV4MTPModel",
+    "DeepseekV4MTPModel",
+}
+_DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
+
+
+def _probe_v4_routed_expert_dtype(model_path) -> str | None:
+    """Return ``"fp4"`` / ``"fp8"`` / ``None`` for a DeepSeek-V4 checkpoint's
+    routed-expert weights, read from the actual on-disk tensor dtype.
+
+    V4 stores routed experts (``ffn.experts.*.w{1,2,3}``) as either FP4 e2m1
+    (packed two-per-byte into (u)int8 + per_1x32 UE8M0 scale) or FP8 e4m3
+    (per-block 128x128). The checkpoint's global ``quantization_config`` only
+    describes the FP8 *projection* scheme, so the routed-expert dtype can only
+    be known by reading the weight tensor itself.
+    """
+    if not model_path or not os.path.isdir(model_path):
+        return None
+    idx_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(idx_path):
+        return None
+    try:
+        with open(idx_path) as f:
+            wmap = json.load(f).get("weight_map", {})
+        probe = next(
+            (k for k in wmap if ".ffn.experts." in k and k.endswith(".w1.weight")),
+            None,
+        )
+        if probe is None:
+            return None
+        from safetensors import safe_open
+
+        with safe_open(os.path.join(model_path, wmap[probe]), framework="pt") as h:
+            dt = str(h.get_slice(probe).get_dtype()).upper()
+    except Exception:
+        return None
+    if dt in ("I8", "U8", "UINT8", "INT8"):
+        return "fp4"  # FP4 e2m1 packed two values per byte
+    if dt in ("F8_E4M3", "F8_E4M3FN", "F8_E4M3FNUZ"):
+        return "fp8"
+    return None
+
+
+def _maybe_set_v4_expert_dtype(atom_config, vllm_config) -> None:
+    """Pin DeepSeek-V4 ``hf_config.expert_dtype`` from the on-disk routed-expert
+    dtype so ``make_v4_quant_config`` selects the correct (FP4 vs FP8) spec.
+
+    Checkpoints like DeepSeek-V4-Flash ship FP4 routed experts + FP8
+    projections, but their global ``quantization_config`` only declares the FP8
+    scheme. The model's parser-based auto-detection therefore mis-classifies the
+    routed experts as FP8-block and dequantizes the FP4 expert weights wrongly,
+    producing garbage output. ``expert_dtype`` is the model's documented
+    override hook; we set it from the real on-disk dtype.
+    """
+    hf_config = getattr(atom_config, "hf_config", None)
+    if hf_config is None or getattr(hf_config, "expert_dtype", None):
+        return  # explicit config / prior setting wins
+    model_path = getattr(getattr(vllm_config, "model_config", None), "model", None)
+    dtype = _probe_v4_routed_expert_dtype(model_path)
+    if dtype:
+        hf_config.expert_dtype = dtype
+        logger.info(
+            "DeepSeek-V4: pinned expert_dtype=%s from on-disk routed-expert "
+            "weights (%s)",
+            dtype,
+            model_path,
+        )
+
+
 _ATOM_MODEL_CLASSES: dict[str, str] = {
     "LlamaForCausalLM": "atom.models.llama:LlamaForCausalLM",
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
@@ -48,13 +136,17 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
+    "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
-    "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLM",
+    "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
+    "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
+    "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
+    "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
+    "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3:MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
 }
 
 
@@ -78,6 +170,40 @@ def _prepare_env(atom_config) -> None:
     # init aiter dist for using aiter custom collective ops
     logger.info("Init aiter dist for using aiter custom collective ops")
     init_aiter_dist(config=atom_config)
+
+
+def _deepseek_v4_mtp_forward_kwargs(
+    hidden_states,
+    model_kwargs: dict,
+    mtp_model=None,
+) -> dict:
+    if hidden_states is None:
+        hidden_states = model_kwargs.get("hidden_states")
+    if hidden_states is None:
+        raise ValueError("DeepSeek-V4 MTP draft forward requires hidden_states")
+    hidden_states = _deepseek_v4_mtp_unflatten_hidden_states(hidden_states, mtp_model)
+    kwargs = {"hidden_states": hidden_states}
+    if "spec_step_idx" in model_kwargs:
+        kwargs["spec_step_idx"] = model_kwargs["spec_step_idx"]
+    return kwargs
+
+
+def _deepseek_v4_mtp_unflatten_hidden_states(hidden_states, mtp_model=None):
+    args = getattr(mtp_model, "args", None)
+    if (
+        getattr(hidden_states, "dim", lambda: None)() == 2
+        and args is not None
+        and getattr(args, "hc_mult", None) is not None
+        and getattr(args, "dim", None) is not None
+    ):
+        hidden_states = hidden_states.reshape(-1, int(args.hc_mult), int(args.dim))
+    return hidden_states
+
+
+def _deepseek_v4_mtp_flatten_hidden_states(hidden_states):
+    if getattr(hidden_states, "dim", lambda: None)() == 3:
+        hidden_states = hidden_states.flatten(1)
+    return hidden_states
 
 
 def _safe_get_first_arch(config_like) -> str | None:
@@ -117,6 +243,45 @@ def _select_model_arch(vllm_config: VllmConfig) -> str:
     return model_arch
 
 
+def _patch_required_act_dtype_post_load_hooks(
+    module: nn.Module,
+    act_dtype: torch.dtype,
+) -> int:
+    """Give vLLM-style post-load hooks a default dtype in plugin mode.
+
+    ATOM's loader invokes module-level post-load hooks without arguments. Some
+    vLLM modules embedded in multimodal ATOM models require an `act_dtype`
+    parameter, so adapt those instances locally instead of changing the generic
+    ATOM loader behavior.
+    """
+    import inspect
+
+    patched = 0
+    for submodule in module.modules():
+        orig = getattr(submodule, "process_weights_after_loading", None)
+        if orig is None or getattr(orig, "_atom_vllm_act_dtype_patched", False):
+            continue
+
+        try:
+            sig = inspect.signature(orig)
+        except (TypeError, ValueError):
+            continue
+
+        act_dtype_param = sig.parameters.get("act_dtype")
+        if act_dtype_param is None or act_dtype_param.default is not inspect._empty:
+            continue
+
+        @functools.wraps(orig)
+        def wrapped(act_dtype: torch.dtype = act_dtype, _orig=orig):
+            return _orig(act_dtype)
+
+        setattr(wrapped, "_atom_vllm_act_dtype_patched", True)
+        submodule.process_weights_after_loading = wrapped
+        patched += 1
+
+    return patched
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 
@@ -125,7 +290,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        from atom.config import get_current_atom_config
+        from atom.config import get_current_atom_config, use_custom_atom_config
 
         _set_framework_backbone("vllm")
 
@@ -146,6 +311,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         self.vllm_config = vllm_config
         self.is_mtp = False
+        self._mtp_target_hidden_states = None
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config is not None:
             spec_method = speculative_config.method
@@ -155,10 +321,32 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         model_arch = _select_model_arch(vllm_config)
         self.is_mtp_draft_model = self.is_mtp and model_arch != main_model_arch
         if self.is_mtp_draft_model:
-            self.atom_config = get_current_atom_config()
+            # Generate separate config for main model and draft model to make sure
+            # that draft model has its own compilation config rather than carried
+            # over from main model. Also get the mutated hf_config from main model
+            main_atom_config = get_current_atom_config()
+            self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
+            self.atom_config.hf_config = main_atom_config.hf_config
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+            # root HF config so --hf-overrides survive without losing multimodal
+            # sub-configs such as Kimi-K2.5's vision_config/text_config.
+            self.atom_config.hf_config = self.config
         self.model_arch = model_arch
+        logger.info(
+            "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
+            "index_topk_pattern=%s",
+            getattr(self.atom_config.hf_config, "use_index_cache", None),
+            getattr(self.atom_config.hf_config, "index_topk_freq", None),
+            getattr(self.atom_config.hf_config, "index_topk_pattern", None),
+        )
+        # DeepSeek-V4's routed-expert quant scheme (FP4 vs FP8-block) is not
+        # described by the checkpoint's global quantization_config, so the
+        # model's auto-detection can pick the wrong spec and emit garbage. Pin
+        # expert_dtype from the on-disk weights before the model (and its
+        # make_v4_quant_config) is constructed.
+        if model_arch in _DEEPSEEK_V4_ARCHES:
+            _maybe_set_v4_expert_dtype(self.atom_config, vllm_config)
         _prepare_env(atom_config=self.atom_config)
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
@@ -188,10 +376,30 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self.atom_config.quant_config.apply_default_exclude_layers(default_excludes)
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
-        self.model = model_cls(self.atom_config)
+        if self.is_mtp_draft_model:
+            # Draft model's layers read get_current_atom_config() to register their
+            # static_forward_context, so swap out the global atom_config temporarily
+            # with the draft model's atom_config so that the correct forward context
+            # can be registered
+            with use_custom_atom_config(self.atom_config):
+                self.model = model_cls(self.atom_config)
+        else:
+            self.model = model_cls(self.atom_config)
+
+        num_patched_post_load_hooks = _patch_required_act_dtype_post_load_hooks(
+            self.model,
+            vllm_config.model_config.dtype,
+        )
+        if num_patched_post_load_hooks:
+            logger.info(
+                "Patched %d vLLM post-load hooks with default act_dtype "
+                "inside ATOM vLLM plugin wrapper.",
+                num_patched_post_load_hooks,
+            )
 
         if model_arch in _MTP_MASK_INPUT_ARCH:
             self._adapt_mtp_layers_for_vllm()
+        if self.is_mtp:
             # Mirror nested attributes required by vLLM speculative decoding.
             self._expose_spec_decode_attrs()
 
@@ -208,6 +416,31 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # here init aiter dist for using aiter custom collective ops
         self.pp_group = get_pp_group()
         self.tp_group = get_tp_group()
+
+        # DeepSeek-V4 is a native ATOM model: its forward reads ATOM's *own*
+        # forward context (input_ids for hash-MoE routing, indexer/attention
+        # metadata), which vLLM's runner never populates. The plugin bridges
+        # this — register the proxy KV layer now, then per-forward bind the
+        # proxy cache views and enter `atom_deepseek_v4_forward_context`
+        # (see `forward`). Other ATOM models follow vLLM's contract directly.
+        self._is_deepseek_v4 = self.model_arch in _DEEPSEEK_V4_ARCHES
+        self._is_deepseek_v4_mtp = self.model_arch in _DEEPSEEK_V4_MTP_ARCHES
+        if self._is_deepseek_v4:
+            from atom.plugin.vllm.deepseek_v4_bridge import (
+                ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+                deepseek_v4_draft_proxy_layer_name,
+                register_deepseek_v4_proxy_layer,
+            )
+
+            self._deepseek_v4_proxy_layer_name = (
+                deepseek_v4_draft_proxy_layer_name(self.atom_config.hf_config)
+                if self._is_deepseek_v4_mtp
+                else ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+            )
+            register_deepseek_v4_proxy_layer(
+                vllm_config,
+                self._deepseek_v4_proxy_layer_name,
+            )
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.
@@ -235,6 +468,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             if hasattr(model, "lm_head") and not hasattr(self, "lm_head"):
                 self.lm_head = model.lm_head
             return
+
+        # ATOM DeepSeek-V4 names these shared modules `embed` / `head`, while
+        # vLLM's generic MTP proposer expects `embedding` / `lm_head`.
+        if not hasattr(model, "embedding") and hasattr(inner, "embed"):
+            model.embedding = inner.embed
+        if not hasattr(model, "lm_head") and hasattr(inner, "head"):
+            model.lm_head = inner.head
 
         # (1) Mirror: make attrs visible on the outer model for vLLM discovery.
         for attr in (*self._WEIGHT_SHARED_ATTRS, "layers"):
@@ -313,6 +553,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # their prefix parameter (e.g. "model.layers.0.self_attn.attn").
         vllm_sfc = self.vllm_compilation_config.static_forward_context
         for module in indexer_caches:
+            # MTP draft models own a separate atom_config/static_forward_context.
+            # Keep that ownership on the cache so metadata builders can bind
+            # sparse buffers back to the draft modules instead of the main model.
+            module.atom_config = self.atom_config
             prefix = module.prefix
             if prefix not in vllm_sfc:
                 vllm_sfc[prefix] = module
@@ -324,6 +568,29 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     f"Indexer cache {prefix} already in vLLM "
                     f"static_forward_context, skipping"
                 )
+
+    def get_mtp_target_hidden_states(self):
+        """Return the target hidden state that vLLM should feed to MTP.
+
+        DeepSeek V4 target forward returns the pre-hc_head mHC residual
+        `[num_tokens, hc, hidden]`; vLLM's generic hidden state path would
+        otherwise feed the post-logits hidden shape expected by older MTP
+        models.
+        """
+        # Prefer the persistent in-graph residual buffer on the native V4 model.
+        # It is refreshed by a captured `copy_` every forward (including FULL
+        # cudagraph replay), so the MTP draft always gets the current decode
+        # step's pre-hc_head residual. vLLM slices it to the active token count.
+        inner = getattr(self.model, "model", None)
+        buf = getattr(inner, "_mtp_hidden_buffer", None)
+        if buf is not None:
+            return buf
+
+        # Fallback (non-V4 / buffer unavailable): the cached residual tensor.
+        hidden_states = self.__dict__.get("_mtp_target_hidden_states")
+        if getattr(hidden_states, "dim", lambda: None)() == 3:
+            hidden_states = hidden_states.flatten(1)
+        return hidden_states
 
     def _adapt_mtp_layers_for_vllm(self) -> None:
         """Install vLLM-only MTP input masking without changing model code."""
@@ -397,13 +664,68 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             ]
             buf[: positions.numel()].copy_(positions)
 
-        hidden_states = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
+        if self._is_deepseek_v4:
+            # DeepSeek-V4 is a native ATOM model: it reads ATOM's own forward
+            # context and takes a native (input_ids, positions) forward — vLLM's
+            # generic call contract (intermediate_tensors/inputs_embeds) does not
+            # apply (V4 is TP-only, text-only). Bind the proxy cache views and
+            # enter `atom_deepseek_v4_forward_context` so ATOM's Context (the
+            # input_ids hash-MoE routing key) and chunk-aware attention metadata
+            # are populated before the (possibly graph-captured) forward runs.
+            from atom.plugin.vllm.deepseek_v4_bridge import (
+                atom_deepseek_v4_forward_context,
+                bind_deepseek_v4_proxy_cache_views,
+            )
+
+            proxy_layer_name = self.__dict__.get("_deepseek_v4_proxy_layer_name")
+            ready = bind_deepseek_v4_proxy_cache_views(
+                self.model,
+                self.vllm_config,
+                proxy_layer_name,
+            )
+            # Per-request stable state slots + chunk-aware metadata + selective
+            # reset are driven from the allocator/params stashed at bind time.
+            # Only engage them once the proxy cache is bound (real forwards);
+            # dummy/profile forwards fall back to arange slots with no reset.
+            slot_allocator = (
+                getattr(self.model, "_atom_v4_slot_allocator", None) if ready else None
+            )
+            meta_params = (
+                getattr(self.model, "_atom_v4_meta_params", None) if ready else None
+            )
+            with atom_deepseek_v4_forward_context(
+                atom_config=self.atom_config,
+                input_ids=input_ids,
+                positions=positions,
+                force_dummy=not ready,
+                state_model=self.model if ready else None,
+                meta_params=meta_params,
+                slot_allocator=slot_allocator,
+                proxy_layer_name=proxy_layer_name,
+            ):
+                if self._is_deepseek_v4_mtp:
+                    hidden_states = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        **_deepseek_v4_mtp_forward_kwargs(
+                            inputs_embeds, model_kwargs, self.model
+                        ),
+                    )
+                    hidden_states = _deepseek_v4_mtp_flatten_hidden_states(
+                        hidden_states
+                    )
+                else:
+                    hidden_states = self.model(input_ids=input_ids, positions=positions)
+                    self._mtp_target_hidden_states = hidden_states
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
@@ -416,11 +738,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # prevent circular import
         from atom.model_loader.loader import load_model_in_plugin_mode
 
-        is_mtp_draft_model = self.model_arch in {
-            "DeepSeekMTPModel",
-            "Qwen3NextMTP",
-            "Glm4MoeMTPModel",
-        }
+        is_mtp_draft_model = self.model_arch in _MTP_DRAFT_MODEL_ARCHES
         draft_hf_config = None
         if is_mtp_draft_model:
             draft_model_config = getattr(
@@ -446,8 +764,32 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if getattr(self, "_is_deepseek_v4_mtp", False):
+            hidden_states = _deepseek_v4_mtp_unflatten_hidden_states(
+                hidden_states, self.model
+            )
         logits = self.model.compute_logits(hidden_states)
         return logits
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Local-argmax spec-decode hook for vLLM's MTP proposer.
+
+        vLLM's ``LLMBaseProposer._greedy_sample`` calls this (when
+        ``use_local_argmax_reduction`` is enabled) in place of
+        ``compute_logits(...).argmax(-1)``. Bridge it to ATOM's distributed
+        greedy argmax (``compute_draft_token``): each rank reduces its logit
+        shard to ``(max_val, global_idx)`` and only ``[N, 2]`` is all-gathered
+        instead of the full ``[N, vocab]`` logits. Token-identical to
+        ``compute_logits(...).argmax(-1)``; returns ``[N]`` int64 token ids.
+        """
+        if getattr(self, "_is_deepseek_v4_mtp", False):
+            hidden_states = _deepseek_v4_mtp_unflatten_hidden_states(
+                hidden_states, self.model
+            )
+        return self.model.compute_draft_token(hidden_states)
 
 
 class ATOMForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...

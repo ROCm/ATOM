@@ -10,8 +10,10 @@ KV cache data from producer (prefill) to consumer (decode) nodes.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -61,11 +63,26 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-MOONCAKE_PING_INTERVAL_SECONDS = 5
-MOONCAKE_MAX_PING_RETRIES = 100
 MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
+
+
+def _ib_device_exists(device_name: str) -> bool:
+    return os.path.exists(f"/sys/class/infiniband/{device_name}")
+
+
+def _auto_select_ib_device(phys_idx: int) -> str:
+    # Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
+    # them as ionic_N, so try ionic_N only when rdmaN is not present.
+    rdma_device = f"rdma{phys_idx}"
+    if _ib_device_exists(rdma_device):
+        return rdma_device
+    ionic_device = f"ionic_{phys_idx}"
+    if _ib_device_exists(ionic_device):
+        return ionic_device
+    return rdma_device
+
 
 # ZMQ side-channel message types
 MSG_WRITE_REQUEST = b"write_request"
@@ -91,10 +108,125 @@ class MooncakeAgentMetadata(
     kv_caches_base_addr: list[int] | None = None
     num_blocks: int = 0
     block_len: int = 0
+    has_slot_regions: bool = False
+    block_base_addrs: list[int] | None = None
+    block_bpb: list[int] | None = None
+    slot_base_addrs: list[int] | None = None
+    slot_bps: list[int] | None = None
+    num_slots: int = 0
 
 
 def _port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return dp_rank * tp_size + tp_rank
+
+
+def _ip_for_ib_device(ib_device: str, fallback: str) -> str:
+    """Return the IPv4 address bound to the netdev backing an RDMA HCA."""
+    net_root = f"/sys/class/infiniband/{ib_device}/device/net"
+    netdevs: list[str] = []
+    try:
+        netdevs = sorted(os.listdir(net_root))
+    except OSError:
+        logger.info(
+            "Could not list netdevs for ib_device=%s under %s; "
+            "falling back to RDMA GID lookup",
+            ib_device,
+            net_root,
+        )
+
+    for netdev in netdevs:
+        try:
+            out = subprocess.check_output(
+                ["ip", "-o", "-4", "addr", "show", "dev", netdev, "scope", "global"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        for line in out.splitlines():
+            parts = line.split()
+            if "inet" in parts:
+                ip_cidr = parts[parts.index("inet") + 1]
+                return ip_cidr.split("/", 1)[0]
+
+    gid_ip = _ip_for_ib_device_from_gid(ib_device)
+    if gid_ip:
+        logger.info(
+            "Using IPv4 %s parsed from RDMA GID for ib_device=%s", gid_ip, ib_device
+        )
+        return gid_ip
+
+    logger.info(
+        "Could not determine RDMA-local IPv4 for ib_device=%s (netdevs=%s); "
+        "falling back to default IP %s",
+        ib_device,
+        ",".join(netdevs) if netdevs else "<none>",
+        fallback,
+    )
+    return fallback
+
+
+def _ip_for_ib_device_from_gid(ib_device: str) -> str | None:
+    """Parse an IPv4-mapped RoCE GID from sysfs for containers without host netns."""
+    ports_root = f"/sys/class/infiniband/{ib_device}/ports"
+    try:
+        ports = sorted(os.listdir(ports_root))
+    except OSError:
+        return None
+
+    preferred_gid_indexes: list[str] = []
+    for env_name in ("MC_IB_GID_INDEX", "MOONCAKE_IB_GID_INDEX"):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            preferred_gid_indexes.append(env_value)
+    preferred_gid_indexes.extend(["1", "3", "0"])
+
+    for port in ports:
+        gids_root = os.path.join(ports_root, port, "gids")
+        try:
+            available_indexes = sorted(os.listdir(gids_root), key=lambda x: int(x))
+        except (OSError, ValueError):
+            available_indexes = []
+
+        seen_indexes: set[str] = set()
+        gid_indexes = []
+        for idx in preferred_gid_indexes + available_indexes:
+            if idx not in seen_indexes:
+                seen_indexes.add(idx)
+                gid_indexes.append(idx)
+
+        for gid_index in gid_indexes:
+            gid_path = os.path.join(gids_root, gid_index)
+            try:
+                with open(gid_path) as f:
+                    gid = f.read().strip()
+            except OSError:
+                continue
+            ip = _ipv4_from_gid(gid)
+            if ip and ip != "0.0.0.0":
+                logger.info(
+                    "Parsed RDMA GID %s from %s for ib_device=%s as IPv4 %s",
+                    gid,
+                    gid_path,
+                    ib_device,
+                    ip,
+                )
+                return ip
+    return None
+
+
+def _ipv4_from_gid(gid: str) -> str | None:
+    try:
+        ip = ipaddress.ip_address(gid)
+    except ValueError:
+        return None
+
+    if isinstance(ip, ipaddress.IPv4Address):
+        return str(ip)
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return str(mapped)
+    return None
 
 
 # ===================================================================
@@ -109,6 +241,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.handshake_port = get_open_port()
+        self.base_handshake_port = kv_transfer_config.get("handshake_port", 6301)
         self.engine_id = "None"
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.parallel_config.data_parallel_size
@@ -137,21 +270,25 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         meta = ConnectorMetadata()
         meta.request_id_to_transfer_id = self.request_id_to_transfer_id
 
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
+        for req_id, (req, block_ids, slot_idx) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
+            req.kv_transfer_params["local_slot_index"] = slot_idx
             meta.add_new_req_to_recv(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
+                local_swa_block_ids=list(getattr(req, "swa_block_table", []) or []),
             )
 
         # Producer side: pass completed prefill block_ids to worker
-        for req_id, (req, block_ids) in self._reqs_need_save.items():
+        for req_id, (req, block_ids, slot_idx) in self._reqs_need_save.items():
             assert req.kv_transfer_params is not None
+            req.kv_transfer_params["local_slot_index"] = slot_idx
             meta.add_new_req_to_save(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
+                local_swa_block_ids=list(getattr(req, "swa_block_table", []) or []),
             )
 
         if self._reqs_need_recv or self._reqs_need_save:
@@ -174,19 +311,23 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id[transfer_id] = seq.id
                 self.request_id_to_transfer_id[seq.id] = transfer_id
 
+        slot_index = getattr(seq, "per_req_cache_group", -1)
+
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
-            self._reqs_need_recv[seq.id] = (seq, seq.block_table)
+            self._reqs_need_recv[seq.id] = (seq, seq.block_table, slot_index)
             params["do_remote_prefill"] = False
+            params["local_slot_index"] = slot_index
             logger.info(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
-                "(%d blocks), transfer_id=%s, remote_host=%s, "
+                "(%d blocks, slot=%d), transfer_id=%s, remote_host=%s, "
                 "remote_handshake_port=%s",
                 seq.id,
                 len(seq.block_table),
+                slot_index,
                 params.get("transfer_id"),
                 params.get("remote_host"),
                 params.get("remote_handshake_port"),
@@ -195,26 +336,38 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Producer side: queue block_ids for the write listener to look up
         if params.get("do_remote_decode"):
             assert self.is_producer, "Only the producer side handles do_remote_decode"
-            self._reqs_need_save[seq.id] = (seq, seq.block_table)
+            self._reqs_need_save[seq.id] = (seq, seq.block_table, slot_index)
             logger.debug(
-                "Queued req %s for KV save (%d blocks)",
+                "Queued req %s for KV save (%d blocks, slot=%d)",
                 seq.id,
                 len(seq.block_table),
+                slot_index,
             )
 
     def request_finished(self, seq: Sequence) -> None:
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
+        drafts = getattr(seq, "spec_token_ids", None)
+        draft_token_ids = (
+            [int(x) for x in drafts] if drafts is not None and len(drafts) else []
+        )
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_block_ids": seq.block_table.copy(),
+            # paged-SWA: the consumer's SWA-pool block ids (separate pool);
+            # the producer keys the SWA region transfer by these. Empty for
+            # backends without a separate SWA pool.
+            "remote_swa_block_ids": list(getattr(seq, "swa_block_table", []) or []),
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
+            "remote_handshake_port": self.base_handshake_port,
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
+            "draft_token_ids": draft_token_ids,
+            "local_slot_index": getattr(seq, "per_req_cache_group", -1),
         }
 
         if not self.is_producer:
@@ -243,7 +396,8 @@ class MooncakeConnector(KVConnectorBase):
         self.dp_size = get_dp_group().world_size
 
         kv_transfer_config = config.kv_transfer_config
-        self.local_ip = get_ip()
+        default_local_ip = get_ip()
+        self.local_ip = default_local_ip
         self._local_ping_port = get_open_port()
 
         self.is_producer = (
@@ -251,10 +405,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         self.is_consumer = not self.is_producer
 
-        # Networking / service discovery config
+        # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
-        self.proxy_ping_port = kv_transfer_config.get("proxy_ping_port", 36367)
-        self.proxy_ip = kv_transfer_config.get("proxy_ip")
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.protocol = kv_transfer_config.get("protocol", MOONCAKE_DEFAULT_PROTOCOL)
 
@@ -272,7 +424,8 @@ class MooncakeConnector(KVConnectorBase):
             )
 
         # Determine which RDMA device this TP rank should use.
-        # On AMD MI300X, each GPU has a paired RDMA NIC: GPU N → rdmaN.
+        # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
+        # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
         # Registering GPU memory with a non-local RDMA NIC fails with
         # EINVAL.  Pass the device name as a filter so Mooncake only
         # creates a context for the local NIC.
@@ -280,14 +433,35 @@ class MooncakeConnector(KVConnectorBase):
         if not ib_device:
             ib_device = os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
         if not ib_device:
-            gpu_idx = torch.cuda.current_device()
-            ib_device = f"rdma{gpu_idx}"
+            visible_idx = torch.cuda.current_device()
+            visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
+                "CUDA_VISIBLE_DEVICES"
+            )
+            if visible_env:
+                visible_list = [d for d in visible_env.split(",") if d != ""]
+                phys_idx = int(visible_list[visible_idx])
+            else:
+                phys_idx = visible_idx
+            ib_device = _auto_select_ib_device(phys_idx)
             logger.info(
-                "Auto-selecting RDMA device %s for GPU %d (tp_rank=%d)",
+                "Auto-selecting RDMA device %s for physical GPU %d "
+                "(visible_idx=%d, tp_rank=%d)",
                 ib_device,
-                gpu_idx,
+                phys_idx,
+                visible_idx,
                 self.tp_rank,
             )
+
+        rdma_local_ip = _ip_for_ib_device(ib_device, default_local_ip)
+        if rdma_local_ip != default_local_ip:
+            logger.info(
+                "Using RDMA-local IP %s for ib_device=%s instead of default IP %s",
+                rdma_local_ip,
+                ib_device,
+                default_local_ip,
+            )
+        self.local_ip = rdma_local_ip
+        self.request_address = f"{self.local_ip}:{self.http_port}"
 
         self.transfer_engine = TransferEngine()
         ret = self.transfer_engine.initialize(
@@ -322,10 +496,27 @@ class MooncakeConnector(KVConnectorBase):
         self.num_blocks: int = 0
         self._per_block_bytes: int = 0
 
+        # --- region-based transfer state (populated in register_kv_caches) ---
+        self._has_slot_regions: bool = False
+        # (base_addr, bytes_per_block) per region
+        self._block_regions: list[tuple[int, int]] = []
+        # paged-SWA: SWA pool regions, keyed by seq.swa_block_table (separate
+        # from the compressed block_table above); (base_addr, bytes_per_swa_block)
+        self._swa_block_regions: list[tuple[int, int]] = []
+        # (base_addr, bytes_per_slot) per region
+        self._slot_regions: list[tuple[int, int]] = []
+        self._gather_slot = None
+        self._scatter_slot = None
+        self._staging_base_addr: int = 0
+        self._staging_slot_bytes: int = 0
+        self._staging_pool_size: int = 0
+        self._staging_free: list[int] = []
+        self._staging_lock = threading.Lock()
+
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
         # The write listener looks up block_ids here when consumer requests a write.
-        self._completed_prefills: dict[ReqId, list[int]] = {}
+        self._completed_prefills: dict[ReqId, dict] = {}
         self._completed_prefills_lock = threading.Lock()
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._transfer_refcount: dict[ReqId, int] = {}
@@ -334,6 +525,7 @@ class MooncakeConnector(KVConnectorBase):
         # --- Consumer: pending receive tracking ---
         self._pending_recv: set[ReqId] = set()
         self._pending_recv_blocks: dict[ReqId, list[int]] = {}
+        self._pending_recv_slots: dict[ReqId, int] = {}
         self._notification_port = get_open_port()
 
         # --- Completion tracking ---
@@ -366,244 +558,132 @@ class MooncakeConnector(KVConnectorBase):
         self._encoder = msgspec.msgpack.Encoder()
         self._decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
 
-        # --- Service discovery ping (rank 0 only) ---
-        if self.tp_rank == 0 and self.dp_rank == 0:
-            self._ping_thread = threading.Thread(
-                target=self._service_discovery_ping,
-                args=(self.zmq_context,),
-                daemon=True,
-                name="mooncake-ping",
-            )
-            self._ping_thread.start()
-
-    # -----------------------------------------------------------------
-    # Service discovery
-    # -----------------------------------------------------------------
-
-    def _service_discovery_ping(self, zmq_context: zmq.Context) -> None:
-        """Periodically register with the proxy (rank 0 only)."""
-        grpc_endpoint = f"http://{self.request_address}/v1/completions"
-        role_code = "P" if self.is_producer else "D"
-        retry_count = 0
-        msg_index = 1
-        proxy_path = f"tcp://{self.proxy_ip}:{self.proxy_ping_port}"
-
-        with zmq_context.socket(zmq.DEALER) as sock:
-            sock.connect(proxy_path)
-
-            while True:
-                try:
-                    registration_data = {
-                        "type": "register",
-                        "role": role_code,
-                        "index": str(msg_index),
-                        "request_address": grpc_endpoint,
-                        "rpc_port": self.rpc_port,
-                        "handshake_port": self.base_handshake_port,
-                        "dp_size": self.dp_size,
-                        "tp_size": self.tp_size,
-                        "transfer_mode": "write",
-                    }
-                    sock.send(msgpack.dumps(registration_data))
-                    logger.debug(
-                        "Ping #%d sent to %s (role=%s)",
-                        msg_index,
-                        proxy_path,
-                        role_code,
-                    )
-                    retry_count = 0
-
-                except ConnectionRefusedError:
-                    logger.info(
-                        "Proxy connection refused: %s -> %s",
-                        self.local_ip,
-                        proxy_path,
-                    )
-                    retry_count += 1
-
-                except OSError as e:
-                    logger.info("OS error during ping: %s", e)
-                    retry_count += 1
-
-                except Exception as e:
-                    logger.info("Unexpected ping error: %s", e)
-                    retry_count += 1
-                    if retry_count >= MOONCAKE_MAX_PING_RETRIES:
-                        logger.error(
-                            "Ping failed after %d retries, aborting",
-                            MOONCAKE_MAX_PING_RETRIES,
-                        )
-                        raise RuntimeError(
-                            f"Service discovery ping failed after "
-                            f"{retry_count} retries"
-                        ) from e
-
-                finally:
-                    time.sleep(MOONCAKE_PING_INTERVAL_SECONDS)
-                    msg_index += 1
-
     # -----------------------------------------------------------------
     # KVConnectorBase: register_kv_caches
     # -----------------------------------------------------------------
-
-    # RDMA MR size limit — must stay under device max_mr_size (2 GiB on
-    # AMD ROCm RDMA).  Mooncake truncates silently, leaving addresses
-    # beyond the limit unregistered.
     _MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024
 
-    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
-        """Register all KV cache tensors with the Mooncake TransferEngine.
-
-        Must be called once after model loading and KV cache allocation.
-        Starts the side-channel listener threads for write coordination.
-
-        Large tensors (> 2 GiB) are split into chunks for RDMA memory
-        registration to stay within the device max_mr_size.  The logical
-        per-tensor base addresses (used for transfer offset computation)
-        remain unchanged.
-
-        For fp8 KV caches, k_scale and v_scale tensors are also registered
-        so that quantization scale factors are transferred alongside data.
-        """
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, Any],
+        transfer_tensors: Any = None,
+        num_blocks: int | None = None,
+    ) -> None:
+        """Register KV cache tensors with the Mooncake TransferEngine."""
         self.kv_caches = kv_caches
 
-        # Logical per-tensor info (for transfer address computation)
-        tensor_ptrs: list[int] = []
-        tensor_sizes: list[int] = []
+        if transfer_tensors is None:
+            logger.warning(
+                "register_kv_caches called without transfer_tensors; "
+                "RDMA transfers will not be available."
+            )
+            return
 
-        # Chunked regions (for RDMA registration)
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+
+        tt: KVTransferTensors = transfer_tensors
+
+        self._has_slot_regions = (
+            len(tt.slot_regions) > 0 or tt.staging_region is not None
+        )
+        self.num_blocks = tt.num_blocks
+        self._gather_slot = tt.gather_slot
+        self._scatter_slot = tt.scatter_slot
+
+        if tt.staging_region is not None:
+            self._staging_base_addr = tt.staging_region.base_addr
+            self._staging_slot_bytes = tt.staging_region.unit_bytes
+            self._staging_pool_size = tt.staging_pool_size
+            self._staging_free = list(range(tt.staging_pool_size))
+
+        # Populate block/slot region lists for transfer offset computation
+        self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
+        # paged-SWA: SWA pool regions, transferred by seq.swa_block_table.
+        self._swa_block_regions = [
+            (r.base_addr, r.unit_bytes) for r in tt.swa_block_regions
+        ]
+        self._slot_regions = [(r.base_addr, r.unit_bytes) for r in tt.slot_regions]
+
+        self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
+        self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
+
+        # Chunk all regions for RDMA memory registration
         reg_ptrs: list[int] = []
         reg_sizes: list[int] = []
 
-        def _register_tensor(tensor):
-            self.kv_caches_base_addr.append(tensor.data_ptr())
-            sz = tensor.element_size()
-            if is_mla:
-                bpb = self.block_len * tensor.stride(0) * sz
-            else:
-                bpb = tensor.stride(0) * sz
-            self._per_block_bytes_list.append(bpb)
-
-            base = tensor.data_ptr()
-            total = tensor.numel() * sz
-            tensor_ptrs.append(base)
-            tensor_sizes.append(total)
-
-            # Chunk for RDMA registration
+        all_regions = (
+            list(tt.block_regions) + list(tt.swa_block_regions) + list(tt.slot_regions)
+        )
+        if tt.staging_region is not None:
+            all_regions.append(tt.staging_region)
+        for r in all_regions:
             offset = 0
-            while offset < total:
-                chunk = min(self._MAX_RDMA_CHUNK_BYTES, total - offset)
-                reg_ptrs.append(base + offset)
+            while offset < r.total_bytes:
+                chunk = min(self._MAX_RDMA_CHUNK_BYTES, r.total_bytes - offset)
+                reg_ptrs.append(r.base_addr + offset)
                 reg_sizes.append(chunk)
                 offset += chunk
 
-        for layer_name, kv_cache in kv_caches.items():
-            k_cache = kv_cache.k_cache
-            v_cache = kv_cache.v_cache
-            is_mla = v_cache is None
-
-            if self.kv_cache_shape is None:
-                self.kv_cache_shape = k_cache.shape
-
-            _register_tensor(k_cache)
-
-            if not is_mla:
-                _register_tensor(v_cache)
-
-            if kv_cache.k_scale is not None:
-                _register_tensor(kv_cache.k_scale)
-            if kv_cache.v_scale is not None:
-                _register_tensor(kv_cache.v_scale)
-
         logger.info(
-            "Registering %d tensors as %d RDMA chunks " "(max_chunk=%.2f GiB)",
-            len(tensor_ptrs),
+            "Registering %d RDMA chunks (%d block regions, %d slot regions, "
+            "max_chunk=%.2f GiB)",
             len(reg_ptrs),
+            len(tt.block_regions),
+            len(tt.slot_regions),
             self._MAX_RDMA_CHUNK_BYTES / (1024**3),
         )
-        for i, (ptr, sz_bytes) in enumerate(zip(reg_ptrs, reg_sizes)):
-            logger.info(
-                "  reg_chunk[%d] ptr=0x%x  size=%d (%.2f GiB)",
-                i,
-                ptr,
-                sz_bytes,
-                sz_bytes / (1024**3),
-            )
 
         ret = self.transfer_engine.batch_register_memory(reg_ptrs, reg_sizes)
         if ret != 0:
             logger.error(
-                "batch_register_memory FAILED (ret=%d). "
-                "Trying individual registration as fallback...",
+                "batch_register_memory FAILED (ret=%d), "
+                "trying individual registration as fallback...",
                 ret,
             )
-            for i, (ptr, sz_bytes) in enumerate(zip(reg_ptrs, reg_sizes)):
+            for ptr, sz_bytes in zip(reg_ptrs, reg_sizes):
                 r = self.transfer_engine.register_memory(ptr, sz_bytes)
-                logger.info(
-                    "  register_memory[%d] ptr=0x%x size=%d (%.2f GiB) " "=> ret=%d",
-                    i,
-                    ptr,
-                    sz_bytes,
-                    sz_bytes / (1024**3),
-                    r,
-                )
+                if r != 0:
+                    logger.error(
+                        "  register_memory FAILED ptr=0x%x size=%d ret=%d",
+                        ptr,
+                        sz_bytes,
+                        r,
+                    )
         else:
-            logger.info(
-                "batch_register_memory OK (%d chunks from %d tensors)",
-                len(reg_ptrs),
-                len(tensor_ptrs),
+            logger.info("batch_register_memory OK (%d chunks)", len(reg_ptrs))
+
+        # Build metadata for bootstrap exchange
+        if self._has_slot_regions:
+            self._local_metadata = MooncakeAgentMetadata(
+                engine_id=self.engine_id,
+                rpc_port=self.rpc_port,
+                num_blocks=tt.num_blocks,
+                block_len=self.block_len,
+                has_slot_regions=True,
+                block_base_addrs=[b for b, _ in self._block_regions],
+                block_bpb=[bpb for _, bpb in self._block_regions],
+                slot_base_addrs=[b for b, _ in self._slot_regions],
+                slot_bps=[bps for _, bps in self._slot_regions],
+                num_slots=tt.num_slots,
             )
-
-        # Block geometry from last layer
-        last_kv = list(kv_caches.values())[-1]
-        k = last_kv.k_cache
-        is_mla = last_kv.v_cache is None
-        sz = k.element_size()
-
-        if is_mla:
-            self.num_blocks = k.shape[0] // self.block_len
-            self._per_block_bytes = self.block_len * k.stride(0) * sz
         else:
-            self.num_blocks = k.shape[0]
-            self._per_block_bytes = k.stride(0) * sz
-
-        logger.info(
-            "Mooncake registered %d tensors (%d RDMA chunks, %d blocks, "
-            "per_block_bytes=%s, block_len=%d, is_mla=%s, "
-            "k_shape=%s, k_stride=%s, elem_sz=%d, "
-            "tensor_sizes_MB=%s, chunk_sizes_MB=%s)",
-            len(self.kv_caches_base_addr),
-            len(reg_ptrs),
-            self.num_blocks,
-            sorted(set(self._per_block_bytes_list)),
-            self.block_len,
-            is_mla,
-            k.shape,
-            k.stride(),
-            sz,
-            [s // (1024 * 1024) for s in sorted(set(tensor_sizes))],
-            [s // (1024 * 1024) for s in sorted(set(reg_sizes))],
-        )
+            self._local_metadata = MooncakeAgentMetadata(
+                engine_id=self.engine_id,
+                rpc_port=self.rpc_port,
+                kv_caches_base_addr=self.kv_caches_base_addr,
+                num_blocks=tt.num_blocks,
+                block_len=self.block_len,
+            )
 
         logger.info(
             "Mooncake KV registration complete: role=%s, engine_id=%s, "
-            "rpc_port=%d, num_regions=%d, num_blocks=%d, "
-            "base_addrs=[%s]",
+            "has_slot_regions=%s, num_blocks=%d, block_regions=%d, slot_regions=%d",
             "PRODUCER" if self.is_producer else "CONSUMER",
             self.engine_id,
-            self.rpc_port,
-            len(self.kv_caches_base_addr),
-            self.num_blocks,
-            ", ".join(f"0x{a:x}" for a in self.kv_caches_base_addr[:4]),
-        )
-
-        # Build metadata for bootstrap exchange
-        self._local_metadata = MooncakeAgentMetadata(
-            engine_id=self.engine_id,
-            rpc_port=self.rpc_port,
-            kv_caches_base_addr=self.kv_caches_base_addr,
-            num_blocks=self.num_blocks,
-            block_len=self.block_len,
+            self._has_slot_regions,
+            tt.num_blocks,
+            len(self._block_regions),
+            len(self._slot_regions),
         )
 
         # Start side channel threads
@@ -641,15 +721,20 @@ class MooncakeConnector(KVConnectorBase):
 
         self.request_id_to_transfer_id = metadata.request_id_to_transfer_id
 
-        # Producer: cache block_ids from completed prefills
+        # Producer: cache block_ids + slot_index from completed prefills
         if self.is_producer:
             for req_id, meta in metadata.reqs_to_save.items():
                 with self._completed_prefills_cv:
-                    self._completed_prefills[req_id] = meta.local_block_ids
+                    self._completed_prefills[req_id] = {
+                        "block_ids": meta.local_block_ids,
+                        "swa_block_ids": meta.local_swa_block_ids,
+                        "slot_index": meta.local_slot_index,
+                    }
                     self._completed_prefills_cv.notify_all()
                 logger.info(
-                    "[PRODUCER] Cached %d prefill blocks for req %s",
+                    "[PRODUCER] Cached %d prefill blocks (slot=%d) for req %s",
                     len(meta.local_block_ids),
+                    meta.local_slot_index,
                     req_id,
                 )
             return
@@ -675,40 +760,93 @@ class MooncakeConnector(KVConnectorBase):
             )
             remote_addr = make_zmq_path("tcp", meta.remote_host, remote_port)
 
-            unique_bpb = sorted(set(self._per_block_bytes_list))
-            logger.info(
-                "[CONSUMER] Sending write_request for req %s (transfer_id=%s) "
-                "to %s (handshake_port=%d, dp_rank=%d, "
-                "local_tp=%d, remote_tp=%d/%d), "
-                "dst_block_ids=%s, num_regions=%d, "
-                "bytes/block=%s, num_blocks=%d",
-                req_id,
-                meta.transfer_id,
-                remote_addr,
-                meta.remote_handshake_port,
-                meta.remote_dp_rank,
-                self.tp_rank,
-                remote_tp_rank,
-                remote_tp_size,
-                meta.local_block_ids[:10],
-                len(self.kv_caches_base_addr),
-                unique_bpb,
-                self.num_blocks,
-            )
-
-            write_request = msgpack.dumps(
-                {
-                    "request_id": req_id,
-                    "transfer_id": meta.transfer_id,
-                    "consumer_host": self.local_ip,
-                    "consumer_rpc_port": self.rpc_port,
-                    "consumer_base_addrs": self.kv_caches_base_addr,
-                    "dst_block_ids": meta.local_block_ids,
-                    "notify_host": self.local_ip,
-                    "notify_port": self._notification_port,
-                    "consumer_tp_size": self.tp_size,
-                }
-            )
+            if self._has_slot_regions:
+                # Acquire staging pool slot for this request's state RDMA
+                consumer_staging_pool_idx = -1
+                consumer_staging_addr = 0
+                if self._staging_pool_size > 0:
+                    consumer_staging_pool_idx = self._acquire_staging_slot()
+                    consumer_staging_addr = (
+                        self._staging_base_addr
+                        + consumer_staging_pool_idx * self._staging_slot_bytes
+                    )
+                logger.info(
+                    "[CONSUMER] Sending write_request (block+slot) for req %s "
+                    "(transfer_id=%s, slot=%d, staging_pool=%d) to %s, "
+                    "dst_block_ids=%s, %d block regions, %d slot regions",
+                    req_id,
+                    meta.transfer_id,
+                    meta.local_slot_index,
+                    consumer_staging_pool_idx,
+                    remote_addr,
+                    meta.local_block_ids[:10],
+                    len(self._block_regions),
+                    len(self._slot_regions),
+                )
+                write_request = msgpack.dumps(
+                    {
+                        "request_id": req_id,
+                        "transfer_id": meta.transfer_id,
+                        "consumer_host": self.local_ip,
+                        "consumer_rpc_port": self.rpc_port,
+                        "dst_block_ids": meta.local_block_ids,
+                        "notify_host": self.local_ip,
+                        "notify_port": self._notification_port,
+                        "consumer_tp_size": self.tp_size,
+                        "has_slot_regions": True,
+                        "dst_slot_index": meta.local_slot_index,
+                        "consumer_block_base_addrs": [
+                            b for b, _ in self._block_regions
+                        ],
+                        "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
+                        # paged-SWA: separate SWA pool, keyed by swa_block_table
+                        "dst_swa_block_ids": meta.local_swa_block_ids,
+                        "consumer_swa_block_base_addrs": [
+                            b for b, _ in self._swa_block_regions
+                        ],
+                        "consumer_swa_block_bpb": [
+                            bpb for _, bpb in self._swa_block_regions
+                        ],
+                        "consumer_slot_base_addrs": [b for b, _ in self._slot_regions],
+                        "consumer_slot_bps": [bps for _, bps in self._slot_regions],
+                        "consumer_staging_addr": consumer_staging_addr,
+                        "consumer_staging_bytes": self._staging_slot_bytes,
+                    }
+                )
+            else:
+                unique_bpb = sorted(set(self._per_block_bytes_list))
+                logger.info(
+                    "[CONSUMER] Sending write_request for req %s (transfer_id=%s) "
+                    "to %s (handshake_port=%d, dp_rank=%d, "
+                    "local_tp=%d, remote_tp=%d/%d), "
+                    "dst_block_ids=%s, num_regions=%d, "
+                    "bytes/block=%s, num_blocks=%d",
+                    req_id,
+                    meta.transfer_id,
+                    remote_addr,
+                    meta.remote_handshake_port,
+                    meta.remote_dp_rank,
+                    self.tp_rank,
+                    remote_tp_rank,
+                    remote_tp_size,
+                    meta.local_block_ids[:10],
+                    len(self.kv_caches_base_addr),
+                    unique_bpb,
+                    self.num_blocks,
+                )
+                write_request = msgpack.dumps(
+                    {
+                        "request_id": req_id,
+                        "transfer_id": meta.transfer_id,
+                        "consumer_host": self.local_ip,
+                        "consumer_rpc_port": self.rpc_port,
+                        "consumer_base_addrs": self.kv_caches_base_addr,
+                        "dst_block_ids": meta.local_block_ids,
+                        "notify_host": self.local_ip,
+                        "notify_port": self._notification_port,
+                        "consumer_tp_size": self.tp_size,
+                    }
+                )
 
             with self._notify_sockets_lock:
                 sock = self._notify_sockets.get(remote_addr)
@@ -722,11 +860,39 @@ class MooncakeConnector(KVConnectorBase):
 
             self._pending_recv.add(req_id)
             self._pending_recv_blocks[req_id] = list(meta.local_block_ids)
+            if meta.local_slot_index >= 0:
+                self._pending_recv_slots[req_id] = (
+                    meta.local_slot_index,
+                    consumer_staging_pool_idx,
+                )
             logger.info(
                 "[CONSUMER] write_request sent for req %s to %s",
                 req_id,
                 remote_addr,
             )
+
+    # -----------------------------------------------------------------
+    # Staging pool management
+    # -----------------------------------------------------------------
+
+    def _acquire_staging_slot(self) -> int:
+        with self._staging_lock:
+            if self._staging_free:
+                return self._staging_free.pop()
+        logger.warning(
+            "Staging pool exhausted (size=%d), blocking until a slot is freed. "
+            "Increase ATOM_PD_STAGING_POOL if this happens frequently.",
+            self._staging_pool_size,
+        )
+        while True:
+            time.sleep(0.001)
+            with self._staging_lock:
+                if self._staging_free:
+                    return self._staging_free.pop()
+
+    def _release_staging_slot(self, idx: int) -> None:
+        with self._staging_lock:
+            self._staging_free.append(idx)
 
     # -----------------------------------------------------------------
     # KVConnectorBase: get_finished
@@ -795,77 +961,125 @@ class MooncakeConnector(KVConnectorBase):
 
     def _execute_transfer(self, request_data: dict) -> None:
         """Compute offsets and perform RDMA write for a single request."""
-        req_id = request_data["request_id"]
-        transfer_id = request_data.get("transfer_id", req_id)
-        consumer_host = request_data["consumer_host"]
-        consumer_rpc_port = request_data["consumer_rpc_port"]
-        consumer_base_addrs = request_data["consumer_base_addrs"]
-        dst_block_ids = request_data["dst_block_ids"]
-        notify_host = request_data["notify_host"]
-        notify_port = request_data["notify_port"]
-        consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
-        consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
+        try:
+            req_id = request_data["request_id"]
+            transfer_id = request_data.get("transfer_id", req_id)
+            consumer_host = request_data["consumer_host"]
+            consumer_rpc_port = request_data["consumer_rpc_port"]
+            dst_block_ids = request_data["dst_block_ids"]
+            notify_host = request_data["notify_host"]
+            notify_port = request_data["notify_port"]
+            consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
+            consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
+            has_slot_data = request_data.get("has_slot_regions", False)
 
-        logger.info(
-            "[PRODUCER] _execute_transfer: req_id=%s, transfer_id=%s, "
-            "consumer=%s:%s, dst_blocks=%d",
-            req_id,
-            transfer_id,
-            consumer_host,
-            consumer_rpc_port,
-            len(dst_block_ids),
-        )
-
-        # Look up producer's block_ids by transfer_id (= prefill's seq.id),
-        # not request_id (= decode's seq.id).
-        src_block_ids = self._wait_for_prefill_blocks(transfer_id)
-        if src_block_ids is None:
-            logger.error(
-                "[PRODUCER] Timed out waiting for prefill blocks for "
-                "transfer_id=%s (req_id=%s). Available keys: %s",
-                transfer_id,
-                req_id,
-                list(self._completed_prefills.keys()),
-            )
-            return
-
-        target = f"{consumer_host}:{consumer_rpc_port}"
-
-        # Verify the consumer's segment is discoverable via P2P handshake
-        if hasattr(self.transfer_engine, "get_first_buffer_address"):
-            remote_buf = self.transfer_engine.get_first_buffer_address(target)
             logger.info(
-                "[PRODUCER] P2P segment probe for %s: " "get_first_buffer_address=0x%x",
-                target,
-                remote_buf,
+                "[PRODUCER] _execute_transfer: req_id=%s, transfer_id=%s, "
+                "consumer=%s:%s, dst_blocks=%d, has_slot_data=%s",
+                req_id,
+                transfer_id,
+                consumer_host,
+                consumer_rpc_port,
+                len(dst_block_ids),
+                has_slot_data,
             )
-            if remote_buf == 0:
+
+            prefill_data = self._wait_for_prefill_data(transfer_id)
+            if prefill_data is None:
                 logger.error(
-                    "[PRODUCER] Consumer %s has NO registered buffers visible "
-                    "via P2P handshake! Consumer batch_register_memory may "
-                    "have failed, or segment descriptors haven't propagated.",
-                    target,
+                    "[PRODUCER] Timed out waiting for prefill data for "
+                    "transfer_id=%s (req_id=%s). Available keys: %s",
+                    transfer_id,
+                    req_id,
+                    list(self._completed_prefills.keys()),
                 )
+                return
+
+            src_block_ids = prefill_data["block_ids"]
+            target = f"{consumer_host}:{consumer_rpc_port}"
+
+            if hasattr(self.transfer_engine, "get_first_buffer_address"):
+                remote_buf = self.transfer_engine.get_first_buffer_address(target)
+                if remote_buf == 0:
+                    logger.error(
+                        "[PRODUCER] Consumer %s has NO registered buffers.",
+                        target,
+                    )
+
+            if has_slot_data:
+                transfer_ok = self._execute_block_slot_transfer(
+                    request_data,
+                    target,
+                    src_block_ids,
+                    dst_block_ids,
+                    prefill_data,
+                    req_id,
+                )
+            else:
+                transfer_ok = self._execute_block_transfer(
+                    request_data,
+                    target,
+                    src_block_ids,
+                    dst_block_ids,
+                    req_id,
+                )
+
+            if not transfer_ok:
+                logger.error(
+                    "[PRODUCER] transfer failed for req %s (transfer_id=%s); "
+                    "not sending write-done",
+                    req_id,
+                    transfer_id,
+                )
+                return
+
+            # Notify consumer — all data (blocks + slot state) is written.
+            self._send_write_done(notify_host, notify_port, req_id)
+
+            # Track refcount for multi-consumer TP fan-out.
+            all_done = False
+            with self._transfer_refcount_lock:
+                if transfer_id not in self._transfer_refcount:
+                    self._transfer_refcount[transfer_id] = consumers_per_rank
+                self._transfer_refcount[transfer_id] -= 1
+                if self._transfer_refcount[transfer_id] <= 0:
+                    self._transfer_refcount.pop(transfer_id)
+                    all_done = True
+
+            if all_done:
+                with self._completion_lock:
+                    self.done_sending.add(transfer_id)
+                with self._completed_prefills_lock:
+                    self._completed_prefills.pop(transfer_id, None)
+                logger.info(
+                    "[PRODUCER] All %d consumers served for transfer_id=%s",
+                    consumers_per_rank,
+                    transfer_id,
+                )
+        except Exception:
+            logger.exception(
+                "[PRODUCER] transfer FAILED for req %s (transfer_id=%s); "
+                "consumer will not receive write-done and will time out.",
+                request_data.get("request_id"),
+                request_data.get("transfer_id"),
+            )
+
+    def _execute_block_transfer(
+        self,
+        request_data: dict,
+        target: str,
+        src_block_ids: list[int],
+        dst_block_ids: list[int],
+        req_id: str,
+    ) -> bool:
+        """Block-only RDMA transfer (MHA, MLA, and other block-indexed backends)."""
+        consumer_base_addrs = request_data["consumer_base_addrs"]
 
         src_addrs: list[int] = []
         dst_addrs: list[int] = []
         sizes: list[int] = []
 
         num_regions = len(self.kv_caches_base_addr)
-        if num_regions != len(consumer_base_addrs):
-            logger.error(
-                "[PRODUCER] REGION COUNT MISMATCH: producer has %d regions, "
-                "consumer has %d regions",
-                num_regions,
-                len(consumer_base_addrs),
-            )
-        if len(src_block_ids) != len(dst_block_ids):
-            logger.error(
-                "[PRODUCER] BLOCK COUNT MISMATCH: src has %d blocks, "
-                "dst has %d blocks",
-                len(src_block_ids),
-                len(dst_block_ids),
-            )
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[region_idx]
@@ -875,32 +1089,162 @@ class MooncakeConnector(KVConnectorBase):
                 dst_addrs.append(dst_base + db * bpb)
                 sizes.append(bpb)
 
-        unique_bpb = sorted(set(self._per_block_bytes_list))
         logger.info(
-            "[PRODUCER] Starting RDMA write: req=%s, target=%s, "
-            "%d regions × %d blocks, bytes/block=%s, "
-            "src_block_ids=%s, dst_block_ids=%s, "
-            "total_transfer_entries=%d, total_bytes=%d",
+            "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
+            "total_bytes=%d",
             req_id,
-            target,
             num_regions,
             len(src_block_ids),
-            unique_bpb,
-            src_block_ids[:10],
-            dst_block_ids[:10],
-            len(src_addrs),
             sum(sizes),
         )
 
-        if dst_addrs:
-            logger.info(
-                "[PRODUCER] dst_addr range: 0x%x -- 0x%x (first region), "
-                "consumer_base_addrs[0]=0x%x",
-                min(dst_addrs[: len(dst_block_ids)]),
-                max(dst_addrs[: len(dst_block_ids)]) + sizes[0],
-                consumer_base_addrs[0],
-            )
+        if not self._rdma_write_with_retry(
+            target, src_addrs, dst_addrs, sizes, req_id, "block"
+        ):
+            logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+            return False
+        return True
 
+    def _execute_block_slot_transfer(
+        self,
+        request_data: dict,
+        target: str,
+        src_block_ids: list[int],
+        dst_block_ids: list[int],
+        prefill_data: dict,
+        req_id: str,
+    ) -> bool:
+        """Two-phase RDMA for backends with per-request state: block regions first, then slot regions."""
+        consumer_block_addrs = request_data["consumer_block_base_addrs"]
+        consumer_block_bpb = request_data["consumer_block_bpb"]
+        consumer_slot_addrs = request_data["consumer_slot_base_addrs"]
+        consumer_slot_bps = request_data["consumer_slot_bps"]
+        dst_slot = request_data["dst_slot_index"]
+        src_slot = prefill_data["slot_index"]
+        # paged-SWA: separate SWA pool, keyed by swa_block_table.
+        consumer_swa_block_addrs = request_data.get("consumer_swa_block_base_addrs", [])
+        consumer_swa_block_bpb = request_data.get("consumer_swa_block_bpb", [])
+        dst_swa_block_ids = request_data.get("dst_swa_block_ids", [])
+        src_swa_block_ids = prefill_data.get("swa_block_ids", [])
+
+        # ---- Phase 1: Block transfer ----
+        block_src: list[int] = []
+        block_dst: list[int] = []
+        block_sizes: list[int] = []
+
+        for region_idx, (src_base, bpb) in enumerate(self._block_regions):
+            dst_base = consumer_block_addrs[region_idx]
+            for sb, db in zip(src_block_ids, dst_block_ids):
+                block_src.append(src_base + sb * bpb)
+                block_dst.append(dst_base + db * consumer_block_bpb[region_idx])
+                block_sizes.append(bpb)
+
+        # paged-SWA: transfer the SWA pool by swa_block_table. Window-freed
+        # entries carry -1 on either side → skipped, so only the live window
+        # (the last ~128-token block per request) crosses the wire.
+        for region_idx, (src_base, bpb) in enumerate(self._swa_block_regions):
+            dst_base = consumer_swa_block_addrs[region_idx]
+            for sb, db in zip(src_swa_block_ids, dst_swa_block_ids):
+                if sb < 0 or db < 0:
+                    continue
+                block_src.append(src_base + sb * bpb)
+                block_dst.append(dst_base + db * consumer_swa_block_bpb[region_idx])
+                block_sizes.append(bpb)
+
+        logger.info(
+            "[PRODUCER] block RDMA: req=%s, %d regions × %d blocks, " "total_bytes=%d",
+            req_id,
+            len(self._block_regions),
+            len(src_block_ids),
+            sum(block_sizes),
+        )
+
+        if not self._rdma_write_with_retry(
+            target, block_src, block_dst, block_sizes, req_id, "block"
+        ):
+            logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+            return False
+
+        # ---- Phase 2: Slot transfer ----
+        if src_slot < 0 or dst_slot < 0:
+            logger.info(
+                "[PRODUCER] slot transfer skipped (src_slot=%d, dst_slot=%d)",
+                src_slot,
+                dst_slot,
+            )
+            return True
+
+        slot_src: list[int] = []
+        slot_dst: list[int] = []
+        slot_sizes: list[int] = []
+
+        # Phase 2a: SWA slot regions (direct, no staging)
+        for region_idx, (src_base, bps) in enumerate(self._slot_regions):
+            dst_base = consumer_slot_addrs[region_idx]
+            slot_src.append(src_base + src_slot * bps)
+            slot_dst.append(dst_base + dst_slot * consumer_slot_bps[region_idx])
+            slot_sizes.append(bps)
+
+        # Phase 2b: compressor states via staging buffer (182 → 1)
+        producer_pool_idx = -1
+        consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
+        if self._gather_slot is not None and consumer_staging_addr:
+            producer_pool_idx = self._acquire_staging_slot()
+            self._gather_slot(src_slot, producer_pool_idx)
+            # Synchronize on the gather kernel before NIC starts reading the
+            # staging buffer. Without this, the RDMA can race the still-in-flight
+            # gather kernel on TBO prefill (page fault under high concurrency).
+            torch.cuda.current_stream().synchronize()
+            slot_src.append(
+                self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
+            )
+            slot_dst.append(consumer_staging_addr)
+            slot_sizes.append(self._staging_slot_bytes)
+
+        logger.info(
+            "[PRODUCER] slot RDMA: req=%s, %d entries, "
+            "src_slot=%d → dst_slot=%d, total_bytes=%d",
+            req_id,
+            len(slot_src),
+            src_slot,
+            dst_slot,
+            sum(slot_sizes),
+        )
+
+        slot_ok = self._rdma_write_with_retry(
+            target, slot_src, slot_dst, slot_sizes, req_id, "slot"
+        )
+        if not slot_ok:
+            logger.error("[PRODUCER] slot transfer failed for req %s", req_id)
+
+        if producer_pool_idx >= 0:
+            self._release_staging_slot(producer_pool_idx)
+        return slot_ok
+
+    def _wait_for_prefill_data(self, req_id: str) -> dict | None:
+        """Wait until prefill data is available for this request.
+
+        Returns dict with "block_ids" and "slot_index" keys, or None on timeout.
+        """
+        with self._completed_prefills_cv:
+            ready = self._completed_prefills_cv.wait_for(
+                lambda: req_id in self._completed_prefills,
+                timeout=PREFILL_LOOKUP_TIMEOUT,
+            )
+            if ready:
+                return self._completed_prefills[req_id]
+            return None
+
+    def _rdma_write_with_retry(
+        self,
+        target: str,
+        src_addrs: list[int],
+        dst_addrs: list[int],
+        sizes: list[int],
+        req_id: str,
+        label: str,
+    ) -> bool:
+        """Chunked RDMA write with retry. Returns True on success."""
         max_entries_per_batch = 4096
         total_entries = len(src_addrs)
         max_retries = 3
@@ -920,8 +1264,9 @@ class MooncakeConnector(KVConnectorBase):
                     if ret == 0:
                         break
                     logger.error(
-                        "[PRODUCER] RDMA write chunk error %d for req %s → %s "
+                        "[PRODUCER] %s RDMA chunk error %d for req %s → %s "
                         "(entries %d-%d/%d, attempt %d/%d)",
+                        label,
                         ret,
                         req_id,
                         target,
@@ -933,8 +1278,9 @@ class MooncakeConnector(KVConnectorBase):
                     )
                 except Exception:
                     logger.exception(
-                        "[PRODUCER] RDMA write chunk FAILED for req %s "
+                        "[PRODUCER] %s RDMA chunk FAILED for req %s "
                         "(entries %d-%d/%d, attempt %d/%d)",
+                        label,
                         req_id,
                         chunk_start,
                         chunk_end,
@@ -949,53 +1295,8 @@ class MooncakeConnector(KVConnectorBase):
                     time.sleep(retry_delay)
                     retry_delay *= 2
                 else:
-                    return
-
-        logger.info(
-            "[PRODUCER] RDMA write completed for req %s → %s (%d entries)",
-            req_id,
-            target,
-            total_entries,
-        )
-
-        # Notify this consumer immediately — its data is written.
-        self._send_write_done(notify_host, notify_port, req_id)
-
-        # Track how many consumers still need this transfer_id's blocks.
-        # Only mark done_sending (which triggers block deallocation on the
-        # scheduler) after ALL consumers sharing this producer rank have
-        # completed their transfers.
-        all_done = False
-        with self._transfer_refcount_lock:
-            if transfer_id not in self._transfer_refcount:
-                self._transfer_refcount[transfer_id] = consumers_per_rank
-            self._transfer_refcount[transfer_id] -= 1
-            if self._transfer_refcount[transfer_id] <= 0:
-                self._transfer_refcount.pop(transfer_id)
-                all_done = True
-
-        if all_done:
-            with self._completion_lock:
-                self.done_sending.add(transfer_id)
-            with self._completed_prefills_lock:
-                self._completed_prefills.pop(transfer_id, None)
-            logger.info(
-                "[PRODUCER] All %d consumers served for transfer_id=%s, "
-                "blocks released",
-                consumers_per_rank,
-                transfer_id,
-            )
-
-    def _wait_for_prefill_blocks(self, req_id: str) -> list[int] | None:
-        """Wait until prefill block_ids are available for this request."""
-        with self._completed_prefills_cv:
-            ready = self._completed_prefills_cv.wait_for(
-                lambda: req_id in self._completed_prefills,
-                timeout=PREFILL_LOOKUP_TIMEOUT,
-            )
-            if ready:
-                return self._completed_prefills[req_id]
-            return None
+                    return False
+        return True
 
     def _send_write_done(self, host: str, port: int, req_id: str) -> None:
         """Send write-done notification to consumer via persistent socket.
@@ -1034,6 +1335,12 @@ class MooncakeConnector(KVConnectorBase):
                 if msg_type == MSG_WRITE_DONE:
                     data = msgpack.loads(parts[2])
                     req_id = data["request_id"]
+                    slot_info = self._pending_recv_slots.pop(req_id, None)
+                    if slot_info is not None and self._scatter_slot is not None:
+                        compute_slot, pool_idx = slot_info
+                        if pool_idx >= 0:
+                            self._scatter_slot(compute_slot, pool_idx)
+                            self._release_staging_slot(pool_idx)
                     dst_blocks = self._pending_recv_blocks.pop(req_id, None)
                     if dst_blocks:
                         with self._fence_lock:

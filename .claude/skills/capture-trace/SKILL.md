@@ -1,9 +1,9 @@
 ---
 name: capture-trace
 description: Capture a PyTorch profiler / kineto trace from a running ATOM server for a short benchmark window. Use when the user asks for "a trace", "profiler trace", "GPU trace", or "抓 trace" for performance investigation — what kernels ran, what's on the critical path, what's slow. Do NOT use for crashes (use debug-agent-locate-kernel) or numerical bugs (use dump-bisect-debug).
-version: 1.1.0
+version: 1.2.0
 scope: ATOM on AMD ROCm (PyTorch kineto profiler, per-rank `*.pt.trace.json.gz`)
-last_updated: 2026-05-17
+last_updated: 2026-05-20
 ---
 
 ## When to use
@@ -144,11 +144,23 @@ For a UI view, drop the `.gz` (decompressed `.json`) into <https://ui.perfetto.d
 
 ## `record_function` tag format
 
-ATOM annotates the critical path with `torch.profiler.record_function`. The tags follow a stable format used by `parse_trace.py`:
+ATOM annotates the critical path with `torch.profiler.record_function`. The **kind** is the label prefix (groups in Perfetto, greppable); sub-attributes are `key=value` fields. Taxonomy lives in `atom/model_engine/run_labels.py`:
 
-- Prefill: `prefill[bs=<batch> tok=<num_tokens> ctx=<max_ctx>]`
-- Decode: `decode[bs=<batch> tok=<num_tokens> d=<draft_step> spec=<num_spec>]`
-- Draft (eagle mid-step): `draft[i/k bs=<batch>]`
+| Prefix | Meaning |
+|---|---|
+| `prefill[bs= tok= ctx=]` | real prefill (eager) |
+| `decode[bs= tok= p= d= spec=]` | real decode via CUDAGraph |
+| `eager_decode[bs= tok= ctx=]` | real decode forced eager |
+| `dummy_decode[...]` | **DP-sync dummy** (idle rank keeps the MoE collective aligned) |
+| `dummy_eager_decode[...]` | DP-sync dummy, forced eager |
+| `dummy_prefill[...]` | warmup dummy prefill |
+| `draft[i/k bs=]` | eagle/MTP draft mid-step |
+
+Fields: `bs` effective batch, `tok` total tokens, `ctx` per-seq context lens (truncated if many), `p`/`d` prefill/decode seq counts, `spec` speculative steps, and **`tbo=1`** appended when the step ran Two-Batch-Overlap ubatches.
+
+Distinguishing dummy vs real matters: e.g. the leading `dummy_decode[bs=1 tok=1]` runs are DP-sync idle steps, NOT real decode. `parse_trace.py` matches only the exact `prefill[` / `decode[` prefixes, so dummy/eager variants are auto-excluded from its stats.
+
+> **Comparability note:** pre-taxonomy traces labeled DP-sync dummies as plain `decode[...]`, so `parse_trace.py` counted them as real decodes. New traces exclude dummies — decode/prefill counts and averages on a new trace will differ from an old trace of the same workload. Don't attribute that delta to a perf change; re-baseline with a fresh trace.
 
 Searching by these tags is far more reliable than searching by kernel name (which varies across PyTorch/Triton/AITER versions).
 
@@ -159,18 +171,10 @@ Searching by these tags is far more reliable than searching by kernel name (whic
 - Default `=0` (kernel names + durations only — enough for 95% of investigations)
 - `=1` only when you specifically need shapes or Python stacks AND you've kept the window short (≤ 5 seconds of bench traffic, ≤ `CONC * 1` prompts)
 
-## Common model configs
+## Looking up model configs
 
-| Model | Path | TP | Server `EXTRA_ARGS` | Bench notes |
-|---|---|---|---|---|
-| DeepSeek-V4-Pro | `/data/DeepSeek-V4-Pro` | 8 | `--level 0` (CG not yet enabled) | tokenizer has no chat template — do NOT pass `--use-chat-template` |
-| DeepSeek-V4-Pro MTP1 | `/data/DeepSeek-V4-Pro` | 8 | `--level 0 --method mtp --num-speculative-tokens 1` | same — no chat template |
-| DeepSeek-R1-0528 | `/data/DeepSeek-R1-0528` | 8 | | |
-| DeepSeek-R1-0528 MTP3 | `/data/DeepSeek-R1-0528` | 8 | `--method mtp --num-speculative-tokens 3` | `--use-chat-template` REQUIRED on bench |
-| DeepSeek FP4 MTP3 | `/data/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4` | 8 | `--method mtp --num-speculative-tokens 3` | `--use-chat-template` REQUIRED |
-| GLM-5 FP8 | `/data/GLM-5-FP8` | 8 | | |
-| gpt-oss-120b | `/data/openai/gpt-oss-120b` | 1 | drop `-tp` | |
-| Kimi-K2.5-MXFP4 | `/data/Kimi-K2.5-MXFP4` | 4 | `--trust-remote-code` + `HSA_NO_SCRATCH_RECLAIM=1` env | |
+- **Server launch args + env vars**: `.github/benchmark/models.json` (CI source of truth).
+- **Does this model need `--use-chat-template` on the bench?** Inspect the model's `tokenizer_config.json` — if it has a non-null `chat_template` field, pass `--use-chat-template`; otherwise the bench will tokenize the raw prompt directly.
 
 ## Anti-patterns
 
@@ -179,27 +183,7 @@ Searching by these tags is far more reliable than searching by kernel name (whic
 - **Trusting the `.gz` size to decide if the export finished.** Use `.gz exists AND no orphan .json`. The exporter writes `.json` first, then gzips + unlinks; a leftover `.json` means it crashed mid-export.
 - **Forgetting `--use-chat-template` on MTP DeepSeek-R1 benchmarks.** Tokenizer mismatch silently degrades accuracy — the trace will look fine but the workload is wrong.
 - **Adding `--mark-trace` or `ENABLE_TORCH_PROFILER=1`.** Neither is needed — `--torch-profiler-dir` on the server + `PROFILE=1` on the bench is the complete handshake. The extras either no-op or interfere.
-- **Profiling under `--level 3` for V4-Pro right now.** V4-Pro Inductor + autotune hits a `cluster_dims` bug on AMD — start with `--level 0` until CG support lands.
-
-## Real example — May 17 2026
-
-Captured an MTP-1 vs no-MTP V4-Pro trace at `1024/1024/c=64`, 64 prompts each, to compare whether `_hash_topk` uses the fused `aiter::topk_softplus` kernel or the native `softplus + sqrt` chain:
-
-```bash
-mkdir -p /app/logs_claude/traces/v4_mtp1
-bash /app/ATOM/scripts/start_atom_server.sh /data/DeepSeek-V4-Pro 8 8000 \
-  --level 0 --method mtp --num-speculative-tokens 1 \
-  --torch-profiler-dir /app/logs_claude/traces/v4_mtp1
-bash /app/ATOM/scripts/run_benchmark.sh /data/DeepSeek-V4-Pro 8000 1024 1024 64 1 1
-# (wait loop on .gz / .json — see Step 3)
-zcat /app/logs_claude/traces/v4_mtp1/rank_0/*.gz | python3 -c "..."
-```
-
-Finding: 12,938 `aiter::topk_softplus` calls (the `elif scoring_func == 'sqrtsoftplus'`
-branch in `moe.py:2637` IS taken) plus 12,658 native `softplus_kernel` calls
-(from `_hash_topk` in `deepseek_v4.py:1982` — the first 3 hash layers don't go
-through the fused path). Trace files: `/app/logs_claude/traces/v4_mtp1/` and
-`/app/logs_claude/traces/v4_nomtp/`.
+- **Profiling V4-Pro under default `--level 3`.** V4-Pro Inductor + autotune hits a `cluster_dims` bug on AMD — pass `--level 0` until that bug is fixed.
 
 ## Cross-references
 

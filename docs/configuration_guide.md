@@ -215,6 +215,11 @@ ATOM can re-quantize model weights while loading them by passing
 is unquantized or uses a different supported quantization layout than the runtime
 layout you want to benchmark.
 
+> For ready-to-run recipes (DeepSeek-R1, Qwen3 MoE, …), pattern-design guidance,
+> verification, and troubleshooting, see
+> [`online_quantization_guide.md`](./online_quantization_guide.md). This section
+> documents only the field-level reference.
+
 The flag accepts a JSON object:
 
 ```bash

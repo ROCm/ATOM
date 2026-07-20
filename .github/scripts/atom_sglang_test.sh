@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Usage:
+#   .github/scripts/atom_sglang_test.sh start
 #   .github/scripts/atom_sglang_test.sh launch
 #   .github/scripts/atom_sglang_test.sh accuracy
 #
@@ -26,10 +27,12 @@ set -euo pipefail
 #   LM_EVAL_TASK
 #   LM_EVAL_NUM_FEWSHOT
 #   LM_EVAL_NUM_CONCURRENT
+#   LM_EVAL_EXTRA_MODEL_ARGS
+#   LM_EVAL_USE_CHAT_COMPLETIONS
 
 TYPE=${1:-launch}
-if [[ "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
-  echo "Invalid TYPE: ${TYPE}. Expected: launch or accuracy"
+if [[ "${TYPE}" != "start" && "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
+  echo "Invalid TYPE: ${TYPE}. Expected: start, launch, or accuracy"
   exit 2
 fi
 
@@ -46,6 +49,8 @@ KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 LM_EVAL_TASK=${LM_EVAL_TASK:-gsm8k}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LM_EVAL_NUM_CONCURRENT=${LM_EVAL_NUM_CONCURRENT:-65}
+LM_EVAL_EXTRA_MODEL_ARGS=${LM_EVAL_EXTRA_MODEL_ARGS:-}
+LM_EVAL_USE_CHAT_COMPLETIONS=${LM_EVAL_USE_CHAT_COMPLETIONS:-0}
 
 MODEL_NAME=${SGLANG_MODEL_NAME:-}
 MODEL_PATH=${SGLANG_MODEL_PATH:-}
@@ -144,6 +149,7 @@ stop_server() {
 }
 
 launch_server() {
+  local wait_for_ready="${1:-1}"
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${MODEL_PATH}")
 
@@ -174,7 +180,19 @@ launch_server() {
 
   local -a extra_arg_array=()
   if [[ -n "${MODEL_EXTRA_ARGS}" ]]; then
-    read -r -a extra_arg_array <<< "${MODEL_EXTRA_ARGS}"
+    while IFS= read -r -d '' token; do
+      extra_arg_array+=("${token}")
+    done < <(
+      MODEL_EXTRA_ARGS="${MODEL_EXTRA_ARGS}" python3 - <<'PY'
+import os
+import shlex
+import sys
+
+for token in shlex.split(os.environ["MODEL_EXTRA_ARGS"]):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
   fi
 
   rm -rf /root/.cache
@@ -198,7 +216,9 @@ launch_server() {
   echo $! > "${SGLANG_PID_FILE}"
   echo "Server PID: $(cat "${SGLANG_PID_FILE}")"
 
-  wait_server_ready
+  if [[ "${wait_for_ready}" == "1" ]]; then
+    wait_server_ready
+  fi
 }
 
 run_accuracy() {
@@ -224,10 +244,28 @@ run_accuracy() {
   echo "========== Running SGLang accuracy =========="
   echo "Model name: ${MODEL_NAME}"
 
-  lm_eval --model local-completions \
-    --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${SGLANG_PORT}/v1/completions",num_concurrent="${LM_EVAL_NUM_CONCURRENT}",max_retries=1,tokenized_requests=False,trust_remote_code=True \
+  local lm_eval_model="local-completions"
+  local lm_eval_endpoint_path="/v1/completions"
+  local -a lm_eval_extra_args=()
+  local lm_eval_model_args
+
+  if [[ "${LM_EVAL_USE_CHAT_COMPLETIONS}" == "1" || "${LM_EVAL_USE_CHAT_COMPLETIONS}" == "true" ]]; then
+    lm_eval_model="local-chat-completions"
+    lm_eval_endpoint_path="/v1/chat/completions"
+    lm_eval_extra_args+=(--batch_size 65 --apply_chat_template --fewshot_as_multiturn)
+    lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT}"
+  else
+    lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT},max_retries=1,tokenized_requests=False,trust_remote_code=True"
+  fi
+  if [[ -n "${LM_EVAL_EXTRA_MODEL_ARGS}" ]]; then
+    lm_eval_model_args="${lm_eval_model_args},${LM_EVAL_EXTRA_MODEL_ARGS#,}"
+  fi
+
+  lm_eval --model "${lm_eval_model}" \
+    --model_args "${lm_eval_model_args}" \
     --tasks "${LM_EVAL_TASK}" \
     --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+    "${lm_eval_extra_args[@]}" \
     --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
   # Capture lm_eval exit code explicitly; tee always exits 0 so PIPESTATUS is needed.
   lm_eval_exit="${PIPESTATUS[0]}"
@@ -318,7 +356,7 @@ PY
 }
 
 cleanup_on_exit() {
-  if [[ "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ]]; then
+  if [[ "${TYPE}" == "start" || ( "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ) ]]; then
     echo "Keeping SGLang server alive for follow-up steps."
     return 0
   fi
@@ -327,7 +365,9 @@ cleanup_on_exit() {
 
 trap 'cleanup_on_exit' EXIT
 
-if [[ "${TYPE}" == "launch" ]]; then
+if [[ "${TYPE}" == "start" ]]; then
+  launch_server "0"
+elif [[ "${TYPE}" == "launch" ]]; then
   launch_server
 else
   launch_server

@@ -7,9 +7,10 @@ concurrency:
 
 on:
   schedule:
-    # Mon–Sat 21:00 Beijing (13:00 UTC): Mon/Wed/Fri AWS P0; Tue/Thu AWS P1+Meta P0; Sat AWS P2+OOB (see load-models).
-    - cron: '0 13 * * 1-6'
-    # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AWS P1+Meta P0; Sun Meta P1
+    # Tue-Sun 00:30 Beijing (Mon-Sat 16:30 UTC): delayed previous-evening slot.
+    # Effective Mon/Wed AW P0; Tue/Thu AW P0+Met P0; Fri AW all; Sat AW P0+OOB.
+    - cron: '30 16 * * 1-6'
+    # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AW P1+P2+Met P0; Sun AW all+Met P1.
     - cron: '0 2 * * 0,6'
   workflow_dispatch:
     inputs:
@@ -20,6 +21,18 @@ on:
         options:
           - InferenceMax bench
           - vLLM bench
+      benchmark_group:
+        description: "Optional manual benchmark group. Leave as none to use model slots."
+        type: choice
+        default: none
+        options:
+          - none
+          - AW-P0
+          - AW-P0+MET-P0
+          - AW-ALL
+          - AW-P1+P2+MET-P0
+          - AW-ALL+MET-P1
+          - AW-P0+OOB
       model_slot_1:
         description: "Manual selection slot 1: choose a model + TP size candidate."
         type: choice
@@ -30,6 +43,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -45,6 +62,9 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -67,6 +87,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -82,6 +106,9 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -104,6 +131,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -119,6 +150,9 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -141,6 +175,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -156,6 +194,9 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -178,6 +219,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -193,6 +238,9 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -215,6 +263,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -230,6 +282,9 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -252,6 +307,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -267,6 +326,9 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -289,6 +351,10 @@ on:
           - DeepSeek-R1 MXFP4 TP8 (MET)
           - gpt-oss-120b TP1 (MET)
           - GLM-5.1-FP8 TP8 (OOB)
+          - GLM-5.2-FP8 TP4 (OOB)
+          - GLM-5.2-FP8 MTP TP4 (OOB)
+          - GLM-5.2-MXFP4 TP4 (OOB)
+          - GLM-5.2-MXFP4 MTP TP4 (OOB)
           - Kimi-K2-Thinking-MXFP4 TP4 (MET)
           - Kimi-K2-Thinking-MXFP4 TP8 (MET)
           - Kimi-K2.5-MXFP4 TP4 (MET)
@@ -304,6 +370,9 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -484,6 +553,8 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
@@ -517,7 +588,7 @@ jobs:
 
           BENCHMARK_CLIENT="${INPUT_BENCHMARK_CLIENT:-InferenceMax bench}"
 
-          mapfile -t VLLM_META < <(python3 - <<'PY'
+          mapfile -t VLLM_MET < <(python3 - <<'PY'
           import re
           from pathlib import Path
 
@@ -533,8 +604,8 @@ jobs:
           PY
           )
 
-          SELECTED_VLLM_COMMIT="${VLLM_META[0]}"
-          SELECTED_VLLM_VERSION="${VLLM_META[1]}"
+          SELECTED_VLLM_COMMIT="${VLLM_MET[0]}"
+          SELECTED_VLLM_VERSION="${VLLM_MET[1]}"
 
           if [[ -n "${INPUT_OOT_IMAGE}" ]]; then
             PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE}"
@@ -547,7 +618,7 @@ jobs:
                 --reference-tag vllm-latest \
                 --preferred-version "${SELECTED_VLLM_VERSION}"
             )"; then
-              mapfile -t RESOLVED_IMAGE_META < <(
+              mapfile -t RESOLVED_IMAGE_MET < <(
                 RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
           import json
           import os
@@ -560,11 +631,11 @@ jobs:
           print(resolution.get("matched_tag", ""))
           PY
               )
-              PREBUILT_OOT_IMAGE="${RESOLVED_IMAGE_META[0]}"
-              RESOLVED_PREBUILT_ALIAS="${RESOLVED_IMAGE_META[1]}"
-              RESOLVED_PREBUILT_DIGEST="${RESOLVED_IMAGE_META[2]}"
-              PREBUILT_RESOLUTION_TYPE="${RESOLVED_IMAGE_META[3]}"
-              RESOLVED_NIGHTLY_TAG="${RESOLVED_IMAGE_META[4]}"
+              PREBUILT_OOT_IMAGE="${RESOLVED_IMAGE_MET[0]}"
+              RESOLVED_PREBUILT_ALIAS="${RESOLVED_IMAGE_MET[1]}"
+              RESOLVED_PREBUILT_DIGEST="${RESOLVED_IMAGE_MET[2]}"
+              PREBUILT_RESOLUTION_TYPE="${RESOLVED_IMAGE_MET[3]}"
+              RESOLVED_NIGHTLY_TAG="${RESOLVED_IMAGE_MET[4]}"
             else
               echo "::warning::Failed to resolve or digest-pin rocm/atom-dev:vllm-latest; falling back to the floating tag."
               PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
@@ -794,6 +865,7 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
+          BENCHMARK_GROUP: ${{ inputs.benchmark_group || 'none' }}
           MODEL_SLOT_1: ${{ inputs.model_slot_1 || 'none' }}
           MODEL_SLOT_2: ${{ inputs.model_slot_2 || 'none' }}
           MODEL_SLOT_3: ${{ inputs.model_slot_3 || 'none' }}
@@ -891,40 +963,46 @@ jobs:
                   m for m in variants if str(m.get("display", "")) in displays
               ]
 
-          AWS_P0 = {
+          AW_P0 = {
+              "gpt-oss-120b TP1 (AW)",
+              "DeepSeek-V3.2 FP8 TP4 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
+              "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
+              "DeepSeek-V4-Pro TP8 (OOB)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-5.2-FP8 TP4 (OOB)",
+              "GLM-5.2-FP8 MTP TP4 (OOB)",
+              "GLM-5.2-MXFP4 TP4 (OOB)",
+              "GLM-5.2-MXFP4 MTP TP4 (OOB)",
+              "GLM-4.7-FP8 TP4 (AW)",
+              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP4 (AW)",
               "MiniMax-M2.5 TP2 (AW)",
+          }
+          AW_P1 = {
               "MiniMax-M2.5 TP4 (AW)",
               "DeepSeek-V3.2 FP8 TP8 (AW)",
               "gpt-oss-120b TP2 (AW)",
               "gpt-oss-120b TP8 (AW)",
-          }
-          AWS_P1 = {
-              "GLM-4.7-FP8 TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP8 (AW)",
-              "GLM-4.7-FP8 MTP TP4 (AW)",
               "GLM-4.7-FP8 MTP TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
           }
-          AWS_P2 = {
-              "DeepSeek-V3.2 FP8 TP4 (AW)",
+          AW_P2 = {
               "GLM-4.7-FP8 TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Kimi-K2.5-MXFP4 TP8 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)",
-              "gpt-oss-120b TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
           }
-          META_P0 = {
+          MET_P0 = {
               "Kimi-K2.5-MXFP4 TP4 (MET)",
               "gpt-oss-120b TP1 (MET)",
           }
-          META_P1 = {
+          MET_P1 = {
               "Kimi-K2-Thinking-MXFP4 TP4 (MET)",
               "Kimi-K2-Thinking-MXFP4 TP8 (MET)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)",
-              "Qwen3.5-397B-A17B-FP8 TP4 (OOB)",
               "DeepSeek-R1 FP8 TP8 (MET)",
               "DeepSeek-R1 MXFP4 TP8 (MET)",
           }
@@ -933,6 +1011,7 @@ jobs:
               for m in all_variants
               if str(m.get("display", "")).endswith("(OOB)")
           }
+          aw_all = AW_P0 | AW_P1 | AW_P2
 
           if event == "schedule":
               created_at = os.environ.get("SCHEDULE_CREATED_AT", "")
@@ -943,44 +1022,57 @@ jobs:
               beijing_tz = timezone(timedelta(hours=8))
               run_date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
               beijing_dt = run_date.astimezone(beijing_tz)
-              beijing_weekday = beijing_dt.weekday()
               beijing_hour = beijing_dt.hour
 
-              # Beijing weekday: Mon=0 .. Sun=6. Hour buckets use 15:00 to split
-              # ~10:00 daytime vs ~21:00 evening scheduled runs.
-              # Mon/Wed/Fri evening: AWS P0. Tue/Thu evening: AWS P1 + Meta P0.
-              # Fri evening: AWS P0. Sat daytime (~10:00): AWS P1 + Meta P0.
-              # Sat evening (~21:00): AWS P2 + OOB. Sun daytime (~10:00): Meta P1.
-              is_daytime_slot = beijing_hour < 15
+              # Beijing weekday: Mon=0 .. Sun=6. The evening slot now runs just
+              # after midnight, so attribute it to the previous Beijing day.
+              is_delayed_evening_slot = beijing_hour < 3
+              effective_beijing_dt = (
+                  beijing_dt - timedelta(days=1)
+                  if is_delayed_evening_slot
+                  else beijing_dt
+              )
+              beijing_weekday = effective_beijing_dt.weekday()
+
+              # Hour buckets use 15:00 to split ~10:00 daytime vs delayed
+              # previous-evening scheduled runs.
+              is_daytime_slot = (not is_delayed_evening_slot) and beijing_hour < 15
 
               if beijing_weekday == 5:  # Saturday
                   if is_daytime_slot:
-                      selected_group = "AWS-P1+META-P0"
-                      target_displays = AWS_P1 | META_P0
+                      selected_group = "AW-P1+P2+MET-P0"
+                      target_displays = AW_P1 | AW_P2 | MET_P0
                   else:
-                      selected_group = "AWS-P2+OOB"
-                      target_displays = AWS_P2 | OOB_DISPLAYS
+                      selected_group = "AW-P0+OOB"
+                      target_displays = AW_P0 | OOB_DISPLAYS
               elif beijing_weekday == 6:  # Sunday
                   if is_daytime_slot:
-                      selected_group = "META-P1"
-                      target_displays = META_P1
+                      selected_group = "AW-ALL+MET-P1"
+                      target_displays = aw_all | MET_P1
                   else:
                       selected_group = "SKIP"
                       target_displays = set()
-              elif beijing_weekday in (0, 2, 4):  # Mon / Wed / Fri
+              elif beijing_weekday in (0, 2):  # Mon / Wed
                   if is_daytime_slot:
                       selected_group = "SKIP"
                       target_displays = set()
                   else:
-                      selected_group = "AWS-P0"
-                      target_displays = AWS_P0
+                      selected_group = "AW-P0"
+                      target_displays = AW_P0
               elif beijing_weekday in (1, 3):  # Tue / Thu
                   if is_daytime_slot:
                       selected_group = "SKIP"
                       target_displays = set()
                   else:
-                      selected_group = "AWS-P1+META-P0"
-                      target_displays = AWS_P1 | META_P0
+                      selected_group = "AW-P0+MET-P0"
+                      target_displays = AW_P0 | MET_P0
+              elif beijing_weekday == 4:  # Friday
+                  if is_daytime_slot:
+                      selected_group = "SKIP"
+                      target_displays = set()
+                  else:
+                      selected_group = "AW-ALL"
+                      target_displays = aw_all
               else:
                   selected_group = "SKIP"
                   target_displays = set()
@@ -999,29 +1091,61 @@ jobs:
                           file=sys.stderr,
                       )
           else:
-              variant_map = {}
-              for family in families:
-                  for variant in family["variants"]:
-                      variant_map[str(variant["display"])] = flatten_variant(
-                          family, variant
-                      )
-
-              seen_prefixes = set()
-              for slot_idx in range(1, 9):
-                  label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
-                  if not label or label == none_choice:
-                      continue
-                  selected_variant = variant_map.get(label)
-                  if selected_variant is None:
-                      available = ", ".join(sorted(variant_map))
+              group_map = {
+                  "AW-P0": AW_P0,
+                  "AW-P0+MET-P0": AW_P0 | MET_P0,
+                  "AW-ALL": aw_all,
+                  "AW-P1+P2+MET-P0": AW_P1 | AW_P2 | MET_P0,
+                  "AW-ALL+MET-P1": aw_all | MET_P1,
+                  "AW-P0+OOB": AW_P0 | OOB_DISPLAYS,
+              }
+              requested_group = os.environ.get("BENCHMARK_GROUP", "").strip()
+              if requested_group and requested_group != none_choice:
+                  target_displays = group_map.get(requested_group)
+                  if target_displays is None:
+                      available = ", ".join([none_choice] + sorted(group_map))
                       raise SystemExit(
-                          f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
+                          f"Unknown benchmark group {requested_group!r}. Available choices: {available}"
                       )
-                  prefix = str(selected_variant["prefix"])
-                  if prefix in seen_prefixes:
-                      continue
-                  selected.append(selected_variant)
-                  seen_prefixes.add(prefix)
+                  selected_group = requested_group
+                  selected = select_by_display(all_variants, target_displays)
+                  missing = target_displays - {
+                      str(m.get("display", "")) for m in selected
+                  }
+                  if missing:
+                      print(
+                          "Warning: manual group targets missing from catalog: "
+                          + ", ".join(sorted(missing)),
+                          file=sys.stderr,
+                      )
+                  if not selected:
+                      raise SystemExit(
+                          f"No benchmark model variants were selected for group {requested_group}."
+                      )
+              else:
+                  variant_map = {}
+                  for family in families:
+                      for variant in family["variants"]:
+                          variant_map[str(variant["display"])] = flatten_variant(
+                              family, variant
+                          )
+
+                  seen_prefixes = set()
+                  for slot_idx in range(1, 9):
+                      label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
+                      if not label or label == none_choice:
+                          continue
+                      selected_variant = variant_map.get(label)
+                      if selected_variant is None:
+                          available = ", ".join(sorted(variant_map))
+                          raise SystemExit(
+                              f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
+                          )
+                      prefix = str(selected_variant["prefix"])
+                      if prefix in seen_prefixes:
+                          continue
+                      selected.append(selected_variant)
+                      seen_prefixes.add(prefix)
 
           if selected_group:
               print(
@@ -1071,7 +1195,8 @@ jobs:
           MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
           PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
         run: |
-          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          BENCHMARK_MATRIX_FILE="${RUNNER_TEMP:-/tmp}/benchmark_matrix.json"
+          python3 - <<'PY' > "${BENCHMARK_MATRIX_FILE}"
           import json
           import os
 
@@ -1079,9 +1204,22 @@ jobs:
           params = json.loads(os.environ["PARAMS_JSON"])
 
           include = []
+          aw_p0_displays = {
+              "gpt-oss-120b TP1 (AW)",
+              "DeepSeek-V3.2 FP8 TP4 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-4.7-FP8 TP4 (AW)",
+              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP4 (AW)",
+              "MiniMax-M2.5 TP2 (AW)",
+          }
           for model in models:
               prefix = str(model.get("prefix", ""))
+              display = str(model.get("display", ""))
               is_aw_model = "-aw-" in prefix
+              is_aw_p0_model = display in aw_p0_displays
               aw_pairs = (
                   (1000, 100),
                   (5000, 500),
@@ -1098,11 +1236,11 @@ jobs:
                   if is_aw_model:
                       base_params = []
                       for input_length, output_length in aw_pairs:
-                          aws_param = dict(param)
-                          aws_param["input_length"] = input_length
-                          aws_param["output_length"] = output_length
-                          aws_param["random_range_ratio"] = ""
-                          base_params.append(aws_param)
+                          aw_param = dict(param)
+                          aw_param["input_length"] = input_length
+                          aw_param["output_length"] = output_length
+                          aw_param["random_range_ratio"] = "0.0"
+                          base_params.append(aw_param)
 
                   variants = []
                   for base_param in base_params:
@@ -1124,25 +1262,86 @@ jobs:
                       seen.add(key)
                       model_params.append(variant)
 
+              filtered_params = []
               for param in model_params:
                   pair = f'{param["input_length"]}x{param["output_length"]}'
                   if supported_pairs and pair not in supported_pairs:
                       continue
                   if pair in excluded_pairs:
                       continue
-                  include.append({"model": model, "params": param})
+                  if is_aw_p0_model and int(param["concurrency"]) == 512:
+                      continue
+                  filtered_params.append(param)
+
+              if is_aw_model:
+                  filtered_params.sort(
+                      key=lambda p: (
+                          int(p["input_length"]),
+                          int(p["output_length"]),
+                          str(p["random_range_ratio"]),
+                          int(p["concurrency"]),
+                      )
+                  )
+                  cases_by_pair = {}
+                  for param in filtered_params:
+                      pair_key = (
+                          int(param["input_length"]),
+                          int(param["output_length"]),
+                          str(param["random_range_ratio"]),
+                      )
+                      cases_by_pair.setdefault(pair_key, []).append(param)
+
+                  for pair_key in sorted(cases_by_pair):
+                      pair_cases = cases_by_pair[pair_key]
+                      include.append(
+                          {
+                              "model": model,
+                              # One AW matrix cell launches one server for one ISL/OSL pair,
+                              # then runs all concurrency cases for that pair.
+                              "params": pair_cases[0],
+                              "cases": pair_cases,
+                          }
+                      )
+              else:
+                  for param in filtered_params:
+                      include.append({"model": model, "params": param, "cases": [param]})
 
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
-          )"
-          echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
-          if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
+          {
+            echo "benchmark_matrix<<EOF"
+            cat "${BENCHMARK_MATRIX_FILE}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          if python3 - "${BENCHMARK_MATRIX_FILE}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as matrix_file:
+              payload = json.load(matrix_file)
+          include = payload.get("include", [])
+          if not include:
+              sys.exit(1)
+          print(f"Benchmark matrix cells: {len(include)}")
+          PY
+          then
+            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
+          else
             echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
             echo "No eligible benchmark cases remain after model-specific parameter filtering."
-          else
-            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
-            echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
           fi
+
+      - name: Persist benchmark matrix payload
+        run: |
+          cat > benchmark_matrix.json <<'EOF'
+          ${{ steps.build.outputs.benchmark_matrix }}
+          EOF
+
+      - name: Upload benchmark matrix payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-benchmark-matrix
+          path: benchmark_matrix.json
 
   build-oot-image:
     name: Build custom OOT benchmark image
@@ -1251,7 +1450,7 @@ jobs:
           docker rmi atom_oot_base:ci || true
 
   benchmark:
-    name: OOT ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
+    name: ${{ contains(matrix.model.display, '(AW)') && format('OOT {0} {1}/{2} all concurrency', matrix.model.display, matrix.params.input_length, matrix.params.output_length) || format('OOT {0} {1}/{2} c={3}', matrix.model.display, matrix.params.input_length, matrix.params.output_length, matrix.params.concurrency) }}
     needs: [resolve-atom-source, build-benchmark-matrix, build-oot-image]
     if: >-
       always()
@@ -1263,7 +1462,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.build-benchmark-matrix.outputs.benchmark_matrix) }}
     runs-on: ${{ matrix.model.runner }}
-    timeout-minutes: 240
+    timeout-minutes: 360
     permissions:
       actions: read
       contents: write
@@ -1280,6 +1479,7 @@ jobs:
       CONC: ${{ matrix.params.concurrency }}
       RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
       RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
+      BENCHMARK_CASES_JSON: ${{ toJson(matrix.cases) }}
       CONTAINER_NAME: atom_vllm_oot_benchmark_${{ strategy.job-index }}
       CONTAINER_RESULT_DIR: /tmp/oot-benchmark-results
       CONTAINER_BENCH_SERVING_DIR: /tmp/oot-benchmark/bench_serving
@@ -1294,6 +1494,24 @@ jobs:
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
       BENCHMARK_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vLLM bench' || needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
+      - name: Print runner user
+        run: |
+          echo "=== Container engine diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "podman version:"
+          podman version || true
+          echo "podman info:"
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+
       - name: Detect container engine
         run: |
           if docker info > /dev/null 2>&1; then
@@ -1406,7 +1624,9 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host \
+            --network=host \
+            --group-add video \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -1424,7 +1644,9 @@ jobs:
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
 
       - name: Download model if needed
+        timeout-minutes: 150
         run: |
+          set -euo pipefail
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
@@ -1436,14 +1658,27 @@ jobs:
             model_dir="/models/${model_dir}"
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "/models directory found, downloading model to ${model_dir}"
-            if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
+            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            if ! $CONTAINER_ENGINE exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${MODEL_SOURCE_PATH}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
               echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
               exit 1
             fi
           else
             echo "/models directory not mounted; skipping model download"
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "2h"
+          MODEL_LOCK_WAIT_SECONDS: "1800"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Resolve OOT model path
         run: |
@@ -1502,7 +1737,7 @@ jobs:
 
       - name: Run OOT benchmark client
         id: run_benchmark_client
-        timeout-minutes: 240
+        timeout-minutes: 360
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1515,122 +1750,206 @@ jobs:
             fi
           fi
 
-          {
-            echo "=== Benchmark config: ${MODEL_NAME} CLIENT=${BENCHMARK_CLIENT} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
-            if [[ "${BENCHMARK_CLIENT}" == "InferenceMax bench" ]]; then
-              $CONTAINER_ENGINE exec \
-                -e ISL="${ISL}" \
-                -e OSL="${OSL}" \
-                -e CONC="${CONC}" \
-                -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-                -e RESULT_FILENAME="${RESULT_FILENAME}" \
-                -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-                "$CONTAINER_NAME" bash -lc "
-                  set -euo pipefail
-                  rm -rf \"${CONTAINER_RESULT_DIR}\"
-                  mkdir -p \"${CONTAINER_RESULT_DIR}\"
-                  PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
-                    --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                    --backend=vllm \
-                    --base-url=http://127.0.0.1:8000 \
-                    --dataset-name=random \
-                    --random-input-len=\"${ISL}\" \
-                    --random-output-len=\"${OSL}\" \
-                    --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                    --num-prompts=\"$(( CONC * 10 ))\" \
-                    --max-concurrency=\"${CONC}\" \
-                    ${TRUST_REMOTE_CODE_ARG} \
-                    --num-warmups=\"$(( 2 * CONC ))\" \
-                    --request-rate=inf \
-                    --ignore-eos \
-                    --save-result \
-                    --percentile-metrics=\"ttft,tpot,itl,e2el\" \
-                    --result-dir=\"${CONTAINER_RESULT_DIR}\" \
-                    --result-filename=\"${RESULT_FILENAME}.json\" \
-                    ${BENCH_EXTRA_ARGS:-}
-                "
-            else
-              $CONTAINER_ENGINE exec \
-                -e ISL="${ISL}" \
-                -e OSL="${OSL}" \
-                -e CONC="${CONC}" \
-                -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-                -e RESULT_FILENAME="${RESULT_FILENAME}" \
-                -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-                "$CONTAINER_NAME" bash -lc "
-                  set -euo pipefail
-                  rm -rf \"${CONTAINER_RESULT_DIR}\"
-                  mkdir -p \"${CONTAINER_RESULT_DIR}\"
-                  vllm bench serve \
-                    --backend vllm \
-                    --base-url http://127.0.0.1:8000 \
-                    --endpoint /v1/completions \
-                    --model \"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                    --dataset-name random \
-                    --random-input-len \"${ISL}\" \
-                    --random-output-len \"${OSL}\" \
-                    ${RANDOM_RANGE_RATIO:+--random-range-ratio \"${RANDOM_RANGE_RATIO}\"} \
-                    --num-prompts \"$(( CONC * 8 ))\" \
-                    --max-concurrency \"${CONC}\" \
-                    ${TRUST_REMOTE_CODE_ARG} \
-                    --num-warmups \"${CONC}\" \
-                    --request-rate inf \
-                    --ignore-eos \
-                    --disable-tqdm \
-                    --save-result \
-                    --percentile-metrics ttft,tpot,itl,e2el \
-                    --result-dir \"${CONTAINER_RESULT_DIR}\" \
-                    --result-filename \"${RESULT_FILENAME}.json\" \
-                    ${BENCH_EXTRA_ARGS:-}
-                "
+          TEMPERATURE_ARG=""
+          if [[ "${MODEL_NAME}" == *"MTP"* ]]; then
+            TEMPERATURE_ARG="--temperature 0"
+          fi
+
+          python3 - <<'PY' > /tmp/benchmark_cases.tsv
+          import json
+          import os
+
+          cases = json.loads(os.environ["BENCHMARK_CASES_JSON"])
+          prefix = os.environ["RESULT_PREFIX"]
+          for case in cases:
+              isl = str(case["input_length"])
+              osl = str(case["output_length"])
+              conc = str(case["concurrency"])
+              ratio = str(case.get("random_range_ratio", ""))
+              result_filename = f"{prefix}-{isl}-{osl}-{conc}-{ratio}"
+              print("\t".join((isl, osl, conc, ratio, result_filename)))
+          PY
+
+          if [ ! -s /tmp/benchmark_cases.tsv ]; then
+            echo "::error::No benchmark cases were provided for ${MODEL_NAME}."
+            exit 1
+          fi
+
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            rm -rf \"${CONTAINER_RESULT_DIR}\"
+            mkdir -p \"${CONTAINER_RESULT_DIR}\"
+          "
+
+          append_vllm_marker() {
+            local phase="$1"
+            local status="${2:-}"
+            $CONTAINER_ENGINE exec \
+              -e MARKER_PHASE="${phase}" \
+              -e MARKER_STATUS="${status}" \
+              -e MARKER_MODEL="${MODEL_NAME}" \
+              -e MARKER_RESULT_FILENAME="${RESULT_FILENAME}" \
+              -e MARKER_ISL="${ISL}" \
+              -e MARKER_OSL="${OSL}" \
+              -e MARKER_CONC="${CONC}" \
+              -e MARKER_RATIO="${RANDOM_RANGE_RATIO}" \
+              "$CONTAINER_NAME" bash -lc '
+                set +e
+                marker_time="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+                printf "\n===== BENCHMARK CASE %s model=%s result=%s isl=%s osl=%s conc=%s ratio=%s status=%s utc=%s =====\n" \
+                  "$MARKER_PHASE" \
+                  "$MARKER_MODEL" \
+                  "$MARKER_RESULT_FILENAME" \
+                  "$MARKER_ISL" \
+                  "$MARKER_OSL" \
+                  "$MARKER_CONC" \
+                  "$MARKER_RATIO" \
+                  "$MARKER_STATUS" \
+                  "$marker_time" >> /tmp/vllm_oot.log
+              ' || true
+          }
+
+          overall_status=0
+          failed_cases=()
+          while IFS=$'\t' read -r ISL OSL CONC RANDOM_RANGE_RATIO RESULT_FILENAME; do
+            client_log="./${RESULT_FILENAME}.client.log"
+            append_vllm_marker "START"
+            case_status=0
+            {
+              echo "=== Benchmark config: ${MODEL_NAME} CLIENT=${BENCHMARK_CLIENT} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+              if [[ "${BENCHMARK_CLIENT}" == "InferenceMax bench" ]]; then
+                $CONTAINER_ENGINE exec \
+                  -e ISL="${ISL}" \
+                  -e OSL="${OSL}" \
+                  -e CONC="${CONC}" \
+                  -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+                  -e RESULT_FILENAME="${RESULT_FILENAME}" \
+                  -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                  "$CONTAINER_NAME" bash -lc "
+                    set -euo pipefail
+                    PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
+                      --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                      --backend=vllm \
+                      --base-url=http://127.0.0.1:8000 \
+                      --dataset-name=random \
+                      --random-input-len=\"${ISL}\" \
+                      --random-output-len=\"${OSL}\" \
+                      --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                      --num-prompts=\"$(( CONC * 10 ))\" \
+                      --max-concurrency=\"${CONC}\" \
+                      ${TRUST_REMOTE_CODE_ARG} \
+                      --num-warmups=\"$(( 2 * CONC ))\" \
+                      --request-rate=inf \
+                      --ignore-eos \
+                      --save-result \
+                      --percentile-metrics=\"ttft,tpot,itl,e2el\" \
+                      --result-dir=\"${CONTAINER_RESULT_DIR}\" \
+                      --result-filename=\"${RESULT_FILENAME}.json\" \
+                      ${BENCH_EXTRA_ARGS:-}
+                  "
+              else
+                $CONTAINER_ENGINE exec \
+                  -e ISL="${ISL}" \
+                  -e OSL="${OSL}" \
+                  -e CONC="${CONC}" \
+                  -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+                  -e RESULT_FILENAME="${RESULT_FILENAME}" \
+                  -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                  "$CONTAINER_NAME" bash -lc "
+                    set -euo pipefail
+                    vllm bench serve \
+                      --backend vllm \
+                      --base-url http://127.0.0.1:8000 \
+                      --endpoint /v1/completions \
+                      --model \"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                      --dataset-name random \
+                      --random-input-len \"${ISL}\" \
+                      --random-output-len \"${OSL}\" \
+                      ${RANDOM_RANGE_RATIO:+--random-range-ratio \"${RANDOM_RANGE_RATIO}\"} \
+                      --num-prompts \"$(( CONC * 8 ))\" \
+                      --max-concurrency \"${CONC}\" \
+                      ${TRUST_REMOTE_CODE_ARG} \
+                      --num-warmups \"${CONC}\" \
+                      --request-rate inf \
+                      --ignore-eos \
+                      --disable-tqdm \
+                      --save-result \
+                      --percentile-metrics ttft,tpot,itl,e2el \
+                      --result-dir \"${CONTAINER_RESULT_DIR}\" \
+                      --result-filename \"${RESULT_FILENAME}.json\" \
+                      ${TEMPERATURE_ARG} \
+                      ${BENCH_EXTRA_ARGS:-}
+                  "
+              fi
+            } > "${client_log}" 2>&1 || case_status=$?
+
+            append_vllm_marker "END" "${case_status}"
+            if [ "${case_status}" -ne 0 ]; then
+              echo "::warning::Benchmark case failed for ${MODEL_NAME}: ${RESULT_FILENAME} (exit ${case_status})."
+              failed_cases+=("${RESULT_FILENAME}:${case_status}")
+              if [ "${overall_status}" -eq 0 ]; then
+                overall_status="${case_status}"
+              fi
             fi
-          } > "./${RESULT_FILENAME}.client.log" 2>&1
+          done < /tmp/benchmark_cases.tsv
+
+          if [ "${#failed_cases[@]}" -gt 0 ]; then
+            printf '::warning::Failed benchmark cases for %s: %s\n' "${MODEL_NAME}" "${failed_cases[*]}"
+          fi
+          exit "${overall_status}"
 
       - name: Copy OOT benchmark outputs
         if: always()
         run: |
           set -euo pipefail
-          if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "test -f \"${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json\"" >/dev/null 2>&1; then
-            $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json" || true
+          if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "test -d \"${CONTAINER_RESULT_DIR}\"" >/dev/null 2>&1; then
+            $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/." . || true
           fi
           if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "test -f /tmp/vllm_oot.log" >/dev/null 2>&1; then
-            $CONTAINER_ENGINE cp "${CONTAINER_NAME}:/tmp/vllm_oot.log" "./${RESULT_FILENAME}.vllm.log" || true
+            $CONTAINER_ENGINE cp "${CONTAINER_NAME}:/tmp/vllm_oot.log" "./${RESULT_PREFIX}.vllm.log" || true
+            shopt -s nullglob
+            for f in "${RESULT_PREFIX}"-*.json; do
+              cp "./${RESULT_PREFIX}.vllm.log" "./${f%.json}.vllm.log" || true
+            done
           fi
 
-      - name: Enrich copied benchmark result
+      - name: Enrich copied benchmark results
         if: always()
         run: |
           set -euo pipefail
-          if [ ! -f "${RESULT_FILENAME}.json" ]; then
+          shopt -s nullglob
+          result_files=("${RESULT_PREFIX}"-*.json)
+          if [ ${#result_files[@]} -eq 0 ]; then
             echo "No benchmark result JSON found to enrich."
             exit 0
           fi
-          RESULT_PATH="${RESULT_FILENAME}.json" \
-          ISL="${ISL}" \
-          OSL="${OSL}" \
-          EXTRA_ARGS_TEXT="${OOT_EXTRA_ARGS}" \
-          DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
-          ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
-          ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
-          ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
-          VLLM_COMMIT_USED="${VLLM_COMMIT_USED}" \
-          VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
-          OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
-          OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
-          PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
-          UPLOAD_TO_CUSTOM_DASHBOARD="${UPLOAD_TO_CUSTOM_DASHBOARD}" \
-          BENCHMARK_CLIENT="${BENCHMARK_CLIENT}" \
-          python3 - <<'PY'
+          for result_path in "${result_files[@]}"; do
+            RESULT_PATH="${result_path}" \
+            EXTRA_ARGS_TEXT="${OOT_EXTRA_ARGS}" \
+            DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
+            ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
+            ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
+            ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
+            VLLM_COMMIT_USED="${VLLM_COMMIT_USED}" \
+            VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
+            OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
+            OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
+            PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
+            UPLOAD_TO_CUSTOM_DASHBOARD="${UPLOAD_TO_CUSTOM_DASHBOARD}" \
+            BENCHMARK_CLIENT="${BENCHMARK_CLIENT}" \
+            python3 - <<'PY'
           import json
           import os
           import re
+          from pathlib import Path
 
           result_path = os.environ["RESULT_PATH"]
           with open(result_path, encoding="utf-8") as f:
               data = json.load(f)
 
-          data["random_input_len"] = int(os.environ["ISL"])
-          data["random_output_len"] = int(os.environ["OSL"])
+          _, isl, osl, _, _ = Path(result_path).stem.rsplit("-", 4)
+          data["random_input_len"] = int(isl)
+          data["random_output_len"] = int(osl)
           data["benchmark_backend"] = "ATOM-vLLM"
 
           display_name = os.environ.get("DASHBOARD_MODEL_NAME", "")
@@ -1662,21 +1981,38 @@ jobs:
           with open(result_path, "w", encoding="utf-8") as f:
               json.dump(data, f, indent=2)
           PY
+          done
 
       - name: Dump OOT benchmark diagnostics
         if: always()
         run: |
           set -euo pipefail
-          RESULT_PATH="${RESULT_FILENAME}.json"
-          CLIENT_LOG="${RESULT_FILENAME}.client.log"
-          VLLM_LOG="${RESULT_FILENAME}.vllm.log"
           BENCH_OUTCOME="${{ steps.run_benchmark_client.outcome }}"
-          COMPLETED=""
-          NUM_PROMPTS=""
+          python3 - <<'PY' > /tmp/benchmark_cases.tsv
+          import json
+          import os
 
-          if [ -f "${RESULT_PATH}" ]; then
-            mapfile -t RESULT_COUNTS < <(
-              RESULT_PATH="${RESULT_PATH}" python3 - <<'PY'
+          cases = json.loads(os.environ["BENCHMARK_CASES_JSON"])
+          prefix = os.environ["RESULT_PREFIX"]
+          for case in cases:
+              ratio = str(case.get("random_range_ratio", ""))
+              result_filename = (
+                  f'{prefix}-{case["input_length"]}-{case["output_length"]}-'
+                  f'{case["concurrency"]}-{ratio}'
+              )
+              print(result_filename)
+          PY
+
+          dumped_any=0
+          while IFS= read -r result_filename; do
+            RESULT_PATH="${result_filename}.json"
+            CLIENT_LOG="${result_filename}.client.log"
+            COMPLETED=""
+            NUM_PROMPTS=""
+
+            if [ -f "${RESULT_PATH}" ]; then
+              mapfile -t RESULT_COUNTS < <(
+                RESULT_PATH="${RESULT_PATH}" python3 - <<'PY'
           import json
           import os
 
@@ -1691,30 +2027,36 @@ jobs:
               print(data.get("completed", ""))
               print(data.get("num_prompts", ""))
           PY
-            )
-            COMPLETED="${RESULT_COUNTS[0]:-}"
-            NUM_PROMPTS="${RESULT_COUNTS[1]:-}"
-          fi
+              )
+              COMPLETED="${RESULT_COUNTS[0]:-}"
+              NUM_PROMPTS="${RESULT_COUNTS[1]:-}"
+            fi
 
-          if [[ "${BENCH_OUTCOME}" == "success" && -f "${RESULT_PATH}" && -n "${NUM_PROMPTS}" && "${COMPLETED}" == "${NUM_PROMPTS}" ]]; then
+            if [[ "${BENCH_OUTCOME}" == "success" && -f "${RESULT_PATH}" && -n "${NUM_PROMPTS}" && "${COMPLETED}" == "${NUM_PROMPTS}" ]]; then
+              continue
+            fi
+
+            dumped_any=1
+            echo "::warning::Dumping benchmark diagnostics for ${MODEL_NAME} ${result_filename} (benchmark outcome=${BENCH_OUTCOME}, completed=${COMPLETED:-missing}, num_prompts=${NUM_PROMPTS:-missing})."
+            echo "::group::Benchmark client log ${result_filename}"
+            if [ -f "${CLIENT_LOG}" ]; then
+              cat "${CLIENT_LOG}"
+            else
+              echo "Benchmark client log not found: ${CLIENT_LOG}"
+            fi
+            echo "::endgroup::"
+          done < /tmp/benchmark_cases.tsv
+
+          if [ "${dumped_any}" -eq 0 ]; then
             echo "Benchmark finished without triggering diagnostic dump."
             exit 0
           fi
 
-          echo "::warning::Dumping benchmark diagnostics for ${MODEL_NAME} (benchmark outcome=${BENCH_OUTCOME}, completed=${COMPLETED:-missing}, num_prompts=${NUM_PROMPTS:-missing})."
-          echo "::group::Benchmark client log"
-          if [ -f "${CLIENT_LOG}" ]; then
-            cat "${CLIENT_LOG}"
-          else
-            echo "Benchmark client log not found: ${CLIENT_LOG}"
-          fi
-          echo "::endgroup::"
-
           echo "::group::vLLM log tail"
-          if [ -f "${VLLM_LOG}" ]; then
-            tail -n 400 "${VLLM_LOG}"
+          if [ -f "${RESULT_PREFIX}.vllm.log" ]; then
+            tail -n 400 "${RESULT_PREFIX}.vllm.log"
           else
-            echo "vLLM log not found: ${VLLM_LOG}"
+            echo "vLLM log not found: ${RESULT_PREFIX}.vllm.log"
           fi
           echo "::endgroup::"
 
@@ -1743,71 +2085,82 @@ jobs:
         id: validate_benchmark_result
         run: |
           set -euo pipefail
-          RESULT_PATH="${RESULT_FILENAME}.json"
-          RESULT_PATH="${RESULT_PATH}" MODEL_NAME="${MODEL_NAME}" python3 - <<'PY'
+          BENCHMARK_CASES_JSON="${BENCHMARK_CASES_JSON}" RESULT_PREFIX="${RESULT_PREFIX}" MODEL_NAME="${MODEL_NAME}" python3 - <<'PY'
           import json
           import os
           import sys
 
-          result_path = os.environ["RESULT_PATH"]
+          cases = json.loads(os.environ["BENCHMARK_CASES_JSON"])
+          prefix = os.environ["RESULT_PREFIX"]
           model_name = os.environ["MODEL_NAME"]
+          validated = 0
 
-          if not os.path.exists(result_path):
-              print(
-                  f"::error::Benchmark result file {result_path} was not generated for {model_name}.",
-                  file=sys.stderr,
+          for case in cases:
+              ratio = str(case.get("random_range_ratio", ""))
+              result_path = (
+                  f'{prefix}-{case["input_length"]}-{case["output_length"]}-{case["concurrency"]}-{ratio}.json'
               )
-              sys.exit(1)
 
-          try:
-              with open(result_path, encoding="utf-8") as f:
-                  data = json.load(f)
-          except (OSError, ValueError, json.JSONDecodeError) as exc:
+              if not os.path.exists(result_path):
+                  print(
+                      f"::error::Benchmark result file {result_path} was not generated for {model_name}.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              try:
+                  with open(result_path, encoding="utf-8") as f:
+                      data = json.load(f)
+              except (OSError, ValueError, json.JSONDecodeError) as exc:
+                  print(
+                      f"::error::Failed to read benchmark result file {result_path}: {exc}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              num_prompts = data.get("num_prompts")
+              completed = data.get("completed")
+
+              try:
+                  num_prompts = int(num_prompts)
+                  completed = int(completed)
+              except (TypeError, ValueError):
+                  print(
+                      f"::error::Invalid benchmark result in {result_path}: "
+                      f"num_prompts={num_prompts!r}, completed={completed!r}.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              if completed != num_prompts:
+                  print(
+                      f"::error::Invalid benchmark result in {result_path}: "
+                      f"successful requests ({completed}) did not match num_prompts ({num_prompts}). "
+                      "Skipping artifact upload and dashboard publishing.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              validated += 1
               print(
-                  f"::error::Failed to read benchmark result file {result_path}: {exc}",
-                  file=sys.stderr,
+                  f"Validated benchmark result for {model_name} {result_path}: "
+                  f"successful requests ({completed}) matched num_prompts ({num_prompts})."
               )
-              sys.exit(1)
 
-          num_prompts = data.get("num_prompts")
-          completed = data.get("completed")
-
-          try:
-              num_prompts = int(num_prompts)
-              completed = int(completed)
-          except (TypeError, ValueError):
-              print(
-                  f"::error::Invalid benchmark result in {result_path}: "
-                  f"num_prompts={num_prompts!r}, completed={completed!r}.",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          if completed != num_prompts:
-              print(
-                  f"::error::Invalid benchmark result in {result_path}: "
-                  f"successful requests ({completed}) did not match num_prompts ({num_prompts}). "
-                  "Skipping artifact upload and dashboard publishing.",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          print(
-              f"Validated benchmark result for {model_name}: "
-              f"successful requests ({completed}) matched num_prompts ({num_prompts})."
-          )
+          print(f"Validated {validated} benchmark result(s) for {model_name}.")
           PY
 
       - name: Upload benchmark artifacts
         if: always() && steps.validate_benchmark_result.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: oot-benchmark-${{ env.RESULT_FILENAME }}
+          name: oot-benchmark-${{ env.RESULT_PREFIX }}-${{ strategy.job-index }}
           if-no-files-found: warn
           path: |
-            ${{ env.RESULT_FILENAME }}.json
-            ${{ env.RESULT_FILENAME }}.client.log
-            ${{ env.RESULT_FILENAME }}.vllm.log
+            ${{ env.RESULT_PREFIX }}-*.json
+            ${{ env.RESULT_PREFIX }}-*.client.log
+            ${{ env.RESULT_PREFIX }}-*.vllm.log
+            ${{ env.RESULT_PREFIX }}.vllm.log
 
       - name: Clean up OOT benchmark container
         if: always()
@@ -1822,6 +2175,9 @@ jobs:
           fi
 
   summarize-benchmark-result:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     if: >-
       always()
       && needs.resolve-atom-source.result == 'success'
@@ -1849,6 +2205,12 @@ jobs:
           json_files=(*.json)
           echo "downloaded_count=${#json_files[@]}" >> "$GITHUB_OUTPUT"
           printf 'Downloaded %s benchmark result files\n' "${#json_files[@]}"
+
+      - name: Download benchmark matrix payload
+        uses: actions/download-artifact@v8
+        with:
+          name: oot-benchmark-matrix
+          path: .
 
       - name: Note summary behavior
         run: |
@@ -1878,12 +2240,11 @@ jobs:
 
       - name: Generate OOT benchmark summary table
         env:
-          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
-            --matrix-json "${BENCHMARK_MATRIX}" \
+            --matrix-json-file benchmark_matrix.json \
             --run-url "${RUN_URL}" \
             --output-json oot_benchmark_summary.json \
             --title "ATOM-vLLM Benchmark Summary" \
@@ -2272,7 +2633,7 @@ jobs:
           alert-threshold: "80%"
           comment-on-alert: true
           fail-on-alert: false
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push dashboard data to gh-pages

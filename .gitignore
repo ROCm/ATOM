@@ -54,3 +54,7 @@ aiter_logs
 *.log
 online_quant_info_*.json
 .claude/plan/
+
+# CI: Docker / BuildKit state under workspace (self-hosted CI)
+.atom-docker-client/
+.buildkit-tmp/

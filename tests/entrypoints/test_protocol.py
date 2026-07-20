@@ -171,10 +171,32 @@ class TestChatCompletionRequest:
         )
         assert req.temperature == 1.0
         assert req.max_tokens == 8192
+        assert req.get_max_tokens() == 8192
         assert req.stream is False
         assert req.top_p == 1.0
         assert req.top_k == -1
         assert req.n == 1
+
+    def test_max_completion_tokens_sets_effective_limit(self):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_completion_tokens": 16,
+            }
+        )
+        assert req.max_tokens == 8192
+        assert req.max_completion_tokens == 16
+        assert req.get_max_tokens() == 16
+
+    def test_max_tokens_still_sets_effective_limit(self):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 32,
+            }
+        )
+        assert req.max_tokens == 32
+        assert req.get_max_tokens() == 32
 
     def test_n_greater_than_one(self):
         req = ChatCompletionRequest.model_validate(
@@ -184,6 +206,22 @@ class TestChatCompletionRequest:
             }
         )
         assert req.n == 4
+
+    def test_kv_transfer_params_parsed(self):
+        kv = {"transfer_id": "abc", "block_table": [1, 2, 3]}
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "kv_transfer_params": kv,
+            }
+        )
+        assert req.kv_transfer_params == kv
+
+    def test_kv_transfer_params_default_none(self):
+        req = ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="Hi")],
+        )
+        assert req.kv_transfer_params is None
 
     def test_multimodal_messages(self):
         """Request with multimodal content should parse correctly."""
@@ -213,7 +251,19 @@ class TestCompletionRequest:
         req = CompletionRequest(prompt="Hello world")
         assert req.prompt == "Hello world"
         assert req.max_tokens == 8192
+        assert req.get_max_tokens() == 8192
         assert req.n == 1
+
+    def test_max_completion_tokens_sets_effective_limit(self):
+        req = CompletionRequest.model_validate(
+            {
+                "prompt": "Hello world",
+                "max_completion_tokens": 16,
+            }
+        )
+        assert req.max_tokens == 8192
+        assert req.max_completion_tokens == 16
+        assert req.get_max_tokens() == 16
 
     def test_extra_fields_ignored(self):
         req = CompletionRequest.model_validate(
@@ -250,6 +300,35 @@ class TestResponseModels:
         )
         assert resp.id == "chatcmpl-123"
         assert resp.choices[0]["message"]["content"] == "Hello!"
+
+    def test_chat_response_kv_transfer_params(self):
+        kv = {"transfer_id": "xfer-123", "block_table": [0, 1]}
+        resp = ChatCompletionResponse(
+            id="chatcmpl-456",
+            created=int(time.time()),
+            model="test-model",
+            choices=[
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hi"},
+                    "finish_reason": "stop",
+                }
+            ],
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            kv_transfer_params=kv,
+        )
+        dumped = resp.model_dump()
+        assert dumped["kv_transfer_params"] == kv
+
+    def test_chat_response_kv_transfer_params_absent(self):
+        resp = ChatCompletionResponse(
+            id="chatcmpl-789",
+            created=int(time.time()),
+            model="test-model",
+            choices=[],
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+        assert resp.kv_transfer_params is None
 
     def test_completion_response(self):
         resp = CompletionResponse(

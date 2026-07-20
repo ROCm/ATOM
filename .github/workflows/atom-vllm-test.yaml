@@ -3,29 +3,73 @@ name: ATOM vLLM Test
 on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
-    types: [opened, synchronize, reopened, ready_for_review, closed]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - 'atom/plugin/sglang/**'
+      - 'atom/mesh/**'
+      - '.github/benchmark/models_atomesh.yaml'
+      - '.github/scripts/atomesh/**'
+      - '.github/workflows/atomesh-*.yaml'
+      - '.github/workflows/atom-sglang-*.yaml'
+      - '.github/benchmark/sglang_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
+  pull_request_review:
+    types: [submitted]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'pull_request_review' || github.event.review.state == 'approved' }}
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  ATOM_PYTHON_TAG: "cp312"
   OOT_IMAGE_CACHE_KEEP: "3"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_OOT_IMAGE_TAG: rocm/atom-dev:vllm-latest
-  VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
+  VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
 
 jobs:
   # ---------- OOT CI path (pull_request only) ----------
+  ci-gate:
+    name: Check Heavy CI Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Check approval and label gate
+        id: gate
+        env:
+          CI_GATE_LABELS: ci:full,ci:vllm
+          CI_GATE_PATHS_IGNORE: |
+            **/*.md
+            docs/**
+            atom/plugin/sglang/**
+            atom/mesh/**
+            .github/workflows/atomesh-*.yaml
+            .github/scripts/atomesh_*.sh
+            .github/dashboard/atomesh_*.html
+            .github/workflows/atom-sglang-*.yaml
+            .github/benchmark/sglang_models_accuracy.json
+            LICENSE
+            .gitignore
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash ./.github/scripts/check_heavy_ci_gate.sh
+
   check-signal:
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    needs: [ci-gate]
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
     permissions:
@@ -40,10 +84,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
+          CHECK_SIGNAL_EVENT_NAME: pull_request
+          CHECK_SIGNAL_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha }}
 
   download_aiter_wheel:
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
-    needs: [check-signal]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' }}
+    needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
     outputs:
@@ -76,20 +123,23 @@ jobs:
           }
 
           find_latest_artifact() {
-            local runs_json artifact_json run_id
+            local runs_json artifact_json run_id python_artifact_suffix
 
             if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
               return 0
             fi
 
-            echo "=== Finding latest aiter-whl-* artifact from ROCm/aiter ==="
+            python_artifact_suffix="py${ATOM_PYTHON_TAG#cp}"
+            python_artifact_suffix="${python_artifact_suffix:0:3}.${python_artifact_suffix:3}"
+
+            echo "=== Finding latest aiter-whl-* artifact for ${python_artifact_suffix} from ROCm/aiter ==="
             runs_json=$(curl -fsSL -H "$AUTH_HEADER" \
               "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
 
             for run_id in $(echo "$runs_json" | jq -r '.workflow_runs[].id'); do
               artifact_json=$(curl -fsSL -H "$AUTH_HEADER" \
                 "$API_URL/repos/ROCm/aiter/actions/runs/$run_id/artifacts" \
-                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-")) | select(.expired == false)] | sort_by(.created_at) | last')
+                | jq --arg artifact_suffix "-${python_artifact_suffix}" '[.artifacts[] | select(.name | startswith("aiter-whl-") and endswith($artifact_suffix)) | select(.expired == false)] | sort_by(.created_at) | last')
 
               if [ "$artifact_json" != "null" ] && [ -n "$artifact_json" ]; then
                 ARTIFACT_ID=$(echo "$artifact_json" | jq -r '.id')
@@ -119,11 +169,24 @@ jobs:
             manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
             manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
             manifest_commit=$(jq -r '.commit // empty' "$manifest_file")
-            wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
-            wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+
+            wheel_name=$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_name // empty" "$manifest_file")
+            wheel_url=$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_url // empty" "$manifest_file")
+            if [ -n "$wheel_name" ] && [ -n "$wheel_url" ]; then
+              echo "Selected ${ATOM_PYTHON_TAG} wheel from versioned manifest"
+            else
+              wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
+              wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+              echo "Versioned manifest not available, using top-level wheel fields"
+            fi
 
             if [ "$manifest_branch" != "main" ] || [ -z "$manifest_timestamp" ] || [ -z "$manifest_commit" ] || [ -z "$wheel_name" ] || [ -z "$wheel_url" ]; then
               echo "Invalid latest main wheel manifest"
+              return 1
+            fi
+
+            if [[ "$wheel_name" == *cp* ]] && [[ "$wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "WARNING: wheel $wheel_name does not match target Python ${ATOM_PYTHON_TAG}"
               return 1
             fi
 
@@ -154,9 +217,11 @@ jobs:
           }
 
           download_from_artifact() {
-            echo "=== Falling back to latest aiter-whl-* artifact from ROCm/aiter ==="
+            local fallback_wheel fallback_wheel_name
+
+            echo "=== Falling back to latest ${ATOM_PYTHON_TAG} aiter-whl-* artifact from ROCm/aiter ==="
             find_latest_artifact || {
-              echo "ERROR: No aiter-whl-* artifact found in recent Aiter Test runs"
+              echo "ERROR: No ${ATOM_PYTHON_TAG} aiter-whl-* artifact found in recent Aiter Test runs"
               return 1
             }
 
@@ -167,6 +232,15 @@ jobs:
               -o aiter-whl.zip
             unzip -o aiter-whl.zip -d aiter-whl
             rm -f aiter-whl.zip
+
+            fallback_wheel=$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
+            fallback_wheel_name=$(basename "${fallback_wheel:-}")
+            if [ -z "$fallback_wheel" ] || [[ "$fallback_wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "ERROR: artifact fallback did not produce a ${ATOM_PYTHON_TAG} wheel"
+              ls -la aiter-whl/ || true
+              return 1
+            fi
+            echo "Downloaded artifact-selected wheel: $fallback_wheel"
           }
 
           if download_from_s3_manifest; then
@@ -182,73 +256,95 @@ jobs:
             ls -la aiter-whl/ || true
             exit 1
           fi
+          if [[ "$(basename "$AITER_WHL")" != *${ATOM_PYTHON_TAG}* ]]; then
+            echo "ERROR: selected wheel $AITER_WHL does not match target Python ${ATOM_PYTHON_TAG}"
+            exit 1
+          fi
 
           echo "Selected wheel: $AITER_WHL"
           echo "aiter_artifact_id=${ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
           echo "aiter_wheel_name=$(basename "$AITER_WHL")" >> "$GITHUB_OUTPUT"
 
       - name: Upload aiter wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
           retention-days: 7
 
   atom-vllm-oot:
-    needs: [check-signal, download_aiter_wheel]
-    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
+    needs: [ci-gate, check-signal, download_aiter_wheel]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' && needs.download_aiter_wheel.result == 'success' }}
     name: Accuracy (${{ matrix.display_name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - display_name: "DeepSeek-R1-FP8 TP8"
-            model_name: "DeepSeek-R1-FP8"
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extra_args: "--tensor-parallel-size 8"
-            env_vars: ""
+          - display_name: "DeepSeek-V4-Flash TP4"
+            model_name: "DeepSeek-V4-Flash"
+            model_path: "deepseek-ai/DeepSeek-V4-Flash"
+            extra_args: "--tensor-parallel-size 4 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4"
+            env_vars: |
+              AITER_BF16_FP8_MOE_BOUND=0
+              ATOM_MOE_GU_ITLV=1
+            lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.93
-            runner: atom-mi355-8gpu.predownload
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extra_args: "--tensor-parallel-size 1 --gpu-memory-utilization 0.5"
             client_command: "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
-            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_USE_V2_MODEL_RUNNER=1"
+            lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.88
-            runner: linux-atom-mi35x-1
-          - display_name: "Kimi-K2-Thinking-MXFP4 TP4"
-            model_name: "Kimi-K2-Thinking-MXFP4"
-            model_path: "amd/Kimi-K2-Thinking-MXFP4"
-            extra_args: "--tensor-parallel-size 4"
-            env_vars: ""
-            accuracy_test_threshold: 0.90
-            runner: linux-atom-mi35x-4
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+          - display_name: "Kimi-K2.5-MXFP4 TP4"
+            model_name: "Kimi-K2.5-MXFP4"
+            model_path: "amd/Kimi-K2.5-MXFP4-AttnFP8"
+            extra_args: "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384"
+            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+            lm_eval_num_fewshot: 3
+            accuracy_test_threshold: 0.92
+            runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
             extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
-            # FIXME: Remove these temporary Qwen3.5 workarounds after the
-            # aiter fix landed
             env_vars: |
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
-            accuracy_test_threshold: 0.76
-            runner: linux-atom-mi35x-4
+            lm_eval_num_fewshot: 3
+            accuracy_test_threshold: 0.77
+            runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
-      VLLM_COMMIT: 2a69949bdadf0e8942b7a1619b229cb475beef20
-      VLLM_VERSION: "0.19.0"
+      VLLM_COMMIT: 0b3ba88f165976e77ca5e6a7a3f5bba4562b80af
+      VLLM_VERSION: "0.22.0"
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
+      - name: Configure Docker client config path
+        run: |
+          if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            echo "DOCKER_CONFIG=${GITHUB_WORKSPACE}/.atom-docker-client" >> "$GITHUB_ENV"
+            echo "Set DOCKER_CONFIG to workspace .atom-docker-client (runner-owned, avoids /it-share chmod)."
+          else
+            echo "Runner ${{ matrix.runner }}: leave DOCKER_CONFIG unset (default ~/.docker)."
+          fi
+
       - name: Clean up containers and workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
-          containers=$(docker ps -q)
+          if ! docker ps >/tmp/docker-ps.out 2>/tmp/docker-ps.err; then
+            echo "::warning::Docker is unavailable on this runner. Skipping pre-cleanup."
+            cat /tmp/docker-ps.err || true
+            exit 0
+          fi
+          containers=$(cat /tmp/docker-ps.out)
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
@@ -258,6 +354,17 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
 
+      - name: Ensure Docker client config directory
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKER_CONFIG:-}" ]; then
+            echo "DOCKER_CONFIG is unset for runner ${{ matrix.runner }}; using Docker's default config path."
+            exit 0
+          fi
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
 
@@ -266,8 +373,26 @@ jobs:
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
+      - name: Print runner user
+        run: |
+          echo "=== Container engine diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "podman version:"
+          podman version || true
+          echo "podman info:"
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+      
       - name: Download aiter wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiter-whl
           path: aiter-whl
@@ -309,7 +434,7 @@ jobs:
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
           RUN pip show amd-aiter atom vllm torch triton mori || true
           EOF
-
+      
       - name: Build OOT image locally
         run: |
           set -euo pipefail
@@ -381,8 +506,20 @@ jobs:
           if [ -d "/models" ]; then
             MODEL_CACHE_MOUNT="-v /models:/models"
             MODEL_CACHE_DESC="/models (host mount)"
+          elif [ -d "/it-share/models" ]; then
+            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
+            MODEL_CACHE_DESC="/it-share/models (host path)"
+          elif [ -d "/mnt/dcgpuval/models" ]; then
+            MODEL_CACHE_MOUNT="-v /mnt/dcgpuval/models:/models"
+            MODEL_CACHE_DESC="/mnt/dcgpuval/models (host path)"
+          elif [ -d "/shareddata/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
+            MODEL_CACHE_DESC="/shareddata/models (host path)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (host path)"
           else
-            echo "Warning: /models directory not found on runner; using container-local /models."
+            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models and /data/models directory not found on runner; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -404,7 +541,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host --network=host --group-add video \
             --shm-size=16G \
             --privileged \
             --cap-add=SYS_PTRACE \
@@ -417,6 +554,13 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: GPU preflight check
+        if: success()
+        timeout-minutes: 5
+        env:
+          GPU_PREFLIGHT_ALLOCATION_MB: "8"
+        run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
+
       - name: Download or refresh model if needed
         if: success()
         run: |
@@ -424,7 +568,7 @@ jobs:
           model_dir="/models/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             model_use_lock="true"
-            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ] || [ "${{ matrix.runner }}" = "atom-mi35x-8gpu-oot-acc" ]; then
               model_use_lock="false"
             fi
             echo "Using shared model download script for ${model_dir} (MODEL_USE_LOCK=${model_use_lock})"
@@ -464,7 +608,7 @@ jobs:
 
       - name: Run OOT launch and gsm8k accuracy via script (ci mode)
         if: success()
-        timeout-minutes: 120
+        timeout-minutes: 45
         env:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
@@ -472,7 +616,7 @@ jobs:
           OOT_CLIENT_COMMAND: ${{ matrix.client_command || '' }}
           OOT_ENV_VARS: ${{ matrix.env_vars }}
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
-          MAX_WAIT_RETRIES: "120"
+          MAX_WAIT_RETRIES: "40"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
@@ -500,7 +644,15 @@ jobs:
           fi
 
           echo "RESULT_FILE: $result_file"
-          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
+          flexible_extract_value=$(python3 - "$result_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              data = json.load(f)
+          print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
+          PY
+          )
           echo "Flexible extract value: $flexible_extract_value"
           echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
 
@@ -528,7 +680,7 @@ jobs:
 
       - name: Upload OOT artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oot-${{ matrix.model_name }}-artifacts
           path: |

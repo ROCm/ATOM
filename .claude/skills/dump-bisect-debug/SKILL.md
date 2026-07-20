@@ -1,9 +1,9 @@
 ---
 name: dump-bisect-debug
 description: Locate forward numerical bugs by dumping intermediate tensors from a target implementation and a known-good reference, then bisecting layer by layer. Also covers batch-invariance bisect (the same token at any batch position should produce a bitwise-identical output, per DeepSeek V4 paper §3.3). Use when "the output is wrong but I don't know where" — model produces gibberish, degenerates, or picks the wrong token, but code review reveals nothing.
-version: 3.0.0
+version: 3.1.0
 scope: ATOM (generalizable to any PyTorch forward debug)
-last_updated: 2026-04-30  # add Phase 8 batch invariance + atom/utils/debug_helper infra
+last_updated: 2026-05-20
 ---
 
 ## ATOM built-in infrastructure (v3.0+ — read first)
@@ -292,10 +292,7 @@ print(cos_max(out_C2, ref_dump))
 2. **Re-run the forward dump and verify cos**: confirm the fix is real and the sub-stage cos actually improved.
 3. **Run e2e and look at token output**: from rambling → coherent output → byte-equal vs ref.
 4. **Multiple bugs may need fixing**: one fix is often not enough (e.g. fixing V4 attention still leaves FFN wrong) → continue bisecting the next one.
-5. **Fix isolation revert** ★ Once all fixes pass, **revert each one in turn** to identify the critical ones (this is core principle #6):
-   - V4 case: reverting `linear.py` (Bug 8) showed Bug 9+10 alone were enough to output `"6"`.
-   - Bug 8 was just fine-tuning (byte-equal vs ref) and had a perf cost.
-   - This step decides the PR split granularity (critical fixes merge immediately; fine-tuning fixes can wait).
+5. **Fix isolation revert** ★ Once all fixes pass, **revert each one in turn** to identify the critical ones (this is core principle #6). A fix may be "fine-tuning" (byte-equal vs ref but other fixes alone already produce correct output) and carry a perf cost — those can ship separately or wait. This step decides PR split granularity: critical fixes merge immediately; fine-tuning fixes can wait.
 
 ### Phase 8: Batch-invariance bisect (DeepSeek V4 paper §3.3)
 
@@ -374,15 +371,14 @@ Set `ATOM_FWD_DUMP_ONE_SHOT=0` so each call writes its own file (`layer{LL}_{Cls
 | Layer 1+ attn cos explodes (0.97) | Hash routing / sqrtsoftplus cascades small upstream drift. |
 | Whole model cos ≈ 0.999 yet final logits diverge | Edge-confidence token + sampling noise. |
 
-**Example** (Bug 11, V4 batch=4 prompt P3 answers `"15"`):
-- Single prompt: 100% answers `"6"`. Batch=4: 40% flip to `"15"`.
-- E1 4×P3 + temp=0.0: slot 0/1/3 → `"6"`, slot 2 → `"1+2+"` (different).
-- Layer 0 attn cos 0.99988 (near identical) → MoE 0.998 (10× amplification) → layer 1 attn 0.97 (cascaded).
-- Full write-up: `/app/logs_claude/deepseek_v4/notes/21_bug11_isolation.md`.
+**Diagnostic pattern** — when batch=N flips a token that single-prompt gets right:
+- E1 with 4× the same prompt at temp=0.0 shows slots disagreeing (e.g. slot 2 produces different tokens than 0/1/3).
+- Layer 0 attention cos = 0.99988 (near identical) → MoE 0.998 (10× amplification) → layer 1 attention 0.97 (cascaded).
+- The single-step cos drop is in the GEMM / MoE reduction, not the model code.
 
 **Fix direction**:
-- Cannot be fixed at the ATOM layer — needs aiter to ship batch-invariant kernels (DeepGEMM-style + dual-kernel attention).
-- Short term: document as a known limitation; only the single-prompt and high-confidence batch paths are guaranteed correct.
+- Not fixable at the ATOM layer — needs aiter to ship batch-invariant kernels (DeepGEMM-style + dual-kernel attention).
+- Mitigation: document as a known limitation; only single-prompt and high-confidence batch paths are guaranteed correct.
 
 ## Common root-cause categories (by frequency)
 

@@ -361,6 +361,7 @@ the programmatic API.
 | `--torch-profiler-dir <dir>` | CLI arg to set the trace output directory |
 | `ATOM_TORCH_PROFILER_DIR` env var | Sets the default `torch_profiler_dir` in `Config` |
 | `ATOM_PROFILER_MORE=1` env var | Enables detailed profiling: `record_shapes`, `with_stack`, `profile_memory` |
+| `ATOM_PROFILER_TIMEOUT=<seconds>` env var | Overrides the `stop_profile` timeout; default is 300 seconds |
 
 When a profiler directory is configured, each worker saves traces to a
 rank-specific subdirectory:
@@ -387,6 +388,7 @@ curl -s -S -X POST http://127.0.0.1:8000/stop_profile
 
 The server must be started with `--torch-profiler-dir` or with
 `ATOM_TORCH_PROFILER_DIR` set for these endpoints to produce traces.
+For large traces, set `ATOM_PROFILER_TIMEOUT` higher before starting the server.
 
 ### 5.3 Programmatic Profiling
 
@@ -472,8 +474,9 @@ python -m atom.entrypoints.openai_server \
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--method` | `None` | Speculative method; currently only `mtp` is supported |
+| `--method` | `None` | Speculative method: `mtp` (DeepSeek MTP) or `eagle3` (EAGLE 3 / EAGLE 3.1 — see [`eagle3_speculative_decoding.md`](eagle3_speculative_decoding.md)) |
 | `--num-speculative-tokens` | `1` | Number of draft tokens per iteration (draft model runs this many autoregressive steps) |
+| `--draft-model` | `None` | Path or HF repo of the speculative draft model. Required for `--method eagle3`; the draft's `config.json` drives EAGLE 3 vs EAGLE 3.1 toggles automatically |
 
 ### 6.3 MTP Statistics
 
