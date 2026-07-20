@@ -2560,9 +2560,11 @@ class DeepseekV4Attention(nn.Module):
                 # blocks (free_before=0) so every dst block is valid here.
                 # K source is the PCP all-gathered full extend K (k_*_full); off
                 # PCP it falls back to qkn.k_packed/k_rope (single-rank identical).
-                attn_md.max_seqlen_q
-                if _V4_SWA_FULL_RETAIN
-                else min(self.window_size, attn_md.max_seqlen_q),
+                (
+                    attn_md.max_seqlen_q
+                    if _V4_SWA_FULL_RETAIN
+                    else min(self.window_size, attn_md.max_seqlen_q)
+                ),
                 k_packed=k_packed_full,
                 k_rope=k_rope_full,
                 swa_region_rope=self.swa_kv_rope,

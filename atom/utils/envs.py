@@ -94,9 +94,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
     # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
     # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
-    "ATOM_SWA_FULL_RETAIN": lambda: (
-        os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"
-    ),
+    "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
