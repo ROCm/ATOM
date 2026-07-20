@@ -13,7 +13,7 @@ from atom.config import (
     CUDAGraphMode,
     DSparkConfig,
     SpeculativeConfig,
-    EPLBConfig
+    EPLBConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
@@ -75,6 +75,7 @@ class EngineArgs:
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+
     eplb_enable: bool = False
     eplb_config: Optional[dict] = None
 

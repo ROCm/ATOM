@@ -784,9 +784,7 @@ class ExpertLocationMetadata:
         assert self.logical_to_physical_map.shape == other.logical_to_physical_map.shape
         assert self.ep_rank == other.ep_rank, "per-rank maps must be same rank"
         for layer_id in layer_ids:
-            assert torch.equal(
-                self.expert_map[layer_id], other.expert_map[layer_id]
-            ), (
+            assert torch.equal(self.expert_map[layer_id], other.expert_map[layer_id]), (
                 "expert_map changed across rebalance, but slot ownership is "
                 "assumed invariant. Placement likely became dynamic -- re-enable "
                 "the layer expert_map/mask refresh and commit expert_map here."
@@ -1856,7 +1854,6 @@ class EPLBManager:
             layer.expert_map = runtime_map
             if getattr(layer, "expert_mask", None) is not None:
                 layer.expert_mask = (runtime_map > -1).to(torch.int32)
-
 
     def _assert_placement_matches_loaded(self) -> None:
         """Sanity-check the trivial placement against the checkpoint loader.

@@ -418,9 +418,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=getattr(
-                layer, "num_logical_experts", global_num_experts
-            ),
+            num_routing_experts=layer.global_num_experts
+            - layer.num_redundant_experts,
             num_fused_shared_experts=layer.num_fused_shared_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
@@ -1811,6 +1810,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         prefix: str = "",
     ) -> torch.Tensor:
         """Apply compressed-tensors FP8 MoE computation."""
+        # Select top-k experts using router logits
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -1823,7 +1823,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
             num_fused_shared_experts=layer.num_fused_shared_experts,
-            num_routing_experts=global_num_experts,
+            num_routing_experts=layer.global_num_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
@@ -2462,32 +2462,29 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        self.num_logical_experts = num_experts
         self.num_redundant_experts = (
             int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
             if self.use_ep and getattr(atom_config, "eplb_enable", False)
             else 0
         )
-        self.num_physical_experts = (
-            self.num_logical_experts + self.num_redundant_experts
-        )
+        # physical slots = routed experts + EPLB redundant replicas
+        self.global_num_experts = num_experts + self.num_redundant_experts
         if self.use_ep:
-            assert self.num_physical_experts % self.ep_size == 0, (
+            assert self.global_num_experts % self.ep_size == 0, (
                 "EPLB physical experts must be divisible by ep_size: "
-                f"num_logical={self.num_logical_experts}, "
+                f"num_logical={num_experts}, "
                 f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
             )
-        self.global_num_experts = self.num_physical_experts
         self.register_buffer("expert_map", None, persistent=False)
         self.register_buffer("expert_mask", None, persistent=False)
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
-                global_num_experts=self.num_physical_experts,
+                global_num_experts=self.global_num_experts,
             )
         else:
-            self.local_num_experts = self.num_physical_experts
+            self.local_num_experts = self.global_num_experts
         self.top_k = top_k
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
@@ -2542,7 +2539,7 @@ class FusedMoE(torch.nn.Module):
             )
         if fuse_shared_experts and self.num_fused_shared_experts > 0:
             init_aiter_topK_meta_data(
-                n_routed_experts=self.num_logical_experts,
+                n_routed_experts=num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
                 top_k=self.top_k,
                 tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
