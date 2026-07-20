@@ -1152,6 +1152,16 @@ class ModelRunner:
         if pcp_size > 1:
             warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
 
+        # TEMPORARY (benign, warmup-only): cap the dummy warmup prefill. A large
+        # all-zero warmup batch samples garbage logits over all positions and
+        # faults the sampler/softmax on gfx1250; real inference only samples the
+        # last token per seq so it is unaffected. Proper fix = skip/greedy sampling
+        # during is_dummy_run warmup, then this cap can go. Not needed for the MoE
+        # (that large-M crash is fixed in aiter grouped_moe_gfx1250).
+        _warmup_cap = int(os.environ.get("ATOM_WARMUP_MAX_TOKENS", "0") or "0")
+        if _warmup_cap > 0:
+            warmup_max_tokens = min(warmup_max_tokens, _warmup_cap)
+
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
         if num_seqs == 0:
