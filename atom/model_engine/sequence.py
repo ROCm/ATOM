@@ -130,9 +130,6 @@ class Sequence:
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
 
-        # Genuine prefix-cache hit (in tokens), snapshotted at prefill admission
-        # by the scheduler. On a PD decode consumer the local prefill never runs,
-        # so inherit the producer's value carried in kv_transfer_params.
         self.prefix_cache_hit_tokens = (kv_transfer_params or {}).get(
             "prefix_cache_hit_tokens", 0
         )

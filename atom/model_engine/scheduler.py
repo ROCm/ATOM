@@ -1010,13 +1010,6 @@ class Scheduler:
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
-            # Snapshot the genuine prefix-cache hit at admission. After this,
-            # num_cached_tokens is repurposed to track chunked-prefill progress
-            # (it grows to the full prompt length in postprocess), so it can't be
-            # used to report the cache hit. Set once per seq (Phase-2 admission
-            # only); Phase-1 resume doesn't recompute num_cached_blocks. Skipped
-            # for a PD decode consumer, which parks above and keeps the producer's
-            # hit count inherited via kv_transfer_params.
             seq.prefix_cache_hit_tokens = (
                 num_cached_blocks * self.block_manager.block_size
             )
