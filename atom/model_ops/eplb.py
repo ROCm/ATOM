@@ -598,6 +598,16 @@ class ExpertLocationMetadata:
       - expert_map                            [L, P]  physical slot -> local index (-1 non-local)
       - logical_to_rank_dispatch_physical_map [L, Lg] this rank's chosen replica per logical
 
+    Not all per-rank maps are dynamic. `logical_to_rank_dispatch_physical_map`
+    changes every rebalance (which replica each logical dispatches to). But
+    `expert_map` encodes physical-slot OWNERSHIP -- a function of ep_rank +
+    budget (see `_build_expert_map`), fixed at init and independent of the load
+    placement. It is therefore INVARIANT across rebalances: built once, consumed
+    by `_bind_layer_expert_maps` (which seeds the layer's runtime expert_map /
+    expert_mask, mask == `expert_map > -1`) and the loader consistency check, and
+    NOT re-committed by `update()` (see its docstring). The layer's derived
+    expert_mask lives only on the layer; it is likewise invariant.
+
     R = max_num_replicas is the init-fixed budget (num_redundant + 1); tensors keep
     fixed addresses so `update` can write in place (copy_) under cudagraph capture.
     """
@@ -748,10 +758,24 @@ class ExpertLocationMetadata:
         )
 
     def update(self, other: "ExpertLocationMetadata", layer_ids: list[int]) -> None:
-        """In-place atomic commit of all maps for the given layers (module-E §5).
+        """In-place atomic commit of the placement-dependent maps for the given
+        layers (module-E §5).
 
         Same-shape copy_ into fixed-address live tensors (cudagraph-safe). Both
         metas must share num_logical / num_physical / max_num_replicas / ep_rank.
+
+        `expert_map` is deliberately NOT committed here. It encodes physical-slot
+        OWNERSHIP (which contiguous slot block this rank owns + its local buffer
+        index), a function of ep_rank + budget that is fixed at init and
+        independent of the load placement -- so it never changes across a
+        rebalance (see `_build_expert_map`). It is built once and consumed by
+        `_bind_layer_expert_maps` / the loader check; the layer runtime buffers
+        (`layer.expert_map` / `layer.expert_mask`, mask == `expert_map > -1`) are
+        seeded there once and need no per-rebalance refresh. The assert below
+        pins that invariant: if a future placement policy ever reassigns slot
+        ownership, it fires here instead of silently serving a stale map/mask --
+        at which point the layer-side refresh (removed for this reason) must come
+        back and `expert_map` must be committed again.
         """
         assert (
             self.max_num_replicas == other.max_num_replicas
@@ -760,6 +784,13 @@ class ExpertLocationMetadata:
         assert self.logical_to_physical_map.shape == other.logical_to_physical_map.shape
         assert self.ep_rank == other.ep_rank, "per-rank maps must be same rank"
         for layer_id in layer_ids:
+            assert torch.equal(
+                self.expert_map[layer_id], other.expert_map[layer_id]
+            ), (
+                "expert_map changed across rebalance, but slot ownership is "
+                "assumed invariant. Placement likely became dynamic -- re-enable "
+                "the layer expert_map/mask refresh and commit expert_map here."
+            )
             self.physical_to_logical_map[layer_id].copy_(
                 other.physical_to_logical_map[layer_id]
             )
@@ -769,7 +800,6 @@ class ExpertLocationMetadata:
             self.logical_replica_count[layer_id].copy_(
                 other.logical_replica_count[layer_id]
             )
-            self.expert_map[layer_id].copy_(other.expert_map[layer_id])
             self.logical_to_rank_dispatch_physical_map[layer_id].copy_(
                 other.logical_to_rank_dispatch_physical_map[layer_id]
             )
@@ -1827,13 +1857,6 @@ class EPLBManager:
             if getattr(layer, "expert_mask", None) is not None:
                 layer.expert_mask = (runtime_map > -1).to(torch.int32)
 
-    def _refresh_layer_expert_map(self, layer_id: int) -> None:
-        assert self.live_metadata is not None
-        layer = self._moe_layers[layer_id]
-        num_physical = self.live_metadata.num_physical_experts
-        layer.expert_map[:num_physical].copy_(self.live_metadata.expert_map[layer_id])
-        if getattr(layer, "expert_mask", None) is not None:
-            layer.expert_mask.copy_((layer.expert_map > -1).to(torch.int32))
 
     def _assert_placement_matches_loaded(self) -> None:
         """Sanity-check the trivial placement against the checkpoint loader.
@@ -2095,7 +2118,7 @@ class EPLBManager:
                     p2p_batch_chunk_size=self._p2p_batch_chunk_size,
                     cuda_stream=None,
                 )
-                self._refresh_layer_expert_map(layer_id)
+                # if needed, just refresh relayer expert_map/mask here
             _chunk_ms = (_time.perf_counter() - _tc) * 1000.0
             logger.info(
                 "EPLB rebalance #%d ep_rank=%d chunk %d/%d layers=%s migrate=%.1fms",

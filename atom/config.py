@@ -1098,6 +1098,9 @@ class DSparkConfig:
                 f"Supported keys: {sorted(allowed)}"
             )
         return cls(**cfg)
+
+
+@dataclass
 class EPLBConfig:
     """EPLB sub-config (vLLM-style: enable + config object)."""
 
@@ -1145,6 +1148,22 @@ class EPLBConfig:
             "naive",
             "biased",
         }, "eplb.placement_policy must be one of {'naive','biased'}"
+
+    @classmethod
+    def from_dict(cls, cfg: Optional[dict]) -> "EPLBConfig":
+        """Build from the ``--eplb-config`` JSON dict.
+
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --eplb-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
 
 
 @dataclass

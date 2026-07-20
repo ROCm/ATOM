@@ -147,7 +147,7 @@ def test_update_is_inplace_and_correct():
     # addresses unchanged (in-place copy_)
     for name, p in ptrs.items():
         assert getattr(live, name).data_ptr() == p, f"{name} address changed"
-    # layer 0 now equals new's layer 0 for every map
+    # layer 0 now equals new's layer 0 for every placement-dependent map
     assert torch.equal(live.physical_to_logical_map[0], new.physical_to_logical_map[0])
     assert torch.equal(live.logical_to_physical_map[0], new.logical_to_physical_map[0])
     assert torch.equal(live.logical_replica_count[0], new.logical_replica_count[0])
@@ -155,8 +155,35 @@ def test_update_is_inplace_and_correct():
         live.logical_to_rank_dispatch_physical_map[0],
         new.logical_to_rank_dispatch_physical_map[0],
     )
+    # expert_map is an EP-topology invariant: update() does not commit it, and it
+    # stays identical to new's (which is built the same way for the same rank).
+    assert torch.equal(live.expert_map[0], new.expert_map[0])
     # layer 1 untouched (still uniform placement, differs from new layer1 generally)
     assert not torch.equal(live.physical_to_logical_map[0], layer0_before)
+
+
+def test_update_rejects_expert_map_drift():
+    # expert_map is assumed invariant across rebalance; if a (hypothetical future)
+    # placement ever changes slot ownership, update() must fail loudly rather than
+    # silently serve a stale layer map/mask.
+    live = ExpertLocationMetadata.from_trivial(
+        num_layers=1,
+        num_logical_experts=6,
+        num_physical_experts=8,
+        ep_size=2,
+        ep_rank=0,
+    )
+    new = ExpertLocationMetadata.from_trivial(
+        num_layers=1,
+        num_logical_experts=6,
+        num_physical_experts=8,
+        ep_size=2,
+        ep_rank=0,
+    )
+    # Simulate a dynamic-placement bug: slot ownership shifted on the new meta.
+    new.expert_map[0, 0] = 7
+    with pytest.raises(AssertionError):
+        live.update(new, [0])
 
 
 def test_update_rejects_budget_mismatch():
