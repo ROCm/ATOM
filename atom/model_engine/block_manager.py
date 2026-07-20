@@ -17,6 +17,7 @@ from atom.distributed.kv_events import (
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.swa_pool import SlidingWindowPool
+from atom.utils import envs
 
 
 def _make_block_stored(
@@ -88,6 +89,7 @@ class BlockManager:
             block_size=block_size,
             max_num_batched_tokens=getattr(config, "max_num_batched_tokens", 0),
             mtp_k=_mtp_k,
+            full_retain=envs.ATOM_SWA_FULL_RETAIN,
         )
 
     @property

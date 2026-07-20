@@ -63,7 +63,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -531,6 +531,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ceil(max_model_len/bs) (e.g. 1024 → ~66 blocks at 131072/8192/128/128).
         """
         bs = self.block_size
+        # Full-retain (ATOM_SWA_FULL_RETAIN): the SWA cache keeps every block of
+        # every active seq's history (window-only prefill write is off), so size
+        # the pool like the compressed pool — full per-seq footprint — so freed-
+        # but-cached blocks survive until a cross-request replay hit reuses them.
+        # `+64` slide-boundary margin (matches the default branch).
+        if envs.ATOM_SWA_FULL_RETAIN:
+            per_seq_full = (max_model_len + bs - 1) // bs + 1
+            return max_num_seqs * per_seq_full + 64
         # per_decode uses win_with_spec (= window + max_spec_steps), not window
         # alone: under MTP each decoding seq writes up to `max_spec_steps` draft
         # tokens into the SWA pool before the next window-free, so its peak
