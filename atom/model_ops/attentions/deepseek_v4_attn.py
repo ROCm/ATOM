@@ -1724,6 +1724,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._apply_pcp_reindex(
                 attn_metadata, positions, scheduled_bs, sum_scheduled_tokens
             )
+        self._attach_tbo_prefill_cpu_lens(attn_metadata, scheduled_bs)
         return attn_metadata, positions
 
     def _apply_pcp_reindex(
