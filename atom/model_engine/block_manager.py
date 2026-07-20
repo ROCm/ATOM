@@ -184,6 +184,10 @@ class BlockManager:
         # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
         # the hit.
         num_cached_blocks = self.swa.bounded_hit(seq, compressed_hit, block_hashes)
+        # Instrumentation: record the pre-gate compressed hit so CacheStats can
+        # separate reuse lost to the SWA tail gate (compressed_hit -
+        # num_cached_blocks) from reuse lost to compressed eviction.
+        seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = seq.num_blocks
