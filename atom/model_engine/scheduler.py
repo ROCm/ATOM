@@ -913,17 +913,6 @@ class Scheduler:
                 self._rejected.append(seq)
                 continue
 
-            # Concurrency cap: keep resident sequences at or below max_num_seqs.
-            # Both fresh prefills (_schedule_prefill_seq) and PD consumers
-            # promoted to first-decode (_schedule_first_decode_after_remote_kv)
-            # append to self.running immediately, so len(self.running) already
-            # reflects every seq admitted earlier this tick as well as those
-            # carried over from prior ticks. The pre-existing per-step gate
-            # (num_seqs_prefill < max_num_seqs) only bounds admissions within a
-            # single tick, so without this check running grows unbounded across
-            # ticks — most visibly for a PD decode consumer whose short prompt
-            # passes the admission-time KV check, which then thrashes (preempt ->
-            # full recompute) once decode growth exhausts KV.
             if len(self.running) >= self.max_num_seqs:
                 self.waiting.appendleft(seq)
                 break
