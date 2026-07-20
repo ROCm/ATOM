@@ -19,7 +19,7 @@ Verify your ROCm installation before proceeding:
 
 .. code-block:: bash
 
-   rocm-smi
+   amd-smi
    rocminfo | grep gfx
 
 Installation methods
@@ -117,12 +117,12 @@ Troubleshooting
       export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
 
 **RuntimeError: No AMD GPU found**
-   The GPU is not visible to the process. Check that ``rocm-smi`` lists your
+   The GPU is not visible to the process. Check that ``amd-smi`` lists your
    device and that the ROCm kernel modules are loaded:
 
    .. code-block:: bash
 
-      rocm-smi
+      amd-smi
       rocminfo | grep gfx
 
    In Docker, confirm you passed ``--device=/dev/kfd --device=/dev/dri`` when
