@@ -90,6 +90,8 @@ class BlockManager:
             max_num_batched_tokens=getattr(config, "max_num_batched_tokens", 0),
             mtp_k=_mtp_k,
             full_retain=envs.ATOM_SWA_FULL_RETAIN,
+            retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
+            checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
         )
 
     @property
