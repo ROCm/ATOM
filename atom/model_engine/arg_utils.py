@@ -13,6 +13,7 @@ from atom.config import (
     CUDAGraphMode,
     DSparkConfig,
     SpeculativeConfig,
+    EPLBConfig
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
@@ -74,6 +75,14 @@ class EngineArgs:
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+    eplb_enable: bool = False
+    eplb_load_window_size: int = 1000
+    eplb_rebalance_interval: int = 3000
+    eplb_rebalance_layers_per_chunk: int = 64
+    eplb_num_redundant_experts: int = 0
+    eplb_rebalance_min_balancedness: float = 0.8
+    eplb_rebalance_balancedness_agg: str = "min"
+    eplb_p2p_batch_chunk_size: int = 32
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -370,6 +379,55 @@ class EngineArgs:
                 """  '{"confidence_schedule": true, "ragged": true, """
                 """"ragged_graph_sizes": "8"}'"""
             ),
+        eplb_group = parser.add_argument_group("EPLB options")
+        eplb_group.add_argument(
+            "--eplb-enable",
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB runtime load monitoring and expert rebalance.",
+        )
+        eplb_group.add_argument(
+            "--eplb-load-window-size",
+            type=int,
+            default=1000,
+            help="Number of non-dummy forwards accumulated for EPLB load stats.",
+        )
+        eplb_group.add_argument(
+            "--eplb-rebalance-interval",
+            type=int,
+            default=3000,
+            help="Forward-pass interval for EPLB rebalance gating.",
+        )
+        eplb_group.add_argument(
+            "--eplb-rebalance-layers-per-chunk",
+            type=int,
+            default=64,
+            help="Number of MoE layers migrated per EPLB rebalance chunk.",
+        )
+        eplb_group.add_argument(
+            "--eplb-num-redundant-experts",
+            "--num-redundant-experts",
+            type=int,
+            default=0,
+            help="Extra physical expert slots per MoE layer for EPLB replicas.",
+        )
+        eplb_group.add_argument(
+            "--eplb-rebalance-min-balancedness",
+            type=float,
+            default=0.8,
+            help="Skip EPLB rebalance when balancedness is at least this value.",
+        )
+        eplb_group.add_argument(
+            "--eplb-rebalance-balancedness-agg",
+            choices=["min", "mean"],
+            default="min",
+            help="Layer aggregation used by the EPLB balancedness gate.",
+        )
+        eplb_group.add_argument(
+            "--eplb-p2p-batch-chunk-size",
+            type=int,
+            default=32,
+            help="P2P batch chunk size used while migrating expert weights.",
         )
 
         return parser
@@ -437,6 +495,15 @@ class EngineArgs:
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
         kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
+        kwargs["eplb_config"] = EPLBConfig(
+            load_window_size=kwargs.pop("eplb_load_window_size"),
+            rebalance_interval=kwargs.pop("eplb_rebalance_interval"),
+            rebalance_layers_per_chunk=kwargs.pop("eplb_rebalance_layers_per_chunk"),
+            num_redundant_experts=kwargs.pop("eplb_num_redundant_experts"),
+            rebalance_min_balancedness=kwargs.pop("eplb_rebalance_min_balancedness"),
+            rebalance_balancedness_agg=kwargs.pop("eplb_rebalance_balancedness_agg"),
+            p2p_batch_chunk_size=kwargs.pop("eplb_p2p_batch_chunk_size"),
+        )
 
         logger.info(f"Engine kwargs: {kwargs}")
 

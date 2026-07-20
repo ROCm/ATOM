@@ -1098,6 +1098,43 @@ class DSparkConfig:
                 f"Supported keys: {sorted(allowed)}"
             )
         return cls(**cfg)
+class EPLBConfig:
+    """EPLB sub-config (vLLM-style: enable + config object)."""
+
+    load_window_size: int = 1000
+    rebalance_interval: int = 3000
+    rebalance_layers_per_chunk: int = 64
+    num_redundant_experts: int = 0
+    rebalance_min_balancedness: float = 0.8
+    rebalance_balancedness_agg: str = "min"
+    p2p_batch_chunk_size: int = 32
+
+    def __post_init__(self):
+        self.load_window_size = int(self.load_window_size)
+        assert self.load_window_size > 0, "eplb.load_window_size must be > 0"
+        self.rebalance_interval = int(self.rebalance_interval)
+        assert self.rebalance_interval > 0, "eplb.rebalance_interval must be > 0"
+        assert (
+            self.rebalance_interval >= self.load_window_size
+        ), "eplb.rebalance_interval must be >= eplb.load_window_size"
+        self.rebalance_layers_per_chunk = int(self.rebalance_layers_per_chunk)
+        assert (
+            self.rebalance_layers_per_chunk > 0
+        ), "eplb.rebalance_layers_per_chunk must be > 0"
+        self.num_redundant_experts = int(self.num_redundant_experts)
+        assert (
+            self.num_redundant_experts >= 0
+        ), "eplb.num_redundant_experts must be >= 0"
+        self.rebalance_min_balancedness = float(self.rebalance_min_balancedness)
+        self.rebalance_balancedness_agg = (
+            str(self.rebalance_balancedness_agg).lower().strip()
+        )
+        assert self.rebalance_balancedness_agg in {
+            "min",
+            "mean",
+        }, "eplb.rebalance_balancedness_agg must be one of {'min','mean'}"
+        self.p2p_batch_chunk_size = int(self.p2p_batch_chunk_size)
+        assert self.p2p_batch_chunk_size > 0, "eplb.p2p_batch_chunk_size must be > 0"
 
 
 @dataclass
@@ -1166,23 +1203,9 @@ class Config:
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
-    # EPLB module-A runtime flags (env -> config centralized).
-    eplb_enable: bool = field(default_factory=lambda: envs.ATOM_EPLB_ENABLE)
-    eplb_load_window_size: int = field(
-        default_factory=lambda: envs.ATOM_EPLB_LOAD_WINDOW_SIZE
-    )
-    eplb_rebalance_interval: int = field(
-        default_factory=lambda: envs.ATOM_EPLB_REBALANCE_INTERVAL
-    )
-    eplb_rebalance_min_balancedness: float = field(
-        default_factory=lambda: envs.ATOM_EPLB_REBALANCE_MIN_BALANCEDNESS
-    )
-    eplb_rebalance_balancedness_agg: str = field(
-        default_factory=lambda: envs.ATOM_EPLB_REBALANCE_BALANCEDNESS_AGG
-    )
-    eplb_p2p_batch_chunk_size: int = field(
-        default_factory=lambda: envs.ATOM_EPLB_P2P_BATCH_CHUNK_SIZE
-    )
+    # EPLB master switch + sub-config (vLLM style).
+    eplb_enable: bool = False
+    eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
@@ -1208,27 +1231,13 @@ class Config:
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
-        self.eplb_load_window_size = int(self.eplb_load_window_size)
-        assert self.eplb_load_window_size > 0, "eplb_load_window_size must be > 0"
-        self.eplb_rebalance_interval = int(self.eplb_rebalance_interval)
-        assert self.eplb_rebalance_interval > 0, "eplb_rebalance_interval must be > 0"
-        assert (
-            self.eplb_rebalance_interval >= self.eplb_load_window_size
-        ), "eplb_rebalance_interval must be >= eplb_load_window_size"
-        self.eplb_rebalance_min_balancedness = float(
-            self.eplb_rebalance_min_balancedness
-        )
-        self.eplb_rebalance_balancedness_agg = (
-            str(self.eplb_rebalance_balancedness_agg).lower().strip()
-        )
-        assert self.eplb_rebalance_balancedness_agg in {
-            "min",
-            "mean",
-        }, "eplb_rebalance_balancedness_agg must be one of {'min','mean'}"
-        self.eplb_p2p_batch_chunk_size = int(self.eplb_p2p_batch_chunk_size)
-        assert (
-            self.eplb_p2p_batch_chunk_size > 0
-        ), "eplb_p2p_batch_chunk_size must be > 0"
+        if isinstance(self.eplb_config, dict):
+            self.eplb_config = EPLBConfig(**self.eplb_config)
+        elif isinstance(self.eplb_config, EPLBConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.eplb_config = EPLBConfig(**self.eplb_config.__dict__)
+        else:
+            raise TypeError("eplb_config must be EPLBConfig or dict")
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
