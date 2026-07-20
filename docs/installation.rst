@@ -7,7 +7,7 @@ Requirements
 * Python 3.10 to 3.12
 * ROCm 6.0 or later
 * PyTorch with ROCm support
-* AMD Instinct GPU (MI200 or MI300 series recommended)
+* AMD Instinct GPU (MI200, MI300, or MI350 Series recommended)
 
 Installation methods
 --------------------
