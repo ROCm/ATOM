@@ -144,7 +144,7 @@ def local_tbo_precompute(
         under-filled-but-splittable ranks are force-split to stay aligned.
 
     Net: ``collective_active = OR(meets_min_tokens) AND AND(can_split)`` (plus
-    the uniform-mode guard in :func:`sync_dp_for_tbo`). The ub0/ub1 counts are
+    the uniform-mode guard in :func:`sync_dp_metadata`). The ub0/ub1 counts are
     MAX-reduced so every rank picks the same per-ubatch CUDAGraph buffer size.
     """
     if not config.enable_tbo:
@@ -171,7 +171,7 @@ def local_tbo_precompute(
 
 @dataclass
 class DPSyncResult:
-    """Output of :func:`sync_dp_for_tbo`."""
+    """Output of :func:`sync_dp_metadata`."""
 
     # [dp_size] int32 CPU tensor — each rank's input token count.
     num_tokens_across_dp: torch.Tensor
@@ -184,9 +184,14 @@ class DPSyncResult:
     tbo_collective_active: bool
     # (ub0_max, ub1_max) across DP — only set when tbo_collective_active.
     ub_max_tokens_across_dp: Optional[tuple[int, int]]
+    # DP-MAX of the DSpark decode shape (q, decode_bs, total_tokens) — only set when
+    # ``dspark_shape`` was passed in (DSpark active + DP). Folded into this
+    # packed all_gather so DSpark's graph-shape sync no longer needs its own
+    # separate all_reduce (halves the per-step DP round-trips).
+    dspark_shape_max: Optional[tuple[int, int, int]] = None
 
 
-def sync_dp_for_tbo(
+def sync_dp_metadata(
     *,
     dp_group,
     dp_size: int,
@@ -196,12 +201,17 @@ def sync_dp_for_tbo(
     local_meets_min_tokens: bool = False,
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
+    dspark_shape: Optional[tuple[int, int, int]] = None,
 ) -> DPSyncResult:
-    """Single packed DP all_gather over the per-rank scalars needed to
-    decide DP padding, the prefill fan-out, and the cross-DP TBO gate.
+    """Single packed DP all_gather over all per-rank scalars a decode/prefill
+    step needs synchronized: DP token padding, the prefill fan-out, the
+    cross-DP TBO gate, and (when active) the DSpark graph-shape MAX.
+
+    DSpark folds its [q, bs, total_tokens] shape sync in here too (3 extra
+    fields), so the step issues one collective instead of two.
 
     Pre-Plan-B this required up to 3 separate all_reduces per step
-    (``get_dp_padding`` / ``sync_dp_for_tbo`` / a third inside
+    (``get_dp_padding`` / this sync / a third inside
     ``UBatchWrapper``). Now one all_gather of ``n_fields`` int32 values
     per rank suffices. When TBO is off only the first 2 fields are
     exchanged (saves 60 % payload + skips :func:`local_tbo_precompute`
@@ -215,10 +225,20 @@ def sync_dp_for_tbo(
       row 3 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
       row 4 : ub0_tokens               -> ub_max_tokens_across_dp[0]              [TBO only]
       row 5 : ub1_tokens               -> ub_max_tokens_across_dp[1]              [TBO only]
+      row k+0 : dspark q               -> dspark_shape_max[0] (MAX)     [DSpark only]
+      row k+1 : dspark decode_bs       -> dspark_shape_max[1] (MAX)     [DSpark only]
+      row k+2 : dspark total_tokens    -> dspark_shape_max[2] (MAX)     [DSpark only]
 
     Gate: ``active = OR(meets_min_tokens) AND AND(can_split) AND uniform``.
+
+    ``dspark_shape`` folds DSpark's per-step graph-shape sync (formerly a
+    standalone all_reduce in ``_dspark_sync_graph_shape_dp``) into this same
+    packed all_gather. It is global-config gated (DSpark on + DP), so every
+    rank appends the same 3 fields and the payload stays symmetric.
     """
-    n_fields = 6 if tbo_on else 2
+    tbo_fields = 6 if tbo_on else 2
+    dspark_on = dspark_shape is not None
+    n_fields = tbo_fields + (3 if dspark_on else 0)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = num_input_tokens
     local[1] = 1 if is_prefill else 0
@@ -227,6 +247,10 @@ def sync_dp_for_tbo(
         local[3] = 1 if local_can_split else 0
         local[4] = local_ub_tokens[0]
         local[5] = local_ub_tokens[1]
+    if dspark_on:
+        local[tbo_fields + 0] = dspark_shape[0]
+        local[tbo_fields + 1] = dspark_shape[1]
+        local[tbo_fields + 2] = dspark_shape[2]
 
     gathered = [
         torch.empty(n_fields, dtype=torch.int32, device="cpu") for _ in range(dp_size)
@@ -260,11 +284,20 @@ def sync_dp_for_tbo(
                 int(sync[5].max()),
             )
 
+    dspark_shape_max: Optional[tuple[int, int, int]] = None
+    if dspark_on:
+        dspark_shape_max = (
+            int(sync[tbo_fields + 0].max()),
+            int(sync[tbo_fields + 1].max()),
+            int(sync[tbo_fields + 2].max()),
+        )
+
     return DPSyncResult(
         num_tokens_across_dp=num_tokens_across_dp,
         any_rank_has_prefill=any_rank_has_prefill,
         tbo_collective_active=tbo_collective_active,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+        dspark_shape_max=dspark_shape_max,
     )
 
 
