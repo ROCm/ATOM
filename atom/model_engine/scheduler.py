@@ -474,7 +474,6 @@ class Scheduler:
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
 
-        self._max_inflight_remote_loads: int = config.max_num_seqs
         self._num_parked_remote_kv: int = 0
 
         from atom.utils.forward_context import get_kvconnector
@@ -957,7 +956,7 @@ class Scheduler:
 
             if (
                 needs_remote_load
-                and self._num_parked_remote_kv >= self._max_inflight_remote_loads
+                and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
             ):
                 self.waiting.appendleft(seq)
                 break
@@ -1033,12 +1032,13 @@ class Scheduler:
 
         if self._num_parked_remote_kv > 0 and self._schedule_tick % 100 == 0:
             logger.info(
-                "PD backpressure: parked=%d/%d, waiting=%d, running=%d, "
-                "kv_usage=%.2f",
+                "PD backpressure: parked=%d, waiting=%d, running=%d, "
+                "resident=%d/%d, kv_usage=%.2f",
                 self._num_parked_remote_kv,
-                self._max_inflight_remote_loads,
                 len(self.waiting),
                 len(self.running),
+                len(self.running) + self._num_parked_remote_kv,
+                self.max_num_seqs,
                 self._kv_usage(),
             )
 
