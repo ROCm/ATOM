@@ -20,9 +20,7 @@ ATOM (AiTer Optimized Model) supports three parallelism strategies for distribut
 | MoE throughput scaling | TP + DP + EP | `-tp 4 -dp 2 --enable-expert-parallel` |
 | Dense throughput scaling | TP + DP | `-tp 4 -dp 2` |
 
----
-
-## 1. Tensor Parallelism (TP)
+## Tensor Parallelism (TP)
 
 Tensor Parallelism shards model weights across GPUs so each GPU holds a slice of every layer. ATOM uses AITER's `init_dist_env()` to initialize NCCL process groups.
 
@@ -30,11 +28,11 @@ Tensor Parallelism shards model weights across GPUs so each GPU holds a slice of
 
 ATOM provides parallel linear layer classes in `atom/model_ops/linear.py`:
 
-- **`ColumnParallelLinear`** -- splits the output dimension (dim 0) across TP ranks. Each GPU computes a shard of the output independently.
-- **`RowParallelLinear`** -- splits the input dimension (dim 1) across TP ranks. After the local matmul, an AllReduce across the TP group aggregates partial results.
-- **`QKVParallelLinear`** -- extends `ColumnParallelLinear` for attention Q/K/V projections. Partitions heads across TP ranks, replicating KV heads when `num_kv_heads < tp_size`.
-- **`MergedColumnParallelLinear`** -- merges multiple column-parallel outputs (e.g., gate and up projections) into a single weight tensor, sharded along dim 0.
-- **`ReplicatedLinear`** -- no sharding; weight is replicated on every rank.
+- **`ColumnParallelLinear`** — splits the output dimension (dim 0) across TP ranks. Each GPU computes a shard of the output independently.
+- **`RowParallelLinear`** — splits the input dimension (dim 1) across TP ranks. After the local matmul, an AllReduce across the TP group aggregates partial results.
+- **`QKVParallelLinear`** — extends `ColumnParallelLinear` for attention Q/K/V projections. Partitions heads across TP ranks, replicating KV heads when `num_kv_heads < tp_size`.
+- **`MergedColumnParallelLinear`** — merges multiple column-parallel outputs (e.g., gate and up projections) into a single weight tensor, sharded along dim 0.
+- **`ReplicatedLinear`** — no sharding; weight is replicated on every rank.
 
 ### Process Group Initialization
 
@@ -70,11 +68,9 @@ if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
 - `Config.tensor_parallel_size` (int, default `1`): Number of TP ranks. Must satisfy `1 <= tensor_parallel_size <= 8`.
 - CLI: `--tensor-parallel-size N` or `-tp N`
 
----
+## Data Parallelism (DP)
 
-## 2. Data Parallelism (DP)
-
-Data Parallelism runs multiple independent engine replicas, each handling a subset of incoming requests. DP is coordinated at the scheduling level rather than the model level -- each DP rank has its own `EngineCore`, scheduler, and model runner.
+Data Parallelism runs multiple independent engine replicas, each handling a subset of incoming requests. DP is coordinated at the scheduling level rather than the model level — each DP rank has its own `EngineCore`, scheduler, and model runner.
 
 ### Architecture
 
@@ -110,7 +106,7 @@ def _init_data_parallel(self, config):
 
 The `stateless_init_dp_group()` method (in `ParallelConfig`) calls `stateless_init_torch_distributed_process_group()` with the `gloo` backend, creating an isolated process group that does not interfere with the NCCL TP group.
 
-### Synchronized Busy Loop
+### Synchronized busy loop
 
 The DP busy loop overrides the base `EngineCore.busy_loop()` to synchronize state across DP ranks before each step. The `_sync_dp_state()` method packs four signals into an int64 tensor and performs a single `AllReduce(MAX)`:
 
@@ -135,14 +131,14 @@ This ensures:
 - **Graceful shutdown**: all ranks must agree before exiting.
 - **Token count alignment**: the maximum token count across ranks is used for padding.
 
-### Dummy Batch Execution
+### Dummy batch execution
 
 When a DP rank has no real work but other ranks do, it executes dummy batches to participate in collective operations:
 
-- **`_execute_dummy_batch()`** -- runs a 1-token decode dummy through the model, triggering AllReduce and MORI collectives so other ranks are not blocked.
-- **`_execute_dummy_prefill(num_tokens)`** -- runs a dummy prefill with the same token count as the max across DP ranks, so that MORI dispatch/combine stays synchronized.
+- **`_execute_dummy_batch()`** — runs a 1-token decode dummy through the model, triggering AllReduce and MORI collectives so other ranks are not blocked.
+- **`_execute_dummy_prefill(num_tokens)`** — runs a dummy prefill with the same token count as the max across DP ranks, so that MORI dispatch/combine stays synchronized.
 
-### Device Assignment
+### Device assignment
 
 When DP is enabled on a single node, each DP rank uses a different set of GPUs. The device mapping in `ModelRunner.__init__()` is:
 
@@ -176,7 +172,7 @@ num_tokens_tensor = torch.tensor(num_tokens_across_dp, device="cpu", dtype=torch
 dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
 ```
 
-### CoreManager (DP Orchestration)
+### CoreManager (DP orchestration)
 
 `CoreManager` (in `atom/model_engine/engine_core_mgr.py`) manages multiple DP engine processes:
 
@@ -195,7 +191,7 @@ if config.enable_dp_attention:
     config.tensor_parallel_size = 1
 ```
 
-### DP Request Load Balancing
+### DP request load balancing
 
 Because the DP busy loop is **lockstep** (all ranks `AllReduce` `has_unfinished`
 each step, and an idle rank runs `_execute_dummy_batch()` when any other rank is
@@ -247,9 +243,7 @@ invoked while requests are still charged.
 - CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens}`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
 
----
-
-## 3. Expert Parallelism (EP)
+## Expert Parallelism (EP)
 
 Expert Parallelism distributes MoE experts across GPUs so that each GPU owns a subset of experts. Tokens are routed to the correct GPU via all-to-all communication.
 
@@ -291,7 +285,7 @@ if use_ep:
     return FusedMoEParallelConfig(tp_size=1, tp_rank=0, ep_size=ep_size, ...)
 ```
 
-### Expert Distribution
+### Expert distribution
 
 In `FusedMoE.__init__()`, when EP is active, the global experts are partitioned:
 
@@ -309,7 +303,7 @@ else:
 
 Each GPU only loads weights for its assigned experts, reducing per-GPU memory usage proportionally.
 
-### MORI Communication
+### MORI communication
 
 When `use_all2all_kernels` is `True`, the `MoriPrepareAndFinalize` class (in `atom/model_ops/fused_moe/mori_prepare_finalize.py`) handles token routing:
 
@@ -340,9 +334,7 @@ The block configuration adapts to the batch type: prefill uses `block_num=128, w
 - `Config.enable_dp_attention` (bool, default `False`): Flattens DP ranks into the TP/EP dimension for MoE, while using per-rank attention for non-MoE layers.
 - CLI: `--enable-expert-parallel`, `--enable-dp-attention`
 
----
-
-## 4. Environment Variables
+## Environment variables
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -363,13 +355,11 @@ Environment variables in `atom/utils/envs.py` are evaluated lazily via `__getatt
 |----------|------|---------|-------------|
 | `AITER_QUICK_REDUCE_QUANTIZATION` | str | -- | Set to `INT4` to enable quantized AllReduce for prefill (read by AITER's AllReduce kernel) |
 
----
-
-## 5. Multi-GPU Deployment Examples
+## Multi-GPU deployment examples
 
 ### DeepSeek-R1 on 8 GPUs (TP8)
 
-From the project README -- a dense MLA model deployed with pure tensor parallelism:
+From the project README — a dense MLA model deployed with pure tensor parallelism:
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -380,7 +370,7 @@ python -m atom.entrypoints.openai_server \
 
 ### Qwen3-235B-A22B on 8 GPUs (TP8 + EP)
 
-From `recipes/Qwen3-235b.md` -- a MoE model with 128 experts, deployed with tensor parallelism and expert parallelism:
+From `recipes/Qwen3-235b.md` — a MoE model with 128 experts, deployed with tensor parallelism and expert parallelism:
 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
@@ -402,7 +392,7 @@ Tips from the recipe:
 
 ### Kimi-K2-Thinking on 4 GPUs (TP4)
 
-From `recipes/Kimi-K2-Thinking.md` -- an MXFP4 MoE model:
+From `recipes/Kimi-K2-Thinking.md` — an MXFP4 MoE model:
 
 ```bash
 export HIP_VISIBLE_DEVICES=0,1,2,3
@@ -414,11 +404,9 @@ python -m atom.entrypoints.openai_server \
     --kv_cache_dtype fp8
 ```
 
----
+## Combined parallelism strategies
 
-## 6. Combined Parallelism Strategies
-
-### TP Only (Dense Models)
+### TP only (dense models)
 
 For dense models like Llama and Qwen3 (non-MoE), use pure tensor parallelism:
 
@@ -428,7 +416,7 @@ python -m atom.entrypoints.openai_server --model meta-llama/Meta-Llama-3-8B -tp 
 
 All weights are sharded across GPUs. AllReduce collectives synchronize after each `RowParallelLinear`.
 
-### TP + EP (MoE Models)
+### TP + EP (MoE models)
 
 For MoE models, enable expert parallelism so each GPU holds a subset of experts:
 
@@ -438,7 +426,7 @@ python -m atom.entrypoints.openai_server --model Qwen/Qwen3-235B-A22B-Instruct-2
 
 Dense layers (attention, norms) remain tensor-parallel. MoE layers distribute experts across the `ep_size = tp_size` GPUs. MORI all-to-all routes tokens to the correct expert owner.
 
-### TP + DP (Dense Throughput)
+### TP + DP (dense throughput)
 
 For throughput scaling with dense models, run multiple DP replicas:
 
@@ -453,7 +441,7 @@ Each DP replica independently processes a subset of requests. The `CoreManager` 
 
 Formula: `local_device_rank = dp_rank_local * tp_size + tp_rank`
 
-### TP + DP + EP (MoE Throughput)
+### TP + DP + EP (MoE throughput)
 
 For MoE models with DP + EP, the expert parallel dimension spans all `tp_size * dp_size` devices:
 
@@ -469,7 +457,7 @@ In this configuration:
 - MoE layers: EP size = `dp_size * tp_size = 8`, spreading experts across all 8 GPUs.
 - MORI all-to-all crosses DP boundaries to route tokens to the correct expert owner.
 
-### DP Attention Mode
+### DP attention mode
 
 When `--enable-dp-attention` is set, `CoreManager` flattens the TP dimension into DP:
 
@@ -481,9 +469,7 @@ tensor_parallel_size = 1
 
 This means each GPU runs an independent attention computation (no TP AllReduce for attention), while MoE layers still use the full EP group across all GPUs. This can reduce communication overhead for attention-heavy workloads.
 
----
-
-## Source Files
+## Source files
 
 | File | Description |
 |------|-------------|

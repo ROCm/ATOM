@@ -1,7 +1,7 @@
 Serving API
 ===========
 
-LLMEngine Class
+LLMEngine class
 ---------------
 
 Main class for loading and serving models.
@@ -74,7 +74,7 @@ Configuration for text generation.
    The following parameters are NOT currently supported (may be added in future):
    top_p, top_k, presence_penalty, frequency_penalty
 
-Return Values
+Return values
 -------------
 
 The ``generate()`` method returns a list of strings (not RequestOutput objects).

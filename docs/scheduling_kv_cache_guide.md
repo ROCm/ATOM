@@ -1,8 +1,8 @@
-# ATOM Scheduling & KV Cache Guide
+# ATOM scheduling & KV cache guide
 
 ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache block management to drive LLM inference on AMD ROCm/HIP GPUs. This guide covers the scheduling algorithm, batch construction, block-level KV cache management, prefix caching, postprocessing, speculative decoding integration, and sequence lifecycle.
 
-## Quick Reference
+## Quick reference
 
 | Class | File | Purpose |
 |---|---|---|
@@ -28,13 +28,11 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 | `scheduler_delay_factor` | 0.0 | Delay factor for batching prompt requests (0 = no delay) |
 | `gpu_memory_utilization` | 0.9 | Fraction of GPU memory for KV cache |
 
----
-
-## 1. Scheduling Algorithm
+## Scheduling algorithm
 
 The scheduler implements a **prefill-first** policy: all waiting (prefill) requests are scheduled before any running (decode) requests. The entry point is `Scheduler.schedule()`, which returns a `(ScheduledBatch, dict[int, Sequence])` tuple or `None` if both queues are empty.
 
-### 1.1 Scheduler Initialization
+### Scheduler initialization
 
 ```python
 class Scheduler:
@@ -59,13 +57,13 @@ class Scheduler:
         self.total_accepted_tokens = 0
 ```
 
-The scheduler maintains two deques -- `waiting` (pending prefill) and `running` (active decode) -- plus a `BlockManager` for KV cache allocation.
+The scheduler maintains two deques — `waiting` (pending prefill) and `running` (active decode) — plus a `BlockManager` for KV cache allocation.
 
-### 1.2 Schedule Flow
+### Schedule flow
 
 `Scheduler.schedule()` proceeds in two phases:
 
-**Phase 1 -- Prefill scheduling:**
+**Phase 1 — Prefill scheduling:**
 
 1. While the delay gate passes (`_passed_delay`), the waiting queue is non-empty, and `num_seqs_prefill < max_num_seqs`:
    - Peek the first waiting sequence.
@@ -74,7 +72,7 @@ The scheduler maintains two deques -- `waiting` (pending prefill) and `running` 
    - Otherwise: allocate blocks, set `seq.status = RUNNING`, `seq.type = PREFILL`, move from `waiting` to `running`.
 2. If any prefill sequences were scheduled, return the batch immediately (no decode mixing).
 
-**Phase 2 -- Decode scheduling (only when zero prefills were scheduled):**
+**Phase 2 — Decode scheduling (only when zero prefills were scheduled):**
 
 1. Pop sequences from `running` up to `max_num_seqs`.
 2. For each sequence, check `block_manager.can_append(seq)`.
@@ -83,7 +81,7 @@ The scheduler maintains two deques -- `waiting` (pending prefill) and `running` 
 5. Call `block_manager.may_append(seq, num_new_tokens)` where `num_new_tokens = mtp_k + 1`.
 6. Re-insert all scheduled sequences back into `running` (preserving order).
 
-### 1.3 Delay Factor
+### Delay factor
 
 When `scheduler_delay_factor > 0`, the scheduler delays prefill scheduling to allow the waiting queue to accumulate more requests for better batching:
 
@@ -104,7 +102,7 @@ def _passed_delay(self, now: float) -> bool:
 
 A new prefill is scheduled only when the earliest waiting request has waited longer than `delay_factor * last_prompt_latency`, or when there are no running decode requests.
 
-### 1.4 Preemption
+### Preemption
 
 When a decode step cannot extend a sequence's KV cache (no free blocks), the scheduler preempts the **last** running sequence:
 
@@ -127,17 +125,15 @@ def preempt(self, seq: Sequence):
 
 The preempted sequence is pushed to the front of the waiting queue and its blocks are fully deallocated, so it will be re-prefilled on the next scheduling cycle.
 
-**MTP placeholder stripping:** When speculative decoding is active (`mtp_k > 0`), `postprocess()` appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is `mtp_k + seq.num_rejected` -- this accounts for both the `mtp_k` placeholder slots and any tokens that were rejected during the last verification step. The method deletes that many trailing entries from both `seq.token_ids` and `seq.output_tokens` and decrements `seq.num_tokens` accordingly.
+**MTP placeholder stripping:** When speculative decoding is active (`mtp_k > 0`), `postprocess()` appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is `mtp_k + seq.num_rejected` — this accounts for both the `mtp_k` placeholder slots and any tokens that were rejected during the last verification step. The method deletes that many trailing entries from both `seq.token_ids` and `seq.output_tokens` and decrements `seq.num_tokens` accordingly.
 
-**Speculative state reset:** After stripping, the sequence's speculative decoding state is fully cleared: `num_rejected` and `num_bonus_tokens` are zeroed, and `spec_token_ids` is set to an empty array. This ensures the sequence re-enters the scheduling pipeline with a clean state -- no stale draft predictions or acceptance metadata carry over across preemption.
+**Speculative state reset:** After stripping, the sequence's speculative decoding state is fully cleared: `num_rejected` and `num_bonus_tokens` are zeroed, and `spec_token_ids` is set to an empty array. This ensures the sequence re-enters the scheduling pipeline with a clean state — no stale draft predictions or acceptance metadata carry over across preemption.
 
----
-
-## 2. ScheduledBatch Structure
+## ScheduledBatch structure
 
 `ScheduledBatch` is constructed by `Scheduler.schedule()` and passed to the model runner. It is a frozen snapshot of batch metadata.
 
-### 2.1 Constructor Signature
+### Constructor signature
 
 ```python
 class ScheduledBatch:
@@ -157,7 +153,7 @@ class ScheduledBatch:
     ):
 ```
 
-### 2.2 Fields
+### Fields
 
 | Field | Type | Description |
 |---|---|---|
@@ -179,7 +175,7 @@ class ScheduledBatch:
 | `num_spec_step` | `int` | Number of speculative decode steps (`mtp_k`) |
 | `scheduled_spec_decode_tokens` | `dict[int, list[int]]` | Draft token IDs per sequence ID from prior speculative step |
 
-### 2.3 ScheduledBatchOutput
+### ScheduledBatchOutput
 
 Returned by the model runner after a forward pass:
 
@@ -199,13 +195,11 @@ class ScheduledBatchOutput:
 - `draft_token_ids` maps sequence ID to a list of speculative draft token IDs for the next step (when MTP is active).
 - A special key `-1` in `token_ids` signals deferred output mode.
 
----
-
-## 3. Block Manager
+## Block manager
 
 The `BlockManager` implements paged KV cache management with fixed-size blocks.
 
-### 3.1 Block Class
+### Block class
 
 ```python
 class Block:
@@ -217,10 +211,10 @@ class Block:
 ```
 
 Methods:
-- `update(hash, token_ids)` -- Sets the block's hash and token content.
-- `reset()` -- Sets `ref_count = 1`, `hash = -1`, `token_ids = []` (used on fresh allocation).
+- `update(hash, token_ids)` — Sets the block's hash and token content.
+- `reset()` — Sets `ref_count = 1`, `hash = -1`, `token_ids = []` (used on fresh allocation).
 
-### 3.2 BlockManager Initialization
+### BlockManager initialization
 
 ```python
 class BlockManager:
@@ -253,11 +247,11 @@ class BlockManager:
 The block pool is pre-allocated at startup. `free_block_ids` is a deque for O(1) pop/push, `used_block_ids` tracks active blocks, and `hash_to_block_id` maps content hashes to block IDs for prefix caching.
 
 **Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (currently GDN: Qwen3-Next, Qwen3.5; future: DeepseekV4 ring buffer + compressor state, etc.):
-- `free_per_req_cache_groups` -- list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `1 + num_speculative_tokens` contiguous tensor slot indices.
-- `per_req_cache_accounting` -- maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.
-- `per_req_cache_equiv_blocks` -- number of KV cache block equivalents reserved per request for its per-request cache (computed from `AttentionMetadataBuilder.compute_per_req_cache_bytes() / block_bytes`).
+- `free_per_req_cache_groups` — list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `1 + num_speculative_tokens` contiguous tensor slot indices.
+- `per_req_cache_accounting` — maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.
+- `per_req_cache_equiv_blocks` — number of KV cache block equivalents reserved per request for its per-request cache (computed from `AttentionMetadataBuilder.compute_per_req_cache_bytes() / block_bytes`).
 
-### 3.3 Allocation (`allocate`)
+### Allocation (`allocate`)
 
 Called during prefill scheduling for new sequences:
 
@@ -280,7 +274,7 @@ def allocate(self, seq: Sequence):
 2. Stores these block IDs in `per_req_cache_accounting[seq.id]` to track per-request memory usage.
 3. Pops one slot group index from `free_per_req_cache_groups` and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors).
 
-### 3.4 Deallocation (`deallocate`)
+### Deallocation (`deallocate`)
 
 Called when a sequence finishes or is preempted:
 
@@ -310,7 +304,7 @@ def deallocate(self, seq: Sequence):
 2. Returns the slot group index `seq.per_req_cache_group` to `free_per_req_cache_groups` for reuse.
 3. Clears `seq.per_req_cache_group` to `-1` to mark it as released.
 
-### 3.5 Can-Allocate and Can-Append Checks
+### Can-allocate and can-append checks
 
 ```python
 def can_allocate(self, seq: Sequence) -> bool:
@@ -341,7 +335,7 @@ def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
   
 - `can_append` checks whether a decode step needs a new block. Calculates the required block count given `num_new_tokens` (typically `mtp_k + 1` for speculative decode) and returns whether enough free blocks remain.
 
-### 3.6 May-Append (Decode Extension)
+### May-append (decode extension)
 
 ```python
 def may_append(self, seq: Sequence, num_new_tokens: int = 1):
@@ -352,16 +346,14 @@ Called during decode scheduling to extend a sequence's block table:
 1. If the sequence length modulo `block_size` falls within `(0, num_new_tokens]`, or `block_size == 1`, a new block is needed:
    - Allocates from `free_block_ids` and appends to `block_table`.
    - For `block_size == 1`, immediately computes and stores the hash.
-2. If `seq_len % block_size == 0`, the last block is now full -- computes and stores its hash using the chained prefix.
+2. If `seq_len % block_size == 0`, the last block is now full — computes and stores its hash using the chained prefix.
 3. Otherwise the last block is partially filled with `hash = -1` (hash deferred until full).
 
----
-
-## 4. Prefix Caching
+## Prefix caching
 
 Prefix caching enables sharing KV cache blocks across sequences that share a common prompt prefix, avoiding redundant computation.
 
-### 4.1 Hash Function
+### Hash function
 
 ATOM uses `xxhash64` (via the `xxhash` Python library) for fast, collision-resistant block hashing:
 
@@ -375,7 +367,7 @@ def compute_hash(cls, token_ids: list[int], prefix: int = -1):
     return h.intdigest()
 ```
 
-### 4.2 Hash Chaining
+### Hash chaining
 
 Blocks form a hash chain: each block's hash incorporates the previous block's hash as a prefix. This ensures that two blocks with identical token content but different preceding context produce different hashes.
 
@@ -383,7 +375,7 @@ Blocks form a hash chain: each block's hash incorporates the previous block's ha
 - Subsequent blocks: `compute_hash(token_ids, prefix=prev_block.hash)`.
 - Only **full** blocks (where `len(token_ids) == block_size`) receive a hash. Partial blocks have `hash = -1` and are not cached.
 
-### 4.3 Cache Lookup During Allocation
+### Cache lookup during allocation
 
 During `allocate()`, for each full block:
 
@@ -393,24 +385,22 @@ During `allocate()`, for each full block:
 4. **Hit:** Reuse the block. If already in `used_block_ids`, increment `ref_count`. Add `block_size` to `seq.num_cached_tokens`.
 5. **Miss (or first miss in chain):** Once a cache miss occurs, all subsequent blocks in the sequence are also misses (`cache_miss = True` is sticky). Allocate fresh blocks from the free list.
 
-### 4.4 Reference Counting
+### Reference counting
 
 - On allocation: `block.reset()` sets `ref_count = 1`.
 - On cache hit for an in-use block: `ref_count += 1`.
 - On deallocation: `ref_count -= 1`. Block returns to free list only when `ref_count == 0`.
 - Shared blocks (prefix cache hits) have `ref_count > 1`.
 
-### 4.5 Enabling Prefix Caching
+### Enabling prefix caching
 
 Set `enable_prefix_caching=True` in `Config`. When disabled, the hash lookup in `allocate()` is skipped entirely (`block_id` is always `-1`).
 
----
-
-## 5. Postprocessing
+## Postprocessing
 
 `Scheduler.postprocess()` is called after the model forward pass to update sequences with sampled tokens, check stop conditions, generate streaming output, and clean up finished sequences.
 
-### 5.1 Signature
+### Signature
 
 ```python
 def postprocess(
@@ -421,7 +411,7 @@ def postprocess(
 ) -> list[Sequence]:
 ```
 
-### 5.2 Token Appending
+### Token appending
 
 For each running sequence whose ID appears in `fwd_output.req_ids`:
 
@@ -432,7 +422,7 @@ For each running sequence whose ID appears in `fwd_output.req_ids`:
   ```
 - **Normal path:** Calls `seq.append_token(token_id)` for each accepted token, which appends to `token_ids`, updates `output_tokens`, `last_token`, and `num_tokens`.
 
-### 5.3 Stop Condition Checking
+### Stop condition checking
 
 The postprocessor checks stop conditions in priority order:
 
@@ -441,7 +431,7 @@ The postprocessor checks stop conditions in priority order:
 3. **Stop token IDs:** If any accepted token is in `self.stop_token_ids` (from `Config.stop_token_ids`, derived from the model's generation config). Sets `leave_reason = "stop_{token_id}"`.
 4. **Max tokens:** If `seq.num_completion_tokens >= seq.max_tokens`. Sets `leave_reason = "max_tokens"`.
 
-### 5.4 Stream Output
+### Stream output
 
 When `stream_output_queue` is provided, the scheduler creates a `RequestOutput` for each processed sequence:
 
@@ -465,7 +455,7 @@ request_output = RequestOutput(
 
 Stream outputs are batched and put onto `stream_output_queue` via `put_nowait`.
 
-### 5.5 Sequence Cleanup
+### Sequence cleanup
 
 For finished sequences:
 1. Set `seq.status = SequenceStatus.FINISHED`.
@@ -473,7 +463,7 @@ For finished sequences:
 3. Remove from the `running` deque.
 4. Return in the `finished_seqs` list.
 
-### 5.6 Placeholder Insertion
+### Placeholder insertion
 
 When speculative decoding or deferred output is active, placeholder EOS tokens are appended to still-running sequences to reserve KV cache slots for the next step:
 
@@ -493,13 +483,11 @@ The placeholder count is determined as follows:
   - Deferred output only: `1`
   - Speculative only: `mtp_k`
 
----
-
-## 6. Speculative Decoding Integration
+## Speculative decoding integration
 
 ATOM supports Multi-Token Prediction (MTP) speculative decoding, where a draft model proposes `mtp_k` additional tokens per step.
 
-### 6.1 Scheduler Tracking
+### Scheduler tracking
 
 ```python
 self.use_spec = config.speculative_config is not None
@@ -510,14 +498,14 @@ self.total_accepted_tokens = 0
 
 Note: `SpeculativeConfig` currently enforces `num_speculative_tokens == 1`.
 
-### 6.2 Draft Tokens in Scheduling
+### Draft tokens in scheduling
 
 During decode scheduling:
 - If `seq.spec_token_ids` is non-empty, the draft tokens are recorded in `scheduled_spec_decode_tokens[seq.id]`.
 - `num_new_tokens = mtp_k + 1` (1 target + `mtp_k` draft tokens), so `may_append` reserves enough block space.
 - The `ScheduledBatch` carries `num_spec_step = mtp_k` and the `scheduled_spec_decode_tokens` dict.
 
-### 6.3 Acceptance Statistics
+### Acceptance statistics
 
 ```python
 def update_spec_stats(self, num_accepted_tokens):
@@ -531,7 +519,7 @@ Every 1000 draft tokens, the acceptance rate is logged:
 [MTP Stats] Total draft tokens: 5000, Accepted: 3750, Acceptance rate: 75.00%
 ```
 
-### 6.4 Draft Token Storage on Sequences
+### Draft token storage on sequences
 
 After postprocessing, accepted draft token IDs for the next step are stored on the sequence:
 
@@ -542,13 +530,11 @@ if draft_token_ids and seq.id in draft_token_ids:
 
 These are picked up by the scheduler on the next `schedule()` call.
 
----
-
-## 7. Sequence Management
+## Sequence management
 
 The `Sequence` class represents a single request throughout its lifecycle.
 
-### 7.1 Constructor
+### Constructor
 
 ```python
 class Sequence:
@@ -563,7 +549,7 @@ class Sequence:
     ):
 ```
 
-### 7.2 Core Fields
+### Core fields
 
 | Field | Type | Description |
 |---|---|---|
@@ -589,7 +575,7 @@ class Sequence:
 | `spec_token_ids` | `list[int]` | Speculative draft token IDs for next step |
 | `num_placeholder` | `int` | Number of placeholder tokens inserted for speculative/deferred output |
 
-### 7.3 Timing Fields
+### Timing fields
 
 | Field | Type | Description |
 |---|---|---|
@@ -598,7 +584,7 @@ class Sequence:
 | `leave_time` | `float` | Timestamp when the sequence finished |
 | `leave_reason` | `str` | Reason for finishing (e.g., `"eos"`, `"max_tokens"`, `"stop_sequence"`) |
 
-### 7.4 Computed Properties
+### Computed properties
 
 | Property | Returns |
 |---|---|
@@ -608,7 +594,7 @@ class Sequence:
 | `num_cached_blocks` | `num_cached_tokens // block_size` |
 | `is_finished` | `status == SequenceStatus.FINISHED` |
 
-### 7.5 num_tokens Setter
+### num_tokens setter
 
 Setting `num_tokens` triggers derived field updates:
 
@@ -620,7 +606,7 @@ def num_tokens(self, value):
     self.last_block_num_tokens = self._num_tokens - (self.num_blocks - 1) * self.block_size
 ```
 
-### 7.6 Lifecycle
+### Lifecycle
 
 ```
                           allocate blocks
@@ -639,7 +625,7 @@ def num_tokens(self, value):
                                          (removed from running)
 ```
 
-### 7.7 SequenceStatus Enum
+### SequenceStatus enum
 
 | Value | Meaning |
 |---|---|
@@ -648,7 +634,7 @@ def num_tokens(self, value):
 | `FINISHED` | Stop condition met, blocks deallocated |
 | `EXIT_ENGINE` | Sentinel for engine shutdown |
 
-### 7.8 SequenceType Enum
+### SequenceType enum
 
 | Value | Meaning |
 |---|---|
@@ -656,15 +642,13 @@ def num_tokens(self, value):
 | `PREFILL` | Currently in prefill phase |
 | `DECODE` | Currently in decode phase |
 
----
-
-## Source Files
+## Source files
 
 | File | Description |
 |---|---|
-| `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` -- scheduling algorithm, postprocessing, speculative decode stats |
-| `atom/model_engine/block_manager.py` | `Block`, `BlockManager` -- paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64 |
-| `atom/model_engine/sequence.py` | `Sequence`, `SequenceStatus`, `SequenceType` -- request lifecycle, token management, timing |
-| `atom/model_engine/request.py` | `RequestOutput` -- streaming output dataclass with `request_id`, `output_tokens`, `finished`, `finish_reason` |
-| `atom/config.py` | `Config` -- scheduling-related fields (`max_num_seqs`, `max_num_batched_tokens`, `kv_cache_block_size`, `enable_prefix_caching`, `scheduler_delay_factor`), `SpeculativeConfig` |
-| `atom/sampling_params.py` | `SamplingParams` -- `temperature`, `max_tokens`, `ignore_eos`, `stop_strings` |
+| `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` — scheduling algorithm, postprocessing, speculative decode stats |
+| `atom/model_engine/block_manager.py` | `Block`, `BlockManager` — paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64 |
+| `atom/model_engine/sequence.py` | `Sequence`, `SequenceStatus`, `SequenceType` — request lifecycle, token management, timing |
+| `atom/model_engine/request.py` | `RequestOutput` — streaming output dataclass with `request_id`, `output_tokens`, `finished`, `finish_reason` |
+| `atom/config.py` | `Config` — scheduling-related fields (`max_num_seqs`, `max_num_batched_tokens`, `kv_cache_block_size`, `enable_prefix_caching`, `scheduler_delay_factor`), `SpeculativeConfig` |
+| `atom/sampling_params.py` | `SamplingParams` — `temperature`, `max_tokens`, `ignore_eos`, `stop_strings` |

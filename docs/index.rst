@@ -74,14 +74,14 @@ Supported GPUs
      - 128 GB HBM2e
      - ✅ Fully Supported
 
-Quick Links
+Quick links
 -----------
 
 * **GitHub**: https://github.com/ROCm/ATOM
 * **ROCm Documentation**: https://rocm.docs.amd.com
 * **Issues**: https://github.com/ROCm/ATOM/issues
 
-Getting Help
+Getting help
 ------------
 
 * **Documentation**: https://rocm.github.io/ATOM/
