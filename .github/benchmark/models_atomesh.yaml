@@ -249,7 +249,7 @@ models:
           eval_concurrency: [64, 256]
 
         - name: kimi-k25-1p1d-tp4-tp8
-          topology: 1p1d_tp8
+          topology: 1p1d_tp4_tp8
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [8192]
