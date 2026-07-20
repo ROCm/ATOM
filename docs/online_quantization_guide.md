@@ -8,7 +8,7 @@ right after the loader finishes copying tensors.
 This guide covers when to use online quantization, the full configuration
 syntax, ready-to-run recipes for the most common model families, how to verify
 the result, and troubleshooting tips. For the dataclass-level field reference,
-see [`configuration_guide.md` § 3.7](./configuration_guide.md#37-online-quantization-at-load-time).
+see [`configuration_guide.md` § Online quantization at load time](./configuration_guide.md#online-quantization-at-load-time).
 
 ## When to use online quantization
 
@@ -195,6 +195,7 @@ python -m atom.entrypoints.openai_server \
 it is a good drop-in when you want FP8 accuracy closer to the block-scaled
 checkpoint than per-token `ptpc_fp8`.
 
+(plugin-mode-vllm-serve)=
 ### Plugin mode (`vllm serve`)
 
 In the [vLLM out-of-tree plugin backend](vllm_plugin_backend_guide.md) you launch
@@ -203,7 +204,8 @@ flag. Instead, pass the **same JSON object** through vLLM's official plugin
 escape hatch `--additional-config`, under the `online_quant_config` key. ATOM
 reads it during the vLLM→ATOM config translation and routes it through the
 identical load-time quantization path (`process_weights_after_loading`),
-including the `online_quant_info_*.json` dump described in § 4.
+including the `online_quant_info_*.json` dump described in
+[Verifying the result](#verifying-the-result).
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-R1-0528 \
