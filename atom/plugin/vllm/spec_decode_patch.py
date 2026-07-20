@@ -112,9 +112,9 @@ def _build_heterogeneous_kv_cache_groups(kv_cache_spec):
         for name, spec in mla_layers.items()
     }
     mla_uniform = UniformTypeKVCacheSpecs.from_specs(mla_specs)
-    assert mla_uniform is not None, (
-        "Failed to build UniformTypeKVCacheSpecs for MLA target layers"
-    )
+    assert (
+        mla_uniform is not None
+    ), "Failed to build UniformTypeKVCacheSpecs for MLA target layers"
     mla_group = KVCacheGroupSpec(
         layer_names=list(mla_specs.keys()),
         kv_cache_spec=mla_uniform,
@@ -171,9 +171,7 @@ def _groups_are_heterogeneous_mla_mha(kv_cache_groups) -> bool:
         )
 
     g0, g1 = kv_cache_groups
-    return (_is_mla(g0) and _is_mha(g1)) or (
-        _is_mla(g1) and _is_mha(g0)
-    )
+    return (_is_mla(g0) and _is_mha(g1)) or (_is_mla(g1) and _is_mha(g0))
 
 
 def _build_heterogeneous_kv_cache_config_from_groups(
@@ -297,7 +295,9 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
         return orig_max_mem(vllm_config, kv_cache_groups)
 
     vllm_kv_cache_utils.get_kv_cache_groups = patched_get_kv_cache_groups
-    vllm_kv_cache_utils.get_kv_cache_config_from_groups = patched_get_kv_cache_config_from_groups
+    vllm_kv_cache_utils.get_kv_cache_config_from_groups = (
+        patched_get_kv_cache_config_from_groups
+    )
     vllm_kv_cache_utils._max_memory_usage_bytes_from_groups = (
         patched_max_memory_usage_bytes_from_groups
     )
