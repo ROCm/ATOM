@@ -1452,11 +1452,19 @@ def _convert_req_index_to_global_index_kernel(
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr)  # int32
 
-        # Guard block_table access
-        valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        # `store_mask` selects which output slots this program writes (by column
+        # position). `tok` is a top-k value used as the offset into this
+        # request's kv_indices segment [kv_start, kv_start+kv_len); guard only
+        # the LOAD with the tok bound so an out-of-range tok cannot page-fault
+        # the GPU. Masked loads yield 0, which the store writes as page index 0
+        # (a valid entry) — keeping the store on the column-only mask so every
+        # consumed slot is deterministically written, never left stale. Mirrors
+        # _gather_kv_indices_sparse_kernel.
+        store_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        load_mask = store_mask & (tok >= 0) & (tok < kv_len)
         out_val = tl.load(
             kv_indices + kv_start + tok,
-            mask=valid_mask,
+            mask=load_mask,
             other=0,
         )
 
@@ -1465,7 +1473,7 @@ def _convert_req_index_to_global_index_kernel(
         tl.store(
             out_ptr_ij,
             out_val,
-            mask=valid_mask,
+            mask=store_mask,
         )
 
 
