@@ -342,15 +342,6 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
-
-        # num_spec_query_tokens: SINGLE SOURCE OF TRUTH for this step's per-seq
-        # decode query length (= anchor + verified drafts). Default = num_spec_step
-        # + 1 (full MTP block); DSpark's `_dspark_apply_q_bucket` overwrites it
-        # with the chosen q-bucket on shrink. EVERY "tokens per decode seq"
-        # consumer (input_ids, positions, ForwardMode bs recovery, draft anchor,
-        # ...) MUST read this instead of re-deriving it — scattered re-derivation
-        # was a whole family of q-shrink desync bugs. Plain MTP keeps num_spec_step
-        # + 1, so consumers are unchanged.
         self.num_spec_query_tokens = num_spec_step + 1
         # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
         # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when

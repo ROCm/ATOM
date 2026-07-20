@@ -486,12 +486,7 @@ try:
     from atom.model_ops.linear import ReplicatedLinear  # noqa: E402
     from atom.model_ops.v4_kernels.state_writes import (  # noqa: E402
         dspark_paged_window_gather,
-        dspark_paged_window_gather_2buff,
         swa_write,
-        swa_write_2buff_prepacked,
-    )
-    from atom.model_ops.v4_kernels.v4_quant import (  # noqa: E402
-        quantize_bf16_to_v4_2buff_triton,
     )
 
     _ATOM_V4_AVAILABLE = True
@@ -570,17 +565,11 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor at
         # allocate_kv_cache; see precompute_context_kv / dspark_attention.
         #
-        # Mark this attn as a DSpark draft layer so the builder can choose the
-        # draft window dtype INDEPENDENTLY of the target KV cache:
-        #   - DEFAULT (config.dspark.fp8_swa False): a PRIVATE bf16 SWA pool, even
-        #     when the target is fp8. DSpark's block attention is bf16, so an fp8
-        #     draft window only saves a little gather bandwidth while paying
-        #     quant(write)+dequant(read) — net-negative on the small draft window.
-        #   - fp8_swa True AND target fp8: the SHARED native 2buff fp8 pool
-        #     (`swa_kv` nope-fp8 + `swa_kv_rope` bf16), same as the target — kept
-        #     for A/B and a future fused fp8 draft-attention kernel.
-        # The runtime read/write paths key off module.kv_fp8 / swa_kv_rope (set by
-        # the builder), so bf16 vs fp8 is fully determined at bind time.
+        # Mark this attn as a DSpark draft layer so the builder always binds it a
+        # PRIVATE bf16 SWA pool, even under an fp8 target KV cache. DSpark's block
+        # attention runs bf16 (no fused fp8 kernel for its [window ++ draft-block]
+        # shape), so an fp8 draft window is a measured net regression. The target
+        # KV cache is unaffected (still fp8).
         self.attn.dspark_draft = True
 
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
@@ -592,15 +581,13 @@ class DSparkLayer(Block):  # type: ignore[misc]
     # ---- DSpark attention path (replaces Block.attn's paged sparse attn) -----
 
     def _compute_main_kv(
-        self, main_x: torch.Tensor, positions: torch.Tensor, apply_qat: bool = True
+        self, main_x: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
         """Project one target hidden state per request into a rolling-window KV
-        row (post kv_norm + RoPE). main_x: [B, dim] -> [B, head_dim].
+        row (post kv_norm + RoPE + QAT). main_x: [B, dim] -> [B, head_dim].
 
-        ``apply_qat``: fake-quant the NoPE lanes through fp8 E4M3 (DSpark QAT
-        numerics) then store bf16. Skipped on the native-fp8 SWA write path,
-        where the pool IS fp8 and the caller quantizes the clean bf16 directly
-        (a real fp8 store, not a QAT round-trip + re-quant double-pass)."""
+        The NoPE lanes are fake-quantized through fp8 E4M3 (DSpark QAT numerics)
+        then stored bf16 — matching the QAT-trained draft's expected KV values."""
         a = self.attn
         qr_kv = _linear_out(a.wqkv_a(main_x))
         _, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
@@ -614,8 +601,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             ),
             a.rope_head_dim,
         )
-        if apply_qat:
-            _apply_dspark_kv_qat_(kv, a.rope_head_dim)
+        _apply_dspark_kv_qat_(kv, a.rope_head_dim)
         return kv.view(-1, a.head_dim)
 
     def precompute_context_kv(
@@ -661,44 +647,21 @@ class DSparkLayer(Block):  # type: ignore[misc]
             return
         attn_md = fc.attn_metadata
         a = self.attn
-        kv_fp8 = getattr(a, "kv_fp8", False) and a.swa_kv_rope is not None
-        # Native fp8 SWA: compute clean bf16 KV (no QAT round-trip — the pool IS
-        # fp8), quantize to the 2buff layout, and scatter into both paged pools.
-        main_kv = self._compute_main_kv(
-            main_x, positions, apply_qat=not kv_fp8
-        )  # [T, head_dim]
+        main_kv = self._compute_main_kv(main_x, positions)  # [T, head_dim]
+        main_kv = main_kv.to(a.swa_kv.dtype).contiguous()
         if cu_seqlens_q is None:
             B = main_kv.shape[0]
             cu_seqlens_q = torch.arange(B + 1, device=main_kv.device, dtype=torch.int32)
         B = cu_seqlens_q.shape[0] - 1
-        positions_i32 = positions.to(torch.int32)
-        cu_seqlens_i32 = cu_seqlens_q.to(torch.int32)
-        block_tables = attn_md.swa_block_tables[:B]
-        if kv_fp8:
-            k_packed, k_rope = quantize_bf16_to_v4_2buff_triton(
-                main_kv.to(torch.bfloat16).contiguous()
-            )  # [T, 512] fp8, [T, 64] bf16
-            swa_write_2buff_prepacked(
-                k_packed,
-                k_rope,
-                positions_i32,
-                cu_seqlens_i32,
-                block_tables,
-                a.swa_kv,  # [num_pages, 512] fp8 nope pool
-                a.swa_kv_rope,  # [num_pages, 64] bf16 rope pool
-                a.swa_block_size,
-                write_per_batch,
-            )
-        else:
-            swa_write(
-                main_kv.to(a.swa_kv.dtype).contiguous(),  # [T, head_dim]
-                positions_i32,  # [T]
-                cu_seqlens_i32,  # [B+1] per-req spans
-                block_tables,  # [B, max_blocks]
-                a.swa_kv,  # [num_pages, head_dim]
-                a.swa_block_size,
-                write_per_batch,
-            )
+        swa_write(
+            main_kv,  # [T, head_dim]
+            positions.to(torch.int32),  # [T]
+            cu_seqlens_q.to(torch.int32),  # [B+1] per-req spans
+            attn_md.swa_block_tables[:B],  # [B, max_blocks]
+            a.swa_kv,  # [num_pages, head_dim]
+            a.swa_block_size,
+            write_per_batch,
+        )
 
     def dspark_attention(
         self,
@@ -758,26 +721,13 @@ class DSparkLayer(Block):  # type: ignore[misc]
             valid_target = torch.zeros(B, W, dtype=torch.bool, device=x.device)
         else:
             attn_md = fc.attn_metadata
-            if getattr(a, "kv_fp8", False) and a.swa_kv_rope is not None:
-                # Native 2buff fp8 SWA: gather both paged pools (nope-fp8 +
-                # rope-bf16) and dequantize back to a dense bf16 [B, W, head_dim]
-                # window, so the downstream cat / sparse_attn stay bf16.
-                window_kv = dspark_paged_window_gather_2buff(
-                    a.swa_kv,  # [num_pages, 512] fp8 nope pool
-                    a.swa_kv_rope,  # [num_pages, 64] bf16 rope pool
-                    attn_md.swa_block_tables[:B],  # [B, max_blocks]
-                    positions,  # [B] anchor positions
-                    W,
-                    a.swa_block_size,
-                )  # [B, W, head_dim] bf16
-            else:
-                window_kv = dspark_paged_window_gather(
-                    a.swa_kv,  # [num_pages, head_dim]
-                    attn_md.swa_block_tables[:B],  # [B, max_blocks]
-                    positions,  # [B] anchor positions
-                    W,
-                    a.swa_block_size,
-                )  # [B, W, head_dim]
+            window_kv = dspark_paged_window_gather(
+                a.swa_kv,  # [num_pages, head_dim]
+                attn_md.swa_block_tables[:B],  # [B, max_blocks]
+                positions,  # [B] anchor positions
+                W,
+                a.swa_block_size,
+            )  # [B, W, head_dim]
             # slot s valid iff abs position (anchor-(W-1)+s) >= 0.
             slot_ids = torch.arange(W, device=x.device).view(1, W)
             valid_target = slot_ids >= (W - 1) - positions.view(B, 1)

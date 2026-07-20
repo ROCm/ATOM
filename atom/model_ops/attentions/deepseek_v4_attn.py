@@ -784,24 +784,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         swa_pages = self.model_runner.num_swa_blocks * self.block_size
 
         if isinstance(module, _V4Attention):
-            # DSpark draft layer: by default (config.dspark.fp8_swa False) give
-            # it a PRIVATE bf16 SWA pool even under an fp8 target.
+            # DSpark draft layer: fp8 target KV cache. DSpark's block attention runs bf16.
             if getattr(module, "dspark_draft", False):
-                dspark_cfg = getattr(self.model_runner.config, "dspark", None)
-                want_fp8 = bool(getattr(dspark_cfg, "fp8_swa", False))
-                if not (self._kv_fp8 and want_fp8):
-                    module.swa_kv = torch.zeros(
-                        (swa_pages, self.head_dim),
-                        dtype=torch.bfloat16,
-                        device=self.model_runner.device,
-                    )
-                    module.swa_block_size = self.block_size
-                    module.kv_fp8 = False
-                    module.unified_kv = None
-                    module.unified_kv_rope = None
-                    module.swa_kv_rope = None
-                    return None
-                # else: fp8_swa opted in + target fp8 → shared 2buff pool below.
+                module.swa_kv = torch.zeros(
+                    (swa_pages, self.head_dim),
+                    dtype=torch.bfloat16,
+                    device=self.model_runner.device,
+                )
+                module.swa_block_size = self.block_size
+                module.kv_fp8 = False
+                module.unified_kv = None
+                module.unified_kv_rope = None
+                module.swa_kv_rope = None
+                return None
             # Bind both:
             #   - `attn.unified_kv`: the full per-layer pool (paged_decode reads).
             #   - `attn.swa_kv`: the flat [num_swa_blocks*block_size, head_dim]
