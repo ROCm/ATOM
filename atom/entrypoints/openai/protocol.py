@@ -29,13 +29,11 @@ STREAM_DONE_MESSAGE = "data: [DONE]\n\n"
 
 
 def _fix_invalid_json_escapes(s: str) -> str:
-    """Escape lone backslashes that are not valid JSON escape sequences.
+    """Fix invalid JSON escapes in model-generated tool-call arguments.
 
-    Some production payloads contain tool-call arguments with invalid escape
-    sequences like ``\\k`` or ``\\p`` (e.g. from free-text embedded in the
-    JSON).  Standard ``json.loads`` rejects these.  This helper doubles any
-    backslash that is NOT followed by a valid JSON escape character so the
-    string can be parsed.
+    Models occasionally produce invalid escape sequences like ``\\k`` or
+    ``\\p`` in function.arguments JSON. ``json.loads`` rejects these. This
+    helper doubles any backslash not followed by a valid JSON escape char.
     """
     _VALID = frozenset('"\\bfnrtu/')
     out: list[str] = []
