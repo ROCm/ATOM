@@ -1451,18 +1451,27 @@ class ModelRunner:
             # term; strip it so the compressed pool is sized on compressed bytes.
             compressed_block_bytes = block_bytes - swa_block_bytes
             if envs.ATOM_SWA_FULL_RETAIN:
-                # Full-retain: the SWA cache mirrors the compressed cache one-for-
-                # one (every compressed block has a paired SWA block used in
-                # lockstep), so size BOTH pools equally from the shared budget by
-                # the combined per-block bytes. This is memory-bounded like vLLM's
-                # unified block pool — NOT max_num_seqs * ceil(max_model_len/bs),
-                # which explodes to ~TB at DSV4's 1M max_position_embeddings.
-                # Live SWA footprint stays ~window/seq (window-free is kept); the
-                # extra blocks hold lazily-freed-but-cached tails for cross-request
-                # replay reuse, capacity == the compressed prefix cache.
-                num_kvcache_blocks = available_for_pool // block_bytes
-                num_swa_blocks = num_kvcache_blocks
+                # Full-retain: give the SWA tail pool a small fraction `f` of the
+                # budget; the rest stays with the compressed pool. One SWA block is
+                # ~7x the bytes of one compressed block, so a 1:1 mirror
+                # (num_swa == num_kvcache) starves the compressed prefix index
+                # (measured: 298k -> 36.8k blocks -> hit rate collapsed). A small
+                # f keeps compressed near full while retaining the hot-boundary
+                # tail working set (LRU-evicted, same eviction discipline as
+                # vLLM's FreeKVCacheBlockQueue). Memory-bounded regardless of
+                # max_model_len. Live SWA footprint stays ~window/seq (window-free
+                # is kept); the tail pool holds lazily-freed-but-cached tails.
+                f = min(0.9, max(1e-3, envs.ATOM_SWA_TAIL_BUDGET_FRAC))
+                swa_budget = int(available_for_pool * f)
+                compressed_budget = available_for_pool - swa_budget
+                num_swa_blocks = swa_budget // swa_block_bytes
+                num_kvcache_blocks = compressed_budget // compressed_block_bytes
                 swa_reserved = num_swa_blocks * swa_block_bytes
+                logger.info(
+                    f"paged-SWA full-retain: tail_budget_frac={f:.3f}, "
+                    f"swa_budget={swa_budget / (1 << 30):.2f}GB, "
+                    f"compressed_budget={compressed_budget / (1 << 30):.2f}GB"
+                )
             else:
                 num_swa_blocks = b.swa_pool_num_blocks(
                     config.max_num_seqs, config.max_model_len
