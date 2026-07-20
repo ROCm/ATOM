@@ -34,11 +34,15 @@ def _torch_reshape_and_cache(
     slot_mapping: torch.Tensor,
 ) -> None:
     slots = slot_mapping.flatten().to(torch.long)
-    valid = slots >= 0
-    if not valid.all():
-        slots = slots[valid]
-        k = k[valid]
-        v = v[valid]
+    # The valid-slot filter needs a host sync (valid.all()/boolean indexing) that
+    # is illegal during CUDA-graph capture. Decode batches (the only ones captured)
+    # have no padded (-1) slots, so skip the data-dependent filter while capturing.
+    if not torch.cuda.is_current_stream_capturing():
+        valid = slots >= 0
+        if not valid.all():
+            slots = slots[valid]
+            k = k[valid]
+            v = v[valid]
     if slots.numel() == 0:
         return
 

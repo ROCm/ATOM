@@ -287,6 +287,25 @@ class KimiSparseMoeBlock(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # gfx1250 work-around (REQUIRED for correctness, not just stability): the
+        # grouped MoE + MXFP4 latent projections are only numerically correct at
+        # small M on gfx1250 — at large prefill M the contiguous-M path OOB-faults
+        # AND the non-contiguous path returns coherent-but-wrong values (gsm8k
+        # 0.0). The MoE block is per-token independent, so split a large prefill
+        # into <=chunk sub-batches (numerically identical) so every kernel sees a
+        # small, correct M. Keeps whole-prompt prefill (correct MLA). Gated by
+        # ATOM_K3_MOE_CHUNK; remove once the gfx1250 MoE kernel is fixed at large M.
+        chunk = int(os.environ.get("ATOM_K3_MOE_CHUNK", "0") or "0")
+        n = hidden_states.shape[0]
+        if chunk > 0 and n > chunk:
+            outs = [
+                self._forward_impl(hidden_states[i : i + chunk])
+                for i in range(0, n, chunk)
+            ]
+            return torch.cat(outs, dim=0)
+        return self._forward_impl(hidden_states)
+
+    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         # Match the reference Kimi router: route in fp32 before sigmoid/top-k.
         router_logits = F.linear(
