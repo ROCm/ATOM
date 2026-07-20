@@ -66,12 +66,6 @@ from atom.config import (
     QuantType,
     get_current_atom_config,
 )
-from atom.distributed.pcp_utils import (
-    get_pcp_world_size,
-    pcp_allgather_rerange,
-    pcp_pad_len,
-    pcp_round_robin_split,
-)
 from atom.model_loader.loader import WeightsMapper
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`

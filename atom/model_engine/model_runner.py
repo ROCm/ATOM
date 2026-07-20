@@ -54,12 +54,6 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_split,
 )
-from atom.distributed.pcp_utils import (
-    PcpBalGroup,
-    pcp_allgather_rerange,
-    pcp_pad_len,
-    pcp_round_robin_split,
-)
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
