@@ -544,16 +544,19 @@ class KimiFullAttention(nn.Module):
         )
         kv = self.kv_b_proj(self.kv_a_layernorm(k_latent))
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k_rope = k_rope.unsqueeze(1).expand(-1, self.num_local_heads, -1)
 
-        # k_nope (from kv_b) and the MQA-shared k_rope (from kv_a) are distinct
-        # sources, so this cat is real (unlike q's).
-        k = torch.cat((k_nope, k_rope), dim=-1)
-        # Kimi MLA is stored in the standard paged-MHA cache: pad V to the query
-        # head dim so K and V share a cache entry, then slice V back afterwards.
-        v_padded = F.pad(v, (0, self.q_head_dim - self.v_head_dim)).reshape(
-            -1, self.local_q_size
+        # Fused assembly (one kernel instead of split + cat + pad): builds
+        # k = [k_nope (from kv) | k_rope (MQA-shared)] and v_padded = [v | 0].
+        # Kimi MLA is stored in the standard paged-MHA cache, so V is padded to
+        # the query head dim to share a cache entry with K (sliced back after).
+        from atom.models.kimi_k3_fused import fuse_mla_kv
+
+        k, v_padded = fuse_mla_kv(
+            kv,
+            k_rope,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+            self.qk_rope_head_dim,
         )
 
         # MLA-as-MHA at head_dim=192. self.attn both writes the paged KV cache
@@ -564,7 +567,7 @@ class KimiFullAttention(nn.Module):
         attn_out = self.attn(
             q.reshape(-1, self.local_q_size),
             k.reshape(-1, self.local_q_size),
-            v_padded,
+            v_padded.reshape(-1, self.local_q_size),
         )
         attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
             :, :, : self.v_head_dim
