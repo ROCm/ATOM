@@ -14,7 +14,12 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
-from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
+from atom.utils.tbo.ubatch_splitting import (
+    UBatchSlice,
+    attach_tbo_cpu_lens,
+    split_attn_metadata,
+)
+from atom.utils.tbo.ubatching import tbo_enabled
 from atom.utils.forward_context import AttentionMetaData, AttnState
 from torch import nn
 
@@ -503,6 +508,26 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     ) -> AttentionMetaData:
         del ubatch_idx  # only used by builders with per-ubatch plan buffers
         return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+
+    def _attach_tbo_prefill_cpu_lens(
+        self, attn_metadata: AttentionMetaData, bs: int
+    ) -> None:
+        """Publish CPU (numpy) copies of the per-request length arrays so that
+        split_attn_metadata can recompute per-ubatch max_seqlen_q/k and total_kv
+        on the host with zero device sync.
+        """
+        if not tbo_enabled():
+            return
+        var = self.model_runner.forward_vars
+        attach_tbo_cpu_lens(
+            attn_metadata, "context_lens", var["context_lens"].np[:bs].copy()
+        )
+        attach_tbo_cpu_lens(
+            attn_metadata, "cu_seqlens_q", var["cu_seqlens_q"].np[: bs + 1].copy()
+        )
+        attach_tbo_cpu_lens(
+            attn_metadata, "cu_seqlens_k", var["cu_seqlens_k"].np[: bs + 1].copy()
+        )
 
     def build(self, batch: ScheduledBatch, bs: int):
         is_prefill = batch.total_tokens_num_prefill > 0

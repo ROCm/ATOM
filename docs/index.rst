@@ -2,6 +2,7 @@ ATOM Documentation
 ==================
 
 **ATOM** (Accelerated Training and Optimization for Models) is AMD's high-performance LLM serving framework optimized for ROCm platforms.
+Find the source code at `<https://github.com/ROCm/ATOM>`__.
 
 .. image:: assets/atom_logo.png
    :align: center
@@ -25,6 +26,7 @@ ATOM Documentation
    model_ops_guide
    scheduling_kv_cache_guide
    distributed_guide
+   context_parallel_guide
    compilation_cudagraph_guide
    serving_benchmarking_guide
 
@@ -74,22 +76,9 @@ Supported GPUs
      - 128 GB HBM2e
      - ✅ Fully Supported
 
-Quick Links
+Quick links
 -----------
 
 * **GitHub**: https://github.com/ROCm/ATOM
 * **ROCm Documentation**: https://rocm.docs.amd.com
 * **Issues**: https://github.com/ROCm/ATOM/issues
-
-Getting Help
-------------
-
-* **Documentation**: https://rocm.github.io/ATOM/
-* **GitHub Issues**: https://github.com/ROCm/ATOM/issues
-* **ROCm Community**: https://github.com/ROCm/ROCm/discussions
-
-Indices and tables
-==================
-
-* :ref:`genindex`
-* :ref:`search`

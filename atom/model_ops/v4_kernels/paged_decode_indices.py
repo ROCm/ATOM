@@ -35,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 
 @triton.jit
 def _v4_paged_decode_indices_kernel(
@@ -105,6 +107,7 @@ def _v4_paged_decode_indices_kernel(
     tl.store(hca_indices_ptr + hca_end - n + i, paged, mask=mask)
 
 
+@mark_trace
 def write_v4_paged_decode_indices(
     *,
     block_tables: torch.Tensor,
@@ -119,6 +122,7 @@ def write_v4_paged_decode_indices(
     T: int,
     win: int,
     block_size: int,
+    prefix: str = "",
 ) -> None:
     """In-place fill SWA / CSA / HCA window-prefix offsets via a single
     Triton kernel. Replaces the prior `_build_window_topk_np` (CPU O(T·win))

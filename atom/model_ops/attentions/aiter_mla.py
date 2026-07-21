@@ -1032,6 +1032,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta(batch, bs)
 
         attn_metadata.dtype_q = self.dtype_q
+        # TBO: publish CPU length copies for zero-sync ubatch splits.
+        # Attached last, once all metadata is finalized. No-op unless TBO is on.
+        self._attach_tbo_prefill_cpu_lens(attn_metadata, bs)
         return attn_metadata, positions
 
     def _build_mla_chunk_meta(
