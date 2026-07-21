@@ -3369,10 +3369,25 @@ class FusedMoE(torch.nn.Module):
         ):
             w13_batchable.append(getattr(self, "w13_weight_scale", None))
             w2_batchable.append(getattr(self, "w2_weight_scale", None))
+        # Only local BASE (non-redundant) expert slots receive a checkpoint
+        # weight during loading; EPLB redundant physical slots are filled later
+        # by fill_redundant, so they never arrive here. Counting all local
+        # physical slots (local_num_experts) would over-estimate `expected` on
+        # ranks that own redundant slots -> the batched staging entry never
+        # reaches the flush threshold, so it is never flushed/freed (staging
+        # leaks for every layer -> OOM, and load never completes -> the rank
+        # misses the post-load all2all init collective -> hang). Count only the
+        # local slots inside the logical range (the base experts the checkpoint
+        # actually delivers).
+        if self.expert_map is not None:
+            num_logical = self.global_num_experts - self.num_redundant_experts
+            n_local_base = int((self.expert_map[:num_logical] != -1).sum().item())
+        else:
+            n_local_base = self.local_num_experts
         if any(param is p for p in w13_batchable if p is not None):
-            return self.local_num_experts * 2
+            return n_local_base * 2
         if any(param is p for p in w2_batchable if p is not None):
-            return self.local_num_experts
+            return n_local_base
         return None
 
     def weight_loader(

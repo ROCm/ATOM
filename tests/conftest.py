@@ -74,6 +74,12 @@ class _StubEPLBConfig:
         for key, value in kwargs.items():
             setattr(self, key, value)
 
+    @classmethod
+    def from_dict(cls, cfg):
+        # Mirror the real EPLBConfig.from_dict: arg_utils builds the config via
+        # EPLBConfig.from_dict(--eplb-config JSON dict).
+        return cls(**(cfg or {}))
+
 
 class _StubAtomConfig:
     """Placeholder returned by get_current_atom_config in unit tests."""

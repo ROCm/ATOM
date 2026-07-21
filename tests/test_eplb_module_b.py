@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_ops/eplb.py (Module-B manager only)
 
+import types
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -108,6 +110,10 @@ def test_manager_balancedness_gate_skips_when_balanced(monkeypatch):
         rebalance_balancedness_agg="min",
     )
     _spy_rebalance(manager, fired)
+    # Per-GPU balancedness needs ep_size from the live placement; in this
+    # manager-only unit test there is no model, so provide a minimal stub.
+    # counts=[3,3] with ep_size=2 -> perg=[3,3] -> mean/max = 1.0.
+    manager.live_metadata = types.SimpleNamespace(ep_size=2)
     manager.on_forward_pass_end(is_dummy_run=False)  # consumes interval yield
     manager.on_forward_pass_end(is_dummy_run=False)  # enters _rebalance, gate skips
     assert fired == []
@@ -117,8 +123,9 @@ def test_manager_balancedness_gate_skips_when_balanced(monkeypatch):
 
 def test_manager_min_vs_mean_aggregation(monkeypatch):
     monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
-    # layer-0: 10/2 => 0.5, layer-1: 6/6 => 1.0
-    # min=0.5, mean=0.75
+    # ep_size=2 -> each physical slot is one GPU; per-layer mean/max over GPUs:
+    #   layer-0 [10,2] -> 6/10 = 0.6 ; layer-1 [6,6] -> 6/6 = 1.0
+    #   => min=0.6, mean=0.8
     fake_load = torch.tensor([[10, 2], [6, 6]], dtype=torch.int32)
     monkeypatch.setattr(monitor, "dump_global_physical_load", lambda: fake_load)
 
@@ -131,9 +138,10 @@ def test_manager_min_vs_mean_aggregation(monkeypatch):
         rebalance_balancedness_agg="min",
     )
     _spy_rebalance(mgr_min, fired_min)
+    mgr_min.live_metadata = types.SimpleNamespace(ep_size=2)
     mgr_min.on_forward_pass_end(is_dummy_run=False)
     mgr_min.on_forward_pass_end(is_dummy_run=False)
-    assert fired_min == [1]  # min=0.5 < 0.7 -> rebalance
+    assert fired_min == [1]  # min=0.6 < 0.7 -> rebalance
 
     fired_mean = []
     mgr_mean = eplb.EPLBManager(
@@ -144,9 +152,10 @@ def test_manager_min_vs_mean_aggregation(monkeypatch):
         rebalance_balancedness_agg="mean",
     )
     _spy_rebalance(mgr_mean, fired_mean)
+    mgr_mean.live_metadata = types.SimpleNamespace(ep_size=2)
     mgr_mean.on_forward_pass_end(is_dummy_run=False)
     mgr_mean.on_forward_pass_end(is_dummy_run=False)
-    assert fired_mean == []  # mean=0.75 >= 0.7 -> skip
+    assert fired_mean == []  # mean=0.8 >= 0.7 -> skip
 
 
 def test_manager_interval_must_cover_window():
