@@ -18,7 +18,6 @@ Main class for loading and serving models.
 * **gpu_memory_utilization** (*float*) - GPU memory usage (0.0-1.0). Default: 0.9
 * **max_model_len** (*int*) - Maximum sequence length
 * **tensor_parallel_size** (*int*) - Number of GPUs for tensor parallelism. Default: 1
-* **dtype** (*str*) - Model dtype ('float16', 'bfloat16', 'float32')
 
 Methods
 ^^^^^^^
@@ -40,12 +39,15 @@ Generate text from prompts.
 
 **Returns:**
 
-* **outputs** (*list[str]*) - Generated text strings
+* **outputs** (*list[dict]*) - One dict per prompt. Each dict contains at
+  minimum a ``"text"`` key with the generated string, plus ``"token_ids"``,
+  ``"latency"``, ``"finish_reason"``, ``"num_tokens_input"``,
+  ``"num_tokens_output"``, ``"ttft"``, and ``"logprobs"``.
 
 .. note::
-   Unlike some APIs, ``generate()`` requires prompts to be a list and returns
-   a list of strings, not RequestOutput objects. Parameters like max_tokens
-   must be specified via SamplingParams.
+   ``generate()`` requires prompts to be a list. Access generated text via
+   ``outputs[i]["text"]``. Parameters like ``max_tokens`` must be specified
+   via ``SamplingParams``.
 
 SamplingParams
 --------------
@@ -71,23 +73,20 @@ Configuration for text generation.
 * **stop_strings** (*list[str] | None*) - Strings that stop generation. Default: None
 
 .. note::
-   The following parameters are NOT currently supported (may be added in future):
-   top_p, top_k, presence_penalty, frequency_penalty
+   ``presence_penalty`` and ``frequency_penalty`` are not currently supported.
+   ``top_p`` and ``top_k`` are supported (``top_k=-1`` disables it;
+   ``top_p=1.0`` disables it).
 
 Return values
 -------------
 
-The ``generate()`` method returns a list of strings (not RequestOutput objects).
+The ``generate()`` method returns a ``list[dict]``. Access the generated
+text via the ``"text"`` key:
 
 .. code-block:: python
 
    outputs = llm.generate(["Hello, world!"], sampling_params)
-   # outputs is list[str], e.g., ["Hello, world! How are you today?"]
-
-.. note::
-   Unlike some LLM serving frameworks, ATOM's generate() method returns
-   plain strings, not structured output objects. If you need token IDs
-   or other metadata, these are not currently exposed in the API.
+   print(outputs[0]["text"])  # e.g., "Hello, world! How are you today?"
 
 Example
 -------
@@ -96,26 +95,26 @@ Complete example:
 
 .. code-block:: python
 
-   from atom import LLM, SamplingParams
+   from atom import LLMEngine, SamplingParams
 
    # Initialize model
-   llm = LLM(
+   llm = LLMEngine(
        model="meta-llama/Llama-2-7b-hf",
        tensor_parallel_size=2,
-       gpu_memory_utilization=0.9
+       gpu_memory_utilization=0.9,
    )
 
    # Configure sampling
    sampling_params = SamplingParams(
        temperature=0.7,
        top_p=0.9,
-       max_tokens=200
+       max_tokens=200,
    )
 
    # Generate
    prompts = ["Tell me about AMD GPUs"]
    outputs = llm.generate(prompts, sampling_params=sampling_params)
 
-   for output in outputs:
-       print(f"Prompt: {output.prompt}")
-       print(f"Generated: {output.text}")
+   for prompt, output in zip(prompts, outputs):
+       print(f"Prompt: {prompt}")
+       print(f"Generated: {output['text']}")
