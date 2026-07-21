@@ -156,16 +156,9 @@ def _sparse_unified_attention(
     # key_cache: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     block_size = k_cache_view.shape[3]
     # Each token is its own length-1 sequence (decode); cu_seqlens_q = 0..num_seqs.
-    _cache = getattr(_sparse_unified_attention, "_cu_seqlens_q_cache", None)
-    if _cache is None:
-        _cache = {}
-        _sparse_unified_attention._cu_seqlens_q_cache = _cache
-    key = (q_view.device, int(num_seqs))
-    if key not in _cache:
-        _cache[key] = torch.arange(
-            num_seqs + 1, dtype=torch.int32, device=q_view.device
-        )
-    cu_seqlens_q = _cache[key]
+    # Per-call (not cached): caching would retain a GPU tensor per batch size and
+    # break already-captured CUDA graphs on regrow.
+    cu_seqlens_q = torch.arange(num_seqs + 1, dtype=torch.int32, device=q_view.device)
     # Safe upper bound: full block table width * page size (>= every sparse_ctx).
     max_seqlen_k = int(sparse_bt.shape[1]) * int(block_size)
 
