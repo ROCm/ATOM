@@ -55,6 +55,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
+    # --- Fake Expert Parallelism (single-GPU EP simulation) ---
+    # Pretend EP=N while running a single real GPU (real tp=dp=world=1).  When
+    # >0, FusedMoEParallelConfig.make forces (use_ep=True, ep_size=N, ep_rank=
+    # ATOM_FAKE_EP_RANK, dp_size=1).  Effect: only this rank's N-th slice of
+    # experts (E//N) is allocated + loaded, expert_map/expert_mask are built,
+    # and dp_size=1 disables the mori all2all path so the direct masked
+    # fused_moe runs locally -- no cross-GPU dispatch/combine.  Pair with
+    # --fake-eplb so routing is redirected onto the local expert block (see
+    # init_balance_router_logits) and the loaded experts carry a full EP rank's
+    # load.  Benchmarking harness only (output is not meaningful).
+    "ATOM_FAKE_EP": lambda: int(os.getenv("ATOM_FAKE_EP", "0")),
+    # Which EP rank (0..ATOM_FAKE_EP-1) to simulate; selects which contiguous
+    # expert block [rank*L, (rank+1)*L) is loaded/routed.  Ranks are symmetric
+    # when E is divisible by ATOM_FAKE_EP, so 0 is the representative default.
+    "ATOM_FAKE_EP_RANK": lambda: int(os.getenv("ATOM_FAKE_EP_RANK", "0")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a

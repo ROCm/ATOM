@@ -104,6 +104,7 @@ def init_balance_router_logits(
     ep_size: int = 1,
     dtype: torch.dtype = torch.bfloat16,
     max_num_tokens: int = 32768,
+    fake_ep_rank: int = -1,
 ):
     # Build synthetic router logits whose argmax-topk is balanced BOTH across
     # experts and across EP ranks. ATOM uses contiguous expert->rank sharding
@@ -117,6 +118,22 @@ def init_balance_router_logits(
     # included).
     device = "cuda"
     E = n_routed_experts
+    if fake_ep_rank >= 0:
+        # Fake single-GPU EP (ATOM_FAKE_EP): this process physically holds only
+        # the local expert block [fake_ep_rank*L, (fake_ep_rank+1)*L).  Route
+        # EVERY token's topk picks into that block (balanced, distinct per token
+        # since topk <= L) so the loaded experts carry a full EP rank's MoE
+        # load.  Using the stock cross-rank spread instead would leave ~1-1/ep
+        # of picks pointing at experts absent on this GPU (masked out), which
+        # under-loads the grouped GEMM by a factor of ep_size.
+        L = E // ep_size
+        router_logits = torch.zeros((max_num_tokens, E), dtype=dtype, device=device)
+        t = torch.arange(max_num_tokens, device=device).unsqueeze(1)  # (T, 1)
+        k = torch.arange(topk, device=device).unsqueeze(0)  # (1, topk)
+        local_slot = (t * topk + k) % L  # rolling window within the local block
+        expert_ids = fake_ep_rank * L + local_slot  # global ids, all local
+        router_logits.scatter_(1, expert_ids, 1.0)
+        return router_logits
     if ep_size <= 1:
         # No EP: rank-balance is trivial; keep pure expert-balance via a rolling
         # window of topk consecutive experts per token.
@@ -163,6 +180,27 @@ class FusedMoEParallelConfig:
     def make(
         tp_size_: int, dp_size_: int, parallel_config: Config
     ) -> "FusedMoEParallelConfig":
+        # --- Fake single-GPU EP (ATOM_FAKE_EP) ------------------------------
+        # Simulate one rank of an EP=N deployment on a single physical GPU.
+        # Force EP sizing directly (instead of deriving ep_size from dp*tp,
+        # which would require N real processes) while keeping dp_size=1 so that
+        # use_all2all_kernels stays False -- no mori dispatch/combine is built,
+        # and the direct masked fused_moe path runs this rank's E//N expert
+        # slice locally.  determine_expert_map (use_ep=True) then loads only the
+        # local expert block; pair with --fake-eplb for local balanced routing.
+        _fake_ep = envs.ATOM_FAKE_EP
+        if _fake_ep > 0:
+            return FusedMoEParallelConfig(
+                tp_size=1,
+                tp_rank=0,
+                dp_size=1,
+                dp_rank=0,
+                ep_size=_fake_ep,
+                ep_rank=envs.ATOM_FAKE_EP_RANK,
+                use_ep=True,
+                local_ep_size=_fake_ep,
+            )
+
         def flatten_tp_across_dp(dp_rank: int):
             tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
             # There are actually dp_size_ * tp_size_ devices. Update tp_size
@@ -2646,6 +2684,9 @@ class FusedMoE(torch.nn.Module):
                 self.ep_size if self.use_ep else 1,
                 torch.get_default_dtype(),
                 atom_config.max_num_batched_tokens,
+                # Under ATOM_FAKE_EP, redirect all picks onto this rank's local
+                # expert block so the single GPU carries a full EP rank's load.
+                fake_ep_rank=(self.ep_rank if envs.ATOM_FAKE_EP > 0 else -1),
             )
             if atom_config.fake_eplb
             else None
