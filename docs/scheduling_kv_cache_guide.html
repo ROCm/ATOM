@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ATOM Scheduling &amp; KV Cache Guide &mdash; ATOM 0.1.0 documentation</title>
+  <title>ATOM scheduling &amp; KV cache guide &mdash; ATOM 0.1.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
@@ -20,7 +20,7 @@
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
     <link rel="next" title="ATOM Distributed Inference Guide" href="distributed_guide.html" />
-    <link rel="prev" title="ATOM Model Operations Guide" href="model_ops_guide.html" /> 
+    <link rel="prev" title="ATOM model operations guide" href="model_ops_guide.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -47,95 +47,99 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
-<li class="toctree-l3"><a class="reference internal" href="installation.html#docker-installation">Docker Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From source</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#docker">Docker</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verify-the-installation">Verify the installation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#serving-a-model">Serving a Model</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#batch-inference">Batch Inference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#distributed-serving">Distributed Serving</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-server">API Server</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#performance-tips">Performance Tips</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quick start</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#offline-inference">Offline inference</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart.html#single-prompt">Single prompt</a></li>
+<li class="toctree-l3"><a class="reference internal" href="quickstart.html#batch-inference">Batch inference</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model Run Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported Models</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_run_guide.html#vllm-plugin-backend">vLLM Plugin Backend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#distributed-inference">Distributed inference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-server">API server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#performance-tips">Performance tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next steps</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live Dashboard</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model run guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_run_guide.html#vllm-plugin-backend">vLLM plugin backend</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI benchmark configurations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live dashboard</a></li>
 </ul>
 </li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
 <ul class="current">
-<li class="toctree-l1"><a class="reference internal" href="architecture_guide.html">ATOM Architecture Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#system-overview">1. System Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#component-architecture">2. Component Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#request-lifecycle">3. Request Lifecycle</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#forward-context-pattern">4. Forward Context Pattern</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#multi-process-architecture">5. Multi-Process Architecture</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#sequence-lifecycle">6. Sequence Lifecycle</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#speculative-decoding-mtp-eagle">7. Speculative Decoding (MTP / EAGLE)</a><ul>
+<li class="toctree-l1"><a class="reference internal" href="architecture_guide.html">ATOM architecture guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#quick-reference">Quick reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#system-overview">System overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#component-architecture">Component architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#request-lifecycle">Request lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#forward-context-pattern">Forward context pattern</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#multi-process-architecture">Multi-process architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#sequence-lifecycle">Sequence lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#speculative-decoding-mtp-eagle">Speculative decoding (MTP / EAGLE)</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#supported-mtp-architectures">Supported MTP architectures</a></li>
 <li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#weight-sharing">Weight sharing</a></li>
 <li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#propose-loop-mha-vs-mla-branching">Propose loop: MHA vs MLA branching</a></li>
 <li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#prepare-mtp-decode"><code class="docutils literal notranslate"><span class="pre">prepare_mtp_decode()</span></code></a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#source-files">Source files</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="configuration_guide.html">ATOM Configuration Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#master-configuration-config">1. Master Configuration (<code class="docutils literal notranslate"><span class="pre">Config</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#compilation-configuration-compilationconfig">2. Compilation Configuration (<code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilation-levels-compilationlevel">2.1 Compilation Levels (<code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilationconfig-fields">2.2 <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code> Fields</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#cuda-graph-mode-cudagraphmode">2.3 CUDA Graph Mode (<code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code>)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="configuration_guide.html">ATOM configuration guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quick-reference">Quick reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#master-configuration-config">Master configuration (<code class="docutils literal notranslate"><span class="pre">Config</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#compilation-configuration-compilationconfig">Compilation configuration (<code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilation-levels-compilationlevel">Compilation levels (<code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#compilationconfig-fields"><code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code> fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#cuda-graph-mode-cudagraphmode">CUDA graph mode (<code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quantization-configuration-quantizationconfig-layerquantconfig">3. Quantization Configuration (<code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> &amp; <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layerquantconfig-fields">3.1 <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> Fields</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quantizationconfig-attributes">3.2 <code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> Attributes</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quanttype-values-from-aiter">3.3 <code class="docutils literal notranslate"><span class="pre">QuantType</span></code> Values (from AITER)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#supported-quantization-dtypes">3.4 Supported Quantization Dtypes</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#auto-detection-from-huggingface">3.5 Auto-Detection from HuggingFace</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layer-level-quantization-dispatch">3.6 Layer-Level Quantization Dispatch</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#online-quantization-at-load-time">3.7 Online Quantization at Load Time</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#quantization-configuration-quantizationconfig-layerquantconfig">Quantization configuration (<code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> &amp; <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layerquantconfig-fields"><code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quantizationconfig-attributes"><code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> attributes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#quanttype-values-from-aiter"><code class="docutils literal notranslate"><span class="pre">QuantType</span></code> values (from AITER)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#supported-quantization-dtypes">Supported quantization dtypes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#auto-detection-from-huggingface">Auto-detection from HuggingFace</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#layer-level-quantization-dispatch">Layer-level quantization dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#online-quantization-at-load-time">Online quantization at load time</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#parallel-configuration-parallelconfig">4. Parallel Configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#speculative-decoding-configuration-speculativeconfig">5. Speculative Decoding Configuration (<code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#table-driven-mtp-config">5.1 Table-Driven MTP Config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#post-init-behaviour-hf-config-override">5.2 Post-init behaviour (<code class="docutils literal notranslate"><span class="pre">hf_config_override</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#parallel-configuration-parallelconfig">Parallel configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#speculative-decoding-configuration-speculativeconfig">Speculative decoding configuration (<code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#table-driven-mtp-config">Table-driven MTP config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#post-init-behaviour-hf-config-override">Post-init behaviour (<code class="docutils literal notranslate"><span class="pre">hf_config_override</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#sampling-parameters-samplingparams">6. Sampling Parameters (<code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#cli-arguments-engineargs">7. CLI Arguments (<code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#environment-variables">8. Environment Variables</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#variables-registered-in-atom-utils-envs-py">8.1 Variables Registered in <code class="docutils literal notranslate"><span class="pre">atom/utils/envs.py</span></code></a></li>
-<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#additional-environment-variables-used-outside-envs-py">8.2 Additional Environment Variables (Used Outside <code class="docutils literal notranslate"><span class="pre">envs.py</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#sampling-parameters-samplingparams">Sampling parameters (<code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#cli-arguments-engineargs">CLI arguments (<code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#environment-variables">Environment variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#variables-registered-in-atom-utils-envs-py">Variables registered in <code class="docutils literal notranslate"><span class="pre">atom/utils/envs.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#additional-environment-variables-used-outside-envs-py">Additional environment variables (used outside <code class="docutils literal notranslate"><span class="pre">envs.py</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#decision-tree-choosing-a-compilation-level">9. Decision Tree – Choosing a Compilation Level</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#decision-tree-choosing-a-compilation-level">Decision tree — choosing a compilation level</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#source-files">Source files</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="model_support_guide.html">ATOM Model Support Guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#supported-model-architectures">1. Supported Model Architectures</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-architecture-details">2. Model Architecture Details</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#supported-model-architectures">Supported model architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-architecture-details">Model architecture details</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-qwen3forcausallm">Qwen3 (<code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code>)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qwen3moeforcausallm">Qwen3-MoE (<code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code>)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-llamaforcausallm">Llama (<code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code>)</a></li>
@@ -150,89 +154,89 @@
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-5-mtp-qwen3-5mtp">Qwen3.5 MTP (<code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#weight-loading">3. Weight Loading</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#function-signature">Function Signature</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#loading-flow">Loading Flow</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#batched-expert-staging">Batched Expert Staging</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#layers-beyond-num-hidden-layers">Layers Beyond <code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#weight-loading">Weight loading</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#function-signature">Function signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#loading-flow">Loading flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#batched-expert-staging">Batched expert staging</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#layers-beyond-num-hidden-layers">Layers beyond <code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code></a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#adding-a-new-model">4. Adding a New Model</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-1-create-the-model-file">Step 1: Create the Model File</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-2-implement-layer-classes">Step 2: Implement Layer Classes</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-3-implement-the-model-and-causallm-classes">Step 3: Implement the Model and CausalLM Classes</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-4-register-the-model">Step 4: Register the Model</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-5-handle-weight-loading">Step 5: Handle Weight Loading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#adding-a-new-model">Adding a new model</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-1-create-the-model-file">Step 1: Create the model file</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-2-implement-layer-classes">Step 2: Implement layer classes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-3-implement-the-model-and-causallm-classes">Step 3: Implement the model and CausalLM classes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-4-register-the-model">Step 4: Register the model</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#step-5-handle-weight-loading">Step 5: Handle weight loading</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-specific-optimizations">5. Model-Specific Optimizations</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-fused-rmsnorm-quant-and-silu-mul-quant">Llama: Fused RMSNorm+Quant and SiLU+Mul+Quant</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-v2-v3-mla-fused-input-norm-qk-norm-fusion">DeepSeek V2/V3: MLA + Fused Input Norm + QK Norm Fusion</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qk-norm-rope-cache-quant-fusion">Qwen3-MoE: QK Norm + RoPE + Cache + Quant Fusion</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#mtp-multi-token-prediction-speculative-decoding">MTP: Multi-Token Prediction (Speculative Decoding)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#model-specific-optimizations">Model-specific optimizations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#llama-fused-rmsnorm-quant-and-silu-mul-quant">Llama: fused RMSNorm+Quant and SiLU+Mul+Quant</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#deepseek-v2-v3-mla-fused-input-norm-qk-norm-fusion">DeepSeek V2/V3: MLA + fused input norm + QK norm fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#qwen3-moe-qk-norm-rope-cache-quant-fusion">Qwen3-MoE: QK norm + RoPE + cache + quant fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#mtp-multi-token-prediction-speculative-decoding">MTP: Multi-token prediction (speculative decoding)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#source-files">Source files</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="model_ops_guide.html">ATOM Model Operations Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#aiter-integration-overview">1. AITER Integration Overview</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#aiter-kernel-mapping-table">AITER Kernel Mapping Table</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model_ops_guide.html">ATOM model operations guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#quick-reference">Quick reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#aiter-integration-overview">AITER integration overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#aiter-kernel-mapping-table">AITER kernel mapping table</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#linear-operations">2. Linear Operations</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#class-hierarchy">2.1 Class Hierarchy</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#quantization-dispatch">2.2 Quantization Dispatch</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#tensor-parallel-sharding">2.3 Tensor Parallel Sharding</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#weight-processing">2.4 Weight Processing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#linear-operations">Linear operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#class-hierarchy">Class hierarchy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#quantization-dispatch">Quantization dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#tensor-parallel-sharding">Tensor parallel sharding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#weight-processing">Weight processing</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#attention-operations">3. Attention Operations</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#base-attention-base-attention-py">3.1 Base: <code class="docutils literal notranslate"><span class="pre">Attention</span></code> (<code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#multi-head-attention-attention-mha-py">3.2 Multi-Head Attention (<code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#multi-head-latent-attention-attention-mla-py">3.3 Multi-head Latent Attention (<code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#backend-abstraction-attentions-backends-py">3.4 Backend Abstraction (<code class="docutils literal notranslate"><span class="pre">attentions/backends.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#kv-cache-operations">3.5 KV Cache Operations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#attention-operations">Attention operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#base-attention-base-attention-py">Base: <code class="docutils literal notranslate"><span class="pre">Attention</span></code> (<code class="docutils literal notranslate"><span class="pre">base_attention.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#multi-head-attention-attention-mha-py">Multi-head attention (<code class="docutils literal notranslate"><span class="pre">attention_mha.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#multi-head-latent-attention-attention-mla-py">Multi-head latent attention (<code class="docutils literal notranslate"><span class="pre">attention_mla.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#backend-abstraction-attentions-backends-py">Backend abstraction (<code class="docutils literal notranslate"><span class="pre">attentions/backends.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#kv-cache-operations">KV cache operations</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#mixture-of-experts-moe">4. Mixture of Experts (MoE)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#fusedmoe-class-moe-py">4.1 <code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code> Class (<code class="docutils literal notranslate"><span class="pre">moe.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#quantization-methods">4.2 Quantization Methods</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#topk-routing-topk-py">4.3 TopK Routing (<code class="docutils literal notranslate"><span class="pre">topK.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#fusedmoeparallelconfig">4.4 <code class="docutils literal notranslate"><span class="pre">FusedMoEParallelConfig</span></code></a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#mori-integration-fused-moe-mori-prepare-finalize-py">4.5 MORI Integration (<code class="docutils literal notranslate"><span class="pre">fused_moe/mori_prepare_finalize.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#moe-quantization-config-fused-moe-config-py">4.6 MoE Quantization Config (<code class="docutils literal notranslate"><span class="pre">fused_moe/config.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#triton-moe-fallback-fused-moe-triton-py">4.7 Triton MoE Fallback (<code class="docutils literal notranslate"><span class="pre">fused_moe_triton.py</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#mixture-of-experts-moe">Mixture of experts (MoE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#fusedmoe-class-moe-py"><code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code> class (<code class="docutils literal notranslate"><span class="pre">moe.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#quantization-methods">Quantization methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#topk-routing-topk-py">TopK routing (<code class="docutils literal notranslate"><span class="pre">topK.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#fusedmoeparallelconfig"><code class="docutils literal notranslate"><span class="pre">FusedMoEParallelConfig</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#mori-integration-fused-moe-mori-prepare-finalize-py">MORI integration (<code class="docutils literal notranslate"><span class="pre">fused_moe/mori_prepare_finalize.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#moe-quantization-config-fused-moe-config-py">MoE quantization config (<code class="docutils literal notranslate"><span class="pre">fused_moe/config.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#triton-moe-fallback-fused-moe-triton-py">Triton MoE fallback (<code class="docutils literal notranslate"><span class="pre">fused_moe_triton.py</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#normalization">5. Normalization</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rmsnorm-layernorm-py">5.1 <code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#layernorm-layernorm-py">5.2 <code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#normalization">Normalization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rmsnorm-layernorm-py"><code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#layernorm-layernorm-py"><code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> (<code class="docutils literal notranslate"><span class="pre">layernorm.py</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#activation-functions">6. Activation Functions</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#siluandmul-activation-py">6.1 <code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code> (<code class="docutils literal notranslate"><span class="pre">activation.py</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#activation-functions">Activation functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#siluandmul-activation-py"><code class="docutils literal notranslate"><span class="pre">SiluAndMul</span></code> (<code class="docutils literal notranslate"><span class="pre">activation.py</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#embedding-output-head">7. Embedding &amp; Output Head</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#vocabparallelembedding-embed-head-py">7.1 <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#parallellmhead-embed-head-py">7.2 <code class="docutils literal notranslate"><span class="pre">ParallelLMHead</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#embedding-and-output-head">Embedding and output head</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#vocabparallelembedding-embed-head-py"><code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#parallellmhead-embed-head-py"><code class="docutils literal notranslate"><span class="pre">ParallelLMHead</span></code> (<code class="docutils literal notranslate"><span class="pre">embed_head.py</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#rotary-position-embedding-rope">8. Rotary Position Embedding (RoPE)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rotaryembedding-rotary-embedding-py">8.1 <code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">rotary_embedding.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#get-rope-factory">8.2 <code class="docutils literal notranslate"><span class="pre">get_rope()</span></code> Factory</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#integration-in-attention">8.3 Integration in Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#rotary-position-embedding-rope">Rotary position embedding (RoPE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rotaryembedding-rotary-embedding-py"><code class="docutils literal notranslate"><span class="pre">RotaryEmbedding</span></code> (<code class="docutils literal notranslate"><span class="pre">rotary_embedding.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#get-rope-factory"><code class="docutils literal notranslate"><span class="pre">get_rope()</span></code> factory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#integration-in-attention">Integration in attention</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#sampling">9. Sampling</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#sampler-sampler-py">9.1 <code class="docutils literal notranslate"><span class="pre">Sampler</span></code> (<code class="docutils literal notranslate"><span class="pre">sampler.py</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rejectionsampler-rejection-sampler-py">9.2 <code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code> (<code class="docutils literal notranslate"><span class="pre">rejection_sampler.py</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#sampling">Sampling</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#sampler-sampler-py"><code class="docutils literal notranslate"><span class="pre">Sampler</span></code> (<code class="docutils literal notranslate"><span class="pre">sampler.py</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#rejectionsampler-rejection-sampler-py"><code class="docutils literal notranslate"><span class="pre">RejectionSampler</span></code> (<code class="docutils literal notranslate"><span class="pre">rejection_sampler.py</span></code>)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#fused-kernel-chains">10. Fused Kernel Chains</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#source-files">Source Files</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#fused-kernel-chains">Fused kernel chains</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_ops_guide.html#source-files">Source files</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops-attentions"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/attentions/</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="model_ops_guide.html#atom-model-ops-fused-moe"><code class="docutils literal notranslate"><span class="pre">atom/model_ops/fused_moe/</span></code></a></li>
@@ -241,262 +245,262 @@
 </li>
 </ul>
 </li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">ATOM Scheduling &amp; KV Cache Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#scheduling-algorithm">1. Scheduling Algorithm</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#scheduler-initialization">1.1 Scheduler Initialization</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#schedule-flow">1.2 Schedule Flow</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#delay-factor">1.3 Delay Factor</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#preemption">1.4 Preemption</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">ATOM scheduling &amp; KV cache guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#scheduling-algorithm">Scheduling algorithm</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#scheduler-initialization">Scheduler initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#schedule-flow">Schedule flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#delay-factor">Delay factor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#preemption">Preemption</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#scheduledbatch-structure">2. ScheduledBatch Structure</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#constructor-signature">2.1 Constructor Signature</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#fields">2.2 Fields</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#scheduledbatchoutput">2.3 ScheduledBatchOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#scheduledbatch-structure">ScheduledBatch structure</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#constructor-signature">Constructor signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#fields">Fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#scheduledbatchoutput">ScheduledBatchOutput</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#block-manager">3. Block Manager</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#block-class">3.1 Block Class</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#blockmanager-initialization">3.2 BlockManager Initialization</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#allocation-allocate">3.3 Allocation (<code class="docutils literal notranslate"><span class="pre">allocate</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#deallocation-deallocate">3.4 Deallocation (<code class="docutils literal notranslate"><span class="pre">deallocate</span></code>)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#can-allocate-and-can-append-checks">3.5 Can-Allocate and Can-Append Checks</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#may-append-decode-extension">3.6 May-Append (Decode Extension)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#block-manager">Block manager</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#block-class">Block class</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#blockmanager-initialization">BlockManager initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#allocation-allocate">Allocation (<code class="docutils literal notranslate"><span class="pre">allocate</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#deallocation-deallocate">Deallocation (<code class="docutils literal notranslate"><span class="pre">deallocate</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#can-allocate-and-can-append-checks">Can-allocate and can-append checks</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#may-append-decode-extension">May-append (decode extension)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#prefix-caching">4. Prefix Caching</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#hash-function">4.1 Hash Function</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#hash-chaining">4.2 Hash Chaining</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#cache-lookup-during-allocation">4.3 Cache Lookup During Allocation</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#reference-counting">4.4 Reference Counting</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#enabling-prefix-caching">4.5 Enabling Prefix Caching</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#prefix-caching">Prefix caching</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#hash-function">Hash function</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#hash-chaining">Hash chaining</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#cache-lookup-during-allocation">Cache lookup during allocation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#reference-counting">Reference counting</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#enabling-prefix-caching">Enabling prefix caching</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#postprocessing">5. Postprocessing</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#signature">5.1 Signature</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#token-appending">5.2 Token Appending</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#stop-condition-checking">5.3 Stop Condition Checking</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#stream-output">5.4 Stream Output</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#sequence-cleanup">5.5 Sequence Cleanup</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#placeholder-insertion">5.6 Placeholder Insertion</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#postprocessing">Postprocessing</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#signature">Signature</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#token-appending">Token appending</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#stop-condition-checking">Stop condition checking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#stream-output">Stream output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#sequence-cleanup">Sequence cleanup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#placeholder-insertion">Placeholder insertion</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#speculative-decoding-integration">6. Speculative Decoding Integration</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#scheduler-tracking">6.1 Scheduler Tracking</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#draft-tokens-in-scheduling">6.2 Draft Tokens in Scheduling</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#acceptance-statistics">6.3 Acceptance Statistics</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#draft-token-storage-on-sequences">6.4 Draft Token Storage on Sequences</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#speculative-decoding-integration">Speculative decoding integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#scheduler-tracking">Scheduler tracking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#draft-tokens-in-scheduling">Draft tokens in scheduling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#acceptance-statistics">Acceptance statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#draft-token-storage-on-sequences">Draft token storage on sequences</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#sequence-management">7. Sequence Management</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#constructor">7.1 Constructor</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#core-fields">7.2 Core Fields</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#timing-fields">7.3 Timing Fields</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#computed-properties">7.4 Computed Properties</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#num-tokens-setter">7.5 num_tokens Setter</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#lifecycle">7.6 Lifecycle</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#sequencestatus-enum">7.7 SequenceStatus Enum</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#sequencetype-enum">7.8 SequenceType Enum</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#sequence-management">Sequence management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#constructor">Constructor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#core-fields">Core fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#timing-fields">Timing fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#computed-properties">Computed properties</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#num-tokens-setter">num_tokens setter</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#lifecycle">Lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#sequencestatus-enum">SequenceStatus enum</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#sequencetype-enum">SequenceType enum</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#source-files">Source files</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="distributed_guide.html">ATOM Distributed Inference Guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#tensor-parallelism-tp">1. Tensor Parallelism (TP)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#tensor-parallelism-tp">Tensor Parallelism (TP)</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#weight-sharding">Weight Sharding</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#process-group-initialization">Process Group Initialization</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#allreduce">AllReduce</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#configuration">Configuration</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#data-parallelism-dp">2. Data Parallelism (DP)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#data-parallelism-dp">Data Parallelism (DP)</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#architecture">Architecture</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-process-group-initialization">DP Process Group Initialization</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#synchronized-busy-loop">Synchronized Busy Loop</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dummy-batch-execution">Dummy Batch Execution</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#device-assignment">Device Assignment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#synchronized-busy-loop">Synchronized busy loop</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dummy-batch-execution">Dummy batch execution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#device-assignment">Device assignment</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dpmetadata">DPMetadata</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#coremanager-dp-orchestration">CoreManager (DP Orchestration)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-request-load-balancing">DP Request Load Balancing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#coremanager-dp-orchestration">CoreManager (DP orchestration)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-request-load-balancing">DP request load balancing</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id1">Configuration</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#expert-parallelism-ep">3. Expert Parallelism (EP)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#expert-parallelism-ep">Expert Parallelism (EP)</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#fusedmoeparallelconfig">FusedMoEParallelConfig</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#expert-distribution">Expert Distribution</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#mori-communication">MORI Communication</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#expert-distribution">Expert distribution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#mori-communication">MORI communication</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id2">Configuration</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#environment-variables">4. Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#multi-gpu-deployment-examples">5. Multi-GPU Deployment Examples</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#environment-variables">Environment variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#multi-gpu-deployment-examples">Multi-GPU deployment examples</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#deepseek-r1-on-8-gpus-tp8">DeepSeek-R1 on 8 GPUs (TP8)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#qwen3-235b-a22b-on-8-gpus-tp8-ep">Qwen3-235B-A22B on 8 GPUs (TP8 + EP)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#kimi-k2-thinking-on-4-gpus-tp4">Kimi-K2-Thinking on 4 GPUs (TP4)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#combined-parallelism-strategies">6. Combined Parallelism Strategies</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-only-dense-models">TP Only (Dense Models)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-ep-moe-models">TP + EP (MoE Models)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-dense-throughput">TP + DP (Dense Throughput)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-ep-moe-throughput">TP + DP + EP (MoE Throughput)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-attention-mode">DP Attention Mode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#combined-parallelism-strategies">Combined parallelism strategies</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-only-dense-models">TP only (dense models)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-ep-moe-models">TP + EP (MoE models)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-dense-throughput">TP + DP (dense throughput)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#tp-dp-ep-moe-throughput">TP + DP + EP (MoE throughput)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-attention-mode">DP attention mode</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distributed_guide.html#source-files">Source files</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="compilation_cudagraph_guide.html">ATOM Compilation &amp; CUDA Graphs Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-levels">1. Compilation Levels</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-0-no-compilation">Level 0 – NO_COMPILATION</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-1-dynamo-as-is">Level 1 – DYNAMO_AS_IS</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-2-dynamo-once">Level 2 – DYNAMO_ONCE</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-3-piecewise-production-default">Level 3 – PIECEWISE (Production Default)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="compilation_cudagraph_guide.html">ATOM compilation &amp; CUDA graphs guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-levels">Compilation levels</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-0-no-compilation">Level 0 — NO_COMPILATION</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-1-dynamo-as-is">Level 1 — DYNAMO_AS_IS</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-2-dynamo-once">Level 2 — DYNAMO_ONCE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#level-3-piecewise-production-default">Level 3 — PIECEWISE (production default)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-modes">2. CUDA Graph Modes</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-modes">CUDA graph modes</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#none-value-0">NONE (value: 0)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#piecewise-value-1">PIECEWISE (value: 1)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-value-2">FULL (value: 2)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-decode-only-value-full-none">FULL_DECODE_ONLY (value: (FULL, NONE))</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#full-and-piecewise-value-full-piecewise">FULL_AND_PIECEWISE (value: (FULL, PIECEWISE))</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#helper-methods">Helper Methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#helper-methods">Helper methods</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-capture">3. CUDA Graph Capture</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#capture-flow">Capture Flow</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-keying">Graph Keying</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-pool-sharing">Graph Pool Sharing</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#default-capture-sizes">Default Capture Sizes</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-replay-in-run-model">Graph Replay in run_model()</a></li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#cuda-graph-capture">CUDA graph capture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#capture-flow">Capture flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-keying">Graph keying</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-pool-sharing">Graph pool sharing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#default-capture-sizes">Default capture sizes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#graph-replay-in-run-model">Graph replay in run_model()</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#piecewise-compilation">4. Piecewise Compilation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#splitting-operations">Splitting Operations</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-pipeline">Compilation Pipeline</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#cache-management">Cache Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#piecewise-compilation">Piecewise compilation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#splitting-operations">Splitting operations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilation-pipeline">Compilation pipeline</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#cache-management">Cache management</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#forward-context-stateless-dispatch">5. Forward Context &amp; Stateless Dispatch</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#forwardcontext-fields">ForwardContext Fields</a></li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#forward-context-stateless-dispatch">Forward context &amp; stateless dispatch</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#forwardcontext-fields">ForwardContext fields</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#lifecycle">Lifecycle</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#context-dataclass">Context Dataclass</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#integration-with-cuda-graphs">Integration with CUDA Graphs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#context-dataclass">Context dataclass</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#integration-with-cuda-graphs">Integration with CUDA graphs</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compiler-backend">6. Compiler Backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#compiler-backend">Compiler backend</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilermanager">CompilerManager</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#compilerinterface">CompilerInterface</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#inductoradaptor">InductorAdaptor</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#inductorstandaloneadaptor">InductorStandaloneAdaptor</a></li>
 <li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#vllmbackend">VllmBackend</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#support-torch-compile-decorator">&#64;support_torch_compile Decorator</a></li>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#custom-op-registration">Custom Op Registration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#support-torch-compile-decorator">&#64;support_torch_compile decorator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#custom-op-registration">Custom op registration</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#configuration-options">7. Configuration Options</a></li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#decision-tree">8. Decision Tree</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#common-configurations">Common Configurations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#configuration-options">Configuration options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#decision-tree">Decision tree</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compilation_cudagraph_guide.html#common-configurations">Common configurations</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="compilation_cudagraph_guide.html#source-files">Source files</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="serving_benchmarking_guide.html">ATOM Serving &amp; Benchmarking Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#quick-reference">Quick Reference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#openai-compatible-server">1. OpenAI-Compatible Server</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#endpoints">1.1 Endpoints</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#request-models">1.2 Request Models</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#response-models">1.3 Response Models</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#server-startup">1.4 Server Startup</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#example-curl">1.5 Example: curl</a></li>
+<li class="toctree-l1"><a class="reference internal" href="serving_benchmarking_guide.html">ATOM serving &amp; benchmarking guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#quick-reference">Quick reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#openai-compatible-server">OpenAI-compatible server</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#endpoints">Endpoints</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#request-models">Request models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#response-models">Response models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#server-startup">Server startup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#example-curl">Example: curl</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-api-llmengine">2. Programmatic API (LLMEngine)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#initialization">2.1 Initialization</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#samplingparams">2.2 SamplingParams</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#core-methods">2.3 Core Methods</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#synchronous-generation-example">2.4 Synchronous Generation Example</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#asynchronous-streaming-usage">2.5 Asynchronous / Streaming Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-api-llmengine">Programmatic API (LLMEngine)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#initialization">Initialization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#samplingparams">SamplingParams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#core-methods">Core methods</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#synchronous-generation-example">Synchronous generation example</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#asynchronous-streaming-usage">Asynchronous / streaming usage</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#simple-inference">3. Simple Inference</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#usage">3.1 Usage</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#what-it-does">3.2 What It Does</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#simple-inference">Simple inference</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#usage">Usage</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#what-it-does">What it does</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#benchmarking">4. Benchmarking</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#metrics">4.1 Metrics</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#key-cli-arguments">4.2 Key CLI Arguments</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#backend-request-functions">4.3 Backend Request Functions</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#full-benchmark-example">4.4 Full Benchmark Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#benchmarking">Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#metrics">Metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#key-cli-arguments">Key CLI arguments</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#backend-request-functions">Backend request functions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#full-benchmark-example">Full benchmark example</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#profiling">5. Profiling</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#configuration">5.1 Configuration</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#online-profiling-http">5.2 Online Profiling (HTTP)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-profiling">5.3 Programmatic Profiling</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#offline-profiling-script">5.4 Offline Profiling Script</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#profiling-during-benchmarks">5.5 Profiling During Benchmarks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#profiling">Profiling</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#configuration">Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#online-profiling-http">Online profiling (HTTP)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#programmatic-profiling">Programmatic profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#offline-profiling-script">Offline profiling script</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#profiling-during-benchmarks">Profiling during benchmarks</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#speculative-decoding-mtp">6. Speculative Decoding (MTP)</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#architecture">6.1 Architecture</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#id1">6.2 Configuration</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#mtp-statistics">6.3 MTP Statistics</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#how-rejection-sampling-works">6.4 How Rejection Sampling Works</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#speculative-decoding-mtp">Speculative decoding (MTP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#architecture">Architecture</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#id1">Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#mtp-statistics">MTP statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#how-rejection-sampling-works">How rejection sampling works</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#deployment-examples">7. Deployment Examples</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#single-gpu">7.1 Single-GPU</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#multi-gpu-with-tensor-parallelism">7.2 Multi-GPU with Tensor Parallelism</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#docker-deployment">7.3 Docker Deployment</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#engine-cli-arguments-engineargs">7.4 Engine CLI Arguments (EngineArgs)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#deployment-examples">Deployment examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#single-gpu">Single-GPU</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#multi-gpu-with-tensor-parallelism">Multi-GPU with tensor parallelism</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#docker-deployment">Docker deployment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#engine-cli-arguments-engineargs">Engine CLI arguments (EngineArgs)</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#accuracy-validation">8. Accuracy Validation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#setup">8.1 Setup</a></li>
-<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#run-evaluation">8.2 Run Evaluation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#accuracy-validation">Accuracy validation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#setup">Setup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="serving_benchmarking_guide.html#run-evaluation">Run evaluation</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serving_benchmarking_guide.html#source-files">Source files</a></li>
 </ul>
 </li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Framework Integrations</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">vLLM-ATOM Backend</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#architecture">1. Architecture</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#design-overview">1.1 Design overview</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-it-works">1.2 How it works</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#plugin-lifecycle">1.3 Plugin lifecycle</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#key-modules">1.4 Key Modules</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#component-diagram">1.5 Component Diagram</a></li>
+<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">vLLM-ATOM backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#architecture">Architecture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#design-overview">Design overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-it-works">How it works</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#plugin-lifecycle">Plugin lifecycle</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#key-modules">Key modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#component-diagram">Component diagram</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#configuration-translation">2. Configuration Translation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#pluginconfig-fields">2.1 <code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code> Fields</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#vllm-config-mapping">2.2 vLLM Config Mapping</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#configuration-translation">Configuration translation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#pluginconfig-fields"><code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code> fields</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#vllm-config-mapping">vLLM config mapping</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#attention-integration">3. Attention Integration</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-the-backend-is-selected">3.1 How the Backend Is Selected</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#attention-integration">Attention integration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-the-backend-is-selected">How the backend is selected</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#supported-models">4. Supported Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#installation-and-quick-start">5. Installation and Quick Start</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#prerequisites">5.1 Prerequisites</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#set-up-the-environment">5.2 Set Up the Environment</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#launch-vllm-with-atom-plugin">5.3 Launch vLLM with ATOM Plugin</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#benchmark-serving">5.4 Benchmark Serving</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#enable-profiling">5.5 Enable Profiling</a></li>
-<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#disable-atom-plugin">5.6 Disable ATOM Plugin</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#supported-models">Supported models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#installation-and-quick-start">Installation and quick start</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#set-up-the-environment">Set up the environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#launch-vllm-with-atom-plugin">Launch vLLM with ATOM plugin</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#benchmark-serving">Benchmark serving</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#enable-profiling">Enable profiling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#disable-atom-plugin">Disable ATOM plugin</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">6. Environment Variables</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">Environment variables</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#online-quantization">Online quantization</a></li>
 </ul>
 </li>
@@ -506,7 +510,7 @@
 <p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="api/serving.html">Serving API</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/serving.html#llmengine-class">LLMEngine Class</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#llmengine-class">LLMEngine class</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="api/serving.html#methods">Methods</a><ul>
 <li class="toctree-l4"><a class="reference internal" href="api/serving.html#generate">generate()</a></li>
 </ul>
@@ -514,17 +518,17 @@
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="api/serving.html#samplingparams">SamplingParams</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/serving.html#return-values">Return Values</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/serving.html#return-values">Return values</a></li>
 <li class="toctree-l2"><a class="reference internal" href="api/serving.html#example">Example</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="api/models.html">Supported Models</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#llama-models">Llama Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#gpt-models">GPT Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api/models.html">Supported models</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#llama-models">Llama models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#gpt-models">GPT models</a></li>
 <li class="toctree-l2"><a class="reference internal" href="api/models.html#mixtral">Mixtral</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#other-architectures">Other Architectures</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#model-configuration">Model Configuration</a></li>
-<li class="toctree-l2"><a class="reference internal" href="api/models.html#performance-by-model-size">Performance by Model Size</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#other-architectures">Other architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#model-configuration">Model configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/models.html#performance-by-model-size">Performance by model size</a></li>
 <li class="toctree-l2"><a class="reference internal" href="api/models.html#quantization">Quantization</a></li>
 </ul>
 </li>
@@ -544,7 +548,7 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">ATOM Scheduling &amp; KV Cache Guide</li>
+      <li class="breadcrumb-item active">ATOM scheduling &amp; KV cache guide</li>
       <li class="wy-breadcrumbs-aside">
             <a href="_sources/scheduling_kv_cache_guide.md.txt" rel="nofollow"> View page source</a>
       </li>
@@ -555,10 +559,10 @@
            <div itemprop="articleBody">
              
   <section id="atom-scheduling-kv-cache-guide">
-<h1>ATOM Scheduling &amp; KV Cache Guide<a class="headerlink" href="#atom-scheduling-kv-cache-guide" title="Link to this heading"></a></h1>
+<h1>ATOM scheduling &amp; KV cache guide<a class="headerlink" href="#atom-scheduling-kv-cache-guide" title="Link to this heading"></a></h1>
 <p>ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache block management to drive LLM inference on AMD ROCm/HIP GPUs. This guide covers the scheduling algorithm, batch construction, block-level KV cache management, prefix caching, postprocessing, speculative decoding integration, and sequence lifecycle.</p>
 <section id="quick-reference">
-<h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<h2>Quick reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Class</p></th>
@@ -645,12 +649,11 @@
 </tbody>
 </table>
 </section>
-<hr class="docutils" />
 <section id="scheduling-algorithm">
-<h2>1. Scheduling Algorithm<a class="headerlink" href="#scheduling-algorithm" title="Link to this heading"></a></h2>
+<h2>Scheduling algorithm<a class="headerlink" href="#scheduling-algorithm" title="Link to this heading"></a></h2>
 <p>The scheduler implements a <strong>prefill-first</strong> policy: all waiting (prefill) requests are scheduled before any running (decode) requests. The entry point is <code class="docutils literal notranslate"><span class="pre">Scheduler.schedule()</span></code>, which returns a <code class="docutils literal notranslate"><span class="pre">(ScheduledBatch,</span> <span class="pre">dict[int,</span> <span class="pre">Sequence])</span></code> tuple or <code class="docutils literal notranslate"><span class="pre">None</span></code> if both queues are empty.</p>
 <section id="scheduler-initialization">
-<h3>1.1 Scheduler Initialization<a class="headerlink" href="#scheduler-initialization" title="Link to this heading"></a></h3>
+<h3>Scheduler initialization<a class="headerlink" href="#scheduler-initialization" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">Scheduler</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">Config</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_num_seqs</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_num_seqs</span>
@@ -673,12 +676,12 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">total_accepted_tokens</span> <span class="o">=</span> <span class="mi">0</span>
 </pre></div>
 </div>
-<p>The scheduler maintains two deques – <code class="docutils literal notranslate"><span class="pre">waiting</span></code> (pending prefill) and <code class="docutils literal notranslate"><span class="pre">running</span></code> (active decode) – plus a <code class="docutils literal notranslate"><span class="pre">BlockManager</span></code> for KV cache allocation.</p>
+<p>The scheduler maintains two deques — <code class="docutils literal notranslate"><span class="pre">waiting</span></code> (pending prefill) and <code class="docutils literal notranslate"><span class="pre">running</span></code> (active decode) — plus a <code class="docutils literal notranslate"><span class="pre">BlockManager</span></code> for KV cache allocation.</p>
 </section>
 <section id="schedule-flow">
-<h3>1.2 Schedule Flow<a class="headerlink" href="#schedule-flow" title="Link to this heading"></a></h3>
+<h3>Schedule flow<a class="headerlink" href="#schedule-flow" title="Link to this heading"></a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">Scheduler.schedule()</span></code> proceeds in two phases:</p>
-<p><strong>Phase 1 – Prefill scheduling:</strong></p>
+<p><strong>Phase 1 — Prefill scheduling:</strong></p>
 <ol class="arabic simple">
 <li><p>While the delay gate passes (<code class="docutils literal notranslate"><span class="pre">_passed_delay</span></code>), the waiting queue is non-empty, and <code class="docutils literal notranslate"><span class="pre">num_seqs_prefill</span> <span class="pre">&lt;</span> <span class="pre">max_num_seqs</span></code>:</p>
 <ul class="simple">
@@ -690,7 +693,7 @@
 </li>
 <li><p>If any prefill sequences were scheduled, return the batch immediately (no decode mixing).</p></li>
 </ol>
-<p><strong>Phase 2 – Decode scheduling (only when zero prefills were scheduled):</strong></p>
+<p><strong>Phase 2 — Decode scheduling (only when zero prefills were scheduled):</strong></p>
 <ol class="arabic simple">
 <li><p>Pop sequences from <code class="docutils literal notranslate"><span class="pre">running</span></code> up to <code class="docutils literal notranslate"><span class="pre">max_num_seqs</span></code>.</p></li>
 <li><p>For each sequence, check <code class="docutils literal notranslate"><span class="pre">block_manager.can_append(seq)</span></code>.</p></li>
@@ -701,7 +704,7 @@
 </ol>
 </section>
 <section id="delay-factor">
-<h3>1.3 Delay Factor<a class="headerlink" href="#delay-factor" title="Link to this heading"></a></h3>
+<h3>Delay factor<a class="headerlink" href="#delay-factor" title="Link to this heading"></a></h3>
 <p>When <code class="docutils literal notranslate"><span class="pre">scheduler_delay_factor</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>, the scheduler delays prefill scheduling to allow the waiting queue to accumulate more requests for better batching:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">_passed_delay</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">now</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
     <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">prev_prompt</span><span class="p">:</span>
@@ -720,7 +723,7 @@
 <p>A new prefill is scheduled only when the earliest waiting request has waited longer than <code class="docutils literal notranslate"><span class="pre">delay_factor</span> <span class="pre">*</span> <span class="pre">last_prompt_latency</span></code>, or when there are no running decode requests.</p>
 </section>
 <section id="preemption">
-<h3>1.4 Preemption<a class="headerlink" href="#preemption" title="Link to this heading"></a></h3>
+<h3>Preemption<a class="headerlink" href="#preemption" title="Link to this heading"></a></h3>
 <p>When a decode step cannot extend a sequence’s KV cache (no free blocks), the scheduler preempts the <strong>last</strong> running sequence:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">preempt</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">):</span>
     <span class="n">seq</span><span class="o">.</span><span class="n">status</span> <span class="o">=</span> <span class="n">SequenceStatus</span><span class="o">.</span><span class="n">WAITING</span>
@@ -738,17 +741,16 @@
     <span class="bp">self</span><span class="o">.</span><span class="n">waiting</span><span class="o">.</span><span class="n">appendleft</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>The preempted sequence is pushed to the front of the waiting queue and its blocks are fully deallocated, so it will be re-prefilled on the next scheduling cycle.</p>
-<p><strong>MTP placeholder stripping:</strong> When speculative decoding is active (<code class="docutils literal notranslate"><span class="pre">mtp_k</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>), <code class="docutils literal notranslate"><span class="pre">postprocess()</span></code> appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is <code class="docutils literal notranslate"><span class="pre">mtp_k</span> <span class="pre">+</span> <span class="pre">seq.num_rejected</span></code> – this accounts for both the <code class="docutils literal notranslate"><span class="pre">mtp_k</span></code> placeholder slots and any tokens that were rejected during the last verification step. The method deletes that many trailing entries from both <code class="docutils literal notranslate"><span class="pre">seq.token_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">seq.output_tokens</span></code> and decrements <code class="docutils literal notranslate"><span class="pre">seq.num_tokens</span></code> accordingly.</p>
-<p><strong>Speculative state reset:</strong> After stripping, the sequence’s speculative decoding state is fully cleared: <code class="docutils literal notranslate"><span class="pre">num_rejected</span></code> and <code class="docutils literal notranslate"><span class="pre">num_bonus_tokens</span></code> are zeroed, and <code class="docutils literal notranslate"><span class="pre">spec_token_ids</span></code> is set to an empty array. This ensures the sequence re-enters the scheduling pipeline with a clean state – no stale draft predictions or acceptance metadata carry over across preemption.</p>
+<p>The scheduler pushes the preempted sequence to the front of the waiting queue, fully deallocates its blocks, and re-prefills it on the next scheduling cycle.</p>
+<p><strong>MTP placeholder stripping:</strong> When speculative decoding is active (<code class="docutils literal notranslate"><span class="pre">mtp_k</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>), <code class="docutils literal notranslate"><span class="pre">postprocess()</span></code> appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is <code class="docutils literal notranslate"><span class="pre">mtp_k</span> <span class="pre">+</span> <span class="pre">seq.num_rejected</span></code> — this accounts for both the <code class="docutils literal notranslate"><span class="pre">mtp_k</span></code> placeholder slots and any tokens that were rejected during the last verification step. The method deletes that many trailing entries from both <code class="docutils literal notranslate"><span class="pre">seq.token_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">seq.output_tokens</span></code> and decrements <code class="docutils literal notranslate"><span class="pre">seq.num_tokens</span></code> accordingly.</p>
+<p><strong>Speculative state reset:</strong> After stripping, the sequence’s speculative decoding state is fully cleared: <code class="docutils literal notranslate"><span class="pre">num_rejected</span></code> and <code class="docutils literal notranslate"><span class="pre">num_bonus_tokens</span></code> are zeroed, and <code class="docutils literal notranslate"><span class="pre">spec_token_ids</span></code> is set to an empty array. This ensures the sequence re-enters the scheduling pipeline with a clean state — no stale draft predictions or acceptance metadata carry over across preemption.</p>
 </section>
 </section>
-<hr class="docutils" />
 <section id="scheduledbatch-structure">
-<h2>2. ScheduledBatch Structure<a class="headerlink" href="#scheduledbatch-structure" title="Link to this heading"></a></h2>
+<h2>ScheduledBatch structure<a class="headerlink" href="#scheduledbatch-structure" title="Link to this heading"></a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">ScheduledBatch</span></code> is constructed by <code class="docutils literal notranslate"><span class="pre">Scheduler.schedule()</span></code> and passed to the model runner. It is a frozen snapshot of batch metadata.</p>
 <section id="constructor-signature">
-<h3>2.1 Constructor Signature<a class="headerlink" href="#constructor-signature" title="Link to this heading"></a></h3>
+<h3>Constructor signature<a class="headerlink" href="#constructor-signature" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">ScheduledBatch</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -768,7 +770,7 @@
 </div>
 </section>
 <section id="fields">
-<h3>2.2 Fields<a class="headerlink" href="#fields" title="Link to this heading"></a></h3>
+<h3>Fields<a class="headerlink" href="#fields" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Field</p></th>
@@ -849,7 +851,7 @@
 </table>
 </section>
 <section id="scheduledbatchoutput">
-<h3>2.3 ScheduledBatchOutput<a class="headerlink" href="#scheduledbatchoutput" title="Link to this heading"></a></h3>
+<h3>ScheduledBatchOutput<a class="headerlink" href="#scheduledbatchoutput" title="Link to this heading"></a></h3>
 <p>Returned by the model runner after a forward pass:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">ScheduledBatchOutput</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
@@ -869,12 +871,11 @@
 </ul>
 </section>
 </section>
-<hr class="docutils" />
 <section id="block-manager">
-<h2>3. Block Manager<a class="headerlink" href="#block-manager" title="Link to this heading"></a></h2>
+<h2>Block manager<a class="headerlink" href="#block-manager" title="Link to this heading"></a></h2>
 <p>The <code class="docutils literal notranslate"><span class="pre">BlockManager</span></code> implements paged KV cache management with fixed-size blocks.</p>
 <section id="block-class">
-<h3>3.1 Block Class<a class="headerlink" href="#block-class" title="Link to this heading"></a></h3>
+<h3>Block class<a class="headerlink" href="#block-class" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">Block</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block_id</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">block_id</span> <span class="o">=</span> <span class="n">block_id</span>   <span class="c1"># Unique integer ID</span>
@@ -885,12 +886,12 @@
 </div>
 <p>Methods:</p>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">update(hash,</span> <span class="pre">token_ids)</span></code> – Sets the block’s hash and token content.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">reset()</span></code> – Sets <code class="docutils literal notranslate"><span class="pre">ref_count</span> <span class="pre">=</span> <span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">hash</span> <span class="pre">=</span> <span class="pre">-1</span></code>, <code class="docutils literal notranslate"><span class="pre">token_ids</span> <span class="pre">=</span> <span class="pre">[]</span></code> (used on fresh allocation).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">update(hash,</span> <span class="pre">token_ids)</span></code> — Sets the block’s hash and token content.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">reset()</span></code> — Sets <code class="docutils literal notranslate"><span class="pre">ref_count</span> <span class="pre">=</span> <span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">hash</span> <span class="pre">=</span> <span class="pre">-1</span></code>, <code class="docutils literal notranslate"><span class="pre">token_ids</span> <span class="pre">=</span> <span class="pre">[]</span></code> (used on fresh allocation).</p></li>
 </ul>
 </section>
 <section id="blockmanager-initialization">
-<h3>3.2 BlockManager Initialization<a class="headerlink" href="#blockmanager-initialization" title="Link to this heading"></a></h3>
+<h3>BlockManager initialization<a class="headerlink" href="#blockmanager-initialization" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">BlockManager</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">Config</span><span class="p">):</span>
         <span class="n">block_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">kv_cache_block_size</span>      <span class="c1"># Tokens per block (default 16)</span>
@@ -921,13 +922,13 @@
 <p>The block pool is pre-allocated at startup. <code class="docutils literal notranslate"><span class="pre">free_block_ids</span></code> is a deque for O(1) pop/push, <code class="docutils literal notranslate"><span class="pre">used_block_ids</span></code> tracks active blocks, and <code class="docutils literal notranslate"><span class="pre">hash_to_block_id</span></code> maps content hashes to block IDs for prefix caching.</p>
 <p><strong>Per-Request Cache Pools (Stateful-Attention Models):</strong> For models whose attention type maintains per-request state outside the paged KV pool (currently GDN: Qwen3-Next, Qwen3.5; future: DeepseekV4 ring buffer + compressor state, etc.):</p>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">free_per_req_cache_groups</span></code> – list of available per-request slot group indices (0 to <code class="docutils literal notranslate"><span class="pre">num_per_req_cache_groups</span> <span class="pre">-</span> <span class="pre">1</span></code>). Each group corresponds to one request and contains <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">+</span> <span class="pre">num_speculative_tokens</span></code> contiguous tensor slot indices.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">per_req_cache_accounting</span></code> – maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">per_req_cache_equiv_blocks</span></code> – number of KV cache block equivalents reserved per request for its per-request cache (computed from <code class="docutils literal notranslate"><span class="pre">AttentionMetadataBuilder.compute_per_req_cache_bytes()</span> <span class="pre">/</span> <span class="pre">block_bytes</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">free_per_req_cache_groups</span></code> — list of available per-request slot group indices (0 to <code class="docutils literal notranslate"><span class="pre">num_per_req_cache_groups</span> <span class="pre">-</span> <span class="pre">1</span></code>). Each group corresponds to one request and contains <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">+</span> <span class="pre">num_speculative_tokens</span></code> contiguous tensor slot indices.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">per_req_cache_accounting</span></code> — maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">per_req_cache_equiv_blocks</span></code> — number of KV cache block equivalents reserved per request for its per-request cache (computed from <code class="docutils literal notranslate"><span class="pre">AttentionMetadataBuilder.compute_per_req_cache_bytes()</span> <span class="pre">/</span> <span class="pre">block_bytes</span></code>).</p></li>
 </ul>
 </section>
 <section id="allocation-allocate">
-<h3>3.3 Allocation (<code class="docutils literal notranslate"><span class="pre">allocate</span></code>)<a class="headerlink" href="#allocation-allocate" title="Link to this heading"></a></h3>
+<h3>Allocation (<code class="docutils literal notranslate"><span class="pre">allocate</span></code>)<a class="headerlink" href="#allocation-allocate" title="Link to this heading"></a></h3>
 <p>Called during prefill scheduling for new sequences:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">):</span>
 </pre></div>
@@ -952,7 +953,7 @@
 </ol>
 </section>
 <section id="deallocation-deallocate">
-<h3>3.4 Deallocation (<code class="docutils literal notranslate"><span class="pre">deallocate</span></code>)<a class="headerlink" href="#deallocation-deallocate" title="Link to this heading"></a></h3>
+<h3>Deallocation (<code class="docutils literal notranslate"><span class="pre">deallocate</span></code>)<a class="headerlink" href="#deallocation-deallocate" title="Link to this heading"></a></h3>
 <p>Called when a sequence finishes or is preempted:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">deallocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">):</span>
     <span class="k">for</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">(</span><span class="n">seq</span><span class="o">.</span><span class="n">block_table</span><span class="p">):</span>
@@ -980,7 +981,7 @@
 </ol>
 </section>
 <section id="can-allocate-and-can-append-checks">
-<h3>3.5 Can-Allocate and Can-Append Checks<a class="headerlink" href="#can-allocate-and-can-append-checks" title="Link to this heading"></a></h3>
+<h3>Can-allocate and can-append checks<a class="headerlink" href="#can-allocate-and-can-append-checks" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">can_allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
     <span class="n">per_req_cache_cost</span> <span class="o">=</span> <span class="p">(</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">per_req_cache_equiv_blocks</span> <span class="k">if</span> <span class="n">seq</span><span class="o">.</span><span class="n">has_per_req_cache</span> <span class="k">else</span> <span class="mi">0</span>
@@ -1014,7 +1015,7 @@
 </ul>
 </section>
 <section id="may-append-decode-extension">
-<h3>3.6 May-Append (Decode Extension)<a class="headerlink" href="#may-append-decode-extension" title="Link to this heading"></a></h3>
+<h3>May-append (decode extension)<a class="headerlink" href="#may-append-decode-extension" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">may_append</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">num_new_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
 </pre></div>
 </div>
@@ -1026,17 +1027,16 @@
 <li><p>For <code class="docutils literal notranslate"><span class="pre">block_size</span> <span class="pre">==</span> <span class="pre">1</span></code>, immediately computes and stores the hash.</p></li>
 </ul>
 </li>
-<li><p>If <code class="docutils literal notranslate"><span class="pre">seq_len</span> <span class="pre">%</span> <span class="pre">block_size</span> <span class="pre">==</span> <span class="pre">0</span></code>, the last block is now full – computes and stores its hash using the chained prefix.</p></li>
+<li><p>If <code class="docutils literal notranslate"><span class="pre">seq_len</span> <span class="pre">%</span> <span class="pre">block_size</span> <span class="pre">==</span> <span class="pre">0</span></code>, the last block is now full — computes and stores its hash using the chained prefix.</p></li>
 <li><p>Otherwise the last block is partially filled with <code class="docutils literal notranslate"><span class="pre">hash</span> <span class="pre">=</span> <span class="pre">-1</span></code> (hash deferred until full).</p></li>
 </ol>
 </section>
 </section>
-<hr class="docutils" />
 <section id="prefix-caching">
-<h2>4. Prefix Caching<a class="headerlink" href="#prefix-caching" title="Link to this heading"></a></h2>
+<h2>Prefix caching<a class="headerlink" href="#prefix-caching" title="Link to this heading"></a></h2>
 <p>Prefix caching enables sharing KV cache blocks across sequences that share a common prompt prefix, avoiding redundant computation.</p>
 <section id="hash-function">
-<h3>4.1 Hash Function<a class="headerlink" href="#hash-function" title="Link to this heading"></a></h3>
+<h3>Hash function<a class="headerlink" href="#hash-function" title="Link to this heading"></a></h3>
 <p>ATOM uses <code class="docutils literal notranslate"><span class="pre">xxhash64</span></code> (via the <code class="docutils literal notranslate"><span class="pre">xxhash</span></code> Python library) for fast, collision-resistant block hashing:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@classmethod</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">compute_hash</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">prefix</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">):</span>
@@ -1049,7 +1049,7 @@
 </div>
 </section>
 <section id="hash-chaining">
-<h3>4.2 Hash Chaining<a class="headerlink" href="#hash-chaining" title="Link to this heading"></a></h3>
+<h3>Hash chaining<a class="headerlink" href="#hash-chaining" title="Link to this heading"></a></h3>
 <p>Blocks form a hash chain: each block’s hash incorporates the previous block’s hash as a prefix. This ensures that two blocks with identical token content but different preceding context produce different hashes.</p>
 <ul class="simple">
 <li><p>First block: <code class="docutils literal notranslate"><span class="pre">compute_hash(token_ids,</span> <span class="pre">prefix=-1)</span></code> (no prefix).</p></li>
@@ -1058,7 +1058,7 @@
 </ul>
 </section>
 <section id="cache-lookup-during-allocation">
-<h3>4.3 Cache Lookup During Allocation<a class="headerlink" href="#cache-lookup-during-allocation" title="Link to this heading"></a></h3>
+<h3>Cache lookup during allocation<a class="headerlink" href="#cache-lookup-during-allocation" title="Link to this heading"></a></h3>
 <p>During <code class="docutils literal notranslate"><span class="pre">allocate()</span></code>, for each full block:</p>
 <ol class="arabic simple">
 <li><p>Compute the block hash via the chain.</p></li>
@@ -1069,7 +1069,7 @@
 </ol>
 </section>
 <section id="reference-counting">
-<h3>4.4 Reference Counting<a class="headerlink" href="#reference-counting" title="Link to this heading"></a></h3>
+<h3>Reference counting<a class="headerlink" href="#reference-counting" title="Link to this heading"></a></h3>
 <ul class="simple">
 <li><p>On allocation: <code class="docutils literal notranslate"><span class="pre">block.reset()</span></code> sets <code class="docutils literal notranslate"><span class="pre">ref_count</span> <span class="pre">=</span> <span class="pre">1</span></code>.</p></li>
 <li><p>On cache hit for an in-use block: <code class="docutils literal notranslate"><span class="pre">ref_count</span> <span class="pre">+=</span> <span class="pre">1</span></code>.</p></li>
@@ -1078,16 +1078,15 @@
 </ul>
 </section>
 <section id="enabling-prefix-caching">
-<h3>4.5 Enabling Prefix Caching<a class="headerlink" href="#enabling-prefix-caching" title="Link to this heading"></a></h3>
+<h3>Enabling prefix caching<a class="headerlink" href="#enabling-prefix-caching" title="Link to this heading"></a></h3>
 <p>Set <code class="docutils literal notranslate"><span class="pre">enable_prefix_caching=True</span></code> in <code class="docutils literal notranslate"><span class="pre">Config</span></code>. When disabled, the hash lookup in <code class="docutils literal notranslate"><span class="pre">allocate()</span></code> is skipped entirely (<code class="docutils literal notranslate"><span class="pre">block_id</span></code> is always <code class="docutils literal notranslate"><span class="pre">-1</span></code>).</p>
 </section>
 </section>
-<hr class="docutils" />
 <section id="postprocessing">
-<h2>5. Postprocessing<a class="headerlink" href="#postprocessing" title="Link to this heading"></a></h2>
+<h2>Postprocessing<a class="headerlink" href="#postprocessing" title="Link to this heading"></a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">Scheduler.postprocess()</span></code> is called after the model forward pass to update sequences with sampled tokens, check stop conditions, generate streaming output, and clean up finished sequences.</p>
 <section id="signature">
-<h3>5.1 Signature<a class="headerlink" href="#signature" title="Link to this heading"></a></h3>
+<h3>Signature<a class="headerlink" href="#signature" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span>
     <span class="bp">self</span><span class="p">,</span>
     <span class="n">seqs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Sequence</span><span class="p">],</span>
@@ -1098,7 +1097,7 @@
 </div>
 </section>
 <section id="token-appending">
-<h3>5.2 Token Appending<a class="headerlink" href="#token-appending" title="Link to this heading"></a></h3>
+<h3>Token appending<a class="headerlink" href="#token-appending" title="Link to this heading"></a></h3>
 <p>For each running sequence whose ID appears in <code class="docutils literal notranslate"><span class="pre">fwd_output.req_ids</span></code>:</p>
 <ul>
 <li><p><strong>Deferred output or speculative decode with EOS:</strong> Replaces placeholder tokens in-place:</p>
@@ -1111,7 +1110,7 @@
 </ul>
 </section>
 <section id="stop-condition-checking">
-<h3>5.3 Stop Condition Checking<a class="headerlink" href="#stop-condition-checking" title="Link to this heading"></a></h3>
+<h3>Stop condition checking<a class="headerlink" href="#stop-condition-checking" title="Link to this heading"></a></h3>
 <p>The postprocessor checks stop conditions in priority order:</p>
 <ol class="arabic simple">
 <li><p><strong>Stop token sequences:</strong> Compares the tail of <code class="docutils literal notranslate"><span class="pre">seq.token_ids</span></code> against each entry in <code class="docutils literal notranslate"><span class="pre">seq.stop_token_sequences</span></code>. Also checks the MTP-adjusted position for speculative decode. Sets <code class="docutils literal notranslate"><span class="pre">leave_reason</span> <span class="pre">=</span> <span class="pre">&quot;stop_sequence&quot;</span></code>.</p></li>
@@ -1121,7 +1120,7 @@
 </ol>
 </section>
 <section id="stream-output">
-<h3>5.4 Stream Output<a class="headerlink" href="#stream-output" title="Link to this heading"></a></h3>
+<h3>Stream output<a class="headerlink" href="#stream-output" title="Link to this heading"></a></h3>
 <p>When <code class="docutils literal notranslate"><span class="pre">stream_output_queue</span></code> is provided, the scheduler creates a <code class="docutils literal notranslate"><span class="pre">RequestOutput</span></code> for each processed sequence:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">request_output</span> <span class="o">=</span> <span class="n">RequestOutput</span><span class="p">(</span>
     <span class="n">request_id</span><span class="o">=</span><span class="n">seq</span><span class="o">.</span><span class="n">id</span><span class="p">,</span>
@@ -1161,7 +1160,7 @@
 <p>Stream outputs are batched and put onto <code class="docutils literal notranslate"><span class="pre">stream_output_queue</span></code> via <code class="docutils literal notranslate"><span class="pre">put_nowait</span></code>.</p>
 </section>
 <section id="sequence-cleanup">
-<h3>5.5 Sequence Cleanup<a class="headerlink" href="#sequence-cleanup" title="Link to this heading"></a></h3>
+<h3>Sequence cleanup<a class="headerlink" href="#sequence-cleanup" title="Link to this heading"></a></h3>
 <p>For finished sequences:</p>
 <ol class="arabic simple">
 <li><p>Set <code class="docutils literal notranslate"><span class="pre">seq.status</span> <span class="pre">=</span> <span class="pre">SequenceStatus.FINISHED</span></code>.</p></li>
@@ -1171,7 +1170,7 @@
 </ol>
 </section>
 <section id="placeholder-insertion">
-<h3>5.6 Placeholder Insertion<a class="headerlink" href="#placeholder-insertion" title="Link to this heading"></a></h3>
+<h3>Placeholder insertion<a class="headerlink" href="#placeholder-insertion" title="Link to this heading"></a></h3>
 <p>When speculative decoding or deferred output is active, placeholder EOS tokens are appended to still-running sequences to reserve KV cache slots for the next step:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">if</span> <span class="n">need_placeholder</span><span class="p">:</span>
     <span class="k">for</span> <span class="n">seq</span> <span class="ow">in</span> <span class="n">seqs</span><span class="p">:</span>
@@ -1193,12 +1192,11 @@
 </ul>
 </section>
 </section>
-<hr class="docutils" />
 <section id="speculative-decoding-integration">
-<h2>6. Speculative Decoding Integration<a class="headerlink" href="#speculative-decoding-integration" title="Link to this heading"></a></h2>
+<h2>Speculative decoding integration<a class="headerlink" href="#speculative-decoding-integration" title="Link to this heading"></a></h2>
 <p>ATOM supports Multi-Token Prediction (MTP) speculative decoding, where a draft model proposes <code class="docutils literal notranslate"><span class="pre">mtp_k</span></code> additional tokens per step.</p>
 <section id="scheduler-tracking">
-<h3>6.1 Scheduler Tracking<a class="headerlink" href="#scheduler-tracking" title="Link to this heading"></a></h3>
+<h3>Scheduler tracking<a class="headerlink" href="#scheduler-tracking" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="bp">self</span><span class="o">.</span><span class="n">use_spec</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">speculative_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 <span class="bp">self</span><span class="o">.</span><span class="n">mtp_k</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">num_speculative_tokens</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_spec</span> <span class="k">else</span> <span class="mi">0</span>
 <span class="bp">self</span><span class="o">.</span><span class="n">total_draft_tokens</span> <span class="o">=</span> <span class="mi">0</span>
@@ -1208,7 +1206,7 @@
 <p>Note: <code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code> currently enforces <code class="docutils literal notranslate"><span class="pre">num_speculative_tokens</span> <span class="pre">==</span> <span class="pre">1</span></code>.</p>
 </section>
 <section id="draft-tokens-in-scheduling">
-<h3>6.2 Draft Tokens in Scheduling<a class="headerlink" href="#draft-tokens-in-scheduling" title="Link to this heading"></a></h3>
+<h3>Draft tokens in scheduling<a class="headerlink" href="#draft-tokens-in-scheduling" title="Link to this heading"></a></h3>
 <p>During decode scheduling:</p>
 <ul class="simple">
 <li><p>If <code class="docutils literal notranslate"><span class="pre">seq.spec_token_ids</span></code> is non-empty, the draft tokens are recorded in <code class="docutils literal notranslate"><span class="pre">scheduled_spec_decode_tokens[seq.id]</span></code>.</p></li>
@@ -1217,7 +1215,7 @@
 </ul>
 </section>
 <section id="acceptance-statistics">
-<h3>6.3 Acceptance Statistics<a class="headerlink" href="#acceptance-statistics" title="Link to this heading"></a></h3>
+<h3>Acceptance statistics<a class="headerlink" href="#acceptance-statistics" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">update_spec_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_accepted_tokens</span><span class="p">):</span>
     <span class="bp">self</span><span class="o">.</span><span class="n">total_draft_tokens</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_k</span>
     <span class="bp">self</span><span class="o">.</span><span class="n">total_accepted_tokens</span> <span class="o">+=</span> <span class="n">num_accepted_tokens</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_k</span>
@@ -1229,7 +1227,7 @@
 </div>
 </section>
 <section id="draft-token-storage-on-sequences">
-<h3>6.4 Draft Token Storage on Sequences<a class="headerlink" href="#draft-token-storage-on-sequences" title="Link to this heading"></a></h3>
+<h3>Draft token storage on sequences<a class="headerlink" href="#draft-token-storage-on-sequences" title="Link to this heading"></a></h3>
 <p>After postprocessing, accepted draft token IDs for the next step are stored on the sequence:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">if</span> <span class="n">draft_token_ids</span> <span class="ow">and</span> <span class="n">seq</span><span class="o">.</span><span class="n">id</span> <span class="ow">in</span> <span class="n">draft_token_ids</span><span class="p">:</span>
     <span class="n">seq</span><span class="o">.</span><span class="n">spec_token_ids</span> <span class="o">=</span> <span class="n">draft_token_ids</span><span class="p">[</span><span class="n">seq</span><span class="o">.</span><span class="n">id</span><span class="p">]</span>
@@ -1238,12 +1236,11 @@
 <p>These are picked up by the scheduler on the next <code class="docutils literal notranslate"><span class="pre">schedule()</span></code> call.</p>
 </section>
 </section>
-<hr class="docutils" />
 <section id="sequence-management">
-<h2>7. Sequence Management<a class="headerlink" href="#sequence-management" title="Link to this heading"></a></h2>
+<h2>Sequence management<a class="headerlink" href="#sequence-management" title="Link to this heading"></a></h2>
 <p>The <code class="docutils literal notranslate"><span class="pre">Sequence</span></code> class represents a single request throughout its lifecycle.</p>
 <section id="constructor">
-<h3>7.1 Constructor<a class="headerlink" href="#constructor" title="Link to this heading"></a></h3>
+<h3>Constructor<a class="headerlink" href="#constructor" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">Sequence</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1258,7 +1255,7 @@
 </div>
 </section>
 <section id="core-fields">
-<h3>7.2 Core Fields<a class="headerlink" href="#core-fields" title="Link to this heading"></a></h3>
+<h3>Core fields<a class="headerlink" href="#core-fields" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Field</p></th>
@@ -1355,7 +1352,7 @@
 </table>
 </section>
 <section id="timing-fields">
-<h3>7.3 Timing Fields<a class="headerlink" href="#timing-fields" title="Link to this heading"></a></h3>
+<h3>Timing fields<a class="headerlink" href="#timing-fields" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Field</p></th>
@@ -1384,7 +1381,7 @@
 </table>
 </section>
 <section id="computed-properties">
-<h3>7.4 Computed Properties<a class="headerlink" href="#computed-properties" title="Link to this heading"></a></h3>
+<h3>Computed properties<a class="headerlink" href="#computed-properties" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Property</p></th>
@@ -1411,7 +1408,7 @@
 </table>
 </section>
 <section id="num-tokens-setter">
-<h3>7.5 num_tokens Setter<a class="headerlink" href="#num-tokens-setter" title="Link to this heading"></a></h3>
+<h3>num_tokens setter<a class="headerlink" href="#num-tokens-setter" title="Link to this heading"></a></h3>
 <p>Setting <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> triggers derived field updates:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@num_tokens</span><span class="o">.</span><span class="n">setter</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">num_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
@@ -1422,7 +1419,7 @@
 </div>
 </section>
 <section id="lifecycle">
-<h3>7.6 Lifecycle<a class="headerlink" href="#lifecycle" title="Link to this heading"></a></h3>
+<h3>Lifecycle<a class="headerlink" href="#lifecycle" title="Link to this heading"></a></h3>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span>                          <span class="n">allocate</span> <span class="n">blocks</span>
    <span class="n">add</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span> <span class="o">---------&gt;</span> <span class="n">WAITING</span> <span class="o">---------&gt;</span> <span class="n">RUNNING</span> <span class="p">(</span><span class="n">PREFILL</span><span class="p">)</span>
                           <span class="o">^</span>                    <span class="o">|</span>
@@ -1441,7 +1438,7 @@
 </div>
 </section>
 <section id="sequencestatus-enum">
-<h3>7.7 SequenceStatus Enum<a class="headerlink" href="#sequencestatus-enum" title="Link to this heading"></a></h3>
+<h3>SequenceStatus enum<a class="headerlink" href="#sequencestatus-enum" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Value</p></th>
@@ -1465,7 +1462,7 @@
 </table>
 </section>
 <section id="sequencetype-enum">
-<h3>7.8 SequenceType Enum<a class="headerlink" href="#sequencetype-enum" title="Link to this heading"></a></h3>
+<h3>SequenceType enum<a class="headerlink" href="#sequencetype-enum" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Value</p></th>
@@ -1486,9 +1483,8 @@
 </table>
 </section>
 </section>
-<hr class="docutils" />
 <section id="source-files">
-<h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
+<h2>Source files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>File</p></th>
@@ -1497,22 +1493,22 @@
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_engine/scheduler.py</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Scheduler</span></code>, <code class="docutils literal notranslate"><span class="pre">ScheduledBatch</span></code>, <code class="docutils literal notranslate"><span class="pre">ScheduledBatchOutput</span></code> – scheduling algorithm, postprocessing, speculative decode stats</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Scheduler</span></code>, <code class="docutils literal notranslate"><span class="pre">ScheduledBatch</span></code>, <code class="docutils literal notranslate"><span class="pre">ScheduledBatchOutput</span></code> — scheduling algorithm, postprocessing, speculative decode stats</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_engine/block_manager.py</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Block</span></code>, <code class="docutils literal notranslate"><span class="pre">BlockManager</span></code> – paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Block</span></code>, <code class="docutils literal notranslate"><span class="pre">BlockManager</span></code> — paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_engine/sequence.py</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Sequence</span></code>, <code class="docutils literal notranslate"><span class="pre">SequenceStatus</span></code>, <code class="docutils literal notranslate"><span class="pre">SequenceType</span></code> – request lifecycle, token management, timing</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Sequence</span></code>, <code class="docutils literal notranslate"><span class="pre">SequenceStatus</span></code>, <code class="docutils literal notranslate"><span class="pre">SequenceType</span></code> — request lifecycle, token management, timing</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/model_engine/request.py</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">RequestOutput</span></code> – streaming output dataclass with <code class="docutils literal notranslate"><span class="pre">request_id</span></code>, <code class="docutils literal notranslate"><span class="pre">output_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">finished</span></code>, <code class="docutils literal notranslate"><span class="pre">finish_reason</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">RequestOutput</span></code> — streaming output dataclass with <code class="docutils literal notranslate"><span class="pre">request_id</span></code>, <code class="docutils literal notranslate"><span class="pre">output_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">finished</span></code>, <code class="docutils literal notranslate"><span class="pre">finish_reason</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Config</span></code> – scheduling-related fields (<code class="docutils literal notranslate"><span class="pre">max_num_seqs</span></code>, <code class="docutils literal notranslate"><span class="pre">max_num_batched_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_cache_block_size</span></code>, <code class="docutils literal notranslate"><span class="pre">enable_prefix_caching</span></code>, <code class="docutils literal notranslate"><span class="pre">scheduler_delay_factor</span></code>), <code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Config</span></code> — scheduling-related fields (<code class="docutils literal notranslate"><span class="pre">max_num_seqs</span></code>, <code class="docutils literal notranslate"><span class="pre">max_num_batched_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_cache_block_size</span></code>, <code class="docutils literal notranslate"><span class="pre">enable_prefix_caching</span></code>, <code class="docutils literal notranslate"><span class="pre">scheduler_delay_factor</span></code>), <code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/sampling_params.py</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code> – <code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>, <code class="docutils literal notranslate"><span class="pre">stop_strings</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code> — <code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>, <code class="docutils literal notranslate"><span class="pre">stop_strings</span></code></p></td>
 </tr>
 </tbody>
 </table>
@@ -1523,7 +1519,7 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="model_ops_guide.html" class="btn btn-neutral float-left" title="ATOM Model Operations Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="model_ops_guide.html" class="btn btn-neutral float-left" title="ATOM model operations guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="distributed_guide.html" class="btn btn-neutral float-right" title="ATOM Distributed Inference Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 

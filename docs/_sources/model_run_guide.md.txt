@@ -1,8 +1,8 @@
-# Model Run Guide
+# Model run guide
 
 Ready-to-use commands for serving models on ATOM with AMD Instinct MI355X / MI300X GPUs. Each model recipe below is validated in nightly CI.
 
-## Quick Start
+## Quick start
 
 ```bash
 # Pull the latest ATOM container
@@ -17,7 +17,7 @@ docker run -it --device=/dev/kfd --device=/dev/dri \
   rocm/atom:latest
 ```
 
-## Supported Models
+## Supported models
 
 | Model | Type | Precision | TP | Recipe |
 |-------|------|-----------|-----|--------|
@@ -29,11 +29,11 @@ docker run -it --device=/dev/kfd --device=/dev/dri \
 | Qwen3-235B | MoE | FP8 | 8 | [recipes/Qwen3-235b.md](../recipes/Qwen3-235b.md) |
 | Qwen3-Next | MoE | FP8 | 8 | [recipes/Qwen3-Next.md](../recipes/Qwen3-Next.md) |
 
-### vLLM Plugin Backend
+### vLLM plugin backend
 
 ATOM also runs as a vLLM plugin backend. See recipes under [recipes/atom_vllm/](../recipes/atom_vllm/) for vLLM-integrated serving.
 
-## Nightly CI Benchmark Configurations
+## Nightly CI benchmark configurations
 
 The nightly CI sweeps these configurations for every model:
 
@@ -61,7 +61,7 @@ Key parameters:
 - `--request-rate inf` — closed-loop benchmarking (no inter-request delay)
 - `--ignore-eos` — forces full output length generation
 
-## Live Dashboard
+## Live dashboard
 
 Nightly benchmark results are published to the [ATOM Benchmark Dashboard](https://rocm.github.io/ATOM/benchmark-dashboard/).
 
