@@ -14,6 +14,11 @@ class SequenceStatus(Enum):
     WAITING_FOR_REMOTE_KVS = auto()
     WAITING = auto()
     RUNNING = auto()
+    # Client disconnected: the seq is still live (its KV must be freed via the
+    # normal stop path). The scheduler finishes it at the next step (running) or
+    # drops it when popped from `waiting`. Distinct from FINISHED so it still
+    # rides one cleanup pass; is_finished() stays False until then.
+    ABORTED = auto()
     FINISHED = auto()
     EXIT_ENGINE = auto()
 
@@ -114,6 +119,11 @@ class Sequence:
 
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)
+
+        # DSpark Phase 2: scheduler-chosen verify length from the previous
+        # decode step's propose(). None = no schedule yet -> verify mtp_k (full).
+        # Next decode step sizes this seq's verification to dspark_next_ell+1.
+        self.dspark_next_ell: Optional[int] = None
 
         # statistics fields
         self.arrive_time = 0.0

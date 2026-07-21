@@ -8,7 +8,13 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
+from atom.config import (
+    CompilationConfig,
+    CUDAGraphMode,
+    DSparkConfig,
+    SpeculativeConfig,
+)
+from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
 logger = logging.getLogger("atom")
 
@@ -36,6 +42,7 @@ class EngineArgs:
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: Optional[str] = None
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
@@ -48,11 +55,11 @@ class EngineArgs:
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
     cudagraph_mode: str = "FULL"
-    load_dummy: bool = False
+    load_dummy: Optional[str] = None
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
-    enable_deepseek_v4_fp4_indexer: bool = False
+    dp_load_balance: str = DP_LB_DEFAULT
     enable_tbo: Optional[str] = None
     all2all_backend: Optional[str] = None
     method: Optional[str] = None
@@ -62,6 +69,11 @@ class EngineArgs:
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
+    dspark_config: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        if self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -116,11 +128,23 @@ class EngineArgs:
             help="Engine internal port",
         )
         parser.add_argument(
+            "--kv-cache-dtype",
             "--kv_cache_dtype",
+            dest="kv_cache_dtype",
             choices=["bf16", "fp8"],
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'.",
+        )
+        parser.add_argument(
+            "--index-cache-dtype",
+            "--index_cache_dtype",
+            choices=["bf16", "fp8", "fp4"],
+            type=str,
+            default=None,
+            help="Index cache type. Defaults to --kv_cache_dtype. 'fp4' selects "
+            "the DeepSeek-V4 FP4 CSA indexer (gfx950 only; falls back to fp8 "
+            "elsewhere).",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -150,7 +174,16 @@ class EngineArgs:
             "attention eager (requires --level 3).",
         )
         parser.add_argument(
-            "--load_dummy", action="store_true", help="Skip loading model weights."
+            "--load_dummy",
+            nargs="?",
+            const="empty",
+            default=None,
+            choices=["empty", "zero", "xavier"],
+            help="Use dummy weights instead of reading the checkpoint. Bare flag "
+            "or '=empty': skip loading (uninitialized, legacy behavior). '=zero': "
+            "all weights 0. '=xavier': xavier_uniform_ for bf16 weights and a "
+            "constant target magnitude for fp4/fp8 packed weights (finite, "
+            "roughly real-scale; fp4 is the validated path).",
         )
         parser.add_argument(
             "--enable-expert-parallel",
@@ -169,10 +202,18 @@ class EngineArgs:
             help="Enable DP attention.",
         )
         parser.add_argument(
-            "--enable-deepseek-v4-fp4-indexer",
-            action="store_true",
-            help="Enable the FP4 CSA Indexer KV cache for DeepSeek-V4 (gfx950). "
-            "Default off → FP8 indexer.",
+            "--dp-load-balance",
+            type=str,
+            default=DP_LB_DEFAULT,
+            choices=list(DP_LB_STRATEGIES),
+            help="Strategy the CoreManager uses to route a request to a DP "
+            "engine rank. 'round_robin': legacy request-count-agnostic "
+            "rotation. 'least_requests' (default): route to the rank with the "
+            "fewest in-flight requests, breaking ties by the lighter in-flight "
+            "prompt-token load. 'least_tokens': route to the rank with "
+            "the lowest combined in-flight token load (prompt tokens + "
+            "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(
             "--enable-tbo",
@@ -198,7 +239,7 @@ class EngineArgs:
             "--method",
             type=str,
             default=None,
-            choices=["mtp", "eagle3"],
+            choices=["mtp", "eagle3", "dspark"],
             help="Speculative method",
         )
         parser.add_argument(
@@ -310,6 +351,28 @@ class EngineArgs:
                 '\'{"use_index_cache": true, "index_topk_freq": 4}\''
             ),
         )
+        parser.add_argument(
+            "--dspark-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "DSpark dynamic config as a JSON dict, parsed straight into a "
+                "DSparkConfig object (no env vars). Supported keys:\n"
+                '  - "confidence_schedule": bool, enable confidence-scheduled '
+                "verification (per-request verify length ell_r).\n"
+                '  - "ragged": bool, enable per-request ragged verify '
+                "(no batch-level q padding).\n"
+                '  - "ragged_graph_sizes": str, comma-separated per-seq CUDA-graph '
+                'query-length buckets to capture, e.g. "1,3,6" or "8".\n'
+                '  - "q_buckets": str, CUDA-graph query-length buckets for the '
+                "older batch-uniform q-bucket verify path.\n"
+                '  - "disable_sps_calib": bool, skip SPS calibration and use the '
+                "synthetic stub.\n"
+                "Example:\n"
+                """  '{"confidence_schedule": true, "ragged": true, """
+                """"ragged_graph_sizes": "8"}'"""
+            ),
+        )
 
         return parser
 
@@ -372,6 +435,10 @@ class EngineArgs:
 
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+
+        # --dspark-config (JSON dict) → DSparkConfig object, passed through as
+        # Config.dspark (no env vars).
+        kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
 
         logger.info(f"Engine kwargs: {kwargs}")
 

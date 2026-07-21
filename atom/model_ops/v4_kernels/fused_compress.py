@@ -10,7 +10,7 @@ SGLang plan-style batched dispatch (vs. the earlier per-seq launcher):
   Each compression boundary across the entire fwd is one row in
   `compress_plan_gpu` — a packed `[num_compress, 4] int32` tensor where each
   row is `[ragged_id, batch_id, position, window_len]`. The kernel grid is
-  the caller-supplied slice length (decode CG: `_decode_compress_cap[ratio]`
+  the caller-supplied slice length (decode CG: `graph_bs * ceil(qlen/ratio)`
   / eager prefill: `n_compress`); inactive plan rows are sentinel-marked
   (`position == -1`) and bail at the top of the kernel. Each program does
   ONE 4×i32 load to get all the metadata it needs:
@@ -56,6 +56,8 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+
+from atom.utils.decorators import mark_trace
 
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
 from atom.utils import envs
@@ -141,7 +143,7 @@ def _fused_compress_attn_kernel(
     FP8_MAX: tl.constexpr = 1.0,
 ):
     """One program per boundary in the plan. Grid = caller-supplied slice
-    length (decode CG: `_decode_compress_cap[ratio]` for capture/replay
+    length (decode CG: `graph_bs * ceil(qlen/ratio)` for capture/replay
     address stability; eager prefill: tight `n_compress`). Inactive rows
     are sentinel-marked (position == -1) and bail before any load /
     store / scatter."""
@@ -369,6 +371,7 @@ def _fused_compress_attn_kernel(
             tl.store(kv_cache_ptr + cache_addr, rotated.to(tl.bfloat16), mask=d_mask)
 
 
+@mark_trace
 def fused_compress_attn(
     *,
     # Source tensors (ragged across all seqs in batch)
@@ -405,6 +408,13 @@ def fused_compress_attn(
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
     fp8_max: Optional[float] = None,  # E4M3 max; required for FP8 quant
     quant_mode: Optional[str] = None,  # "none"|"fp8"|"fp4"; default from `quant`
+    # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
+    # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
+    # e8m0 nope-fp8 + inline dup-scale into `kv_cache` (fp8 [NB,k,512]) and bf16
+    # rope into `kv_cache_rope` (bf16 [NB,k,64]) via the flydsl group_fp8 scatter.
+    main_2buff_fp8: bool = False,
+    kv_cache_rope: Optional[torch.Tensor] = None,  # bf16 [NB,k_per_block,64]
+    prefix: str = "",
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
     dispatched via SGLang-style packed plan.
@@ -434,11 +444,17 @@ def fused_compress_attn(
     if plan_capacity == 0:
         return  # nothing to do — no plan rows ever populated.
 
-    # Resolve quant mode. The FP4 indexer path keys off cache dtype upstream
-    # (Compressor.forward) and passes quant_mode="fp4"; FP8/none stay derived
-    # from the legacy `quant` bool for callers that don't pass quant_mode.
+    # Resolve quant mode (single source of truth). `quant_mode` is the unified
+    # selector; the legacy `quant` bool is only a fallback for callers that don't
+    # pass quant_mode ("fp8" if quant else "none").
     _mode = quant_mode if quant_mode is not None else ("fp8" if quant else "none")
     _fp4 = _mode == "fp4"
+    # `quant` = the Indexer-inner per-row fp8/fp4 scatter (needs cache_scale /
+    # fp8_max, takes the quant validation + Triton fallback path). Derive it from
+    # the mode so callers only pass quant_mode. CSA/HCA Main group_fp8 is NOT
+    # `quant` — its 2buff scatter is driven by `main_2buff_fp8` — and `none`/bf16
+    # is plain. (Back-compat: legacy quant=True → quant_mode None → _mode "fp8".)
+    quant = _mode in ("fp8", "per_row_fp8", "fp4")
 
     # ------------------------------------------------------------------
     # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
@@ -469,6 +485,8 @@ def fused_compress_attn(
         and _shape_key == (512, 64, 128, False)
     )
     if _hca_use:
+        # main_2buff_fp8: native group_fp8 2buff scatter (nope-fp8 into
+        # kv_cache, bf16 rope into k_rope_cache). Otherwise plain bf16.
         flydsl_hca_compress_attn(
             kv_in=kv_in,
             score_in=score_in,
@@ -487,9 +505,15 @@ def fused_compress_attn(
             ratio=ratio,
             head_dim=head_dim,
             rope_head_dim=rope_head_dim,
+            quant=main_2buff_fp8,
+            k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
+            quant_group_size=64,
         )
         return
     if _flydsl_use:
+        # main_2buff_fp8: CSA Main native group_fp8 2buff (nope-fp8 + inline
+        # e8m0 into kv_cache, bf16 rope into k_rope_cache; scale carried inline
+        # so cache_scale stays None). Indexer-inner uses per_row_fp8 preshuffle.
         flydsl_fused_compress_attn(
             kv_in=kv_in,
             score_in=score_in,
@@ -509,11 +533,12 @@ def fused_compress_attn(
             ratio=ratio,
             head_dim=head_dim,
             rope_head_dim=rope_head_dim,
-            quant=quant,
+            quant=quant or main_2buff_fp8,
             cache_scale=cache_scale,
             use_ue8m0=use_ue8m0,
-            preshuffle=preshuffle,
-            quant_mode=_mode,
+            preshuffle=preshuffle and not main_2buff_fp8,
+            quant_mode="group_fp8" if main_2buff_fp8 else _mode,
+            k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
         )
         return
 

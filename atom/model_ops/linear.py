@@ -62,22 +62,12 @@ else:
 
 if use_triton_gemm():
     try:
-        # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
         from aiter.ops.triton.gemm_afp4wfp4 import (
             gemm_afp4wfp4_preshuffle,
         )  # noqa: E402
     except ImportError as e:
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
-
-    # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
-    try:
-        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-            gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton,
-        )  # noqa: E402
-    except ImportError as e:
-        logger.warning(f"Triton w8a8 GEMM not available: {e}")
-        gemm_a8w8_blockscale_bpreshuffle_triton = None
 
     # Plain (non-preshuffle) Triton blockscale GEMM. Consumes an unshuffled
     # (N, K) weight with row-major x_scale (M, scale_k) and w_scale
@@ -100,7 +90,6 @@ if use_triton_gemm():
         gemm_a8w8_triton = None
 else:
     gemm_afp4wfp4_preshuffle = None
-    gemm_a8w8_blockscale_bpreshuffle_triton = None
     gemm_a8w8_blockscale_triton = None
     gemm_a8w8_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
@@ -271,7 +260,6 @@ def gemm_a8w8_blockscale_preshuffle_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_preshuffle_fake, mutates_args=[])
 def gemm_a8w8_blockscale_preshuffle_impl(
     x: torch.Tensor,
@@ -281,14 +269,7 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
 ) -> torch.Tensor:
-    if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
-        weight_shuffled = weight.reshape(weight.shape[0] // 16, weight.shape[1] * 16)
-        y = gemm_a8w8_blockscale_bpreshuffle_triton(
-            x, weight_shuffled, x_scale, w_scale, dtype
-        )
-    else:
-        y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
-    return y
+    return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
 
 
 def gemm_a8w8_blockscale_triton_fake(
@@ -301,7 +282,6 @@ def gemm_a8w8_blockscale_triton_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_triton_fake, mutates_args=[])
 def gemm_a8w8_blockscale_triton_impl(
     x: torch.Tensor,
@@ -327,7 +307,6 @@ def gemm_a8w8_per_tensor_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_per_tensor_fake, mutates_args=[])
 def gemm_a8w8_per_tensor_impl(
     x: torch.Tensor,
@@ -366,7 +345,6 @@ def gemm_a8w8_per_token_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_per_token_fake, mutates_args=[])
 def gemm_a8w8_per_token_impl(
     x: torch.Tensor,
@@ -476,11 +454,16 @@ class LinearBase(nn.Module):
                     torch.empty(self.output_size, 1, dtype=dtypes.fp32)
                 )
             elif quant_type == QuantType.per_1x128:
+                scale_dtype = (
+                    dtypes.fp8_e8m0
+                    if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+                    else dtypes.fp32
+                )
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
-                        dtype=dtypes.fp32,
+                        dtype=scale_dtype,
                     )
                 )
             elif quant_type == QuantType.per_1x32:
@@ -596,7 +579,9 @@ class LinearBase(nn.Module):
             return
 
         assert online_quant_dtype in [
+            dtypes.fp8,
             torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
             torch.float4_e2m1fn_x2,
         ], (
             f"Unsupported online quant: "
@@ -678,6 +663,7 @@ class LinearBase(nn.Module):
         self.quant_func = get_hip_quant(online_quant_type)
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
+            and online_quant_type == QuantType.per_Token
         )
         # A dynamic online target (e.g. ptpc per_Token) quantizes activations at
         # runtime. Drop any static input_scale inherited from a static per_Tensor
@@ -790,6 +776,25 @@ class LinearBase(nn.Module):
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
+    # linear mark trace shape/dtype helper
+    def get_trace_prefix(
+        self,
+        x: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
+        otype=dtypes.bf16,
+    ) -> str:
+        k = x.shape[-1]
+        m = x.numel() // k
+        n = self.output_size
+        a_dtype = (
+            self.params_dtype
+            if self.quant_type.value != QuantType.No.value
+            else x.dtype
+        )
+        w_dtype = self.params_dtype
+        o_dtype = otype
+        return f"{self.prefix}[M={m},N={n},K={k},a={a_dtype},w={w_dtype},o={o_dtype}]"
+
     @mark_trace
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
@@ -810,6 +815,11 @@ class LinearBase(nn.Module):
                     quant_func = functools_partial(
                         self.quant_func,
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                        **(
+                            {"scale_type": dtypes.fp8_e8m0}
+                            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+                            else {}
+                        ),
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(

@@ -65,6 +65,8 @@ class KVConnectorOutput:
         finished_recving: Request IDs whose KV receive completed on this worker.
         failed_recving: Request IDs whose KV receive failed on this worker.
         finished_saving: Request IDs whose local fire-and-forget save completed.
+        finished_loading: Request IDs whose local/offload KV load completed.
+        failed_loading: Request IDs whose local/offload KV load failed.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -73,6 +75,8 @@ class KVConnectorOutput:
     finished_recving: set[ReqId] = field(default_factory=set)
     failed_recving: set[ReqId] = field(default_factory=set)
     finished_saving: set[ReqId] = field(default_factory=set)
+    finished_loading: set[ReqId] = field(default_factory=set)
+    failed_loading: set[ReqId] = field(default_factory=set)
     expected_finished_count: int = 0
 
     def is_empty(self) -> bool:
@@ -82,6 +86,8 @@ class KVConnectorOutput:
             and not self.finished_recving
             and not self.failed_recving
             and not self.finished_saving
+            and not self.finished_loading
+            and not self.failed_loading
         )
 
     def __repr__(self) -> str:
@@ -89,7 +95,9 @@ class KVConnectorOutput:
             f"KVConnectorOutput(sending={self.finished_sending}, "
             f"recving={self.finished_recving}, "
             f"failed_recving={self.failed_recving}, "
-            f"finished_saving={self.finished_saving})"
+            f"finished_saving={self.finished_saving}, "
+            f"loading={self.finished_loading}, "
+            f"failed_loading={self.failed_loading})"
         )
 
 
