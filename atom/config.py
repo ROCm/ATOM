@@ -1285,6 +1285,12 @@ class Config:
                     "disabling enable_prefix_caching."
                 )
                 self.enable_prefix_caching = False
+            if self.enable_chunked_prefill:
+                logger.warning(
+                    "DCP does not support chunked prefill yet; "
+                    "disabling enable_chunked_prefill."
+                )
+                self.enable_chunked_prefill = False
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
