@@ -77,7 +77,8 @@ def _v4_paged_prefill_indices_kernel(
     # Constants.
     win: tl.constexpr,
     block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
-    swa_pages,  # num_blocks * block_size — boundary into HCA compress section
+    swa_pages,  # HCA compress base row. Static split: num_blocks*block_size.
+    # Unified-share: 0 (HCA compress addressed absolutely from unified row 0).
     HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
 ):
@@ -167,6 +168,9 @@ def _v4_paged_prefill_indices_kernel(
         k = j + i
         hca_mask = k < n_hca
         bt = tl.load(block_tables_ptr + bt_row_base + k, mask=hca_mask, other=0)
+        # HCA k2=1 → block c at row swa_pages + c. Unified-share passes
+        # swa_pages=0 and stores bt = absolute row (BlockManager), so this is the
+        # absolute unified row — no reverse/negative offset (flydsl-safe).
         tl.store(
             prefix_hca_indices_ptr + hca_dst_base + k,
             swa_pages + bt,

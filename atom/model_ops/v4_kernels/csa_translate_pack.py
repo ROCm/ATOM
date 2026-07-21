@@ -63,7 +63,8 @@ def _csa_translate_pack_kernel(
     batch_id_per_token_ptr,  # [T] int32 — token → seq, sentinel -1
     skip_prefix_len_per_token_ptr,  # [T] int32 — per-token write offset; ignored when INLINE_SKIP_FROM_POS
     kv_indices_csa_ptr,  # [total_indices] int32 — destination
-    swa_pages,  # i32 — SWA region size, runtime int
+    swa_pages,  # i32 — compress base row. Static split: num_swa_blocks*block_size.
+    # Unified-share: 0 (compress addressed absolutely from unified row 0; phys = row//k).
     mnbps,  # i32 — max blocks per seq, runtime int
     index_topk: tl.constexpr,
     csa_block_capacity: tl.constexpr,
@@ -133,6 +134,9 @@ def _csa_translate_pack_kernel(
         mask=in_range,
         other=0,
     )
+    # Static split: paged = swa_pages + phys*cap + slot. Unified-share passes
+    # swa_pages=0 and stores phys = absolute_row//cap (BlockManager), so this
+    # yields the absolute unified row — no reverse/negative offset (flydsl-safe).
     paged = swa_pages + phys * csa_block_capacity + slot
     tl.store(
         kv_indices_csa_ptr + write_base + k_offs,

@@ -54,6 +54,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.utils import envs
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -179,10 +180,27 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     swa_pages: int = 0
     """Boundary in `unified_kv`: index < swa_pages → SWA region; index >=
     swa_pages → compress region. paged-SWA: `num_swa_blocks * block_size`."""
+    num_compress_blocks: int = 0
+    """Physical compress-block count (`num_physical_kvcache_blocks`). Only used
+    when `ATOM_UNIFIED_KV_SHARE` is on: the reverse compress layout maps physical
+    block `c` to slot `num_compress_blocks-1-c` within the compress region
+    (mirrors the negative-stride write view), so the read-side index builders
+    (csa_translate_pack / paged_prefill_indices) remap `phys` accordingly."""
+    unified_kv_share: bool = False
+    """Snapshot of `envs.ATOM_UNIFIED_KV_SHARE` at metadata build time — passed to
+    the index-builder kernels so the compress offset (forward vs reverse-anchored)
+    matches the physical write layout."""
     swa_block_tables: Optional[torch.Tensor] = None
     """[bs, max_blocks] int32 GPU — paged-SWA logical→physical block table
     for the independent SWA pool (parallel to `block_tables`, which addresses
     the compressed pool). -1 entries are window-freed blocks (never indexed)."""
+    csa_block_tables: Optional[torch.Tensor] = None
+    """[bs, max_blocks] int32 GPU — unified-share (ATOM_UNIFIED_KV_SHARE) PHYSICAL
+    CSA compress table (base-0, row = phys*k1). Replaces `block_tables` for CSA
+    read/write kernels when the flag is on; None (falls back to block_tables) off."""
+    hca_block_tables: Optional[torch.Tensor] = None
+    """[bs, max_blocks] int32 GPU — unified-share PHYSICAL HCA compress table
+    (base-0, row = phys). Replaces `block_tables` for HCA kernels when on."""
 
     # ----- Native 2buff fp8 per-token paged-decode index tensors -----
     # Feed the aiter asm decode kernel `mla_decode_fwd_v4_nm` (op5), which treats
@@ -283,6 +301,36 @@ class DeepseekV4Backend(AttentionBackend):
         return DeepseekV4AttentionMetadataBuilder
 
 
+def _bind_compress_view(
+    unified_1d: torch.Tensor,
+    swa_pages: int,
+    num_blocks: int,
+    k: int,
+    hd: int,
+) -> torch.Tensor:
+    """Build the ``[N, k, hd]`` view the Compressor writes via
+    ``kv_cache[block_id, slot_in_block, :]`` and the index builders read.
+
+    - Forward (default, ``ATOM_UNIFIED_KV_SHARE`` off): block ``c`` occupies rows
+      ``[swa_pages + c*k, swa_pages + (c+1)*k)`` — today's contiguous tail view,
+      ``N = num_blocks`` compress blocks after the SWA region.
+    - Unified-share (base-0, plan §11.2): the WHOLE tensor is the compress arena,
+      block ``c`` at rows ``[c*k, (c+1)*k)`` (``base = 0``). SWA (rows ``s*128``)
+      and compress share it; the coordinator guarantees a physical block id and an
+      SWA slot never alias the same rows. ``N = T_L // k`` covers every slot
+      (including SWA-region slots compress may borrow). All three compress-write
+      paths take the block stride from ``kv_cache.stride(0)``, so this base-0 view
+      needs NO write-kernel change; the read builders drop ``swa_pages`` to 0.
+      Non-negative offsets throughout → flydsl-safe (plan §5.3 wall avoided).
+    """
+    if envs.ATOM_UNIFIED_KV_SHARE:
+        # Whole tensor as compress blocks (base-0). T_L is a multiple of k by
+        # construction (T_L = n_slots * 128, k divides 128), so view() is exact.
+        assert unified_1d.shape[0] % k == 0, (unified_1d.shape[0], k)
+        return unified_1d.view(-1, k, hd)
+    return unified_1d[swa_pages:].view(num_blocks, k, hd)
+
+
 class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     """Per-request cache owner for V4's state-cache buffers.
 
@@ -304,6 +352,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ratios = list(getattr(hf, "compress_ratios", ()))
         assert ratios, "deepseek_v4 hf_config must define compress_ratios"
         self.compress_ratios = ratios
+        # Unified KV share (plan §11) does not yet wire the TBO ubatch decode
+        # buffers ({p}csa/hca_block_tables). Fail loud rather than KeyError /
+        # silently fall back to logical addressing (which would corrupt KV).
+        if envs.ATOM_UNIFIED_KV_SHARE and getattr(
+            model_runner.config, "enable_tbo_decode", False
+        ):
+            raise NotImplementedError(
+                "ATOM_UNIFIED_KV_SHARE + enable_tbo_decode not wired yet "
+                "(per-ubatch csa/hca block tables). Disable one of them."
+            )
         self.num_layers = len(ratios)
         # Per-buffer-type layer indexing.
         # Buffers are layer-major: shape [num_layers_of_type, num_slots, *state_shape].
@@ -658,20 +716,44 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         head_dim = self.head_dim
         dtype = self._swa_dtype
 
+        # Unified KV share (plan §11): SWA and compress share ONE base-0 tensor per
+        # layer type. Rows = n_type_slots * block_size (SWA region + own compress +
+        # room for borrowing), addressed base-0 (row = phys*k). Sized from the SAME
+        # formula the coordinator uses so the physical tensor and BlockManager's
+        # slot pools agree exactly. Flag-off keeps today's swa_pages+compress tail.
+        unified = envs.ATOM_UNIFIED_KV_SHARE and swa_pages > 0
+        if unified:
+            from atom.model_engine.unified_chunk_pool import unified_slot_counts
+            assert self.block_ratio == 1, (
+                "ATOM_UNIFIED_KV_SHARE assumes logical==physical compress blocks "
+                f"(block_ratio must be 1, got {self.block_ratio})"
+            )
+            n_csa_slots, n_hca_slots = unified_slot_counts(
+                self.model_runner.num_swa_blocks, num_blocks, self.block_size
+            )
+            csa_rows = n_csa_slots * self.block_size
+            hca_rows = n_hca_slots * self.block_size
+
+        def _layer_rows(ratio: int) -> int:
+            if unified:
+                if ratio == 4:
+                    return csa_rows
+                if ratio == 128:
+                    return hca_rows
+                return swa_pages  # Dense: SWA-only
+            if ratio == 4:
+                return swa_pages + num_blocks * self.k1_csa
+            if ratio == 128:
+                return swa_pages + num_blocks * self.k2_hca
+            return swa_pages  # Dense
+
         # Per-layer unified_kv: SWA prefix + (CSA/HCA) compress tail.
         unified_kv: list[torch.Tensor] = []
         ratios = self.compress_ratios
         for layer_id in range(self.num_layers):
-            ratio = ratios[layer_id]
-            if ratio == 4:
-                compress_pages = num_blocks * self.k1_csa
-            elif ratio == 128:
-                compress_pages = num_blocks * self.k2_hca
-            else:
-                compress_pages = 0  # Dense
             unified_kv.append(
                 torch.zeros(
-                    (swa_pages + compress_pages, head_dim),
+                    (_layer_rows(ratios[layer_id]), head_dim),
                     dtype=dtype,
                     device=device,
                 )
@@ -684,16 +766,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         unified_kv_rope: list[Optional[torch.Tensor]] = []
         if self._kv_fp8:
             for layer_id in range(self.num_layers):
-                ratio = ratios[layer_id]
-                if ratio == 4:
-                    compress_pages = num_blocks * self.k1_csa
-                elif ratio == 128:
-                    compress_pages = num_blocks * self.k2_hca
-                else:
-                    compress_pages = 0  # Dense
                 unified_kv_rope.append(
                     torch.zeros(
-                        (swa_pages + compress_pages, self.rope_head_dim),
+                        (_layer_rows(ratios[layer_id]), self.rope_head_dim),
                         dtype=self._rope_dtype,
                         device=device,
                     )
@@ -876,19 +951,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_main_kv_state[pos]
                 module.score_state = runner.v4_csa_main_score_state[pos]
-                # CSA Main compressed pool now lives in the tail of the
-                # owning layer's `unified_kv`. Compressor.forward writes via
-                # `kv_cache[block_id, slot_in_block, :] = entry`, so we hand
-                # it the standard [num_blocks, k1, head_dim] view.
+                # CSA Main compressed pool lives in the tail of the owning
+                # layer's `unified_kv`. Compressor.forward writes via
+                # `kv_cache[block_id, slot_in_block, :] = entry`. Forward: block
+                # c at rows [swa_pages+c*k, ..). Unified-share (reverse): block c
+                # at rows [T_L-(c+1)*k, ..) via a negative-stride view — the write
+                # kernels read block_stride from kv_cache.stride(0), so this flips
+                # the write with no kernel change. See _bind_compress_view.
                 num_blocks = runner.num_physical_kvcache_blocks
                 unified = runner.v4_unified_kv[layer_id_from_prefix]
-                module.kv_cache = unified[swa_pages:].view(
-                    num_blocks, self.k1_csa, self.head_dim
+                module.kv_cache = _bind_compress_view(
+                    unified, swa_pages, num_blocks, self.k1_csa, self.head_dim
                 )
                 if self._kv_fp8:
                     rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
-                    module.kv_cache_rope = rope[swa_pages:].view(
-                        num_blocks, self.k1_csa, self.rope_head_dim
+                    module.kv_cache_rope = _bind_compress_view(
+                        rope, swa_pages, num_blocks, self.k1_csa, self.rope_head_dim
                     )
                     module.write_mode = "main_2buff_fp8"
                 else:
@@ -900,13 +978,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.score_state = runner.v4_hca_main_score_state[pos]
                 num_blocks = runner.num_physical_kvcache_blocks
                 unified = runner.v4_unified_kv[layer_id_from_prefix]
-                module.kv_cache = unified[swa_pages:].view(
-                    num_blocks, self.k2_hca, self.head_dim
+                module.kv_cache = _bind_compress_view(
+                    unified, swa_pages, num_blocks, self.k2_hca, self.head_dim
                 )
                 if self._kv_fp8:
                     rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
-                    module.kv_cache_rope = rope[swa_pages:].view(
-                        num_blocks, self.k2_hca, self.rope_head_dim
+                    module.kv_cache_rope = _bind_compress_view(
+                        rope, swa_pages, num_blocks, self.k2_hca, self.rope_head_dim
                     )
                     module.write_mode = "main_2buff_fp8"
                 else:
@@ -1371,6 +1449,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # (model-forward swa_write + decode index kernel), keyed into the
             # separate num_swa_blocks pool.
             swa_bt_gpu = var["swa_block_tables"].copy_to_gpu(scheduled_bs)
+            # Unified KV share: per-type PHYSICAL compress tables (None flag-off).
+            csa_bt_gpu, hca_bt_gpu = self._populate_compress_block_tables(
+                batch, scheduled_bs
+            )
             state_slot_gpu = ss_buf.copy_to_gpu(scheduled_bs)
 
         # ---- CPU numpy work, overlapped with prep_stream H2D ----
@@ -1403,6 +1485,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_mapping_cpu = state_slot_np
         attn_metadata.compress_plans = compress_plans
         attn_metadata.swa_block_tables = swa_bt_gpu
+        attn_metadata.csa_block_tables = csa_bt_gpu  # None flag-off
+        attn_metadata.hca_block_tables = hca_bt_gpu
 
         padded_bs = int(bs)
         self._attach_v4_per_fwd_meta(
@@ -1641,6 +1725,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.swa_block_tables = self._populate_swa_block_tables(
                 batch, scheduled_bs
             )
+        if attn_metadata.csa_block_tables is None:  # unified share (None flag-off)
+            (
+                attn_metadata.csa_block_tables,
+                attn_metadata.hca_block_tables,
+            ) = self._populate_compress_block_tables(batch, scheduled_bs)
         state_slot_gpu, state_slot_np = self._populate_state_slot_mapping(
             batch, scheduled_bs, return_cpu=True
         )
@@ -2265,7 +2354,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `_attach_v4_per_fwd_meta`.
 
         # ----- HCA compress paged offsets (CPU numpy, vectorized) -----
-        block_tables_np_full = var[f"{buf_prefix_ubatch}block_tables"].np[:scheduled_bs]
+        # Unified KV share: HCA reads its PHYSICAL table with base 0 (row=phys*1);
+        # flag-off keeps logical block_tables + swa_pages boundary.
+        if envs.ATOM_UNIFIED_KV_SHARE:
+            block_tables_np_full = var[
+                f"{buf_prefix_ubatch}hca_block_tables"
+            ].np[:scheduled_bs]
+            hca_base = 0
+        else:
+            block_tables_np_full = var[
+                f"{buf_prefix_ubatch}block_tables"
+            ].np[:scheduled_bs]
+            hca_base = swa_pages
         hca_total_indices = int(hca_indptr_np[T])
         hca_indices_np = np.full(hca_total_indices, -1, dtype=np.int32)
         # n_committed_hca_per_seq is int32; gather stays int32.
@@ -2284,7 +2384,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             write_pos = hca_indptr_np[token_indices] + entry_offsets
             bid_expanded = batch_id_per_token_np[token_indices]
             hca_indices_np[write_pos] = (
-                swa_pages + block_tables_np_full[bid_expanded, entry_offsets]
+                hca_base + block_tables_np_full[bid_expanded, entry_offsets]
             ).astype(np.int32)
         # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
         hca_indices_gpu = self._stage(
@@ -2349,6 +2449,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indptr_csa = csa_indptr_gpu
         attn_metadata.kv_indptr_hca = hca_indptr_gpu
         attn_metadata.swa_pages = swa_pages
+        attn_metadata.num_compress_blocks = self.model_runner.num_physical_kvcache_blocks
+        attn_metadata.unified_kv_share = envs.ATOM_UNIFIED_KV_SHARE
 
         # Per-token paged-decode index tensors for the fp8 asm decode kernel. The
         # kernel sees N = q_packed.shape[0] = T_pad (padded decode grid). Both
@@ -2529,6 +2631,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_q_per_seq_gpu = var["cu_seqlens_q"].gpu[:scheduled_bs]
         if block_tables_gpu is None:
             block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
+        # Unified KV share: the prefill index kernel uses `block_tables` ONLY for
+        # the HCA-compress section → hand it the PHYSICAL HCA table with base 0
+        # (hca_swa_pages below). Flag-off keeps logical block_tables + swa_pages.
+        hca_swa_pages = swa_pages
+        if attn_metadata.hca_block_tables is not None:
+            block_tables_gpu = attn_metadata.hca_block_tables[:scheduled_bs]
+            hca_swa_pages = 0
         # paged-SWA: SWA-prefix offsets index the separate SWA pool via
         # swa_block_tables; HCA still uses the compressed block_tables.
         swa_block_tables_gpu = attn_metadata.swa_block_tables[:scheduled_bs]
@@ -2578,7 +2687,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             T=T,
             win=win,
             block_size=self.block_size,
-            swa_pages=swa_pages,
+            swa_pages=hca_swa_pages,
         )
 
         # ----- skip_prefix_len_csa: per-token SWA prefix length -----
@@ -2602,6 +2711,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indptr_prefix_hca = hca_indptr
         attn_metadata.skip_prefix_len_csa = skip_csa_gpu
         attn_metadata.swa_pages = swa_pages
+        attn_metadata.num_compress_blocks = self.model_runner.num_physical_kvcache_blocks
+        attn_metadata.unified_kv_share = envs.ATOM_UNIFIED_KV_SHARE
 
     def _build_compress_plans(
         self,
@@ -2696,6 +2807,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     # indexed; a raw -1 phys → negative paged offset → OOB).
                     swa_np[i, : len(bt)] = [max(0, b) for b in bt]
         return var["swa_block_tables"].copy_to_gpu(scheduled_bs)
+
+    def _populate_compress_block_tables(self, batch: ScheduledBatch, scheduled_bs: int):
+        """Unified KV share (plan §11): fill the per-type PHYSICAL compress tables
+        (CSA base-0 row=phys*k1, HCA base-0 row=phys) from batch.csa/hca_block_tables
+        and return (csa_gpu, hca_gpu) sliced to scheduled_bs. No-op (returns
+        (None, None)) when the flag is off — callers then fall back to block_tables."""
+        if not envs.ATOM_UNIFIED_KV_SHARE:
+            return None, None
+        var = self.model_runner.forward_vars
+        out = []
+        for name in ("csa_block_tables", "hca_block_tables"):
+            buf = var[name]
+            np_buf = buf.np
+            tables = getattr(batch, name, None) or []
+            for i in range(scheduled_bs):
+                np_buf[i] = 0
+                if i < len(tables) and len(tables[i]):
+                    np_buf[i, : len(tables[i])] = tables[i]
+            out.append(buf.copy_to_gpu(scheduled_bs))
+        return out[0], out[1]
 
     def _populate_state_slot_mapping(
         self, batch: ScheduledBatch, scheduled_bs: int, return_cpu: bool = False
@@ -3012,6 +3143,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (never indexed; SWA attention only reads in-window positions).
         _bt_cols = self.model_runner.forward_vars["block_tables"].np.shape[1]
         bufs["swa_block_tables"] = CpuGpuBuffer(bs, _bt_cols, **i32)
+        # Unified KV share (plan §11): per-type PHYSICAL compress tables (base-0).
+        # Same shape as block_tables; filled from batch.csa/hca_block_tables. Only
+        # populated/consumed when ATOM_UNIFIED_KV_SHARE is on (compress kernels then
+        # read these + swa_pages=0 instead of the logical block_tables).
+        if envs.ATOM_UNIFIED_KV_SHARE:
+            bufs["csa_block_tables"] = CpuGpuBuffer(bs, _bt_cols, **i32)
+            bufs["hca_block_tables"] = CpuGpuBuffer(bs, _bt_cols, **i32)
 
         self.model_runner.forward_vars.update(bufs)
 

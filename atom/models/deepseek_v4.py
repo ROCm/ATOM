@@ -1863,14 +1863,33 @@ class DeepseekV4Attention(nn.Module):
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
+    def _main_compress_bt(self, attn_md):
+        """Main-compressor block table into unified_kv. Unified KV share (flag-on,
+        signalled by csa_block_tables being set): the PHYSICAL per-type table (CSA
+        k=32 / HCA k=1, base-0). Flag-off: the logical block_tables (today)."""
+        if attn_md.csa_block_tables is not None:
+            return (
+                attn_md.csa_block_tables
+                if self.compress_ratio == 4
+                else attn_md.hca_block_tables
+            )
+        return attn_md.block_tables
+
     def maybe_compressors_async(
-        self, x, plan, state_slot_mapping, block_tables
+        self, x, plan, state_slot_mapping, block_tables, idx_block_tables=None
     ) -> bool:
         """Fire Compressor(s) on side streams, return immediately.
 
         Main Compressor → alt_stream (CSA + HCA).
         Indexer Compressor → indexer_stream (CSA only).
-        Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
+        Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us.
+
+        `block_tables` scatters the MAIN compressor into `unified_kv` (unified KV
+        share: per-type PHYSICAL table, base-0). `idx_block_tables` (defaults to
+        `block_tables`) scatters the Indexer inner compressor into the SEPARATE
+        `v4_csa_idx_kv` pool, which is NOT shared → always the LOGICAL table."""
+        if idx_block_tables is None:
+            idx_block_tables = block_tables
         fc = get_forward_context()
         current_stream = fc.main_stream
         from atom.utils.tbo.ubatching import tbo_active
@@ -1900,7 +1919,7 @@ class DeepseekV4Attention(nn.Module):
                         x,
                         plan=plan,
                         state_slot_mapping=state_slot_mapping,
-                        block_tables=block_tables,
+                        block_tables=idx_block_tables,
                     )
         else:
             if has_compressor:
@@ -1915,7 +1934,7 @@ class DeepseekV4Attention(nn.Module):
                     x,
                     plan=plan,
                     state_slot_mapping=state_slot_mapping,
-                    block_tables=block_tables,
+                    block_tables=idx_block_tables,
                 )
         return use_async_compress
 
@@ -2047,7 +2066,8 @@ class DeepseekV4Attention(nn.Module):
             x,
             plan_for_layer,
             attn_md.state_slot_mapping,
-            attn_md.block_tables,
+            self._main_compress_bt(attn_md),  # per-type physical (unified share)
+            attn_md.block_tables,  # indexer inner compressor → separate idx pool
         )
 
         # Q/KV projections (indexer projection deferred to the core's inline
@@ -2147,7 +2167,11 @@ class DeepseekV4Attention(nn.Module):
             )
         else:
             use_async_compress = self.maybe_compressors_async(
-                x, plan_for_layer, state_slot_mapping, block_tables_gpu
+                x,
+                plan_for_layer,
+                state_slot_mapping,
+                self._main_compress_bt(attn_md),  # per-type physical (unified)
+                block_tables_gpu,  # indexer inner compressor → separate idx pool
             )
         is_decode = attn_md.state is AttnState.DECODE
         # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
@@ -2478,15 +2502,23 @@ class DeepseekV4Attention(nn.Module):
             skip_buf = attn_md.skip_prefix_len_csa
             window_size = 0
 
+        # Unified KV share: CSA reads its PHYSICAL table with base 0 (row=phys*k1);
+        # flag-off keeps logical block_tables + swa_pages boundary.
+        _csa_bt = (
+            attn_md.csa_block_tables
+            if attn_md.csa_block_tables is not None
+            else attn_md.block_tables
+        )
+        _csa_base = 0 if attn_md.csa_block_tables is not None else attn_md.swa_pages
         csa_translate_pack(
             topk_local_raw,
-            attn_md.block_tables,
+            _csa_bt,
             positions,
             kv_indptr,
             attn_md.batch_id_per_token,
             skip_buf,
             kv_indices,
-            swa_pages=attn_md.swa_pages,
+            swa_pages=_csa_base,
             csa_block_capacity=csa_block_capacity,
             window_size=window_size,
             prefix=f"{self.layer_name}.csa_translate_pack",
