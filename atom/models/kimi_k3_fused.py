@@ -71,27 +71,57 @@ if _HAS_TRITON:
 if _HAS_TRITON:
 
     @triton.jit
-    def _attn_res_scores_kernel(
-        v_ptr, sw_ptr, scores_ptr,
-        Bp, H, eps,
-        stride_t, stride_b, stride_st,
+    def _attn_res_fused_kernel(
+        br_ptr, ps_ptr, nw_ptr, pw_ptr, y_ptr,
+        B, Bp, H, eps,
+        stride_br_t, stride_br_b, stride_ps_t, stride_yt,
+        BP: tl.constexpr,       # Bp padded to a power of 2 (vectorized candidate axis)
         BLOCK_H: tl.constexpr,
     ):
-        # one program per (t, b): reduce over H to get var and dot(v, score_weight)
+        # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
+        # <normed, score_weight>, softmax over Bp, then weighted sum -> y[t].
+        # Candidates 0..B-1 are block_residual rows; candidate B is prefix_sum.
+        # Read both source tensors directly (no torch.cat materialization); the
+        # Bp axis is vectorized, so scores/probs stay in registers and softmax +
+        # weighted-sum never touch HBM.
         t = tl.program_id(0)
-        b = tl.program_id(1)
-        base = t * stride_t + b * stride_b
-        acc_sq = 0.0
-        acc_dot = 0.0
+        b_idx = tl.arange(0, BP)
+        b_mask = b_idx < Bp
+        is_last = b_idx == B                              # prefix_sum candidate
+        br_base = t * stride_br_t + b_idx * stride_br_b   # [BP]
+        ps_base = t * stride_ps_t
+
+        acc_sq = tl.zeros((BP,), dtype=tl.float32)
+        acc_dot = tl.zeros((BP,), dtype=tl.float32)
         for h0 in range(0, H, BLOCK_H):
             cols = h0 + tl.arange(0, BLOCK_H)
-            mask = cols < H
-            v = tl.load(v_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
-            sw = tl.load(sw_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-            acc_sq += tl.sum(v * v, axis=0)
-            acc_dot += tl.sum(v * sw, axis=0)
+            h_mask = cols < H
+            br = tl.load(br_ptr + br_base[:, None] + cols[None, :],
+                         mask=(b_idx < B)[:, None] & h_mask[None, :], other=0.0).to(tl.float32)
+            ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(tl.float32)  # [BLOCK_H]
+            v = tl.where(is_last[:, None], ps[None, :], br)   # [BP, BLOCK_H], ps broadcast in-reg
+            # score_weight = norm_weight * proj_weight, folded in per H-chunk
+            nw = tl.load(nw_ptr + cols, mask=h_mask, other=0.0).to(tl.float32)
+            pw = tl.load(pw_ptr + cols, mask=h_mask, other=0.0).to(tl.float32)
+            sw = nw * pw
+            acc_sq += tl.sum(v * v, axis=1)               # [BP]
+            acc_dot += tl.sum(v * sw[None, :], axis=1)    # [BP]
+
         rstd = 1.0 / tl.sqrt(acc_sq / H + eps)
-        tl.store(scores_ptr + t * stride_st + b, rstd * acc_dot)
+        scores = tl.where(b_mask, rstd * acc_dot, float("-inf"))
+        scores = scores - tl.max(scores, axis=0)
+        probs = tl.exp(scores)
+        probs = probs / tl.sum(probs, axis=0)             # [BP], softmax over Bp
+
+        for h0 in range(0, H, BLOCK_H):
+            cols = h0 + tl.arange(0, BLOCK_H)
+            h_mask = cols < H
+            br = tl.load(br_ptr + br_base[:, None] + cols[None, :],
+                         mask=(b_idx < B)[:, None] & h_mask[None, :], other=0.0).to(tl.float32)
+            ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(tl.float32)
+            v = tl.where(is_last[:, None], ps[None, :], br)
+            out = tl.sum(probs[:, None] * v, axis=0)      # [BLOCK_H]
+            tl.store(y_ptr + t * stride_yt + cols, out.to(y_ptr.dtype.element_ty), mask=h_mask)
 
 
 def apply_attn_res(
@@ -103,22 +133,20 @@ def apply_attn_res(
 ) -> torch.Tensor:
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
     score = <normed, norm_weight*proj_weight>, softmax over B+1, weighted sum."""
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)  # [T,Bp,H]
-    T, Bp, H = values.shape
+    T, B, H = block_residual.shape
+    Bp = B + 1
     if not _HAS_TRITON or T == 0:
         return _apply_attn_res_torch(prefix_sum, block_residual, proj_weight, norm_weight, eps)
-    score_weight = (norm_weight.float() * proj_weight.float()).contiguous()
-    values_c = values.contiguous()
-    scores = torch.empty((T, Bp), device=values.device, dtype=torch.float32)
-    BLOCK_H = 1024
-    _attn_res_scores_kernel[(T, Bp)](
-        values_c, score_weight, scores,
-        Bp, H, float(eps),
-        values_c.stride(0), values_c.stride(1), scores.stride(0),
-        BLOCK_H=BLOCK_H,
+    br = block_residual.contiguous()
+    ps = prefix_sum.contiguous()
+    y = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
+    _attn_res_fused_kernel[(T,)](
+        br, ps, norm_weight.contiguous(), proj_weight.contiguous(), y,
+        B, Bp, H, float(eps),
+        br.stride(0), br.stride(1), ps.stride(0), y.stride(0),
+        BP=triton.next_power_of_2(Bp), BLOCK_H=1024,
     )
-    probs = scores.softmax(-1).unsqueeze(1)  # [T,1,Bp]
-    return torch.matmul(probs, values_c.float()).squeeze(1).to(prefix_sum.dtype)
+    return y
 
 
 def _apply_attn_res_torch(prefix_sum, block_residual, proj_weight, norm_weight, eps):
