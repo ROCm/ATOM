@@ -84,9 +84,8 @@ python -m atom.benchmarks.benchmark_serving \
 ```
 
 Performance on 8xMI355X GPUs with the following environment:
-- Date measured: 2026-07-15.
+- Date measured: 2026-07-21.
 - Docker image: rocm/atom:latest.
-- ATOM: `feat/dspark-spec-decode` branch (commit a1d51a73).
 - `--kv_cache_dtype fp8`, `--method dspark --num-speculative-tokens 7`,
   `--cudagraph-mode PIECEWISE`, `--enable-dp-attention`.
 - DSpark config: `confidence_schedule=true, ragged=true, ragged_graph_sizes="8"`.
@@ -95,19 +94,65 @@ Performance on 8xMI355X GPUs with the following environment:
 
 Mixed-length serving run (random dataset, avg ISL ≈ 7387, avg OSL ≈ 922):
 
-Throughput:
+```
+============ Serving Benchmark Result ============
+Successful requests:                     1280
+Benchmark duration (s):                  394.18
+Total input tokens:                      9454961
+Total generated tokens:                  1181330
+Request throughput (req/s):              3.25
+Output token throughput (tok/s):         2996.97
+Total Token throughput (tok/s):          26983.66
+---------------Time to First Token----------------
+Mean TTFT (ms):                          4426.86
+Median TTFT (ms):                        3455.09
+P99 TTFT (ms):                           16575.08
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          35.52
+Median TPOT (ms):                        31.09
+P99 TPOT (ms):                           90.13
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           189.56
+Median ITL (ms):                         73.00
+P99 ITL (ms):                            2129.34
+==================================================
+```
 
-| Requests | Duration (s) | Input tok | Output tok | Req/s | Output tok/s | Total tok/s |
-| -------- | ------------ | --------- | ---------- | ----- | ------------ | ----------- |
-| 1280     | 456.26       | 9,454,961 | 1,180,719  | 2.81  | 2587.83      | 23310.65    |
+```
+============ Serving Benchmark Result ============
+Successful requests:                     2560
+Benchmark duration (s):                  741.58
+Total input tokens:                      18877524
+Total generated tokens:                  2366401
+Request throughput (req/s):              3.45
+Output token throughput (tok/s):         3191.01
+Total Token throughput (tok/s):          28646.71
+---------------Time to First Token----------------
+Mean TTFT (ms):                          4324.45
+Median TTFT (ms):                        2106.55
+P99 TTFT (ms):                           37325.13
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          68.29
+Median TPOT (ms):                        63.71
+P99 TPOT (ms):                           163.37
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           293.17
+Median ITL (ms):                         124.32
+P99 ITL (ms):                            1830.16
+==================================================
+```
 
-Latency (ms):
+### Accuracy (GSM8K, 3-shot)
 
-| Metric | Mean | Median | P99 |
-| ------ | ---- | ------ | ---- |
-| TTFT   | 3208.86 | 2058.98 | 18162.68 |
-| TPOT   | 39.79   | 36.29   | 101.90   |
-| ITL    | 176.43  | 97.30   | 1641.30  |
+Lossless speculative decoding — verify always emits the target-greedy token, so
+DSpark matches the plain target's accuracy:
+
+```
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.9469|±  |0.0062|
+|     |       |strict-match    |     3|exact_match|↑  |0.9500|±  |0.0060|
+```
 
 The numbers above are a snapshot. For the latest data tracked across commits, see
 [rocm.github.io/ATOM/benchmark-dashboard](https://rocm.github.io/ATOM/benchmark-dashboard/).
