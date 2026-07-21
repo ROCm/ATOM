@@ -173,7 +173,6 @@ def _count_dspark_stages(model_path, default: int = 0) -> int:
     return (max(stages) + 1) if stages else default
 
 
-
 def _fake_fp8_e4m3_inplace(x: torch.Tensor, block_size: int = 64) -> None:
     """In-place FP8 E4M3 fake-quant with power-of-two block scales (DSpark QAT).
 
