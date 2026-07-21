@@ -13,6 +13,7 @@
 
 ## 📢 News
 
+- **[2026/07]** ATOM now supports **DeepSeek-V4-Pro DSpark** speculative decoding — a semi-autoregressive block drafter (parallel backbone + Markov head + confidence head) with confidence-scheduled ragged verification, FP8 KV cache, DP attention, and PIECEWISE CUDA graphs. See [DeepSeek-V4-DSpark recipe](recipes/DeepSeek-V4-DSpark.md).
 - **[2026/06]** ATOM now supports **MiniMax-M3** inference on the native OpenAI-compatible server path, including MXFP4/MXFP8 checkpoints, FP8 KV cache, and EAGLE3 speculative decoding. See [MiniMax-M3 recipe](recipes/MiniMax-M3.md).
 - **[2026/06] Featured ROCm Blog:** [DP Attention and TBO for DeepSeek-V4 on MI355X](https://rocm.blogs.amd.com/software-tools-optimization/atom-optimiztion/README.html) highlights how ATOM optimizes DeepSeek-V4 inference on AMD Instinct MI355X GPUs with DP Attention using all-gather/reduce-scatter and Two-Batch Overlap, achieving strongly competitive DeepSeek-V4 inference performance.
 - **[2026/06] Featured ROCm Blog:** [ATOMesh: Unlocking AMD Hardware for Scalable LLM Serving](https://rocm.blogs.amd.com/software-tools-optimization/atomesh-inference/README.html) explains how ATOMesh orchestrates distributed inference on AMD GPUs with ATOM, AITER, MORI, and RCCL.
