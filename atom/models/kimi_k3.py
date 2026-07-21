@@ -766,7 +766,7 @@ class KimiKDAAttention(nn.Module):
             k=k,
             v=v,
             g=g,
-            beta=beta.float(),
+            beta=beta,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             initial_state=initial_state,
@@ -821,6 +821,10 @@ class KimiKDAAttention(nn.Module):
         # x.stride(1)==1 (feature-contiguous, which the slice preserves).
         mixed_qkv = fused_in[..., : 3 * lp]
         out_gate = fused_in[..., 3 * lp : 4 * lp]
+        # beta stays bf16 (no .float()): b_proj is a bf16 GEMM so the values are
+        # already bf16-precision -- widening to fp32 adds nothing, and fla's KDA
+        # kernel upcasts beta to fp32 internally for sigmoid(beta). Dropping the
+        # cast removes a separate elementwise kernel on both prefill and decode.
         beta = self.b_proj(hidden_states).unsqueeze(0)
         gate = self.f_b_proj(self.f_a_proj(hidden_states))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -849,8 +853,14 @@ class KimiKDAAttention(nn.Module):
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            initial = ssm_state[state_indices].contiguous()
-            initial[~gdn_metadata.has_initial_state, ...] = 0
+            # Fused masked gather: ssm_state[state_indices] with fresh
+            # sequences (~has_initial_state) written as zeros in one pass,
+            # replacing the gather + separate zero-write.
+            from atom.models.kimi_k3_fused import gather_kda_initial_state
+
+            initial = gather_kda_initial_state(
+                ssm_state, state_indices, gdn_metadata.has_initial_state
+            )
             # gfx1250 workaround: chunk_kda NaNs on short prompts (seq < chunk
             # size) and its `transpose_state_layout` output can mismatch the
             # decode-time fused_recurrent_kda reader, producing NaN on the first
