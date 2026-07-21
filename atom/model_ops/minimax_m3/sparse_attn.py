@@ -156,14 +156,9 @@ def _sparse_unified_attention(
     # key_cache: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     block_size = k_cache_view.shape[3]
     # Each token is its own length-1 sequence (decode); cu_seqlens_q = 0..num_seqs.
-    _cache = getattr(_sparse_unified_attention, "_cu_seqlens_q_cache", None)
-    if _cache is None:
-        _cache = {}
-        _sparse_unified_attention._cu_seqlens_q_cache = _cache
-    key = (q_view.device, int(num_seqs))
-    if key not in _cache:
-        _cache[key] = torch.arange(num_seqs + 1, dtype=torch.int32, device=q_view.device)
-    cu_seqlens_q = _cache[key]
+    # Per-call (not cached): caching would retain a GPU tensor per batch size and
+    # break already-captured CUDA graphs on regrow.
+    cu_seqlens_q = torch.arange(num_seqs + 1, dtype=torch.int32, device=q_view.device)
     # Safe upper bound: full block table width * page size (>= every sparse_ctx).
     max_seqlen_k = int(sparse_bt.shape[1]) * int(block_size)
 
@@ -178,6 +173,7 @@ def _sparse_unified_attention(
         max_seqlen_k=max_seqlen_k,
         softmax_scale=sm_scale,
         causal=True,
+        alibi_slopes=None,
         window_size=(-1, -1),
         block_table=sparse_bt,
         softcap=0,
@@ -1362,7 +1358,7 @@ def _run_prefill_fp8_gluon(
     if get_gfx() == "gfx1250":
         if _is_fp8_kv_cache_tensor(k_cache):
             raise NotImplementedError(
-                "Paged Attn fp8 prefill is not yet supported on gfx1250:"
+                "Paged Attn fp8 prefill is not yet supported on gfx1250: "
                 "the gluon per-page descale path has no unified_attention "
                 "equivalent here. Use a bf16 KV cache on gfx1250."
             )
