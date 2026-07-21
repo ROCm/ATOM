@@ -1319,9 +1319,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.qo_indptr = self._stage(
                 "v4_qo_indptr", self._v4_qo_indptr_np[: bs + 1]
             )
-            attn_metadata.kv_last_page_lens = self._stage(
-                "v4_kv_last_page_lens", self._v4_kv_last_page_lens_np[:bs]
-            )
 
         # NOT rebuilt (unused by SWA-only MTP layer; would block a future
         # CSA/HCA MTP layer — assert at top guards):
@@ -2607,9 +2604,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if T_pad > T:
                 qo_indptr_np[T + 1 :] = T
             attn_metadata.qo_indptr = self._stage("v4_qo_indptr", qo_indptr_np)
-            attn_metadata.kv_last_page_lens = self._stage(
-                "v4_kv_last_page_lens", self._v4_kv_last_page_lens_np[:T_pad]
-            )
 
     def _build_paged_prefill_meta(
         self,
@@ -3188,15 +3182,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (`mla_decode_fwd_v4_nm`, page_size=1). Values are CONSTANT — they
         # depend only on the (padded) decode token count N, not the batch:
         #   qo_indptr        = arange(N+1)   (per-token q indptr, max_seqlen_q=1)
-        #   kv_last_page_lens = ones(N)       (page_size=1 → every page full)
         # Built the SAME way as `kv_indptr_*`: a CpuGpuBuffer re-staged via
         # `self._stage(...)` EVERY fwd, which is what makes them CUDAGraph-safe
         # (re-copied into the captured buffer before graph.replay). The constant
         # numpy sources are precomputed once so the per-fwd cost is a slice + H2D.
         bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
-        bufs["v4_kv_last_page_lens"] = CpuGpuBuffer(T_dec, **i32)
         self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
-        self._v4_kv_last_page_lens_np = np.ones(T_dec, dtype=np.int32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by csa_translate_pack
         # (kernel masks `(k < n_committed) & (k < index_topk)`) AND by the
         # indexer (cast to int64 inline). Built unconditionally in
