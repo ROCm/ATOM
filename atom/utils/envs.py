@@ -197,6 +197,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # Kimi-K3: overlap the shared-expert MLP with the routed experts on a
+    # separate CUDA stream (shared compute runs on alt_stream while routed
+    # experts + latent post-proc run on the main stream). Default OFF; set to
+    # "1" to enable. Per-call decode/prefill gating still uses
+    # ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD.
+    "ATOM_K3_SHARED_EXPERT_OVERLAP": lambda: (
+        os.getenv("ATOM_K3_SHARED_EXPERT_OVERLAP", "0") == "1"
+    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
