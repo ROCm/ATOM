@@ -16,6 +16,7 @@ from typing import Optional, Union
 import torch
 import torch.nn.functional as F
 from aiter import ActivationType, QuantType
+from aiter.tuned_gemm import tgemm
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -696,15 +697,20 @@ class KimiKDAAttention(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Fuse q/k/v/g/b into a single in-proj weight (one runtime GEMM).
+        """Fuse q/k/v/g into a single in-proj weight (one runtime GEMM).
 
-        The five hidden-input projections are loaded as separate modules
+        The four hidden-input projections are loaded as separate modules
         (their checkpoint names are unique and collision-free; g_proj in
         particular cannot go through packed_modules_mapping because its name is
         shared with the MLA layers' g_proj under the loader's substring match).
-        Here they are concatenated into one ``[q | k | v | g | b]`` weight and
-        the per-projection storage is released, so ``forward`` runs a single
-        ``F.linear`` instead of five. Runs once; idempotent.
+        Here they are concatenated into one ``[q | k | v | g]`` weight and the
+        per-projection storage is released, so ``forward`` runs a single
+        ``tgemm.mm`` instead of four. Runs once; idempotent.
+
+        b_proj is deliberately left out: its output width is num_heads (tiny),
+        which would make the fused N = 4*local_proj + num_heads a non-multiple
+        of the GEMM tile and cost more than the extra kernel it saves. It stays
+        a standalone ColumnParallelLinear (its own tgemm call).
 
         Assumes bf16 (unquantized) attention weights, which the Kimi-K3
         checkpoint guarantees (``re:.*self_attn.*`` is in the quant ignore
@@ -713,7 +719,7 @@ class KimiKDAAttention(nn.Module):
         """
         if getattr(self, "_in_proj_fused", False):
             return
-        subs = (self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.b_proj)
+        subs = (self.q_proj, self.k_proj, self.v_proj, self.g_proj)
         assert all(m.quant_type == QuantType.No for m in subs), (
             "KDA in-proj fusion assumes unquantized (bf16) attention weights; "
             "this checkpoint quantizes self_attn projections."
@@ -797,15 +803,20 @@ class KimiKDAAttention(nn.Module):
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
-        # Single fused in-proj GEMM producing [q | k | v | g | b]; slice out
-        # each part. `out_gate` is the KDA output gate consumed at o_norm below
+        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
+        # part. `out_gate` is the KDA output gate consumed at o_norm below
         # (computed here so it rides the same GEMM instead of a separate one
-        # after the recurrence).
+        # after the recurrence). Routed through tgemm (aiter's tunable GEMM
+        # path) so the fused shape can pick up a tuned config; N = 4*local_proj
+        # is a clean multiple of the GEMM tile (b_proj's tiny num_heads width is
+        # kept out so it does not misalign N).
         lp = self.local_proj_size
-        fused_in = F.linear(hidden_states, self.in_proj_weight)
+        fused_in = tgemm.mm(
+            hidden_states, self.in_proj_weight, None, otype=hidden_states.dtype
+        )
         mixed_qkv = fused_in[..., : 3 * lp].contiguous()
         out_gate = fused_in[..., 3 * lp : 4 * lp]
-        beta = fused_in[..., 4 * lp :].unsqueeze(0)
+        beta = self.b_proj(hidden_states).unsqueeze(0)
         gate = self.f_b_proj(self.f_a_proj(hidden_states))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         out = hidden_states.new_empty(
