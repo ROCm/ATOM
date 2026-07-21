@@ -1041,7 +1041,9 @@ def _sparse_attn_v4_paged_decode_asm(
         sm_scale=softmax_scale,
         num_kv_splits=num_kv_splits,
     )
-    return output
+    # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
+    # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
+    return output[:, :H_real].contiguous() if H_real != H else output
 
 
 @mark_trace
