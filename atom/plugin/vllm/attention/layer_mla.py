@@ -305,6 +305,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self.cp_kv_cache_interleave_size = (
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
         )
+        self.need_to_return_lse_for_decode = (
+            get_current_vllm_config().parallel_config.decode_context_parallel_size > 1
+        )
         self.is_aiter_triton_fp4_bmm_enabled = (
             envs.ATOM_USE_TRITON_MXFP4_BMM
             and self.kv_b_proj.weight.dtype == torch.bfloat16
@@ -951,6 +954,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             # to ensure all ranks within a DP group compute the
             # same expert outputs.
             return output.fill_(0)
+
+        if self.dcp_world_size == -1:
+            self.dcp_world_size = get_dcp_group().world_size
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
