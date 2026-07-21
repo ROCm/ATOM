@@ -885,6 +885,9 @@ class KimiKDAAttention(nn.Module):
             ssm_state[state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
         elif gdn_metadata.num_decodes > 0:
+            # Slice the per-token cache-slot indices once (was recomputed for
+            # the conv update, the state gather, and the state scatter-back).
+            decode_state_indices = state_indices[:num_actual_tokens]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -893,13 +896,16 @@ class KimiKDAAttention(nn.Module):
                 self.local_proj_size,
                 None,
                 self.activation,
-                conv_state_indices=state_indices[:num_actual_tokens],
+                conv_state_indices=decode_state_indices,
                 validate_data=True,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            initial = ssm_state[state_indices[:num_actual_tokens]].contiguous()
+            # Advanced indexing already returns a contiguous tensor, so no
+            # .contiguous() is needed. No zeroing here: decode sequences always
+            # carry an initial state.
+            initial = ssm_state[decode_state_indices]
             kda_out, last_state = self._run_kda(
                 q,
                 k,
@@ -911,7 +917,7 @@ class KimiKDAAttention(nn.Module):
                 True,
                 recurrent=True,
             )
-            ssm_state[state_indices[:num_actual_tokens]] = last_state
+            ssm_state[decode_state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
         else:
             out.zero_()
