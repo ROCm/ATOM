@@ -532,11 +532,11 @@ class KimiFullAttention(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        # q already has the [nope | rope] head layout from q_b_proj; RoPE is
+        # applied inside self.attn, so there is no split/re-cat here (that would
+        # be an identity round-trip that just copies q).
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(-1, self.num_local_heads, self.q_head_dim)
-        q_nope, q_rope = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_latent, k_rope = torch.split(
@@ -547,7 +547,8 @@ class KimiFullAttention(nn.Module):
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_rope = k_rope.unsqueeze(1).expand(-1, self.num_local_heads, -1)
 
-        q = torch.cat((q_nope, q_rope), dim=-1)
+        # k_nope (from kv_b) and the MQA-shared k_rope (from kv_a) are distinct
+        # sources, so this cat is real (unlike q's).
         k = torch.cat((k_nope, k_rope), dim=-1)
         # Kimi MLA is stored in the standard paged-MHA cache: pad V to the query
         # head dim so K and V share a cache entry, then slice V back afterwards.
