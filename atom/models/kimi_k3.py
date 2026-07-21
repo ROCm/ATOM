@@ -39,7 +39,6 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from atom.model_ops.attention_mha import _torch_reshape_and_cache
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -80,7 +79,9 @@ def _normalize_kimi_config(config) -> None:
         config, "linear_num_key_heads", lin.get("num_heads", config.num_attention_heads)
     )
     config.linear_num_value_heads = getattr(
-        config, "linear_num_value_heads", lin.get("num_heads", config.num_attention_heads)
+        config,
+        "linear_num_value_heads",
+        lin.get("num_heads", config.num_attention_heads),
     )
     config.linear_key_head_dim = getattr(
         config, "linear_key_head_dim", lin.get("head_dim", config.qk_nope_head_dim)
@@ -91,9 +92,7 @@ def _normalize_kimi_config(config) -> None:
     config.linear_conv_kernel_dim = getattr(
         config, "linear_conv_kernel_dim", lin.get("short_conv_kernel_size", 4)
     )
-    config.kimi_full_attn_layers = [
-        int(i) - 1 for i in lin.get("full_attn_layers", [])
-    ]
+    config.kimi_full_attn_layers = [int(i) - 1 for i in lin.get("full_attn_layers", [])]
     config.kimi_kda_layers = [int(i) - 1 for i in lin.get("kda_layers", [])]
     config.num_gdn_attn_state = len(config.kimi_kda_layers)
     config.num_full_attn = len(config.kimi_full_attn_layers)
@@ -213,9 +212,13 @@ class KimiSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_token
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.use_latent_moe = getattr(config, "routed_expert_hidden_size", None) is not None
+        self.use_latent_moe = (
+            getattr(config, "routed_expert_hidden_size", None) is not None
+        )
         self.moe_hidden_size = (
-            config.routed_expert_hidden_size if self.use_latent_moe else config.hidden_size
+            config.routed_expert_hidden_size
+            if self.use_latent_moe
+            else config.hidden_size
         )
 
         self.gate = ReplicatedLinear(
@@ -258,6 +261,7 @@ class KimiSparseMoeBlock(nn.Module):
             self.shared_experts = None
 
         if self.use_latent_moe:
+
             def _routed_source_quant_dtype(layer_prefix: str) -> torch.dtype | None:
                 if quant_config is None:
                     return None
@@ -439,93 +443,9 @@ class KimiFullAttention(nn.Module):
             prefix=prefix,
         )
 
-    def _prefill_sdpa(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """Per-sequence SDPA over the in-batch Q/K/V (unpadded V).
-
-        The paged/unified attention prefill kernel faults on multi-sequence
-        varlen batches at head_dim=192 (Kimi MLA-as-MHA), so run SDPA per
-        sequence instead. The paged KV cache is populated separately via
-        ``_write_kv_cache`` so decode can read the prompt K/V.
-        """
-        fwd_ctx = get_forward_context()
-        cu_seqlens = getattr(fwd_ctx.attn_metadata, "cu_seqlens_q", None)
-        out = torch.empty_like(v)
-        if cu_seqlens is None:
-            spans = [(0, q.shape[0])]
-        else:
-            starts = cu_seqlens[:-1].tolist()
-            ends = cu_seqlens[1:].tolist()
-            spans = list(zip(starts, ends))
-        for start, end in spans:
-            if end <= start:
-                continue
-            out_seq = F.scaled_dot_product_attention(
-                q[start:end].transpose(0, 1).unsqueeze(0),
-                k[start:end].transpose(0, 1).unsqueeze(0),
-                v[start:end].transpose(0, 1).unsqueeze(0),
-                dropout_p=0.0,
-                is_causal=True,
-                scale=self.scaling,
-            )
-            out[start:end].copy_(out_seq.squeeze(0).transpose(0, 1))
-        return out.reshape(-1, self.local_v_size)
-
-    def _write_kv_cache(self, k: torch.Tensor, v_padded: torch.Tensor) -> None:
-        """Write prefill K/V into the paged KV cache in the same layout the
-        decode path (self.attn -> rope_cache -> reshape_and_cache) reads."""
-        import aiter
-
-        fwd_ctx = get_forward_context()
-        # Dummy warmup runs have no populated KV cache / slot mapping.
-        if fwd_ctx.context.is_dummy_run or fwd_ctx.kv_cache_data is None:
-            return
-        attn_metadata = fwd_ctx.attn_metadata
-        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
-        k_cache, v_cache = cache.k_cache, cache.v_cache
-        k_r = k.view(-1, self.num_local_heads, self.q_head_dim)
-        v_r = v_padded.view(-1, self.num_local_heads, self.q_head_dim)
-        # The full-attn layers are bound in the 4D FLASH layout (see
-        # aiter_attention.build_kv_cache_tensor): [num_blocks, block_size,
-        # num_kv_heads, head_dim]. Write prefill K/V with reshape_and_cache_flash
-        # so it matches what decode's unified_attention(shuffled_kv_cache=False)
-        # reads. head_dim=192 mis-indexes under the 5D SHUFFLE read, hence flash.
-        if v_cache.dim() == 4 and envs.ATOM_USE_TORCH_CACHE:
-            _torch_reshape_and_cache(
-                k_r, v_r, k_cache, v_cache, attn_metadata.slot_mapping
-            )
-        elif v_cache.dim() == 4:
-            flash_scale = self.attn.impl._pa_decode_bf16_asm_scale
-            aiter.reshape_and_cache_flash(
-                k_r,
-                v_r,
-                k_cache,
-                v_cache,
-                attn_metadata.slot_mapping,
-                "auto",
-                flash_scale,
-                flash_scale,
-            )
-        else:
-            # Legacy SHUFFLE fallback (asm layout when V cache is 5-D).
-            asm_layout = not (v_cache.dim() != 5)
-            aiter.reshape_and_cache(
-                k_r,
-                v_r,
-                k_cache,
-                v_cache,
-                attn_metadata.slot_mapping,
-                kv_cache_dtype="auto",
-                k_scale=None,
-                v_scale=None,
-                asm_layout=asm_layout,
-            )
-
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(-1, self.num_local_heads, self.q_head_dim)
         q_nope, q_rope = torch.split(
@@ -549,24 +469,19 @@ class KimiFullAttention(nn.Module):
             -1, self.local_q_size
         )
 
-        fwd_ctx = get_forward_context()
-        if fwd_ctx.context.is_prefill:
-            # SDPA compute (handles multi-sequence varlen at head_dim=192) plus an
-            # explicit cache write so decode can read the prompt K/V. Routing
-            # prefill through self.attn instead faults on batched varlen prefill.
-            attn_out = self._prefill_sdpa(q, k, v)
-            self._write_kv_cache(
-                k.reshape(-1, self.local_q_size), v_padded
-            )
-        else:
-            attn_out = self.attn(
-                q.reshape(-1, self.local_q_size),
-                k.reshape(-1, self.local_q_size),
-                v_padded,
-            )
-            attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
-                :, :, : self.v_head_dim
-            ].reshape(-1, self.local_v_size)
+        # MLA-as-MHA at head_dim=192. self.attn both writes the paged KV cache
+        # (4D FLASH layout, reshape_and_cache_flash) and runs aiter unified_attention
+        # for prefill (varlen) AND decode: the standard Triton kernel handles the
+        # non-power-of-two head dim via HEAD_SIZE_PADDED, so prefill needs no torch
+        # SDPA fallback. This routing also lets chunked prefill read the paged cache.
+        attn_out = self.attn(
+            q.reshape(-1, self.local_q_size),
+            k.reshape(-1, self.local_q_size),
+            v_padded,
+        )
+        attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
+            :, :, : self.v_head_dim
+        ].reshape(-1, self.local_v_size)
         attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))
         return self.o_proj(attn_out)
 
@@ -755,13 +670,19 @@ class KimiKDAAttention(nn.Module):
         num_actual_tokens = gdn_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
         mixed_qkv = torch.cat(
-            [self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)],
+            [
+                self.q_proj(hidden_states),
+                self.k_proj(hidden_states),
+                self.v_proj(hidden_states),
+            ],
             dim=-1,
         )
         gate = self.f_b_proj(self.f_a_proj(hidden_states))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         beta = self.b_proj(hidden_states).unsqueeze(0)
-        out = hidden_states.new_empty((num_actual_tokens, self.num_local_heads, self.head_dim))
+        out = hidden_states.new_empty(
+            (num_actual_tokens, self.num_local_heads, self.head_dim)
+        )
 
         conv_weights = self._conv_weights()
         state_indices = gdn_metadata.non_spec_state_indices_tensor
@@ -792,9 +713,7 @@ class KimiKDAAttention(nn.Module):
             # decode step. Forcing the recurrent path for prefill keeps the KDA
             # state layout consistent across prefill/decode. Env-gated so the
             # fast chunk path stays default on archs where it is correct.
-            _kda_force_recurrent = (
-                os.getenv("ATOM_KDA_FORCE_RECURRENT", "0") == "1"
-            )
+            _kda_force_recurrent = os.getenv("ATOM_KDA_FORCE_RECURRENT", "0") == "1"
             kda_out, last_state = self._run_kda(
                 q,
                 k,
@@ -835,12 +754,17 @@ class KimiKDAAttention(nn.Module):
                 True,
                 recurrent=True,
             )
-            ssm_state[state_indices[:num_actual_tokens]] = last_state.to(ssm_state.dtype)
+            ssm_state[state_indices[:num_actual_tokens]] = last_state.to(
+                ssm_state.dtype
+            )
             out.copy_(kda_out.squeeze(0))
         else:
             out.zero_()
 
-        out = self.o_norm(out, rearrange(self.g_proj(hidden_states), "t (h d) -> t h d", d=self.head_dim))
+        out = self.o_norm(
+            out,
+            rearrange(self.g_proj(hidden_states), "t (h d) -> t h d", d=self.head_dim),
+        )
         return self.o_proj(rearrange(out, "t h d -> t (h d)"))
 
 
@@ -858,10 +782,14 @@ class KimiDecoderLayer(nn.Module):
         self.layer_idx = layer_num
         self.hidden_size = config.hidden_size
         if layer_num in config.kimi_kda_layers:
-            self.self_attn = KimiKDAAttention(atom_config, quant_config, prefix=f"{prefix}.self_attn")
+            self.self_attn = KimiKDAAttention(
+                atom_config, quant_config, prefix=f"{prefix}.self_attn"
+            )
             self.is_linear_attn = True
         else:
-            self.self_attn = KimiFullAttention(atom_config, quant_config, prefix=f"{prefix}.self_attn")
+            self.self_attn = KimiFullAttention(
+                atom_config, quant_config, prefix=f"{prefix}.self_attn"
+            )
             self.is_linear_attn = False
 
         if (
@@ -881,10 +809,14 @@ class KimiDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
+        self.use_attn_residuals = (
+            getattr(config, "attn_res_block_size", None) is not None
+        )
         if self.use_attn_residuals:
             self.attn_res_block_size = config.attn_res_block_size
-            self.self_attention_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.self_attention_res_norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
             self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.self_attention_res_proj = ReplicatedLinear(
                 config.hidden_size,
@@ -928,7 +860,10 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum = hidden_states
         if block_residual is not None and block_residual.shape[1] > 0:
             hidden_states = _apply_attn_res(
-                prefix_sum, block_residual, self.self_attention_res_proj, self.self_attention_res_norm
+                prefix_sum,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
             )
         if self.layer_idx % self.attn_res_block_size == 0:
             assert block_residual is not None
@@ -984,7 +919,9 @@ class KimiLinearModel(nn.Module):
         self.vocab_size = config.vocab_size
 
         if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -1027,9 +964,15 @@ class KimiLinearModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
-            hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+            hidden_states = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_tokens(input_ids)
+            )
             block_residual = (
-                hidden_states.new_zeros(hidden_states.shape[0], 0, hidden_states.shape[1])
+                hidden_states.new_zeros(
+                    hidden_states.shape[0], 0, hidden_states.shape[1]
+                )
                 if getattr(self.config, "attn_res_block_size", None) is not None
                 else None
             )
@@ -1039,7 +982,9 @@ class KimiLinearModel(nn.Module):
             block_residual = intermediate_tensors["block_residual"]
 
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, block_residual = layer(positions, hidden_states, block_residual)
+            hidden_states, block_residual = layer(
+                positions, hidden_states, block_residual
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1087,7 +1032,9 @@ class KimiLinearForCausalLM(nn.Module):
             )
         else:
             self.lm_head = PPMissingLayer()
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -1120,7 +1067,10 @@ class KimiK3ForCausalLM(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         root_config = atom_config.hf_config
-        if hasattr(root_config, "text_config") and root_config.text_config is not root_config:
+        if (
+            hasattr(root_config, "text_config")
+            and root_config.text_config is not root_config
+        ):
             _normalize_kimi_config(root_config.text_config)
             if (
                 getattr(root_config, "quantization_config", None) is None
@@ -1153,7 +1103,9 @@ class KimiK3ForCausalLM(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        return self.language_model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         return self.language_model.compute_logits(hidden_states)
