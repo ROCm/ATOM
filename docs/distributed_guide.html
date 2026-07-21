@@ -19,7 +19,7 @@
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="ATOM compilation &amp; CUDA graphs guide" href="compilation_cudagraph_guide.html" />
+    <link rel="next" title="Prefill Context Parallel (PCP) Guide" href="context_parallel_guide.html" />
     <link rel="prev" title="ATOM scheduling &amp; KV cache guide" href="scheduling_kv_cache_guide.html" /> 
 </head>
 
@@ -351,6 +351,25 @@
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#source-files">Source files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="context_parallel_guide.html">Prefill Context Parallel (PCP) Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#when-to-use-pcp">When to use PCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#cli-usage">CLI usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#launching-server">Launching server</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="context_parallel_guide.html#deepseek-v4-tp4-pcp2-8-gpus">DeepSeek-V4: TP4 + PCP2 (8 GPUs)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="context_parallel_guide.html#deepseek-v4-tp1-pcp8-prefill-tbo-overlap-8-gpus">DeepSeek-V4: TP1 + PCP8 + prefill TBO overlap (8 GPUs)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#tuning-for-long-sequences">Tuning for long sequences</a></li>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#performance-baseline">Performance baseline</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="context_parallel_guide.html#pcp-tbo-prefill-overlap">PCP + TBO (prefill overlap)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#constraints-compatibility">Constraints &amp; Compatibility</a></li>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#how-it-works">How it works</a></li>
+<li class="toctree-l2"><a class="reference internal" href="context_parallel_guide.html#source-files">Source Files</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="compilation_cudagraph_guide.html">ATOM compilation &amp; CUDA graphs guide</a><ul>
@@ -1172,7 +1191,7 @@ python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="scheduling_kv_cache_guide.html" class="btn btn-neutral float-left" title="ATOM scheduling &amp; KV cache guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="compilation_cudagraph_guide.html" class="btn btn-neutral float-right" title="ATOM compilation &amp; CUDA graphs guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="context_parallel_guide.html" class="btn btn-neutral float-right" title="Prefill Context Parallel (PCP) Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
