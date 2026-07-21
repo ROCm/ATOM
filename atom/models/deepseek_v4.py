@@ -1984,6 +1984,9 @@ class Indexer(nn.Module):
             n_committed_per_seq_gpu,
             topk_local,
             total_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
         )
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
