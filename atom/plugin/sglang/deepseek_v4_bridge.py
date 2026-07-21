@@ -163,9 +163,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 )
             except Exception:
                 pass
-        # aiter DSV4 native 2-buffer fp8 op4/op5 kernels are not shipped for
-        # MI308/gfx942.  Match the native ATOM builder: keep gfx950/gfx1250 on
-        # the fp8 fast path and fall back to the bf16/Triton path elsewhere.
+        # aiter DSV4 native 2-buffer fp8 op4/op5 kernels are only known to be
+        # shipped for gfx950/gfx1250. This disables only that DSV4-native path;
+        # it does not change the user-requested SGLang/ATOM KV-cache dtype.
         if self.use_fp8_kv and not supports_dsv4_fp8_2buff():
             self.use_fp8_kv = False
         del c4_state_pool_size, c128_state_pool_size, dtype, state_dtype
