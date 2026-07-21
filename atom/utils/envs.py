@@ -37,6 +37,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
+    # Override the PCP size that SGLang+ATOM maps into aiter. 0 means unset.
+    "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -325,6 +327,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
+    # --- PCP MoE comm mode ---
+    # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
+    # Only meaningful when prefill_context_parallel_size > 1.
+    # Default "1": route MoE weights as folded PCP*TP shards.  The V2/GLM
+    # path keeps MoE on local 1/W token rows and all-reduces routed partials
+    # over PCP, matching native ATOM PCP and avoiding full-hidden all-gather
+    # before each MoE layer.  "0": do not fold PCP into routed MoE sharding.
+    "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.

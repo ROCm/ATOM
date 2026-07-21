@@ -1737,6 +1737,8 @@ def build_atom_v4_attention_metadata_from_sglang(
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
     _populate_indexer(md, batch_np, positions[:total], device)
+    if not is_decode and not is_draft_extend:
+        _maybe_apply_pcp_reindex(md, positions, total, device)
     return md
 
 
@@ -1931,6 +1933,100 @@ def _populate_indexer(md, batch_np, positions, device) -> None:
         (positions.to(torch.int32) + 1) // 4,
         md.n_committed_csa_per_seq[bid],
     ).to(torch.int32)
+    md.indexer_meta = {
+        "total_committed": int(cu[-1]),
+        "cu_committed_gpu": cu_gpu,
+        "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
+        "batch_id_per_token_gpu": bid,
+        "seq_base_per_token_gpu": base,
+        "cu_starts_gpu": base,
+        "cu_ends_gpu": end,
+    }
+
+
+def _maybe_apply_pcp_reindex(md, positions: torch.Tensor, total_tokens: int, device):
+    try:
+        from atom.distributed.pcp_utils import (
+            get_pcp_world_size,
+            pcp_pad_dense,
+            pcp_pad_indptr,
+            pcp_pad_len,
+            pcp_reindex_ragged,
+            pcp_round_robin_query_indices,
+        )
+    except Exception:
+        return
+
+    pcp_size = get_pcp_world_size()
+    if pcp_size <= 1 or total_tokens <= 0:
+        return
+
+    padded_total = pcp_pad_len(total_tokens, pcp_size)
+    n_pad = padded_total - total_tokens
+    owned_q_cpu = pcp_round_robin_query_indices(padded_total, pcp_size)
+    owned_q = owned_q_cpu.to(device)
+
+    for ind_attr, idx_attr in (
+        ("kv_indptr_prefix_swa", "kv_indices_prefix_swa"),
+        ("kv_indptr_prefix_csa", "kv_indices_prefix_csa"),
+        ("kv_indptr_prefix_hca", "kv_indices_prefix_hca"),
+        ("kv_indptr_extend", "kv_indices_extend"),
+    ):
+        indptr = getattr(md, ind_attr, None)
+        indices = getattr(md, idx_attr, None)
+        if indptr is None or indices is None:
+            continue
+        indptr = pcp_pad_indptr(indptr, n_pad)
+        local_indptr, local_indices = pcp_reindex_ragged(indptr, indices, owned_q)
+        setattr(md, ind_attr, local_indptr)
+        setattr(md, idx_attr, local_indices)
+
+    if getattr(md, "skip_prefix_len_csa", None) is not None:
+        skip = pcp_pad_dense(md.skip_prefix_len_csa, n_pad)
+        md.skip_prefix_len_csa = skip[owned_q].contiguous()
+
+    batch_cpu = np.asarray(md.batch_id_per_token_cpu[:total_tokens], dtype=np.int32)
+    if n_pad > 0:
+        batch_cpu = np.concatenate([batch_cpu, np.full(n_pad, -1, dtype=np.int32)])
+    local_batch_cpu = batch_cpu[owned_q_cpu.numpy()].astype(np.int32)
+    md.batch_id_per_token_cpu = local_batch_cpu
+    md.batch_id_per_token = torch.from_numpy(local_batch_cpu).to(device=device)
+
+    pos = positions[:total_tokens]
+    if n_pad > 0:
+        pos = torch.cat([pos, pos.new_zeros(n_pad)], dim=0)
+    local_positions = pos[owned_q].contiguous()
+    _populate_pcp_indexer(md, local_positions, device)
+
+
+def _populate_pcp_indexer(md, positions: torch.Tensor, device) -> None:
+    n_csa = md.n_committed_csa_per_seq_cpu
+    cu = np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(n_csa, dtype=np.int32)])
+    cu[-1] = max(int(cu[-1]), 1)
+    cu_gpu = torch.from_numpy(cu).to(device=device, dtype=torch.int32)
+    bid = md.batch_id_per_token
+    if bid.numel() == 0:
+        md.indexer_meta = {
+            "total_committed": int(cu[-1]),
+            "cu_committed_gpu": cu_gpu,
+            "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
+            "batch_id_per_token_gpu": bid,
+            "seq_base_per_token_gpu": None,
+            "cu_starts_gpu": None,
+            "cu_ends_gpu": None,
+        }
+        return
+
+    valid = bid >= 0
+    safe_bid = bid.clamp_min(0).to(torch.long)
+    base = cu_gpu[safe_bid].to(torch.int32)
+    end = base + torch.minimum(
+        (positions.to(torch.int32) + 1) // 4,
+        md.n_committed_csa_per_seq[safe_bid],
+    ).to(torch.int32)
+    zero = torch.zeros_like(base)
+    base = torch.where(valid, base, zero)
+    end = torch.where(valid, end, zero)
     md.indexer_meta = {
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,
