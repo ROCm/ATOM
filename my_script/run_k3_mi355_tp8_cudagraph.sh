@@ -60,6 +60,20 @@ fi
 ( cd "$MODEL" 2>/dev/null && ls model-*.safetensors 2>/dev/null \
     | xargs -P12 -I{} dd if={} of=/dev/null bs=4M 2>/dev/null ) || true
 
+# flydsl moe
+export ATOM_USE_TRITON_GEMM=1
+export AITER_USE_GROUPED_GEMM=0
+export ATOM_USE_TRITON_MOE=0
+export AITER_FLYDSL_FORCE=1
+export AITER_FORCE_GFX1250=0
+
+# runtime
+export K3_MAX_MODEL_LEN=16384
+export K3_MAX_NUM_SEQS=16
+export K3_MAX_NUM_BATCHED_TOKENS=10240
+export K3_GMU=0.93
+export K3_LEVEL=0
+
 cd "$ATOM_DIR"
 exec /opt/venv/bin/python -m atom.entrypoints.openai_server \
   --model "$MODEL" \
