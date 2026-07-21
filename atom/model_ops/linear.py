@@ -631,15 +631,12 @@ class LinearBase(nn.Module):
                 need_gather = self.tp_dim == 1 and self.input_size % 32 != 0
         if need_gather:
             weight = self._gather_full_weight(weight)
-            # Only gather the scale along a dim it is actually sharded on. A
-            # per_Token scale is (N, 1): sharded on dim 0 (column parallel) but
-            # already full on dim 1 (row parallel), so gathering the size-1 dim
-            # would corrupt it. Block scales (per_1x128 / per_1x32) have a real
-            # size on tp_dim and are gathered as before.
-            if (
-                weight_scale is not None
-                and weight_scale.dim() > self.tp_dim
-                and weight_scale.shape[self.tp_dim] > 1
+            # Per-token scales are shaped (N, 1). In row-parallel layers
+            # (tp_dim=1), that size-1 dim is replicated rather than sharded, so
+            # gathering it would duplicate the scale columns. Block scales still
+            # follow the weight sharding and are gathered here.
+            if weight_scale is not None and not (
+                self.quant_type == QuantType.per_Token and self.tp_dim == 1
             ):
                 weight_scale = self._gather_full_weight(weight_scale)
 
