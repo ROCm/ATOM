@@ -26,6 +26,19 @@ def maybe_get_glm52_dsa_pools_from_sglang_backend(forward_batch=None):
         req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
         if token_to_kv_pool is not None and req_to_token_pool is not None:
             return token_to_kv_pool, req_to_token_pool
+
+    try:
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+    except Exception:
+        backend = None
+
+    token_to_kv_pool = getattr(backend, "token_to_kv_pool", None)
+    req_to_token_pool = getattr(backend, "req_to_token_pool", None)
+    if token_to_kv_pool is not None and req_to_token_pool is not None:
+        return token_to_kv_pool, req_to_token_pool
+
     return None, None
 
 
