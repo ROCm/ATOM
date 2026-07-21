@@ -65,25 +65,32 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  download_aiter_wheel:
+  prepare_aiter:
     if: ${{ needs.check-signal.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     needs: [check-signal]
-    name: Download aiter wheel
+    name: Prepare aiter dependency
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         uses: actions/checkout@v6
       - name: Prefer latest main aiter wheel manifest and fallback to artifact
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         uses: actions/upload-artifact@v7
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
           retention-days: 7
+
+      - name: Select requested aiter branch build
+        if: ${{ env.AITER_GIT_REF != 'main' }}
+        run: echo "AITER_GIT_REF=${AITER_GIT_REF} will be built inside each test container"
 
   load-test-models:
     name: Load test model configs
@@ -127,7 +134,7 @@ jobs:
           PY
 
   atomesh-test:
-    needs: [download_aiter_wheel, load-test-models]
+    needs: [prepare_aiter, load-test-models]
     name: Accuracy
     strategy:
       fail-fast: false
@@ -255,6 +262,7 @@ jobs:
           EOF
 
       - name: Download aiter wheel
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         uses: actions/download-artifact@v8
         with:
           name: aiter-whl
@@ -285,7 +293,12 @@ jobs:
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         run: bash .github/scripts/install_aiter_wheel.sh
+
+      - name: Build and install requested aiter branch
+        if: ${{ env.AITER_GIT_REF != 'main' }}
+        run: bash .github/scripts/install_aiter_branch.sh
 
       - name: Install ATOM and dependencies
         run: |
