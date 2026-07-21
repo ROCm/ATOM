@@ -8,7 +8,12 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
+from atom.config import (
+    CompilationConfig,
+    CUDAGraphMode,
+    DSparkConfig,
+    SpeculativeConfig,
+)
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
 logger = logging.getLogger("atom")
@@ -64,6 +69,7 @@ class EngineArgs:
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
+    dspark_config: Optional[dict] = None
 
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
@@ -231,7 +237,7 @@ class EngineArgs:
             "--method",
             type=str,
             default=None,
-            choices=["mtp", "eagle3"],
+            choices=["mtp", "eagle3", "dspark"],
             help="Speculative method",
         )
         parser.add_argument(
@@ -343,6 +349,28 @@ class EngineArgs:
                 '\'{"use_index_cache": true, "index_topk_freq": 4}\''
             ),
         )
+        parser.add_argument(
+            "--dspark-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "DSpark dynamic config as a JSON dict, parsed straight into a "
+                "DSparkConfig object (no env vars). Supported keys:\n"
+                '  - "confidence_schedule": bool, enable confidence-scheduled '
+                "verification (per-request verify length ell_r).\n"
+                '  - "ragged": bool, enable per-request ragged verify '
+                "(no batch-level q padding).\n"
+                '  - "ragged_graph_sizes": str, comma-separated per-seq CUDA-graph '
+                'query-length buckets to capture, e.g. "1,3,6" or "8".\n'
+                '  - "q_buckets": str, CUDA-graph query-length buckets for the '
+                "older batch-uniform q-bucket verify path.\n"
+                '  - "disable_sps_calib": bool, skip SPS calibration and use the '
+                "synthetic stub.\n"
+                "Example:\n"
+                """  '{"confidence_schedule": true, "ragged": true, """
+                """"ragged_graph_sizes": "8"}'"""
+            ),
+        )
 
         return parser
 
@@ -405,6 +433,10 @@ class EngineArgs:
 
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+
+        # --dspark-config (JSON dict) → DSparkConfig object, passed through as
+        # Config.dspark (no env vars).
+        kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
 
         logger.info(f"Engine kwargs: {kwargs}")
 

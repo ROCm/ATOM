@@ -909,8 +909,9 @@ def _make_compress_plans(extend_lens_cpu, context_lens_cpu, device):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         [(4, True), (128, False)],
         plan_buffers=plan_buffers,
-        decode_capacity_per_ratio=None,
     )
+    # Eager path (graph_bs unset): full-buffer write slice; the eager bridge
+    # launches update_compressor_states with exactly num_write rows.
     for plan in plans.values():
         plan.write_plan_gpu = plan.write_plan_gpu[: plan.num_write]
     return plans
@@ -974,17 +975,25 @@ class _V4SGLangDecodeGraphBuffers:
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
 
+        # Decode CG plan slicing is `graph_bs * per_seq_bound` (computed inside
+        # make_compress_plans). graph_bs == num_slots (padded decode batch);
+        # max_q_len == 1 + max_spec_steps (== max_decode_tokens // num_slots).
+        self.decode_graph_bs = s
+        self.decode_q_len = max(1, t // s)
+        # Compress buffer sized to the graph_bs compress cap `s*ceil(qlen/ratio)`
+        # (matches make_compress_plans' slice); write buffer to `s*K_pool`. Sizing
+        # flat `s` would undersize the compress plan once ceil(qlen/ratio)>1 (mtp_k
+        # >= 4). Mirrors the vllm bridge's `S*per_seq` sizing.
         self.plan_buffers = {
             4: {
-                "compress": i32(max(1, s), 4),
+                "compress": i32(max(1, s * ((self.decode_q_len + 3) // 4)), 4),
                 "write": i32(max(1, s * 8), 4),
             },
             128: {
-                "compress": i32(max(1, s), 4),
+                "compress": i32(max(1, s * ((self.decode_q_len + 127) // 128)), 4),
                 "write": i32(max(1, s * 128), 4),
             },
         }
-        self.decode_compress_cap = {4: max(1, s), 128: max(1, s)}
 
     def stage(self, buf, arr_np, n: Optional[int] = None):
         n = int(arr_np.shape[0]) if n is None else int(n)
@@ -1091,7 +1100,8 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         [(4, True), (128, False)],
         plan_buffers=bufs.plan_buffers,
-        decode_capacity_per_ratio=bufs.decode_compress_cap,
+        graph_bs=bufs.decode_graph_bs,
+        max_q_len=bufs.decode_q_len,
     )
 
 

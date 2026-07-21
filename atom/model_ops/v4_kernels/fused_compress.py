@@ -10,7 +10,7 @@ SGLang plan-style batched dispatch (vs. the earlier per-seq launcher):
   Each compression boundary across the entire fwd is one row in
   `compress_plan_gpu` — a packed `[num_compress, 4] int32` tensor where each
   row is `[ragged_id, batch_id, position, window_len]`. The kernel grid is
-  the caller-supplied slice length (decode CG: `_decode_compress_cap[ratio]`
+  the caller-supplied slice length (decode CG: `graph_bs * ceil(qlen/ratio)`
   / eager prefill: `n_compress`); inactive plan rows are sentinel-marked
   (`position == -1`) and bail at the top of the kernel. Each program does
   ONE 4×i32 load to get all the metadata it needs:
@@ -143,7 +143,7 @@ def _fused_compress_attn_kernel(
     FP8_MAX: tl.constexpr = 1.0,
 ):
     """One program per boundary in the plan. Grid = caller-supplied slice
-    length (decode CG: `_decode_compress_cap[ratio]` for capture/replay
+    length (decode CG: `graph_bs * ceil(qlen/ratio)` for capture/replay
     address stability; eager prefill: tight `n_compress`). Inactive rows
     are sentinel-marked (position == -1) and bail before any load /
     store / scatter."""

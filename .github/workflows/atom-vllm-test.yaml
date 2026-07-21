@@ -132,32 +132,41 @@ jobs:
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu-vllm-sgl-ci
-          - display_name: "gpt-oss-120b TP1"
-            model_name: "gpt-oss-120b"
-            model_path: "openai/gpt-oss-120b"
-            extra_args: "--tensor-parallel-size 1 --gpu-memory-utilization 0.5"
-            client_command: "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
-            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_USE_V2_MODEL_RUNNER=1"
-            lm_eval_num_fewshot: 3
-            accuracy_test_threshold: 0.88
+          - display_name: "GLM-5.2-MXFP4-MTP TP4"
+            model_name: "GLM-5.2-MXFP4-MTP"
+            model_path: "amd/GLM-5.2-MXFP4"
+            extra_args: "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\", \"model.layers.[1-6][0-9].mlp.*expert*\", \"model.layers.7[0-7].mlp.*expert*\"]}}' --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'"
+            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1"
+            lm_eval_num_fewshot: 20
+            accuracy_test_threshold: 0.91
             runner: atom-mi355-8gpu-vllm-sgl-ci
-          - display_name: "Kimi-K2.5-MXFP4 TP4"
-            model_name: "Kimi-K2.5-MXFP4"
-            model_path: "amd/Kimi-K2.5-MXFP4-AttnFP8"
+          - display_name: "MiniMax-M3-MXFP4 TP4"
+            model_name: "MiniMax-M3-MXFP4"
+            model_path: "amd/MiniMax-M3-MXFP4"
+            client_command: "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=32,max_gen_toks=2048 --tasks gsm8k --num_fewshot 5 --batch_size 65 --output_path ${OUTPUT_PATH}"
+            extra_args: "--tensor-parallel-size 4 --kv-cache-dtype auto --no-trust-remote-code --gpu-memory-utilization 0.85 --block-size 128 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --no-enable_prefix_caching --no-async-scheduling --language-model-only --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}'"
+            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+            lm_eval_num_fewshot: 5
+            accuracy_test_threshold: 0.93
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+          - display_name: "Kimi-K2.7-MXFP4 TP4"
+            model_name: "Kimi-K2.7-Code-MXFP4"
+            model_path: "amd/Kimi-K2.7-Code-MXFP4"
             extra_args: "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384"
             env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.92
             runner: atom-mi355-8gpu-vllm-sgl-ci
-          - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
-            model_name: "Qwen3.5-35B-A3B-FP8"
-            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
-            extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
+          - display_name: "Qwen3.5-397B-A17B-MXFP4 TP4"
+            model_name: "Qwen3.5-397B-A17B-MXFP4"
+            model_path: "amd/Qwen3.5-397B-A17B-MXFP4"
+            extra_args: "--tensor-parallel-size 4"
             env_vars: |
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
+              ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
             lm_eval_num_fewshot: 3
-            accuracy_test_threshold: 0.77
+            accuracy_test_threshold: 0.83
             runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180

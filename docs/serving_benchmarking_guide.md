@@ -1,13 +1,11 @@
-# ATOM Serving & Benchmarking Guide
+# ATOM serving & benchmarking guide
 
 ATOM (AiTer Optimized Model) is AMD's lightweight LLM inference engine built on
 [AITER](https://github.com/ROCm/aiter) kernels for ROCm/HIP GPUs.  This guide
 covers the OpenAI-compatible serving API, programmatic engine usage, benchmarking
 tools, profiling, and speculative decoding.
 
----
-
-## Quick Reference
+## Quick reference
 
 ```bash
 # Start the OpenAI-compatible server
@@ -32,15 +30,13 @@ lm_eval --model local-completions \
     --tasks gsm8k --num_fewshot 5
 ```
 
----
-
-## 1. OpenAI-Compatible Server
+## OpenAI-compatible server
 
 The server is implemented in `atom/entrypoints/openai_server.py` using FastAPI
 and Uvicorn.  It exposes OpenAI-compatible HTTP endpoints so that existing
 clients (curl, OpenAI SDK, lm-eval) work without modification.
 
-### 1.1 Endpoints
+### Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -51,7 +47,7 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `POST` | `/start_profile` | Start torch profiler on the engine |
 | `POST` | `/stop_profile` | Stop torch profiler and flush traces |
 
-### 1.2 Request Models
+### Request models
 
 **ChatCompletionRequest** fields:
 
@@ -81,22 +77,22 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `ignore_eos` | `Optional[bool]` | `False` | Ignore end-of-sequence token |
 | `stream` | `Optional[bool]` | `False` | Enable SSE streaming |
 
-### 1.3 Response Models
+### Response models
 
 Both `ChatCompletionResponse` and `CompletionResponse` include:
 
-- `id` -- unique request identifier (e.g. `chatcmpl-<uuid>` or `cmpl-<uuid>`)
-- `object` -- `"chat.completion"` or `"text_completion"`
-- `created` -- Unix timestamp
-- `model` -- model name
-- `choices` -- list of generated completions
-- `usage` -- token counts (`prompt_tokens`, `completion_tokens`, `total_tokens`)
+- `id` — unique request identifier (e.g. `chatcmpl-<uuid>` or `cmpl-<uuid>`)
+- `object` — `"chat.completion"` or `"text_completion"`
+- `created` — Unix timestamp
+- `model` — model name
+- `choices` — list of generated completions
+- `usage` — token counts (`prompt_tokens`, `completion_tokens`, `total_tokens`)
   plus `ttft_s`, `tpot_s`, and `latency_s` timing fields
 
 Streaming responses use the SSE (Server-Sent Events) protocol with
 `data: [DONE]\n\n` as the termination signal.
 
-### 1.4 Server Startup
+### Server startup
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -115,7 +111,7 @@ Server-specific CLI arguments:
 
 All `EngineArgs` arguments are also accepted (see Section 7 for the full list).
 
-### 1.5 Example: curl
+### Example: curl
 
 ```bash
 # Non-streaming chat completion
@@ -137,14 +133,12 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
----
-
-## 2. Programmatic API (LLMEngine)
+## Programmatic API (LLMEngine)
 
 The `LLMEngine` class in `atom/model_engine/llm_engine.py` provides a
 Python-native interface for inference without running an HTTP server.
 
-### 2.1 Initialization
+### Initialization
 
 ```python
 from atom import LLMEngine, SamplingParams
@@ -157,7 +151,7 @@ engine = LLMEngine(model="deepseek-ai/DeepSeek-R1", kv_cache_dtype="fp8",
 keyword arguments (e.g. `tensor_parallel_size`, `kv_cache_dtype`,
 `max_model_len`, `data_parallel_size`, `gpu_memory_utilization`).
 
-### 2.2 SamplingParams
+### SamplingParams
 
 Defined in `atom/sampling_params.py`:
 
@@ -170,7 +164,7 @@ class SamplingParams:
     stop_strings: Optional[list[str]] = None
 ```
 
-### 2.3 Core Methods
+### Core methods
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -182,7 +176,7 @@ class SamplingParams:
 | `stop_profile` | `()` | Stop torch profiler and write traces |
 | `print_mtp_statistics` | `()` | Print speculative decoding acceptance statistics |
 
-### 2.4 Synchronous Generation Example
+### Synchronous generation example
 
 ```python
 from atom import LLMEngine, SamplingParams
@@ -198,7 +192,7 @@ for out in outputs:
 Each output dictionary contains: `text`, `token_ids`, `latency`,
 `finish_reason`, `num_tokens_input`, `num_tokens_output`, `ttft`, and `tpot`.
 
-### 2.5 Asynchronous / Streaming Usage
+### Asynchronous / streaming usage
 
 ```python
 engine.add_request(
@@ -212,14 +206,12 @@ while not engine.is_finished():
     # process completed sequences
 ```
 
----
-
-## 3. Simple Inference
+## Simple inference
 
 The `atom/examples/simple_inference.py` script provides a quick way to validate
 model loading and generation.
 
-### 3.1 Usage
+### Usage
 
 ```bash
 python -m atom.examples.simple_inference \
@@ -228,7 +220,7 @@ python -m atom.examples.simple_inference \
     --temperature 0.6
 ```
 
-### 3.2 What It Does
+### What it does
 
 1. Parses all `EngineArgs` plus `--temperature` (default `0.6`).
 2. Creates an `LLMEngine` via `EngineArgs.from_cli_args(args).create_engine()`.
@@ -238,15 +230,13 @@ python -m atom.examples.simple_inference \
 5. Calls `llm.print_mtp_statistics()` to report speculative decoding stats
    (if MTP is enabled).
 
----
-
-## 4. Benchmarking
+## Benchmarking
 
 ATOM ships a comprehensive online serving benchmark in
 `atom/benchmarks/benchmark_serving.py` (adapted from vLLM's benchmarking
 tooling).
 
-### 4.1 Metrics
+### Metrics
 
 The `BenchmarkMetrics` dataclass tracks:
 
@@ -264,7 +254,7 @@ The `BenchmarkMetrics` dataclass tracks:
 For each latency metric, mean, median, standard deviation, and configurable
 percentiles (default: P99) are reported.
 
-### 4.2 Key CLI Arguments
+### Key CLI arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -301,7 +291,7 @@ percentiles (default: P99) are reported.
 | `--random-prefix-len` | `0` | Fixed prefix token length |
 | `--use-chat-template` | `False` | Apply chat template to random prompts |
 
-### 4.3 Backend Request Functions
+### Backend request functions
 
 Defined in `atom/benchmarks/backend_request_func.py`:
 
@@ -320,7 +310,7 @@ Defined in `atom/benchmarks/backend_request_func.py`:
 Each function uses `RequestFuncInput` and returns a `RequestFuncOutput` with
 timing data (`ttft`, `itl`, `latency`, `tpot`).
 
-### 4.4 Full Benchmark Example
+### Full benchmark example
 
 ```bash
 # 1. Start the server
@@ -347,14 +337,12 @@ python -m atom.benchmarks.benchmark_serving \
     --result-dir=./ --result-filename=$RESULT_FILENAME.json
 ```
 
----
-
-## 5. Profiling
+## Profiling
 
 ATOM supports PyTorch profiling via environment variables, HTTP endpoints, and
 the programmatic API.
 
-### 5.1 Configuration
+### Configuration
 
 | Mechanism | Description |
 |-----------|-------------|
@@ -372,7 +360,7 @@ rank-specific subdirectory:
 Traces are saved in gzip-compressed TensorBoard format and can be viewed with
 `tensorboard --logdir <profiler_dir>` or Chrome's `chrome://tracing`.
 
-### 5.2 Online Profiling (HTTP)
+### Online profiling (HTTP)
 
 While the server is running, start and stop profiling with HTTP requests:
 
@@ -390,7 +378,7 @@ The server must be started with `--torch-profiler-dir` or with
 `ATOM_TORCH_PROFILER_DIR` set for these endpoints to produce traces.
 For large traces, set `ATOM_PROFILER_TIMEOUT` higher before starting the server.
 
-### 5.3 Programmatic Profiling
+### Programmatic profiling
 
 ```python
 engine = LLMEngine(model="Qwen/Qwen3-0.6B", torch_profiler_dir="./traces")
@@ -401,7 +389,7 @@ engine.stop_profile()
 # Traces written to ./traces/rank_0/
 ```
 
-### 5.4 Offline Profiling Script
+### Offline profiling script
 
 `atom/examples/profile_offline.py` provides a self-contained offline profiling
 workflow:
@@ -428,7 +416,7 @@ Script-specific arguments:
 If `--torch-profiler-dir` is not specified, the script defaults to
 `./profiler_traces`.
 
-### 5.5 Profiling During Benchmarks
+### Profiling during benchmarks
 
 The benchmark tool can trigger profiling automatically via `--profile`:
 
@@ -443,14 +431,12 @@ python -m atom.benchmarks.benchmark_serving \
 This sends `POST /start_profile` before the benchmark and
 `POST /stop_profile` after completion.
 
----
-
-## 6. Speculative Decoding (MTP)
+## Speculative decoding (MTP)
 
 ATOM supports Multi-Token Prediction (MTP) for DeepSeek models using the
 Eagle-style speculative decoding framework.
 
-### 6.1 Architecture
+### Architecture
 
 - **EagleProposer** (`atom/spec_decode/eagle.py`): Loads and runs the draft
   (MTP) model to propose speculative tokens.  Supports the `DeepSeekMTPModel`
@@ -460,7 +446,7 @@ Eagle-style speculative decoding framework.
   against target model argmax and accepts matching prefixes; appends a bonus
   token if all drafts are accepted.
 
-### 6.2 Configuration
+### Configuration
 
 Enable MTP via CLI arguments:
 
@@ -478,7 +464,7 @@ python -m atom.entrypoints.openai_server \
 | `--num-speculative-tokens` | `1` | Number of draft tokens per iteration (draft model runs this many autoregressive steps) |
 | `--draft-model` | `None` | Path or HF repo of the speculative draft model. Required for `--method eagle3`; the draft's `config.json` drives EAGLE 3 vs EAGLE 3.1 toggles automatically |
 
-### 6.3 MTP Statistics
+### MTP statistics
 
 ATOM tracks acceptance statistics at runtime:
 
@@ -493,14 +479,14 @@ engine.print_mtp_statistics()
 ```
 
 Example output:
-```
+```text
 MTP Statistics:
   Total draft tokens: 5000
   Accepted tokens:    4250
   Acceptance rate:    85.00%
 ```
 
-### 6.4 How Rejection Sampling Works
+### How rejection sampling works
 
 1. The draft model generates `num_speculative_tokens` token predictions
    autoregressively using argmax.
@@ -513,11 +499,9 @@ MTP Statistics:
    - If all draft tokens match, a bonus token from the target model is
      appended.
 
----
+## Deployment examples
 
-## 7. Deployment Examples
-
-### 7.1 Single-GPU
+### Single-GPU
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -525,7 +509,7 @@ python -m atom.entrypoints.openai_server \
     --kv_cache_dtype fp8
 ```
 
-### 7.2 Multi-GPU with Tensor Parallelism
+### Multi-GPU with tensor parallelism
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -534,7 +518,7 @@ python -m atom.entrypoints.openai_server \
     -tp 8
 ```
 
-### 7.3 Docker Deployment
+### Docker deployment
 
 ```bash
 # Pull the ROCm PyTorch image
@@ -565,7 +549,7 @@ python -m atom.entrypoints.openai_server \
     --kv_cache_dtype fp8 -tp 8
 ```
 
-### 7.4 Engine CLI Arguments (EngineArgs)
+### Engine CLI arguments (EngineArgs)
 
 These arguments are available for all entrypoints (server, examples, and any
 script using `EngineArgs.add_cli_args`):
@@ -595,21 +579,19 @@ script using `EngineArgs.add_cli_args`):
 | `--method` | `None` | Speculative decoding method (`mtp`) |
 | `--num-speculative-tokens` | `1` | Number of speculative tokens per step |
 
----
-
-## 8. Accuracy Validation
+## Accuracy validation
 
 ATOM supports accuracy validation through the
 [lm-eval](https://github.com/EleutherAI/lm-evaluation-harness) framework via
 the OpenAI-compatible API.
 
-### 8.1 Setup
+### Setup
 
 ```bash
 pip install lm-eval[api]
 ```
 
-### 8.2 Run Evaluation
+### Run evaluation
 
 Start an ATOM server, then run lm-eval against it:
 
@@ -630,9 +612,7 @@ Any lm-eval task can be used.  The `local-completions` model type sends
 requests to the `/v1/completions` endpoint, making it compatible with the ATOM
 server without modification.
 
----
-
-## Source Files
+## Source files
 
 | File | Description |
 |------|-------------|

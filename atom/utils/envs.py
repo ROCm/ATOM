@@ -255,6 +255,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
+    # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
+    # They are configured via --dspark-config (JSON dict) and carried in
+    # config.dspark (see atom/config.py DSparkConfig). See
+    # recipes/DeepSeek-V4-DSpark.md.
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under
