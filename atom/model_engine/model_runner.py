@@ -3099,9 +3099,6 @@ class ModelRunner:
                 pp_group = get_pp_group()
                 pp_enabled = pp_group.world_size > 1
 
-                if pp_enabled and self._pp_pending_send:
-                    commit_pp_send_work(self._pp_pending_send)
-
                 intermediate_tensors = None
                 if pp_enabled and not pp_group.is_first_rank:
                     intermediate_tensors = recv_intermediate_tensors()
@@ -3120,6 +3117,8 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 if pp_enabled and not pp_group.is_last_rank:
+                    if self._pp_pending_send:
+                        commit_pp_send_work(self._pp_pending_send)
                     self._pp_pending_send = async_send_intermediate_tensors(
                         model_output
                     )
