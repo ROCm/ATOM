@@ -724,17 +724,22 @@ class KimiKDAAttention(nn.Module):
         # shells; their bf16 post-load hooks are no-ops and are never re-run.
         for m in subs:
             m.weight.data = m.weight.data.new_empty(0)
-        self._in_proj_fused = True
 
-    def _conv_weights(self) -> torch.Tensor:
-        return torch.cat(
+        # Pre-concatenate the static q/k/v causal-conv weights once here instead
+        # of rebuilding the [3*local_proj_size, K] tensor on every forward.
+        self.conv_weight = torch.cat(
             [
                 self.q_conv1d.weight.view(self.local_proj_size, self.conv_kernel_size),
                 self.k_conv1d.weight.view(self.local_proj_size, self.conv_kernel_size),
                 self.v_conv1d.weight.view(self.local_proj_size, self.conv_kernel_size),
             ],
             dim=0,
-        )
+        ).contiguous()
+
+        self._in_proj_fused = True
+
+    def _conv_weights(self) -> torch.Tensor:
+        return self.conv_weight
 
     def _run_kda(
         self,
