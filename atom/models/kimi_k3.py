@@ -599,6 +599,13 @@ class KimiKDAAttention(nn.Module):
         self.activation = "silu"
         self.base_linear_attention = True
 
+        # q/k/v/g/b input projections. These are loaded as separate modules
+        # (unique, collision-free checkpoint names) and then concatenated into a
+        # single fused in-proj weight in process_weights_after_loading so the
+        # runtime does one GEMM ([q | k | v | g | b]). g_proj cannot be merged
+        # via packed_modules_mapping because its name is shared with the MLA
+        # layers' g_proj (the loader matches by substring), so all five go
+        # through the post-load concat path instead.
         self.q_proj = ColumnParallelLinear(
             self.hidden_size,
             self.proj_size,
@@ -688,6 +695,37 @@ class KimiKDAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+    def process_weights_after_loading(self) -> None:
+        """Fuse q/k/v/g/b into a single in-proj weight (one runtime GEMM).
+
+        The five hidden-input projections are loaded as separate modules
+        (their checkpoint names are unique and collision-free; g_proj in
+        particular cannot go through packed_modules_mapping because its name is
+        shared with the MLA layers' g_proj under the loader's substring match).
+        Here they are concatenated into one ``[q | k | v | g | b]`` weight and
+        the per-projection storage is released, so ``forward`` runs a single
+        ``F.linear`` instead of five. Runs once; idempotent.
+
+        Assumes bf16 (unquantized) attention weights, which the Kimi-K3
+        checkpoint guarantees (``re:.*self_attn.*`` is in the quant ignore
+        list). A quantized-attention checkpoint would need per-shard scale
+        handling and is rejected loudly rather than silently mis-fused.
+        """
+        if getattr(self, "_in_proj_fused", False):
+            return
+        subs = (self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.b_proj)
+        assert all(m.quant_type == QuantType.No for m in subs), (
+            "KDA in-proj fusion assumes unquantized (bf16) attention weights; "
+            "this checkpoint quantizes self_attn projections."
+        )
+        fused = torch.cat([m.weight.data for m in subs], dim=0).contiguous()
+        self.in_proj_weight = nn.Parameter(fused, requires_grad=False)
+        # Release the per-projection weight storage. The modules stay as empty
+        # shells; their bf16 post-load hooks are no-ops and are never re-run.
+        for m in subs:
+            m.weight.data = m.weight.data.new_empty(0)
+        self._in_proj_fused = True
+
     def _conv_weights(self) -> torch.Tensor:
         return torch.cat(
             [
@@ -754,17 +792,17 @@ class KimiKDAAttention(nn.Module):
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
-        mixed_qkv = torch.cat(
-            [
-                self.q_proj(hidden_states),
-                self.k_proj(hidden_states),
-                self.v_proj(hidden_states),
-            ],
-            dim=-1,
-        )
+        # Single fused in-proj GEMM producing [q | k | v | g | b]; slice out
+        # each part. `out_gate` is the KDA output gate consumed at o_norm below
+        # (computed here so it rides the same GEMM instead of a separate one
+        # after the recurrence).
+        lp = self.local_proj_size
+        fused_in = F.linear(hidden_states, self.in_proj_weight)
+        mixed_qkv = fused_in[..., : 3 * lp].contiguous()
+        out_gate = fused_in[..., 3 * lp : 4 * lp]
+        beta = fused_in[..., 4 * lp :].unsqueeze(0)
         gate = self.f_b_proj(self.f_a_proj(hidden_states))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        beta = self.b_proj(hidden_states).unsqueeze(0)
         out = hidden_states.new_empty(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
@@ -847,8 +885,7 @@ class KimiKDAAttention(nn.Module):
             out.zero_()
 
         out = self.o_norm(
-            out,
-            rearrange(self.g_proj(hidden_states), "t (h d) -> t h d", d=self.head_dim),
+            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
         )
         return self.o_proj(rearrange(out, "t h d -> t (h d)"))
 
