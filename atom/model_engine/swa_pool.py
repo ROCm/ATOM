@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from collections import OrderedDict, deque
+from collections import OrderedDict
 
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.unified_chunk_pool import UnifiedTypePool
 
 
 class SlidingWindowPool:
@@ -39,6 +40,7 @@ class SlidingWindowPool:
         full_retain: bool = False,
         retention_interval: int = 0,
         checkpoint_frac: float = 0.5,
+        chunk_pool: "UnifiedTypePool | None" = None,
     ):
         self.enabled: bool = num_blocks > 0
         self.window: int = window
@@ -82,34 +84,49 @@ class SlidingWindowPool:
         )
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.free_block_ids_set: set[int] = set(range(num_blocks))
-        self.used_block_ids: set[int] = set()
+        # Free-list moved to the shared UnifiedChunkPool (plan §5.2): the SWA pool
+        # draws physical block ids from it, so freed SWA blocks can (Phase 2) be
+        # reused by the compressor and vice versa. Phase 1: SWA-only side, spc=1 →
+        # behaviorally identical to the old deque/set. When BlockManager injects a
+        # shared pool it is used directly; otherwise own a private SWA-only one.
+        # SWA draws slots from a per-type UnifiedTypePool. Flag-off (static split):
+        # a private SWA-only pool (k=0), num_swa_blocks slots → phys = slot = w,
+        # row = w*block_size, byte-identical to the old free-list. Flag-on: a
+        # shared per-type pool is injected (SWA + that type's compress share it).
+        self.chunk_pool: UnifiedTypePool = chunk_pool or UnifiedTypePool(
+            num_blocks, k=0, block_size=block_size
+        )
 
     # ----------------------------- primitives ------------------------------ #
     def _pop(self) -> int:
-        while self.free_block_ids:
-            block_id = self.free_block_ids.popleft()
-            if block_id in self.free_block_ids_set:
-                self.free_block_ids_set.discard(block_id)
-                return block_id
-        raise AssertionError("No free SWA blocks available")
+        """Get a free SWA block id from the shared chunk pool (marks it used)."""
+        return self.chunk_pool.alloc_swa()
 
     def _alloc(self, block_id: int) -> Block:
+        """Reset block metadata for a freshly-popped id (lazy hash eviction).
+        Free-list state is owned by chunk_pool; _pop already marked it used."""
         block = self.blocks[block_id]
         assert block.ref_count == 0
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
         block.reset()
-        self.free_block_ids_set.discard(block_id)
-        self.used_block_ids.add(block_id)
         return block
 
     def _dealloc(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
-        self.free_block_ids_set.add(block_id)
+        self.chunk_pool.free_swa(block_id)
+
+    def evict_slot(self, block_id: int) -> None:
+        """Drop the content-cache entry for SWA block `block_id` because a compress
+        pool is about to overwrite its physical slot (unified pool, plan §11.1).
+        Registered as the coordinator's SWA evict callback. Only called for
+        released (ref-0) slots; pinned checkpoints hold a ref → never released, so
+        never reach here. Idempotent / safe if the slot holds no live hash."""
+        block = self.blocks[block_id]
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+            del self.hash_to_block_id[block.hash]
+        block.hash = -1
+        self.checkpoint_lru.pop(block_id, None)
 
     # ------------------------ sparse checkpoint pins ----------------------- #
     def _is_checkpoint(self, seq: Sequence, i: int) -> bool:
@@ -152,7 +169,7 @@ class SlidingWindowPool:
         blocks admission)."""
         if not self.enabled:
             return True
-        return len(self.free_block_ids_set) >= n
+        return self.chunk_pool.has_free_swa(n)
 
     def admission_blocks(self, seq: Sequence) -> int:
         """Peak concurrent SWA blocks one request holds during (chunked) prefill.
@@ -218,13 +235,12 @@ class SlidingWindowPool:
             return
         swa_id = self.hash_to_block_id[h]
         block = self.blocks[swa_id]
-        if swa_id in self.used_block_ids:
+        if not self.chunk_pool.is_free_swa(swa_id):
             block.ref_count += 1
         else:
             assert block.ref_count == 0
             block.ref_count = 1
-            self.free_block_ids_set.discard(swa_id)
-            self.used_block_ids.add(swa_id)
+            self.chunk_pool.claim_swa(swa_id)
         # Cross-request reuse of a pinned checkpoint → refresh its LRU recency.
         if swa_id in self.checkpoint_lru:
             self.checkpoint_lru.move_to_end(swa_id)

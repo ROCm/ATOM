@@ -354,6 +354,16 @@ class ScheduledBatch:
         self.swa_block_tables = [
             seq.swa_block_table for seq in seqs.values() if seq.block_table
         ]
+        # DeepSeek-V4 unified KV pool (ATOM_UNIFIED_KV_SHARE / plan §11): per-type
+        # PHYSICAL compress tables (base-0, row = phys*k). CSA and HCA are allocated
+        # independently so each can borrow SWA-freed slots. `block_table` above
+        # stays LOGICAL. Empty (flag-off) → downstream reverts to block_tables.
+        self.csa_block_tables = [
+            seq.csa_block_table for seq in seqs.values() if seq.block_table
+        ]
+        self.hca_block_tables = [
+            seq.hca_block_table for seq in seqs.values() if seq.block_table
+        ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]

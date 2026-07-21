@@ -96,6 +96,14 @@ class Sequence:
         # out-of-window SWA blocks can be freed while compressed blocks persist).
         # Empty / unused for non-SWA models.
         self.swa_block_table = []
+        # DeepSeek-V4 unified KV pool (ATOM_UNIFIED_KV_SHARE / plan §11): per-type
+        # PHYSICAL compress block tables. `block_table` stays the LOGICAL compress
+        # id (prefix-cache / hashing unchanged); these hold the physical block ids
+        # in the CSA (k=32) and HCA (k=1) pools, which are allocated independently
+        # so each can borrow SWA-freed slots (base-0 addressing, row = phys * k).
+        # Positionally aligned with `block_table`. Empty unless the flag is on.
+        self.csa_block_table = []
+        self.hca_block_table = []
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).

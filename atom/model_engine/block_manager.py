@@ -17,6 +17,10 @@ from atom.distributed.kv_events import (
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.swa_pool import SlidingWindowPool
+from atom.model_engine.unified_chunk_pool import (
+    UnifiedKvCoordinator,
+    unified_slot_counts,
+)
 from atom.utils import envs
 
 
@@ -83,8 +87,35 @@ class BlockManager:
         # byte-identical. See atom/model_engine/swa_pool.py.
         _spec = getattr(config, "speculative_config", None)
         _mtp_k = int(getattr(_spec, "num_speculative_tokens", 0) or 0) if _spec else 0
+        _num_swa_blocks = getattr(config, "num_swa_blocks", 0)
+
+        # DeepSeek-V4 unified KV pool (ATOM_UNIFIED_KV_SHARE / plan §11, option-2).
+        # When on for a V4 (SWA) model, SWA and the per-type compressors (CSA k=32,
+        # HCA k=1) draw physical space from ONE coordinator so compress can borrow
+        # SWA-freed slots. `block_table` stays LOGICAL (prefix cache unchanged); the
+        # coordinator maps each live logical compress block to a physical id in the
+        # CSA and HCA pools (base-0, row = phys * k). Flag-off → coordinator is None
+        # and every path below stays byte-identical to today.
+        self._unified: UnifiedKvCoordinator | None = None
+        if envs.ATOM_UNIFIED_KV_SHARE and _num_swa_blocks > 0:
+            n_csa_slots, n_hca_slots = self._unified_slot_counts(
+                config, _num_swa_blocks, num_blocks, block_size
+            )
+            self._unified = UnifiedKvCoordinator(
+                num_swa_base=_num_swa_blocks,
+                n_csa_slots=n_csa_slots,
+                n_hca_slots=n_hca_slots,
+                block_size=block_size,
+            )
+            # Per-logical-block physical binding (index = logical compress id).
+            # -1 = unbound (block not currently holding content). A binding is
+            # created on true allocation, retained across cache-free (lazy reuse),
+            # and re-issued on evict-reuse; see _allocate_block / _deallocate_block.
+            self._logical_csa: list[int] = [-1] * num_blocks
+            self._logical_hca: list[int] = [-1] * num_blocks
+
         self.swa = SlidingWindowPool(
-            num_blocks=getattr(config, "num_swa_blocks", 0),
+            num_blocks=_num_swa_blocks,
             window=getattr(config, "swa_window_size", 0),
             block_size=block_size,
             max_num_batched_tokens=getattr(config, "max_num_batched_tokens", 0),
@@ -92,7 +123,21 @@ class BlockManager:
             full_retain=envs.ATOM_SWA_FULL_RETAIN,
             retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
             checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
+            chunk_pool=self._unified,
         )
+        if self._unified is not None:
+            # Compress borrowing an SWA-cached slot must drop the SWA cache entry
+            # first (plan §11.1), else a later SWA hash-hit double-claims it.
+            self._unified.set_swa_evict_cb(self.swa.evict_slot)
+
+    @staticmethod
+    def _unified_slot_counts(config, num_swa_blocks, num_logical_blocks, block_size):
+        """Per-type compress-pool slot counts. Shares the SINGLE formula with the
+        attention builder's unified_kv tensor sizing (unified_slot_counts) so the
+        coordinator and the physical tensors agree exactly. block_ratio is asserted
+        1 for V4 (logical == physical compress blocks) in allocate_kv_cache; here
+        num_logical_blocks == num_physical compress blocks."""
+        return unified_slot_counts(num_swa_blocks, num_logical_blocks, block_size)
 
     @property
     def swa_enabled(self) -> bool:
@@ -129,6 +174,9 @@ class BlockManager:
         block.reset()
         self.free_block_ids_set.discard(block_id)
         self.used_block_ids.add(block_id)
+        # Unified pool: this logical id now holds fresh content → (re)bind its
+        # per-type physical space (returns any prior binding to the coordinator).
+        self._rebind_physical(block_id)
         return self.blocks[block_id]
 
     def _deallocate_block(self, block_id: int):
@@ -136,6 +184,42 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
         self.free_block_ids_set.add(block_id)
+        # Unified pool: RETAIN the physical CSA/HCA binding across cache-free so a
+        # later cache-hit reuses the resident KV (matches flag-off's lazy logical
+        # retention). Physical is returned to the coordinator only on evict-reuse
+        # (_rebind_physical) — that is when SWA can reclaim the freed slot.
+
+    # --------------- unified pool: per-type physical binding --------------- #
+    def _rebind_physical(self, block_id: int) -> None:
+        """Give logical compress block `block_id` a fresh CSA+HCA physical binding
+        for new content (true alloc / evict-reuse). Frees any prior binding first
+        so the coordinator can hand a borrowed SWA slot back to SWA. Flag-off: no-op
+        (self._unified is None)."""
+        if self._unified is None:
+            return
+        old_csa = self._logical_csa[block_id]
+        if old_csa != -1:
+            self._unified.free_csa(old_csa)
+            self._unified.free_hca(self._logical_hca[block_id])
+        self._logical_csa[block_id] = self._unified.alloc_csa()
+        self._logical_hca[block_id] = self._unified.alloc_hca()
+
+    def _append_phys(self, seq: Sequence, block_id: int) -> None:
+        """Append `block_id`'s physical CSA/HCA ids to the seq's per-type tables,
+        positionally aligned with seq.block_table. Flag-off: no-op."""
+        if self._unified is None:
+            return
+        seq.csa_block_table.append(self._logical_csa[block_id])
+        seq.hca_block_table.append(self._logical_hca[block_id])
+
+    def _unified_has_free(self, n_new_blocks: int) -> bool:
+        """Whether the coordinator can supply `n_new_blocks` new CSA and HCA
+        physical blocks. Flag-off / n<=0: True."""
+        if self._unified is None or n_new_blocks <= 0:
+            return True
+        return self._unified.has_free_csa(n_new_blocks) and self._unified.has_free_hca(
+            n_new_blocks
+        )
 
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
@@ -162,6 +246,10 @@ class BlockManager:
             # incrementally + window-freed), not the whole prompt. No-op / True
             # when SWA disabled.
             if not self.swa.has_free(self.swa.admission_blocks(seq)):
+                return -1
+            # Unified pool: each new logical compress block needs a CSA + HCA
+            # physical block (no-op / True flag-off).
+            if not self._unified_has_free(seq.num_blocks):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
@@ -202,6 +290,10 @@ class BlockManager:
         # incrementally + window-freed), not the full new-block count. No-op /
         # True when SWA disabled.
         if not self.swa.has_free(min(num_new_blocks, self.swa.admission_blocks(seq))):
+            return -1
+        # Unified pool: physical CSA/HCA blocks for the uncached logical blocks
+        # (cache-hit blocks keep their retained binding). No-op / True flag-off.
+        if not self._unified_has_free(num_new_blocks):
             return -1
         return num_cached_blocks
 
@@ -244,6 +336,7 @@ class BlockManager:
                 self.free_block_ids_set.discard(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
+            self._append_phys(seq, block_id)  # unified pool (no-op flag-off)
             if i < swa_hit_start:
                 self.swa.alloc_placeholder(seq)  # out of window: never read → -1
             else:
@@ -252,6 +345,7 @@ class BlockManager:
             block_id = self._pop_free_block()
             self._allocate_block(block_id)
             seq.block_table.append(block_id)
+            self._append_phys(seq, block_id)  # unified pool (no-op flag-off)
             # Uncached blocks: -1 placeholder keeps swa_block_table the same
             # length as block_table; ensure_for_tokens fills the current chunk's
             # window slots before each forward, free_after_prefill_chunk releases
@@ -326,6 +420,13 @@ class BlockManager:
         )  # release SWA blocks + clear swa_block_table (no-op if disabled)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        if self._unified is not None:
+            # Physical bindings are retained on the logical blocks (lazy reuse);
+            # only the per-seq positional tables are cleared here, mirroring
+            # block_table. (deallocate above dropped ref_counts; blocks that hit 0
+            # went to the free pool with their CSA/HCA binding intact.)
+            seq.csa_block_table.clear()
+            seq.hca_block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             self.free_per_req_cache_groups.append(seq.per_req_cache_group)
             seq.per_req_cache_group = -1
@@ -340,6 +441,8 @@ class BlockManager:
         if len(self.free_block_ids_set) < new_blocks_needed:
             return False
         if not self.swa.has_free(new_blocks_needed):  # True when SWA disabled
+            return False
+        if not self._unified_has_free(new_blocks_needed):  # unified pool (no-op off)
             return False
         return True
 
@@ -361,6 +464,7 @@ class BlockManager:
                 block_id = self._pop_free_block()
                 self._allocate_block(block_id)
                 block_table.append(block_id)
+                self._append_phys(seq, block_id)  # unified pool (no-op flag-off)
                 self.swa.append_new(seq)  # lockstep SWA block (no-op if disabled)
         # Reclaim SWA blocks that just fell out of the window (no-op if disabled).
         self.swa.free_out_of_window(seq, len(seq))
