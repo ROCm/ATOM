@@ -33,13 +33,18 @@ def _is_deepseek_v4_model_config(*configs: Any) -> bool:
     return False
 
 
-def _supports_dsv4_fp8_2buff() -> bool:
+def supports_dsv4_fp8_2buff() -> bool:
     try:
         from aiter.jit.utils.chip_info import get_gfx
 
         return get_gfx() in ("gfx950", "gfx1250")
-    except Exception:
-        return True
+    except Exception as exc:
+        logger.warning(
+            "Unable to detect GPU arch for DeepSeek-V4 fp8 2-buffer support; "
+            "falling back to bf16 KV cache: %s",
+            exc,
+        )
+        return False
 
 
 def _resolve_sglang_atom_kv_cache_dtype(server_args: Any, model_config: Any) -> str:
@@ -47,7 +52,7 @@ def _resolve_sglang_atom_kv_cache_dtype(server_args: Any, model_config: Any) -> 
     if (
         str(kv_cache_dtype).startswith("fp8")
         and _is_deepseek_v4_model_config(model_config)
-        and not _supports_dsv4_fp8_2buff()
+        and not supports_dsv4_fp8_2buff()
     ):
         logger.warning(
             "DeepSeek-V4 SGLang --kv-cache-dtype fp8 is only supported on "

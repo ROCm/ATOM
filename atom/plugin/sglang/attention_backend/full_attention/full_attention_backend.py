@@ -35,25 +35,12 @@ from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     build_pa_metadata_for_decode as _build_pa_metadata_for_decode,
     build_pa_metadata_for_prefill as _build_pa_metadata_for_prefill,
 )
+from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
-
-
-def _is_draft_extend_mode(forward_mode: ForwardMode, include_v2: bool = False) -> bool:
-    is_draft_extend = getattr(forward_mode, "is_draft_extend", None)
-    if is_draft_extend is not None:
-        try:
-            return bool(is_draft_extend(include_v2=include_v2))
-        except TypeError:
-            if bool(is_draft_extend()):
-                return True
-
-    return include_v2 and bool(
-        getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
-    )
 
 
 try:
@@ -237,7 +224,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             self._init_forward_metadata_decode(forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_draft_extend_v2():
             self._init_draft_extend_v2_mla(forward_batch.batch_size, forward_batch)
-        elif self.use_mla and _is_draft_extend_mode(forward_batch.forward_mode):
+        elif self.use_mla and is_draft_extend_mode(forward_batch.forward_mode):
             self._init_draft_extend_mla(forward_batch.batch_size, forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_target_verify():
             self._init_target_verify_mla(forward_batch.batch_size, forward_batch)
@@ -1194,7 +1181,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     mask_indptr=None,
                     max_extend_len=num_tokens_per_bs,
                 )
-        elif _is_draft_extend_mode(forward_mode):
+        elif is_draft_extend_mode(forward_mode):
             num_tokens_per_bs = self.speculative_num_steps + 1
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -1533,7 +1520,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     mask_indptr=None,
                     max_extend_len=num_tokens_per_bs,
                 )
-        elif _is_draft_extend_mode(forward_mode):
+        elif is_draft_extend_mode(forward_mode):
             num_tokens_per_bs = self.speculative_num_steps + 1
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
@@ -1928,7 +1915,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 qo_indptr,
                 forward_batch,
             )
-        if _is_draft_extend_mode(forward_batch.forward_mode, include_v2=True) and (
+        if is_draft_extend_mode(forward_batch.forward_mode, include_v2=True) and (
             k is None or v is None or layer.qk_head_dim == K_Buffer.shape[-1]
         ):
             return self._forward_extend_mla_speculative(
@@ -1938,7 +1925,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 qo_indptr,
                 forward_batch,
             )
-        if not forward_batch.forward_mode.is_extend() and not _is_draft_extend_mode(
+        if not forward_batch.forward_mode.is_extend() and not is_draft_extend_mode(
             forward_batch.forward_mode, include_v2=True
         ):
             raise ValueError(
@@ -2387,7 +2374,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             self._call_mla_decode_fwd(q, K_Buffer, o, layer)
             return o
 
-        if _is_draft_extend_mode(forward_batch.forward_mode, include_v2=True):
+        if is_draft_extend_mode(forward_batch.forward_mode, include_v2=True):
             if md.run_graph is not True:
                 bs, q_pad, _ = pad_sequence_with_mask(
                     q.view(q.shape[0], -1),

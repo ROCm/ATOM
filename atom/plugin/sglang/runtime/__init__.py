@@ -5,6 +5,7 @@ from atom.plugin.sglang.runtime.context import (
     SGLangForwardBatchMetadata,
     bind_current_forward_batch,
     get_current_forward_batch,
+    is_draft_extend_mode,
     plugin_runtime_scope,
 )
 from atom.plugin.sglang.runtime.forward_context import SGLangPluginRuntime
@@ -31,5 +32,6 @@ __all__ = [
     "get_current_forward_batch",
     "get_model_arch_spec",
     "is_glm52_dsa_config",
+    "is_draft_extend_mode",
     "plugin_runtime_scope",
 ]
