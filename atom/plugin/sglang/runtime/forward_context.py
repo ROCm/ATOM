@@ -383,8 +383,34 @@ def _set_atom_forward_context(
     )
 
     forward_mode = forward_batch.forward_mode
+    is_target_verify = bool(
+        getattr(forward_mode, "is_target_verify", lambda: False)()
+    )
+    is_draft_extend = bool(
+        getattr(forward_mode, "is_draft_extend", lambda **kwargs: False)(
+            include_v2=True
+        )
+    )
     # This value is only used by ATOM-side MoE padding in the SGLang wrapper.
-    max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
+    if is_target_verify:
+        draft_token_num = int(
+            getattr(
+                getattr(forward_batch, "spec_info", None), "draft_token_num", 0
+            )
+            or 0
+        )
+        max_seqlen_q = max(1, draft_token_num)
+    elif is_draft_extend:
+        from atom.plugin.sglang.glm52_dsa_bridge import _draft_extend_token_num
+
+        max_seqlen_q = max(
+            1,
+            _draft_extend_token_num(
+                forward_batch, positions, int(forward_batch.batch_size)
+            ),
+        )
+    else:
+        max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
     attn_metadata = None
     try:
         attn_metadata = _build_minimax_m3_metadata(
@@ -422,6 +448,14 @@ def _set_atom_forward_context(
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
     is_prefill = forward_mode.is_prefill()
+    if is_target_verify or is_draft_extend:
+        from atom.utils.forward_context import AttnState
+
+        verify_state = getattr(attn_metadata, "state", None)
+        is_prefill = verify_state in (
+            AttnState.PREFILL_PREFIX,
+            AttnState.PREFILL_NATIVE,
+        )
     num_tokens = int(positions.shape[0])
 
     if bool(atom_config.enable_dp_attention):

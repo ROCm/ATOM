@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from glob import glob
-from typing import Generator, Tuple
+from typing import Callable, Generator, Tuple
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -146,21 +146,55 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         )
 
 
+def _resolve_model_weights_dir(model_name_or_path: str) -> str:
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
+    return download_weights_from_hf(
+        model_name_or_path, None, ["*.safetensors"], ignore_patterns=["original/*"]
+    )
+
+
+def _list_safetensor_shard_files(weights_dir: str) -> list[str]:
+    return filter_duplicate_safetensors_files(
+        glob(os.path.join(weights_dir, "*.safetensors")),
+        weights_dir,
+        SAFE_WEIGHTS_INDEX_NAME,
+    )
+
+
+def _select_safetensor_shards_for_keys(
+    weights_dir: str,
+    key_filter: Callable[[str], bool],
+) -> list[str] | None:
+    index_path = os.path.join(weights_dir, SAFE_WEIGHTS_INDEX_NAME)
+    if not os.path.isfile(index_path):
+        return None
+    with open(index_path) as f:
+        index = json.load(f)
+    weight_map = index.get("weight_map")
+    if not weight_map:
+        return None
+    shard_files: set[str] = set()
+    for ckpt_name, shard_name in weight_map.items():
+        if key_filter(ckpt_name):
+            shard_files.add(os.path.join(weights_dir, shard_name))
+    return sorted(shard_files)
+
+
 def safetensors_weights_iterator(
     model_name_or_path: str,
     disable_mmap: bool = False,
+    *,
+    shard_files: list[str] | None = None,
+    key_filter: Callable[[str], bool] | None = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     logger.info(f"disable_mmap: {disable_mmap}")
-    path = (
-        model_name_or_path
-        if os.path.isdir(model_name_or_path)
-        else download_weights_from_hf(
-            model_name_or_path, None, ["*.safetensors"], ignore_patterns=["original/*"]
-        )
-    )
-    hf_weights_files = filter_duplicate_safetensors_files(
-        glob(os.path.join(path, "*.safetensors")), path, SAFE_WEIGHTS_INDEX_NAME
+    path = _resolve_model_weights_dir(model_name_or_path)
+    hf_weights_files = (
+        shard_files
+        if shard_files is not None
+        else _list_safetensor_shard_files(path)
     )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -191,10 +225,14 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name, param in result.items():
+                    if key_filter is not None and not key_filter(name):
+                        continue
                     yield name, param
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if key_filter is not None and not key_filter(name):
+                        continue
                     yield name, f.get_tensor(name)
 
 
@@ -615,10 +653,101 @@ def load_model(
         else:
             fn(*args)
 
+    iterator_kwargs: dict[str, Any] = {}
+    if spec_decode and envs.ATOM_SPEC_DECODE_FAST_LOADER:
+
+        def _should_materialize_checkpoint_tensor(orig_name: str) -> bool:
+            name = orig_name
+            if weights_mapper is not None:
+                mapped = weights_mapper._map_name(name)
+                if mapped is None:
+                    return False
+                name = mapped
+            if load_dummy:
+                return False
+            if "mtp" in name and not spec_decode:
+                return False
+            if name.endswith("kv_scale") or "inv_freq" in name:
+                return False
+            if skip_weight_prefixes and any(
+                name.startswith(p) for p in skip_weight_prefixes
+            ):
+                return False
+            if spec_decode and mtp_remap is not None:
+                remapped = mtp_remap(name)
+                if remapped is None:
+                    return False
+                name = remapped
+            for mapping_part in weights_mapping.keys():
+                if mapping_part in name:
+                    name = name.replace(mapping_part, weights_mapping[mapping_part])
+            if "weight_scale_inv" in name:
+                name = name.replace("weight_scale_inv", "weight_scale")
+
+            layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
+            layerId = int(layerId_.group(1)) if layerId_ else 0
+            if (
+                hf_config.num_hidden_layers
+                and layerId >= hf_config.num_hidden_layers
+                and not spec_decode
+            ):
+                return False
+
+            if (
+                "mlp.experts." in name
+                or "ffn.experts." in name
+                or "block_sparse_moe.experts." in name
+            ) and name not in params_dict:
+                return False
+
+            if name in params_dict:
+                return True
+
+            if has_expert_mapping:
+                for wm_name in expert_weight_prefixes:
+                    if wm_name in name:
+                        param_name, _, _ = expert_index[wm_name]
+                        candidate = name.replace(wm_name, param_name)
+                        return candidate in params_dict
+
+            for k, packed_value in packed_modules_mapping.items():
+                if k not in name:
+                    continue
+                if isinstance(packed_value, list):
+                    for target_name in packed_value:
+                        param_name = name.replace(k, target_name)
+                        if (
+                            "output_scale" not in param_name
+                            and param_name in params_dict
+                        ):
+                            return True
+                else:
+                    v, _ = packed_value
+                    param_name = name.replace(k, v)
+                    if "output_scale" not in param_name and param_name in params_dict:
+                        return True
+            return False
+
+        iterator_kwargs["key_filter"] = _should_materialize_checkpoint_tensor
+        weights_dir = _resolve_model_weights_dir(model_name_or_path)
+        selected_shards = _select_safetensor_shards_for_keys(
+            weights_dir, _should_materialize_checkpoint_tensor
+        )
+        if selected_shards is not None:
+            iterator_kwargs["shard_files"] = selected_shards
+            total_shards = len(_list_safetensor_shard_files(weights_dir))
+            logger.info(
+                "Spec-decode fast loader: %d/%d safetensor shards selected",
+                len(selected_shards),
+                total_shards,
+            )
+
     try:
         disable_mmap = envs.ATOM_DISABLE_MMAP
         for name, weight_tensor in safetensors_weights_iterator(
-            model_name_or_path, disable_mmap=disable_mmap
+            model_name_or_path,
+            disable_mmap=disable_mmap,
+            **iterator_kwargs,
         ):
             _orig_ckpt_name = name  # preserve for ckpt-side coverage report
             if weights_mapper is not None:

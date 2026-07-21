@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+import numpy as np
 import torch
 from aiter import (
     cp_gather_indexer_k_quant_cache,
@@ -123,6 +124,117 @@ def _parse_layer_id_from_indexer_prefix(prefix: str) -> int:
     return int(match.group(1))
 
 
+def _is_draft_extend_v2(forward_batch) -> bool:
+    return bool(
+        getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
+            include_v2=True
+        )
+    )
+
+
+def _mtp_spec_tokens_per_req(forward_batch) -> int:
+    spec_info = getattr(forward_batch, "spec_info", None)
+    tokens_per_req = int(
+        getattr(spec_info, "draft_token_num", 0)
+        or getattr(spec_info, "num_tokens_per_req", 0)
+        or 0
+    )
+    if tokens_per_req > 0:
+        return tokens_per_req
+    bs = int(getattr(forward_batch, "batch_size", 0) or 0)
+    positions = getattr(forward_batch, "positions", None)
+    if bs > 0 and torch.is_tensor(positions) and int(positions.numel()) >= bs:
+        return max(1, int(positions.numel()) // bs)
+    return 0
+
+
+def _is_mtp_spec_extend_like(forward_batch) -> bool:
+    """Eager MTP phases with bs * K query rows (target_verify / draft_extend decode)."""
+    if forward_batch.forward_mode.is_target_verify():
+        return True
+    if not _is_draft_extend_v2(forward_batch):
+        return False
+    try:
+        from atom.plugin.sglang.glm52_dsa_bridge import (
+            _should_use_mtp_draft_extend_decode_path,
+        )
+
+        return _should_use_mtp_draft_extend_decode_path(forward_batch)
+    except Exception:
+        return True
+
+
+def _build_mtp_spec_query_ranges(
+    forward_batch,
+    *,
+    tokens_per_req: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = forward_batch.seq_lens.device
+    bs = int(forward_batch.batch_size)
+    if tokens_per_req <= 0:
+        raise RuntimeError("MTP sparse MLA requires tokens_per_req > 0")
+    positions = getattr(forward_batch, "positions", None)
+    if positions is None:
+        positions = getattr(getattr(forward_batch, "spec_info", None), "positions", None)
+    if torch.is_tensor(positions) and int(positions.numel()) >= bs * tokens_per_req:
+        prefix_lens = positions[: bs * tokens_per_req : tokens_per_req].to(
+            dtype=torch.int32
+        )
+    else:
+        prefix_lens = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
+    seq_lens = prefix_lens
+    kv_lens = seq_lens + tokens_per_req
+    base_offsets = torch.cumsum(
+        torch.cat([torch.zeros(1, dtype=torch.int32, device=device), kv_lens[:-1]]),
+        dim=0,
+    )
+    starts = torch.repeat_interleave(base_offsets, tokens_per_req)
+    per_req_end_base = torch.repeat_interleave(base_offsets + seq_lens, tokens_per_req)
+    draft_offsets = torch.arange(
+        1, tokens_per_req + 1, dtype=torch.int32, device=device
+    ).repeat(bs)
+    return starts.to(dtype=torch.int32), (per_req_end_base + draft_offsets).to(
+        dtype=torch.int32
+    )
+
+
+def _mtp_eager_context_lens(forward_batch) -> torch.Tensor | None:
+    if not _is_mtp_spec_extend_like(forward_batch):
+        return None
+    bs = int(forward_batch.batch_size)
+    tokens_per_req = _mtp_spec_tokens_per_req(forward_batch)
+    if tokens_per_req <= 0:
+        return None
+    positions = getattr(forward_batch, "positions", None)
+    if positions is None:
+        positions = getattr(getattr(forward_batch, "spec_info", None), "positions", None)
+    if torch.is_tensor(positions) and int(positions.numel()) >= bs * tokens_per_req:
+        prefix_lens = positions[: bs * tokens_per_req : tokens_per_req].to(
+            dtype=torch.int32
+        )
+    else:
+        prefix_lens = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
+    return prefix_lens + int(tokens_per_req)
+
+
+def _build_mtp_eager_gather_indptr(forward_batch) -> torch.Tensor:
+    context_lens = _mtp_eager_context_lens(forward_batch)
+    if context_lens is None:
+        return torch.nn.functional.pad(
+            torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), (1, 0)
+        )
+    return torch.nn.functional.pad(
+        torch.cumsum(context_lens, dim=0, dtype=torch.int32), (1, 0)
+    )
+
+
+def _mtp_eager_total_kv(forward_batch) -> int:
+    context_lens = _mtp_eager_context_lens(forward_batch)
+    if context_lens is None:
+        return int(forward_batch.seq_lens_sum)
+    return max(1, int(context_lens.sum().item()))
+
+
 def _build_sglang_query_ranges(forward_batch) -> tuple[torch.Tensor, torch.Tensor]:
     device = forward_batch.seq_lens.device
     if forward_batch.forward_mode.is_decode_or_idle():
@@ -130,6 +242,12 @@ def _build_sglang_query_ranges(forward_batch) -> tuple[torch.Tensor, torch.Tenso
         starts = torch.zeros(bs, dtype=torch.int32, device=device)
         ends = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
         return starts, ends
+
+    if _is_mtp_spec_extend_like(forward_batch):
+        return _build_mtp_spec_query_ranges(
+            forward_batch,
+            tokens_per_req=_mtp_spec_tokens_per_req(forward_batch),
+        )
 
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
@@ -164,28 +282,58 @@ def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
     token_table = req_to_token[req_pool_indices, :]
     if not forward_batch.forward_mode.is_decode_or_idle():
         token_table = token_table.clone()
-        query_lens = getattr(forward_batch, "extend_seq_lens", None)
-        if query_lens is None:
-            query_lens = forward_batch.seq_lens
-        prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
-        if prefix_lens is None:
-            prefix_lens = forward_batch.seq_lens - query_lens
-        query_lens_cpu = query_lens[: int(forward_batch.batch_size)].detach().cpu()
-        prefix_lens_cpu = prefix_lens[: int(forward_batch.batch_size)].detach().cpu()
+        bs = int(forward_batch.batch_size)
+        if _is_mtp_spec_extend_like(forward_batch):
+            tokens_per_req = _mtp_spec_tokens_per_req(forward_batch)
+            if tokens_per_req <= 0:
+                raise RuntimeError("MTP sparse MLA requires tokens_per_req > 0")
+            positions = getattr(forward_batch, "positions", None)
+            if positions is None:
+                positions = getattr(
+                    getattr(forward_batch, "spec_info", None), "positions", None
+                )
+            if (
+                torch.is_tensor(positions)
+                and int(positions.numel()) >= bs * tokens_per_req
+            ):
+                prefix_lens_cpu = (
+                    positions[: bs * tokens_per_req : tokens_per_req]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
+                )
+            else:
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = forward_batch.seq_lens[:bs].detach().cpu()
+                prefix_lens_cpu = np.asarray(seq_lens_cpu[:bs], dtype=np.int32)
+            query_lens_cpu = [tokens_per_req] * bs
+        else:
+            query_lens = getattr(forward_batch, "extend_seq_lens", None)
+            if query_lens is None:
+                query_lens = forward_batch.seq_lens
+            prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+            if prefix_lens is None:
+                prefix_lens = forward_batch.seq_lens - query_lens
+            query_lens_cpu = query_lens[:bs].detach().cpu()
+            prefix_lens_cpu = prefix_lens[:bs].detach().cpu()
         offset = 0
         for req_idx, (prefix_len_raw, query_len_raw) in enumerate(
             zip(prefix_lens_cpu, query_lens_cpu)
         ):
             prefix_len = int(prefix_len_raw)
             query_len = int(query_len_raw)
+            remaining = int(forward_batch.out_cache_loc.shape[0]) - offset
+            query_len = min(query_len, max(remaining, 0))
             if query_len > 0:
                 token_table[req_idx, prefix_len : prefix_len + query_len] = (
                     forward_batch.out_cache_loc[offset : offset + query_len]
                 )
             offset += query_len
     if page_size == 1:
-        return token_table
-    return token_table[:, ::page_size] // page_size
+        return token_table.to(dtype=torch.int32).contiguous()
+    return (token_table[:, ::page_size] // page_size).to(dtype=torch.int32).contiguous()
 
 
 def _build_sparse_req_id_per_token_for_sglang(
@@ -196,6 +344,11 @@ def _build_sparse_req_id_per_token_for_sglang(
     req_ids = torch.arange(bs, dtype=torch.int32, device=device)
     if forward_batch.forward_mode.is_decode_or_idle():
         return req_ids
+    if _is_mtp_spec_extend_like(forward_batch):
+        tokens_per_req = _mtp_spec_tokens_per_req(forward_batch)
+        if tokens_per_req <= 0:
+            raise RuntimeError("MTP sparse MLA requires tokens_per_req > 0")
+        return torch.repeat_interleave(req_ids, tokens_per_req)
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
         query_lens = forward_batch.seq_lens
@@ -508,7 +661,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
         return weights
 
     cu_starts, cu_ends = _build_sglang_query_ranges(forward_batch)
-    total_kv = int(forward_batch.seq_lens_sum)
+    total_kv = _mtp_eager_total_kv(forward_batch)
     k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
     k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
     cp_gather_indexer_k_quant_cache(
@@ -516,9 +669,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
         k_fp8,
         k_scale.view(dtypes.fp8),
         block_table,
-        torch.nn.functional.pad(
-            torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), (1, 0)
-        ),
+        _build_mtp_eager_gather_indptr(forward_batch),
         preshuffle=preshuffle_cache,
     )
     logits = fp8_mqa_logits(

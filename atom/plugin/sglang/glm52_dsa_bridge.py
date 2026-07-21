@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
@@ -38,6 +40,22 @@ def _get_seq_lens_cpu(forward_batch, bs: int) -> np.ndarray:
     return np.asarray(seq_lens_cpu[:bs], dtype=np.int32)
 
 
+def _get_extend_prefix_lens_cpu(forward_batch, bs: int) -> np.ndarray | None:
+    """Committed prefix length before the current draft_extend suffix."""
+    prefix = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if prefix is not None:
+        if isinstance(prefix, list):
+            return np.asarray(prefix[:bs], dtype=np.int32)
+        if torch.is_tensor(prefix):
+            return prefix[:bs].detach().cpu().numpy().astype(np.int32)
+    prefix = getattr(forward_batch, "extend_prefix_lens", None)
+    if prefix is None:
+        return None
+    if torch.is_tensor(prefix):
+        return prefix[:bs].detach().cpu().numpy().astype(np.int32)
+    return np.asarray(prefix[:bs], dtype=np.int32)
+
+
 def _get_extend_lens_cpu(forward_batch, positions: torch.Tensor, bs: int) -> np.ndarray:
     extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
     if extend_lens is None:
@@ -64,12 +82,19 @@ def _build_token_table(
     page_size: int,
 ) -> torch.Tensor:
     bs = int(forward_batch.batch_size)
-    max_seq_len = int(seq_lens.max(initial=1))
+    if extend_lens is not None and not forward_batch.forward_mode.is_decode_or_idle():
+        prefix_lens = np.maximum(seq_lens - extend_lens, 0).astype(np.int32)
+        table_lens = np.maximum(seq_lens, prefix_lens + extend_lens)
+    else:
+        prefix_lens = None
+        table_lens = seq_lens
+    max_seq_len = int(table_lens.max(initial=1))
     req_pool_indices = forward_batch.req_pool_indices[:bs]
     token_table = req_to_token_pool.req_to_token[req_pool_indices, :max_seq_len].clone()
 
     if extend_lens is not None and not forward_batch.forward_mode.is_decode_or_idle():
-        prefix_lens = seq_lens - extend_lens
+        if prefix_lens is None:
+            prefix_lens = seq_lens - extend_lens
         offset = 0
         for req_idx, (prefix_len, query_len) in enumerate(
             zip(prefix_lens, extend_lens)
@@ -123,6 +148,406 @@ def _metadata_dtype(atom_config):
     if str(kv_dtype).startswith("fp8"):
         return dtypes.fp8
     return getattr(dtypes, "d_dtypes", {}).get(kv_dtype, torch.bfloat16)
+
+
+def _resolve_target_verify_lens(
+    forward_batch,
+    positions: torch.Tensor,
+    bs: int,
+    draft_token_num: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return committed prefix lengths and total KV lengths for target_verify."""
+    del forward_batch
+    position_rows = positions.detach().cpu().numpy().astype(np.int32)
+    required = bs * draft_token_num
+    if position_rows.size < required:
+        raise RuntimeError(
+            "GLM-5.2 DSA target_verify positions are shorter than "
+            f"bs*draft_token_num: positions={position_rows.size}, "
+            f"bs={bs}, draft_token_num={draft_token_num}"
+        )
+    prefix_lens = position_rows[:required:draft_token_num].astype(np.int32)
+    context_lens = prefix_lens + draft_token_num
+    return prefix_lens, context_lens
+
+
+def _is_draft_extend_mode(forward_batch) -> bool:
+    return bool(
+        getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
+            include_v2=True
+        )
+    )
+
+
+def _draft_extend_k_only() -> bool:
+    """Debug opt-in: attend only the current K-token extend chunk (legacy workaround)."""
+    return os.environ.get("ATOM_GLM52_DRAFT_EXTEND_K_ONLY", "0") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
+def _resolve_draft_extend_lens(
+    forward_batch,
+    positions: torch.Tensor,
+    bs: int,
+    draft_token_num: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return prefix and total KV lengths for DRAFT_EXTEND_V2.
+
+    SGLang V2 materializes ``bs * num_draft_tokens`` query rows regardless of
+    accept count. Prefix comes from verifier positions / ``extend_prefix_lens``;
+    sparse per-token attend lengths are derived in
+    ``_compute_mtp_sparse_per_token_kv_lens(..., draft_extend=True)``.
+    """
+    draft_token_num = int(draft_token_num)
+    if _draft_extend_k_only():
+        prefix_lens = np.zeros(bs, dtype=np.int32)
+        context_lens = np.full(bs, draft_token_num, dtype=np.int32)
+        return prefix_lens, context_lens
+
+    seq_lens = _get_seq_lens_cpu(forward_batch, bs)
+    position_rows = positions.detach().cpu().numpy().astype(np.int32)
+    required = bs * draft_token_num
+    if position_rows.size >= required:
+        prefix_lens = position_rows[:required:draft_token_num].astype(np.int32)
+    else:
+        prefix_lens = _get_extend_prefix_lens_cpu(forward_batch, bs)
+        if prefix_lens is None:
+            prefix_lens = np.maximum(seq_lens - draft_token_num, 0).astype(np.int32)
+        else:
+            prefix_lens = prefix_lens.astype(np.int32)
+
+    context_lens = (prefix_lens + draft_token_num).astype(np.int32)
+    context_lens = np.maximum(context_lens, seq_lens).astype(np.int32)
+    return prefix_lens.astype(np.int32), context_lens.astype(np.int32)
+
+
+def _draft_extend_token_num(forward_batch, positions: torch.Tensor, bs: int) -> int:
+    extend_lens = _get_extend_lens_cpu(forward_batch, positions, bs)
+    if extend_lens.size:
+        return int(extend_lens.max(initial=1))
+    tokens_per_req = getattr(
+        getattr(forward_batch, "spec_info", None), "num_tokens_per_req", None
+    )
+    if tokens_per_req is not None:
+        return int(tokens_per_req)
+    if bs > 0 and int(positions.numel()) >= bs:
+        return max(1, int(positions.numel()) // bs)
+    return 1
+
+
+def _should_use_mtp_draft_extend_decode_path(forward_batch) -> bool:
+    """Use decode-style draft_extend metadata (native propose i=0 semantics).
+
+    DRAFT_EXTEND_V2 always uses fixed ``num_draft_tokens`` rows per request.
+    Prefill-style metadata only attends the suffix chunk and breaks accept.
+    """
+    override = os.environ.get("ATOM_GLM52_DRAFT_EXTEND_PATH", "").lower()
+    if override in ("prefill", "prefill_prefix"):
+        return False
+    if override in ("decode",):
+        return True
+    if _is_draft_extend_mode(forward_batch):
+        return True
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return True
+    if int(getattr(forward_batch, "_graph_cache_bs", 0) or 0) > 0:
+        return True
+    return False
+
+
+def _compute_mtp_sparse_per_token_kv_lens(
+    *,
+    prefix_lens_np: np.ndarray,
+    context_lens_np: np.ndarray,
+    max_seqlen_q: int,
+    bs: int,
+    draft_extend: bool,
+) -> np.ndarray:
+    """Per-query KV lengths for sparse MTP verify / draft_extend."""
+    if draft_extend:
+        return (
+            np.repeat(prefix_lens_np, max_seqlen_q)
+            + np.tile(np.arange(0, max_seqlen_q, dtype=np.int32), bs)
+        ).astype(np.int32)
+    return (
+        np.repeat(context_lens_np, max_seqlen_q)
+        - max_seqlen_q
+        + np.tile(np.arange(1, max_seqlen_q + 1, dtype=np.int32), bs)
+    ).astype(np.int32)
+
+
+def _should_use_mtp_verify_prefill_path(
+    forward_batch,
+    positions: torch.Tensor,
+    atom_config,
+) -> bool:
+    """Choose prefill vs decode metadata for eager target_verify."""
+    del forward_batch, positions, atom_config
+    override = os.environ.get("ATOM_GLM52_TV_VERIFY_PATH", "").lower()
+    if override in ("prefill", "prefill_prefix"):
+        return True
+    if override in ("decode",):
+        return False
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return False
+    return False
+
+
+def _make_sparse_mtp_work_buffers(
+    *,
+    sparse_cu_seqlens_q: torch.Tensor,
+    sparse_kv_indptr: torch.Tensor,
+    sparse_kv_last_page_lens: torch.Tensor,
+    num_heads: int,
+    dtype_q,
+    dtype_kv,
+    page_size: int,
+) -> dict[str, torch.Tensor]:
+    num_tokens = max(1, int(sparse_cu_seqlens_q.numel()) - 1)
+    padded_heads = max(num_heads, 16)
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = get_mla_metadata_info_v1(
+        num_tokens,
+        1,
+        padded_heads,
+        dtype_q,
+        dtype_kv,
+        is_sparse=True,
+        fast_mode=True,
+    )
+    device = sparse_cu_seqlens_q.device
+    work = {
+        "sparse_mtp_work_meta_data": torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=device
+        ),
+        "sparse_mtp_work_indptr": torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=device
+        ),
+        "sparse_mtp_work_info_set": torch.empty(
+            work_info_set_size, dtype=work_info_set_type, device=device
+        ),
+        "sparse_mtp_reduce_indptr": torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+        ),
+        "sparse_mtp_reduce_final_map": torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+        ),
+        "sparse_mtp_reduce_partial_map": torch.empty(
+            reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
+        ),
+    }
+    get_mla_metadata_v1(
+        sparse_cu_seqlens_q,
+        sparse_kv_indptr,
+        sparse_kv_last_page_lens,
+        padded_heads,
+        1,
+        True,
+        work["sparse_mtp_work_meta_data"],
+        work["sparse_mtp_work_info_set"],
+        work["sparse_mtp_work_indptr"],
+        work["sparse_mtp_reduce_indptr"],
+        work["sparse_mtp_reduce_final_map"],
+        work["sparse_mtp_reduce_partial_map"],
+        page_size=page_size,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
+        kv_granularity=max(page_size, 16),
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
+        fast_mode=True,
+    )
+    return work
+
+
+def _build_mtp_multi_token_decode_metadata(
+    forward_batch,
+    positions: torch.Tensor,
+    *,
+    token_to_kv_pool,
+    req_to_token_pool,
+    atom_config,
+    draft_token_num: int,
+    resolve_lens_fn,
+):
+    """Build decode-style metadata for multi-token MTP phases (verify / draft_extend)."""
+    from atom.utils.forward_context import AttentionMetaData, AttnState
+
+    device = positions.device
+    bs = int(forward_batch.batch_size)
+    if draft_token_num <= 0:
+        raise RuntimeError(
+            "GLM-5.2 DSA multi-token decode metadata requires draft_token_num > 0"
+        )
+
+    max_seqlen_q = draft_token_num
+    prefix_lens_np, context_lens_np = resolve_lens_fn(
+        forward_batch, positions, bs, draft_token_num
+    )
+    extend_lens = np.full(bs, draft_token_num, dtype=np.int32)
+    sum_scheduled_tokens = bs * max_seqlen_q
+
+    q_np = np.zeros(bs + 1, dtype=np.int32)
+    q_np[1:] = np.cumsum(extend_lens, dtype=np.int32)
+    cu_q = torch.from_numpy(q_np).to(device=device)
+
+    topk = _get_index_topk(atom_config)
+    page_size = _validate_page_size(token_to_kv_pool, atom_config)
+    block_tables = _build_token_table(
+        forward_batch,
+        req_to_token_pool,
+        seq_lens=context_lens_np,
+        extend_lens=extend_lens,
+        page_size=page_size,
+    )
+    token_table = _build_token_table(
+        forward_batch,
+        req_to_token_pool,
+        seq_lens=context_lens_np,
+        extend_lens=extend_lens,
+        page_size=1,
+    )
+    kv_indptr = _counts_to_indptr(context_lens_np, device)
+    kv_indices = _flatten_kv_indices(token_table, context_lens_np)
+    kv_last_page_lens = torch.ones(bs, dtype=torch.int32, device=device)
+    slot_mapping = forward_batch.out_cache_loc[:sum_scheduled_tokens]
+    context_lens = torch.from_numpy(context_lens_np).to(device=device, dtype=torch.int32)
+
+    draft_extend = _is_draft_extend_mode(forward_batch)
+    per_token_kv_lens = _compute_mtp_sparse_per_token_kv_lens(
+        prefix_lens_np=prefix_lens_np,
+        context_lens_np=context_lens_np,
+        max_seqlen_q=max_seqlen_q,
+        bs=bs,
+        draft_extend=draft_extend,
+    )
+    sparse_per_token_lens = np.clip(per_token_kv_lens, 0, topk).astype(np.int32)
+    sparse_kv_indptr = _counts_to_indptr(sparse_per_token_lens, device)
+    sparse_cu = torch.arange(sum_scheduled_tokens + 1, dtype=torch.int32, device=device)
+    sparse_kv_last_page_lens = torch.ones(
+        sum_scheduled_tokens, dtype=torch.int32, device=device
+    )
+    token_to_seq_idxs = torch.repeat_interleave(
+        torch.arange(bs, dtype=torch.int32, device=device),
+        torch.from_numpy(extend_lens.astype(np.int64)).to(device=device),
+    )
+
+    _ensure_shared_sparse_buffer(
+        token_to_kv_pool,
+        num_tokens=sum_scheduled_tokens,
+        topk=topk,
+        device=device,
+    )
+    dtype_q = _metadata_dtype(atom_config)
+    attention_page_size = _attention_page_size(token_to_kv_pool)
+    num_heads = _local_num_attention_heads(atom_config)
+    max_seqlen_k = int(
+        max(
+            int(context_lens_np.max(initial=1)),
+            int(per_token_kv_lens.max(initial=1)),
+        )
+    )
+
+    work = _make_mla_work_buffers(
+        cu_seqlens_q=cu_q,
+        kv_indptr=kv_indptr,
+        kv_last_page_lens=kv_last_page_lens,
+        num_heads=num_heads,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_q,
+        page_size=attention_page_size,
+    )
+    sparse_mtp_work = _make_sparse_mtp_work_buffers(
+        sparse_cu_seqlens_q=sparse_cu,
+        sparse_kv_indptr=sparse_kv_indptr,
+        sparse_kv_last_page_lens=sparse_kv_last_page_lens,
+        num_heads=num_heads,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_q,
+        page_size=attention_page_size,
+    )
+
+    md = AttentionMetaData(
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=kv_indptr,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        slot_mapping=slot_mapping,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        state=AttnState.DECODE,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        sparse_kv_indptr=sparse_kv_indptr,
+        sparse_cu_seqlens_q=sparse_cu,
+        token_to_seq_idxs=token_to_seq_idxs,
+        **work,
+    )
+    md.dtype_q = dtype_q
+    md.sparse_kv_last_page_lens = sparse_kv_last_page_lens
+    for key, value in sparse_mtp_work.items():
+        setattr(md, key, value)
+    return md
+
+
+def _build_mtp_verify_decode_metadata(
+    forward_batch,
+    positions: torch.Tensor,
+    *,
+    token_to_kv_pool,
+    req_to_token_pool,
+    atom_config,
+):
+    """Build ATOM-native decode-style metadata for SGLang target_verify."""
+    bs = int(forward_batch.batch_size)
+    draft_token_num = int(
+        getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0) or 0
+    )
+    if draft_token_num <= 0:
+        raise RuntimeError("GLM-5.2 DSA target_verify requires draft_token_num")
+    return _build_mtp_multi_token_decode_metadata(
+        forward_batch,
+        positions,
+        token_to_kv_pool=token_to_kv_pool,
+        req_to_token_pool=req_to_token_pool,
+        atom_config=atom_config,
+        draft_token_num=draft_token_num,
+        resolve_lens_fn=_resolve_target_verify_lens,
+    )
+
+
+def _build_mtp_draft_extend_decode_metadata(
+    forward_batch,
+    positions: torch.Tensor,
+    *,
+    token_to_kv_pool,
+    req_to_token_pool,
+    atom_config,
+):
+    """Build decode-style metadata for SGLang DRAFT_EXTEND_V2 (draft step i=0)."""
+    bs = int(forward_batch.batch_size)
+    draft_token_num = _draft_extend_token_num(forward_batch, positions, bs)
+    if draft_token_num <= 0:
+        raise RuntimeError("GLM-5.2 DSA draft_extend requires draft_token_num")
+    return _build_mtp_multi_token_decode_metadata(
+        forward_batch,
+        positions,
+        token_to_kv_pool=token_to_kv_pool,
+        req_to_token_pool=req_to_token_pool,
+        atom_config=atom_config,
+        draft_token_num=draft_token_num,
+        resolve_lens_fn=_resolve_draft_extend_lens,
+    )
 
 
 def _make_mla_work_buffers(
@@ -673,6 +1098,19 @@ def build_atom_glm52_attention_metadata_from_sglang(
     req_to_token_pool,
     atom_config,
 ):
+    if getattr(forward_batch.forward_mode, "is_target_verify", lambda: False)():
+        if _should_use_mtp_verify_prefill_path(forward_batch, positions, atom_config):
+            raise RuntimeError(
+                "GLM-5.2 DSA target_verify prefill metadata is not ported yet; "
+                "use decode path (default) or unset ATOM_GLM52_TV_VERIFY_PATH"
+            )
+        return _build_mtp_verify_decode_metadata(
+            forward_batch,
+            positions,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token_pool=req_to_token_pool,
+            atom_config=atom_config,
+        )
     if forward_batch.forward_mode.is_decode_or_idle():
         return _build_decode_metadata(
             forward_batch,
@@ -684,8 +1122,20 @@ def build_atom_glm52_attention_metadata_from_sglang(
     if getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
         include_v2=True
     ):
-        raise RuntimeError(
-            "GLM-5.2 native DSA SGLang bridge does not yet support draft extend/MTP."
+        if _should_use_mtp_draft_extend_decode_path(forward_batch):
+            return _build_mtp_draft_extend_decode_metadata(
+                forward_batch,
+                positions,
+                token_to_kv_pool=token_to_kv_pool,
+                req_to_token_pool=req_to_token_pool,
+                atom_config=atom_config,
+            )
+        return _build_prefill_metadata(
+            forward_batch,
+            positions,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token_pool=req_to_token_pool,
+            atom_config=atom_config,
         )
     return _build_prefill_metadata(
         forward_batch,

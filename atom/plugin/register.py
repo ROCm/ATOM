@@ -204,6 +204,24 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         except Exception:
             return False
 
+    def _is_glm52_nextn_runner(runner) -> bool:
+        try:
+            arches = (
+                getattr(
+                    getattr(getattr(runner, "model_config", None), "hf_config", None),
+                    "architectures",
+                    None,
+                )
+                or []
+            )
+            return any(
+                "GlmMoeDsaForCausalLMNextN" in str(arch)
+                or "DeepseekV3ForCausalLMNextN" in str(arch)
+                for arch in arches
+            )
+        except Exception:
+            return False
+
     def _is_dsv4_runner(runner) -> bool:
         try:
             arches = (
@@ -511,10 +529,20 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
         def _draft_extend_for_decode(self, batch, batch_result):
             try:
+                is_glm52 = _is_glm52_nextn_runner(getattr(self, "draft_runner", None))
+                is_dsv4 = _is_dsv4_nextn_runner(getattr(self, "draft_runner", None))
+                draft_extend_graph_runner = getattr(
+                    self, "cuda_graph_runner_for_draft_extend", None
+                )
+                if not is_glm52 and not is_dsv4:
+                    return original_draft_extend_for_decode(self, batch, batch_result)
                 if (
-                    not _is_dsv4_nextn_runner(getattr(self, "draft_runner", None))
-                    or getattr(self, "cuda_graph_runner_for_draft_extend", None) is None
+                    is_glm52
+                    and os.environ.get("ATOM_GLM52_DRAFT_EXTEND_NATIVE", "0")
+                    in ("1", "true", "True")
                 ):
+                    return original_draft_extend_for_decode(self, batch, batch_result)
+                if is_dsv4 and draft_extend_graph_runner is None:
                     return original_draft_extend_for_decode(self, batch, batch_result)
 
                 import torch
@@ -529,26 +557,22 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if num_draft_tokens <= 0:
                     return original_draft_extend_for_decode(self, batch, batch_result)
 
-                if not _dsv4_draft_extend_graph_layout_ok(
-                    self.cuda_graph_runner_for_draft_extend
+                use_draft_extend_graph_runner = draft_extend_graph_runner
+                if (
+                    use_draft_extend_graph_runner is not None
+                    and not _dsv4_draft_extend_graph_layout_ok(
+                        use_draft_extend_graph_runner
+                    )
                 ):
-                    runner = self.cuda_graph_runner_for_draft_extend
-                    self.cuda_graph_runner_for_draft_extend = None
-                    try:
-                        return original_draft_extend_for_decode(
-                            self, batch, batch_result
-                        )
-                    finally:
-                        self.cuda_graph_runner_for_draft_extend = runner
+                    use_draft_extend_graph_runner = None
 
                 accept_lens = getattr(batch_result, "accept_lens", None)
                 if not torch.is_tensor(accept_lens):
                     return original_draft_extend_for_decode(self, batch, batch_result)
 
                 # DRAFT_EXTEND_V2 materializes exactly `num_draft_tokens` slots
-                # per sequence.  `accept_lens` includes the target bonus token,
-                # so the value can be `num_draft_tokens + 1`; using that directly
-                # in the fixed-layout index points one slot past the graph output.
+                # per sequence.  `accept_lens` includes the target bonus token, so
+                # clamp before converting it to a fixed-layout per-request row offset.
                 graph_accept_lens = accept_lens.clamp(min=1, max=num_draft_tokens)
 
                 draft_input = EagleDraftInput(
@@ -556,6 +580,26 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     num_tokens_per_req=self.speculative_num_steps + 1,
                     num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
                 )
+                if is_glm52:
+                    try:
+                        hidden = batch_result.logits_output.hidden_states
+                        hidden_probe = None
+                        if torch.is_tensor(hidden):
+                            rows = hidden[
+                                : min(4, int(hidden.shape[0]))
+                            ].detach().float()
+                            hidden_probe = {
+                                "shape": tuple(hidden.shape),
+                                "norm": rows.norm(dim=-1).cpu().tolist(),
+                            }
+                        logger.info(
+                            "[GLM52_HIDDEN_HANDOFF] verify->draft_extend "
+                            "accept_lens=%s hidden=%s",
+                            accept_lens.detach().cpu().tolist(),
+                            hidden_probe,
+                        )
+                    except Exception:
+                        logger.exception("Failed GLM52 hidden handoff log")
                 select_index = (
                     torch.arange(len(batch.seq_lens), device=self.device)
                     * num_draft_tokens
@@ -570,7 +614,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             batch_result.next_token_ids,
                             num_draft_tokens,
                             self.draft_runner,
-                            self.cuda_graph_runner_for_draft_extend,
+                            use_draft_extend_graph_runner,
                         )
                     )
 
@@ -579,19 +623,41 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         self.plan_stream
                     )
 
-                # The graph only fills draft slots.  Keep the scheduler-facing
-                # `batch_result.accept_lens` untouched, but make the graph's
-                # per-sequence counts match the fixed draft-token layout.
+                if is_glm52:
+                    try:
+                        positions = getattr(forward_batch, "positions", None)
+                        logger.info(
+                            "[GLM52_DRAFT_EXTEND_DECODE] in accept_lens=%s "
+                            "graph_accept_lens=%s select_index=%s "
+                            "extend_num_tokens=%s positions_head=%s input_ids_head=%s",
+                            accept_lens.detach().cpu().tolist(),
+                            graph_accept_lens.detach().cpu().tolist(),
+                            select_index.detach().cpu().tolist(),
+                            getattr(forward_batch, "extend_num_tokens", None),
+                            (
+                                positions.detach().cpu().tolist()[:16]
+                                if torch.is_tensor(positions)
+                                else None
+                            ),
+                            (
+                                forward_batch.input_ids.detach().cpu().tolist()[:16]
+                                if torch.is_tensor(getattr(forward_batch, "input_ids", None))
+                                else None
+                            ),
+                        )
+                    except Exception:
+                        logger.exception("Failed GLM52 draft extend decode in log")
+
                 forward_batch.spec_info.num_correct_drafts = graph_accept_lens - 1
                 forward_batch.spec_info.num_accept_tokens = graph_accept_lens
 
                 can_cuda_graph = (
-                    self.cuda_graph_runner_for_draft_extend
-                    and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+                    use_draft_extend_graph_runner is not None
+                    and use_draft_extend_graph_runner.can_run(forward_batch)
                 )
                 if can_cuda_graph:
-                    draft_logits_output = (
-                        self.cuda_graph_runner_for_draft_extend.replay(forward_batch)
+                    draft_logits_output = use_draft_extend_graph_runner.replay(
+                        forward_batch
                     )
                 else:
                     draft_logits_output = self.draft_runner.forward(
@@ -612,7 +678,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     output_len = int(draft_logits_output.next_token_logits.shape[0])
                 if max_index >= output_len:
                     raise RuntimeError(
-                        "DSV4 DRAFT_EXTEND_V2 output/index layout mismatch: "
+                        "ATOM DRAFT_EXTEND_V2 output/index layout mismatch: "
                         f"max_index={max_index}, output_len={output_len}, "
                         f"batch={len(batch.seq_lens)}, "
                         f"num_draft_tokens={num_draft_tokens}, "
@@ -631,6 +697,25 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 probs = torch.softmax(selected_logits, dim=-1)
                 ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
 
+                if is_glm52:
+                    try:
+                        logger.info(
+                            "[GLM52_DRAFT_EXTEND_DECODE] out ret_topk_head=%s "
+                            "ret_topk_p_head=%s logits_rows=%s hidden_shape=%s "
+                            "can_cuda_graph=%s",
+                            ret_topk_index.detach().cpu().reshape(-1).tolist()[:8],
+                            ret_topk_p.detach().cpu().reshape(-1).tolist()[:8],
+                            output_len,
+                            (
+                                tuple(selected_hidden_states.shape)
+                                if torch.is_tensor(selected_hidden_states)
+                                else None
+                            ),
+                            bool(can_cuda_graph),
+                        )
+                    except Exception:
+                        logger.exception("Failed GLM52 draft extend decode out log")
+
                 next_draft_input = batch_result.next_draft_input
                 (
                     next_draft_input.topk_p,
@@ -647,6 +732,84 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
         EagleDraftWorker._draft_extend_for_decode = _draft_extend_for_decode
         EagleDraftWorker._atom_dsv4_draft_extend_accept_patched = True
+
+    if not getattr(EagleDraftWorker, "_atom_glm52_draft_prefill_dump_patched", False):
+
+        def _draft_extend_for_prefill(self, batch, *args, **kwargs):
+            original = EagleDraftWorker._atom_glm52_draft_prefill_dump_original
+            target_hidden = args[0] if args else kwargs.get("target_hidden_states")
+            next_token_ids = args[1] if len(args) > 1 else kwargs.get("next_token_ids")
+            if _is_glm52_nextn_runner(getattr(self, "draft_runner", None)):
+                try:
+                    import torch
+
+                    next_list = (
+                        next_token_ids.detach().cpu().reshape(-1).tolist()
+                        if torch.is_tensor(next_token_ids)
+                        else next_token_ids
+                    )
+                    logger.info(
+                        "[GLM52_DRAFT_PREFILL] in bs=%s seq_lens=%s extend_seq_lens=%s "
+                        "next_token_ids=%s target_hidden_shape=%s",
+                        int(getattr(batch, "batch_size", 0) or 0),
+                        getattr(batch, "seq_lens", None),
+                        getattr(batch, "extend_seq_lens", None),
+                        next_list,
+                        tuple(target_hidden.shape)
+                        if torch.is_tensor(target_hidden)
+                        else None,
+                    )
+                except Exception:
+                    logger.exception("Failed GLM52 draft prefill in log")
+
+            ret = original(self, batch, *args, **kwargs)
+
+            if _is_glm52_nextn_runner(getattr(self, "draft_runner", None)):
+                try:
+                    import torch
+
+                    topk = getattr(ret, "topk_index", None)
+                    topk_head = (
+                        topk.detach().cpu().reshape(-1).tolist()[:8]
+                        if torch.is_tensor(topk)
+                        else None
+                    )
+                    bonus = getattr(ret, "bonus_tokens", None)
+                    bonus_head = (
+                        bonus.detach().cpu().reshape(-1).tolist()[:8]
+                        if torch.is_tensor(bonus)
+                        else None
+                    )
+                    logger.info(
+                        "[GLM52_DRAFT_PREFILL] out ret_topk_head=%s ret_topk_p_head=%s "
+                        "bonus_tokens=%s new_seq_lens=%s hidden_shape=%s",
+                        topk_head,
+                        (
+                            getattr(ret, "topk_p", None)
+                            .detach()
+                            .cpu()
+                            .reshape(-1)
+                            .tolist()[:8]
+                            if torch.is_tensor(getattr(ret, "topk_p", None))
+                            else None
+                        ),
+                        bonus_head,
+                        getattr(ret, "new_seq_lens", None),
+                        (
+                            tuple(ret.hidden_states.shape)
+                            if torch.is_tensor(getattr(ret, "hidden_states", None))
+                            else None
+                        ),
+                    )
+                except Exception:
+                    logger.exception("Failed GLM52 draft prefill out log")
+            return ret
+
+        EagleDraftWorker._atom_glm52_draft_prefill_dump_original = (
+            EagleDraftWorker._draft_extend_for_prefill
+        )
+        EagleDraftWorker._draft_extend_for_prefill = _draft_extend_for_prefill
+        EagleDraftWorker._atom_glm52_draft_prefill_dump_patched = True
 
     if not getattr(EagleDraftWorker, "_atom_dsv4_init_cuda_graphs_patched", False):
         original_init_cuda_graphs = EagleDraftWorker.init_cuda_graphs
@@ -717,6 +880,240 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         EagleDraftWorker._atom_dsv4_init_cuda_graphs_patched = True
 
 
+def _patch_sglang_glm52_target_verify_log() -> None:
+    """Log GLM-5.2 eager target_verify in/out for staged MTP gates."""
+    try:
+        from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+    except Exception as exc:
+        logger.debug("Skip GLM52 target verify log patch: %s", exc)
+        return
+
+    if getattr(EAGLEWorkerV2, "_atom_glm52_target_verify_log_patched", False):
+        return
+
+    def _is_glm52_runner(runner) -> bool:
+        try:
+            from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+            hf_config = getattr(
+                getattr(runner, "model_config", None), "hf_config", None
+            )
+            return is_glm52_dsa_config(hf_config)
+        except Exception:
+            return False
+
+    original_verify = EAGLEWorkerV2.verify
+
+    def verify(self, batch):
+        target_runner = getattr(
+            getattr(self, "target_worker", None), "model_runner", None
+        )
+        is_glm52 = _is_glm52_runner(target_runner)
+        if is_glm52:
+            try:
+                import torch
+
+                verify_input = getattr(batch, "spec_info", None)
+                draft_token = getattr(verify_input, "draft_token", None)
+                candidates = (
+                    draft_token.detach().cpu().reshape(-1).tolist()[:16]
+                    if torch.is_tensor(draft_token)
+                    else None
+                )
+                positions = getattr(verify_input, "positions", None)
+                logger.info(
+                    "[GLM52_TARGET_VERIFY] in candidates_head=%s draft_token_num=%s "
+                    "seq_lens=%s positions_head=%s",
+                    candidates,
+                    getattr(verify_input, "draft_token_num", None),
+                    getattr(batch, "seq_lens", None),
+                    (
+                        positions.detach().cpu().tolist()[:16]
+                        if torch.is_tensor(positions)
+                        else None
+                    ),
+                )
+            except Exception:
+                logger.exception("Failed GLM52 target verify in log")
+
+        out = original_verify(self, batch)
+
+        if is_glm52:
+            try:
+                import torch
+
+                accept = getattr(out, "accept_lens", None)
+                new_seq = getattr(out, "new_seq_lens", None)
+                logger.info(
+                    "[GLM52_TARGET_VERIFY] out accept_lens=%s new_seq_lens=%s",
+                    accept.detach().cpu().tolist() if torch.is_tensor(accept) else None,
+                    new_seq.detach().cpu().tolist() if torch.is_tensor(new_seq) else None,
+                )
+            except Exception:
+                logger.exception("Failed GLM52 target verify out log")
+        return out
+
+    EAGLEWorkerV2.verify = verify
+    EAGLEWorkerV2._atom_glm52_target_verify_log_patched = True
+
+
+def _patch_sglang_eagle_v2_draft_argmax() -> None:
+    """Use ATOM draft distributed argmax for SGLang EAGLE topk=1 drafting."""
+    if os.getenv("ATOM_SGLANG_DRAFT_ARGMAX", "1").lower() in ("0", "false", "no"):
+        return
+    try:
+        import torch
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+        from sglang.srt.speculative.spec_utils import (
+            maybe_detect_nan,
+            maybe_detect_oob,
+            select_top_k_tokens,
+        )
+    except Exception as exc:
+        logger.debug("Skip patching SGLang EAGLE draft argmax: %s", exc)
+        return
+
+    if getattr(EagleDraftWorker, "_atom_sglang_draft_argmax_patched", False):
+        return
+
+    def _is_glm52_nextn_runner(runner) -> bool:
+        try:
+            arches = (
+                getattr(
+                    getattr(getattr(runner, "model_config", None), "hf_config", None),
+                    "architectures",
+                    None,
+                )
+                or []
+            )
+            return any(
+                "GlmMoeDsaForCausalLMNextN" in str(arch)
+                or "DeepseekV3ForCausalLMNextN" in str(arch)
+                for arch in arches
+            )
+        except Exception:
+            return False
+
+    def draft_forward(self, forward_batch):
+        spec_info = forward_batch.spec_info
+        out_cache_loc = forward_batch.out_cache_loc
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+
+        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        out_cache_loc = out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
+
+        score_list = []
+        token_list = []
+        parents_list = []
+        scores = None
+        use_argmax = self.topk == 1
+
+        try:
+            from atom.plugin.sglang.glm52_dsa_bridge import (
+                clear_draft_decode_sub_step,
+                set_draft_decode_sub_step,
+            )
+        except Exception:
+            clear_draft_decode_sub_step = lambda *args, **kwargs: None  # type: ignore[assignment]
+            set_draft_decode_sub_step = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        clear_draft_decode_sub_step(forward_batch)
+
+        for i in range(self.speculative_num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+
+            if i == self.speculative_num_steps - 1:
+                break
+
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            forward_batch._atom_use_draft_argmax = use_argmax
+            spec_info.hidden_states = hidden_states
+            if _is_glm52_nextn_runner(getattr(self, "draft_runner", None)):
+                set_draft_decode_sub_step(forward_batch, i)
+
+            logits_output = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+
+            draft_token_ids = None
+            customized_info = getattr(logits_output, "customized_info", None) or {}
+            if use_argmax:
+                draft_token_ids = customized_info.get("draft_token_ids")
+
+            if draft_token_ids is not None:
+                topk_index = draft_token_ids.reshape(-1, 1)
+                topk_p = torch.ones(
+                    (topk_index.shape[0], 1),
+                    dtype=torch.float32,
+                    device=topk_index.device,
+                )
+            else:
+                maybe_detect_nan(
+                    logits_output.next_token_logits, f"draft_forward step {i}"
+                )
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                from sglang.srt.utils.common import fast_topk
+
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                )
+
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+            forward_batch.positions.add_(1)
+
+        score_list = torch.cat(score_list, dim=1).flatten(1)
+        ss_token_list = torch.cat(token_list, dim=1)
+        top_scores = torch.topk(
+            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        )
+        top_scores_index = torch.sort(top_scores.indices).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            ss_token_list.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
+        )
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            batch_size = parents_list[0].shape[0]
+            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+
+        return parent_list, top_scores_index, draft_tokens
+
+    EagleDraftWorker.draft_forward = draft_forward
+    EagleDraftWorker._atom_sglang_draft_argmax_patched = True
+    logger.info("Patched SGLang EAGLE draft_forward for ATOM distributed argmax")
+
+
 def register_ops_to_sglang(atom_config: Config) -> None:
     """
     Register custom ops to sglang, including attention
@@ -724,6 +1121,8 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     _register_custom_attention_to_sglang()
     _patch_sglang_dsv4_draft_backends()
     _patch_sglang_dsv4_spec_cuda_graph()
+    _patch_sglang_glm52_target_verify_log()
+    _patch_sglang_eagle_v2_draft_argmax()
 
 
 def set_attn_cls() -> None:
