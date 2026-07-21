@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Pipeline-parallel communication and distributed-init helpers (CPP A·P1a).
+# Pipeline-parallel communication and distributed-init helpers.
 #
 # aiter's `init_dist_env` hardcodes pipeline_model_parallel_size=1 and does not
 # expose it. Rather than patch aiter, this module replicates its body while
@@ -16,6 +16,7 @@
 #   dp_idx  =  rank // (tp*pcp*pp)
 
 import logging
+import pickle
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +27,7 @@ from aiter.dist.parallel_state import (
     get_tp_group,
     init_distributed_environment,
     ensure_model_parallel_initialized,
+    _split_tensor_dict,
 )
 from aiter.ops.communication import set_custom_all_reduce
 from atom.models.utils import IntermediateTensors
@@ -163,16 +165,11 @@ def recv_intermediate_tensors() -> IntermediateTensors:
 # uses synchronous recv) works unchanged.
 # ---------------------------------------------------------------------------
 
-# Reuse aiter's internal helper that splits a dict into (metadata, tensors).
-from aiter.dist.parallel_state import _split_tensor_dict  # noqa: E402
-
 
 def _async_send_object(
     obj: object, dst_global: int, cpu_group: torch.distributed.ProcessGroup
 ) -> list[P2PWork]:
     """Async version of aiter GroupCoordinator.send_object."""
-    import pickle
-
     object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
     size_tensor = torch.tensor([object_tensor.numel()], dtype=torch.long, device="cpu")
     works: list[P2PWork] = []

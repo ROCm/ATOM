@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Pipeline-parallel inter-stage CPU transport (CPP A·P1b, 方案②).
+# Pipeline-parallel inter-stage CPU transport.
 #
 # Each PP stage runs as its own EngineCore process. Two control channels run
 # over ZMQ (CPU); the hidden-state tensors themselves go GPU-to-GPU over NCCL
@@ -90,7 +90,7 @@ class PPStageTransport:
     def recv_tokens(self, timeout_ms: Optional[int] = None) -> Any:
         """Head: block for the last stage's sampled ScheduledBatchOutput.
 
-        Returns None on timeout (used as a deadlock guard in tests/bring-up).
+        Returns None on timeout.
         """
         if timeout_ms is not None:
             if not self._token_recv.poll(timeout_ms):
