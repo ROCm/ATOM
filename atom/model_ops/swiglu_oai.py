@@ -74,6 +74,11 @@ def swiglu_oai_split(
     if not gate_up.is_cuda:
         raise RuntimeError("SwiGLU-OAI is only supported on AMD GPU tensors.")
 
+    # <= 0 means "no clamp" (see docstring); collapse it to None so the kernel's
+    # has_limit flag and the reference semantics agree everywhere.
+    if limit is not None and limit <= 0:
+        limit = None
+
     orig_shape = gate_up.shape
     two_i = orig_shape[-1]
     n_inter = two_i // 2
