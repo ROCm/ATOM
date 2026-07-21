@@ -814,7 +814,12 @@ class KimiKDAAttention(nn.Module):
         fused_in = tgemm.mm(
             hidden_states, self.in_proj_weight, None, otype=hidden_states.dtype
         )
-        mixed_qkv = fused_in[..., : 3 * lp].contiguous()
+        # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
+        # row stride 4*lp). Both causal-conv consumers read the token stride from
+        # the tensor itself — causal_conv1d_fn uses x.stride(1) after transpose
+        # (channel-last: stride(0)==1), and causal_conv1d_update only requires
+        # x.stride(1)==1 (feature-contiguous, which the slice preserves).
+        mixed_qkv = fused_in[..., : 3 * lp]
         out_gate = fused_in[..., 3 * lp : 4 * lp]
         beta = self.b_proj(hidden_states).unsqueeze(0)
         gate = self.f_b_proj(self.f_a_proj(hidden_states))
