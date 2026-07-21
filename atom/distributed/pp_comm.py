@@ -1,19 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Pipeline-parallel communication and distributed-init helpers.
-#
-# aiter's `init_dist_env` hardcodes pipeline_model_parallel_size=1 and does not
-# expose it. Rather than patch aiter, this module replicates its body while
-# threading `pipeline_model_parallel_size` through to the lower-level aiter
-# primitives, so ATOM can build a real `_PP` GroupCoordinator. The pp=1 path is
-# left to aiter's own `init_dist_env` (byte-identical to today).
-#
-# The aiter rank layout is DP x PP x PCP x TP (TP innermost/contiguous), i.e.
-#   all_ranks.reshape(-1, dp, pp, pcp, tp)
-# so a global rank decomposes as:
-#   tp_idx  =  rank                       % tp
-#   pcp_idx = (rank // tp)                % pcp
-#   pp_idx  = (rank // (tp*pcp))          % pp
-#   dp_idx  =  rank // (tp*pcp*pp)
 
 import logging
 import pickle
@@ -40,19 +26,7 @@ _PP_PROXY_KEYS = ("hidden_states", "residual")
 
 
 def pp_send_allgather_group():
-    """The TP group over which PP payloads are replicated, or None.
-
-    At a PP boundary hidden_states/residual are TP-replicated (o_proj and MoE
-    all-reduce over the full TP group), so instead of every TP rank sending an
-    identical full copy, each rank can send only its 1/tp_size slice and the
-    receiver rebuilds the tensor via a TP-group all-gather. PP+DP-attention is
-    disallowed (assert in engine_core_mgr), so the replication group is always
-    the full TP group.
-
-    Both the sender (async_send_intermediate_tensors) and the receiver
-    (recv_intermediate_tensors) MUST derive the group from this single helper so
-    the send/recv slicing decision can never diverge — a mismatch deadlocks.
-    """
+    """TP group for PP send-allgather, or None if disabled/tp=1."""
     if not envs.ATOM_PP_SEND_ALLGATHER:
         return None
     tp = get_tp_group()
@@ -63,8 +37,7 @@ def pp_send_allgather_group():
 
 @dataclass
 class P2PWork:
-    """Handle for an in-flight isend; keeps the payload tensor alive until
-    the send completes so the underlying buffer is not GC'd or reused."""
+    """Handle for an in-flight isend; prevents payload GC until completion."""
 
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
@@ -81,17 +54,7 @@ def init_pp_aware_dist_env(
     prefill_context_model_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
 ) -> None:
-    """PP-aware distributed init for the "one EngineCore per stage" model.
-
-    Unlike aiter's init_dist_env (which pins pp=1), this threads
-    pipeline_model_parallel_size into group construction. Because each PP stage
-    is a *separate* EngineCore process with its own CUDA_VISIBLE_DEVICES, the
-    caller passes the already-resolved GLOBAL rank (in the DPxPPxPCPxTP layout)
-    and the full world_size; we set data_parallel_size=1 for the environment
-    init (no internal DP rank offset — the caller already folded dp/pp into
-    global_rank) but pass the real data_parallel_size to the group builder so
-    TP/PP/DP groups come out correct.
-    """
+    """PP-aware distributed init (aiter's init_dist_env pins pp=1)."""
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
@@ -132,15 +95,7 @@ def init_pp_aware_dist_env(
 
 
 def send_intermediate_tensors(it: IntermediateTensors) -> None:
-    """Send hidden_states/residual to the next pipeline stage (blocking).
-
-    aiter's send_tensor_dict expects `dst` as the GROUP-relative rank (not the
-    global rank that `next_rank` returns), so compute the next index in the PP
-    group directly.
-
-    Threads the same ``pp_send_allgather_group()`` as the async send/recv paths
-    so a blocking send stays wire-compatible with ``recv_intermediate_tensors``.
-    """
+    """Blocking send of hidden_states/residual to the next PP stage."""
     pp = get_pp_group()
     tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
     dst = (pp.rank_in_group + 1) % pp.world_size
@@ -148,22 +103,11 @@ def send_intermediate_tensors(it: IntermediateTensors) -> None:
 
 
 def recv_intermediate_tensors() -> IntermediateTensors:
-    """Receive hidden_states/residual from the previous pipeline stage.
-
-    `src` is the GROUP-relative rank of the upstream stage.
-    """
+    """Receive hidden_states/residual from the previous PP stage."""
     pp = get_pp_group()
     src = (pp.rank_in_group - 1) % pp.world_size
     tensors = pp.recv_tensor_dict(src=src, all_gather_group=pp_send_allgather_group())
     return IntermediateTensors(tensors)
-
-
-# ---------------------------------------------------------------------------
-# Async send — bypasses aiter's synchronous send_tensor_dict, using
-# torch.distributed.isend directly.  Wire protocol is identical to aiter's
-# send_object + per-tensor send, so the receiver's recv_tensor_dict (which
-# uses synchronous recv) works unchanged.
-# ---------------------------------------------------------------------------
 
 
 def _async_send_object(
@@ -183,26 +127,12 @@ def _async_send_object(
 def async_send_intermediate_tensors(
     it: IntermediateTensors,
 ) -> list[P2PWork]:
-    """Non-blocking send of hidden_states/residual to the next PP stage.
-
-    When send-allgather is active (see ``pp_send_allgather_group``), each rank
-    transmits only its 1/tp_size slice of the TP-replicated tensor; the receiver
-    rebuilds the full tensor via a TP-group all-gather. The sent metadata still
-    carries the *full* shape (computed before slicing), matching aiter's
-    recv_tensor_dict which allocates the full tensor then recvs into a slice.
-
-    Each (possibly sliced) tensor is cloned before isend so the model can
-    immediately reuse its forward buffers for the next micro-batch. The returned
-    P2PWork list holds references to the cloned tensors (preventing GC) and must
-    be committed via ``commit_pp_send_work`` before the *next* async send.
-    """
+    """Non-blocking send of hidden_states/residual to the next PP stage."""
     pp = get_pp_group()
     dst_local = (pp.rank_in_group + 1) % pp.world_size
     dst_global = pp.ranks[dst_local]
 
     tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
-    # metadata_list is derived from the full tensors, so it carries the full
-    # shape even when only a slice is sent below.
     metadata_list, tensor_list = _split_tensor_dict(tensors)
 
     works = _async_send_object(metadata_list, dst_global, pp.cpu_group)
@@ -214,9 +144,6 @@ def async_send_intermediate_tensors(
     for tensor in tensor_list:
         if tensor.numel() == 0:
             continue
-        # send-allgather: send only this rank's slice. The guard must match
-        # aiter recv_tensor_dict exactly (numel % ag_size == 0) so both sides
-        # agree on whether a slice or the full tensor crosses the wire.
         if ag_group is not None and tensor.numel() % ag_size == 0:
             tensor = tensor.reshape(ag_size, -1)[ag_rank]
         buf = tensor.clone()
