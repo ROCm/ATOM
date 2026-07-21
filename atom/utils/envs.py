@@ -95,6 +95,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
     # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
     "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
+    # DeepSeek-V4 unified KV pool (plan_atom_unified_kv_pool.md): SWA and the
+    # compressor share ONE per-layer physical tensor — SWA grows from the front
+    # (row = w*block_size), compress from the BACK (row = T_L - (c+1)*k_L),
+    # meeting in a shared middle so freed SWA space can back compress and vice
+    # versa. Default 0 = today's static swa_pages-forward split (no behavior
+    # change). 1 = reverse-anchored compress layout (Phase 2) + shared budget
+    # (Phase 3). Gated so the working path stays byte-identical when off.
+    "ATOM_UNIFIED_KV_SHARE": lambda: (os.getenv("ATOM_UNIFIED_KV_SHARE", "0") == "1"),
     # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
     # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
     # the bytes of one compressed block, so a 1:1 mirror starves the compressed
