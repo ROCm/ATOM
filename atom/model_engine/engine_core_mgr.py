@@ -50,10 +50,9 @@ class CoreManager:
             config.tensor_parallel_size = 1
         else:
             dp_size = config.parallel_config.data_parallel_size
-            assert not (pp_size > 1 and dp_size > 1), (
-                "Pipeline parallel combined with data parallel is not supported "
-                "yet (phase-1 targets dp=1)."
-            )
+            assert not (
+                pp_size > 1 and dp_size > 1
+            ), "Pipeline parallel combined with data parallel is not supported yet."
             # One EngineCore per (dp_rank, pp_rank) stage.
             self.local_engine_count = dp_size * pp_size
         # Inter-stage ZMQ channels (head<->downstream metadata, last->head

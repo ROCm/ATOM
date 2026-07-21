@@ -868,10 +868,8 @@ class ModelRunner:
                 dp_gather_scatter=dp_gather_scatter,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
-        # forward_vars is now fully populated (runner + attn builder + any V4/TBO
-        # buffers, all allocated in the builder ctor above). Build the
-        # per-in-flight-slot ring so concurrent pipeline microbatches don't share
-        # metadata staging buffers.
+        # forward_vars is fully populated here; build the per-slot ring so
+        # concurrent pipeline microbatches don't share staging buffers.
         self._init_forward_vars_ring()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
@@ -1459,28 +1457,16 @@ class ModelRunner:
         """Build a ring of independent ``forward_vars`` copies, one per possible
         in-flight pipeline microbatch.
 
-        Under chunked pipeline parallelism the head launches up to ``pp_size``
-        forwards back-to-back without a GPU sync (``pp_engine_core`` /
-        ``call_func(wait_out=True)`` only waits for the CPU return). All
-        per-forward attention metadata lives in a single reused set of
-        ``forward_vars`` buffers, so microbatch N+1's ``prepare_inputs`` would
-        overwrite the staging buffers microbatch N's kernels are still reading
-        -> cross-microbatch corruption -> GPU memory fault.
-
-        Giving each in-flight slot its own buffer set fixes this. Reuse of a
+        The head launches up to ``pp_size`` forwards back-to-back without a GPU
+        sync, so a single reused ``forward_vars`` set would let microbatch N+1's
+        ``prepare_inputs`` overwrite staging buffers microbatch N's kernels are
+        still reading. Each in-flight slot gets its own buffer set; reuse of a
         slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
-        ``_record_forward_vars_event``): before overwriting slot k the host
-        blocks until slot k's previous forward has finished consuming it on the
-        GPU. This bounds how far the CPU may race ahead to exactly the ring size
-        regardless of how the head collects — necessary because the head pops
-        non-output (middle prefill chunk) batches without any GPU confirmation
-        (``pp_engine_core._pp_head_step``), so the ``< pp_size`` in-flight gate
-        alone does NOT bound GPU lead. ``pp_size`` slots keep the event a no-op
-        in the balanced case (the slot's prior forward is already done on wrap).
+        ``_record_forward_vars_event``), bounding the CPU's GPU lead to the ring
+        size even when the head pops middle-chunk batches without a GPU sync.
 
-        When ``pp_size == 1`` (all non-PP paths, incl. the decode consumer and
-        cudagraph capture) the ring is the single original dict and advance is a
-        no-op, so behavior is unchanged.
+        When ``pp_size == 1`` the ring is the single original dict and advance is
+        a no-op, so behavior is unchanged.
         """
         pp_size = self.config.pipeline_parallel_size
         self._fv_idx = 0
@@ -1489,11 +1475,6 @@ class ModelRunner:
             self._fv_slot_events = None
             return
 
-        # CUDAGraph replay binds to fixed buffer addresses captured on slot 0;
-        # swapping slots per forward would desync replay from the metadata the
-        # model reads. PP under this engine is eager (--level 0 / --enforce-eager)
-        # so capture never runs; enforce that invariant rather than corrupt
-        # silently if someone enables graphs with PP.
         assert self.enforce_eager, (
             "pipeline_parallel_size > 1 requires eager execution "
             "(--enforce-eager / --level 0): the forward_vars ring swaps metadata "
@@ -3390,9 +3371,7 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        # Rotate to this microbatch's own metadata slot before any buffer is
-        # written (prepare_model/prepare_inputs). Keeps pipeline microbatches
-        # from sharing staging buffers under CPP. No-op unless pp_size > 1.
+        # Rotate to this microbatch's slot before prepare_inputs writes buffers.
         if not batch.is_dummy_run:
             self._advance_forward_vars()
         (

@@ -39,6 +39,7 @@ from atom.kv_transfer.disaggregation.types import (
     TransferId,
 )
 from atom.model_engine.sequence import Sequence
+from atom.models.utils import get_pp_indices
 from atom.utils import get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
@@ -677,8 +678,6 @@ class MooncakeConnector(KVConnectorBase):
         # _consumer_region_map).
         self._num_local_layers = len(kv_caches)
         if self.pp_size > 1:
-            from atom.models.utils import get_pp_indices
-
             self._start_layer = get_pp_indices(
                 self.num_hidden_layers, self.pp_rank, self.pp_size
             )[0]
@@ -852,8 +851,7 @@ class MooncakeConnector(KVConnectorBase):
             # The consumer sends the same write_request to every stage; each
             # stage writes only its layer window (see _consumer_region_map).
             remote_pp_size = max(1, meta.remote_pp_size)
-            tp_fan_in = 1
-            expected_responses = remote_pp_size * tp_fan_in
+            expected_responses = remote_pp_size
             write_nonce = int.from_bytes(os.urandom(8), "big")
             with self._completion_lock:
                 self._pending_recv_expected[req_id] = expected_responses

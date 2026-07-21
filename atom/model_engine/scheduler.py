@@ -1130,11 +1130,8 @@ class Scheduler:
             )
 
             if self.advance_on_schedule:
-                # Advance chunked-prefill progress now (post batch build so the
-                # batch keeps pre-advance offsets), so the next schedule() issues
-                # the following chunk instead of re-issuing this one. Hash
-                # registration stays in postprocess (after the forward computes
-                # the KV); num_cached_tokens is the deferred hash start.
+                # Advance after batch build (so the batch keeps pre-advance
+                # offsets) so the next schedule() issues the following chunk.
                 self._advance_prefill_on_schedule(
                     scheduled_seqs, num_scheduled_tokens, is_final_chunk
                 )
@@ -1456,10 +1453,10 @@ class Scheduler:
     ) -> None:
         """Advance chunked-prefill progress at schedule time (pipeline-parallel).
 
-        Mirrors the num_cached_tokens / is_partial_prefill bookkeeping that
-        postprocess() does in the legacy path, so the head can schedule the next
-        chunk before this one's output returns. Hash registration is NOT done
-        here — it stays in postprocess where the forward has computed the KV.
+        Applies the num_cached_tokens / is_partial_prefill bookkeeping that
+        postprocess() otherwise does, so the head can schedule the next chunk
+        before this one's output returns. Hash registration is NOT done here — it
+        stays in postprocess where the forward has computed the KV.
         """
         for i, seq in enumerate(scheduled_seqs.values()):
             seq.num_cached_tokens += int(num_scheduled_tokens[i])
@@ -1499,10 +1496,8 @@ class Scheduler:
         """Head: release seqs blocked by mark_pp_inflight after postprocess.
 
         Discards exactly the set mark_pp_inflight() added (see
-        _pp_inflight_req_ids). Releasing every req_id unconditionally would let
-        an earlier middle-chunk batch (collected first, FIFO) clear the block a
-        later final-chunk batch just set for the same seq, leaking it into the
-        decode segment before its first token has returned.
+        _pp_inflight_req_ids) so a middle-chunk batch cannot clear a block that a
+        later final-chunk batch set for the same seq.
         """
         for req_id in self._pp_inflight_req_ids(batch):
             self._pp_inflight_token_block.discard(req_id)
