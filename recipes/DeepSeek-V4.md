@@ -75,6 +75,66 @@ For V4-Flash-Base's HF `quantization_config = {"quant_method": "fp8", "fmt": "e4
 For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without MTP), see
 [recipes/mesh/DeepSeek-V4.md](mesh/DeepSeek-V4.md).
 
+### EPLB (Expert Parallel Load Balancing)
+
+With `--enable-expert-parallel`, each GPU (EP rank) holds a fixed subset of
+physical experts. Real traffic routes unevenly across V4-Pro's 384 routed
+experts, so some EP ranks end up doing far more MoE work than others every
+step — the imbalanced ranks become the straggler the rest of the group waits
+on at the dispatch/combine barrier. EPLB periodically re-measures per-expert
+load and re-places experts (optionally replicating hot ones onto spare
+physical slots) to even that out.
+
+**Requires `--enable-expert-parallel`** — EPLB rebalances *physical* expert
+placement across EP ranks, so it's a no-op without EP (plain TP shards every
+expert's weights across all ranks; there's nothing to rebalance).
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-V4-Pro \
+  --kv_cache_dtype fp8 -tp 8 --enable-expert-parallel --enable-dp-attention \
+  --eplb-enable \
+  --eplb-config '{"num_redundant_experts": 64, "placement_policy": "biased", "rebalance_interval": 200}'
+```
+
+- **`--eplb-enable`** (alias `--enable-eplb`) is the master switch. `--eplb-config` only tunes it once enabled.
+- **`--eplb-config`** is a single JSON dict (no per-field flags), parsed into an `EPLBConfig`. Unknown keys raise at startup (fail fast on typos). Supported keys:
+
+  | Key | Default | Meaning |
+  |---|---|---|
+  | `num_redundant_experts` | `0` | Extra physical expert slots per MoE layer set aside for replicas. `0` = pure rearrangement only (no extra memory; still rebalances via re-placement). Must be a multiple of the GPU count. |
+  | `placement_policy` | `"naive"` | How the redundant-expert budget is spent. `"naive"`: greedy-replicate + `balanced_packing` spreads replicas thinly (DeepSeek-reference algorithm) — works with `num_redundant_experts=0` (pure rearrangement) or `>0`. `"biased"`: fully replicates the top-K hottest experts to **every** GPU (K = `num_redundant_experts // num_gpus`), trading memory for eliminating cross-GPU traffic on the hottest experts — **requires `num_redundant_experts > 0` (K ≥ 1); with `num_redundant_experts=0` it silently computes K=0 and falls back to identical behavior as `"naive"` ** If you set `placement_policy="biased"` and don't see the expected throughput gain, check `num_redundant_experts` first. |
+  | `rebalance_interval` | `3000` | Forward-pass steps between rebalance attempts. **Tune to the workload**: prefill-heavy/short runs accumulate steps slowly — use a small interval (e.g. `200`) or a short eval simply never triggers a rebalance. Decode-heavy runs accumulate steps fast — too small an interval (e.g. `200` for a long decode run) fires rebalances every few seconds and the migration overhead itself becomes the bottleneck; use a larger interval (e.g. `3000`) so rebalances land roughly every 8–12× the load-window size. |
+  | `load_window_size` | `1000` | Non-dummy (real) forward passes accumulated into the load histogram before a rebalance decision uses it. Must be `<= rebalance_interval`. |
+  | `rebalance_min_balancedness` | `2.0` | Gate: skip a rebalance if the measured per-GPU balancedness is already `>=` this value. Per-GPU balancedness is bounded by ~1.0 in practice, so the `2.0` default is **inert** (always rebalances every interval) — lower it toward `~0.85–0.9` to let already-balanced layers skip rebalancing (saves plan/migration cost when biased placement is already flat). |
+  | `rebalance_balancedness_agg` | `"min"` | `"min"` or `"mean"` — how per-layer balancedness scores are aggregated for the gate. |
+  | `rebalance_layers_per_chunk` | `64` | MoE layers migrated per rebalance chunk (chunking bounds per-rebalance P2P burst size). |
+  | `p2p_batch_chunk_size` | `32` | P2P batch chunk size used while migrating expert weights. |
+
+- **Memory**: `num_redundant_experts=0` (pure rearrangement) costs nothing extra. Each redundant slot costs one extra physical expert's weights on the GPU(s) holding it — `biased` concentrates that cost onto every GPU for the top-K experts, `naive` spreads it thinly.
+- EPLB is safe to enable with `num_redundant_experts=0` any time EP is on — it just periodically re-places experts across the existing physical slots to flatten per-GPU load, with no placement/memory tradeoffs to reason about.
+
+**Measured effect** (8×MI355X, EP+DPA, 8k-in/1-out prefill, `mnbt=8192`, conc=128; relative to EP with EPLB disabled):
+
+| Config | `eplb-config` | Throughput (req/s) | Δ vs no-EPLB |
+|---|---|---|---|
+| No EPLB | *(omit `--eplb-enable`)* | 6.48 | — |
+| Pure rearrange | `{"num_redundant_experts": 0, "placement_policy": "naive"}` | 7.56 | **+16.7%** |
+| Naive, 64 redundant | `{"num_redundant_experts": 64, "placement_policy": "naive"}` | 8.06 | **+24.4%** |
+| Biased, 64 redundant | `{"num_redundant_experts": 64, "placement_policy": "biased"}` | 8.68 | **+34.0%** |
+
+Pure rearrangement flattens the per-layer MoE straggler that the rest of the group waits on at the combine barrier; `biased` additionally removes cross-GPU dispatch/combine traffic for the hottest (top-8) experts. Effect size is workload-dependent — regimes with a pronounced per-layer straggler benefit most.
+
+**Accuracy** (GSM8K 5-shot, `local-completions`, same three configs, measured separately from the throughput run above after the `num_redundant_experts>0` startup-bug fixes; see the `DeepSeek-V4-Pro EPLB r0` / `r64 naive` / `r64 biased` cases in [`.github/benchmark/models_accuracy.json`](../.github/benchmark/models_accuracy.json) for the exact CI configs):
+
+| Config | `eplb-config` | GSM8K exact_match (flexible / strict) | Rebalances during eval | Crashes |
+|---|---|---|---|---|
+| Pure rearrange | `{"num_redundant_experts": 0, "placement_policy": "naive"}` | 0.9560 / 0.9568 | 4 | 0 |
+| Naive, 64 redundant | `{"num_redundant_experts": 64, "placement_policy": "naive"}` | 0.956 | 4 | 0 |
+| Biased, 64 redundant | `{"num_redundant_experts": 64, "placement_policy": "biased"}` | 0.9553 | 4 | 0 |
+
+All three match the no-EPLB baseline (≈0.95–0.96).
+
 ## Performance baseline
 
 The following script can be used to benchmark the performance:
