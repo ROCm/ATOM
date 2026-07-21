@@ -916,7 +916,7 @@ def _sparse_attn_v4_paged_decode_asm(
     q_packed_in: torch.Tensor,
     q_rope_in: torch.Tensor,
     qo_indptr: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
+    kv_last_page_lens: torch.Tensor | None = None,  # unused on v4 nm (page_size=1)
     num_kv_splits: int | None = None,
 ) -> torch.Tensor:
     """Native 2buff fp8 V4 decode via the aiter assembly kernel
@@ -931,8 +931,10 @@ def _sparse_attn_v4_paged_decode_asm(
     The flat-CSR ``unified_kv`` is made compatible with the kernel's paged
     format by treating each token as a 1-token page (``page_size=1``):
     ``kv_page_indices = kv_indices``, ``kv_indptr`` is the existing CSR indptr,
-    ``kv_last_page_lens = ones(N)``, ``qo_indptr = arange(N+1)``,
-    ``max_seqlen_q = 1``. No translation layer needed.
+    ``qo_indptr = arange(N+1)``, ``max_seqlen_q = 1``. No translation layer
+    needed. ``kv_last_page_lens`` is not built/forwarded: page_size=1 makes it
+    logically ones(N), but the kernel derives kv_seq_len from the token-level
+    ``kv_indptr`` and ignores the values (aiter synthesizes a throwaway buffer).
 
     softmax_scale is ignored by the kernel (hardcodes 1/sqrt(512)); passed
     through for API parity.
@@ -1000,7 +1002,6 @@ def _sparse_attn_v4_paged_decode_asm(
     # needed — only the trim to the real query count N (and a contiguity fixup on
     # the possibly-viewed kv_indices).
     qo_indptr = qo_indptr[: N + 1]
-    kv_last_page_lens = kv_last_page_lens[:N]
     kv_indptr_i32 = kv_indptr[: N + 1]
     kv_page_indices_i32 = kv_indices.contiguous()
     max_seqlen_q = 1
@@ -1008,9 +1009,8 @@ def _sparse_attn_v4_paged_decode_asm(
     output = torch.empty(
         (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
     )
-    out_16_nosplit = 1 if num_kv_splits == 1 else 0
 
-    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+    aiter.mla.mla_decode_fwd_v4_nm(
         q_packed,
         q_rope,
         kv_packed,
@@ -1019,20 +1019,12 @@ def _sparse_attn_v4_paged_decode_asm(
         qo_indptr,
         kv_indptr_i32,
         kv_page_indices_i32,
-        kv_last_page_lens,
         max_seqlen_q,
         sink=attn_sink,
         sm_scale=softmax_scale,
-        out_16_nosplit=out_16_nosplit,
         num_kv_splits=num_kv_splits,
     )
-    # Result lands in `output` for the bf16-direct write (out_16_nosplit=1) or
-    # the stage2 LSE merge (resolved splits > 1). Only the single-pass fp32
-    # path leaves it in logits[:, 0]. logits.shape[1] = resolved split count.
-    resolved_splits = logits.shape[1]
-    if out_16_nosplit != 0 or resolved_splits > 1:
-        return output
-    return logits[:, 0].to(torch.bfloat16)
+    return output
 
 
 @mark_trace
