@@ -1,29 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Pipeline-parallel EngineCore: one per PP stage.
-#
-# Each stage is an independent EngineCore process (reusing the DP multi-core
-# infrastructure). Only the head (stage 0) owns the Scheduler and the request
-# lifecycle; downstream stages are executors driven by the head's metadata.
-#
-#   head (stage 0):  schedule -> ZMQ metadata to downstream
-#                             -> forward its layers (NCCL-send hidden downstream)
-#                             -> ring=1: block for last stage's sampled tokens
-#                             -> scheduler.postprocess(tokens) -> emit / next step
-#   downstream:      recv metadata -> forward its layers (NCCL-recv hidden,
-#                             middle stages NCCL-send onward)
-#   last stage:      ... -> sample -> ZMQ tokens back to head
-#
-# Hidden states move GPU-to-GPU over NCCL inside ModelRunner.run_model
-# (pp_comm.py); only the scheduled batch and the sampled output cross here
-# (pp_transport.py).
-#
-# Batch-queue pipeline: the head keeps up to pp_size batches in
-# flight (launch phase), then blocks on the OLDEST one's tokens (collect phase),
-# so all pp_size stages compute different micro-batches concurrently. The
-# scheduler advances chunked-prefill progress at schedule time
-# (Scheduler.advance_on_schedule) and blocks re-decoding a seq whose token is
-# still in flight, so back-to-back schedules stay correct. Downstream stages are
-# unchanged — they already run a FIFO recv->forward loop.
+# Head (stage 0) owns the Scheduler; downstream stages are stateless executors.
+# Hidden states move over NCCL (pp_comm.py); batch metadata and sampled tokens
+# cross stages via ZMQ (pp_transport.py).
 
 import logging
 import queue
@@ -46,8 +25,6 @@ class PPEngineCoreProc(EngineCore):
         self.pp_size = config.pipeline_parallel_size
         self.is_head = self.pp_rank == 0
         self.is_last = self.pp_rank == self.pp_size - 1
-        # super().__init__ spawns this stage's workers, allocates its layers' KV
-        # cache, builds the Scheduler (only the head uses it), and sends READY.
         super().__init__(config, input_address, output_address)
         self.pp_transport = PPStageTransport(
             self.pp_rank,
@@ -55,8 +32,6 @@ class PPEngineCoreProc(EngineCore):
             pc.pp_meta_addrs,
             pc.pp_token_addr,
         )
-        # Batches launched but not yet collected, FIFO. Depth is capped at
-        # pp_size so every stage has a micro-batch to work on.
         self._in_flight: deque = deque()
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
@@ -69,7 +44,6 @@ class PPEngineCoreProc(EngineCore):
         else:
             self._downstream_busy_loop()
 
-    # ---- head (stage 0) -----------------------------------------------------
     def _head_busy_loop(self):
         shutdown = False
         try:
@@ -94,7 +68,6 @@ class PPEngineCoreProc(EngineCore):
             self.scheduler.shutdown_kv_events()
 
     def _pp_head_step(self):
-        # ---- Launch: fill the pipeline up to pp_size in-flight batches. ----
         launched = 0
         while len(self._in_flight) < self.pp_size:
             result = self.scheduler.schedule()
@@ -110,10 +83,6 @@ class PPEngineCoreProc(EngineCore):
                 break
 
             needs_output = scheduled_batch.produces_output()
-            # Hand the scheduled batch to every downstream stage (CPU/ZMQ), then
-            # run this stage's layers; workers NCCL-send hidden downstream and
-            # (non-last) produce no logits. The forward returns fast — it does
-            # not wait for downstream stages, which is what fills the pipeline.
             if (
                 self.kv_transfer_enabled
                 and scheduled_batch.connector_meta_output is not None
@@ -124,29 +93,16 @@ class PPEngineCoreProc(EngineCore):
                 )
             self.pp_transport.send_metadata(scheduled_batch)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-            # Block re-decoding these seqs until their tokens come back.
             self.scheduler.mark_pp_inflight(scheduled_batch)
             self._in_flight.append((scheduled_batch, seqs, needs_output))
             launched += 1
 
-        # No forward ran this step: commit the previous forward's deferred send
-        # now. run_model only commits at the start of the *next* forward, so an
-        # uncommitted send would dangle across the collect/idle spin and leave
-        # the downstream stage's matching recv unposted until the NCCL watchdog.
+        # Flush deferred send when idle — otherwise it dangles until next forward.
         if launched == 0:
             self.runner_mgr.call_func("flush_pp_send", wait_out=True)
 
-        # ---- KV transfer: drain completed transfers so blocks are freed. ----
-        # The non-PP path (engine_core.py) calls _poll_kv_transfer_progress()
-        # after every forward. Without this, deferred_free_blocks accumulates
-        # indefinitely and the block pool exhausts under sustained load.
         self._poll_kv_transfer_progress()
 
-        # ---- Collect: drain the FIFO head without blocking the stage. ----
-        # Non-output batches (middle-chunk prefill) never produce tokens, so
-        # release them immediately. For output batches, poll rather than block:
-        # if the oldest isn't ready, return to the outer loop to pull input and
-        # launch more, keeping admission decoupled from collection.
         poll_ms = 0 if launched else _PP_HEAD_IDLE_POLL_MS
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
@@ -160,8 +116,6 @@ class PPEngineCoreProc(EngineCore):
                 break
             poll_ms = 0
 
-            # Tokens return in launch order (single FIFO PULL socket), so the
-            # output must match the FIFO head; fail fast if that ever breaks.
             assert list(fwd_out.req_ids) == list(scheduled_batch.req_ids), (
                 f"PP token ordering violated: received {list(fwd_out.req_ids)}, "
                 f"expected FIFO head {list(scheduled_batch.req_ids)}"
@@ -184,7 +138,6 @@ class PPEngineCoreProc(EngineCore):
             if finished_seqs:
                 self.output_queue.put_nowait(finished_seqs)
 
-    # ---- downstream / last stage -------------------------------------------
     def _downstream_busy_loop(self):
         shutdown = False
         try:
@@ -195,13 +148,8 @@ class PPEngineCoreProc(EngineCore):
                     break
                 if self._is_idle_rl_weights_offloaded():
                     continue
-                # Wait (with timeout, to stay responsive to shutdown) for the
-                # head's scheduled batch, then run this stage's layers.
                 batch = self.pp_transport.recv_metadata(timeout_ms=100)
                 if batch is None:
-                    # No forward this iteration: commit any deferred send so it
-                    # does not dangle across the idle wait and starve the next
-                    # stage's matching recv.
                     self.runner_mgr.call_func("flush_pp_send", wait_out=True)
                     continue
                 fwd_out = self.runner_mgr.call_func("forward", batch, wait_out=True)
