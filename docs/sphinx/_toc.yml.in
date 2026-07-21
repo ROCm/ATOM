@@ -32,7 +32,9 @@ subtrees:
       - file: scheduling_kv_cache_guide
         title: Scheduling and KV cache
       - file: distributed_guide
-        title: Distributed cache
+        title: Distributed inference
+      - file: context_parallel_guide
+        title: Context parallelism
       - file: compilation_cudagraph_guide
         title: Compilation and CUDA graphs
       - file: serving_benchmarking_guide
