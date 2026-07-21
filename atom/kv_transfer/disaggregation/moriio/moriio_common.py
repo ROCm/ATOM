@@ -12,9 +12,11 @@ submodules.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+from contextlib import nullcontext
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import msgspec
 
@@ -65,9 +67,65 @@ class MoRIIOAgentMetadata(
     attn_backend_name: str = "aiter"
 
 
+class MoRIIOWriteRegion(
+    msgspec.Struct,
+    omit_defaults=True,
+    dict=True,
+    kw_only=True,
+):
+    """One unit-addressed RDMA region advertised for write-mode transfer."""
+
+    kind: str
+    chunks: list[bytes]
+    unit_bytes: int
+    units_per_chunk: int
+    total_units: int
+
+
+class MoRIIOWriteRequest(
+    msgspec.Struct,
+    omit_defaults=True,
+    dict=True,
+    kw_only=True,
+):
+    """Consumer-to-producer write-mode transfer request."""
+
+    decode_req_id: str | int
+    transfer_id: str | int
+    consumer_engine_desc: bytes
+    consumer_regions: list[MoRIIOWriteRegion]
+    dst_block_ids: list[int]
+    dst_slot_index: int = -1
+    dst_staging_pool_idx: int = -1
+    notify_host: str
+    notify_port: int
+    consumer_tp_size: int
+    consumer_dp_rank: int = 0
+
+
+class MoRIIOWriteDone(
+    msgspec.Struct,
+    omit_defaults=True,
+    dict=True,
+    kw_only=True,
+):
+    """Producer-to-consumer write-mode completion notification."""
+
+    decode_req_id: str | int
+    status: str
+    reason: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Enums & role management
 # ---------------------------------------------------------------------------
+
+
+class TransferMode(str, Enum):
+    """MoRIIO transfer direction."""
+
+    READ_PULL = "read"
+    WRITE_PUSH = "write"
 
 
 class Role(Enum):
@@ -159,6 +217,8 @@ class MoRIIOConstants:
     # ZMQ handshake message types
     GET_META_MSG = b"get_meta_msg"
     POP_DONE_RECV = b"pop_done_recv"
+    WRITE_REQUEST = b"write_request"
+    WRITE_DONE = b"write_done"
     OVER = b"OVER"
     COMPLETION_PREFIX = "cmpl"
 
@@ -172,3 +232,42 @@ class MoRIIOConstants:
 
 def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return (dp_rank) * tp_size + tp_rank
+
+
+# ---------------------------------------------------------------------------
+# Fabric KV allocation pool (mem-pool provider for KVConnectorFactory)
+# ---------------------------------------------------------------------------
+
+_FABRIC_KV_MEM_POOL = None
+
+
+def _moriio_fabric_enabled(kv_transfer_config: Optional[dict]) -> bool:
+    """Whether the MoRIIO FABRIC backend is selected (env or kv config)."""
+    if os.environ.get("ATOM_MORIIO_FABRIC", "0") == "1":
+        return True
+    kv_cfg = kv_transfer_config or {}
+    return str(kv_cfg.get("moriio_backend", "")).lower() == "fabric"
+
+
+def maybe_fabric_kv_mem_pool_ctx(config: Any = None):
+    """Mem-pool provider for the MoRIIO connector (see KVConnectorFactory).
+
+    The mori-io FABRIC backend (UALink scale-up) can only register/transfer VMM
+    memory created with a fabric handle, so KV tensors must be allocated inside
+    a fabric-exportable MemPool. Returns ``torch.cuda.use_mem_pool(pool)`` when
+    the fabric backend is selected, else a ``nullcontext`` (RDMA registers
+    ordinary torch memory and needs no custom pool). The pool is created once
+    and cached at module scope, which also keeps it alive for the process
+    lifetime. Analogous to mooncake's ``init_mooncake_custom_mem_pool``.
+    """
+    kv_transfer_config = getattr(config, "kv_transfer_config", None)
+    if not _moriio_fabric_enabled(kv_transfer_config):
+        return nullcontext()
+
+    import torch
+    from mori.io import make_fabric_mem_pool
+
+    global _FABRIC_KV_MEM_POOL
+    if _FABRIC_KV_MEM_POOL is None:
+        _FABRIC_KV_MEM_POOL = make_fabric_mem_pool()
+    return torch.cuda.use_mem_pool(_FABRIC_KV_MEM_POOL)
