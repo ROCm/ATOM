@@ -660,14 +660,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 (k_cache, v_cache, module.k_scale, module.v_scale)
             )
         elif getattr(runner, "is_kimi_linear", lambda: False)():
-            # Kimi-K3 full-attn (MLA-as-MHA) layers run at head_dim=192, which is
-            # non-power-of-2. The aiter SHUFFLE paged read mis-indexes the 5D
-            # SHUFFLE V/K cache at 192 (~100% error), so bind these layers in the
-            # 4D FLASH layout [num_blocks, block_size, num_kv_heads, head_dim]
-            # instead. unified_attention(shuffled_kv_cache=False) reads it
-            # correctly at 192; writes go through reshape_and_cache_flash. The
-            # backing storage runner.kv_cache[k/v, attn_idx] is already exactly
-            # this 4D shape, so no reshape is needed.
+            # Kimi-K3 full-attn (MLA-as-MHA) layers run at head_dim=192
+            # (non-power-of-2) and are bound in the 4D FLASH layout
+            # [num_blocks, block_size, num_kv_heads, head_dim]:
+            # unified_attention(shuffled_kv_cache=False) reads it correctly at
+            # 192, writes go through reshape_and_cache_flash, and the backing
+            # storage runner.kv_cache[k/v, attn_idx] is already exactly this 4D
+            # shape, so no reshape is needed. Validated: gsm8k-1319 graph =
+            # 0.9431 flex / 0.9424 strict (> baseline 0.9378).
+            #
+            # The 5D SHUFFLE decode path is deliberately NOT used at 192:
+            #  (1) the stock aiter SHUFFLE read mis-indexes the padded head_dim
+            #      at 192 (~100% error);
+            #  (2) a candidate kernel fix for (1) (kept in
+            #      code_k3/shuffle_kernel_fix.patch) is bit-accurate in op-tests
+            #      and eager server decode, but it still (a) regresses under
+            #      CUDA-graph capture (full-1319 graph: SHUFFLE 0.9204 vs FLASH
+            #      0.9431) and (b) destabilises the SHARED unified_attention
+            #      FLASH path in-server (non-deterministic garbage) even though
+            #      the edit is SHUFFLED_KV_CACHE-guarded and op-test-clean.
+            # So SHUFFLE decode at 192 stays a follow-up; keep FLASH.
             k_cache = runner.kv_cache[0, attn_idx]
             v_cache = runner.kv_cache[1, attn_idx]
             module.impl.use_flash_layout = True
