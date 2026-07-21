@@ -72,5 +72,4 @@ exec /opt/venv/bin/python -m atom.entrypoints.openai_server \
   --level "${K3_LEVEL:-0}" \
   --server-port "${K3_PORT:-8000}" \
   --no-enable_prefix_caching \
-  --no-enable_chunked_prefill \
   "${EAGER_FLAG[@]}"
