@@ -46,7 +46,8 @@
           "label": "DPA TBO",
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
-          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
+          "env_vars": "
+ATOM_PREFILL_DELAYER_STALL_TICKS=10\nATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS=100\nATOM_PREFILL_DELAYER_TTFT_MAX_TICKS=200\nATOM_PREFILL_DELAYER_TARGET_FILL=0.7\nATOM_ENABLE_PREFILL_DELAYER=1\nGPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
           "conc_min": 256,
           "conc_max": 1024
         },
