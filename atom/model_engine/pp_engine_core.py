@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Pipeline-parallel EngineCore: one per PP stage (CPP A·P1b, 方案②).
+# Pipeline-parallel EngineCore: one per PP stage.
 #
 # Each stage is an independent EngineCore process (reusing the DP multi-core
 # infrastructure). Only the head (stage 0) owns the Scheduler and the request
@@ -17,7 +17,7 @@
 # (pp_comm.py); only the scheduled batch and the sampled output cross here
 # (pp_transport.py).
 #
-# Batch-queue pipeline (CPP A·P2): the head keeps up to pp_size batches in
+# Batch-queue pipeline: the head keeps up to pp_size batches in
 # flight (launch phase), then blocks on the OLDEST one's tokens (collect phase),
 # so all pp_size stages compute different micro-batches concurrently. The
 # scheduler advances chunked-prefill progress at schedule time
@@ -27,7 +27,7 @@
 
 import logging
 import queue
-from collections import deque  # noqa: F401 — used for _in_flight type
+from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
 from atom.model_engine.engine_core import EngineCore

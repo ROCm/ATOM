@@ -8,6 +8,7 @@ import importlib.machinery
 import sys
 import os
 import types
+import enum
 import hashlib
 from itertools import count
 from pathlib import Path
@@ -27,6 +28,9 @@ if ATOM_ROOT not in sys.path:
 _atom_pkg = types.ModuleType("atom")
 _atom_pkg.__path__ = [os.path.join(ATOM_ROOT, "atom")]
 _atom_pkg.__package__ = "atom"
+# arg_utils does `from atom import LLMEngine`; stub it so the import resolves
+# without running atom/__init__.py (which pulls in zmq / GPU init).
+_atom_pkg.LLMEngine = MagicMock()
 sys.modules["atom"] = _atom_pkg
 
 # ── 3. Stub `atom.config` to avoid HuggingFace / torch heavy imports ──────
@@ -88,10 +92,23 @@ class _StubAtomConfig:
     eplb_config = _StubEPLBConfig()
 
 
+class _StubCUDAGraphMode(enum.Enum):
+    """Mirror the real enum members so arg_utils' `CUDAGraphMode[name]` works."""
+
+    NONE = 0
+    PIECEWISE = 1
+    FULL = 2
+
+
 _atom_config.Config = _StubConfig
 _atom_config.KVCacheTensor = _StubKVCacheTensor
 _atom_config.ParallelConfig = _StubParallelConfig
 _atom_config.EPLBConfig = _StubEPLBConfig
+_atom_config.CUDAGraphMode = _StubCUDAGraphMode
+# Config dataclasses arg_utils imports; tests only need them constructible.
+_atom_config.CompilationConfig = MagicMock(side_effect=lambda **kw: MagicMock(**kw))
+_atom_config.SpeculativeConfig = MagicMock(side_effect=lambda **kw: MagicMock(**kw))
+_atom_config.DSparkConfig = MagicMock(side_effect=lambda **kw: MagicMock(**kw))
 # Present so tests can monkeypatch it (raising=True) and so EPLB code paths that
 # call it without a patch get usable defaults.
 _atom_config.get_current_atom_config = lambda: _StubAtomConfig()
