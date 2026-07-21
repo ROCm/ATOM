@@ -879,7 +879,10 @@ class KimiKDAAttention(nn.Module):
                 True,
                 recurrent=_kda_force_recurrent,
             )
-            ssm_state[state_indices] = last_state.to(ssm_state.dtype)
+            # last_state already has ssm_state's dtype (fla preserves the
+            # initial_state dtype; the gathered initial is allocated as such),
+            # so no .to() cast is needed.
+            ssm_state[state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
         elif gdn_metadata.num_decodes > 0:
             q, k, v = causal_conv1d_update(
@@ -908,9 +911,7 @@ class KimiKDAAttention(nn.Module):
                 True,
                 recurrent=True,
             )
-            ssm_state[state_indices[:num_actual_tokens]] = last_state.to(
-                ssm_state.dtype
-            )
+            ssm_state[state_indices[:num_actual_tokens]] = last_state
             out.copy_(kda_out.squeeze(0))
         else:
             out.zero_()
