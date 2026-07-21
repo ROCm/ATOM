@@ -434,14 +434,17 @@ class DSparkLayer(Block):  # type: ignore[misc]
         qr_kv = _linear_out(a.wqkv_a(main_x))
         _, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
         kv = a.kv_norm(kv).view(-1, 1, a.head_dim)
-        rd = a.rope_head_dim
+        rope_dim = a.rope_head_dim
         # RoPE via the shared aiter fused kernel (rope_cached_positions, GPT-J
         # interleaved = the same rotate_style=1 layout the draft used to apply via
         # its own triton kernel). In-place on the rope-slice only (aiter handles
-        # the non-contiguous [..., -rd:] slice via strides); `kv` is a fresh
-        # local tensor so the in-place write is safe.
-        a.rotary_emb.forward(positions.reshape(-1), kv[..., -rd:])
-        _apply_dspark_kv_qat_(kv, rd)
+        # the non-contiguous [..., -rope_dim:] slice via strides); `kv` is a fresh
+        # local tensor so the in-place write is safe. Guard rope_dim > 0 so
+        # rope_dim == 0 doesn't turn `[..., -rope_dim:]` into the whole head
+        # (-0 == 0).
+        if rope_dim:
+            a.rotary_emb.forward(positions.reshape(-1), kv[..., -rope_dim:])
+        _apply_dspark_kv_qat_(kv, rope_dim)
         return kv.view(-1, a.head_dim)
 
     def precompute_context_kv(
@@ -534,13 +537,16 @@ class DSparkLayer(Block):  # type: ignore[misc]
         draft_pos = positions.view(B, 1) + torch.arange(
             1, T + 1, device=x.device, dtype=positions.dtype
         ).view(1, T)
-        rd = a.rope_head_dim
+        rope_dim = a.rope_head_dim
         dp_flat = draft_pos.reshape(-1)
         # RoPE via the shared aiter fused kernel (rope_cached_positions_2c, GPT-J
         # interleaved = the draft's former hand-rolled triton layout). In-place on
-        # the rope-slice of q and kv together; both are fresh local tensors.
-        a.rotary_emb.forward(dp_flat, q[..., -rd:], kv[..., -rd:])
-        _apply_dspark_kv_qat_(kv, rd)
+        # the rope-slice of q and kv together; both are fresh local tensors. Guard
+        # rope_dim > 0 so rope_dim == 0 doesn't turn `[..., -rope_dim:]` into the
+        # whole head.
+        if rope_dim:
+            a.rotary_emb.forward(dp_flat, q[..., -rope_dim:], kv[..., -rope_dim:])
+        _apply_dspark_kv_qat_(kv, rope_dim)
         q = q.view(B, T, a.n_local_heads, a.head_dim)
         kv = kv.view(B, T, a.head_dim)
 
@@ -583,9 +589,9 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # lanes, grouped output-LoRA einsum with the BF16 wo_a weight, then wo_b.
         # GPU-VERIFY: numerics validated against the V4 reference output stage.
         o = out.reshape(B * T, a.n_local_heads, a.head_dim).contiguous()
-        rd = a.rope_head_dim
+        rope_dim = a.rope_head_dim
         # Remove the absolute-position contribution carried in via value-side RoPE.
-        a.rotary_emb.inverse(draft_pos.reshape(-1), o[..., -rd:])
+        a.rotary_emb.inverse(draft_pos.reshape(-1), o[..., -rope_dim:])
         o = o.view(B * T, a.n_local_groups, -1)
         wo_a = a.wo_a.weight.view(a.n_local_groups, a.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
