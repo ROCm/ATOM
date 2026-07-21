@@ -378,6 +378,54 @@ models:
           run_eval: true
           eval_concurrency: [64, 256]
 
+        - name: minimax-m3-fp4-1p1d-tp4-agentic-lmcache-256k
+          topology: 1p1d
+          display_topology: 1P1D-TP4-agentic
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [262144]
+          osl: 1024
+          concurrency: [16]
+          server:
+            common_args:
+              kv_cache_dtype: bf16
+              max_model_len: 262144
+              max_num_seqs: 64
+              max_num_batched_tokens: 65536
+              decode_max_num_batched_tokens: 262144
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            common:
+              PYTHONHASHSEED: "0"
+            prefill:
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+              LMCACHE_CHUNK_SIZE: "256"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode: {}
+          benchmark:
+            kind: aiperf_agentic
+            scenario: inferencex-agentx-mvp
+            public_dataset: semianalysis_cc_traces_weka_062126_256k
+            max_context_length: 262144
+            num_dataset_entries: 393
+            benchmark_duration: 1800
+            agentic_cache_warmup_duration: 600
+            trajectory_start_min_ratio: 0.25
+            trajectory_start_max_ratio: 0.75
+            failed_request_threshold: 0.50
+            slice_duration: 1.0
+            cancel_drain_timeout: 300
+            wait_server_timeout: 4500
+            wait_router_timeout: 600
+          run_eval: false
+
         - name: minimax-m3-fp4-2p1d-dpa-tp4
           topology: 2p1d_dpa
           pd_worker_layout: multi_node
