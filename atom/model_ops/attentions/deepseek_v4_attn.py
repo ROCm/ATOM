@@ -1056,6 +1056,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
         positions_gpu=None,
+        buf_prefix_ubatch: str = "",
     ) -> None:
         """Build and attach the CSA Indexer per-fwd GPU metadata.
 
@@ -1063,6 +1064,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         n_committed / seq_base_per_token / cu_ends) into a single per-fwd
         build. None for warmup or empty fwd; `_build_v4_indexer_meta`
         handles both.
+
+        ``buf_prefix_ubatch`` selects the ub{idx}_ prefixed cu_committed staging
+        buffer so TBO ubatches don't collide on the shared global one.
         """
         attn_metadata.indexer_meta = self._build_v4_indexer_meta(
             attn_metadata=attn_metadata,
@@ -1070,6 +1074,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             scheduled_bs=scheduled_bs,
             total_tokens=total_tokens,
             device=self.device,
+            buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
     def _build_v4_indexer_meta(
@@ -1080,6 +1085,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
         device,
+        buf_prefix_ubatch: str = "",
     ):
         """Build per-fwd GPU index tensors consumed by `Indexer.forward_batched`.
 
@@ -1162,7 +1168,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # cu_committed_gpu is consumed both as `cu_starts/cu_ends` for the
         # fp8_mqa_logits per-token range AND as `cu_seq_lens` for the
         # cp_gather_indexer_k_quant_cache call (per-seq cumulative committed K).
-        cu_committed_gpu = self._stage("v4_indexer_cu_committed", cu_committed_cpu)
+        cu_committed_gpu = self._stage(
+            f"{buf_prefix_ubatch}v4_indexer_cu_committed", cu_committed_cpu
+        )
 
         # Layer-invariant GPU derivations (each was previously rebuilt ~30x
         # per fwd inside the per-CSA-layer body).
@@ -1799,6 +1807,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._apply_pcp_reindex(
                 attn_metadata, positions, scheduled_bs, sum_scheduled_tokens
             )
+        self._attach_tbo_prefill_cpu_lens(attn_metadata, scheduled_bs)
         return attn_metadata, positions
 
     def _apply_pcp_reindex(
@@ -1995,57 +2004,51 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             ub_attn.compress_plans = {}
 
-        # Multiple helpers read context_lens and block_tables from
-        # forward_vars by position [0:scheduled_bs]. For ubatch 1 the
-        # relevant rows live at [rs.start:rs.stop], not [0:ub_num_reqs].
-        # Temporarily place the ubatch's slices at the front so helpers
-        # see the right values.
-        bt = var["block_tables"].np
-        saved_ctx = var["context_lens"].np[:ub_num_reqs].copy()
-        saved_bt = bt[:ub_num_reqs].copy()
-        try:
-            var["context_lens"].np[:ub_num_reqs] = context_lens_np
-            bt[:ub_num_reqs] = bt[rs.start : rs.stop].copy()
+        # TBO path (_prepare_ubatch_decode). `_attach_v4_per_fwd_meta` reads
+        # var[f"{p}context_lens"].np[:ub_num_reqs] for this ubatch's ctx lens;
+        # its paged-decode branch is a no-op for prefill state, so only
+        # context_lens needs staging into the prefixed set here.
+        p = f"ub{ubatch_idx}_"
+        var[f"{p}context_lens"].np[:ub_num_reqs] = context_lens_np
 
-            self._attach_v4_per_fwd_meta(
-                ub_attn,
-                extend_lens_np,  # ubatch's per-seq token counts
-                ub_attn.state_slot_mapping_cpu,
-                ub_num_reqs,
-                ub_num_tokens,
-            )
+        self._attach_v4_per_fwd_meta(
+            ub_attn,
+            extend_lens_np,  # ubatch's per-seq token counts
+            ub_attn.state_slot_mapping_cpu,
+            ub_num_reqs,
+            ub_num_tokens,
+            buf_prefix_ubatch=p,
+        )
 
-            positions_gpu = var["positions"].gpu[ts.start : ts.stop]
-            self._attach_v4_indexer_meta(
-                ub_attn,
-                ub_num_reqs,
-                ub_num_tokens,
-                positions_gpu=positions_gpu,
-            )
+        positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+        self._attach_v4_indexer_meta(
+            ub_attn,
+            ub_num_reqs,
+            ub_num_tokens,
+            positions_gpu=positions_gpu,
+            buf_prefix_ubatch=p,
+        )
 
-            # start_pos = position of first token of each seq in this ubatch.
-            ub_start_pos_per_seq_np = positions_np[ub_cu[:ub_num_reqs]]
-            ub_positions_gpu = var["positions"].gpu[ts.start : ts.stop]
-            ub_block_tables_gpu = var["block_tables"].gpu[rs.start : rs.stop]
-            ub_cu_q_per_seq_gpu = torch.from_numpy(
-                np.ascontiguousarray(ub_cu[:ub_num_reqs], dtype=np.int32)
-            ).to(self.device, non_blocking=True)
-            self._build_paged_prefill_meta(
-                ub_attn,
-                positions_np,
-                ub_cu,
-                extend_lens_np,
-                ub_start_pos_per_seq_np,
-                ub_attn.state_slot_mapping_cpu,
-                ub_num_reqs,
-                ub_num_tokens,
-                positions_gpu=ub_positions_gpu,
-                cu_q_per_seq_gpu=ub_cu_q_per_seq_gpu,
-                block_tables_gpu=ub_block_tables_gpu,
-            )
-        finally:
-            bt[:ub_num_reqs] = saved_bt
-            var["context_lens"].np[:ub_num_reqs] = saved_ctx
+        # start_pos = position of first token of each seq in this ubatch.
+        ub_start_pos_per_seq_np = positions_np[ub_cu[:ub_num_reqs]]
+        ub_positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+        ub_block_tables_gpu = var["block_tables"].gpu[rs.start : rs.stop]
+        ub_cu_q_per_seq_gpu = torch.from_numpy(
+            np.ascontiguousarray(ub_cu[:ub_num_reqs], dtype=np.int32)
+        ).to(self.device, non_blocking=True)
+        self._build_paged_prefill_meta(
+            ub_attn,
+            positions_np,
+            ub_cu,
+            extend_lens_np,
+            ub_start_pos_per_seq_np,
+            ub_attn.state_slot_mapping_cpu,
+            ub_num_reqs,
+            ub_num_tokens,
+            positions_gpu=ub_positions_gpu,
+            cu_q_per_seq_gpu=ub_cu_q_per_seq_gpu,
+            block_tables_gpu=ub_block_tables_gpu,
+        )
 
         # `split_attn_metadata` computed ub_attn.cu_seqlens_q/k from RAW request
         # boundaries (orig_cu[rs] - base), which is WRONG for a straddling
@@ -2744,7 +2747,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         hca_total = int(hca_indptr_np[T])
 
         # ----- H2D: 4 indptrs + 2 per-seq scalars -----
-        # All non-blocking; bounded by `total ≤ T*max_per_tok`.
+        # All non-blocking; sources are per-call temp np arrays, so not a
+        # cross-ubatch race source (the shared-pinned-buffer race is handled by
+        # the stream sync before build_ubatch_prefill_metadata's finally).
         chunk_start_per_seq_gpu = torch.from_numpy(chunk_start_per_seq_np).to(
             device, non_blocking=True
         )
@@ -3261,7 +3266,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"v4_write_plan_{ratio}"].cpu.fill_(-1)
             bufs[f"v4_write_plan_{ratio}"].copy_to_gpu()
 
-        if getattr(self.model_runner.config, "enable_tbo_decode", False):
+        # ub{0,1}_ prefixed buffer sets are used by BOTH TBO decode and TBO
+        # prefill ubatch metadata builds (each ubatch reads/writes its own set
+        # instead of racing on the shared global forward_vars buffers). Allocate
+        # whenever TBO is on, not just for decode.
+        if getattr(self.model_runner.config, "enable_tbo", False) or getattr(
+            self.model_runner.config, "enable_tbo_decode", False
+        ):
             self._alloc_v4_ubatch_decode_buffers(bufs, i32, i64)
 
         # paged-SWA: parallel SWA block table (same shape as the compressed
