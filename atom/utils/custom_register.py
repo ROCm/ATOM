@@ -28,6 +28,14 @@ def direct_register_custom_op(
 
         schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
     my_lib = target_lib or aiter_lib
+    # Guard against double registration. torch's op registry (torch.ops) is a
+    # C++ global that outlives Python module state, so re-importing the module
+    # that runs this (e.g. after a sys.modules wipe in tests, or a second
+    # import path) would call define() twice for the same op and raise. Skip
+    # if the op already exists — production single-import flows are unaffected.
+    op_namespace = getattr(torch.ops, my_lib.ns)
+    if hasattr(op_namespace, op_name):
+        return
     my_lib.define(op_name + schema_str, tags=tags)
     my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
     if fake_impl is not None:

@@ -242,7 +242,7 @@ lm_eval --model local-completions \
 
 ## 📚 Documentation
 
-**Full documentation: [rocm.github.io/ATOM/docs](https://rocm.github.io/ATOM/docs)**
+**Full documentation: [rocm.docs.amd.com/projects/atom/en/latest/](https://rocm.docs.amd.com/projects/atom/en/latest/)**
 
 | Topic | Description | Guide |
 |---|---|---|

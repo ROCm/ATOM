@@ -118,8 +118,7 @@ python3 -m sglang.launch_server \
     --tp-size "${TP}" \
     --mem-fraction-static 0.8 \
     --disable-radix-cache \
-    --page-size 1 \
-    --attention-backend aiter \
+    --max-prefill-tokens 65536 \
     --kv-cache-dtype fp8_e4m3 \
     --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}" \
     2>&1 | tee glm-server-fp8-tp8-sglang.log

@@ -13,7 +13,8 @@ Ported from SGLang's DSA round-robin CP path
 `layers/utils/cp_utils.py:cp_all_gather_rerange_output`).
 """
 
-from typing import Optional
+import logging
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -22,6 +23,28 @@ from aiter.dist.parallel_state import (
     get_prefill_context_model_parallel_rank,
     get_prefill_context_model_parallel_world_size,
 )
+
+
+class PcpBalGroup(NamedTuple):
+    """One request group for PCP+TBO request-boundary split prefill.
+
+    A prefill batch is split into request groups at request boundaries (never
+    inside a sequence); each group is processed as an independent non-TBO PCP
+    mini-batch (padded to a pcp multiple, round-robin striped, reindexed on its
+    own). Consumed by ModelRunner.run_model (per-group stripe / restore) and the
+    attn builder's `_build_ubatch_prefill_metadata_balanced` (slice + reindex).
+    """
+
+    req_start: int  # first request index of this group (inclusive)
+    req_stop: int  # last request index of this group (exclusive)
+    tok_start: int  # global token offset of the group's first token
+    tok_end: int  # global token offset past the group's last REAL token
+    pad_total: (
+        int  # tok count padded to a pcp multiple = pcp_pad_len(tok_end-tok_start, pcp)
+    )
+
+
+logger = logging.getLogger("atom")
 
 
 def get_pcp_world_size() -> int:
@@ -39,22 +62,27 @@ def pcp_is_enabled() -> bool:
 def pcp_pad_len(
     total_tokens: int,
     pcp_size: Optional[int] = None,
+    multiple: int = 1,
 ) -> int:
-    """Padded token count so the global sequence is divisible by pcp_size.
+    """Padded token count so the global sequence is divisible by pcp_size * multiple.
 
     Round-robin split requires the global token count to be divisible by pcp_size
-    (see SGLang `can_dsa_cp_split` assert / HIP `apply_cp_reindex`). Returns the
-    padded length (>= total_tokens); callers pad per-token tensors to this
-    length with dummy tokens (KV length 0) before splitting.
+    (see SGLang `can_dsa_cp_split` assert / HIP `apply_cp_reindex`). `multiple` is
+    an extra factor applied on top of pcp_size when the sequence must additionally
+    be evenly divisible by some multiplier. Returns the padded length
+    (>= total_tokens); callers pad per-token tensors to this length with dummy
+    tokens (KV length 0) before splitting.
+
     """
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
-    if pcp_size <= 1:
+    divisor = pcp_size * max(multiple, 1)
+    if divisor <= 1:
         return total_tokens
-    rem = total_tokens % pcp_size
+    rem = total_tokens % divisor
     if rem == 0:
         return total_tokens
-    return total_tokens + (pcp_size - rem)
+    return total_tokens + (divisor - rem)
 
 
 def pcp_round_robin_split(
@@ -109,6 +137,55 @@ def pcp_allgather_rerange(
         .reshape(pcp_size * local_len, *rest)
     )
     return out
+
+
+# ==== MoE-path PCP collectives (rank-major gather + reduce_scatter) ====
+# Rank-major all_gather + reduce_scatter are a mutually-inverse pair:
+#   - gather (1/W -> full): all_gather(dim=0) concats rank-major, so rank r's
+#     1/W stripe lands at rows [r*L:(r+1)*L]. MoE is per-token so the rank-major
+#     (not global) order is fine.
+#   - reduce_scatter (full partial-sum -> 1/W): sums the pcp-half across ranks
+#     AND scatters dim0 back so rank r receives the summed chunk r == its own
+#     original stripe tokens. No rerange/slice needed.
+
+
+def pcp_allgather_rankmajor(
+    input_: torch.Tensor, pcp_size: Optional[int] = None
+) -> torch.Tensor:
+    """Gather this rank's 1/W stripe shard into the full rank-major sequence
+    via a plain all_gather (dim=0). Inverse of pcp_reduce_scatter."""
+    if pcp_size is None:
+        pcp_size = get_pcp_world_size()
+    if pcp_size <= 1:
+        return input_
+    return get_pcp_group().all_gather(input_.contiguous(), dim=0)
+
+
+def pcp_reduce_scatter(
+    input_: torch.Tensor, pcp_size: Optional[int] = None
+) -> torch.Tensor:
+    """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
+    stripe via a plain reduce_scatter (dim=0). Inverse of pcp_allgather_rankmajor."""
+    if pcp_size is None:
+        pcp_size = get_pcp_world_size()
+    if pcp_size <= 1:
+        return input_
+    return get_pcp_group().reduce_scatter(input_.contiguous(), dim=0)
+
+
+def pcp_all_reduce(
+    input_: torch.Tensor, pcp_size: Optional[int] = None
+) -> torch.Tensor:
+    """All-reduce (sum) over the PCP group, no token reshaping. DECODE path:
+    tokens are pcp-redundant (every rank holds the same full batch), so just sum
+    the pcp-half of the intermediate that combine_outputs' tp all_reduce missed.
+    Uses aiter's compile-safe custom-op all_reduce.
+    """
+    if pcp_size is None:
+        pcp_size = get_pcp_world_size()
+    if pcp_size <= 1:
+        return input_
+    return get_pcp_group().all_reduce(input_)
 
 
 def pcp_round_robin_query_indices(

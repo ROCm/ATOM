@@ -260,7 +260,6 @@ def gemm_a8w8_blockscale_preshuffle_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_preshuffle_fake, mutates_args=[])
 def gemm_a8w8_blockscale_preshuffle_impl(
     x: torch.Tensor,
@@ -283,7 +282,6 @@ def gemm_a8w8_blockscale_triton_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_triton_fake, mutates_args=[])
 def gemm_a8w8_blockscale_triton_impl(
     x: torch.Tensor,
@@ -309,7 +307,6 @@ def gemm_a8w8_per_tensor_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_per_tensor_fake, mutates_args=[])
 def gemm_a8w8_per_tensor_impl(
     x: torch.Tensor,
@@ -348,7 +345,6 @@ def gemm_a8w8_per_token_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_per_token_fake, mutates_args=[])
 def gemm_a8w8_per_token_impl(
     x: torch.Tensor,
@@ -779,6 +775,25 @@ class LinearBase(nn.Module):
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+
+    # linear mark trace shape/dtype helper
+    def get_trace_prefix(
+        self,
+        x: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
+        otype=dtypes.bf16,
+    ) -> str:
+        k = x.shape[-1]
+        m = x.numel() // k
+        n = self.output_size
+        a_dtype = (
+            self.params_dtype
+            if self.quant_type.value != QuantType.No.value
+            else x.dtype
+        )
+        w_dtype = self.params_dtype
+        o_dtype = otype
+        return f"{self.prefix}[M={m},N={n},K={k},a={a_dtype},w={w_dtype},o={o_dtype}]"
 
     @mark_trace
     def forward(

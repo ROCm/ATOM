@@ -1,9 +1,9 @@
-Supported Models
+Supported models
 ================
 
 ATOM supports a wide range of LLM architectures optimized for AMD GPUs.
 
-Llama Models
+Llama models
 ------------
 
 Meta's Llama family:
@@ -21,7 +21,7 @@ Meta's Llama family:
 
    llm = LLM(model="meta-llama/Llama-2-7b-hf")
 
-GPT Models
+GPT models
 ----------
 
 GPT-style architectures:
@@ -53,7 +53,7 @@ Mixture of Experts models:
        tensor_parallel_size=4
    )
 
-Other Architectures
+Other architectures
 -------------------
 
 * **Mistral**: Mistral-7B
@@ -61,7 +61,7 @@ Other Architectures
 * **MPT**: MPT-7B, MPT-30B
 * **BLOOM**: BLOOM-7B1
 
-Model Configuration
+Model configuration
 -------------------
 
 Custom model configurations:
@@ -77,7 +77,7 @@ Custom model configurations:
        max_model_len=8192
    )
 
-Performance by Model Size
+Performance by model size
 -------------------------
 
 .. list-table::
