@@ -770,7 +770,12 @@ class KimiKDAAttention(nn.Module):
             k=k,
             v=v,
             g=g,
-            beta=beta,
+            # Keep beta in fp32: fla computes b = sigmoid(beta) in-kernel with
+            # use_beta_sigmoid_in_kernel, and triton's sigmoid follows the input
+            # dtype -- a bf16 beta yields a bf16 write strength, which erodes the
+            # delta-rule state update across the 71 KDA layers (measured gsm8k
+            # regression). b_proj stays bf16; only this reduction is widened.
+            beta=beta.float(),
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             initial_state=initial_state,
@@ -825,10 +830,8 @@ class KimiKDAAttention(nn.Module):
         # x.stride(1)==1 (feature-contiguous, which the slice preserves).
         mixed_qkv = fused_in[..., : 3 * lp]
         out_gate = fused_in[..., 3 * lp : 4 * lp]
-        # beta stays bf16 (no .float()): b_proj is a bf16 GEMM so the values are
-        # already bf16-precision -- widening to fp32 adds nothing, and fla's KDA
-        # kernel upcasts beta to fp32 internally for sigmoid(beta). Dropping the
-        # cast removes a separate elementwise kernel on both prefill and decode.
+        # beta is widened to fp32 inside _run_kda (see the note there): the KDA
+        # delta-rule write strength must stay fp32 for accuracy.
         beta = self.b_proj(hidden_states).unsqueeze(0)
         gate = self.f_b_proj(self.f_a_proj(hidden_states))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
