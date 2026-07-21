@@ -15,9 +15,10 @@ release = version
 # -- General configuration ---------------------------------------------------
 extensions = [
     "rocm_docs",
-    # "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
+    # enabled by rocm_docs:
+    # "sphinx.ext.autodoc",
     # "sphinx.ext.mathjax",
     # "myst_parser",
 ]
@@ -35,21 +36,22 @@ html_theme_options = {
     "repository_url": "https://github.com/ROCm/ATOM",
     "use_repository_button": True,
     "use_issues_button": True,
+    "use_download_button": True,
 }
 
 html_logo = "assets/atom_logo.png"
 
 # -- Extension configuration -------------------------------------------------
 
+# Publish the llms.txt index at the docs site root and let
+# rocm-docs-core generate llms-full.txt after each build (the llms.txt standard,
+# https://llmstxt.org/). See the rocm-docs-core guide:
+# https://rocm.docs.amd.com/projects/rocm-docs-core/en/latest/user_guide/llms.html
+rocm_docs_generate_llms = True
+
 # Napoleon settings
 napoleon_google_docstring = True
 napoleon_numpy_docstring = True
-#
-# # Intersphinx configuration
-# intersphinx_mapping = {
-#     "python": ("https://docs.python.org/3", None),
-#     "torch": ("https://pytorch.org/docs/stable/", None),
-# }
 
 # MyST parser settings
 myst_enable_extensions = {

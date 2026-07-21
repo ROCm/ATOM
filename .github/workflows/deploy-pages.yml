@@ -33,29 +33,24 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           CURRENT_SHA=$(git rev-parse HEAD)
 
-          # Save pages before switching branches
-          cp -r .github/pages /tmp/pages_copy
+          # Save all page directories before switching branches
+          for dir in .github/pages/*/; do
+            page_name=$(basename "$dir")
+            cp -r "$dir" "/tmp/page_${page_name}"
+            echo "Found page: $page_name"
+          done
 
           # Switch to gh-pages
           git fetch origin gh-pages
           git checkout gh-pages
 
-          # Deploy subdirectories (clean first so stale files don't linger)
-          for dir in /tmp/pages_copy/*/; do
-            page_name=$(basename "$dir")
-            git rm -r --quiet "$page_name" 2>/dev/null || true
+          # Copy each page to its destination
+          for dir in /tmp/page_*/; do
+            page_name=$(basename "$dir" | sed 's/^page_//')
             mkdir -p "$page_name"
-            cp -r "$dir/." "$page_name/"
+            cp -r "$dir"* "$page_name/"
             git add "$page_name/"
             echo "Deployed: $page_name"
-          done
-
-          # Deploy root-level files (e.g., index.html redirect)
-          for file in /tmp/pages_copy/*; do
-            [ -f "$file" ] || continue
-            cp "$file" "$(basename "$file")"
-            git add "$(basename "$file")"
-            echo "Deployed root file: $(basename "$file")"
           done
 
           git diff --cached --quiet || git commit -m "pages: deploy static pages"
