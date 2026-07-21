@@ -24,6 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -123,13 +124,41 @@ if use_triton_gemm():
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_DS_QKNORM_FUSION = envs.ATOM_ENABLE_DS_QKNORM_FUSION
-ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+# GLM-5.2 correctness note: the fused TP all-reduce+RMSNorm trades a small
+# amount of bit-reproducibility for speed. NCCL/RCCL all-reduce reduction
+# order is not guaranteed bit-stable across calls (industry-known, normally
+# negligible), but GLM-5.2's fp8 pipeline has unusually thin numerical margins
+# (its BF16 small-M GEMM alone shows errors up to 2.0 in logit space -- see
+# the BF16_QKV_FALLBACK fix in atom/model_ops/linear.py), making this normally
+# invisible variance surface as real long-generation token-selection
+# divergence. Clean A/B (identical greedy prompt, N=15, max_tokens=400):
+# fusion ON -> 4/15 distinct outputs; fusion OFF -> 15/15 identical. The file
+# flag lets ops disable it without an env change (workers spawned via
+# multiprocessing do not reliably inherit launch-shell env in this stack).
+ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION and (
+    not os.path.exists("/host_logs/glm_disable_allreduce_rmsnorm_fusion")
+)
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
 ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
     envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
 )
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 ENABLE_GLM_FUSED_INDEXER = envs.ATOM_ENABLE_GLM_FUSED_INDEXER
+# Fixed-shape, cudagraph-capturable fix for GLM's sparse indexer decode top-k:
+# AITER's top_k_per_row_decode breaks ties (equal-score positions) non-
+# deterministically across calls/ranks -- at long context the fp8 MQA-logits
+# have many EXACT ties near the top-k threshold, so a non-deterministic
+# tie-break selects a different top-k KV set per call/rank, and sparse-MLA's
+# all-reduce mixes mismatched KV into garbage. Verified: 0/400 decode-step
+# cross-rank divergence with this enabled (vs. divergent every step without
+# it); a 72k-token fresh-context request completed with no crash; N=15
+# long-context repro clean (vs. heavy corruption at baseline). See
+# `_safe_deterministic_top_k_per_row_decode` below for the approach (encode
+# token position into the sort key so no ties exist, instead of trying to
+# force a consistent tie-break rule onto an opaque primitive).
+ENABLE_SAFE_DETERMINISTIC_INDEXER_TOPK = os.path.exists(
+    "/host_logs/glm_safe_deterministic_indexer_topk"
+) or os.getenv("ATOM_SAFE_DETERMINISTIC_INDEXER_TOPK", "0") == "1"
 _FP8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -1141,6 +1170,68 @@ class DeepseekV32IndexerCache(nn.Module):
         self.dtype = dtype
 
 
+def _float_to_ordered_uint32_as_int64(x: torch.Tensor) -> torch.Tensor:
+    """Bit-monotonic float32 -> unsigned-32-bit-value-in-int64 (radix-sort trick).
+
+    The XOR trick produces a bit pattern whose UNSIGNED 32-bit interpretation
+    orders like the float. torch int32 is signed, so promoting directly to
+    int64 sign-extends and destroys that ordering; mask to the low 32 bits
+    (zero-extend) after promotion to recover the correct non-negative value.
+    """
+    bits = x.view(torch.int32)
+    mask = bits >> 31  # all-1s if negative, else 0 (arithmetic shift)
+    transformed = bits ^ (mask | torch.iinfo(torch.int32).min)
+    return transformed.to(torch.int64) & 0xFFFFFFFF
+
+
+def _safe_deterministic_top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    context_lens: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """CUDAGraph-safe deterministic decode top-k with a stable tie-break.
+
+    AITER's decode top-k breaks ties (equal-score positions) non-deterministically
+    across calls/ranks. A prior fix for this used a Python loop + host `.cpu()`
+    sync + dynamic-shaped `torch.nonzero`, which is eager-only AND was observed
+    to trigger a GPU hardware exception at long context, deadlocking the whole
+    TP engine -- plausibly a boundary bug in its tie-count-dependent slicing.
+    This is a from-scratch, fixed-shape replacement: validated for determinism,
+    correctness against a slow reference, and full torch.compile(fullgraph=True)
+    capturability (no graph break) at production decode-bucket shapes.
+
+    Approach: instead of trying to force a consistent tie-break rule onto an
+    opaque top-k primitive, eliminate ties entirely by encoding the (unique)
+    token position into the sort key, so no two positions ever compare equal.
+    Any top-k implementation then gives the same answer on identical logits,
+    because there is nothing left to tie-break.
+    """
+    num_rows, max_model_len = logits.shape
+    k = out.shape[1]
+    device = logits.device
+
+    row_idx = torch.arange(num_rows, device=device, dtype=torch.int64)
+    batch_idx = row_idx // next_n
+    token_idx = row_idx % next_n
+    valid = context_lens.to(torch.int64)[batch_idx] - next_n + token_idx + 1
+    valid = valid.clamp(min=0, max=max_model_len)
+
+    positions = torch.arange(max_model_len, device=device, dtype=torch.int64)
+    idx_bits = (max_model_len - 1) - positions
+
+    val_key = _float_to_ordered_uint32_as_int64(logits)
+    invalid = positions.unsqueeze(0) >= valid.unsqueeze(1)
+    min_key = torch.iinfo(torch.int64).min // 4
+    val_key = torch.where(invalid, min_key, val_key)
+
+    shift = (max_model_len - 1).bit_length()
+    combined = (val_key << shift) | idx_bits.unsqueeze(0)
+
+    topk_idx = torch.topk(combined, k, dim=-1, sorted=False).indices
+    out.copy_(topk_idx.to(out.dtype))
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -1363,15 +1454,23 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.context_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-        )
+        if ENABLE_SAFE_DETERMINISTIC_INDEXER_TOPK:
+            _safe_deterministic_top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.context_lens,
+                topk_indices_decode,
+            )
+        else:
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.context_lens,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+            )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,

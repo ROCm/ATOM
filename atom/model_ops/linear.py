@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -40,6 +41,14 @@ from atom.quantization.quark.utils import (
 from torch import nn
 
 logger = logging.getLogger("atom")
+
+# TP workers scrub selected environment variables after process setup.  This
+# must be captured at module import (as the GLM diagnostic toggles are), rather
+# than through envs' lazy lookup during forward execution.
+_GLM_MXFP4_BF16_QKV_FALLBACK = (
+    os.getenv("ATOM_GLM_MXFP4_BF16_QKV_FALLBACK", "0") == "1"
+    or os.path.exists("/host_logs/glm_bf16_qkv_fallback")
+)
 
 
 def use_triton_gemm() -> bool:
@@ -794,7 +803,33 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
-        if self.quant_type.value == QuantType.No.value:
+        # GLM-5.2's AITER tuned BF16 GEMM (tgemm.mm) is NON-DETERMINISTIC for
+        # small M (decode): the same M=1 input yields different bytes on every
+        # call and every TP rank (verified 10/10 distinct; also up to 2.0 abs
+        # error vs torch). For the REPLICATED bf16 indexer/qkv-a projections that
+        # feed the sparse indexer, per-rank divergence -> each rank selects a
+        # different top-k KV set -> sparse-MLA all-reduce mixes mismatched KV ->
+        # long-context garbage. Route these bf16 unquantized linears through the
+        # deterministic PyTorch ROCm GEMM instead.
+        #
+        # The condition is intentionally FULLY STATIC (no data-dependent shape
+        # branch): a `x.shape[0] < MXFP4_QUANT_BLOCK_SIZE` guard causes a
+        # torch.compile graph break ("VllmBackend can only be called once")
+        # under cudagraph. These are small projections, so using F.linear for
+        # prefill too is negligible on perf and strictly more accurate.
+        use_glm_bf16_qkv_fallback = (
+            _GLM_MXFP4_BF16_QKV_FALLBACK
+            and x_scale is None
+            # `.value` (int) comparison, NOT the QuantType enum `==`: dynamo can't
+            # fold the enum __eq__ (UserDefinedObject) and graph-breaks on it,
+            # which fails ATOM's single-graph VllmBackend under cudagraph. The
+            # elif below already uses `.value` for the same reason.
+            and self.quant_type.value == QuantType.No.value
+            and self.weight.dtype == torch.bfloat16
+        )
+        if use_glm_bf16_qkv_fallback:
+            y = torch.nn.functional.linear(x, self.weight, self.bias).to(otype)
+        elif self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
                 x,
                 self.weight,
