@@ -70,5 +70,6 @@ exec /opt/venv/bin/python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens "${K3_MAX_NUM_BATCHED_TOKENS:-7168}" \
   --gpu-memory-utilization "${K3_GMU:-0.93}" \
   --server-port "${K3_PORT:-8000}" \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*"]}' \
   --no-enable_prefix_caching \
   "${EAGER_FLAG[@]}"

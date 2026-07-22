@@ -580,10 +580,7 @@ class ModelRunner:
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
         self.use_v4 = self.is_deepseek_v4()
-        if self.is_kimi_linear():
-            from atom.model_ops.linear import set_fp32_allreduce
 
-            set_fp32_allreduce(True)
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
         self.is_deepseek_v32 = (
@@ -670,7 +667,9 @@ class ModelRunner:
             os.getenv("ATOM_SYNC_AFTER_LOAD", "0").lower() in ("1", "true", "yes")
             and get_tp_group().world_size > 1
         ):
-            logger.info("Waiting for all TP ranks to finish model loading before warmup")
+            logger.info(
+                "Waiting for all TP ranks to finish model loading before warmup"
+            )
             get_tp_group().barrier()
             logger.info("All TP ranks finished model loading")
 
@@ -988,9 +987,9 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=enable_detailed_profiling,
+                record_shapes=False,
                 with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                profile_memory=False,
                 on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
