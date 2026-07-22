@@ -308,7 +308,9 @@ jobs:
               git clone "${GITHUB_REPO_URL}" /app/ATOM && \
               cd /app/ATOM && \
               git checkout "${GITHUB_COMMIT_SHA}" && \
-              ulimit -n 1048576 || true && \
+              echo "=== nofile BEFORE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)" && \
+              (ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true) && \
+              echo "=== nofile AFTER: soft=$(ulimit -Sn) hard=$(ulimit -Hn)" && \
               pip install -e . --no-deps && \
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
           RUN pip show amd-aiter atom sglang torch triton mori || true
