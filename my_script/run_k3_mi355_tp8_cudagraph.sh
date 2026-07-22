@@ -83,7 +83,6 @@ exec /opt/venv/bin/python -m atom.entrypoints.openai_server \
   --max-num-seqs "${K3_MAX_NUM_SEQS:-16}" \
   --max-num-batched-tokens "${K3_MAX_NUM_BATCHED_TOKENS:-7168}" \
   --gpu-memory-utilization "${K3_GMU:-0.93}" \
-  --level "${K3_LEVEL:-0}" \
   --server-port "${K3_PORT:-8000}" \
   --no-enable_prefix_caching \
   "${EAGER_FLAG[@]}"
