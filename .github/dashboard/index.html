@@ -3807,7 +3807,7 @@ function renderAtomeshTrendsTab() {
       rowMap[day] = point.row;
     }
     series.push({
-      label: `${fmtIslOsl(islOsl)} c=${concurrency} · ${fmtHardware(hardware)} · ${topology}`,
+      label: `${fmtIslOsl(islOsl)} c=${concurrency} · ${topology}`,
       pointMap,
       rowMap,
       borderColor: idx === 0 ? color.border : `hsl(${(getModelHue(ATOMESH_DATA.backend, state.atomeshTrendModel) + idx * 37) % 360}, 55%, 65%)`,
@@ -3852,7 +3852,7 @@ function renderAtomeshTrendsTab() {
       maintainAspectRatio: false,
       layout: { padding: { top: 8, right: 16 } },
       plugins: {
-        legend: datasets.length <= 8 ? { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } } : { display: false },
+        legend: { labels: { color: C_LEGEND, font: { size: 9 }, boxWidth: 10, usePointStyle: true } },
         tooltip: { ...chartTooltipOpts(), callbacks: {
           title: items => `${state.atomeshTrendModel} · ${items[0].label}`,
           label: item => ` ${item.dataset.label}: ${fmtNum(item.raw, 2)} tok/s/gpu`,
