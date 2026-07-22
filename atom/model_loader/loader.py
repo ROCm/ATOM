@@ -940,7 +940,7 @@ def load_model(
                                 name,
                                 shard_id,
                                 expert_id,
-                                weight_tensor,
+                                get_weight_tensor(),
                             )
                             loaded_weights_record.add(prefix + name)
                             matched = True
