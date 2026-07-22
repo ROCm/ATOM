@@ -41,5 +41,6 @@ exec /opt/venv/bin/lm_eval \
   --model_args "model=${MODEL},base_url=http://localhost:${PORT}/v1/completions,num_concurrent=${NUM_CONCURRENT},max_retries=3,tokenized_requests=False,trust_remote_code=True" \
   --tasks gsm8k \
   --num_fewshot "${NUM_FEWSHOT}" \
+  --seed 42 \
   "${LIMIT_ARG[@]}" \
   "${SAMPLES_ARG[@]}"

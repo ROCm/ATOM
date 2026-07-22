@@ -1051,6 +1051,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         local_blocks: int = 0,
         skip_index_topk: bool = False,
         sparse_layer_ordinal: int = -1,
+        index_cache_dtype: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -1088,6 +1089,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.local_blocks = local_blocks
         self.skip_index_topk = skip_index_topk
         self.sparse_layer_ordinal = sparse_layer_ordinal
+        self.index_cache_dtype = (
+            index_cache_dtype if index_cache_dtype is not None else kv_cache_dtype
+        )
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: Optional[torch.Tensor] = None
@@ -1185,6 +1189,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # per-token dequant scales into k_scale / v_scale (outputs).
         fused_k_scale = k_scale if is_fp8 else None
         fused_v_scale = v_scale if is_fp8 else None
+        fused_index_cache_dtype = (
+            self.index_cache_dtype if self.index_cache_dtype == "fp8" else "auto"
+        )
 
         if self.skip_index_topk:
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
@@ -1257,6 +1264,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             index_q,
             slot_mapping,
             kv_cache_dtype=kv_cache_dtype,
+            index_cache_dtype=fused_index_cache_dtype,
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
             asm_layout=True,

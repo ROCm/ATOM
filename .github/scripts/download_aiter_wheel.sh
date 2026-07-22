@@ -14,12 +14,46 @@ S3_MAIN_MANIFEST_URL="${S3_MAIN_MANIFEST_URL:-https://rocm.frameworks-nightlies.
 API_URL="${API_URL:-https://api.github.com}"
 AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
 AITER_TEST_WORKFLOW_ID="${AITER_TEST_WORKFLOW_ID:-179476100}"
+AITER_WHEEL_DOWNLOAD_MAX_ATTEMPTS="${AITER_WHEEL_DOWNLOAD_MAX_ATTEMPTS:-3}"
+AITER_WHEEL_RETRY_DELAY_SECONDS="${AITER_WHEEL_RETRY_DELAY_SECONDS:-30}"
+AITER_WHEEL_CURL_CONNECT_TIMEOUT_SECONDS="${AITER_WHEEL_CURL_CONNECT_TIMEOUT_SECONDS:-30}"
+AITER_WHEEL_CURL_MAX_TIME_SECONDS="${AITER_WHEEL_CURL_MAX_TIME_SECONDS:-540}"
 
 ARTIFACT_ID=""
 ARTIFACT_NAME=""
 ARTIFACT_RUN_ID=""
 ARTIFACT_RUN_SHA=""
 ARTIFACT_RUN_CREATED_AT=""
+
+retry_cmd() {
+  local max_attempts="$1"
+  shift
+  local attempt=1
+  local rc=0
+
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    rc=$?
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      echo "Command failed after ${attempt} attempts" >&2
+      return "$rc"
+    fi
+    local sleep_seconds=$((attempt * AITER_WHEEL_RETRY_DELAY_SECONDS))
+    echo "Attempt ${attempt}/${max_attempts} failed; retrying in ${sleep_seconds}s" >&2
+    sleep "$sleep_seconds"
+    attempt=$((attempt + 1))
+  done
+}
+
+curl_with_retry() {
+  retry_cmd "$AITER_WHEEL_DOWNLOAD_MAX_ATTEMPTS" \
+    curl --fail --silent --show-error --location \
+      --connect-timeout "$AITER_WHEEL_CURL_CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$AITER_WHEEL_CURL_MAX_TIME_SECONDS" \
+      "$@"
+}
 
 resolve_download_url() {
   # The python body must be column-0: indenting continuation lines to match the
@@ -46,11 +80,11 @@ find_latest_artifact() {
   python_artifact_suffix="${python_artifact_suffix:0:3}.${python_artifact_suffix:3}"
 
   echo "=== Finding latest aiter-whl-* artifact for ${python_artifact_suffix} from ROCm/aiter ==="
-  runs_json=$(curl -fsSL -H "$AUTH_HEADER" \
+  runs_json=$(curl_with_retry -H "$AUTH_HEADER" \
     "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
 
   for run_id in $(echo "$runs_json" | jq -r '.workflow_runs[].id'); do
-    artifact_json=$(curl -fsSL -H "$AUTH_HEADER" \
+    artifact_json=$(curl_with_retry -H "$AUTH_HEADER" \
       "$API_URL/repos/ROCm/aiter/actions/runs/$run_id/artifacts" \
       | jq --arg artifact_suffix "-${python_artifact_suffix}" '[.artifacts[] | select(.name | startswith("aiter-whl-") and endswith($artifact_suffix)) | select(.expired == false)] | sort_by(.created_at) | last')
 
@@ -77,7 +111,7 @@ download_from_s3_manifest() {
   manifest_file=$(mktemp)
   trap 'rm -f "$manifest_file"' RETURN
   manifest_fetch_url="${S3_MAIN_MANIFEST_URL}?ts=$(date +%s)"
-  curl -fsSL -H "Cache-Control: no-cache" "$manifest_fetch_url" -o "$manifest_file" || return 1
+  curl_with_retry -H "Cache-Control: no-cache" "$manifest_fetch_url" -o "$manifest_file" || return 1
 
   manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
   manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
@@ -122,7 +156,7 @@ download_from_s3_manifest() {
   echo "Manifest commit: $manifest_commit"
   echo "Manifest wheel: $wheel_name"
   echo "Downloading manifest-selected wheel: $resolved_wheel_url"
-  curl -fsSL "$resolved_wheel_url" -o "aiter-whl/$wheel_name" || return 1
+  curl_with_retry "$resolved_wheel_url" -o "aiter-whl/$wheel_name" || return 1
   echo "Downloaded wheel from manifest: aiter-whl/$wheel_name"
 
   rm -f "$manifest_file"
@@ -140,7 +174,7 @@ download_from_artifact() {
 
   mkdir -p aiter-whl
   rm -f aiter-whl/amd_aiter*.whl
-  curl -fsSL -H "$AUTH_HEADER" \
+  curl_with_retry -H "$AUTH_HEADER" \
     "$API_URL/repos/ROCm/aiter/actions/artifacts/$ARTIFACT_ID/zip" \
     -o aiter-whl.zip
   unzip -o aiter-whl.zip -d aiter-whl
@@ -175,3 +209,7 @@ if [[ "$(basename "$AITER_WHL")" != *${ATOM_PYTHON_TAG}* ]]; then
 fi
 
 echo "Selected wheel: $AITER_WHL"
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  echo "aiter_artifact_id=${ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
+  echo "aiter_wheel_name=$(basename "$AITER_WHL")" >> "$GITHUB_OUTPUT"
+fi

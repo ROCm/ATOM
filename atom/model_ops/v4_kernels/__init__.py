@@ -40,14 +40,21 @@ from atom.model_ops.v4_kernels.paged_prefill_indices import (
     write_v4_paged_prefill_indices_reference,
 )
 from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
+    QKNormRopeOut,
     qk_norm_rope_maybe_quant,
     qk_norm_rope_maybe_quant_reference,
+    qk_norm_rope_maybe_quant_fp8_2buff,
 )
-from atom.model_ops.v4_kernels.state_writes import update_compressor_states, swa_write
+from atom.model_ops.v4_kernels.state_writes import (
+    update_compressor_states,
+    swa_write,
+    swa_write_2buff_prepacked,
+)
 
 __all__ = [
     "update_compressor_states",
     "swa_write",
+    "swa_write_2buff_prepacked",
     "fused_compress_attn",
     "fused_compress_attn_reference",
     "sparse_attn_v4_paged_decode",
@@ -64,6 +71,8 @@ __all__ = [
     "write_v4_paged_decode_indices_reference",
     "write_v4_paged_prefill_indices",
     "write_v4_paged_prefill_indices_reference",
+    "QKNormRopeOut",
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_reference",
+    "qk_norm_rope_maybe_quant_fp8_2buff",
 ]
