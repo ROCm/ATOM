@@ -142,6 +142,16 @@ P99 ITL (ms):                            1830.16
 ==================================================
 ```
 
+### Acceptance
+
+DSpark drafts a block of `mtp_k = 7` tokens per step; the target then verifies
+it. On the mixed-length run above:
+
+- **Acceptance rate: 63.6%** — accepted draft tokens / total drafted tokens.
+- **Mean accepted length: 5.45 tokens/forward** — 1 verified token + ~4.45
+  accepted draft tokens, i.e. each target forward emits ~5.4x the tokens of
+  non-speculative decode.
+
 ### Accuracy (GSM8K, 3-shot)
 
 Lossless speculative decoding — verify always emits the target-greedy token, so
