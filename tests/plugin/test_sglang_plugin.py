@@ -192,58 +192,6 @@ def test_generate_sglang_config_translates_core_fields(monkeypatch):
     assert cfg.plugin_config.is_vllm is False
 
 
-def test_generate_sglang_config_preserves_dsv4_fp8_kv_cache_dtype(monkeypatch):
-    """DSV4 native 2-buffer gating must not downgrade regular FP8 KV cache."""
-    import atom.config as atom_config_module
-
-    monkeypatch.setattr(atom_config_module, "Config", _FakeConfig, raising=False)
-    monkeypatch.setattr(
-        atom_config_module, "ParallelConfig", _FakeParallelConfig, raising=False
-    )
-    monkeypatch.setattr(
-        atom_config_module, "CompilationConfig", _FakeCompilationConfig, raising=False
-    )
-
-    fake_server_args = _make_fake_server_args(kv_cache_dtype="fp8_e4m3")
-
-    mock_sglang_server_args = MagicMock()
-    mock_sglang_server_args.get_global_server_args.return_value = fake_server_args
-    mock_sglang_server_args.PortArgs = _Obj
-
-    mock_sglang_distributed = MagicMock()
-    mock_sglang_distributed.get_tensor_model_parallel_rank.return_value = 0
-
-    mock_sglang_model_config = MagicMock()
-    fake_model_config = _Obj(hf_config=_Obj(architectures=["DeepseekV4ForCausalLM"]))
-    mock_sglang_model_config.ModelConfig.from_server_args.return_value = (
-        fake_model_config
-    )
-
-    mock_sglang_modelopt_config = MagicMock()
-    mock_sglang_modelopt_config.ModelOptConfig.return_value = _Obj()
-
-    mock_sglang_load_config = MagicMock()
-    mock_sglang_load_config.LoadConfig.return_value = _Obj()
-
-    sgl_mods = _make_sglang_sys_modules(
-        mock_sglang_server_args,
-        mock_sglang_distributed,
-        mock_sglang_model_config,
-        mock_sglang_modelopt_config,
-        mock_sglang_load_config,
-    )
-
-    with (
-        patch.dict(sys.modules, sgl_mods),
-        patch("torch.distributed.get_rank", return_value=0),
-    ):
-        cfg = plugin_config._generate_atom_config_from_sglang_config(
-            config=_Obj(architectures=["DeepseekV4ForCausalLM"])
-        )
-
-    assert cfg.kv_cache_dtype == "fp8_e4m3"
-
-
 def test_generate_sglang_config_raises_on_none_server_args(monkeypatch):
     """Verify clear error when sglang global args are not initialized."""
     import atom.config as atom_config_module

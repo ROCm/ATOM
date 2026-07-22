@@ -15,6 +15,24 @@ logger = logging.getLogger("atom")
 VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
 
 
+def _is_deepseek_v4_model_config(*configs: Any) -> bool:
+    for cfg in configs:
+        if cfg is None:
+            continue
+        hf = getattr(cfg, "hf_config", cfg)
+        archs = getattr(hf, "architectures", None) or getattr(
+            cfg, "architectures", None
+        )
+        if isinstance(archs, (list, tuple)) and any(
+            "deepseekv4" in str(arch).replace("_", "").lower() for arch in archs
+        ):
+            return True
+        model_type = getattr(hf, "model_type", None) or getattr(cfg, "model_type", None)
+        if str(model_type).replace("_", "").lower() == "deepseekv4":
+            return True
+    return False
+
+
 def supports_dsv4_fp8_2buff() -> bool:
     try:
         from aiter.jit.utils.chip_info import get_gfx
@@ -23,10 +41,26 @@ def supports_dsv4_fp8_2buff() -> bool:
     except Exception as exc:
         logger.warning(
             "Unable to detect GPU arch for DeepSeek-V4 fp8 2-buffer support; "
-            "disabling the native 2-buffer path: %s",
+            "falling back to bf16 KV cache: %s",
             exc,
         )
         return False
+
+
+def _resolve_sglang_atom_kv_cache_dtype(server_args: Any, model_config: Any) -> str:
+    kv_cache_dtype = getattr(server_args, "kv_cache_dtype", "bf16")
+    if (
+        str(kv_cache_dtype).startswith("fp8")
+        and _is_deepseek_v4_model_config(model_config)
+        and not supports_dsv4_fp8_2buff()
+    ):
+        logger.warning(
+            "DeepSeek-V4 SGLang --kv-cache-dtype fp8 is only supported on "
+            "gfx950/gfx1250 for ATOM's native 2-buffer op4/op5 path. "
+            "Falling ATOM attention KV cache back to bf16 on this GPU."
+        )
+        return "bf16"
+    return kv_cache_dtype
 
 
 @dataclass
@@ -271,6 +305,9 @@ def _generate_atom_config_from_sglang_config(config: Any):
     server_args.model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
 
     sgl_model_config = SglangModelConfig.from_server_args(server_args)
+    atom_kv_cache_dtype = _resolve_sglang_atom_kv_cache_dtype(
+        server_args, sgl_model_config
+    )
     sgl_model_opt_config = ModelOptConfig(
         quant=server_args.modelopt_quant,
         checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
@@ -379,7 +416,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         # preventing double-compile.
         enforce_eager=True,
         parallel_config=sgl_parallel_config,
-        kv_cache_dtype=server_args.kv_cache_dtype,
+        kv_cache_dtype=atom_kv_cache_dtype,
         enable_prefix_caching=False,
         port=None,
         torch_profiler_dir=None,
