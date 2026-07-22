@@ -350,6 +350,7 @@ the programmatic API.
 | `ATOM_TORCH_PROFILER_DIR` env var | Sets the default `torch_profiler_dir` in `Config` |
 | `ATOM_PROFILER_MORE=1` env var | Enables detailed profiling: `record_shapes`, `with_stack`, `profile_memory` |
 | `ATOM_PROFILER_TIMEOUT=<seconds>` env var | Overrides the `stop_profile` timeout; default is 300 seconds |
+| `ATOM_ENABLE_DETAILED_ANNOTATION=1` env var | Appends attention FLOP aggregates (`sqsq`, `sqsk`, `sk`) to the `prefill[]`/`decode[]` trace labels while profiling is active (see [CUDA-graph capture traces](#cuda-graph-capture-traces)) |
 
 When a profiler directory is configured, each worker saves traces to a
 rank-specific subdirectory:
@@ -430,6 +431,32 @@ python -m atom.benchmarks.benchmark_serving \
 
 This sends `POST /start_profile` before the benchmark and
 `POST /stop_profile` after completion.
+
+### CUDA-graph capture traces
+
+During CUDA-graph capture (server bring-up), ATOM can emit one trace file per
+captured batch size instead of a single combined blob. This makes each graph's
+capture cost easy to inspect in isolation and keeps individual trace files
+small. Capture-trace profiling is gated on `--mark-trace` (with
+`--torch-profiler-dir`/`ATOM_TORCH_PROFILER_DIR` set); the warmup phase is
+omitted so only meaningful capture work is retained.
+
+The per-batch-size traces are written to:
+
+```
+{profiler_dir}/capture_traces/bs_<bs>_rank<rank>.json.gz
+```
+
+where `<bs>` is the captured batch size and `<rank>` the worker rank. Each file
+is a gzip-compressed Chrome trace viewable with `chrome://tracing` or
+TensorBoard.
+
+To additionally annotate the run-phase `prefill[]`/`decode[]` labels with the
+attention FLOP aggregates used for roofline analysis, set
+`ATOM_ENABLE_DETAILED_ANNOTATION=1` (see [Configuration](#configuration)). The added
+fields are `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), summed over
+every request in the forward. These are attention-quadratic terms only — a full
+roofline still requires GEMM FLOPs and bytes moved.
 
 ## Speculative decoding (MTP)
 

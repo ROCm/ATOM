@@ -247,6 +247,10 @@ class EngineUtilityHandler:
 
     def _handle_start_profile(self, args: dict):
         result = self.runner_mgr.call_func("start_profiler", wait_out=True)
+        # Flip the scheduler flag so per-iteration detailed aggregates
+        # (compute_detailed_aggregates) are emitted while profiling is active.
+        if self.scheduler is not None:
+            self.scheduler.profile_active = True
         logger.info(f"{self.label}: profiler started")
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "start_profile", "result": result})
@@ -255,6 +259,8 @@ class EngineUtilityHandler:
     def _handle_stop_profile(self, args: dict):
         logger.info(f"{self.label}: stopping profiler...")
         result = self.runner_mgr.call_func("stop_profiler", wait_out=True)
+        if self.scheduler is not None:
+            self.scheduler.profile_active = False
         logger.info(f"{self.label}: profiler stopped, result={result}")
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})

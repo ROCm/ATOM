@@ -137,6 +137,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
+    # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
+    "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
+        os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
+    ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
