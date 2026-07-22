@@ -10,6 +10,14 @@ from typing import Any, Optional
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+try:
+    import triton
+    import triton.language as tl
+
+    _EPLB_HAS_TRITON = True
+except ImportError:
+    _EPLB_HAS_TRITON = False
+
 import logging
 
 logger = logging.getLogger("atom")
@@ -1448,6 +1456,21 @@ class ExpertLoadMonitor:
             return
         self._cur_pass_count.zero_()
 
+    def pass_count_buffer(
+        self, layer_id: int, num_physical: int
+    ) -> Optional[torch.Tensor]:
+        """Return the [num_physical] cur-pass load row for layer_id, or None
+        if recording is disabled / uninitialized / out of capacity. Lets the
+        fused EPLB map+record kernel atomic_add straight into the live buffer
+        (same target as record())."""
+        if not self.enabled or self._cur_pass_count is None:
+            return None
+        if layer_id < 0 or layer_id >= self._num_layers:
+            return None
+        if num_physical != self._num_physical:
+            return None
+        return self._cur_pass_count[layer_id]
+
     def record(
         self, *, layer_id: int, topk_physical: torch.Tensor, num_physical: int
     ) -> None:
@@ -2445,3 +2468,113 @@ def record_eplb_expert_load(layer: Any, topk_physical: "torch.Tensor") -> None:
     monitor.record(
         layer_id=layer_id, topk_physical=topk_physical, num_physical=num_physical
     )
+
+
+# ---------------------------------------------------------------------------
+# Fused logical->physical remap + expert-load record (one Triton launch).
+# Replaces eplb_map_logical_to_physical (~10 ops) + record_eplb_expert_load
+# (~8 ops) on the hot path; decode (few tokens) is launch-overhead bound, so
+# collapsing ~18 ops/layer to 1 kernel/layer is a large decode win.
+# Semantics preserved exactly: per-rank dispatch gather (NOT vLLM per-token
+# replica hash), tail id -> +id_delta, invalid(<0) kept, record into
+# _cur_pass_count[layer_id]. Mirrors vLLM _eplb_map_and_record_i32_kernel.
+# ---------------------------------------------------------------------------
+if _EPLB_HAS_TRITON:
+
+    @triton.jit
+    def _eplb_map_record_kernel(
+        topk_ids_ptr,      # [numel]        logical ids (in dtype)
+        dispatch_ptr,      # [num_logical]  this rank's logical->physical (int32)
+        out_ids_ptr,       # [numel]        output physical ids (in dtype)
+        load_ptr,          # [num_physical] _cur_pass_count[layer_id]; dummy if !RECORD
+        num_logical,
+        id_delta,
+        num_physical,
+        numel,
+        RECORD: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < numel
+
+        lid = tl.load(topk_ids_ptr + offs, mask=mask, other=-1).to(tl.int64)
+        valid = (lid >= 0) & (lid < num_logical)
+        is_tail = lid >= num_logical
+
+        safe_lid = tl.where(valid, lid, 0)
+        mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(tl.int64)
+        # valid -> dispatch[lid]; tail -> lid + id_delta; invalid(<0) -> lid (keep)
+        phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
+        tl.store(out_ids_ptr + offs, phys, mask=mask)
+
+        if RECORD:
+            in_range = (phys >= 0) & (phys < num_physical)
+            rec_mask = mask & in_range
+            safe_phys = tl.where(in_range, phys, 0)
+            tl.atomic_add(load_ptr + safe_phys, 1, mask=rec_mask)
+
+
+def eplb_map_and_record_fused(layer: Any, topk_ids: "torch.Tensor") -> "torch.Tensor":
+    """Fused logical->physical remap + expert-load record (one Triton launch).
+
+    Drop-in replacement for the sequence
+        topk_physical = eplb_map_logical_to_physical(layer, topk_logical)
+        record_eplb_expert_load(layer, topk_physical)
+    Returns topk_ids unchanged when EPLB metadata is unavailable (non-EP /
+    pre-rebalance). Falls back to the original two-function path if Triton is
+    unavailable.
+    """
+    meta = get_live_expert_location_metadata()
+    layer_id = getattr(layer, "layer_id", None)
+    if meta is None or not isinstance(layer_id, int):
+        return topk_ids
+
+    if not _EPLB_HAS_TRITON:
+        topk_physical = eplb_map_logical_to_physical(layer, topk_ids)
+        record_eplb_expert_load(layer, topk_physical)
+        return topk_physical
+
+    numel = topk_ids.numel()
+    if numel == 0:
+        return topk_ids
+
+    # Per-rank dispatch table (int32, [num_logical]); a fixed-address view into
+    # the meta tensor (rebalance writes it in place via copy_), cudagraph-safe.
+    dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id]
+    if dispatch.device != topk_ids.device:
+        dispatch = dispatch.to(topk_ids.device)
+    num_logical = int(dispatch.numel())
+    num_physical = int(meta.num_physical_experts)
+    id_delta = num_physical - num_logical
+
+    # Resolve record buffer (== _cur_pass_count[layer_id]); None disables it.
+    # eplb_enable is static (server lifetime), so RECORD is a compile-time
+    # constexpr -> cudagraph capture fixes it, no per-step host branch.
+    from atom.config import get_current_atom_config
+
+    load_buf = None
+    atom_cfg = get_current_atom_config()
+    if bool(getattr(atom_cfg, "eplb_enable", False)):
+        monitor = get_expert_load_monitor(
+            enabled=True, window_size=atom_cfg.eplb_config.load_window_size
+        )
+        load_buf = monitor.pass_count_buffer(layer_id, num_physical)
+    record = load_buf is not None
+
+    out = torch.empty_like(topk_ids)
+    topk_c = topk_ids.contiguous()
+    grid = lambda meta_kw: (triton.cdiv(numel, meta_kw["BLOCK"]),)
+    _eplb_map_record_kernel[grid](
+        topk_c,
+        dispatch,
+        out,
+        load_buf if record else out,  # dummy ptr when !RECORD (never written)
+        num_logical,
+        id_delta,
+        num_physical,
+        numel,
+        RECORD=record,
+        BLOCK=256,
+    )
+    return out

@@ -27,6 +27,7 @@ from atom.config import (
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.eplb import (
     eplb_map_logical_to_physical,
+    eplb_map_and_record_fused,
     record_eplb_expert_load,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
@@ -447,8 +448,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        topk_physical = eplb_map_logical_to_physical(layer, topk_logical)
-        record_eplb_expert_load(layer, topk_physical)
+        # Fused logical->physical remap + expert-load record (one Triton
+        # launch, replaces the ~18-op map+record pair; big decode win).
+        topk_physical = eplb_map_and_record_fused(layer, topk_logical)
         return topk_weights, topk_physical
 
     @staticmethod
