@@ -953,8 +953,13 @@ class KimiKDAAttention(nn.Module):
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
             # Advanced indexing already returns a contiguous tensor, so no
-            # .contiguous() is needed. No zeroing here: decode sequences always
-            # carry an initial state.
+            # .contiguous() is needed. CUDA-graph decode pads the batch to the
+            # captured size with PAD_SLOT_ID (-1) state indices; the gather here
+            # harmlessly reads the last slot for padded rows (the values feed
+            # only the padded output rows, which are discarded). The scatter-back
+            # below, however, MUST skip padded rows -- see scatter_kda_state.
+            from atom.models.kimi_k3_fused import scatter_kda_state
+
             initial = ssm_state[decode_state_indices]
             kda_out, last_state = self._run_kda(
                 q,
@@ -967,7 +972,9 @@ class KimiKDAAttention(nn.Module):
                 True,
                 recurrent=True,
             )
-            ssm_state[decode_state_indices] = last_state
+            # Pad-aware writeback: -1 rows are skipped so they never overwrite an
+            # active request's state slot (PyTorch `ssm_state[-1] = ...` would).
+            scatter_kda_state(ssm_state, decode_state_indices, last_state)
             out.copy_(kda_out.squeeze(0))
         else:
             out.zero_()
