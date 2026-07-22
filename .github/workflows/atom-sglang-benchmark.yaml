@@ -26,6 +26,10 @@ on:
         options:
           - none
           - all
+          - OOB_P0
+          - OOB_P1
+          - OOB_P2
+          - OOB_P0+OOB_P1
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V4-Pro MTP1 TP8
           - DeepSeek-V4-Pro MTP3 TP8
@@ -740,20 +744,41 @@ jobs:
               if schedule_cron not in schedule_to_tier:
                   return "SKIP-UNKNOWN-DAY", []
               selected_group, tier_order = schedule_to_tier[schedule_cron]
+              return selected_group, select_oob_models([tier_order], include_mi308=True)
+
+          def select_oob_models(tier_orders, include_mi308):
               by_prefix = first_model_by_prefix(models)
-              tier_prefixes = frozenset(tier_order)
+              tier_prefixes = frozenset(
+                  prefix
+                  for tier_order in tier_orders
+                  for prefix in tier_order
+              )
               selected = []
-              for prefix in tier_order:
-                  model = by_prefix.get(prefix)
-                  if model is not None:
-                      selected.append(model)
+              seen_prefixes = set()
+              for tier_order in tier_orders:
+                  for prefix in tier_order:
+                      if prefix in seen_prefixes:
+                          continue
+                      seen_prefixes.add(prefix)
+                      model = by_prefix.get(prefix)
+                      if model is not None:
+                          selected.append(model)
+              if not include_mi308:
+                  return selected
               for prefix in sorted(by_prefix):
                   if prefix in tier_prefixes:
                       continue
                   model = by_prefix[prefix]
                   if is_oob_mi308(model):
                       selected.append(model)
-              return selected_group, selected
+              return selected
+
+          MANUAL_OOB_SELECTIONS = {
+              "OOB_P0": ("OOB_P0", [OOB_P0_PREFIX_ORDER]),
+              "OOB_P1": ("OOB_P1", [OOB_P1_PREFIX_ORDER]),
+              "OOB_P2": ("OOB_P2", [OOB_P2_PREFIX_ORDER]),
+              "OOB_P0+OOB_P1": ("OOB_P0+OOB_P1", [OOB_P0_PREFIX_ORDER, OOB_P1_PREFIX_ORDER]),
+          }
 
           if event == "schedule":
               schedule_cron = os.environ.get("SCHEDULE_CRON", "")
@@ -761,19 +786,28 @@ jobs:
           else:
               model_mi355 = os.environ.get("MODEL_MI355") or "none"
               model_mi308 = os.environ.get("MODEL_MI308") or "none"
-              selected = [
+              selected = []
+              manual_oob_selection = MANUAL_OOB_SELECTIONS.get(model_mi355)
+              if manual_oob_selection:
+                  selected_group, tier_orders = manual_oob_selection
+                  selected.extend(select_oob_models(tier_orders, include_mi308=False))
+              else:
+                  selected.extend(
+                      model
+                      for model in models
+                      if matches_workload(model)
+                      and manually_selected(model, model_mi355, expected_mi308=False)
+                  )
+              selected.extend(
                   model
                   for model in models
                   if matches_workload(model)
-                  and (
-                      manually_selected(model, model_mi355, expected_mi308=False)
-                      or manually_selected(model, model_mi308, expected_mi308=True)
-                  )
-              ]
+                  and manually_selected(model, model_mi308, expected_mi308=True)
+              )
 
           print(f"SGLang workload label: {workload_label}", file=sys.stderr)
           if selected_group:
-              print(f"Scheduled SGLang benchmark group: {selected_group}", file=sys.stderr)
+              print(f"SGLang benchmark group: {selected_group}", file=sys.stderr)
           if not selected:
               print("No models selected for SGLang benchmark.", file=sys.stderr)
           else:
@@ -792,7 +826,7 @@ jobs:
           MODELS_JSON: ${{ steps.load.outputs.models_json }}
         run: |
           if [[ -n "${SELECTED_GROUP}" ]]; then
-            echo "Scheduled SGLang benchmark group: ${SELECTED_GROUP}"
+            echo "SGLang benchmark group: ${SELECTED_GROUP}"
           fi
           printf 'Selected models: %s\n' "${MODELS_JSON}"
 
