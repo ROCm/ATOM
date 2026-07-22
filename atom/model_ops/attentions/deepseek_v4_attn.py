@@ -1056,6 +1056,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
         positions_gpu=None,
+        buf_prefix_ubatch: str = "",
     ) -> None:
         """Build and attach the CSA Indexer per-fwd GPU metadata.
 
@@ -1063,6 +1064,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         n_committed / seq_base_per_token / cu_ends) into a single per-fwd
         build. None for warmup or empty fwd; `_build_v4_indexer_meta`
         handles both.
+
+        ``buf_prefix_ubatch`` selects the ub{idx}_ prefixed cu_committed staging
+        buffer so TBO ubatches don't collide on the shared global one.
         """
         attn_metadata.indexer_meta = self._build_v4_indexer_meta(
             attn_metadata=attn_metadata,
@@ -1070,6 +1074,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             scheduled_bs=scheduled_bs,
             total_tokens=total_tokens,
             device=self.device,
+            buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
     def _build_v4_indexer_meta(
@@ -1080,6 +1085,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
         device,
+        buf_prefix_ubatch: str = "",
     ):
         """Build per-fwd GPU index tensors consumed by `Indexer.forward_batched`.
 
@@ -1162,7 +1168,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # cu_committed_gpu is consumed both as `cu_starts/cu_ends` for the
         # fp8_mqa_logits per-token range AND as `cu_seq_lens` for the
         # cp_gather_indexer_k_quant_cache call (per-seq cumulative committed K).
-        cu_committed_gpu = self._stage("v4_indexer_cu_committed", cu_committed_cpu)
+        cu_committed_gpu = self._stage(
+            f"{buf_prefix_ubatch}v4_indexer_cu_committed", cu_committed_cpu
+        )
 
         # Layer-invariant GPU derivations (each was previously rebuilt ~30x
         # per fwd inside the per-CSA-layer body).
@@ -1310,9 +1318,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if self._kv_fp8:
             attn_metadata.qo_indptr = self._stage(
                 "v4_qo_indptr", self._v4_qo_indptr_np[: bs + 1]
-            )
-            attn_metadata.kv_last_page_lens = self._stage(
-                "v4_kv_last_page_lens", self._v4_kv_last_page_lens_np[:bs]
             )
 
         # NOT rebuilt (unused by SWA-only MTP layer; would block a future
@@ -1776,7 +1781,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # model.forward entry round-robin-splits hidden/positions to 1/W, so the
         # per-query (per-token) metadata must be reduced to the SAME owned-query
         # set. Per-seq / KV-write fields stay full (every rank keeps full KV).
-        if pcp_is_enabled() and not batch.is_dummy_run:
+        # PCP+TBO request-boundary split: DEFER reindex to per-group in
+        # build_ubatch_prefill_metadata (each request group reindexed
+        # independently on its own pcp pad). Keep the FULL un-reindexed metadata
+        # here so build_ubatch can slice it per group.
+        _bal = getattr(self.model_runner, "_pcp_tbo_balanced_active", False)
+        if pcp_is_enabled() and not batch.is_dummy_run and not _bal:
             # Gate on `not is_dummy_run`: ForCausalLM.forward's round-robin-split is
             # skipped on dummy/warmup runs (_pcp_active() returns False there),
             # so reindexing metadata to 1/W here would pair full-size
@@ -1794,6 +1804,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._apply_pcp_reindex(
                 attn_metadata, positions, scheduled_bs, sum_scheduled_tokens
             )
+        self._attach_tbo_prefill_cpu_lens(attn_metadata, scheduled_bs)
         return attn_metadata, positions
 
     def _apply_pcp_reindex(
@@ -1822,6 +1833,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         pcp_size = get_pcp_world_size()
         device = attn_metadata.batch_id_per_token.device
         # Pad to a multiple of pcp_size; dummy (pad) queries get zero-length KV.
+        # This runs on the non-TBO PCP path (full-batch reindex) and, under
+        # PCP+TBO request-boundary split, per request GROUP (each group reindexed independently
+        # on its own pcp pad). Either way the divisor is pcp_size.
         padded_total = pcp_pad_len(total_tokens, pcp_size)
         n_pad = padded_total - total_tokens
         owned_q = pcp_round_robin_query_indices(padded_total, pcp_size).to(device)
@@ -1912,8 +1926,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         padded_bs: int,
         ubatch_idx: int = 0,
     ) -> AttentionMetaData_DSV4:
-        """Split prefill AttentionMetaData for V4 TBO micro-batches."""
+        """Split prefill AttentionMetaData for V4 TBO micro-batches.
+
+        Two paths:
+        - PCP+TBO request-boundary split: dispatches to
+          `_build_ubatch_prefill_metadata_balanced(attn_metadata, ubatch_idx)`,
+          which derives the group from `model_runner._pcp_bal_groups[ubatch_idx]`
+          and **ignores `ub_slice` / `padded_bs`** (the group's request/token
+          ranges come from the PcpBalGroup, not the ub_slice).
+        - Token-split TBO (default, §11): uses `ub_slice` / `padded_bs`.
+        """
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+
+        # PCP+TBO request-boundary split: each ubatch = one request group processed as an
+        # independent non-TBO PCP mini-batch. Slice the FULL (un-reindexed)
+        # metadata to the group + call _apply_pcp_reindex on it (reuse the proven
+        # reindex). Bypasses the token-split rebuild path entirely.
+        if (
+            getattr(self.model_runner, "_pcp_tbo_balanced_active", False)
+            and getattr(self.model_runner, "_pcp_bal_groups", None) is not None
+        ):
+            return self._build_ubatch_prefill_metadata_balanced(
+                attn_metadata, ubatch_idx
+            )
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
         ub_attn.__class__ = AttentionMetaData_DSV4
@@ -1966,57 +2001,51 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             ub_attn.compress_plans = {}
 
-        # Multiple helpers read context_lens and block_tables from
-        # forward_vars by position [0:scheduled_bs]. For ubatch 1 the
-        # relevant rows live at [rs.start:rs.stop], not [0:ub_num_reqs].
-        # Temporarily place the ubatch's slices at the front so helpers
-        # see the right values.
-        bt = var["block_tables"].np
-        saved_ctx = var["context_lens"].np[:ub_num_reqs].copy()
-        saved_bt = bt[:ub_num_reqs].copy()
-        try:
-            var["context_lens"].np[:ub_num_reqs] = context_lens_np
-            bt[:ub_num_reqs] = bt[rs.start : rs.stop].copy()
+        # TBO path (_prepare_ubatch_decode). `_attach_v4_per_fwd_meta` reads
+        # var[f"{p}context_lens"].np[:ub_num_reqs] for this ubatch's ctx lens;
+        # its paged-decode branch is a no-op for prefill state, so only
+        # context_lens needs staging into the prefixed set here.
+        p = f"ub{ubatch_idx}_"
+        var[f"{p}context_lens"].np[:ub_num_reqs] = context_lens_np
 
-            self._attach_v4_per_fwd_meta(
-                ub_attn,
-                extend_lens_np,  # ubatch's per-seq token counts
-                ub_attn.state_slot_mapping_cpu,
-                ub_num_reqs,
-                ub_num_tokens,
-            )
+        self._attach_v4_per_fwd_meta(
+            ub_attn,
+            extend_lens_np,  # ubatch's per-seq token counts
+            ub_attn.state_slot_mapping_cpu,
+            ub_num_reqs,
+            ub_num_tokens,
+            buf_prefix_ubatch=p,
+        )
 
-            positions_gpu = var["positions"].gpu[ts.start : ts.stop]
-            self._attach_v4_indexer_meta(
-                ub_attn,
-                ub_num_reqs,
-                ub_num_tokens,
-                positions_gpu=positions_gpu,
-            )
+        positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+        self._attach_v4_indexer_meta(
+            ub_attn,
+            ub_num_reqs,
+            ub_num_tokens,
+            positions_gpu=positions_gpu,
+            buf_prefix_ubatch=p,
+        )
 
-            # start_pos = position of first token of each seq in this ubatch.
-            ub_start_pos_per_seq_np = positions_np[ub_cu[:ub_num_reqs]]
-            ub_positions_gpu = var["positions"].gpu[ts.start : ts.stop]
-            ub_block_tables_gpu = var["block_tables"].gpu[rs.start : rs.stop]
-            ub_cu_q_per_seq_gpu = torch.from_numpy(
-                np.ascontiguousarray(ub_cu[:ub_num_reqs], dtype=np.int32)
-            ).to(self.device, non_blocking=True)
-            self._build_paged_prefill_meta(
-                ub_attn,
-                positions_np,
-                ub_cu,
-                extend_lens_np,
-                ub_start_pos_per_seq_np,
-                ub_attn.state_slot_mapping_cpu,
-                ub_num_reqs,
-                ub_num_tokens,
-                positions_gpu=ub_positions_gpu,
-                cu_q_per_seq_gpu=ub_cu_q_per_seq_gpu,
-                block_tables_gpu=ub_block_tables_gpu,
-            )
-        finally:
-            bt[:ub_num_reqs] = saved_bt
-            var["context_lens"].np[:ub_num_reqs] = saved_ctx
+        # start_pos = position of first token of each seq in this ubatch.
+        ub_start_pos_per_seq_np = positions_np[ub_cu[:ub_num_reqs]]
+        ub_positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+        ub_block_tables_gpu = var["block_tables"].gpu[rs.start : rs.stop]
+        ub_cu_q_per_seq_gpu = torch.from_numpy(
+            np.ascontiguousarray(ub_cu[:ub_num_reqs], dtype=np.int32)
+        ).to(self.device, non_blocking=True)
+        self._build_paged_prefill_meta(
+            ub_attn,
+            positions_np,
+            ub_cu,
+            extend_lens_np,
+            ub_start_pos_per_seq_np,
+            ub_attn.state_slot_mapping_cpu,
+            ub_num_reqs,
+            ub_num_tokens,
+            positions_gpu=ub_positions_gpu,
+            cu_q_per_seq_gpu=ub_cu_q_per_seq_gpu,
+            block_tables_gpu=ub_block_tables_gpu,
+        )
 
         # `split_attn_metadata` computed ub_attn.cu_seqlens_q/k from RAW request
         # boundaries (orig_cu[rs] - base), which is WRONG for a straddling
@@ -2054,6 +2083,151 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 im["n_committed_per_seq_gpu"] = im["n_committed_per_seq_gpu"].clone()
 
         return ub_attn
+
+    def _build_ubatch_prefill_metadata_balanced(
+        self,
+        attn_metadata: AttentionMetaData,
+        ubatch_idx: int,
+    ) -> AttentionMetaData_DSV4:
+        """PCP+TBO request-boundary split: build one request group's metadata as an
+        independent non-TBO PCP mini-batch.
+
+        `attn_metadata` is the FULL, UN-reindexed metadata (global). We slice it
+        to this group's requests + global token range, then run the proven
+        `_apply_pcp_reindex` on the group (pads the group to a pcp multiple and
+        round-robin strides to 1/pcp — matching run_model's per-group stripe).
+        Per-seq / KV-write fields (cu_seqlens_q, compress_plans, state_slot) stay
+        GLOBAL for the group (the compressor/swa_write see the group's full
+        all-gathered tokens), exactly as non-TBO PCP does for the whole batch.
+        """
+        from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
+        from atom.model_ops.v4_kernels import make_compress_plans
+
+        mr = self.model_runner
+        grp = mr._pcp_bal_groups[ubatch_idx]  # PcpBalGroup
+        rs0, rs1 = grp.req_start, grp.req_stop
+        gts, gte = grp.tok_start, grp.tok_end
+        group_bs = rs1 - rs0
+        group_total = gte - gts  # group's global token count (real, pre-pad)
+        device = self.device
+        var = mr.forward_vars
+        src = cast(AttentionMetaData_DSV4, attn_metadata)
+
+        # ---- base fields via split on the GROUP's GLOBAL token range ----
+        # full metadata is global, so a global token_slice slices cu_seqlens_q /
+        # slot_mapping / context_lens correctly (per-request, rebased).
+        g_slice = UBatchSlice(
+            request_slice=slice(rs0, rs1),
+            token_slice=slice(gts, gte),
+        )
+        ub = split_attn_metadata(attn_metadata, g_slice, group_bs)
+        ub.__class__ = AttentionMetaData_DSV4
+        # split_attn_metadata doesn't carry these: state drives prefill/decode
+        # dispatch; indexer_meta must be non-None so _apply_pcp_reindex rebuilds
+        # it for the group (it rebuilds from batch_id+positions, ignoring content).
+        ub.state = src.state
+        ub.indexer_meta = src.indexer_meta
+
+        # ---- per-seq DSV4 fields sliced by request ----
+        if src.state_slot_mapping is not None:
+            ub.state_slot_mapping = src.state_slot_mapping[rs0:rs1].contiguous()
+        if src.state_slot_mapping_cpu is not None:
+            ub.state_slot_mapping_cpu = src.state_slot_mapping_cpu[rs0:rs1]
+        if src.n_committed_csa_per_seq is not None:
+            ub.n_committed_csa_per_seq = src.n_committed_csa_per_seq[
+                rs0:rs1
+            ].contiguous()
+        if src.n_committed_csa_per_seq_cpu is not None:
+            ub.n_committed_csa_per_seq_cpu = src.n_committed_csa_per_seq_cpu[rs0:rs1]
+        if src.n_committed_hca_per_seq_cpu is not None:
+            ub.n_committed_hca_per_seq_cpu = src.n_committed_hca_per_seq_cpu[rs0:rs1]
+        # paged-SWA block tables (added by #1423): per-request [bs, MB], required
+        # by swa_write in prefill. split_attn_metadata does not carry this DSV4
+        # field, so slice it to the group's requests explicitly (else None -> crash).
+        if src.swa_block_tables is not None:
+            ub.swa_block_tables = src.swa_block_tables[rs0:rs1].contiguous()
+
+        # ---- per-token DSV4 fields sliced by the GLOBAL token range [gts,gte) ----
+        owned = torch.arange(gts, gte, device=device)
+        for ind_attr, idx_attr in (
+            ("kv_indptr_prefix_swa", "kv_indices_prefix_swa"),
+            ("kv_indptr_prefix_csa", "kv_indices_prefix_csa"),
+            ("kv_indptr_prefix_hca", "kv_indices_prefix_hca"),
+            ("kv_indptr_extend", "kv_indices_extend"),
+        ):
+            indptr = getattr(src, ind_attr, None)
+            indices = getattr(src, idx_attr, None)
+            if indptr is None or indices is None:
+                continue
+            ni, nx = pcp_reindex_ragged(indptr, indices, owned)
+            # kv_indices_extend are ROW offsets into the per-fwd kv_full tensor.
+            # In the full metadata they index the WHOLE sequence's kv_full [0,T);
+            # for this group kv_full only holds the group's tokens (global order
+            # [gts,gte) → rows [0, gte-gts)), so rebase by gts. (prefix indices
+            # point into unified_kv by absolute cache slot — no rebase.) Balanced
+            # splits on request boundaries so each query's SWA window stays within
+            # its sequence (within the group) → row >= gts, rebased value >= 0.
+            if idx_attr == "kv_indices_extend" and nx.numel() > 0:
+                nx = nx - gts
+            setattr(ub, ind_attr, ni)
+            setattr(ub, idx_attr, nx)
+        # batch_id_per_token: slice + rebase global req id → group-local (keep -1).
+        if src.batch_id_per_token is not None:
+            bid = src.batch_id_per_token[gts:gte].clone()
+            ub.batch_id_per_token = torch.where(bid >= 0, bid - rs0, bid)
+        if src.skip_prefix_len_csa is not None:
+            ub.skip_prefix_len_csa = src.skip_prefix_len_csa[gts:gte].contiguous()
+        ub.swa_pages = src.swa_pages
+
+        # ---- compress_plans: group's GLOBAL per-request (compressor all-gathers
+        # the group to full order). Built from global cu / context_lens slices. ----
+        if self._unique_compress_ratios_overlap:
+            gcu = var[
+                "cu_seqlens_q"
+            ].np  # GLOBAL (not overwritten for request-boundary split)
+            ext = (gcu[rs0 + 1 : rs1 + 1] - gcu[rs0:rs1]).astype(np.int32)
+            ctx = np.asarray(var["context_lens"].np[rs0:rs1], dtype=np.int32)
+            plan_bufs = self._get_ubatch_compress_plan_buffers(ubatch_idx)
+            ub.compress_plans = make_compress_plans(
+                np.ascontiguousarray(ext, dtype=np.int32),
+                np.ascontiguousarray(ctx, dtype=np.int32),
+                self._unique_compress_ratios_overlap,
+                plan_buffers=plan_bufs,
+                decode_capacity_per_ratio=None,
+            )
+        else:
+            ub.compress_plans = {}
+
+        # ---- reindex the group to 1/pcp (proven path) ----
+        # positions: group's GLOBAL positions (forward_vars stay global for the
+        # request-boundary split). _apply_pcp_reindex pads group_total to pcp + strides —
+        # matching run_model's per-group pcp_round_robin_split.
+        group_positions = var["positions"].gpu[gts:gte]
+        self._apply_pcp_reindex(ub, group_positions, group_bs, group_total)
+
+        # max_seqlen_q from the group's per-request extend lengths.
+        if ub.cu_seqlens_q is not None and group_bs > 0:
+            per_req_q = ub.cu_seqlens_q[1 : group_bs + 1] - ub.cu_seqlens_q[:group_bs]
+            if per_req_q.numel() > 0:
+                ub.max_seqlen_q = int(per_req_q.max().item())
+
+        # Clone GPU tensors that are slices/views into shared CpuGpuBuffers, so a
+        # later ubatch (or fwd) reusing the same buffer can't overwrite this
+        # ubatch's data (mirrors the token-split path's clones).
+        # n_committed_csa_per_seq is a view of src's shared buffer (the [rs0:rs1]
+        # .contiguous() slice above stays a view when already contiguous).
+        if ub.n_committed_csa_per_seq is not None:
+            ub.n_committed_csa_per_seq = ub.n_committed_csa_per_seq.clone()
+        if ub.indexer_meta is not None:
+            im = ub.indexer_meta
+            for k in (
+                "cu_committed_gpu",
+                "batch_id_per_token_gpu",
+                "n_committed_per_seq_gpu",
+            ):
+                if im.get(k) is not None:
+                    im[k] = im[k].clone()
+        return ub
 
     def _attach_v4_per_fwd_meta(
         self,
@@ -2430,9 +2604,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if T_pad > T:
                 qo_indptr_np[T + 1 :] = T
             attn_metadata.qo_indptr = self._stage("v4_qo_indptr", qo_indptr_np)
-            attn_metadata.kv_last_page_lens = self._stage(
-                "v4_kv_last_page_lens", self._v4_kv_last_page_lens_np[:T_pad]
-            )
 
     def _build_paged_prefill_meta(
         self,
@@ -2570,7 +2741,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         hca_total = int(hca_indptr_np[T])
 
         # ----- H2D: 4 indptrs + 2 per-seq scalars -----
-        # All non-blocking; bounded by `total ≤ T*max_per_tok`.
+        # All non-blocking; sources are per-call temp np arrays, so not a
+        # cross-ubatch race source (the shared-pinned-buffer race is handled by
+        # the stream sync before build_ubatch_prefill_metadata's finally).
         chunk_start_per_seq_gpu = torch.from_numpy(chunk_start_per_seq_np).to(
             device, non_blocking=True
         )
@@ -3009,15 +3182,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (`mla_decode_fwd_v4_nm`, page_size=1). Values are CONSTANT — they
         # depend only on the (padded) decode token count N, not the batch:
         #   qo_indptr        = arange(N+1)   (per-token q indptr, max_seqlen_q=1)
-        #   kv_last_page_lens = ones(N)       (page_size=1 → every page full)
         # Built the SAME way as `kv_indptr_*`: a CpuGpuBuffer re-staged via
         # `self._stage(...)` EVERY fwd, which is what makes them CUDAGraph-safe
         # (re-copied into the captured buffer before graph.replay). The constant
         # numpy sources are precomputed once so the per-fwd cost is a slice + H2D.
         bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
-        bufs["v4_kv_last_page_lens"] = CpuGpuBuffer(T_dec, **i32)
         self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
-        self._v4_kv_last_page_lens_np = np.ones(T_dec, dtype=np.int32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by csa_translate_pack
         # (kernel masks `(k < n_committed) & (k < index_topk)`) AND by the
         # indexer (cast to int64 inline). Built unconditionally in
@@ -3087,7 +3257,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"v4_write_plan_{ratio}"].cpu.fill_(-1)
             bufs[f"v4_write_plan_{ratio}"].copy_to_gpu()
 
-        if getattr(self.model_runner.config, "enable_tbo_decode", False):
+        # ub{0,1}_ prefixed buffer sets are used by BOTH TBO decode and TBO
+        # prefill ubatch metadata builds (each ubatch reads/writes its own set
+        # instead of racing on the shared global forward_vars buffers). Allocate
+        # whenever TBO is on, not just for decode.
+        if getattr(self.model_runner.config, "enable_tbo", False) or getattr(
+            self.model_runner.config, "enable_tbo_decode", False
+        ):
             self._alloc_v4_ubatch_decode_buffers(bufs, i32, i64)
 
         # paged-SWA: parallel SWA block table (same shape as the compressed

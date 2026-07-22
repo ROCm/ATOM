@@ -24,11 +24,15 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
-from atom.utils.cuda_graph import BatchDescriptor
+from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
+from atom.model_ops.eplb import (
+    initialize_eplb_runtime,
+    with_eplb_forward_monitor,
+)
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.eagle import EagleProposer
@@ -39,24 +43,31 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.kv_transfer.disaggregation import KVConnectorOutput
-from atom.utils.forward_context import get_kvconnector
-from atom.utils.tbo import (
-    UBatchWrapper,
-    local_tbo_precompute,
-    maybe_create_ubatch_slices,
-    sync_dp_metadata,
-)
+from atom.utils.cuda_graph import BatchDescriptor
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
     ForwardMode,
     get_forward_context,
+    get_kvconnector,
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
 )
 from atom.utils.selector import get_attn_backend
+from atom.utils.tbo import (
+    UBatchSlice,
+    UBatchWrapper,
+    local_tbo_precompute,
+    maybe_create_ubatch_slices,
+    sync_dp_metadata,
+)
+from atom.distributed.pcp_utils import (
+    PcpBalGroup,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+    pcp_round_robin_split,
+)
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -823,9 +834,7 @@ class ModelRunner:
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
         if self.attn_metadata_builder.compute_per_req_cache_bytes() > 0:
-            from atom.model_engine.llm_engine import (
-                InputOutputProcessor as _IOProc,
-            )
+            from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
             known = _IOProc._per_req_cache_model_types()  # noqa: SLF001
@@ -847,6 +856,7 @@ class ModelRunner:
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
+        initialize_eplb_runtime(self)
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
@@ -1557,24 +1567,17 @@ class ModelRunner:
         free, total = torch.cuda.mem_get_info()
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-
-        # Peak PyTorch usage (high watermark during warmup) — this is memory
-        # consumed by THIS process only (model weights + peak activations).
+        # weights + peak activation tensors (PyTorch allocator high-water).
         peak_torch = max(peak, current)
+        # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
+        # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
+        non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
 
-        # CUDA graph capture overhead estimate
         cudagraph_overhead = self._estimate_cudagraph_overhead()
-
-        # Safety margin (2% of total)
         safety_margin = int(total * 0.02)
 
-        # Budget: this server may use up to gpu_memory_utilization * total.
-        # Subtract our own PyTorch usage + CUDA graph estimate + safety.
-        # This is independent of other processes on the GPU.
         budget = int(total * config.gpu_memory_utilization)
-        # Fixed (utilization-independent) overhead of this process: model
-        # weights + peak activations + CUDA graph capture + safety margin.
-        non_kv_overhead = peak_torch + cudagraph_overhead + safety_margin
+        non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
         available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
@@ -1702,6 +1705,7 @@ class ModelRunner:
             f"utilization={config.gpu_memory_utilization}, "
             f"budget={budget / (1 << 30):.2f}GB, "
             f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
@@ -1757,6 +1761,7 @@ class ModelRunner:
             f"but available_for_kv={available_for_kv / (1 << 20):.2f}MB "
             f"(budget={budget / (1 << 30):.2f}GB, "
             f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
@@ -2088,6 +2093,56 @@ class ModelRunner:
                     self.config, batch, is_prefill, num_scheduled_tokens
                 )
             )
+
+        # PCP+TBO prefill: split requests into two GROUPS at a request boundary
+        # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
+        # request subset". Requires num_reqs >= 2 (request-boundary split needs
+        # two non-empty groups); bs=1 falls back to non-TBO.
+        pcp_size = self.config.prefill_context_parallel_size
+        # True for eligible PCP+TBO request-boundary split prefill; read by
+        # build_ubatch / run_model / prepare_prefill to route the per-group path.
+        self._pcp_tbo_balanced_active = False
+        # Per-group descriptors; reset each step, set in prepare_inputs
+        # request-boundary-split branch. Guards run_model/build_ubatch against
+        # stale values.
+        self._pcp_bal_groups = None
+        if tbo_on and is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            num_prefill_reqs = batch.total_seqs_num_prefill
+            n_prefill = batch.total_tokens_num_prefill
+            # Rough local sizing for TBO eligibility. PCP is always dp=1, so the
+            # dp_size<=1 fast path below returns local_eligible verbatim as
+            # tbo_collective_active; local_ub0/ub1 are only used by the dp>1
+            # sync path (never hit under PCP).
+            local_tokens = n_prefill // pcp_size
+            local_eligible = num_prefill_reqs >= 2 and local_tokens >= 2
+            local_ub0 = local_tokens // 2
+            local_ub1 = local_tokens - local_ub0
+            self._pcp_tbo_balanced_active = local_eligible
+
+        # PCP+TBO prefill: split requests into two GROUPS at a request boundary
+        # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
+        # request subset". Requires num_reqs >= 2 (request-boundary split needs
+        # two non-empty groups); bs=1 falls back to non-TBO.
+        pcp_size = self.config.prefill_context_parallel_size
+        # True for eligible PCP+TBO request-boundary split prefill; read by
+        # build_ubatch / run_model / prepare_prefill to route the per-group path.
+        self._pcp_tbo_balanced_active = False
+        # Per-group descriptors; reset each step, set in prepare_inputs
+        # request-boundary-split branch. Guards run_model/build_ubatch against
+        # stale values.
+        self._pcp_bal_groups = None
+        if tbo_on and is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            num_prefill_reqs = batch.total_seqs_num_prefill
+            n_prefill = batch.total_tokens_num_prefill
+            # Rough local sizing for TBO eligibility. PCP is always dp=1, so the
+            # dp_size<=1 fast path below returns local_eligible verbatim as
+            # tbo_collective_active; local_ub0/ub1 are only used by the dp>1
+            # sync path (never hit under PCP).
+            local_tokens = n_prefill // pcp_size
+            local_eligible = num_prefill_reqs >= 2 and local_tokens >= 2
+            local_ub0 = local_tokens // 2
+            local_ub1 = local_tokens - local_ub0
+            self._pcp_tbo_balanced_active = local_eligible
 
         if dp_size <= 1:
             # Single-rank: TBO decision is purely local; no collective needed.
@@ -2451,6 +2506,10 @@ class ModelRunner:
             ub_max_tokens_across_dp,
             _dspark_shape_max,
         ) = preprocessed
+
+        if not tbo_collective_active:
+            self._pcp_tbo_balanced_active = False
+
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
 
         # mtp_step = per-seq decode token count, used by ForwardMode.decide to
@@ -2539,14 +2598,29 @@ class ModelRunner:
                 input_ids,
             )
 
-        ubatch_slices = self._maybe_create_tbo_slices(
-            batch,
-            is_prefill,
-            scheduled_bs if not is_prefill else 0,
-            actual_num_tokens,
-            num_scheduled_tokens,
-            tbo_collective_active,
+        pcp_size = self.config.prefill_context_parallel_size
+        _pcp_tbo_balanced = (
+            is_prefill
+            and pcp_size > 1
+            and tbo_collective_active
+            and not batch.is_dummy_run
+            and getattr(self, "_pcp_tbo_balanced_active", False)
         )
+        if _pcp_tbo_balanced:
+            # Request-boundary split for PCP+TBO prefill (see
+            # _build_pcp_balanced_slices). forward_vars stay GLOBAL here.
+            ubatch_slices, self._pcp_bal_groups = self._build_pcp_balanced_slices(
+                batch, num_scheduled_tokens, pcp_size
+            )
+        else:
+            ubatch_slices = self._maybe_create_tbo_slices(
+                batch,
+                is_prefill,
+                scheduled_bs if not is_prefill else 0,
+                actual_num_tokens,
+                num_scheduled_tokens,
+                tbo_collective_active,
+            )
 
         set_forward_context(
             attn_metadata=attn_metadata,
@@ -2640,6 +2714,137 @@ class ModelRunner:
             needs_independent_noise,
         )
 
+    @staticmethod
+    def _detailed_label_suffix(batch: Optional[ScheduledBatch]) -> str:
+        """Detailed attention aggregates for the trace label, or ``""``.
+
+        These fields are only populated by
+        `Scheduler.compute_detailed_aggregates` when profiling is active
+        and ``ATOM_ENABLE_DETAILED_ANNOTATION`` is set, so on the normal
+        (unprofiled) path this returns an empty string without any extra work.
+        Appending here keeps the annotation on the ``prefill[]``/``decode[]``
+        ``record_function`` (a GPU-recognized layer) instead of nesting an
+        extra span above ``run_model``.
+        """
+        if batch is None or batch.detailed_sqsq is None:
+            return ""
+        return (
+            f" sqsq={batch.detailed_sqsq}"
+            f" sqsk={batch.detailed_sqsk}"
+            f" sk={batch.detailed_sk}"
+        )
+
+    def _build_pcp_balanced_slices(
+        self,
+        batch: ScheduledBatch,
+        num_scheduled_tokens: np.ndarray,
+        pcp_size: int,
+    ) -> "tuple[list[UBatchSlice], list[PcpBalGroup]]":
+        """Build request-boundary-split ubatch slices for PCP+TBO prefill.
+
+        Split REQUESTS into two groups at a request boundary near the token
+        midpoint. Each group is an independent "non-TBO PCP mini-batch": padded
+        to a pcp multiple and round-robin striped as a whole, so every sequence
+        stays intact in one group (root-fixes token-split R1/R2). forward_vars
+        stay GLOBAL here; build_ubatch_prefill_metadata slices the FULL
+        (un-reindexed) metadata per group and calls _apply_pcp_reindex on it.
+
+        Returns (ubatch_slices, groups): token_slice is in the LOCAL concat
+        space [g0_local | g1_local] that run_model produces (see
+        _apply_pcp_balanced_stripe); groups are the PcpBalGroup descriptors
+        consumed by run_model (per-group stripe) and
+        build_ubatch_prefill_metadata (slice + reindex).
+        """
+        num_prefill_reqs = batch.total_seqs_num_prefill
+        per_req = np.asarray(num_scheduled_tokens[:num_prefill_reqs], dtype=np.int64)
+        total_tok = int(per_req.sum())
+        cum = np.cumsum(per_req)  # cum[j] = sum of reqs [0..j]
+        target = total_tok // 2
+        # request boundary whose cumulative token count is closest to target
+        split_idx = int(np.searchsorted(cum, target, side="left")) + 1
+        split_idx = max(1, min(split_idx, num_prefill_reqs - 1))
+        # global token count of group0 (reqs [0:split_idx])
+        b0 = int(cum[split_idx - 1])
+        h0 = pcp_pad_len(b0, pcp_size)
+        h1 = pcp_pad_len(total_tok - b0, pcp_size)
+        l0 = h0 // pcp_size
+        l1 = h1 // pcp_size
+        ubatch_slices = [
+            UBatchSlice(
+                request_slice=slice(0, split_idx),
+                token_slice=slice(0, l0),
+            ),
+            UBatchSlice(
+                request_slice=slice(split_idx, num_prefill_reqs),
+                token_slice=slice(l0, l0 + l1),
+            ),
+        ]
+        groups = [
+            PcpBalGroup(0, split_idx, 0, b0, h0),
+            PcpBalGroup(split_idx, num_prefill_reqs, b0, total_tok, h1),
+        ]
+        return ubatch_slices, groups
+
+    def _apply_pcp_balanced_stripe(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        groups: "list[PcpBalGroup]",
+        pcp_size: int,
+        forward_context,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """PCP+TBO prefill per-group round-robin stripe, before UBatchWrapper.
+
+        Each request group is padded to a pcp multiple and round-robin striped
+        as a WHOLE (so sequences stay intact per group), then the two groups'
+        1/pcp shards are concatenated into [g0_local | g1_local]. token_slice
+        (built in prepare_inputs) indexes into this concat. Returns the striped
+        (input_ids, positions).
+        """
+        g_ids, g_pos = [], []
+        for grp in groups:
+            seg_ids = input_ids[grp.tok_start : grp.tok_end]
+            seg_pos = positions[grp.tok_start : grp.tok_end]
+            pad = grp.pad_total - (grp.tok_end - grp.tok_start)
+            if pad > 0:
+                seg_ids = torch.cat([seg_ids, seg_ids.new_zeros(pad)])
+                seg_pos = torch.cat([seg_pos, seg_pos.new_zeros(pad)])
+            g_ids.append(pcp_round_robin_split(seg_ids, pcp_size))
+            g_pos.append(pcp_round_robin_split(seg_pos, pcp_size))
+        input_ids = torch.cat(g_ids)
+        positions = torch.cat(g_pos)
+        # context.positions = local per-group concat so _make_ubatch_context
+        # slices each ubatch's forward positions correctly.
+        forward_context.context.positions = positions
+        # Hash MoE: local per-group-concat ids. Each ForCausalLM.forward
+        # allgathers its ubatch's slice (g_i local, H_i/pcp) across pcp ranks →
+        # H_i ids, matching moe_pcp_merge_forward's per-ubatch hidden allgather.
+        if envs.ATOM_PCP_MOE_MERGE:
+            forward_context.context.input_ids = input_ids
+        return input_ids, positions
+
+    def _restore_pcp_balanced_output(
+        self,
+        mo: torch.Tensor,
+        groups: "list[PcpBalGroup]",
+        pcp_size: int,
+    ) -> torch.Tensor:
+        """Restore PCP+TBO request-boundary-split output.
+
+        UBatchWrapper concatenated the two groups' 1/pcp output shards
+        [g0_local | g1_local]. Each group was striped independently, so restore
+        per group: pcp_allgather_rerange its shard back to the group's global
+        order, crop the per-group pad, then concat to the full global sequence.
+        """
+        outs = []
+        off = 0
+        for grp in groups:
+            local_len = grp.pad_total // pcp_size  # group's 1/pcp token count
+            seg = pcp_allgather_rerange(mo[off : off + local_len], pcp_size)
+            outs.append(seg[: grp.tok_end - grp.tok_start])  # crop per-group pad
+            off += local_len
+        return torch.cat(outs)
+
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -2680,6 +2885,40 @@ class ModelRunner:
             batch=batch,
         )
 
+        # Profiler label. Kind (prefix) distinguishes real/dummy and
+        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
+        # `build_run_label`.
+        label = build_run_label(
+            is_prefill=is_prefill,
+            use_cudagraph=forward_mode.use_cudagraph,
+            is_dummy=context.is_dummy_run,
+            tbo_on=forward_context.ubatch_slices is not None,
+            bs=bs,
+            # The CUDAGraph replays a padded batch (context.graph_bs); pass it so
+            # the label shows bs=<real>/<graph> when they differ.
+            graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
+            batch=batch,
+            detailed_suffix=self._detailed_label_suffix(batch),
+        )
+
+        # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
+        # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
+        # output restore further below.
+        _pcp_size = self.config.prefill_context_parallel_size
+        _pcp_bal_groups = getattr(self, "_pcp_bal_groups", None)
+        _pcp_tbo_balanced = (
+            _pcp_size > 1
+            and isinstance(self.model, UBatchWrapper)
+            and forward_context.ubatch_slices is not None
+            and is_prefill
+            and not forward_context.context.is_dummy_run
+            and _pcp_bal_groups is not None
+        )
+        if _pcp_tbo_balanced:
+            input_ids, positions = self._apply_pcp_balanced_stripe(
+                input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
+            )
+
         if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
@@ -2715,6 +2954,25 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
+                # PCP+TBO prefill (request-boundary split): UBatchWrapper concatenated the two
+                # groups' 1/pcp output shards [g0_local | g1_local]. Restore each
+                # group independently: pcp_allgather_rerange its shard back to the
+                # group's global order, crop off the per-group pad, then concat to
+                # the full global sequence. Per-group (not single global) because
+                # each group was striped independently.
+                if _pcp_tbo_balanced:
+                    if self.use_aux_hidden_state_outputs:
+                        _h, _aux = model_output
+                        model_output = (
+                            self._restore_pcp_balanced_output(
+                                _h, _pcp_bal_groups, _pcp_size
+                            ),
+                            _aux,
+                        )
+                    else:
+                        model_output = self._restore_pcp_balanced_output(
+                            model_output, _pcp_bal_groups, _pcp_size
+                        )
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, self._aux_hidden_states = model_output
                 else:
@@ -2941,6 +3199,7 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
+    @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         (
             input_ids,
@@ -2962,6 +3221,7 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
+
         return fwd_output
 
     @torch.inference_mode()
@@ -3060,6 +3320,60 @@ class ModelRunner:
         if verify_scheduler is not None:
             verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
+
+    def start_capture_profiler(self):
+        """Set up the per-bs CUDA graph capture profiler (profiles in place).
+
+        Profiles the capture phase as graphs are captured and writes one trace
+        per batch size, per rank (``bs_<bs>_rank<rank>.json.gz``). Enabled on
+        every rank when a torch profiler dir is set and mark-trace is on.
+        """
+        self._capture_profile_enabled = (
+            self.profiler_dir is not None and self.mark_trace
+        )
+        if self._capture_profile_enabled:
+            self._profile_bs_idx = 0
+            self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
+            os.makedirs(self.capture_traces_dir, exist_ok=True)
+            logger.info(f"{self.label}: Starting CUDA graph capture profiler...")
+
+            def on_trace_ready(prof):
+                # Invariant: exactly two prof.step() calls happen per captured
+                # batch size (schedule wait=1 + active=1, repeat=0), so
+                # on_trace_ready fires once per bs, in self.graph_bs order.
+                # This is a profiling-only diagnostic; log-and-skip rather than
+                # assert so a cadence mismatch can never abort CUDA-graph
+                # capture at server startup (and isn't stripped under python -O).
+                if self._profile_bs_idx >= len(self.graph_bs):
+                    logger.warning(
+                        "capture profiler fired %d times but only %d batch "
+                        "sizes were captured; skipping extra trace. Check the "
+                        "prof.step() cadence in capture_cudagraph.",
+                        self._profile_bs_idx + 1,
+                        len(self.graph_bs),
+                    )
+                    return
+                bs = self.graph_bs[self._profile_bs_idx]
+                trace_file = os.path.join(
+                    self.capture_traces_dir, f"bs_{bs}_rank{self.rank}.json.gz"
+                )
+                prof.export_chrome_trace(trace_file)
+                logger.info(f"Saved trace for bs={bs} to {trace_file}")
+                self._profile_bs_idx += 1
+
+            self.capture_profiler = torch_profiler.profile(
+                activities=[
+                    torch_profiler.ProfilerActivity.CUDA,
+                    torch_profiler.ProfilerActivity.CPU,
+                ],
+                schedule=torch_profiler.schedule(wait=1, warmup=0, active=1, repeat=0),
+                record_shapes=True,
+                with_stack=True,
+                profile_memory=False,
+                on_trace_ready=on_trace_ready,
+            )
+        else:
+            self.capture_profiler = nullcontext()
 
     @torch.inference_mode()
     def _piecewise_cg_active(self) -> bool:
@@ -3339,6 +3653,9 @@ class ModelRunner:
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
         self.logits_in_graph = self.world_size == 1 and not is_tbo
 
+        # start capture profiler
+        self.start_capture_profiler()
+
         @contextmanager
         def pause_gc():
             # No GC during capture: a finalizer's hipModuleUnload aborts it (HIP 900).
@@ -3371,7 +3688,7 @@ class ModelRunner:
             "max_q_len" in inspect.signature(build_capture).parameters
         )
 
-        with pause_gc(), graph_capture() as capture_ctx:
+        with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
@@ -3447,6 +3764,8 @@ class ModelRunner:
                         outputs[:num_tokens] = model_output
                     if self.logits_in_graph:
                         self.model.compute_logits(outputs[:num_tokens])
+                    if prof is not None:
+                        prof.step()
 
                     if _piecewise:
                         # PIECEWISE: no manual whole-forward graph; the compiled
@@ -3504,6 +3823,8 @@ class ModelRunner:
                     self.graphs[(bs, max_q_len)] = graph
                     if self.logits_in_graph and ubatch_slices is None:
                         self.graph_logits[(bs, max_q_len)] = graph_logits
+                    if prof is not None:
+                        prof.step()
                     if graph_aux is not None:
                         self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
                     torch.cuda.synchronize()

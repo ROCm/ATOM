@@ -1101,6 +1101,72 @@ class DSparkConfig:
 
 
 @dataclass
+class EPLBConfig:
+    """EPLB sub-config (vLLM-style: enable + config object)."""
+
+    load_window_size: int = 1000
+    rebalance_interval: int = 3000
+    rebalance_layers_per_chunk: int = 64
+    num_redundant_experts: int = 0
+    rebalance_min_balancedness: float = 2.0
+    rebalance_balancedness_agg: str = "min"
+    p2p_batch_chunk_size: int = 32
+    # Placement policy for spending the redundant-expert budget:
+    #   "naive"  -> greedy replicate + balanced_packing (spread thinly)
+    #   "biased" -> fully replicate top-K hottest experts to all GPUs
+    #               (K = num_redundant // num_gpus, per-node in multi-node)
+    placement_policy: str = "naive"
+
+    def __post_init__(self):
+        self.load_window_size = int(self.load_window_size)
+        assert self.load_window_size > 0, "eplb.load_window_size must be > 0"
+        self.rebalance_interval = int(self.rebalance_interval)
+        assert self.rebalance_interval > 0, "eplb.rebalance_interval must be > 0"
+        assert (
+            self.rebalance_interval >= self.load_window_size
+        ), "eplb.rebalance_interval must be >= eplb.load_window_size"
+        self.rebalance_layers_per_chunk = int(self.rebalance_layers_per_chunk)
+        assert (
+            self.rebalance_layers_per_chunk > 0
+        ), "eplb.rebalance_layers_per_chunk must be > 0"
+        self.num_redundant_experts = int(self.num_redundant_experts)
+        assert (
+            self.num_redundant_experts >= 0
+        ), "eplb.num_redundant_experts must be >= 0"
+        self.rebalance_min_balancedness = float(self.rebalance_min_balancedness)
+        self.rebalance_balancedness_agg = (
+            str(self.rebalance_balancedness_agg).lower().strip()
+        )
+        assert self.rebalance_balancedness_agg in {
+            "min",
+            "mean",
+        }, "eplb.rebalance_balancedness_agg must be one of {'min','mean'}"
+        self.p2p_batch_chunk_size = int(self.p2p_batch_chunk_size)
+        assert self.p2p_batch_chunk_size > 0, "eplb.p2p_batch_chunk_size must be > 0"
+        self.placement_policy = str(self.placement_policy).lower().strip()
+        assert self.placement_policy in {
+            "naive",
+            "biased",
+        }, "eplb.placement_policy must be one of {'naive','biased'}"
+
+    @classmethod
+    def from_dict(cls, cfg: Optional[dict]) -> "EPLBConfig":
+        """Build from the ``--eplb-config`` JSON dict.
+
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --eplb-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
@@ -1166,6 +1232,9 @@ class Config:
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # EPLB master switch + sub-config (vLLM style).
+    eplb_enable: bool = False
+    eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
@@ -1191,6 +1260,13 @@ class Config:
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
+        if isinstance(self.eplb_config, dict):
+            self.eplb_config = EPLBConfig(**self.eplb_config)
+        elif isinstance(self.eplb_config, EPLBConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.eplb_config = EPLBConfig(**self.eplb_config.__dict__)
+        else:
+            raise TypeError("eplb_config must be EPLBConfig or dict")
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8

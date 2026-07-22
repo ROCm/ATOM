@@ -13,6 +13,7 @@ from atom.config import (
     CUDAGraphMode,
     DSparkConfig,
     SpeculativeConfig,
+    EPLBConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
@@ -74,6 +75,9 @@ class EngineArgs:
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+
+    eplb_enable: bool = False
+    eplb_config: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -371,6 +375,43 @@ class EngineArgs:
                 """"ragged_graph_sizes": "8"}'"""
             ),
         )
+        eplb_group = parser.add_argument_group("EPLB options")
+        eplb_group.add_argument(
+            "--eplb-enable",
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB runtime load monitoring and expert rebalance.",
+        )
+        eplb_group.add_argument(
+            "--eplb-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "EPLB config as a JSON dict, parsed straight into an EPLBConfig "
+                "object (no per-field flags). --eplb-enable turns EPLB on; "
+                "--eplb-config only tunes it. Supported keys:\n"
+                '  - "load_window_size": int, non-dummy forwards accumulated '
+                "for EPLB load stats.\n"
+                '  - "rebalance_interval": int, forward-pass interval for '
+                "EPLB rebalance gating.\n"
+                '  - "rebalance_layers_per_chunk": int, MoE layers migrated '
+                "per EPLB rebalance chunk.\n"
+                '  - "num_redundant_experts": int, extra physical expert '
+                "slots per MoE layer for EPLB replicas.\n"
+                '  - "rebalance_min_balancedness": float, skip EPLB '
+                "rebalance when balancedness is at least this value.\n"
+                '  - "rebalance_balancedness_agg": "min"|"mean", layer '
+                "aggregation used by the EPLB balancedness gate.\n"
+                '  - "p2p_batch_chunk_size": int, P2P batch chunk size used '
+                "while migrating expert weights.\n"
+                '  - "placement_policy": "naive"|"biased", how to spend the '
+                "redundant budget: 'naive' (spread) or 'biased' (fully "
+                "replicate top-K hottest experts to all GPUs).\n"
+                "Example:\n"
+                """  '{"num_redundant_experts": 8, "placement_policy": """
+                """"biased"}'"""
+            ),
+        )
 
         return parser
 
@@ -437,6 +478,9 @@ class EngineArgs:
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
         kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
+        # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
+        # is the master switch, --eplb-config only tunes it).
+        kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))
 
         logger.info(f"Engine kwargs: {kwargs}")
 
