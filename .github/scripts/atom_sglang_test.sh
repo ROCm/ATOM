@@ -92,24 +92,6 @@ prepare_runtime_paths() {
   fi
 }
 
-patch_aiter_glm52_moe_b16() {
-  local patch_script=".github/scripts/patch_aiter_glm52_moe_b16.sh"
-  if [[ -x "${patch_script}" ]]; then
-    "${patch_script}"
-  elif [[ -f "${patch_script}" ]]; then
-    bash "${patch_script}"
-  fi
-}
-
-patch_aiter_glm52_bad_opus_gemm() {
-  local patch_script=".github/scripts/patch_aiter_glm52_gemm_bad_opus.sh"
-  if [[ -x "${patch_script}" ]]; then
-    "${patch_script}"
-  elif [[ -f "${patch_script}" ]]; then
-    bash "${patch_script}"
-  fi
-}
-
 resolve_model_path() {
   local model_path="$1"
   if [[ "${model_path}" = /* ]]; then
@@ -218,8 +200,6 @@ launch_server() {
   resolved_model_path=$(resolve_model_path "${MODEL_PATH}")
 
   prepare_runtime_paths
-  patch_aiter_glm52_moe_b16
-  patch_aiter_glm52_bad_opus_gemm
 
   export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT4}"
   export SGLANG_AITER_FP8_PREFILL_ATTN="${SGLANG_AITER_FP8_PREFILL_ATTN:-0}"
