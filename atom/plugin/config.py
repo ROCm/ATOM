@@ -59,6 +59,7 @@ def _resolve_sglang_atom_kv_cache_dtype(server_args: Any, model_config: Any) -> 
             "gfx950/gfx1250 for ATOM's native 2-buffer op4/op5 path. "
             "Falling ATOM attention KV cache back to bf16 on this GPU."
         )
+        server_args.kv_cache_dtype = "bf16"
         return "bf16"
     return kv_cache_dtype
 
