@@ -67,7 +67,6 @@ class EngineCore:
         )
         self.input_thread.start()
 
-        self.profile_enbaled = config.torch_profiler_dir is not None
         self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
         self._init_data_parallel(config)
@@ -106,11 +105,6 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
-                # Start profiler before cudagraph capture only if mark-trace is enabled.
-                if self.profile_enbaled and self.mark_trace:
-                    self.runner_mgr.call_func(
-                        "start_profiler", "capture_graph", wait_out=True
-                    )
                 cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
@@ -118,9 +112,6 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
-                if self.profile_enbaled and self.mark_trace:
-                    # Persist a dedicated capture-graph trace immediately.
-                    self.runner_mgr.call_func("stop_profiler", wait_out=True)
             good = True
         finally:
             logger.info(
@@ -287,6 +278,7 @@ class EngineCore:
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
+            self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
