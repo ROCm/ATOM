@@ -277,25 +277,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fill target: release prefill once accumulated pending tokens reach
     # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
     # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT
-    # cost. Default 0.7.
+    # cost. Default 0.9.
     "ATOM_PREFILL_DELAYER_TARGET_FILL": lambda: float(
-        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.7")
+        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.9")
     ),
     # TTFT bound: max consecutive scheduler ticks a held prefill waits before
     # force-release (deterministic across ranks; replaces the old wall-clock +
     # pass-count pair).
     "ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "30")
+        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "200")
     ),
     # Tight bound (ticks) for a held mid-chunked-prefill: a partial holds already
     # allocated KV, so it force-releases sooner than a fresh prefill.
     "ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "8")
+        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "100")
     ),
     # Consecutive non-growing ticks after which the coalescer gives up waiting
     # (burst ended, more won't come) and releases.
     "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "3")
+        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "10")
     ),
     # KV high watermark: at/above this KV usage a prefillable rank force-releases
     # (can't accumulate a bigger batch anyway).
