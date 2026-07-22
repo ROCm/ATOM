@@ -169,6 +169,9 @@ jobs:
             accuracy_test_threshold: 0.83
             runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+      contents: read
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
@@ -243,10 +246,12 @@ jobs:
           echo "=== End container engine diagnostics ==="
       
       - name: Download aiter wheel
-        uses: actions/download-artifact@v8
-        with:
-          name: aiter-whl
-          path: aiter-whl
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_NAME: aiter-whl
+        run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Generate OOT overlay Dockerfile
         run: |
