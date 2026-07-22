@@ -29,10 +29,16 @@ if _HAS_TRITON:
 
     @triton.jit
     def _situ_and_mul_kernel(
-        x_ptr, y_ptr,
-        M, D,
-        stride_xm, stride_ym,
-        beta, inv_beta, linear_beta, inv_linear_beta,
+        x_ptr,
+        y_ptr,
+        M,
+        D,
+        stride_xm,
+        stride_ym,
+        beta,
+        inv_beta,
+        linear_beta,
+        inv_linear_beta,
         HAS_LINEAR: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
@@ -40,7 +46,9 @@ if _HAS_TRITON:
         col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = col < D
         g = tl.load(x_ptr + row * stride_xm + col, mask=mask, other=0.0).to(tl.float32)
-        u = tl.load(x_ptr + row * stride_xm + D + col, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(x_ptr + row * stride_xm + D + col, mask=mask, other=0.0).to(
+            tl.float32
+        )
         # SiTUv2 gate: beta * tanh(gate/beta) * sigmoid(gate); tanh via sigmoid
         # identity (tanh(z) = 2*sigmoid(2z) - 1) for portability across triton.
         out = beta * (2.0 * tl.sigmoid(2.0 * g * inv_beta) - 1.0) * tl.sigmoid(g)
@@ -51,8 +59,12 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rmsnorm_gated_kernel(
-        x_ptr, w_ptr, g_ptr, y_ptr,
-        H, eps,
+        x_ptr,
+        w_ptr,
+        g_ptr,
+        y_ptr,
+        H,
+        eps,
         stride_m,
         BLOCK: tl.constexpr,
     ):
@@ -63,7 +75,9 @@ if _HAS_TRITON:
         var = tl.sum(x * x, axis=0) / H
         rstd = 1.0 / tl.sqrt(var + eps)
         w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        gate = tl.load(g_ptr + row * stride_m + cols, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(g_ptr + row * stride_m + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
         y = (x * rstd * w) * tl.sigmoid(gate)
         tl.store(y_ptr + row * stride_m + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
 
@@ -72,10 +86,20 @@ if _HAS_TRITON:
 
     @triton.jit
     def _attn_res_fused_kernel(
-        br_ptr, ps_ptr, nw_ptr, pw_ptr, y_ptr,
-        B, Bp, H, eps,
-        stride_br_t, stride_br_b, stride_ps_t, stride_yt,
-        BP: tl.constexpr,       # Bp padded to a power of 2 (vectorized candidate axis)
+        br_ptr,
+        ps_ptr,
+        nw_ptr,
+        pw_ptr,
+        y_ptr,
+        B,
+        Bp,
+        H,
+        eps,
+        stride_br_t,
+        stride_br_b,
+        stride_ps_t,
+        stride_yt,
+        BP: tl.constexpr,  # Bp padded to a power of 2 (vectorized candidate axis)
         BLOCK_H: tl.constexpr,
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
@@ -87,8 +111,8 @@ if _HAS_TRITON:
         t = tl.program_id(0)
         b_idx = tl.arange(0, BP)
         b_mask = b_idx < Bp
-        is_last = b_idx == B                              # prefix_sum candidate
-        br_base = t * stride_br_t + b_idx * stride_br_b   # [BP]
+        is_last = b_idx == B  # prefix_sum candidate
+        br_base = t * stride_br_t + b_idx * stride_br_b  # [BP]
         ps_base = t * stride_ps_t
 
         acc_sq = tl.zeros((BP,), dtype=tl.float32)
@@ -96,39 +120,53 @@ if _HAS_TRITON:
         for h0 in range(0, H, BLOCK_H):
             cols = h0 + tl.arange(0, BLOCK_H)
             h_mask = cols < H
-            br = tl.load(br_ptr + br_base[:, None] + cols[None, :],
-                         mask=(b_idx < B)[:, None] & h_mask[None, :], other=0.0).to(tl.float32)
-            ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(tl.float32)  # [BLOCK_H]
-            v = tl.where(is_last[:, None], ps[None, :], br)   # [BP, BLOCK_H], ps broadcast in-reg
+            br = tl.load(
+                br_ptr + br_base[:, None] + cols[None, :],
+                mask=(b_idx < B)[:, None] & h_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(
+                tl.float32
+            )  # [BLOCK_H]
+            v = tl.where(
+                is_last[:, None], ps[None, :], br
+            )  # [BP, BLOCK_H], ps broadcast in-reg
             # score_weight = norm_weight * proj_weight, folded in per H-chunk
             nw = tl.load(nw_ptr + cols, mask=h_mask, other=0.0).to(tl.float32)
             pw = tl.load(pw_ptr + cols, mask=h_mask, other=0.0).to(tl.float32)
             sw = nw * pw
-            acc_sq += tl.sum(v * v, axis=1)               # [BP]
-            acc_dot += tl.sum(v * sw[None, :], axis=1)    # [BP]
+            acc_sq += tl.sum(v * v, axis=1)  # [BP]
+            acc_dot += tl.sum(v * sw[None, :], axis=1)  # [BP]
 
         rstd = 1.0 / tl.sqrt(acc_sq / H + eps)
         scores = tl.where(b_mask, rstd * acc_dot, float("-inf"))
         scores = scores - tl.max(scores, axis=0)
         probs = tl.exp(scores)
-        probs = probs / tl.sum(probs, axis=0)             # [BP], softmax over Bp
+        probs = probs / tl.sum(probs, axis=0)  # [BP], softmax over Bp
 
         for h0 in range(0, H, BLOCK_H):
             cols = h0 + tl.arange(0, BLOCK_H)
             h_mask = cols < H
-            br = tl.load(br_ptr + br_base[:, None] + cols[None, :],
-                         mask=(b_idx < B)[:, None] & h_mask[None, :], other=0.0).to(tl.float32)
+            br = tl.load(
+                br_ptr + br_base[:, None] + cols[None, :],
+                mask=(b_idx < B)[:, None] & h_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
             ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(tl.float32)
             v = tl.where(is_last[:, None], ps[None, :], br)
-            out = tl.sum(probs[:, None] * v, axis=0)      # [BLOCK_H]
-            tl.store(y_ptr + t * stride_yt + cols, out.to(y_ptr.dtype.element_ty), mask=h_mask)
+            out = tl.sum(probs[:, None] * v, axis=0)  # [BLOCK_H]
+            tl.store(
+                y_ptr + t * stride_yt + cols,
+                out.to(y_ptr.dtype.element_ty),
+                mask=h_mask,
+            )
 
 
 def apply_attn_res(
-    prefix_sum: torch.Tensor,        # [T, H]
-    block_residual: torch.Tensor,    # [T, B, H]
-    proj_weight: torch.Tensor,       # [H] (proj.weight.squeeze(0))
-    norm_weight: torch.Tensor,       # [H]
+    prefix_sum: torch.Tensor,  # [T, H]
+    block_residual: torch.Tensor,  # [T, B, H]
+    proj_weight: torch.Tensor,  # [H] (proj.weight.squeeze(0))
+    norm_weight: torch.Tensor,  # [H]
     eps: float,
 ) -> torch.Tensor:
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
@@ -136,15 +174,28 @@ def apply_attn_res(
     T, B, H = block_residual.shape
     Bp = B + 1
     if not _HAS_TRITON or T == 0:
-        return _apply_attn_res_torch(prefix_sum, block_residual, proj_weight, norm_weight, eps)
+        return _apply_attn_res_torch(
+            prefix_sum, block_residual, proj_weight, norm_weight, eps
+        )
     br = block_residual.contiguous()
     ps = prefix_sum.contiguous()
     y = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
     _attn_res_fused_kernel[(T,)](
-        br, ps, norm_weight.contiguous(), proj_weight.contiguous(), y,
-        B, Bp, H, float(eps),
-        br.stride(0), br.stride(1), ps.stride(0), y.stride(0),
-        BP=triton.next_power_of_2(Bp), BLOCK_H=1024,
+        br,
+        ps,
+        norm_weight.contiguous(),
+        proj_weight.contiguous(),
+        y,
+        B,
+        Bp,
+        H,
+        float(eps),
+        br.stride(0),
+        br.stride(1),
+        ps.stride(0),
+        y.stride(0),
+        BP=triton.next_power_of_2(Bp),
+        BLOCK_H=1024,
     )
     return y
 
@@ -160,7 +211,9 @@ def _apply_attn_res_torch(prefix_sum, block_residual, proj_weight, norm_weight, 
     return torch.matmul(probs, values_f).squeeze(1).to(prefix_sum.dtype)
 
 
-def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
+def situ_and_mul(
+    x: torch.Tensor, beta: float, linear_beta: float | None
+) -> torch.Tensor:
     """SiTUv2 gated activation over the last dim (x[..., :D] gate, x[..., D:] up)."""
     *lead, two_d = x.shape
     assert two_d % 2 == 0
@@ -174,17 +227,25 @@ def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: float | None) -> tor
     grid = (m, triton.cdiv(d, BLOCK))
     has_linear = linear_beta is not None
     _situ_and_mul_kernel[grid](
-        x2, y, m, d,
-        x2.stride(0), y.stride(0),
-        float(beta), 1.0 / float(beta),
+        x2,
+        y,
+        m,
+        d,
+        x2.stride(0),
+        y.stride(0),
+        float(beta),
+        1.0 / float(beta),
         float(linear_beta) if has_linear else 0.0,
         (1.0 / float(linear_beta)) if has_linear else 0.0,
-        HAS_LINEAR=has_linear, BLOCK=BLOCK,
+        HAS_LINEAR=has_linear,
+        BLOCK=BLOCK,
     )
     return y.reshape(*lead, d)
 
 
-def rmsnorm_gated(x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps: float) -> torch.Tensor:
+def rmsnorm_gated(
+    x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps: float
+) -> torch.Tensor:
     """rmsnorm(x) over last dim * weight * sigmoid(gate)."""
     h = x.shape[-1]
     x2 = x.reshape(-1, h)
@@ -197,7 +258,14 @@ def rmsnorm_gated(x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps
     y = torch.empty_like(x2)
     BLOCK = triton.next_power_of_2(h)
     _rmsnorm_gated_kernel[(m,)](
-        x2, weight, g2, y, h, float(eps), x2.stride(0), BLOCK=BLOCK,
+        x2,
+        weight,
+        g2,
+        y,
+        h,
+        float(eps),
+        x2.stride(0),
+        BLOCK=BLOCK,
     )
     return y.reshape_as(x)
 
@@ -205,7 +273,9 @@ def rmsnorm_gated(x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps
 # --------------------------------------------------------------------------- #
 # torch references (also the fallback when triton is unavailable)
 # --------------------------------------------------------------------------- #
-def _situ_and_mul_torch(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
+def _situ_and_mul_torch(
+    x: torch.Tensor, beta: float, linear_beta: float | None
+) -> torch.Tensor:
     gate, up = x.chunk(2, dim=-1)
     gate_f = gate.float()
     up_f = up.float()
@@ -215,7 +285,9 @@ def _situ_and_mul_torch(x: torch.Tensor, beta: float, linear_beta: float | None)
     return (out * up_f).to(x.dtype)
 
 
-def _rmsnorm_gated_torch(x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps: float) -> torch.Tensor:
+def _rmsnorm_gated_torch(
+    x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps: float
+) -> torch.Tensor:
     dtype = x.dtype
     x_f = x.float()
     var = x_f.pow(2).mean(dim=-1, keepdim=True)
@@ -230,10 +302,10 @@ if _HAS_TRITON:
 
     @triton.jit
     def _gather_kda_state_kernel(
-        src_ptr,   # ssm_state viewed as [num_lines, S]
-        idx_ptr,   # state_indices [num_seqs]
+        src_ptr,  # ssm_state viewed as [num_lines, S]
+        idx_ptr,  # state_indices [num_seqs]
         mask_ptr,  # has_initial_state [num_seqs] int8 (unused when HAS_MASK=False)
-        dst_ptr,   # initial viewed as [num_seqs, S]
+        dst_ptr,  # initial viewed as [num_seqs, S]
         S,
         stride_src,
         stride_dst,
@@ -287,9 +359,15 @@ def gather_kda_initial_state(
     BLOCK = 1024
     grid = (num_seqs, triton.cdiv(S, BLOCK))
     _gather_kda_state_kernel[grid](
-        src, state_indices, mask_arg, dst, S,
-        src.stride(0), dst.stride(0),
-        HAS_MASK=has_mask, BLOCK=BLOCK,
+        src,
+        state_indices,
+        mask_arg,
+        dst,
+        S,
+        src.stride(0),
+        dst.stride(0),
+        HAS_MASK=has_mask,
+        BLOCK=BLOCK,
     )
     return initial
 
@@ -301,10 +379,10 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fuse_mla_kv_kernel(
-        kv_ptr,     # [T, NH, QK_NOPE + V_HEAD] contiguous ([k_nope | v] per head)
+        kv_ptr,  # [T, NH, QK_NOPE + V_HEAD] contiguous ([k_nope | v] per head)
         krope_ptr,  # [T, QK_ROPE] (MQA-shared rope, same for every head)
-        k_ptr,      # [T, NH, QHD] out  ([k_nope | k_rope])
-        vpad_ptr,   # [T, NH, QHD] out  ([v | 0])
+        k_ptr,  # [T, NH, QHD] out  ([k_nope | k_rope])
+        vpad_ptr,  # [T, NH, QHD] out  ([v | 0])
         stride_kv_t,
         stride_kv_h,
         stride_kr_t,
@@ -373,12 +451,20 @@ def fuse_mla_kv(
     v_padded = torch.empty((T, nh, qhd), dtype=kv.dtype, device=kv.device)
     BLOCK = triton.next_power_of_2(qhd)
     _fuse_mla_kv_kernel[(T * nh,)](
-        kv, k_rope, k, v_padded,
-        kv.stride(0), kv.stride(1),
+        kv,
+        k_rope,
+        k,
+        v_padded,
+        kv.stride(0),
+        kv.stride(1),
         k_rope.stride(0),
-        k.stride(0), k.stride(1),
+        k.stride(0),
+        k.stride(1),
         nh,
-        QK_NOPE=qk_nope_head_dim, V_HEAD=v_head_dim, QHD=qhd, BLOCK=BLOCK,
+        QK_NOPE=qk_nope_head_dim,
+        V_HEAD=v_head_dim,
+        QHD=qhd,
+        BLOCK=BLOCK,
     )
     return k, v_padded
 
@@ -390,9 +476,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _scatter_kda_state_kernel(
-        dst_ptr,   # ssm_state viewed as [num_slots, S]
-        idx_ptr,   # state_indices [N]
-        src_ptr,   # last_state viewed as [N, S]
+        dst_ptr,  # ssm_state viewed as [num_slots, S]
+        idx_ptr,  # state_indices [N]
+        src_ptr,  # last_state viewed as [N, S]
         S,
         stride_dst,
         stride_src,
@@ -438,5 +524,11 @@ def scatter_kda_state(
     BLOCK = 1024
     grid = (n, triton.cdiv(S, BLOCK))
     _scatter_kda_state_kernel[grid](
-        dst, state_indices, src2, S, dst.stride(0), src2.stride(0), BLOCK=BLOCK,
+        dst,
+        state_indices,
+        src2,
+        S,
+        dst.stride(0),
+        src2.stride(0),
+        BLOCK=BLOCK,
     )
