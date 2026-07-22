@@ -1670,10 +1670,10 @@ class EPLBManager:
             )
 
         first_layer = layers[min(layers)]
-        num_logical = int(
-            getattr(first_layer, "num_logical_experts", first_layer.global_num_experts)
-        )
-        num_physical = int(getattr(first_layer, "num_physical_experts", num_logical))
+        num_physical = int(getattr(first_layer, "global_num_experts", 0))
+        num_redundant = int(getattr(first_layer, "num_redundant_experts", 0))
+        assert num_physical > num_redundant
+        num_logical = num_physical - num_redundant
         ep_size = int(getattr(first_layer, "ep_size"))
         ep_rank = int(getattr(first_layer, "ep_rank"))
         if num_physical % ep_size != 0:
@@ -1682,10 +1682,10 @@ class EPLBManager:
                 f"num_physical={num_physical}, ep_size={ep_size}"
             )
         for layer_id, layer in layers.items():
-            layer_logical = int(
-                getattr(layer, "num_logical_experts", layer.global_num_experts)
-            )
-            layer_physical = int(getattr(layer, "num_physical_experts", layer_logical))
+            layer_physical = int(getattr(layer, "global_num_experts", 0))
+            layer_redundant = int(getattr(layer, "num_redundant_experts", 0))
+            assert layer_physical > layer_redundant
+            layer_logical = layer_physical - layer_redundant
             layer_ep_size = int(getattr(layer, "ep_size"))
             if (
                 layer_logical != num_logical

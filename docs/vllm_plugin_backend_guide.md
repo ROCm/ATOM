@@ -297,4 +297,4 @@ vllm serve <model> ... \
     --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*expert*": "mxfp4"}, "exclude_layer": ["lm_head", "*.gate.*"]}}'
 ```
 
-See the [online quantization guide](online_quantization_guide.md#35-plugin-mode-vllm-serve) for the full schema.
+See the [online quantization guide](online_quantization_guide.md#plugin-mode-vllm-serve) for the full schema.
