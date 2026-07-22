@@ -256,7 +256,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     )
     server_args.model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
     hf_overrides = json.loads(
-        getattr(server_args, 'json_model_override_args', None) or '{}'
+        getattr(server_args, "json_model_override_args", None) or "{}"
     )
 
     sgl_model_config = SglangModelConfig.from_server_args(server_args)

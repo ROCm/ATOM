@@ -61,15 +61,17 @@ def _resolve_m3_index_cache_dtype(fallback: torch.dtype) -> torch.dtype:
     try:
         from atom.config import get_current_atom_config
 
-        index_cache_dtype = getattr(get_current_atom_config(), 'index_cache_dtype', None)
+        index_cache_dtype = getattr(
+            get_current_atom_config(), "index_cache_dtype", None
+        )
     except Exception:
         index_cache_dtype = None
 
-    if str(index_cache_dtype).startswith('fp8'):
+    if str(index_cache_dtype).startswith("fp8"):
         from aiter import dtypes
 
-        return dtypes.d_dtypes['fp8']
-    if index_cache_dtype == 'bf16':
+        return dtypes.d_dtypes["fp8"]
+    if index_cache_dtype == "bf16":
         return torch.bfloat16
     return fallback
 
@@ -220,7 +222,7 @@ def install_minimax_m3_pool_patch() -> None:
             self.kv_cache_dtype
         ).startswith("fp8")
         index_dtype = _resolve_m3_index_cache_dtype(
-            getattr(self, 'dtype', getattr(self, 'torch_dtype', torch.bfloat16))
+            getattr(self, "dtype", getattr(self, "torch_dtype", torch.bfloat16))
         )
         num_layers = int(
             getattr(self, "num_effective_layers", hf_config.num_hidden_layers)
@@ -266,7 +268,7 @@ def install_minimax_m3_pool_patch() -> None:
             self.kv_cache_dtype
         ).startswith("fp8")
         index_dtype = _resolve_m3_index_cache_dtype(
-            getattr(self, 'dtype', getattr(self, 'torch_dtype', torch.bfloat16))
+            getattr(self, "dtype", getattr(self, "torch_dtype", torch.bfloat16))
         )
         self.token_to_kv_pool = ATOMMiniMaxM3SGLangKVPool(
             pool,
