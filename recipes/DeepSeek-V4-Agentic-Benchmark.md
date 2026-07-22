@@ -24,14 +24,15 @@ sparse-checkpoint feature in this PR targets.
 
 ### CI data provenance
 Read from the SemiAnalysis dashboard API (`/api/v1/benchmarks?model=DeepSeek-V4-Pro`,
-filtered `hardware=mi355x, benchmark_type=agentic_traces, precision=fp4,
-decode_dp_attention=false`). Each series' points come from a single GitHub
-Actions run:
+filtered `hardware in {mi355x,b200}, benchmark_type=agentic_traces, precision=fp4,
+decode_dp_attention=false`, best run per concurrency). Each series comes from a
+single GitHub Actions run (B200 = run 29706772949, conc 1/2/8/12/16):
 
 | Series | Date | Server image | GitHub Actions run |
 |---|---|---|---|
 | vLLM TP8 (CI) | 2026-07-09 | `vllm/vllm-openai-rocm:nightly-09663abde0f5…` | https://github.com/SemiAnalysisAI/InferenceX/actions/runs/28911223583/attempts/3 |
 | SGLang TP8 (CI) | 2026-07-16 | `lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710` | https://github.com/SemiAnalysisAI/InferenceX/actions/runs/29413860950/attempts/3 |
+| B200 vLLM TP (CI) | 2026-07-21 | `vllm/vllm-openai:nightly-dev-x86_64-cu13.0.1-904e4ec` | https://github.com/SemiAnalysisAI/InferenceX/actions/runs/29706772949/attempts/3 |
 
 Interactive dashboard (all vendors/frameworks, updated continuously):
 https://inferencex.semianalysis.com/inference
@@ -44,7 +45,6 @@ https://inferencex.semianalysis.com/inference
 | 8 | 3,662 | 23.17 | 2.20 s | 106.6 s |
 | 16 | 7,705 | 16.44 | 2.79 s | 126.2 s |
 | 32 | 10,128 | 11.49 | 3.26 s | 154.8 s |
-| 40 | 9,849 | 9.12 | 3.50 s | 185.6 s |
 | 48 | 10,273 | 7.01 | 4.96 s | 217.5 s |
 
 ## MI355X SGLang — CI (FP4, util = engine default, TP8)
@@ -57,6 +57,24 @@ https://inferencex.semianalysis.com/inference
 
 (SGLang's pure-TP8 interactivity saturates ~8 tok/s/user; its high-throughput
 DP-attention configs are intentionally excluded here.)
+
+## B200 vLLM — CI (FP4, TP) — cross-hardware reference (NVIDIA)
+Single CI run `29706772949` (2026-07-21), conc 1/2/8/12/16. **KV offload is ON
+for C=12/16** (only variant in that run); C=1/2/8 are no-offload.
+
+| Conc | tput/GPU | p90 intvty | p90 TTFT | p90 E2E | offload |
+|--:|--:|--:|--:|--:|:--:|
+| 1 | 2,284 | 92.59 | 1.54 s | 33.0 s | off |
+| 2 | 3,330 | 71.33 | 3.79 s | 34.7 s | off |
+| 8 | 7,791 | 44.98 | 0.93 s | 49.1 s | off |
+| 12 | 11,653 | 34.44 | 1.04 s | 51.7 s | **on** |
+| 16 | 12,552 | 24.88 | 1.50 s | 74.1 s | **on** |
+
+B200 (NVIDIA) reaches much higher interactivity than MI355X (faster per-GPU),
+peaking ~11.7–12.6k tok/s/gpu at C=12/16 (**with KV offload**). At the same
+interactivity (~24.9), **MI355X ATOM PR1640 C=48 = 13.8k tok/s/gpu, no offload,
+edges out B200 vLLM C=16 = 12.6k (offload on)**. FP4 weights; DP-attention
+excluded.
 
 ## c48 head-to-head — agentic, TP8 (all DSV4-Pro, EP1, c=48)
 
@@ -82,6 +100,23 @@ late-profile prefix metric (approximate); ATOM = `ATOM_DEBUG_PREFIX_HITS`
 CacheStats (ss = steady-state). ATOM PR1640 (TP8, C=48) lands at **13.8k
 tok/s/gpu** — above local vLLM 0.9 (11.5k) and the SA-CI/0.8 runs — at
 comparable/better latency, with realized prefix-cache hit ~94% (vs 13% pre-fix).
+
+## ATOM PR1640 concurrency sweep (local, TP8, FP8 KV, util 0.9)
+
+The gold curve in the chart. Same config at each concurrency (sparse-32k SWA
+retention, full 3600 s profile, `AIPERF_HTTP_TCP_USER_TIMEOUT=900000`). Higher
+concurrency → higher aggregate throughput/GPU but lower per-user interactivity.
+
+| Conc | req/s | tput/GPU | input tok/s | output tok/s | TTFT p50 | ITL p50 | p90 intvty | realized prefix hit | errors |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | 0.388 | 6,497 | 51,627 | 351.6 | 1.05 s | 22.6 ms | 54.88 | 96.4% | 0/1408 |
+| 16 | 0.501 | 11,182 | 88,982 | 471.5 | 1.32 s | 29.8 ms | 42.76 | 96.4% | 1/1825 |
+| 48 | 0.776 | 13,816 | 109,848 | 680.4 | 1.99 s | 54.7 ms | 24.9 | 94.1% (95–96% ss) | 2/2825 |
+| 1 | _running_ | — | — | — | — | — | — | — | — |
+
+Higher concurrency → higher aggregate tput/GPU but lower per-user interactivity.
+Realized prefix hit stays ~96% at C=8/16 and ~94% at C=48 (lower concurrency =
+less live-window churn, so more checkpoints survive). (C=1 appended when done.)
 
 ## How to run
 
