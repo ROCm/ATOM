@@ -95,7 +95,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
 
         # DP is handled at the EngineCore level (DPEngineCoreProc), not
         # within ModelRunner. Override so downstream code (get_dp_padding,
-        # _preprocess/sync_dp_for_tbo) sees dp_size=1 and skips cross-DP
+        # _preprocess/sync_dp_metadata) sees dp_size=1 and skips cross-DP
         # collectives that would fail on the isolated process group.
         config.parallel_config.data_parallel_size = 1
 

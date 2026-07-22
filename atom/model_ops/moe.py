@@ -27,6 +27,10 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.model_loader.weight_utils import set_weight_attrs
+from atom.model_ops.eplb import (
+    eplb_map_logical_to_physical,
+    record_eplb_expert_load,
+)
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -152,6 +156,30 @@ class FusedMoEParallelConfig:
         else:
             tp_size = tp_size_
             tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
+
+        # PCP moe_pcp_merge: fold the prefill-context-parallel dim into the MoE
+        # tensor/expert sharding so the W=pcp_size redundant copies become real
+        # shards (intermediate//W*tp or expert//W*tp). The flattened rank MUST be
+        # `pcp_rank * tp_size + tp_rank`: this makes each TP group [0..tp-1] own a
+        # contiguous half and its PCP partner own the other half, so the existing
+        # tp all_reduce + the new pcp reduce_scatter (two orthogonal groups) sum
+        # all W*tp shards. The reversed mapping would make PCP partners overlap
+        # and double-count. ep_size/ep_rank below inherit tp_size/tp_rank, so EP
+        # is covered by the same flatten.
+        from aiter.dist.parallel_state import (
+            get_prefill_context_model_parallel_rank,
+            get_prefill_context_model_parallel_world_size,
+        )
+
+        pcp_merge = (
+            envs.ATOM_PCP_MOE_MERGE
+            and get_prefill_context_model_parallel_world_size() > 1
+        )
+        if pcp_merge:
+            pcp_size = get_prefill_context_model_parallel_world_size()
+            pcp_rank = get_prefill_context_model_parallel_rank()
+            tp_rank = pcp_rank * tp_size + tp_rank
+            tp_size = pcp_size * tp_size
 
         atom_config = get_current_atom_config()
 
@@ -379,6 +407,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -387,6 +416,43 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
         raise NotImplementedError
+
+    def select_experts_with_record(
+        self,
+        *,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        use_grouped_topk: bool = False,
+        top_k: int,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        fused_shared_experts_scoring_func: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_weights, topk_logical = FusedMoE.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_routing_experts=layer.global_num_experts - layer.num_redundant_experts,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+        topk_physical = eplb_map_logical_to_physical(layer, topk_logical)
+        record_eplb_expert_load(layer, topk_physical)
+        return topk_weights, topk_physical
 
     @staticmethod
     def _maybe_make_prepare_finalize(
@@ -625,6 +691,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -801,6 +868,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
         self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
+        self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -833,7 +901,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
 
         mxfp4_block = 32
-        pad_align = 256
+        pad_align = self.pad_align
 
         intermediate_size_per_partition_after_pad = (
             (intermediate_size_per_partition + pad_align - 1) // pad_align * pad_align
@@ -956,8 +1024,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max().to(torch.float32)
             )
 
-        if self.use_triton:
-            from atom.config import get_current_atom_config
+        if self.use_triton and not (
+            getattr(get_current_atom_config(), "eplb_enable", False)
+            and getattr(layer, "num_redundant_experts", 0) > 0
+        ):
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
 
             atom_config = get_current_atom_config()
@@ -1125,7 +1195,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
-    @mark_trace(prefix="mxfp4_moe", torch_compile=False)
+    @mark_trace
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1144,6 +1214,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
             # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
@@ -1154,10 +1225,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "ATOM_USE_TRITON_MOE_DECODE (a8w4 GGUU) does not support situ "
                 "activation; disable it for Kimi-K3."
             )
+            from aiter.ops.triton.moe.moe_routing.routing import routing
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts_a8w4_silu_gguu,
             )
-            from aiter.ops.triton.moe.moe_routing.routing import routing
 
             n_expts_act = top_k
 
@@ -1309,7 +1380,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
             )
 
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        topk_weights, topk_ids = self.select_experts_with_record(
+            layer=layer,
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -1317,13 +1389,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            global_num_experts=global_num_experts,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=global_num_experts,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
-            routed_scaling_factor=layer.routed_scaling_factor,
         )
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
@@ -1779,6 +1849,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         """Apply compressed-tensors FP8 MoE computation."""
         # Select top-k experts using router logits
@@ -2216,6 +2287,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -2393,6 +2465,7 @@ class FusedMoE(torch.nn.Module):
         tp_size: Optional[int] = None,
         ep_size: Optional[int] = None,
         dp_size: Optional[int] = None,
+        layer_id: Optional[int] = None,
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
@@ -2403,8 +2476,10 @@ class FusedMoE(torch.nn.Module):
         shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
         shared_expert_prefix: Optional[str] = None,
+        pad_align: Optional[int] = None,
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.prefix = prefix
         layer_quant_config = (
             quant_config.get_layer_quant_config(prefix, check_children=True)
@@ -2429,7 +2504,19 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        self.global_num_experts = num_experts
+        self.num_redundant_experts = (
+            int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
+            if self.use_ep and getattr(atom_config, "eplb_enable", False)
+            else 0
+        )
+        # physical slots = routed experts + EPLB redundant replicas
+        self.global_num_experts = num_experts + self.num_redundant_experts
+        if self.use_ep:
+            assert self.global_num_experts % self.ep_size == 0, (
+                "EPLB physical experts must be divisible by ep_size: "
+                f"num_logical={num_experts}, "
+                f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
+            )
         self.register_buffer("expert_map", None, persistent=False)
         self.register_buffer("expert_mask", None, persistent=False)
         if self.use_ep:
@@ -2441,7 +2528,6 @@ class FusedMoE(torch.nn.Module):
         else:
             self.local_num_experts = self.global_num_experts
         self.top_k = top_k
-        self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
         if shared_expert_prefix is None and prefix.endswith(".experts"):
@@ -2495,7 +2581,7 @@ class FusedMoE(torch.nn.Module):
             )
         if fuse_shared_experts and self.num_fused_shared_experts > 0:
             init_aiter_topK_meta_data(
-                n_routed_experts=self.global_num_experts,
+                n_routed_experts=num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
                 top_k=self.top_k,
                 tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
@@ -2585,6 +2671,12 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
+
+        # Override weight padding alignment before create_weights consumes it.
+        # Must happen here (pre-create_weights) — setting it on quant_method
+        # after FusedMoE construction is a no-op since weights are already sized.
+        if pad_align is not None:
+            self.quant_method.pad_align = pad_align
 
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.moe_quant_params = {
@@ -3239,6 +3331,142 @@ class FusedMoE(torch.nn.Module):
                 narrow_weight = loaded_weight
             target_param[: narrow_weight.shape[0]].copy_(narrow_weight)
 
+    def _copy_expert_shard(
+        self,
+        param: torch.nn.Parameter,
+        expert_data: torch.Tensor,
+        shard_id: str,
+        shard_dim: int,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+    ) -> bool:
+        """Copy one expert's shard into ``expert_data``. Shared by
+        ``weight_loader`` (GPU dest) and ``stage_expert_weight`` (CPU staging
+        dest) so the two paths can't drift. Returns False for cases the batched
+        path can't handle (per-Tensor scale, ``weight_shape``); caller falls back.
+        """
+        # scales / zero-points / offset (group + per-channel)
+        if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
+            quant_method = self.layer_quant_config.quant_type
+            if quant_method == QuantType.per_Token:
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
+                return True
+            if quant_method in (QuantType.per_1x128, QuantType.per_1x32):
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    load_full=getattr(param, "load_full_w2", False),
+                )
+                return True
+            return False
+
+        # model weights; `weight_shape` shares the substring but isn't batchable
+        if "weight" in weight_name and "weight_shape" not in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=self.tp_rank,
+            )
+            return True
+
+        return False
+
+    def stage_expert_weight(
+        self,
+        param: torch.nn.Parameter,
+        staging: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        local_expert_id: int,
+        shard_id: str,
+        weight_name: str,
+    ) -> bool:
+        # Cases not handled by the batched path — caller falls back.
+        if (
+            "input_scale" in weight_name
+            or "g_idx" in weight_name
+            or "weight_shape" in weight_name
+            or weight_name == ""
+        ):
+            return False
+        if shard_id not in ("w1", "w2", "w3"):
+            return False
+
+        # compressed-tensors packed-weight flip (matches weight_loader)
+        if self.quant_method.__class__.__name__ in (
+            "CompressedTensorsWNA16MarlinMoEMethod",
+            "CompressedTensorsWNA16MoEMethod",
+        ):
+            loaded_weight = loaded_weight.t().contiguous()
+
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        is_transposed = getattr(param, "is_transposed", False)
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+        if is_transposed:
+            shard_dim = int(not shard_dim)
+
+        if len(loaded_weight.shape) == 3:
+            return False
+
+        expert_data = staging[local_expert_id]
+
+        if (
+            staging.dtype == torch.uint8
+            and param.data.dtype == dtypes.fp4x2
+            and loaded_weight.dtype == dtypes.fp4x2
+        ):
+            loaded_weight = loaded_weight.view(torch.uint8)
+
+        return self._copy_expert_shard(
+            param=param,
+            expert_data=expert_data,
+            shard_id=shard_id,
+            shard_dim=shard_dim,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+        )
+
+    def expected_batched_arrivals(self, param: torch.nn.Parameter) -> Optional[int]:
+        w13_batchable = [getattr(self, "w13_weight", None)]
+        w2_batchable = [getattr(self, "w2_weight", None)]
+        if self.layer_quant_config.quant_type in (
+            QuantType.per_Token,
+            QuantType.per_1x128,
+            QuantType.per_1x32,
+        ):
+            w13_batchable.append(getattr(self, "w13_weight_scale", None))
+            w2_batchable.append(getattr(self, "w2_weight_scale", None))
+        # Only local BASE (non-redundant) expert slots receive a checkpoint
+        # weight during loading; EPLB redundant physical slots are filled later
+        # by fill_redundant, so they never arrive here. Counting all local
+        # physical slots (local_num_experts) would over-estimate `expected` on
+        # ranks that own redundant slots -> the batched staging entry never
+        # reaches the flush threshold, so it is never flushed/freed (staging
+        # leaks for every layer -> OOM, and load never completes -> the rank
+        # misses the post-load all2all init collective -> hang). Count only the
+        # local slots inside the logical range (the base experts the checkpoint
+        # actually delivers).
+        if self.expert_map is not None:
+            num_logical = self.global_num_experts - self.num_redundant_experts
+            n_local_base = int((self.expert_map[:num_logical] != -1).sum().item())
+        else:
+            n_local_base = self.local_num_experts
+        if any(param is p for p in w13_batchable if p is not None):
+            return n_local_base * 2
+        if any(param is p for p in w2_batchable if p is not None):
+            return n_local_base
+        return None
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -3318,35 +3546,22 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        # Case weight scales, zero_points and offset
+        # Group/per-channel scales and model weights share one copy path with
+        # the batched loader (_copy_expert_shard).
+        # TODO @dsikka: once hardened, refactor to use vLLM Parameters.
+        if self._copy_expert_shard(
+            param=param,
+            expert_data=expert_data,
+            shard_id=shard_id,
+            shard_dim=shard_dim,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+        ):
+            return
+
+        # Case per-Tensor weight scale
         if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
-            # load the weight scales and zp based on the quantization scheme
-            # supported weight scales/zp can be found in
-            # FusedMoeWeightScaleSupported
-            # TODO @dsikka: once hardened, refactor to use vLLM Parameters
-            # specific to each case
-            quant_method = self.layer_quant_config.quant_type
-            if quant_method == QuantType.per_Token:
-                self._load_per_channel_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                )
-            elif quant_method in [
-                QuantType.per_1x128,
-                QuantType.per_1x32,
-            ]:
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                    load_full=getattr(param, "load_full_w2", False),
-                )
-            elif quant_method == QuantType.per_Tensor:
+            if self.layer_quant_config.quant_type == QuantType.per_Tensor:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
@@ -3360,17 +3575,6 @@ class FusedMoE(torch.nn.Module):
             # only required by compressed-tensors
             self._load_single_value(
                 param=param, loaded_weight=loaded_weight, expert_id=expert_id
-            )
-            return
-
-        # Case model weights
-        if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=self.tp_rank,
             )
             return
 
@@ -3563,6 +3767,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            prefix=f"{self.prefix}.fused_moe",
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -3628,6 +3833,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            prefix=f"{self.prefix}.fused_moe",
         )
 
         dp_group = get_dp_group()

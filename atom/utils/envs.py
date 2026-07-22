@@ -28,6 +28,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Token-equivalent cost of one in-flight request for the "least_tokens" DP
+    # load-balance strategy. The per-rank load score is
+    #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests
+    # so a larger value biases routing toward request-count balance (decode
+    # pressure) and a smaller value toward prompt-token balance (prefill
+    # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
+    "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # --- Compilation & Execution ---
@@ -130,6 +137,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
+    # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
+    "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
+        os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
+    ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
@@ -140,11 +152,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
-    # Use a thread pool for weight loading instead of main-process sequential I/O.
-    # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
-    "ATOM_LOADER_USE_THREADPOOL": lambda: (
-        os.getenv("ATOM_LOADER_USE_THREADPOOL", "1") == "1"
-    ),
+    # Worker threads for weight loading. >1 (default 16) enables the batched
+    # parallel loader (per-fused-param CPU staging flushed with one H2D copy)
+    # with that many threads; set to 1 to fall back to the original sequential
+    # per-expert path.
+    "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
     # Use the optional fastsafetensors package for safetensors file reads.
     "ATOM_USE_FASTSAFETENSORS": lambda: (
         os.getenv("ATOM_USE_FASTSAFETENSORS", "0") == "1"
@@ -287,6 +299,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
+    # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
+    # They are configured via --dspark-config (JSON dict) and carried in
+    # config.dspark (see atom/config.py DSparkConfig). See
+    # recipes/DeepSeek-V4-DSpark.md.
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under
@@ -352,6 +369,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
+    # --- PCP MoE comm mode ---
+    # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
+    # Only meaningful when prefill_context_parallel_size > 1;
+    # Default "1": all-gather hidden 1/W -> full before MoE and slice
+    # full -> 1/W after, so MoE sees the complete token set (MoE itself is
+    # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
+    # "0": MoE runs on each rank's 1/W token shard with no extra comm.
+    "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.
