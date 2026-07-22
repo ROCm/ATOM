@@ -240,8 +240,19 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         attn_metadata = attention_metadata
         slot_mapping = attn_metadata.slot_mapping[: q.shape[0]]
 
-        use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
-        # use_triton_attn = True
+        # The AITER asm paged-attention kernel only has a bf16/bf16 variant for
+        # kernel block size 16. When the KV cache uses a different block size
+        # (e.g. the Eagle3 draft sharing the model's block 128 so it can join
+        # vLLM's uniform-type per-layer-tensor KV cache group instead of
+        # collapsing to a singleton group), asm has no kernel and the worker
+        # crashes ("cannot get heuristic kernel"). The Triton path (insert +
+        # decode) is block-size agnostic, so route bf16 caches with a non-16
+        # block size through Triton.
+        use_triton_attn = (
+            self.sliding_window != -1
+            or self.head_dim != 128
+            or (not self.kv_cache_dtype.startswith("fp8") and block_size != 16)
+        )
         self.use_triton_attn = use_triton_attn
 
         if (
@@ -311,7 +322,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                     v_scale=v_scale,
                 )
         elif use_triton_attn and self.rotary_emb is not None:
-            k_scale = v_scale = self.per_tensor_scale
+            # `per_tensor_scale` is only populated for fp8 KV caches (see
+            # forward_impl). For a bf16 cache (e.g. the Eagle3 draft routed here
+            # because its block size != 16) it is absent and unused, since
+            # apply_scale below is False for non-fp8 dtypes.
+            k_scale = v_scale = getattr(self, "per_tensor_scale", None)
             self.per_token_quant = False
             q, k, _k_cache, _v_cache = fused_qk_rope_reshape_and_cache(
                 q,
@@ -423,7 +438,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             query_group_size,
         )
         compute_type = (
-            torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
+            aiter.dtypes.fp8
+            if self.kv_cache_dtype.startswith("fp8")
+            else torch.bfloat16
         )
         exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
         max_logits = torch.empty(
@@ -457,8 +474,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             context_partition_size=context_partition_size,
             compute_type=compute_type,
             q_scale=None,
-            k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
-            v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
+            k_scale=k_scale if self.kv_cache_dtype.startswith("fp8") else None,
+            v_scale=v_scale if self.kv_cache_dtype.startswith("fp8") else None,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
@@ -908,7 +925,24 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
         assert self.attn_type == AttentionType.DECODER
         block_size = vllm_config.cache_config.block_size
-        if self.sliding_window is not None:
+        # `self.sliding_window` uses -1 (not None) as the "no sliding window"
+        # sentinel (see __init__: per_layer_sliding_window or -1, and the
+        # `!= -1` / `> 0` guards throughout this layer). Only emit a
+        # SlidingWindowSpec for a *real* window (> 0); otherwise emit
+        # FullAttentionSpec. This matches native vLLM, where a non-windowed
+        # layer keeps sliding_window=None and registers FullAttentionSpec.
+        #
+        # This matters for speculative decoding: the Eagle3 draft has no
+        # sliding window, so it must be a FullAttentionSpec. MLAAttentionSpec
+        # (M3's sparse indexer cache) subclasses FullAttentionSpec, so a spec
+        # set of {full/sparse target, full draft} stays uniform-type and vLLM
+        # allocates a separate KV tensor per layer. A SlidingWindowSpec draft is
+        # NOT a FullAttentionSpec subclass, which breaks uniformity and drops M3
+        # onto the hybrid/general allocator; with a single draft layer that
+        # collapses group_size to 1 and packs every layer into one shared
+        # KVCacheTensor, aliasing the dense and sparse layouts and corrupting the
+        # KV cache.
+        if self.sliding_window is not None and self.sliding_window > 0:
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

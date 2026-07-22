@@ -1,6 +1,7 @@
 from typing import Type
 
 import torch
+from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
@@ -18,7 +19,19 @@ class AiterMhaBackendForVllm:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [16]
+        # The AITER asm_pa kernel only ships a bf16/bf16 paged-attention variant
+        # for kernel block size 16, but the Triton paged-attention path reads
+        # block_size from the cache shape at runtime and handles any multiple of
+        # 16. AttentionForVllmMHA routes to the Triton path whenever the bf16 KV
+        # cache block size is not 16 (see layer_mha.use_triton_attn), so this
+        # backend genuinely supports any MultipleOf(16). Declaring it as such
+        # lets vLLM pick the kv-manager block size (e.g. 128) as the common
+        # kernel block size, so a layer using this backend (the Eagle3 draft)
+        # can share the uniform-type KV cache group with the block-128
+        # sparse/dense layers instead of forcing a singleton group or a
+        # "No common block size" failure. This matches native vLLM, whose draft
+        # attention also supports the model block size.
+        return [MultipleOf(16)]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
