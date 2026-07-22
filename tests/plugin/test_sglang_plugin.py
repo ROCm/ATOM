@@ -182,7 +182,8 @@ def test_generate_sglang_config_translates_core_fields(monkeypatch):
     assert cfg.model == "/fake/model"
     assert cfg.trust_remote_code is True
     assert cfg.tensor_parallel_size == 4
-    assert cfg.kv_cache_dtype == "fp8_e4m3fn"
+    assert cfg.kv_cache_dtype == "fp8"
+    assert cfg.index_cache_dtype == "fp8"
     assert cfg.max_model_len == 16384
     assert cfg.max_num_seqs == 128
     assert cfg.enforce_eager is True
@@ -245,7 +246,8 @@ def test_generate_sglang_config_preserves_dsv4_fp8_kv_cache_dtype_on_supported_g
             config=_Obj(architectures=["DeepseekV4ForCausalLM"])
         )
 
-    assert cfg.kv_cache_dtype == "fp8_e4m3"
+    assert cfg.kv_cache_dtype == "fp8"
+    assert cfg.index_cache_dtype == "fp8"
     assert fake_server_args.kv_cache_dtype == "fp8_e4m3"
 
 
@@ -305,6 +307,7 @@ def test_generate_sglang_config_downgrades_dsv4_fp8_kv_cache_on_unsupported_gpu(
         )
 
     assert cfg.kv_cache_dtype == "bf16"
+    assert cfg.index_cache_dtype == "bf16"
     assert fake_server_args.kv_cache_dtype == "bf16"
 
 

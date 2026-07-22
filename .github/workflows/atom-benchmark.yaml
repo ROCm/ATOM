@@ -382,7 +382,7 @@ jobs:
         env:
           SERVER_ARGS: ${{ matrix.cell.server_args }}
         run: |
-          if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
+          if [ -n "${MODEL_HOST_ROOT:-}" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
           else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
 
           # cell.env_vars are already injected into the container env via
@@ -404,7 +404,7 @@ jobs:
         run: |
           set -uo pipefail  # no -e: allow per-config failure without aborting loop
 
-          if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
+          if [ -n "${MODEL_HOST_ROOT:-}" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
           else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
 
           FAIL_COUNT=0

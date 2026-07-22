@@ -984,13 +984,12 @@ jobs:
           docker build --network=host \
             --no-cache \
             -t "${SGLANG_IMAGE_TAG}" \
-            --target atom_sglang \
             --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f docker/sglang_release.dockerfile .
           echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom SGLang image

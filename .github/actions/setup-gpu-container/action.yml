@@ -87,11 +87,20 @@ runs:
           DEVICE_FLAG="--device /dev/dri"
         fi
 
-        if [ -d "/models" ]; then
-          MODEL_MOUNT="-v /models:/models"
+        MODEL_HOST_ROOT=""
+        for d in /shared_nfs/huggingface_models /models /data/models; do
+          if [ -d "$d" ]; then
+            MODEL_HOST_ROOT="$d"
+            break
+          fi
+        done
+
+        MODEL_MOUNT=""
+        if [ -n "$MODEL_HOST_ROOT" ]; then
+          MODEL_MOUNT="-v ${MODEL_HOST_ROOT}:/models"
+          echo "MODEL_HOST_ROOT=${MODEL_HOST_ROOT}" >> "$GITHUB_ENV"
         else
-          echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
-          MODEL_MOUNT=""
+          echo "Warning: no model cache directory found on runner; skipping /models mount and disabling model pre-download optimization."
         fi
 
         # Write env_vars via env block (avoids expression injection). Key the
