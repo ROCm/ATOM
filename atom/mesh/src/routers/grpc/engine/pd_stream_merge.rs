@@ -8,7 +8,7 @@ use futures::Stream;
 
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::{InputLogprobs, TokenChunk};
-use crate::routers::token_handle::token_handle::{TokenSource, TokenHandle};
+use crate::routers::token_handle::token_handle::{TokenHandle, TokenSource};
 
 pub fn merge_pd_streams(
     prefill: TokenHandle,

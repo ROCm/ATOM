@@ -377,6 +377,10 @@ class AttentionMetaData:
     cu_seqlen_ks: Optional[torch.Tensor] = None
     cu_seqlen_ke: Optional[torch.Tensor] = None
     sparse_kv_indptr: Optional[torch.Tensor] = None
+    # Last-page lens for sparse (DSA) attention: all 1s, one per query token in
+    # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
+    # (the dense per-seq buffer) so the two never clobber each other.
+    sparse_kv_last_page_lens: Optional[torch.Tensor] = None
 
     work_meta_data: Optional[torch.Tensor] = None
     work_indptr: Optional[torch.Tensor] = None
@@ -545,6 +549,13 @@ class ForwardContext:
     # forward, so it ignores the flag entirely.
     in_hipgraph: bool = False
 
+    # Piecewise-cudagraph dispatch, read per forward by CUDAGraphWrapper:
+    # cudagraph_runtime_mode picks the capture/replay mode, batch_descriptor is
+    # the key (num_tokens). None defaults keep wrappers inert until model_runner
+    # sets them. Typed Any to dodge a CUDAGraphMode circular import.
+    cudagraph_runtime_mode: Any = None
+    batch_descriptor: Optional[Any] = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -690,13 +701,21 @@ def set_kv_cache_data(
     kv_cache_data: dict[int, KVCacheTensor],
     config: Optional[Config] = None,
     transfer_tensors: Any = None,
+    num_blocks: Optional[int] = None,
 ) -> None:
-    """Register KV cache data globally and with the KV connector if enabled."""
+    """Register KV cache data globally and with the KV connector if enabled.
+
+    ``num_blocks`` is the physical KV block count; the offload connector needs
+    it to byte-slice MLA's token-major latent cache (where tensor.shape[0] is
+    the token count, not the block count).
+    """
     global _forward_kv_cache_context
 
     if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
         connector = get_kvconnector(config=config)
         if connector is not None:
-            connector.register_kv_caches(kv_cache_data, transfer_tensors)
+            connector.register_kv_caches(
+                kv_cache_data, transfer_tensors, num_blocks=num_blocks
+            )
 
     _forward_kv_cache_context.kv_cache_data = kv_cache_data

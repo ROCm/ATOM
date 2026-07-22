@@ -128,15 +128,25 @@ def merge_attn_states_kernel(
     s_lse = float("-inf") if s_lse == float("inf") else s_lse
 
     max_lse = tl.maximum(p_lse, s_lse)
-    p_lse = p_lse - max_lse
-    s_lse = s_lse - max_lse
+    # Both prefix AND suffix are empty for this token (no KV on either side) ->
+    # max_lse == -inf. The naive `p_lse - max_lse` would compute -inf-(-inf)=NaN
+    # and `out_se` would be 0, making the scale 0/0=NaN that poisons the output.
+    # This happens in ATOM's global-axis chunked prefill: a short seq can fall
+    # entirely outside a chunk, so its tokens see an empty prefix AND suffix in
+    # that chunk. Force a safe 0/0-split: subtract a finite max so each side's
+    # exp is 0 (out = 0*p_out + 0*s_out = 0, correct for empty attention) and
+    # keep the merged lse at -inf so any downstream merge stays consistent.
+    both_empty = max_lse == float("-inf")
+    safe_max = tl.where(both_empty, 0.0, max_lse)
+    p_lse = p_lse - safe_max
+    s_lse = s_lse - safe_max
     # Will reuse precomputed Exp values for scale factor computation.
     p_se = tl.exp(p_lse)
     s_se = tl.exp(s_lse)
     out_se = p_se + s_se
 
     if OUTPUT_LSE:
-        out_lse = tl.log(out_se) + max_lse
+        out_lse = tl.where(both_empty, float("-inf"), tl.log(out_se) + safe_max)
         tl.store(output_lse + head_idx * num_tokens + token_idx, out_lse)
 
     p_out = tl.load(
@@ -157,8 +167,11 @@ def merge_attn_states_kernel(
     # NOTE(woosuk): Be careful with the numerical stability.
     # We should compute the scale first, and then multiply it with the output.
     # Do not multiply the output with tl.exp(p_lse) or tl.exp(s_lse) directly.
-    p_scale = p_se / out_se
-    s_scale = s_se / out_se
+    # both_empty -> out_se == 0; guard the denominator so the scale is 0/1=0
+    # (not 0/0=NaN). p_out/s_out are 0 for empty attention, so out stays 0.
+    safe_out_se = tl.where(both_empty, 1.0, out_se)
+    p_scale = p_se / safe_out_se
+    s_scale = s_se / safe_out_se
     out = p_out * p_scale + s_out * s_scale
 
     if USE_FP8:

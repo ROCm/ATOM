@@ -1,4 +1,6 @@
 use std::{
+    io,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -21,7 +23,7 @@ use wfaas::LoggingSubscriber;
 
 use crate::{
     app_context::AppContext,
-    config::RouterConfig,
+    config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
         steps::{TokenizerConfigRequest, WorkflowEngines},
@@ -57,6 +59,32 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+}
+
+fn configured_worker_urls(config: &RouterConfig) -> Vec<String> {
+    match &config.mode {
+        RoutingMode::Regular { worker_urls } => worker_urls.clone(),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => prefill_urls
+            .iter()
+            .map(|(url, _)| url.clone())
+            .chain(decode_urls.iter().cloned())
+            .collect(),
+    }
+}
+
+fn has_registered_worker_for_url(registered_urls: &[String], configured_url: &str) -> bool {
+    let configured = configured_url.trim_end_matches('/');
+    registered_urls.iter().any(|url| {
+        let registered = url.trim_end_matches('/');
+        registered == configured
+            || registered
+                .strip_prefix(configured)
+                .map_or(false, |suffix| suffix.starts_with('@'))
+    })
 }
 
 async fn parse_function_call(
@@ -401,6 +429,12 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
+#[derive(Clone, Debug)]
+pub struct ServerTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -413,6 +447,7 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    pub tls: Option<ServerTlsConfig>,
     pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
 }
 
@@ -648,23 +683,31 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // so we poll until all expected workers appear in the registry.
     let expected_workers = config.router_config.mode.worker_count();
     if expected_workers > 0 {
+        let expected_worker_urls = configured_worker_urls(&config.router_config);
         let max_wait = Duration::from_secs(config.router_config.worker_startup_timeout_secs + 60);
         let poll_interval = Duration::from_millis(500);
         let start = std::time::Instant::now();
         loop {
             let current = app_context.worker_registry.len();
-            if current >= expected_workers {
+            let registered_urls = app_context.worker_registry.get_all_urls();
+            let missing_worker_urls: Vec<&str> = expected_worker_urls
+                .iter()
+                .map(String::as_str)
+                .filter(|url| !has_registered_worker_for_url(&registered_urls, url))
+                .collect();
+            if current >= expected_workers && missing_worker_urls.is_empty() {
                 info!(
-                    "All {} expected workers registered (took {:?})",
+                    "All {} expected worker endpoint(s) registered as {} worker(s) (took {:?})",
                     expected_workers,
+                    current,
                     start.elapsed()
                 );
                 break;
             }
             if start.elapsed() > max_wait {
                 warn!(
-                    "Timed out waiting for workers: {} of {} registered after {:?}",
-                    current, expected_workers, max_wait
+                    "Timed out waiting for workers: {} worker(s) registered, expected {} endpoint(s), missing {:?} after {:?}",
+                    current, expected_workers, missing_worker_urls, max_wait
                 );
                 break;
             }
@@ -744,7 +787,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ]
     });
 
-    let app = build_app(app_state.clone(), config.max_payload_size, request_id_headers);
+    let app = build_app(
+        app_state.clone(),
+        config.max_payload_size,
+        request_id_headers,
+    );
 
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
     let bind_addr = format!("{}:{}", config.host, config.port);
@@ -764,11 +811,76 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         app_state_clone.router.shutdown().await;
     });
 
-    axum_server::bind(addr)
-        .handle(handle)
-        .serve(app.into_make_service())
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    if let Some(tls) = config.tls.as_ref() {
+        let cert_metadata = tokio::fs::metadata(&tls.cert_path).await.map_err(|e| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TLS certificate file is not accessible at '{}': {}",
+                    tls.cert_path.display(),
+                    e
+                ),
+            )) as Box<dyn std::error::Error>
+        })?;
+        if !cert_metadata.is_file() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TLS certificate path is not a file: '{}'",
+                    tls.cert_path.display()
+                ),
+            )));
+        }
+
+        let key_metadata = tokio::fs::metadata(&tls.key_path).await.map_err(|e| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TLS private key file is not accessible at '{}': {}",
+                    tls.key_path.display(),
+                    e
+                ),
+            )) as Box<dyn std::error::Error>
+        })?;
+        if !key_metadata.is_file() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TLS private key path is not a file: '{}'",
+                    tls.key_path.display()
+                ),
+            )));
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                .await
+                .map_err(|e| {
+                    Box::new(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "failed to load TLS certificate '{}' and key '{}': {}",
+                            tls.cert_path.display(),
+                            tls.key_path.display(),
+                            e
+                        ),
+                    )) as Box<dyn std::error::Error>
+                })?;
+        info!("TLS enabled");
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    } else {
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    }
 
     // HA handler shutdown is handled by the signal in mesh_run! macro
     // No need to manually shutdown here

@@ -13,6 +13,7 @@ from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils import envs
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 logger = logging.getLogger("atom")
@@ -54,6 +55,73 @@ class LLMEngine:
         if data_parallel_master_port is not None:
             config.parallel_config.data_parallel_master_port = data_parallel_master_port
         self.data_parallel_size = data_parallel_size
+        # PCP and DP-attention are not yet compatible: PCP stripe-splits
+        # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
+        # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
+        # the FULL (un-split) token count, so all_gatherv asserts
+        # `1/pcp_size != full`.
+        if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) combined with "
+                "--enable-dp-attention is not supported yet (may be supported "
+                "in a future release): PCP splits tokens to 1/pcp_size while "
+                "DP-attention's id-gather expects the full token count, "
+                "causing an all_gatherv size mismatch. For now, disable one of "
+                "them (use -tp N -pcp M without DP-attention, or -dp N "
+                "--enable-dp-attention without -pcp)."
+            )
+        # PCP + TBO prefill: supported via coordinated splitting.
+        # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
+        # per-request ubatch split are unverified).
+        if config.prefill_context_parallel_size > 1 and config.enable_tbo:
+            # TBO overlaps compute with the attn<->MoE PCP collectives, which
+            # only exist in MoE merge mode (ATOM_PCP_MOE_MERGE=1). With
+            # ATOM_PCP_MOE_MERGE=0, MoE runs on each rank's 1/W token shard
+            # with NO extra comm between attn and MoE, so TBO has nothing
+            # to overlap and only adds ubatch-splitting overhead. Force it off.
+            if not envs.ATOM_PCP_MOE_MERGE:
+                logger.warning(
+                    "Disabling TBO because ATOM_PCP_MOE_MERGE=0: in this "
+                    "situation it runs MoE on each rank's 1/W token shard with "
+                    "no extra attn<->MoE communication, so TBO has nothing to "
+                    "overlap and only adds overhead."
+                )
+                config.enable_tbo = False
+                config.enable_tbo_decode = False
+            elif config.tensor_parallel_size > 1:
+                # Cross-communicator (PCP x TP) RCCL deadlock:
+                # under TBO the PCP collectives (comm_stream) run concurrently
+                # and UNORDERED with the TP-group all_reduces (compute_stream,
+                # from attention wo_b / MoE RowParallelLinear). On the TPxPCP
+                # rank grid with large collectives this forms a cross-rank
+                # circular wait -> hang (reproduced MI355 TP4PCP2/TP2PCP4 merge
+                # +TBO, 64k/c32). Serialized (non-TBO single stream) is fine, and
+                # TP=1 has no TP communicator so it cannot form the cycle. Only
+                # TP=1 + PCP keeps TBO; TP>1 falls back to non-TBO.
+                logger.warning(
+                    "Disabling TBO: prefill_context_parallel_size > 1 (-pcp) "
+                    "with tensor_parallel_size > 1 (-tp) hangs under TBO due to "
+                    "a PCP<->TP cross-communicator RCCL deadlock (concurrent "
+                    "unordered collectives on comm/compute streams; see "
+                    "PCP_TBO.md 14.4). TBO with PCP is only supported at -tp 1 "
+                    "(e.g. -tp 1 -pcp 8)."
+                )
+                config.enable_tbo = False
+                config.enable_tbo_decode = False
+            elif config.enable_tbo_decode:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) combined with "
+                    "--enable-tbo all (decode TBO) is not supported yet. "
+                    "Use --enable-tbo (prefill only) with -pcp."
+                )
+            # Under PCP, TBO prefill uses a request-boundary split (the
+            # non-default TBO split mode; never token-midpoint split), so
+            # ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored.
+            if config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
+                logger.warning(
+                    "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
+                    "prefill uses request-boundary balanced grouping."
+                )
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
@@ -167,8 +235,9 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         request_ids: Optional[list[str]] = None,
     ) -> list[str]:
-        # Reset round-robin counter to ensure consistent DP not core dump
-        self.core_mgr._rr_counter = 0
+        # Reset DP routing state (round-robin cursor + in-flight load) so a
+        # fresh batch gets deterministic DP assignment and no leaked counts.
+        self.core_mgr.reset_dp_router()
 
         self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
@@ -189,7 +258,7 @@ class LLMEngine:
         multimodal_data_list: list[dict],
     ) -> list[dict]:
         """Generate completions for multimodal inputs (token IDs + vision data)."""
-        self.core_mgr._rr_counter = 0
+        self.core_mgr.reset_dp_router()
         self.add_request(
             token_ids_list,
             sampling_params,
@@ -211,7 +280,9 @@ class LLMEngine:
         logger.info("Profiling started")
 
     def stop_profile(self) -> List[Dict[str, Any]]:
-        responses = self.core_mgr.broadcast_utility_command_sync("stop_profile")
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "stop_profile", timeout=envs.ATOM_PROFILER_TIMEOUT
+        )
         return [resp.get("result", {}) for resp in responses]
 
     def print_mtp_statistics(self):

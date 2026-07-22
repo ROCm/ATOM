@@ -6,7 +6,7 @@ use std::{
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
 use super::{
-    config::{PrometheusConfig, default_duration_buckets},
+    config::{default_duration_buckets, PrometheusConfig},
     schema,
 };
 

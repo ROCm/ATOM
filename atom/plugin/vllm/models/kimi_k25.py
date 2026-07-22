@@ -57,6 +57,12 @@ class KimiK25Model(DeepseekV2Model):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        self.alt_stream: Optional[torch.cuda.Stream] = None
+        if getattr(config, "n_shared_experts", None) is not None:
+            self.alt_stream = torch.cuda.Stream()
+
+        _alt_stream = self.alt_stream
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix, layer_num=None: DeepseekV2DecoderLayer(
@@ -65,6 +71,7 @@ class KimiK25Model(DeepseekV2Model):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 layer_num=layer_num,
+                alt_stream=_alt_stream,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,

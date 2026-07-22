@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import enum
 import logging
 import pickle
 import queue
@@ -14,10 +13,16 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import envs, init_exit_handler, make_zmq_socket
+from atom.utils import (
+    envs,
+    init_exit_handler,
+    make_zmq_socket,
+    set_process_title,
+)
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -25,28 +30,6 @@ from atom.utils.distributed.utils import (
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 
 logger = logging.getLogger("atom")
-
-
-class EngineCoreRequestType(enum.Enum):
-    """
-    Request types defined as hex byte strings, so it can be sent over sockets
-    without separate encoding step.
-    """
-
-    ADD = b"\x00"
-    ABORT = b"\x01"
-    START_DP_WAVE = b"\x02"
-    UTILITY = b"\x03"
-    # Sentinel used within EngineCoreProc.
-    EXECUTOR_FAILED = b"\x04"
-    # Sentinel used within EngineCore.
-    SHUTDOWN = b"\x05"
-    # Stream output for callbacks
-    STREAM = b"\x06"
-    # Signal that EngineCore is fully initialized and ready
-    READY = b"\x07"
-    # Response to a synchronous utility command
-    UTILITY_RESPONSE = b"\x08"
 
 
 class EngineCore:
@@ -84,7 +67,6 @@ class EngineCore:
         )
         self.input_thread.start()
 
-        self.profile_enbaled = config.torch_profiler_dir is not None
         self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
         self._init_data_parallel(config)
@@ -92,9 +74,13 @@ class EngineCore:
         # Initialize model runner processes
         try:
             good = False
+            # Number of worker processes = full model-parallel world size.
+            # PCP is an independent dimension (world = tp x pcp), so spawn
+            # tp x pcp workers; otherwise init_dist_env (which expects a world
+            # of tp x pcp) would hang waiting for the PCP ranks.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tensor_parallel_size,
+                config.tensor_parallel_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
                 config,
             )
@@ -107,6 +93,11 @@ class EngineCore:
             config.num_per_req_cache_groups = block_info.get(
                 "num_per_req_cache_groups", 0
             )
+            # paged-SWA: propagate SWA pool sizing from the runner subprocess
+            # so BlockManager (built in Scheduler below) sees the same value as
+            # the runner's attn builder (else swa_enabled=False vs the SWA pool).
+            config.num_swa_blocks = block_info.get("num_swa_blocks", 0)
+            config.swa_window_size = block_info.get("swa_window_size", 0)
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -114,20 +105,13 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
-                # Start profiler before cudagraph capture only if mark-trace is enabled.
-                if self.profile_enbaled and self.mark_trace:
-                    self.runner_mgr.call_func(
-                        "start_profiler", "capture_graph", wait_out=True
-                    )
-                cap_cost, bs = self.runner_mgr.call_func(
+                cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
                 logger.info(
-                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
+                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} "
+                    f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
-                if self.profile_enbaled and self.mark_trace:
-                    # Persist a dedicated capture-graph trace immediately.
-                    self.runner_mgr.call_func("stop_profiler", wait_out=True)
             good = True
         finally:
             logger.info(
@@ -189,11 +173,25 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        # Bind this EngineCore's lifetime to its parent (the server /
+        # CoreManager): if the parent exits, have the kernel reap this process —
+        # and, transitively, the ModelRunner workers it spawns — instead of
+        # leaving them orphaned. Orphans keep pinning GPU VRAM + the custom
+        # all-reduce IPC handles / rendezvous TCPStore, which makes the next
+        # restart reuse a stale hipIpc handle and crash. See
+        # atom.utils.enable_orphan_reaping for the full rationale.
+        from atom.utils import enable_orphan_reaping
+
+        enable_orphan_reaping()
         engine: EngineCore = None
         try:
             if config.parallel_config.data_parallel_size > 1:
+                set_process_title(
+                    f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
+                )
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
+                set_process_title("EngineCore")
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:
@@ -259,21 +257,13 @@ class EngineCore:
             self.output_queue.put_nowait(rejected)
 
         if result is None:
-            if self.kv_transfer_enabled:
-                kvoutput = self.runner_mgr.call_func_with_aggregation(
-                    "async_proc_aggregation"
-                )
-                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            self._advance_idle_kv_transfer()
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
-            if self.kv_transfer_enabled:
-                kvoutput = self.runner_mgr.call_func_with_aggregation(
-                    "async_proc_aggregation"
-                )
-                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            self._advance_idle_kv_transfer()
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
@@ -288,16 +278,13 @@ class EngineCore:
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
+            self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        if self.kv_transfer_enabled:
-            kvoutput = self.runner_mgr.call_func_with_aggregation(
-                "async_proc_aggregation"
-            )
-            self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
@@ -325,6 +312,29 @@ class EngineCore:
             self.output_queue.put_nowait(finished_seqs)
 
         return True
+
+    def _advance_idle_kv_transfer(self) -> None:
+        # No forward batch will run this tick, but offload load/save work may
+        # still need to be dispatched or reported back to the scheduler.
+        self._dispatch_idle_offload_work()
+        self._poll_kv_transfer_progress()
+
+    def _poll_kv_transfer_progress(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+    def _dispatch_idle_offload_work(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not getattr(connector, "is_offload", False):
+            return
+        meta = connector.build_connector_meta()
+        if meta is None or not getattr(meta, "requests", None):
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", meta)
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
@@ -446,9 +456,14 @@ class DPEngineCoreProc(EngineCore):
                 PrefillDelayer(
                     dp_size=config.parallel_config.data_parallel_size,
                     cpu_group=self.dp_group,
-                    max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
-                    max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 )
             )
 

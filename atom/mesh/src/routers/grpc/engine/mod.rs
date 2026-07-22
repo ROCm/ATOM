@@ -23,7 +23,7 @@ use crate::routers::grpc::engine::worker_client_cache::{get_grpc_client_from_wor
 use crate::routers::prepare::generation_payload::{GenerationPayload, PdMetadata};
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::TokenChunk;
-use crate::routers::token_handle::token_handle::{TokenSource, TokenHandle};
+use crate::routers::token_handle::token_handle::{TokenHandle, TokenSource};
 
 pub use pd_stream_merge::merge_pd_streams;
 
@@ -70,10 +70,7 @@ impl GrpcEngine {
             } => {
                 payload.pd_metadata = Some(PdMetadata {
                     bootstrap_host: prefill.bootstrap_host().to_string(),
-                    bootstrap_port: prefill
-                        .bootstrap_port()
-                        .map(|p| p as i32)
-                        .unwrap_or(0),
+                    bootstrap_port: prefill.bootstrap_port().map(|p| p as i32).unwrap_or(0),
                     bootstrap_room: (rand::random::<u32>() & (i32::MAX as u32)) as i32,
                 });
                 let payload_ref: &GenerationPayload = payload;

@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -318,6 +319,11 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
+        # paged-SWA: parallel SWA block table (independent physical pool;
+        # -1 sentinels for window-freed blocks). Same filter as block_tables.
+        self.swa_block_tables = [
+            seq.swa_block_table for seq in seqs.values() if seq.block_table
+        ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
@@ -337,6 +343,25 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
+        self.num_spec_query_tokens = num_spec_step + 1
+        # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
+        # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when
+        # set, consumers use it (per-seq) instead of the scalar above.
+        self.dynamic_spec_query_tokens_per_req = None
+
+        # DSpark DP graph-shape sync (see model_runner._apply_dspark_shape_max):
+        # DP-max decode bs / ragged token total, so every DP rank replays the same
+        # cudagraph shape. None outside DSpark-under-DP steps.
+        self.dspark_dp_bs = None
+        self.dspark_dp_total_tokens = None
+
+        # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
+        # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
+        # None on the normal path; consumed by ModelRunner.run_model to extend
+        # the prefill[]/decode[] trace labels.
+        self.detailed_sqsq: int | None = None  # sum N_Q^2
+        self.detailed_sqsk: int | None = None  # sum N_Q*N_KV
+        self.detailed_sk: int | None = None  # sum N_KV
 
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
@@ -375,6 +400,7 @@ class ScheduledBatchOutput:
         is_deferred_out: bool = False,
         is_prev_prefill=False,
         logprobs=None,
+        dspark_ell: Optional[np.ndarray] = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -384,6 +410,11 @@ class ScheduledBatchOutput:
         self.is_deferred_out = is_deferred_out
         self.is_prev_prefill = is_prev_prefill
         self.logprobs = logprobs  # Optional[dict[int, float]]
+        # DSpark Phase 2: {req_id: ell_r} from this step's propose() — the
+        # scheduler-chosen verify length per request. Rides back to the
+        # (main-process) scheduler so the NEXT step can size each request's
+        # verification to ell_r+1. None when DSpark scheduling is off.
+        self.dspark_ell = dspark_ell
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: Optional[dict[int, int]] = None
 
@@ -415,6 +446,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.long_prefill_token_threshold = config.long_prefill_token_threshold
         self.max_model_len = config.max_model_len
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
@@ -431,6 +463,7 @@ class Scheduler:
 
         # KV transfer bookkeeping
         self.finished_recving_kv_req_ids: list[int] = []
+        self.failed_recving_kv_req_ids: list[int] = []
         self.deferred_free_blocks: dict[int, Sequence] = {}
 
         # Scheduling delay for batching efficiency
@@ -452,7 +485,19 @@ class Scheduler:
         self.cache_stats: Optional[CacheStats] = (
             CacheStats() if config.enable_prefix_caching else None
         )
+        self.profile_active = False
+        # Cache the env flag once (env vars are fixed at process start) so the
+        # per-iteration compute_detailed_aggregates never pays an os.getenv.
+        self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
+
         self.enable_chunked_prefill = config.enable_chunked_prefill
+        # V4 SWA correctness on a prefix-cache hit is now handled entirely in
+        # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
+        # trailing window is SWA-present, and `allocate` marks out-of-window
+        # blocks -1. The old `_v4_swa_warmup_blocks` (re-forward the tail to
+        # repopulate the per-request ring) was a pre-paged-ring workaround and is
+        # removed — the paged content-addressed SWA pool reuses the tail window
+        # directly. See PLAN_swa_prefix_cache_tail_gate.md.
         # Number of running seqs currently mid-prefill (per-seq state lives in
         # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
         # of `schedule()` can skip the running-queue scan entirely on
@@ -525,6 +570,8 @@ class Scheduler:
         entries) and check `can_allocate` + token-budget, mirroring the
         same checks the admission while-loop runs below.
         """
+        if self._partial_prefill_count > 0:
+            return True
         if not self.waiting:
             return False
         for i, seq in enumerate(self.waiting):
@@ -535,7 +582,10 @@ class Scheduler:
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
                 continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
-            if num_new_tokens > self.max_num_batched_tokens:
+            if (
+                not self.enable_chunked_prefill
+                and num_new_tokens > self.max_num_batched_tokens
+            ):
                 continue
             if self.block_manager.can_allocate(seq) < 0:
                 return False  # KV-pressured: definitely cannot prefill
@@ -545,15 +595,109 @@ class Scheduler:
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
 
-        Used as the `token_usage` signal for PrefillDelayer's low-watermark
-        safety valve. Derived from BlockManager bookkeeping; cheap (no
-        traversal of seq tables).
+        The `kv_usage` signal for PrefillDelayer's KV watermark bounds — both the
+        high watermark (near-full → release, can't accumulate more) and the
+        optional low watermark (GPU starving → release, feed it). Derived from
+        BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
         bm = self.block_manager
         total = len(bm.blocks)
         if total <= 0:
             return 0.0
         return len(bm.used_block_ids) / total
+
+    def _waiting_new_token_count(self) -> int:
+        """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
+        saturated at `max_num_batched_tokens`.
+
+        Feeds PrefillDelayer's coalescer fill signal (accumulate a full prefill
+        batch before releasing, instead of firing many tiny fragments). The cap
+        early-exits the scan: one batch's worth is all the coalescer compares
+        against, so there's no point summing a deep queue.
+
+        Skips the same non-admittable seqs as `_can_admit_head_prefill` —
+        unschedulable, WAITING_FOR_REMOTE_KVS, and oversized-when-chunking-off —
+        so the "queued work" signal counts only tokens this rank could actually
+        prefill this step. Counting remote-KV / unschedulable tokens here would
+        inflate the cross-rank aggregate and reach the fill target before a real
+        batch has accumulated. The `num_cached_tokens` discount is best-effort:
+        an un-admitted seq has not been probed against the prefix cache yet, so
+        this is an upper bound on new tokens for cache-hit prompts.
+        """
+        cap = self.max_num_batched_tokens
+        total = 0
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            if (
+                not self.enable_chunked_prefill
+                and num_new_tokens > self.max_num_batched_tokens
+            ):
+                continue
+            total += max(0, num_new_tokens)
+            if total >= cap:
+                return cap
+        return total
+
+    def _partial_prefill_remaining_tokens(self) -> int:
+        """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill
+        seqs in `running`, saturated at `max_num_batched_tokens`.
+
+        Folded into the coalescer's pending-token signal so a small partial tail
+        chunk does not force its own tiny prefill forward — it accumulates with
+        fresh prefills instead, bounded by the coalescer's partial deadline.
+        Skipped entirely in the common steady-state (no partial) via the
+        `_partial_prefill_count` counter, and stops scanning once all
+        `_partial_prefill_count` partials have been summed.
+
+        This is an UPPER BOUND on what a partial can actually contribute in one
+        forward: `remaining = num_tokens - num_cached_tokens` does NOT apply the
+        per-step `long_prefill_token_threshold` chunk clamp that Phase-1
+        scheduling uses, so when that threshold is set the coalescer fill signal
+        may read slightly high. Acceptable for a coalescing heuristic; consistent
+        with `_waiting_new_token_count`'s best-effort estimate.
+        """
+        if self._partial_prefill_count == 0:
+            return 0
+        cap = self.max_num_batched_tokens
+        total = 0
+        seen = 0
+        for seq in self.running:
+            if not seq.is_partial_prefill:
+                continue
+            total += max(0, seq.num_tokens - seq.num_cached_tokens)
+            if total >= cap:
+                return cap
+            seen += 1
+            if seen >= self._partial_prefill_count:
+                break  # all partials summed; skip the rest of the decode tail
+        return total
+
+    def _oldest_waiting_prefill_age_ms(self) -> float:
+        """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
+        or 0.0 if none.
+
+        Feeds PrefillDelayer's TTFT SLA guard: if this exceeds max_queue_ms the
+        coalescer force-releases so a request never starves in the queue. Uses
+        `seq.arrive_time` (wall-clock seconds, stamped at engine entry) — the
+        true end-to-end wait, including backlog and coalescer holds. Skips the
+        same non-admittable seqs as `_can_admit_head_prefill` (unschedulable,
+        WAITING_FOR_REMOTE_KVS) so a permanently-stuck seq can't peg the guard.
+        """
+        oldest_arrive = None
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if oldest_arrive is None or seq.arrive_time < oldest_arrive:
+                oldest_arrive = seq.arrive_time
+        if oldest_arrive is None:
+            return 0.0
+        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -699,31 +843,53 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
-        # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
-        _delayer_allows_prefill = True
+        self._promote_ready_remote_kv_requests()
+        self._park_ready_offload_partial_prefills()
+
+        # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
+        # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
-            _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
-                local_prefillable=self._can_admit_head_prefill(),
-                token_usage=self._kv_usage(),
+            # pending = fresh waiting new-tokens + resumable partials' remaining,
+            # capped at the batch budget: the coalescer's accumulation signal.
+            pending_tokens = min(
+                self._waiting_new_token_count()
+                + self._partial_prefill_remaining_tokens(),
+                self.max_num_batched_tokens,
             )
+            delayer_allows = self.prefill_delayer.should_allow_prefill(
+                prefillable=self._can_admit_head_prefill(),
+                pending_tokens=pending_tokens,
+                # decode-only: self.running also holds mid-chunked-prefill seqs,
+                # which are NOT decode load — counting them would defeat the
+                # coalescer's "no decode → fire" fast path.
+                running_decode_batch=max(
+                    0, len(self.running) - self._partial_prefill_count
+                ),
+                kv_usage=self._kv_usage(),
+                has_partial=self._partial_prefill_count > 0,
+                oldest_waiting_age_ms=self._oldest_waiting_prefill_age_ms(),
+            )
+        else:
+            delayer_allows = True
 
         if not self.running and not self.waiting:
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
-        # Gated by `_delayer_allows_prefill` so cross-DP alignment still
-        # holds when one rank is mid-chunked-prefill: a delayer veto skips
-        # both Phase 1 and Phase 2 in lockstep. Inside that, skip the
-        # running-queue scan entirely when no seq is mid-prefill — the
-        # common steady-state decode case — using the counter maintained by
-        # postprocess / preempt / finished-removal.
-        if _delayer_allows_prefill and self._partial_prefill_count > 0:
+        # Gated by `delayer_allows` so cross-DP alignment still holds when one
+        # rank is mid-chunked-prefill: a delayer veto skips both Phase 1 and
+        # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
+        # when no seq is mid-prefill — the common steady-state decode case —
+        # using the counter maintained by postprocess / preempt / finished-removal.
+        if delayer_allows and self._partial_prefill_count > 0:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
                 if not seq.is_partial_prefill:
                     continue
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+                remaining = seq.num_tokens - seq.num_cached_tokens
+                if 0 < self.long_prefill_token_threshold < remaining:
+                    remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = min(remaining, budget_remaining)
                 if chunk <= 0:
@@ -736,13 +902,25 @@ class Scheduler:
 
         # ---- Phase 2: new requests from waiting ----
         while (
-            _delayer_allows_prefill
+            delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
         ):
             seq = self.waiting.popleft()
+
+            # Client disconnected before this seq ever ran: it holds no KV yet
+            # and needs no forward pass, so finish it outright and route via
+            # `_rejected` (emits a finished RequestOutput through the same
+            # output_queue). Must intercept here BEFORE the waiting->running
+            # promotion below, which would overwrite ABORTED with RUNNING and
+            # lose the abort intent.
+            if seq.status == SequenceStatus.ABORTED:
+                seq.status = SequenceStatus.FINISHED
+                seq.leave_reason = "aborted"
+                self._rejected.append(seq)
+                continue
 
             # Drop seqs the static-capacity check at submit-time flagged as
             # permanently unschedulable (oversized prompt, exhausted pool,
@@ -760,57 +938,50 @@ class Scheduler:
                 self._rejected.append(seq)
                 continue
 
-            # KV Transfer: skip request if still waiting for remote KVs
-            waiting_remote_to_waiting_ready = False
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                waiting_remote_to_waiting_ready = self._update_waiting_for_remote_kv(
-                    seq
-                )
-                if waiting_remote_to_waiting_ready:
-                    seq.status = SequenceStatus.WAITING
-                else:
-                    skipped_waiting_requests.append(seq)
-                    continue
+            remote_ready_for_decode = self._resolve_waiting_remote_kv(
+                seq, skipped_waiting_requests
+            )
+            if remote_ready_for_decode is None:
+                continue
 
-            need_to_remove_to_load_kv_async_queue = False
-            if self.kv_connector is not None and not waiting_remote_to_waiting_ready:
-                _ext_tokens, need_to_remove_to_load_kv_async_queue = (
-                    self.kv_connector.get_num_new_matched_tokens(seq)
-                )
+            offload_resume = self._is_offload_prefill_resume(seq)
+            needs_remote_load = self._query_connector_prefill_match(
+                seq,
+                skip=remote_ready_for_decode or offload_resume,
+            )
 
-            if waiting_remote_to_waiting_ready:
-                seq.status = SequenceStatus.RUNNING
-                seq.is_first_decode = True
-                first_token_id = (seq.kv_transfer_params or {}).get("first_token_id")
-                if first_token_id is not None:
-                    seq.append_token(first_token_id)
-                    seq._injected_t0 = first_token_id
-                    if self.mtp_k > 0:
-                        drafts = list(
-                            (seq.kv_transfer_params or {}).get("draft_token_ids") or []
-                        )[: self.mtp_k]
-                        for d in drafts:
-                            seq.append_token(int(d))
-                        seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
-                logger.info(
-                    "[PD-TRANSITION] seq %s: num_tokens=%d, "
-                    "num_prompt=%d, blocks=%d, first_token=%s, "
-                    "last_5_tids=%s",
-                    seq.id,
-                    seq.num_tokens,
-                    seq.num_prompt_tokens,
-                    len(seq.block_table),
-                    first_token_id,
-                    seq.token_ids[-5:],
+            if remote_ready_for_decode:
+                self._schedule_first_decode_after_remote_kv(seq)
+                continue
+
+            if offload_resume:
+                # Blocks already held from the pre-park allocate; only re-check
+                # the batch budget. No re-match / re-allocate / re-park.
+                num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
+                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+                chunk = self._prefill_chunk_for_budget(
+                    num_new_tokens, budget_remaining, num_batched_tokens
                 )
-                self.running.append(seq)
+                if chunk is None:
+                    self.waiting.appendleft(seq)
+                    break
+                self._assert_positive_prefill_chunk(
+                    chunk, num_new_tokens, budget_remaining
+                )
+                num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
+                    seq,
+                    chunk,
+                    scheduled_seqs,
+                    num_scheduled_tokens,
+                    num_seqs_prefill,
+                    num_batched_tokens,
+                )
                 continue
 
             # Probe cache hits FIRST so budget check sees the real
-            # (post-prefix-cache) remaining token count. `can_allocate`
-            # excludes the last block from cache hits (prefill must forward
-            # at least one block to produce logits), so num_new_tokens ≥ 1
-            # is guaranteed.
+            # (post-prefix-cache) remaining token count. V4 SWA correctness is
+            # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
+            # where the trailing-window SWA is present); no post-hoc warmup trim.
             num_cached_blocks = self.block_manager.can_allocate(seq)
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
@@ -823,19 +994,18 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.block_size
             )
+            if (
+                self.enable_chunked_prefill
+                and 0 < self.long_prefill_token_threshold < num_new_tokens
+            ):
+                num_new_tokens = self.long_prefill_token_threshold
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
-            if self.enable_chunked_prefill:
-                chunk = min(num_new_tokens, budget_remaining)
-            else:
-                if num_new_tokens > budget_remaining and num_batched_tokens > 0:
-                    self.waiting.appendleft(seq)
-                    break
-                chunk = num_new_tokens
-            assert chunk > 0, (
-                f"chunk must be positive: {chunk=}, "
-                f"{num_new_tokens=}, {budget_remaining=}"
+            chunk = self._prefill_chunk_for_budget(
+                num_new_tokens, budget_remaining, num_batched_tokens
             )
-
+            if chunk is None:
+                self.waiting.appendleft(seq)
+                break
             self.block_manager.allocate(seq, num_cached_blocks)
 
             # Snapshot the genuine prefix-cache hit at admission. After this,
@@ -847,23 +1017,33 @@ class Scheduler:
                 num_cached_blocks * self.block_manager.block_size
             )
 
-            if self.kv_connector is not None:
-                self.kv_connector.update_state_after_alloc(seq)
+            self._notify_connector_after_prefill_alloc(seq)
 
-            if need_to_remove_to_load_kv_async_queue:
-                skipped_waiting_requests.append(seq)
-                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+            needs_remote_load = self._confirm_remote_load_after_alloc(
+                seq, needs_remote_load
+            )
+
+            if needs_remote_load:
+                # PD: the consumer runs no prefill forward (so ensure_swa is
+                # never called) and its first may_append is skipped. Materialize
+                # the trailing-window SWA blocks now — matching the producer's
+                # post-free swa_block_table positions — so the RDMA transfer has
+                # real dst slots to write the sliding-window KV into.
+                self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
+                self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
-            if self.cache_stats:
-                self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
-            num_batched_tokens += chunk
-            num_seqs_prefill += 1
-            seq.status = SequenceStatus.RUNNING
-            seq.type = SequenceType.PREFILL
-            self.running.append(seq)
-            scheduled_seqs[seq.id] = seq
-            num_scheduled_tokens.append(chunk)
+            chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
+
+            self._assert_positive_prefill_chunk(chunk, num_new_tokens, budget_remaining)
+            num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
+                seq,
+                chunk,
+                scheduled_seqs,
+                num_scheduled_tokens,
+                num_seqs_prefill,
+                num_batched_tokens,
+            )
 
         if skipped_waiting_requests:
             logger.debug(
@@ -875,6 +1055,17 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
+            # chunked-prefill: materialize the SWA pool blocks this chunk's
+            # tokens touch BEFORE the forward writes SWA. allocate() left uncached
+            # SWA slots as -1 placeholders; fill the current chunk's logical
+            # range in-place (out-of-window blocks are freed in postprocess after
+            # num_cached_tokens advances). scheduled_seqs / num_scheduled_tokens
+            # are index-aligned; all seqs here are PREFILL.
+            if self.block_manager.swa_enabled:
+                for seq, chunk in zip(scheduled_seqs.values(), num_scheduled_tokens):
+                    self.block_manager.swa.ensure_for_tokens(
+                        seq, seq.num_cached_tokens, chunk
+                    )
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
@@ -912,10 +1103,14 @@ class Scheduler:
         num_new_tokens = self.mtp_k + 1
         remote_kv_blocks: set[int] = set()
         remote_kv_seq_blocks: dict[int, list[int]] = {}
+        skipped_partial_prefills: list[Sequence] = []
         while self.running and num_seqs_decode < self.max_num_seqs:
             if num_decode_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
                 break
             seq = self.running.popleft()
+            if seq.is_partial_prefill:
+                skipped_partial_prefills.append(seq)
+                continue
             while not self.block_manager.can_append(seq, num_new_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -961,6 +1156,25 @@ class Scheduler:
 
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
+        if skipped_partial_prefills:
+            # Re-queue skipped partial prefills at the TAIL, not the head.
+            #
+            # A partial (chunked, prompt-not-done) prefill can land in this
+            # decode loop when the cross-DP PrefillDelayer vetoes prefill for a
+            # tick (Phase 1 skipped, so num_prefill==0 and the prefill-only
+            # early-return doesn't fire). Re-inserting it at the head pins it
+            # at running[0]; once it finishes prefill it becomes the batch's
+            # position-0 *deferred* seq, which pushes the fresh decode seqs to
+            # positions 1..N. TokenIDProcessor.prepare_input_ids then takes the
+            # [deferred | new] path and indexes the (compacted)
+            # scheduled_spec_decode_tokens array by those shifted positions —
+            # running off the end (IndexError: index N out of bounds size N).
+            #
+            # Appending at the tail keeps the partial out of position 0 (its
+            # prefill still resumes: Phase 1 scans all of `running`), so new
+            # decode seqs stay contiguous from position 0 and the safe
+            # [new | deferred] slice path is used.
+            self.running.extend(skipped_partial_prefills)
 
         connector_meta_output = None
         if self.kv_connector is not None:
@@ -981,6 +1195,176 @@ class Scheduler:
             remote_kv_seq_blocks=remote_kv_seq_blocks,
         )
         return (decode_batch, scheduled_seqs)
+
+    # -- Remote KV / offload admission helpers ------------------------------
+    def _resolve_waiting_remote_kv(
+        self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
+    ) -> Optional[bool]:
+        """Resolve a ``WAITING_FOR_REMOTE_KVS`` request before admission.
+
+        Returns:
+          - ``None`` when the request is still blocked and has been requeued.
+          - ``True`` when a P/D consumer should jump to first decode.
+          - ``False`` when normal prefill admission should continue.
+        """
+        if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            return False
+
+        if self._consume_failed_remote_kv(seq):
+            return False
+
+        if not self._update_waiting_for_remote_kv(seq):
+            skipped_waiting_requests.append(seq)
+            return None
+
+        seq.status = SequenceStatus.WAITING
+        if self._connector_flag("is_offload"):
+            self._mark_offload_load_ready(seq)
+            return False
+        return True
+
+    def _consume_failed_remote_kv(self, seq: Sequence) -> bool:
+        if not self._pop_req_id(self.failed_recving_kv_req_ids, seq.id):
+            return False
+
+        if self.kv_connector is not None and hasattr(self.kv_connector, "load_failed"):
+            self.kv_connector.load_failed(seq.id)
+        seq.status = SequenceStatus.WAITING
+        seq.offload_loaded = False
+        seq.offload_loaded_tokens = seq.num_cached_tokens
+        seq.offload_load_failed = True
+        return True
+
+    def _mark_offload_load_ready(self, seq: Sequence) -> None:
+        """Turn a completed offload load into a suffix-prefill resume."""
+        loaded = getattr(seq, "offload_loaded_tokens", None)
+        logger.debug(
+            "[OFFLOAD-WAKE] seq %s: loaded=%s prev_cached=%d num_tokens=%d",
+            seq.id,
+            loaded,
+            seq.num_cached_tokens,
+            seq.num_tokens,
+        )
+        if loaded is not None and loaded > seq.num_cached_tokens:
+            seq.num_cached_tokens = loaded
+        seq.offload_loaded = True
+
+    def _is_offload_prefill_resume(self, seq: Sequence) -> bool:
+        """True when offload already owns blocks and should resume suffix prefill.
+
+        This avoids a second prefix lookup and, more importantly, avoids calling
+        ``BlockManager.allocate`` again for a sequence whose block table was
+        allocated before it parked for the LMCache load.
+        """
+        return (
+            self._connector_flag("is_offload")
+            and (
+                getattr(seq, "offload_loaded", False)
+                or getattr(seq, "offload_load_failed", False)
+            )
+            and len(seq.block_table) > 0
+        )
+
+    def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
+        """Ask the connector whether this prefill should park for remote KV."""
+        if skip or self.kv_connector is None:
+            return False
+        _ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
+            seq
+        )
+        return needs_remote_load
+
+    def _schedule_first_decode_after_remote_kv(self, seq: Sequence) -> None:
+        """P/D path: a remote prefill completed, so schedule first decode."""
+        seq.status = SequenceStatus.RUNNING
+        seq.is_first_decode = True
+        first_token_id = (seq.kv_transfer_params or {}).get("first_token_id")
+        if first_token_id is not None:
+            seq.append_token(first_token_id)
+            seq._injected_t0 = first_token_id
+            if self.mtp_k > 0:
+                drafts = list(
+                    (seq.kv_transfer_params or {}).get("draft_token_ids") or []
+                )[: self.mtp_k]
+                for d in drafts:
+                    seq.append_token(int(d))
+                seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
+        logger.info(
+            "[PD-TRANSITION] seq %s: num_tokens=%d, "
+            "num_prompt=%d, blocks=%d, first_token=%s, "
+            "last_5_tids=%s",
+            seq.id,
+            seq.num_tokens,
+            seq.num_prompt_tokens,
+            len(seq.block_table),
+            first_token_id,
+            seq.token_ids[-5:],
+        )
+        self.running.append(seq)
+
+    def _prefill_chunk_for_budget(
+        self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
+    ) -> Optional[int]:
+        if self.enable_chunked_prefill:
+            return min(num_new_tokens, budget_remaining)
+        if num_new_tokens > budget_remaining and num_batched_tokens > 0:
+            return None
+        return num_new_tokens
+
+    @staticmethod
+    def _assert_positive_prefill_chunk(
+        chunk: int, num_new_tokens: int, budget_remaining: int
+    ) -> None:
+        assert chunk > 0, (
+            f"chunk must be positive: {chunk=}, "
+            f"{num_new_tokens=}, {budget_remaining=}"
+        )
+
+    def _schedule_prefill_seq(
+        self,
+        seq: Sequence,
+        chunk: int,
+        scheduled_seqs: dict[int, Sequence],
+        num_scheduled_tokens: list[int],
+        num_seqs_prefill: int,
+        num_batched_tokens: int,
+    ) -> tuple[int, int]:
+        num_seqs_prefill += 1
+        if self.cache_stats:
+            self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
+        num_batched_tokens += chunk
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.PREFILL
+        self.running.append(seq)
+        scheduled_seqs[seq.id] = seq
+        num_scheduled_tokens.append(chunk)
+        return num_seqs_prefill, num_batched_tokens
+
+    def _notify_connector_after_prefill_alloc(self, seq: Sequence) -> None:
+        if self.kv_connector is not None:
+            self.kv_connector.update_state_after_alloc(seq)
+
+    def _confirm_remote_load_after_alloc(
+        self, seq: Sequence, needs_remote_load: bool
+    ) -> bool:
+        if not needs_remote_load:
+            return False
+        if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
+            return self.kv_connector.should_park_for_load_after_alloc(seq)
+        return True
+
+    def _park_for_remote_load(
+        self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
+    ) -> None:
+        skipped_waiting_requests.append(seq)
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+    def _adjust_prefill_chunk_after_alloc(self, seq: Sequence, chunk: int) -> int:
+        if self.kv_connector is not None and hasattr(
+            self.kv_connector, "adjust_prefill_chunk_after_alloc"
+        ):
+            return self.kv_connector.adjust_prefill_chunk_after_alloc(seq, chunk)
+        return chunk
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
@@ -1016,10 +1400,14 @@ class Scheduler:
         are still mid-prefill (partial chunks) so their sampled tokens can be
         discarded.
         """
-        # Snapshot of seqs that were mid-prefill coming into this step.
-        # Their `is_deferred_out` token (sampled from the prior partial chunk)
-        # is garbage and must be discarded — even for seqs whose prefill
-        # finishes in *this* step. Captured before we mutate the flag below.
+        # Remember which seqs were already in the middle of chunked prefill
+        # before this postprocess call mutates seq.is_partial_prefill below.
+        #
+        # In deferred-output mode, fwd_output.token_ids is one step late. If a
+        # seq finishes its final prompt chunk in this call, the token we see
+        # here is still from the previous partial chunk, not the real first
+        # generated token. Keep the old partial state so we can drop that stale
+        # token later in this loop.
         prev_partial_ids: set[int] = set()
         if batch is not None:
             running_by_id = {seq.id: seq for seq in self.running}
@@ -1038,6 +1426,17 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
+                # chunked-prefill: reclaim SWA blocks that just fell out of
+                # the window, using the computed-so-far length
+                # (num_cached_tokens). Bounds peak SWA to ~window during prefill
+                # instead of waiting for the first decode step's may_append.
+                self.block_manager.swa.free_after_prefill_chunk(seq)
+                # Prefill is partial until the whole PROMPT's KV is computed.
+                # Compare against num_prompt_tokens, not num_tokens: once a
+                # completion token is appended (this step's sampled token, or an
+                # externally-appended EOS), num_tokens > num_prompt_tokens and
+                # comparing against it would wrongly keep a finished prefill
+                # flagged partial — which makes the EOS/finish loop below skip it.
                 now_partial = seq.num_cached_tokens < seq.num_prompt_tokens
                 if now_partial != seq.is_partial_prefill:
                     self._partial_prefill_count += 1 if now_partial else -1
@@ -1067,10 +1466,23 @@ class Scheduler:
             # num_tokens < num_prompt_tokens until the prompt finishes.
             if seq.is_partial_prefill:
                 continue
-            # Deferred output from a previous partial prefill step is garbage
-            # under deferred-out: drop it once, then let the next step's real
-            # first completion token populate the placeholder.
-            if seq.id in prev_partial_ids:
+            # Drop stale tokens produced by chunked-prefill steps.
+            #
+            # There are two ways a stale token reaches this point:
+            # 1. Normal chunked prefill: the seq was partial at the start of
+            #    this postprocess call. With deferred output, the visible token
+            #    is one step late, so it belongs to the previous partial chunk.
+            # 2. Offload/remote-KV handoff: a partial seq can be parked out of
+            #    running and have seq.is_partial_prefill cleared. In that case
+            #    prev_partial_ids can no longer see it, so the park path sets
+            #    _discard_next_deferred_output to carry "drop one old token"
+            #    across the park/resume boundary.
+            was_partial_prefill_at_step_start = seq.id in prev_partial_ids
+            drop_old_token_after_offload_park = False
+            if is_deferred_out and getattr(seq, "_discard_next_deferred_output", False):
+                seq._discard_next_deferred_output = False
+                drop_old_token_after_offload_park = True
+            if was_partial_prefill_at_step_start or drop_old_token_after_offload_park:
                 continue
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
@@ -1095,10 +1507,11 @@ class Scheduler:
             # later in this loop, so they're not part of the prompt hash
             # chain — leaving them in would mint a stale partial-block hash.
             if not seq.prefix_hashes_published:
-                _num_new = seq.num_tokens - seq.num_cached_tokens
-                if need_placeholder:
-                    _num_new -= num_placeholder
-                self.block_manager.hash_blocks(seq, _num_new)
+                if batch is None:
+                    _num_new = seq.num_tokens - seq.num_cached_tokens
+                    if need_placeholder:
+                        _num_new -= num_placeholder
+                    self.block_manager.hash_blocks(seq, max(0, _num_new))
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
@@ -1128,12 +1541,17 @@ class Scheduler:
                     self.spec_stats.update(num_new_token)
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
+                # DSpark Phase 2: stash this step's scheduler-chosen ell on the
+                # seq so the NEXT decode schedule can size its verification to
+                # ell+1. Keyed by req_id (order-safe). Missing -> leave default
+                # (mtp_k), so a request never gets under-verified.
+                if fwd_output.dspark_ell is not None:
+                    ell_r = fwd_output.dspark_ell.get(seq.id)
+                    if ell_r is not None:
+                        seq.dspark_next_ell = int(ell_r)
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
-                # logger.info(
-                #     f"{seq.id=}, {num_new_token=} {num_rejected=} {self.mtp_k} {token_ids=} {seq.token_ids[-8:]=}"
-                # )
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob
@@ -1172,6 +1590,11 @@ class Scheduler:
 
             num_tokens = seq.num_tokens - self.mtp_k - num_rejected
             leave_reason = None
+            # Client disconnected -> finish now via the normal stop path (frees
+            # KV blocks, emits a finished RequestOutput). A natural stop below
+            # may still overwrite the reason; either way the seq terminates.
+            if seq.status == SequenceStatus.ABORTED:
+                leave_reason = "aborted"
             # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
             # only compares draft vs target_argmax for acceptance. So when
             # the verified token is EOS the kernel still emits 1+ accepted
@@ -1228,6 +1651,19 @@ class Scheduler:
             # no-op).
             if stop_at_idx is not None and stop_at_idx < num_new_token - 1:
                 num_tokens -= (num_new_token - 1) - stop_at_idx
+                # The same truncation MUST apply to the EMITTED tokens, not just
+                # the internal seq length. The client-visible text is built from
+                # RequestOutput.output_tokens (an accumulation of `new_tokens`) by
+                # generate_async / the streaming callback — NOT from
+                # completion_token_ids (which the `seq.num_tokens` write above
+                # governs). Without trimming `new_tokens` here, the post-stop
+                # tokens the rejection sampler emits past EOS (it does not inspect
+                # EOS) leak into the response: strict-match still finds the answer,
+                # but flexible-extract's last-number picks up the leaked trailing
+                # digit. `injected_t0` (if present) prepends one slot not counted
+                # in stop_at_idx / num_new_token, so offset the cut by it.
+                keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
+                new_tokens = new_tokens[:keep]
 
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:
@@ -1285,8 +1721,19 @@ class Scheduler:
                 seq.is_partial_prefill = False
                 self._partial_prefill_count -= 1
             if self.kv_connector is not None:
+                if hasattr(self.kv_connector, "request_finished"):
+                    self.kv_connector.request_finished(seq)
                 if not self.kv_connector.is_producer:
-                    self.block_manager.deallocate(seq)
+                    if hasattr(self.kv_connector, "should_defer_free") and (
+                        self.kv_connector.should_defer_free(seq)
+                    ):
+                        logger.debug(
+                            "Deferring block free for seq %s until KV save completes.",
+                            seq.id,
+                        )
+                        self.deferred_free_blocks[seq.id] = seq
+                    else:
+                        self.block_manager.deallocate(seq)
                 else:
                     logger.debug(
                         "Deferring block free for seq %s until KV send completes.",
@@ -1298,6 +1745,92 @@ class Scheduler:
             self.running.remove(seq)
         return finished_seqs
 
+    def compute_detailed_aggregates(
+        self,
+        scheduled_batch: ScheduledBatch,
+        seqs: dict[int, Sequence],
+    ) -> None:
+        """Attach detailed attention aggregates to *scheduled_batch* in place.
+
+        Only the quadratic terms genuinely needed for a downstream attention-FLOP
+        estimate are computed here. The request counts and total query tokens are
+        already emitted by the ``prefill[]``/``decode[]`` labels in
+        :meth:`ModelRunner.run_model`, so this avoids duplicating them.
+
+        The following batch-level sums are stored on the batch and appended to
+        those labels by the runner:
+
+            sqsq  — sum of N_Q^2      (per request)
+            sqsk  — sum of N_Q*N_KV   (per request)
+            sk    — sum of N_KV       (per request)
+
+        where ``N_Q`` is the number of query tokens scheduled for a request and
+        ``N_KV`` is its KV length (cached + new tokens for prefill, full
+        sequence length for decode). Aggregating over every request in the
+        batch gives the total for that single forward, which is exactly the
+        quantity a per-iteration attention-FLOP estimate needs. For MTP/spec-decode a
+        decode step schedules ``mtp_k + 1`` query tokens, so the scheduled
+        token count is used as ``N_Q`` for both branches (rather than a
+        hardcoded 1) to avoid undercounting.
+
+        This is a no-op (leaves the fields ``None``) unless profiling is active
+        and ``ATOM_ENABLE_DETAILED_ANNOTATION`` is set.
+        """
+        if not self.profile_active or not self._detailed_annotation_enabled:
+            return
+
+        sqsq = 0  # sum N_Q^2
+        sqsk = 0  # sum N_Q*N_KV
+        sk = 0  # sum N_KV
+        for seq, num_tokens in zip(seqs.values(), scheduled_batch.num_scheduled_tokens):
+            # Cast to Python int: num_scheduled_tokens is np.int32, so nq*nq /
+            # nq*nkv would overflow once a prefill/chunk exceeds ~46341 tokens
+            # (e.g. np.int32(65536)**2 == 0), silently corrupting the estimate.
+            nq = int(num_tokens)  # query tokens scheduled this forward
+            if seq.type == SequenceType.DECODE:
+                nkv = int(seq.num_tokens)  # full sequence length
+            else:
+                # PREFILL: KV length = cached + new tokens.
+                nkv = int(seq.num_cached_tokens) + nq
+            sqsq += nq * nq
+            sqsk += nq * nkv
+            sk += nkv
+
+        scheduled_batch.detailed_sqsq = sqsq
+        scheduled_batch.detailed_sqsk = sqsk
+        scheduled_batch.detailed_sk = sk
+
+    def _connector_flag(self, name: str) -> bool:
+        return bool(getattr(self.kv_connector, name, False))
+
+    @staticmethod
+    def _has_req_id(req_ids: list, seq_id) -> bool:
+        candidates = (seq_id, str(seq_id))
+        for candidate in candidates:
+            if candidate in req_ids:
+                return True
+        try:
+            int_id = int(seq_id)
+        except (TypeError, ValueError):
+            return False
+        return int_id in req_ids
+
+    @staticmethod
+    def _pop_req_id(req_ids: list, seq_id) -> bool:
+        candidates = (seq_id, str(seq_id))
+        for candidate in candidates:
+            if candidate in req_ids:
+                req_ids.remove(candidate)
+                return True
+        try:
+            int_id = int(seq_id)
+        except (TypeError, ValueError):
+            return False
+        if int_id in req_ids:
+            req_ids.remove(int_id)
+            return True
+        return False
+
     def _update_waiting_for_remote_kv(self, seq: Sequence) -> bool:
         """Check whether a remote KV transfer for *seq* has completed.
 
@@ -1306,10 +1839,9 @@ class Scheduler:
         scheduling step.  When ready, the sequence transitions back
         from ``WAITING_FOR_REMOTE_KVS`` to ``WAITING``.
         """
-        if seq.id not in self.finished_recving_kv_req_ids:
+        if not self._pop_req_id(self.finished_recving_kv_req_ids, seq.id):
             return False
 
-        self.finished_recving_kv_req_ids.remove(seq.id)
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
 
         if self.block_manager.kv_events_enabled:
@@ -1351,6 +1883,64 @@ class Scheduler:
                 )
         return True
 
+    def _promote_ready_remote_kv_requests(self) -> None:
+        """Move completed remote-KV waiters ahead of fresh admissions.
+
+        Offload waiters already own allocated blocks. If a fresh request at the
+        head cannot allocate while a completed waiter sits behind it, the waiter
+        cannot finish and free blocks. Preserve FIFO order within the ready and
+        blocked groups.
+        """
+        if not self.waiting or not (
+            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
+        ):
+            return
+
+        ready: deque[Sequence] = deque()
+        blocked: deque[Sequence] = deque()
+        while self.waiting:
+            seq = self.waiting.popleft()
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
+                self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+                or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+            ):
+                ready.append(seq)
+            else:
+                blocked.append(seq)
+
+        if ready:
+            self.waiting.extend(ready)
+            self.waiting.extend(blocked)
+        else:
+            self.waiting.extend(blocked)
+
+    def _park_ready_offload_partial_prefills(self) -> None:
+        if (
+            not self.running
+            or self.kv_connector is None
+            or not hasattr(self.kv_connector, "should_park_partial_prefill_for_load")
+        ):
+            return
+
+        parked: deque[Sequence] = deque()
+        keep_running: deque[Sequence] = deque()
+        while self.running:
+            seq = self.running.popleft()
+            should_park = self.kv_connector.should_park_partial_prefill_for_load(seq)
+            if should_park:
+                if seq.is_partial_prefill:
+                    seq._discard_next_deferred_output = True
+                    seq.is_partial_prefill = False
+                    self._partial_prefill_count -= 1
+                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                parked.append(seq)
+            else:
+                keep_running.append(seq)
+
+        self.running = keep_running
+        if parked:
+            self.waiting.extendleft(reversed(parked))
+
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """Reconcile scheduler state with completed KV transfers.
 
@@ -1361,22 +1951,72 @@ class Scheduler:
         if kv_connector_output is None:
             return
 
+        def _pop_deferred(req_id):
+            seq = self.deferred_free_blocks.pop(req_id, None)
+            if seq is not None:
+                return seq
+            try:
+                return self.deferred_free_blocks.pop(int(req_id), None)
+            except (TypeError, ValueError):
+                return None
+
+        is_producer = self._connector_flag("is_producer")
+        is_offload = self._connector_flag("is_offload")
+
         for req_id in kv_connector_output.finished_recving or ():
-            assert (
-                not self.kv_connector.is_producer
-            ), "Only consumer should update recving KV status"
+            assert not is_producer, "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
+
+        for req_id in kv_connector_output.failed_recving or ():
+            assert not is_producer, "Only consumer should update failed KV recv status"
+            logger.warning(
+                "KV receive failed for request %s; falling back to prefill.", req_id
+            )
+            self.failed_recving_kv_req_ids.append(req_id)
+
+        for req_id in kv_connector_output.finished_loading or ():
+            assert is_offload, "Only offload connector should update loading KV status"
+            logger.debug("Finished offload KV load for request %s", req_id)
+            self.finished_recving_kv_req_ids.append(req_id)
+
+        for req_id in kv_connector_output.failed_loading or ():
+            assert (
+                is_offload
+            ), "Only offload connector should update failed KV load status"
+            logger.warning(
+                "Offload KV load failed for request %s; falling back to prefill.",
+                req_id,
+            )
+            self.failed_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():
             assert (
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert (
-                req_id in self.deferred_free_blocks
-            ), f"req_id={req_id} not found in deferred_free_blocks"
-            self.block_manager.deallocate(self.deferred_free_blocks.pop(req_id))
+            seq = _pop_deferred(req_id)
+            assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
+            self.block_manager.deallocate(seq)
+
+        for req_id in kv_connector_output.finished_saving or ():
+            if hasattr(self.kv_connector, "save_finished"):
+                self.kv_connector.save_finished(req_id)
+            seq = self.deferred_free_blocks.get(req_id)
+            if seq is None:
+                try:
+                    seq = self.deferred_free_blocks.get(int(req_id))
+                except (TypeError, ValueError):
+                    seq = None
+            if seq is not None and not (
+                hasattr(self.kv_connector, "should_defer_free")
+                and self.kv_connector.should_defer_free(seq)
+            ):
+                seq = _pop_deferred(req_id)
+                if seq is not None and hasattr(self.kv_connector, "request_finished"):
+                    self.kv_connector.request_finished(seq)
+                if seq is not None:
+                    self.block_manager.deallocate(seq)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
@@ -1398,8 +2038,8 @@ class Scheduler:
     def get_next_batch_info(self) -> tuple[bool, int, int]:
         # Check for partial prefills in running (chunked prefill resume)
         for seq in self.running:
-            if seq.num_cached_tokens < seq.num_prompt_tokens:
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+            if seq.num_cached_tokens < seq.num_tokens:
+                remaining = seq.num_tokens - seq.num_cached_tokens
                 chunk = min(remaining, self.max_num_batched_tokens)
                 return (True, chunk, 1)
         # Only consider waiting seqs that are not blocked on a remote KV
@@ -1415,6 +2055,8 @@ class Scheduler:
             total_tokens = 0
             for seq in eligible_waiting:
                 tokens = seq.num_tokens - seq.num_cached_tokens
+                if self.enable_chunked_prefill:
+                    tokens = min(tokens, self.max_num_batched_tokens - total_tokens)
                 if total_tokens + tokens > self.max_num_batched_tokens:
                     break
                 if num_reqs >= self.max_num_seqs:

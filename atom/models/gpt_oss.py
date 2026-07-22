@@ -292,6 +292,7 @@ class TransformerBlock(torch.nn.Module):
             config.hidden_size,
             eps=1e-5,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and layer_num > 0,
+            prefix=f"{prefix}.input_layernorm",
         )
         # Fuse o_proj AllReduce into post_attention_layernorm.
         # Padding for MXFP4 MoE GEMM alignment is now handled inside MLPBlock,
@@ -301,6 +302,7 @@ class TransformerBlock(torch.nn.Module):
             eps=1e-5,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.tp_size > 1,
             x_pad_to_multiple=0 if self.tp_size > 1 else 256,
+            prefix=f"{prefix}.post_attention_layernorm",
         )
 
     def forward(
@@ -336,11 +338,18 @@ class GptOssModel(nn.Module):
         self.config = atom_config.hf_config
         self.quant_config = atom_config.quant_config
         self.config.hidden_size = self.config.hidden_size
-        self.embedding = VocabParallelEmbedding(
+        # Register `embed_tokens` first so it stays the primary (non-deduped)
+        # name reported by `named_parameters()`. The checkpoint stores this
+        # tensor as `model.embed_tokens.weight`; if `embedding` were the primary
+        # name instead, the load-completeness check would falsely flag
+        # `model.embedding.weight` as unloaded (the weight is in fact loaded via
+        # the shared-storage alias). `embedding` remains as an alias for the
+        # internal call sites below.
+        self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
             self.config.hidden_size,
         )
-        self.embed_tokens = self.embedding
+        self.embedding = self.embed_tokens
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_hidden_layers,
             lambda prefix, layer_num=None: TransformerBlock(
@@ -355,6 +364,7 @@ class GptOssModel(nn.Module):
             self.config.hidden_size,
             eps=1e-5,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            prefix=f"{prefix}.norm" if prefix else "norm",
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size

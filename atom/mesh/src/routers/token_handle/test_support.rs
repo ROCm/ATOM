@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::engine_error::EngineError;
 use super::token_chunk::TokenChunk;
-use super::token_handle::{TokenSource, TokenHandle};
+use super::token_handle::{TokenHandle, TokenSource};
 
 #[derive(Debug)]
 pub enum ScriptedItem {

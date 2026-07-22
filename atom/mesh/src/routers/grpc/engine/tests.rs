@@ -283,9 +283,8 @@ mod b_proto_to_chunk {
     #[test]
     fn test_sglang_complete_to_chunk_matched_stop_str() {
         let mut c = sg_complete(vec![1]);
-        c.matched_stop = Some(sglang_proto::generate_complete::MatchedStop::MatchedStopStr(
-            "<eot>".to_string(),
-        ));
+        c.matched_stop =
+            Some(sglang_proto::generate_complete::MatchedStop::MatchedStopStr("<eot>".to_string()));
         let chunk = proto_complete_to_chunk(wrap_complete(c));
         match chunk {
             TokenChunk::Complete {

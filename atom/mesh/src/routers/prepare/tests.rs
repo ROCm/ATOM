@@ -361,8 +361,7 @@ mod b_tool_constraints {
                 name: "add".to_string(),
             },
         };
-        let (calls, remaining) =
-            parse_json_schema_response("{\"a\":1}", &Some(choice), "m", 0);
+        let (calls, remaining) = parse_json_schema_response("{\"a\":1}", &Some(choice), "m", 0);
         let calls = calls.expect("must produce tool calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "add");
@@ -680,7 +679,10 @@ mod c_stop_decoder_builder {
         let tok = test_mocks::tokenizer();
         let _decoder = create_stop_decoder(
             &tok,
-            Some(&StringOrArray::Array(vec!["<a>".to_string(), "<b>".to_string()])),
+            Some(&StringOrArray::Array(vec![
+                "<a>".to_string(),
+                "<b>".to_string(),
+            ])),
             Some(&vec![1u32, 2u32]),
             false,
             true,
@@ -1054,10 +1056,7 @@ mod f_response_context {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
         };
-        assert_eq!(
-            ctx.headers.as_ref().unwrap().get("x-trace").unwrap(),
-            "abc"
-        );
+        assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
 
     #[test]
@@ -1089,7 +1088,9 @@ mod f_response_context {
     }
 }
 
-fn minimal_generate_request_with_stream(stream: bool) -> crate::protocols::generate::GenerateRequest {
+fn minimal_generate_request_with_stream(
+    stream: bool,
+) -> crate::protocols::generate::GenerateRequest {
     crate::protocols::generate::GenerateRequest {
         text: Some("hi".to_string()),
         model: None,
@@ -1212,9 +1213,8 @@ mod h_prepare_chat_generate {
             messages: vec![],
             ..Default::default()
         });
-        let (payload, _) =
-            prepare_chat(req, None, Some("m".to_string()), components.as_ref())
-                .expect("empty messages renders to empty string under our template");
+        let (payload, _) = prepare_chat(req, None, Some("m".to_string()), components.as_ref())
+            .expect("empty messages renders to empty string under our template");
         assert_eq!(payload.text, "");
     }
 
@@ -1243,9 +1243,8 @@ mod h_prepare_chat_generate {
             skip_special_tokens: true,
             ..Default::default()
         });
-        let (payload, _) =
-            prepare_chat(req, None, Some("m".to_string()), components.as_ref())
-                .expect("tools-present path must succeed");
+        let (payload, _) = prepare_chat(req, None, Some("m".to_string()), components.as_ref())
+            .expect("tools-present path must succeed");
         assert!(
             payload.tool_constraints.is_some(),
             "Required choice must emit a constraint"
@@ -1281,9 +1280,8 @@ mod h_prepare_chat_generate {
             skip_special_tokens: true,
             ..Default::default()
         });
-        let (payload, _) =
-            prepare_chat(req, None, Some("m".to_string()), components.as_ref())
-                .expect("None choice path must succeed");
+        let (payload, _) = prepare_chat(req, None, Some("m".to_string()), components.as_ref())
+            .expect("None choice path must succeed");
         assert!(payload.stop.skip_special_tokens);
     }
 

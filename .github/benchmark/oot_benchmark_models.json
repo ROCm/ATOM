@@ -45,9 +45,9 @@
       "variants": [
         {
           "tp_size": 8,
-          "display": "DeepSeek-V4-Pro TP8 (OOB)",
+          "display": "DeepSeek-V4-Pro TP8",
           "dashboard_model": "DeepSeek-V4-Pro",
-          "prefix": "deepseek-v4-pro-tp8-oob",
+          "prefix": "deepseek-v4-pro-tp8",
           "supported_input_output_pairs": [
             "1024x1024",
             "8192x1024"
@@ -125,6 +125,52 @@
       ]
     },
     {
+      "choice_label": "GLM-5.2",
+      "source_path": "zai-org/GLM-5.2-FP8",
+      "path": "zai-org/GLM-5.2-FP8",
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "nightly_group": "A",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "GLM-5.2-FP8 TP4 (OOB)",
+          "dashboard_model": "GLM-5.2-FP8-oob-tp4",
+          "prefix": "glm-5-2-fp8-oob-tp4",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1"
+        },
+        {
+          "tp_size": 4,
+          "display": "GLM-5.2-FP8 MTP TP4 (OOB)",
+          "dashboard_model": "GLM-5.2-FP8-mtp-oob-tp4",
+          "prefix": "glm-5-2-fp8-mtp-oob-tp4",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}}' --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1"
+        },
+        {
+          "tp_size": 4,
+          "display": "GLM-5.2-MXFP4 TP4 (OOB)",
+          "dashboard_model": "GLM-5.2-MXFP4-oob-tp4",
+          "prefix": "glm-5-2-mxfp4-oob-tp4",
+          "source_path": "amd/GLM-5.2-MXFP4",
+          "path": "amd/GLM-5.2-MXFP4",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1"
+        },
+        {
+          "tp_size": 4,
+          "display": "GLM-5.2-MXFP4 MTP TP4 (OOB)",
+          "dashboard_model": "GLM-5.2-MXFP4-mtp-oob-tp4",
+          "prefix": "glm-5-2-mxfp4-mtp-oob-tp4",
+          "source_path": "amd/GLM-5.2-MXFP4",
+          "path": "amd/GLM-5.2-MXFP4",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\", \"model.layers.[1-6][0-9].mlp.*expert*\", \"model.layers.7[0-7].mlp.*expert*\"]}}' --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1"
+        }
+      ]
+    },
+    {
       "choice_label": "Kimi-K2-Thinking-MXFP4",
       "source_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
       "path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
@@ -151,37 +197,19 @@
       ]
     },
     {
-      "choice_label": "Kimi-K2.5-MXFP4",
-      "source_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
-      "path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
+      "choice_label": "Kimi-K2.7-MXFP4",
+      "source_path": "amd/Kimi-K2.7-Code-MXFP4",
+      "path": "amd/Kimi-K2.7-Code-MXFP4",
       "runner": "atom-mi355-8gpu-oot-benchmark",
       "nightly_group": "B",
       "variants": [
         {
           "tp_size": 4,
-          "display": "Kimi-K2.5-MXFP4 TP4 (MET)",
-          "dashboard_model": "Kimi-K2.5-MXFP4-tp4",
-          "prefix": "kimi-k25-mxfp4-tp4-met",
+          "display": "Kimi-K2.7-MXFP4 TP4",
+          "dashboard_model": "Kimi-K2.7-MXFP4-tp4",
+          "prefix": "kimi-k2-7-mxfp4-tp4",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
-        },
-        {
-          "tp_size": 4,
-          "display": "Kimi-K2.5-MXFP4 TP4 (AW)",
-          "dashboard_model": "Kimi-K2.5-MXFP4-aw-tp4",
-          "prefix": "kimi-k2-5-mxfp4-aw-tp4",
-          "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
-        },
-        {
-          "tp_size": 8,
-          "display": "Kimi-K2.5-MXFP4 TP8 (AW)",
-          "dashboard_model": "Kimi-K2.5-MXFP4-aw-tp8",
-          "prefix": "kimi-k2-5-mxfp4-aw-tp8",
-          "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         }
       ]
@@ -236,6 +264,27 @@
           ],
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
+        }
+      ]
+    },
+    {
+      "choice_label": "Qwen3.5-397B-A17B-MXFP4",
+      "source_path": "amd/Qwen3.5-397B-A17B-MXFP4",
+      "path": "amd/Qwen3.5-397B-A17B-MXFP4",
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "nightly_group": "A",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "Qwen3.5-397B-A17B-MXFP4 TP4",
+          "dashboard_model": "Qwen3.5-397B-A17B-MXFP4-tp4",
+          "prefix": "qwen3-5-397b-a17b-mxfp4-tp4",
+          "excluded_input_output_pairs": [
+            "1024x8192"
+          ],
+          "extra_args": "--tensor-parallel-size 4 --async-scheduling --load-format fastsafetensors --trust-remote-code --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}' --kv-cache-dtype fp8 --no-enable_prefix_caching --gpu-memory-utilization 0.9",
+          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
         }
       ]
     },
@@ -356,11 +405,20 @@
       "variants": [
         {
           "tp_size": 4,
-          "display": "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
-          "dashboard_model": "DeepSeek-V3.2-FP8-PTPC-aw-tp4",
-          "prefix": "deepseek-v3-2-fp8-ptpc-aw-tp4",
+          "display": "DeepSeek-V3.2 FP8 PTPC TP4",
+          "dashboard_model": "DeepSeek-V3.2-FP8-PTPC-tp4",
+          "prefix": "deepseek-v3-2-fp8-ptpc-tp4",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0"
+        },
+        {
+          "tp_size": 4,
+          "display": "DeepSeek-V3.2 FP8 PTPC MTP TP4",
+          "dashboard_model": "DeepSeek-V3.2-FP8-PTPC-tp4",
+          "prefix": "deepseek-v3-2-fp8-ptpc-mtp-tp4",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\", \"rejection_sample_method\": \"synthetic\", \"synthetic_acceptance_rates\": [0.9,0.8,0.6]}'",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0"
         }
       ]
@@ -420,6 +478,54 @@
       ]
     },
     {
+      "choice_label": "GLM-5.1-FP8",
+      "source_path": "zai-org/GLM-5.1-FP8",
+      "path": "zai-org/GLM-5.1-FP8",
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "nightly_group": "C",
+      "variants": [
+        {
+          "tp_size": 8,
+          "display": "GLM-5.1-FP8 TP8 (OOB)",
+          "dashboard_model": "GLM-5.1-FP8",
+          "prefix": "glm-5-1-fp8-tp8-oob",
+          "excluded_input_output_pairs": [
+            "1024x8192"
+          ],
+          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+        }
+      ]
+    },    
+    {
+      "choice_label": "GLM-5.2-MXFP4",
+      "source_path": "amd/GLM-5.2-MXFP4",
+      "path": "amd/GLM-5.2-MXFP4",
+      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "nightly_group": "B",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "GLM-5.2-MXFP4 TP4",
+          "dashboard_model": "GLM-5.2-MXFP4-tp4",
+          "prefix": "glm-5-2-mxfp4-tp4",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}' --kv-cache-dtype fp8 --tensor-parallel-size 4 --gpu-memory-utilization 0.8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --max-num-batched-tokens 16384 --max-model-len 16384 --no-enable-prefix-caching",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1"
+        },
+        {
+          "tp_size": 4,
+          "display": "GLM-5.2-MXFP4-MTP TP4",
+          "dashboard_model": "GLM-5.2-MXFP4-MTP-tp4",
+          "prefix": "glm-5-2-mxfp4-mtp-tp4",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}' --kv-cache-dtype fp8 --tensor-parallel-size 4 --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\", \"model.layers.[1-6][0-9].mlp.*expert*\", \"model.layers.7[0-7].mlp.*expert*\"]}}' --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1"
+        }
+      ]
+    },
+    {
       "choice_label": "MiniMax-M2.5",
       "source_path": "MiniMaxAI/MiniMax-M2.5",
       "path": "MiniMaxAI/MiniMax-M2.5",
@@ -452,6 +558,24 @@
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1"
+        }
+      ]
+    },
+    {
+      "choice_label": "MiniMax-M3-MXFP4",
+      "source_path": "amd/MiniMax-M3-MXFP4",
+      "path": "amd/MiniMax-M3-MXFP4",
+      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "nightly_group": "B",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "MiniMax-M3-MXFP4 TP4",
+          "dashboard_model": "MiniMax-M3-MXFP4-tp4",
+          "prefix": "minimax-m3-mxfp4-tp4",
+          "bench_args": "",
+          "extra_args": "--no-trust-remote-code --tensor-parallel-size 4 --gpu-memory-utilization 0.85 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --block-size 128 --no-async-scheduling --no-enable_prefix_caching --kv_cache_dtype auto --language-model-only --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         }
       ]
     }

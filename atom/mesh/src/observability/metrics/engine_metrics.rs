@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::ensure;
 use axum::response::{IntoResponse, Response};
-use futures::{StreamExt, stream};
+use futures::{stream, StreamExt};
 use http::StatusCode;
 use openmetrics_parser::{MetricFamily, MetricsExposition, PrometheusType, PrometheusValue};
 use tracing::warn;

@@ -359,3 +359,148 @@ class TestPrefixCachingEdgeCases:
         initial_free = len(block_manager.free_block_ids_set)
         block_manager.deallocate(s1)
         assert len(block_manager.free_block_ids_set) == initial_free + 1
+
+
+# ── M2 paged-SWA dual pool ───────────────────────────────────────────────────
+
+_MC = MockConfig
+
+
+def _swa_bm(num_blocks=10, num_swa=10, bs=4, window=8, prefix=True):
+    return BlockManager(
+        _MC(
+            num_kvcache_blocks=num_blocks,
+            num_swa_blocks=num_swa,
+            kv_cache_block_size=bs,
+            swa_window_size=window,
+            enable_prefix_caching=prefix,
+        )
+    )
+
+
+class TestM2DualSwaPool:
+    def test_disabled_by_default(self, block_manager, seq_factory):
+        # No num_swa_blocks → swa disabled, swa_block_table stays empty.
+        assert block_manager.swa_enabled is False
+        seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        n = block_manager.can_allocate(seq)
+        block_manager.allocate(seq, n)
+        assert seq.block_table and seq.swa_block_table == []
+
+    def test_allocate_parallel(self, seq_factory):
+        bm = _swa_bm()
+        toks = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # 3 blocks (bs=4)
+        seq = seq_factory(toks)
+        n = bm.can_allocate(seq)
+        bm.allocate(seq, n)
+        # allocate() is lazy: swa_block_table starts as -1 placeholders (same
+        # length as block_table); the scheduler fills the chunk's window before
+        # forward via ensure_for_tokens (here: single-shot whole prompt).
+        assert len(seq.swa_block_table) == len(seq.block_table) == seq.num_blocks
+        assert all(s < 0 for s in seq.swa_block_table)
+        bm.swa.ensure_for_tokens(seq, 0, len(toks))
+        # After ensure, the touched logical blocks hold real disjoint phys ids.
+        assert all(s in bm.swa.used_block_ids for s in seq.swa_block_table)
+
+    def test_windowonly_prefill_no_cross_request_swa_reuse(self, seq_factory):
+        # Window-only prefill writes/publishes SWA only for the trailing
+        # `window` tokens relative to the FULL prompt. Cross-request prefix
+        # reuse needs the trailing window *at the hit boundary* (mid-prompt)
+        # to be SWA-present — which window-only never writes — so bounded_hit
+        # finds no complete in-window run and gates the whole hit to 0. This
+        # trades away cross-request SWA prefix reuse for prefill scatter-write
+        # cost (see paged-SWA perf notes); correctness is preserved (a denied
+        # hit just recomputes, never reads stale SWA).
+        bm = _swa_bm()
+        toks = list(range(1, 13))  # 3 blocks
+        s1 = seq_factory(toks)
+        bm.allocate(s1, bm.can_allocate(s1))
+        bm.swa.ensure_for_tokens(
+            s1, 0, len(toks)
+        )  # fill SWA (scheduler does this pre-forward)
+        bm.hash_blocks(s1, len(toks))  # publish hashes (compressed + swa)
+        s2 = seq_factory(toks)
+        n2 = bm.can_allocate(s2)
+        assert n2 == 0  # window-only: no cross-request SWA prefix reuse
+        bm.allocate(s2, n2)
+        # reused cached blocks share the SAME swa phys ids as s1.
+        for i in range(n2):
+            assert s2.swa_block_table[i] == s1.swa_block_table[i]
+            assert bm.swa.blocks[s2.swa_block_table[i]].ref_count >= 2
+
+    def test_intersection_stops_hit_when_swa_evicted(self, seq_factory):
+        bm = _swa_bm()
+        toks = list(range(1, 13))
+        s1 = seq_factory(toks)
+        bm.allocate(s1, bm.can_allocate(s1))
+        bm.hash_blocks(s1, len(toks))
+        bm.deallocate(s1)
+        # Manually evict the SWA hash for block 0 (simulate window-free/evict)
+        # while leaving the compressed hash intact → hit must stop at block 0.
+        h0 = BlockManager.compute_hash(toks[0:4])
+        bm.swa.hash_to_block_id.pop(h0, None)
+        s2 = seq_factory(toks)
+        n2 = bm.can_allocate(s2)
+        assert n2 == 0  # compressed block 0 cached but SWA gone → no reuse
+
+    def test_deallocate_frees_both_pools(self, seq_factory):
+        bm = _swa_bm()
+        toks = list(range(1, 13))
+        seq = seq_factory(toks)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.swa.ensure_for_tokens(seq, 0, len(toks))  # materialize real SWA blocks
+        used_swa = {s for s in seq.swa_block_table if s >= 0}
+        bm.deallocate(seq)
+        assert seq.swa_block_table == []
+        assert used_swa and used_swa.issubset(bm.swa.free_block_ids_set)
+
+    def test_swa_pool_exhaustion(self, seq_factory):
+        # SWA pool smaller than compressed → admission bounded by SWA pool.
+        bm = _swa_bm(num_blocks=10, num_swa=2, bs=4, prefix=False)
+        seq = seq_factory(list(range(1, 13)))  # needs 3 blocks > 2 swa
+        assert bm.can_allocate(seq) == -1
+
+
+class TestM2WindowFreeing:
+    def test_out_of_window_swa_freed_trailing_kept(self, seq_factory):
+        bs, window = 4, 8
+        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
+        seq = seq_factory(list(range(1, 9)))  # 2 full blocks (len 8)
+        bm.allocate(seq, bm.can_allocate(seq))
+        # Decode forward to len 24 (window=8 → blocks covering <16 fall out).
+        for t in range(8, 24):
+            seq.append_token(1000 + t)
+            bm.may_append(seq)
+        # blocks i with (i+1)*bs <= 24-8=16 → i in {0,1,2} freed (cover 0..11)
+        # wait: (i+1)*4<=16 → i+1<=4 → i<=3 → i in {0,1,2,3} (cover 0..15)
+        freed = [i for i, s in enumerate(seq.swa_block_table) if s < 0]
+        assert set(freed) == {0, 1, 2, 3}, f"freed={freed}"
+        # trailing blocks (in window) still held
+        kept = [s for s in seq.swa_block_table if s >= 0]
+        assert all(s in bm.swa.used_block_ids for s in kept)
+        # live SWA footprint bounded ~ window/bs (+ slack), not full seq length.
+        assert len(kept) <= window // bs + 2
+
+    def test_freed_swa_slot_returned_to_pool(self, seq_factory):
+        bs, window = 4, 8
+        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
+        seq = seq_factory(list(range(1, 9)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        free0 = len(bm.swa.free_block_ids_set)
+        for t in range(8, 30):
+            seq.append_token(1000 + t)
+            bm.may_append(seq)
+        # Many SWA blocks were allocated then window-freed → free pool recovered.
+        assert len(bm.swa.free_block_ids_set) > free0 - (window // bs + 3)
+
+    def test_compressed_untouched_by_window_freeing(self, seq_factory):
+        bs, window = 4, 8
+        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
+        seq = seq_factory(list(range(1, 9)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        for t in range(8, 24):
+            seq.append_token(1000 + t)
+            bm.may_append(seq)
+        # Every compressed block stays held (no -1 sentinels, all in used set).
+        assert all(b >= 0 for b in seq.block_table)
+        assert all(b in bm.used_block_ids for b in seq.block_table)

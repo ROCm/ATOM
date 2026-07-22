@@ -22,7 +22,6 @@ mod a_pipeline_construction {
         let p = Pipeline::new_pd(ctx.worker_registry.clone(), ctx.policy_registry.clone());
         let _ = p;
     }
-
 }
 
 mod b_execute_chat {
@@ -40,17 +39,14 @@ mod b_execute_chat {
     use crate::routers::grpc::pipeline::Pipeline;
     use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
-    use crate::routers::token_handle::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn shared() -> Arc<AppContext> {
         test_mocks::app_context_with_hf_tokenizer("m")
     }
 
-    fn scripted_chunks() -> Vec<
-        Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>,
-    > {
+    fn scripted_chunks(
+    ) -> Vec<Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>> {
         vec![
             Ok(TokenChunk::Partial {
                 token_ids: vec![1],
@@ -147,14 +143,22 @@ mod b_execute_chat {
             .await;
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("[DONE]"), "SSE stream must terminate with [DONE]: {s}");
+        assert!(
+            s.contains("[DONE]"),
+            "SSE stream must terminate with [DONE]: {s}"
+        );
     }
 
     #[tokio::test]
     async fn test_execute_chat_prepare_error_short_circuits() {
         let p = pipeline_regular();
         let resp = p
-            .execute_chat(chat_req(false), None, Some("unregistered".to_string()), shared())
+            .execute_chat(
+                chat_req(false),
+                None,
+                Some("unregistered".to_string()),
+                shared(),
+            )
             .await;
         assert!(
             resp.status().is_client_error() || resp.status().is_server_error(),
@@ -268,17 +272,14 @@ mod c_execute_generate {
     use crate::routers::grpc::pipeline::Pipeline;
     use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
-    use crate::routers::token_handle::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn shared() -> Arc<AppContext> {
         test_mocks::app_context_with_hf_tokenizer("m")
     }
 
-    fn scripted_chunks() -> Vec<
-        Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>,
-    > {
+    fn scripted_chunks(
+    ) -> Vec<Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>> {
         vec![
             Ok(TokenChunk::Partial {
                 token_ids: vec![1],
@@ -382,17 +383,14 @@ mod d_execute_for_responses {
     use crate::routers::grpc::pipeline::Pipeline;
     use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
-    use crate::routers::token_handle::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn shared() -> Arc<AppContext> {
         test_mocks::app_context_with_hf_tokenizer("m")
     }
 
-    fn scripted_chunks() -> Vec<
-        Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>,
-    > {
+    fn scripted_chunks(
+    ) -> Vec<Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>> {
         vec![
             Ok(TokenChunk::Partial {
                 token_ids: vec![1],
@@ -462,7 +460,12 @@ mod d_execute_for_responses {
     async fn test_for_responses_returns_response_err_on_prepare_failure() {
         let p = pipeline_regular();
         let err_resp = p
-            .execute_chat_for_responses(chat_req(), None, Some("unregistered".to_string()), shared())
+            .execute_chat_for_responses(
+                chat_req(),
+                None,
+                Some("unregistered".to_string()),
+                shared(),
+            )
             .await
             .unwrap_err();
         assert!(!err_resp.status().is_success());
@@ -487,17 +490,14 @@ mod e_metrics_labels {
     use crate::routers::grpc::pipeline::Pipeline;
     use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
-    use crate::routers::token_handle::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn shared() -> Arc<AppContext> {
         test_mocks::app_context_with_hf_tokenizer("m")
     }
 
-    fn scripted_chunks() -> Vec<
-        Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>,
-    > {
+    fn scripted_chunks(
+    ) -> Vec<Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>> {
         vec![Ok(TokenChunk::Complete {
             token_ids: vec![1, 6],
             finish_reason: FinishReason::Stop,
@@ -1127,7 +1127,8 @@ mod h_completion_adapter {
     #[tokio::test]
     async fn test_streaming_cumulative_to_delta() {
         let chunk1 = json!({"text": "Hello", "index": 0, "meta_info": {"finish_reason": null}});
-        let chunk2 = json!({"text": "Hello world", "index": 0, "meta_info": {"finish_reason": null}});
+        let chunk2 =
+            json!({"text": "Hello world", "index": 0, "meta_info": {"finish_reason": null}});
         let chunk3 = json!({
             "text": "Hello world!",
             "index": 0,
@@ -1146,7 +1147,12 @@ mod h_completion_adapter {
         let upstream = ok_sse_response(events);
         let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/event-stream"), "content-type: {ct}");
 
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
@@ -1171,7 +1177,11 @@ mod h_completion_adapter {
             }
         }
 
-        assert!(deltas.len() >= 3, "expected at least 3 delta chunks, got {}", deltas.len());
+        assert!(
+            deltas.len() >= 3,
+            "expected at least 3 delta chunks, got {}",
+            deltas.len()
+        );
         assert_eq!(deltas[0], "Hello");
         assert_eq!(deltas[1], " world");
         assert_eq!(deltas[2], "!");
@@ -1188,7 +1198,10 @@ mod h_completion_adapter {
         let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(body_str.contains("data: [DONE]"), "must forward [DONE]: {body_str}");
+        assert!(
+            body_str.contains("data: [DONE]"),
+            "must forward [DONE]: {body_str}"
+        );
     }
 
     #[tokio::test]
@@ -1230,20 +1243,24 @@ mod h_completion_adapter {
                 }
             }
         }
-        assert!(found_usage, "must emit a usage chunk after final token: {body_str}");
+        assert!(
+            found_usage,
+            "must emit a usage chunk after final token: {body_str}"
+        );
     }
 
     #[tokio::test]
     async fn test_streaming_error_json_passthrough() {
         let error_obj = json!({"error": {"message": "rate limited", "code": 429}});
-        let events = vec![
-            sse_event(&serde_json::to_string(&error_obj).unwrap()),
-        ];
+        let events = vec![sse_event(&serde_json::to_string(&error_obj).unwrap())];
         let upstream = ok_sse_response(events);
         let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(body_str.contains("rate limited"), "error must be passed through: {body_str}");
+        assert!(
+            body_str.contains("rate limited"),
+            "error must be passed through: {body_str}"
+        );
     }
 
     #[tokio::test]
@@ -1286,7 +1303,10 @@ mod h_completion_adapter {
                 }
             }
         }
-        assert!(found_matched_stop, "matched_stop must be forwarded: {body_str}");
+        assert!(
+            found_matched_stop,
+            "matched_stop must be forwarded: {body_str}"
+        );
     }
 
     #[tokio::test]
@@ -1299,11 +1319,19 @@ mod h_completion_adapter {
         let upstream = ok_sse_response(events);
         let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
         assert_eq!(
-            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "text/event-stream"
         );
         assert_eq!(
-            resp.headers().get("cache-control").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "no-cache"
         );
         assert_eq!(
@@ -1325,10 +1353,7 @@ mod h_completion_adapter {
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
 
-        let first_data = body_str
-            .lines()
-            .find(|l| l.starts_with("data: {"))
-            .unwrap();
+        let first_data = body_str.lines().find(|l| l.starts_with("data: {")).unwrap();
         let payload = first_data.strip_prefix("data: ").unwrap();
         let parsed: Value = serde_json::from_str(payload).unwrap();
         assert_eq!(parsed["object"], "text_completion");
@@ -1343,7 +1368,11 @@ mod h_completion_adapter {
         let upstream = ok_json_response(&json!([gen]));
         let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
         assert_eq!(
-            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "application/json"
         );
         assert!(resp.headers().get("content-length").is_none());
@@ -1412,10 +1441,7 @@ mod h_completion_adapter {
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
 
-        let first_data = body_str
-            .lines()
-            .find(|l| l.starts_with("data: {"))
-            .unwrap();
+        let first_data = body_str.lines().find(|l| l.starts_with("data: {")).unwrap();
         let payload = first_data.strip_prefix("data: ").unwrap();
         let parsed: Value = serde_json::from_str(payload).unwrap();
         assert!(
@@ -1462,7 +1488,10 @@ mod h_completion_adapter {
                 }
             }
         }
-        assert!(found_stop, "string finish_reason must pass through: {body_str}");
+        assert!(
+            found_stop,
+            "string finish_reason must pass through: {body_str}"
+        );
     }
 
     #[test]

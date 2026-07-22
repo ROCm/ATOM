@@ -25,13 +25,12 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::{
-        prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
-        render,
         comm::{
-            error,
-            metrics_utils::error_type_from_status,
+            error, metrics_utils::error_type_from_status,
             placement_response::placement_err_to_response,
         },
+        prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
+        render,
         token_handle::engine_error::EngineError,
     },
 };
@@ -112,10 +111,11 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) = match prepare::prepare_chat(req, headers, model_id, &components) {
-            Ok(t) => t,
-            Err(e) => return self.record_chat_err(&model, start, e),
-        };
+        let (mut payload, resp_ctx) =
+            match prepare::prepare_chat(req, headers, model_id, &components) {
+                Ok(t) => t,
+                Err(e) => return self.record_chat_err(&model, start, e),
+            };
         let placement = match self.plan_for(&payload, &resp_ctx).await {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),

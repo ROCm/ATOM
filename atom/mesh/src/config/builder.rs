@@ -1,6 +1,6 @@
 use super::{
-    BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig, MetricsConfig,
-    PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+    AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig,
+    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -141,6 +141,11 @@ impl RouterConfigBuilder {
 
     pub fn atom_standalone(mut self, enable: bool) -> Self {
         self.config.atom_standalone = enable;
+        self
+    }
+
+    pub fn atom_pd_rank_mapping_policy(mut self, policy: AtomPdRankMappingPolicy) -> Self {
+        self.config.atom_pd_rank_mapping_policy = policy;
         self
     }
 

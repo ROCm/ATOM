@@ -14,6 +14,7 @@ from typing import Optional
 
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import BaseAttention
+from atom.model_ops.layernorm import GemmaRMSNorm, fused_qk_norm
 from atom.model_ops.utils import atom_parameter
 from atom.plugin.prepare import is_plugin_mode, is_sglang
 from atom.models.utils import maybe_prefix
@@ -40,6 +41,8 @@ class RadixAttention(BaseAttention):
         per_layer_sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
         prefix: Optional[str] = None,
+        q_norm: Optional[torch.nn.Module] = None,
+        k_norm: Optional[torch.nn.Module] = None,
         **kwargs,
     ):
         super().__init__(
@@ -55,10 +58,17 @@ class RadixAttention(BaseAttention):
             per_layer_sliding_window=per_layer_sliding_window,
             rotary_emb=rotary_emb,
             prefix=prefix,
+            q_norm=q_norm,
+            k_norm=k_norm,
             **kwargs,
         )
 
         self.rotary_emb = rotary_emb
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
 
         if is_sglang():
             from sglang.srt.layers.radix_attention import RadixAttention
@@ -141,9 +151,24 @@ class RadixAttention(BaseAttention):
             save_kv_cache = kwargs.get("save_kv_cache", True)
             assert forward_batch is not None, "forward_batch is required for sglang"
 
-            # sglang's RadixAttention does not apply rope internally.
-            # Apply it here when the model passes rotary_emb at construction
-            # and hasn't already applied rope (e.g. fused qknorm path).
+            # sglang's RadixAttention does not apply q/k norm or rope internally.
+            # Apply them here to match ATOM native Attention semantics.
+            if self.q_norm is not None and self.k_norm is not None:
+                eps = getattr(self.q_norm, "variance_epsilon", None) or getattr(
+                    self.q_norm, "eps", None
+                )
+                add_unit_offset = isinstance(self.q_norm, GemmaRMSNorm)
+                query, key = fused_qk_norm(
+                    query.view(-1, self.num_heads, self.head_dim),
+                    key.view(-1, self.num_kv_heads, self.head_dim),
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    eps,
+                    add_unit_offset=add_unit_offset,
+                )
+                query = query.view(-1, self.num_heads * self.head_dim)
+                key = key.view(-1, self.num_kv_heads * self.head_dim)
+
             if self.rotary_emb is not None and positions is not None:
                 query, key = self.rotary_emb(positions, query, key)
 

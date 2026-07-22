@@ -188,7 +188,11 @@ impl CircuitBreaker {
                     self.consecutive_successes.store(0, Ordering::Release);
 
                     info!("Circuit breaker state transition: open -> half_open");
-                    MeshMetrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
+                    MeshMetrics::record_worker_cb_transition(
+                        &self.metric_label,
+                        "open",
+                        "half_open",
+                    );
                     MeshMetrics::set_worker_cb_state(&self.metric_label, STATE_HALF_OPEN);
                     self.publish_gauge_metrics();
                     return CircuitState::HalfOpen;

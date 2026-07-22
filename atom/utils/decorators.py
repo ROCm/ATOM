@@ -3,6 +3,7 @@
 
 from typing import (
     Callable,
+    Literal,
     Optional,
     ParamSpec,
     TypeVar,
@@ -60,6 +61,19 @@ def _resolve_record_span_name(
 
     if isinstance(runtime_prefix, str) and runtime_prefix:
         return runtime_prefix
+
+    if args:
+        trace_prefix_fn = getattr(args[0], "get_trace_prefix", None)
+        if callable(trace_prefix_fn):
+            try:
+                trace_prefix = trace_prefix_fn(*args[1:], **kwargs)
+                if isinstance(trace_prefix, str) and trace_prefix:
+                    return trace_prefix
+            except Exception:
+                pass
+        owner_prefix = getattr(args[0], "prefix", None)
+        if isinstance(owner_prefix, str) and owner_prefix:
+            return owner_prefix
     return span_name
 
 
@@ -142,11 +156,10 @@ def _decorate_mark_trace_torch_compile(func: Callable, prefix: Optional[str] = N
         marker_prefix = str(prefix) if prefix is not None else owner_name
         start_idx = 0
         if skip_first_arg and args:
-            marker_prefix = (
-                str(prefix)
-                if prefix is not None
-                else getattr(args[0], "prefix", owner_name)
-            )
+            if prefix is None:
+                marker_prefix = getattr(args[0], "prefix", owner_name)
+            else:
+                marker_prefix = str(prefix)
             start_idx = 1
         if prefix is None:
             runtime_prefix = kwargs.get("prefix")
@@ -176,6 +189,33 @@ def _decorate_mark_trace_torch_compile(func: Callable, prefix: Optional[str] = N
     return wrapped
 
 
+def _is_torch_compiling() -> bool:
+    try:
+        compiler = getattr(torch, "compiler", None)
+        if compiler is not None and bool(compiler.is_compiling()):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(torch._dynamo.is_compiling())
+    except Exception:
+        return False
+
+
+def _decorate_mark_trace_auto(func: Callable, prefix: Optional[str] = None):
+    compiled_wrapped = _decorate_mark_trace_torch_compile(func, prefix)
+    record_wrapped = _decorate_record_function(func, prefix)
+
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        if _is_torch_compiling():
+            return compiled_wrapped(*args, **kwargs)
+        return record_wrapped(*args, **kwargs)
+
+    wrapped.__mark_trace_wrapped__ = True
+    return wrapped
+
+
 # Overloads preserve the decorated callable's signature for pyright.
 # Without them, `@mark_trace` instances were inferred as plain `Callable`,
 # and class instances whose `__call__` was wrapped (DualRMSNorm, LinearBase,
@@ -185,13 +225,13 @@ def mark_trace(func: Callable[_P, _R], /) -> Callable[_P, _R]: ...
 @_overload
 def mark_trace(
     *,
-    torch_compile: bool = ...,
+    torch_compile: Union[bool, Literal["auto"]] = ...,
     prefix: Optional[str] = ...,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
 def mark_trace(
     func: Optional[Callable] = None,
     *,
-    torch_compile: bool = True,
+    torch_compile: Union[bool, Literal["auto"]] = "auto",
     prefix: Optional[str] = None,
 ):
     """
@@ -199,9 +239,13 @@ def mark_trace(
 
     - torch_compile=True: original graph_marker-based mark_trace behavior.
     - torch_compile=False: record_function behavior.
+    - torch_compile="auto": graph_marker while Dynamo is compiling, otherwise
+      record_function.
     """
 
     def _decorate(target: Callable):
+        if torch_compile == "auto":
+            return _decorate_mark_trace_auto(target, prefix)
         if torch_compile:
             return _decorate_mark_trace_torch_compile(target, prefix)
         return _decorate_record_function(target, prefix)

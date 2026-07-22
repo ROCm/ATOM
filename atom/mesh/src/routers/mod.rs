@@ -17,8 +17,9 @@ use crate::protocols::{
     responses::{ResponsesGetParams, ResponsesRequest},
 };
 
-pub mod factory;
 pub mod atom_standalone;
+pub mod comm;
+pub mod factory;
 pub mod grpc;
 pub mod http_pd_router;
 pub mod http_router;
@@ -26,7 +27,6 @@ pub mod openai;
 pub mod prepare;
 pub mod render;
 pub mod router_manager;
-pub mod comm;
 #[cfg(test)]
 pub(crate) mod test_mocks;
 pub mod token_handle;

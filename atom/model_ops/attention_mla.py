@@ -17,6 +17,18 @@ from aiter import (
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
 )
+
+# The segmented (page_size>1) MLA cache kernels only exist in newer aiter
+# builds. Import them lazily so that the default page_size=1 path keeps working
+# on aiter versions that do not ship the seg variants.
+try:
+    from aiter import (
+        concat_and_cache_mla_seg,
+        fused_qk_rope_concat_and_cache_mla_seg,
+    )
+except ImportError:
+    concat_and_cache_mla_seg = None
+    fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
@@ -28,6 +40,11 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 )
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_is_enabled,
+)
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
@@ -46,9 +63,19 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
+if concat_and_cache_mla_seg is not None:
+    concat_and_cache_mla_seg = mark_trace(
+        concat_and_cache_mla_seg, prefix="kv_cache_seg", torch_compile=False
+    )
 fused_qk_rope_concat_and_cache_mla = mark_trace(
     fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
 )
+if fused_qk_rope_concat_and_cache_mla_seg is not None:
+    fused_qk_rope_concat_and_cache_mla_seg = mark_trace(
+        fused_qk_rope_concat_and_cache_mla_seg,
+        prefix="rope_and_kv_cache",
+        torch_compile=False,
+    )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
@@ -73,6 +100,20 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+
+# The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
+# concat_and_cache_mla_seg + the gfx1250 mla_decode_fwd asm) share a single
+# segmented KV cache layout (all tokens' nope packed first, then all tokens'
+# pe) and a fixed page size hard-coded in the kernels.
+_MLA_SEG_PAGE_SIZE = 64
+# The gfx1250 decode asm consumes an fp8 Q whose per-head row stride is padded
+# to 768 bytes (poc_kl pack_q_page1_padded layout). q_out is allocated with this
+# padded last dim and sliced to the logical kv_lora_rank + qk_rope_head_dim
+# columns; the padding tail is never read by the decode kernel.
+_MLA_Q_OUT_PADDED_DIM = 768
+# Dims the fused seg kernels are compiled against (KV_LORA / PE_DIM constexprs).
+_MLA_SEG_KV_LORA_RANK = 512
+_MLA_SEG_PE_DIM = 64
 
 if False:
     try:
@@ -133,6 +174,13 @@ class MLAModules:
     kv_b_proj: torch.nn.Module
     o_proj: torch.nn.Module
     indexer: Optional[torch.nn.Module]
+    # Model-level sparse flag. A v3.2 / GLM-5.2 model runs sparse MLA on ALL its
+    # layers. GLM-5.2 IndexShare "shared" layers carry no indexer module yet must
+    # still run sparse attention (reusing the prior "full" layer's top-k), so
+    # sparsity must be derived from the model, not from whether this layer owns
+    # an indexer. Defaults keep non-sparse models unchanged.
+    is_sparse: bool = False
+    topk_tokens: Optional[int] = None
 
 
 def dynamic_per_batched_tensor_quant(
@@ -195,16 +243,75 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
-        self.is_sparse_mla = mla_modules.indexer is not None
+        # Derive sparsity from the model-level flag, not from whether THIS layer
+        # owns an indexer: GLM-5.2 IndexShare "shared" layers have indexer=None
+        # but must still run sparse MLA, reusing the prior "full" layer's top-k.
+        # (`mla_modules.is_sparse` defaults False, so non-sparse models and the
+        # `indexer is not None` fallback keep their previous behavior.)
+        self.is_sparse_mla = mla_modules.is_sparse or (mla_modules.indexer is not None)
         self.topk_tokens = (
-            mla_modules.indexer.topk_tokens if mla_modules.indexer is not None else None
+            mla_modules.indexer.topk_tokens
+            if mla_modules.indexer is not None
+            else mla_modules.topk_tokens
         )
+        # Shared layers have no indexer buffer at construction; the metadata
+        # builder rebinds it to the shared `_sparse_kv_indices_gpu` at runtime,
+        # so the layer reads the prior full layer's selected indices.
         self.sparse_kv_indices_buffer = (
             mla_modules.indexer.sparse_kv_indices_buffer
             if mla_modules.indexer is not None
             else None
         )
         self.layer_num = layer_num
+        # When the triton MLA backend is selected we keep the original
+        # interleaved KV cache layout (concat_and_cache_mla /
+        # fused_qk_rope_concat_and_cache_mla) and an unpadded 576-wide q_out;
+        # only the gfx1250 asm decode path needs the segmented layout + 768 pad.
+        self.use_triton_mla = bool(envs.ATOM_USE_TRITON_MLA)
+        # On the non-triton (aiter) path, ATOM_MLA_PAGE_SIZE selects the KV cache
+        # layout: >1 uses the segmented (paged) seg kernels + padded q_out, while
+        # ==1 falls back to the original interleaved per-token (page_size=1)
+        # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
+        self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        if self.use_seg_mla:
+            if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
+                raise RuntimeError(
+                    f"Segmented MLA requires ATOM_MLA_PAGE_SIZE={_MLA_SEG_PAGE_SIZE} "
+                    f"(got {envs.ATOM_MLA_PAGE_SIZE})."
+                )
+            if get_current_atom_config().kv_cache_block_size != _MLA_SEG_PAGE_SIZE:
+                raise RuntimeError(
+                    f"Segmented MLA requires kv_cache_block_size={_MLA_SEG_PAGE_SIZE} "
+                    f"(got {get_current_atom_config().kv_cache_block_size})."
+                )
+            if (
+                concat_and_cache_mla_seg is None
+                or fused_qk_rope_concat_and_cache_mla_seg is None
+            ):
+                raise RuntimeError(
+                    "ATOM_MLA_PAGE_SIZE > 1 requires the segmented MLA kernels "
+                    "(concat_and_cache_mla_seg / fused_qk_rope_concat_and_cache_mla_seg), "
+                    "which are not available in the installed aiter build. Upgrade "
+                    "aiter or set ATOM_MLA_PAGE_SIZE=1."
+                )
+
+    def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Reshape the KV cache buffer into the page-level flat seg layout
+        ``[num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)]`` that the
+        seg write kernels expect (they derive page_size from ``stride(0)``).
+
+        The cache is allocated token-major as ``[num_blocks*page_size, ..., entry]``
+        (so ``kv_cache.shape[0]`` is the total slot count, not the block count).
+        A plain view groups every ``page_size`` consecutive token slots into one
+        block, i.e. slot = block*page_size + offset, which matches slot_mapping
+        and the page-level view used on the decode side
+        (``kv_buffer.view(-1, page_size, 1, entry)``). Using
+        ``kv_cache.view(kv_cache.shape[0], -1)`` here is WRONG: it keeps the
+        token-level stride (entry), so the kernel derives page_size=1 and writes
+        an interleaved layout that the page_size=64 decode then misreads."""
+        page_size = get_current_atom_config().kv_cache_block_size
+        entry = self.kv_lora_rank + self.qk_rope_head_dim
+        return kv_cache.view(-1, page_size * entry)
 
     def process_weights_after_loading(self):
         if is_rocm_aiter_fp4bmm_enabled():
@@ -743,6 +850,14 @@ class MLAAttention(nn.Module):
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
 
+        # In the seg path q arrives with a padded per-head row stride
+        # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
+        # kv_lora_rank + qk_rope_head_dim columns. The slice keeps the padded row
+        # stride, which the asm kernel expects. The triton and non-seg
+        # (page_size=1) paths use an unpadded 576-wide q_out, so no slicing.
+        if self.use_seg_mla:
+            q = q[..., : self.kv_lora_rank + self.qk_rope_head_dim]
+
         o = torch.empty(
             B,
             self.padded_num_heads,
@@ -760,27 +875,53 @@ class MLAAttention(nn.Module):
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
             paged_kv_indices = self.sparse_kv_indices_buffer
+            # Sparse attention needs one last-page len per query token; the dense
+            # kv_last_page_lens (per-seq) would over-read -> illegal access.
+            kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
+            if envs.ATOM_MLA_PAGE_SIZE is not None:
+                page_size = envs.ATOM_MLA_PAGE_SIZE
+            else:
+                page_size = 1
             if self.kv_cache_dtype.startswith("fp8"):
                 mla_decode_fwd(
                     q,
-                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
                     o,
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
                     paged_kv_indices,
                     kv_last_page_lens,
                     max_q_len,
+                    page_size=page_size,
                     sm_scale=self.scale,
                     q_scale=self._q_scale,
                     kv_scale=self._k_scale,
+                    work_meta_data=getattr(
+                        attn_metadata, "sparse_prefill_work_meta_data", None
+                    ),
+                    work_indptr=getattr(
+                        attn_metadata, "sparse_prefill_work_indptr", None
+                    ),
+                    work_info_set=getattr(
+                        attn_metadata, "sparse_prefill_work_info_set", None
+                    ),
+                    reduce_indptr=getattr(
+                        attn_metadata, "sparse_prefill_reduce_indptr", None
+                    ),
+                    reduce_final_map=getattr(
+                        attn_metadata, "sparse_prefill_reduce_final_map", None
+                    ),
+                    reduce_partial_map=getattr(
+                        attn_metadata, "sparse_prefill_reduce_partial_map", None
+                    ),
                 )
             else:
                 mla_prefill_fwd(
                     q,
-                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
                     o,
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
@@ -830,6 +971,14 @@ class MLAAttention(nn.Module):
 
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+
+        # In the seg path q arrives with a padded per-head row stride
+        # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
+        # kv_lora_rank + qk_rope_head_dim columns. The slice keeps the padded row
+        # stride, which the asm kernel expects. The triton and non-seg
+        # (page_size=1) paths use an unpadded 576-wide q_out, so no slicing.
+        if self.use_seg_mla:
+            q = q[..., : self.kv_lora_rank + self.qk_rope_head_dim]
 
         o = torch.empty(
             B,
@@ -906,11 +1055,19 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     max_q_len = 1
                 else:
+                    # Non-MTP sparse decode: KV is packed per token at
+                    # page_size=1, so last_page_len is 1 for every seq. Use the
+                    # all-1s sparse buffer, NOT the dense per-block
+                    # kv_last_page_lens (which makes the asm kernel over-read
+                    # past the written sparse-index region -> illegal access).
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = not (dp_size > 1)
+            if envs.ATOM_MLA_PAGE_SIZE > 1:
+                use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
@@ -939,16 +1096,26 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
+            # TODO refactor this
+            if envs.ATOM_MLA_PAGE_SIZE is not None:
+                page_size = envs.ATOM_MLA_PAGE_SIZE
+            else:
+                page_size = 1
+
+            seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
             mla_decode_fwd(
                 q,
-                kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                seg_kv_buffer_4d,
                 o,
                 paged_cu_seqlens_q,
                 paged_kv_indptr,
                 paged_kv_indices,
                 paged_kv_last_page_lens,
                 max_q_len,
-                num_kv_splits=16,
+                page_size=page_size,
+                # The seg/asm decode path runs with a single kv split; the
+                # original (page_size=1) persistent path keeps 16 splits.
+                num_kv_splits=None if self.use_seg_mla else 16,
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
                 work_indptr=work_indptr,
@@ -964,6 +1131,46 @@ class MLAAttention(nn.Module):
             o = o[:, :: self.head_repeat_factor, :].contiguous()
 
         return self._v_up_proj_and_o_proj(o)
+
+    def _pcp_write_full_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
+        """Write an already-roped full k (kv_lora + rope) into the k-cache.
+
+        Used by the PCP prefill path to materialise the full sequence's KV after
+        the fused MLA kernel produced q_out on 1/pcp queries. Mirrors the
+        non-fused k-writes used by the dense (`not use_prefill_mla`) prefill
+        branch so the physical cache layout matches exactly. `k_rope` must
+        already be rotary-embedded.
+        """
+        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            shuffled_cache = self._shuffled_kv_view(kv_cache)
+            triton_cat_and_cache_mla(
+                k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+                k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                shuffled_cache,
+                slot_mapping.flatten(),
+                self._k_scale,
+                apply_scale=True,
+                shuffled_kv_cache=True,
+            )
+        elif self.use_seg_mla:
+            kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+            concat_and_cache_mla_seg(
+                k_nope,
+                k_rope.squeeze(1),
+                kv_cache_seg,
+                slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+        else:
+            concat_and_cache_mla(
+                k_nope,
+                k_rope.squeeze(1),
+                kv_cache,
+                slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
 
     def forward_impl(
         self,
@@ -1009,6 +1216,22 @@ class MLAAttention(nn.Module):
                         apply_scale=True,
                         shuffled_kv_cache=True,
                     )
+                elif self.use_seg_mla:
+                    # Write the KV cache in the segmented layout so the
+                    # decode-phase mla_decode_fwd (which reads seg layout) sees a
+                    # consistent cache for tokens written during prefill.
+                    # kv_cache is flattened to
+                    # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so
+                    # the kernel derives page_size from stride(0).
+                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+                    concat_and_cache_mla_seg(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache_seg,
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
                 else:
                     concat_and_cache_mla(
                         k_nope,
@@ -1039,15 +1262,54 @@ class MLAAttention(nn.Module):
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
-            q_out = torch.empty(
-                (
-                    q_nope.shape[0],
-                    self.num_heads,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                ),
-                dtype=attn_metadata.dtype_q,
-                device=q_nope.device,
+            # ---- Prefill Context Parallel --------------------------------
+            # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
+            # the k-cache must hold the FULL sequence (every rank keeps full KV).
+            # The fused MLA kernel below couples q_out with the k-write on one
+            # token count, so under PCP it runs on the owned slots (q_out is
+            # correct; its k-write is throwaway) and the full k-cache is written
+            # afterwards from the all-gathered k. Gather the raw (un-roped) k and
+            # key positions BEFORE the fused kernel ropes k in place.
+            pcp = (
+                pcp_is_enabled()
+                and context.is_prefill
+                and not context.is_dummy_run
+                and use_prefill_mla
             )
+            if pcp:
+                pcp_ws = get_pcp_world_size()
+                n_real = attn_metadata.slot_mapping.shape[0]
+                k_nope_full = pcp_allgather_rerange(k_nope, pcp_ws)[:n_real]
+                k_rope_full = pcp_allgather_rerange(k_rope, pcp_ws)[:n_real]
+                positions_full = pcp_allgather_rerange(positions, pcp_ws)[:n_real]
+                write_slot_mapping = attn_metadata.slot_mapping_owned
+            else:
+                write_slot_mapping = attn_metadata.slot_mapping
+
+            if self.use_seg_mla:
+                # Seg path: allocate q_out with a padded last dim so each head row
+                # has a 768-byte stride (required by the gfx1250 decode asm). The
+                # kernel only writes the first kv_lora_rank + qk_rope_head_dim
+                # columns; the padding tail is left untouched and never read.
+                q_out = torch.empty(
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        _MLA_Q_OUT_PADDED_DIM,
+                    ),
+                    dtype=attn_metadata.dtype_q,
+                    device=q_nope.device,
+                )
+            else:
+                q_out = torch.empty(
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=attn_metadata.dtype_q,
+                    device=q_nope.device,
+                )
             if kv_cache.numel() > 0:
                 if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
@@ -1057,7 +1319,7 @@ class MLAAttention(nn.Module):
                         k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
                         k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
                         shuffled_cache,
-                        attn_metadata.slot_mapping,
+                        write_slot_mapping,
                         positions,
                         self.rotary_emb.cos_cache,
                         self.rotary_emb.sin_cache,
@@ -1067,6 +1329,24 @@ class MLAAttention(nn.Module):
                         apply_scale=True,
                         q_out=q_out,
                         shuffled_kv_cache=True,
+                    )
+                elif self.use_seg_mla:
+                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+                    fused_qk_rope_concat_and_cache_mla_seg(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        # Flat seg layout: [num_blocks, page_size*(kv_lora + pe)].
+                        kv_cache_seg,
+                        q_out,
+                        write_slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
                     )
                 else:
                     fused_qk_rope_concat_and_cache_mla(
@@ -1080,7 +1360,7 @@ class MLAAttention(nn.Module):
                             self.kv_lora_rank + self.qk_rope_head_dim,
                         ),
                         q_out,
-                        attn_metadata.slot_mapping,
+                        write_slot_mapping,
                         self._k_scale,
                         self._q_scale,
                         positions,
@@ -1090,6 +1370,22 @@ class MLAAttention(nn.Module):
                         is_nope_first=True,
                     )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
+
+                if pcp:
+                    # Complete the full k-cache: rope the gathered full k (in
+                    # place) then write every real slot, overwriting the fused
+                    # kernel's throwaway owned-slot write. The rope kernel is
+                    # 2-component and needs a non-None partner, so pass a
+                    # throwaway query of matching length.
+                    self.rotary_emb(
+                        positions_full, k_rope_full, torch.empty_like(k_rope_full)
+                    )
+                    self._pcp_write_full_kv(
+                        kv_cache,
+                        k_nope_full,
+                        k_rope_full,
+                        attn_metadata.slot_mapping,
+                    )
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)

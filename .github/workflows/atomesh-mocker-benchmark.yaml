@@ -5,7 +5,8 @@ on:
     branches: [main]
     paths:
       - 'atom/mesh/**'
-      - '.github/scripts/atomesh_mocker_benchmark.sh'
+      - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
+      - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
       - '.github/dashboard/atomesh_mocker_index.html'
       - 'docs/assets/atomesh_logo.png'
@@ -14,7 +15,8 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'atom/mesh/**'
-      - '.github/scripts/atomesh_mocker_benchmark.sh'
+      - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
+      - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
       - '.github/dashboard/atomesh_mocker_index.html'
       - 'docs/assets/atomesh_logo.png'
@@ -170,8 +172,8 @@ jobs:
           RESULT_DIR: atomesh-mocker-results
         run: |
           set -euo pipefail
-          chmod +x .github/scripts/atomesh_mocker_benchmark.sh
-          python3 .github/scripts/atomesh_mocker_benchmark_summary.py
+          chmod +x .github/scripts/atomesh/atomesh_mocker_benchmark.sh
+          python3 .github/scripts/atomesh/atomesh_mocker_benchmark_summary.py
 
       - name: Dump mocker benchmark-request log
         if: always()
@@ -214,6 +216,9 @@ jobs:
           if-no-files-found: ignore
 
   dashboard:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     name: Update Mocker Benchmark Dashboard
     needs: [run_atomesh_mocker_benchmark]
     if: >-

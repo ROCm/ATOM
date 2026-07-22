@@ -21,6 +21,22 @@ ENV MAX_JOBS=${MAX_JOBS}
 ENV VLLM_TARGET_DEVICE=rocm
 ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 
+# Preserve the base image's custom RCCL before any OOT apt runs.
+# The native base builds RCCL from the pinned RCCL_BRANCH (build_rccl stage) and
+# installs it to /usr/local/lib with an /etc/ld.so.conf.d/rccl.conf entry, so
+# ldconfig resolves the custom build. The custom `dpkg -i --force-all` leaves
+# rocm-hip's rccl version dep "broken" on purpose; the OOT `apt --fix-broken
+# install` below satisfies it by reinstalling the STOCK ROCm rccl into
+# /opt/rocm, which then shadows the custom build via ldconfig. That regresses
+# GLM-5.2 decode perf (memory-bound kernels run ~40% slower under the stock rccl
+# even though its collective kernels are never called in decode). Back it up here
+# and restore after all OOT installs (mirrors the Triton backup/restore below).
+RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
+    mkdir -p /tmp/rccl-base-backup && \
+    (cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true) && \
+    (cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true) && \
+    ls -l /tmp/rccl-base-backup/ || true
+
 RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     apt-get update && \
     apt --fix-broken install -y && \
@@ -118,6 +134,29 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     rm -rf /tmp/triton-base-backup && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton || true
+
+# Restore the base image's custom RCCL over any stock rccl that OOT apt pulled
+# into /opt/rocm, so the OOT image runs the SAME custom RCCL as the native image.
+# Must run after ALL OOT apt/pip installs. Removes the stock /opt/rocm librccl so
+# ldconfig unambiguously resolves the custom build in /usr/local/lib (leaving the
+# stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied — only the .so
+# is swapped, exactly the runtime state the native image ships).
+RUN echo "========== [OOT] Restore base-image custom RCCL ==========" && \
+    if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
+      echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
+      rm -f /opt/rocm*/lib/librccl.so* && \
+      cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
+      if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
+        cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
+      else \
+        echo "/usr/local/lib" > /etc/ld.so.conf.d/rccl.conf ; \
+      fi && \
+      ldconfig && \
+      echo "librccl now resolves to:" && ldconfig -p | grep -i librccl ; \
+    else \
+      echo "WARNING: no base-image custom RCCL backup found; leaving rccl unchanged" ; \
+    fi && \
+    rm -rf /tmp/rccl-base-backup
 
 
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
@@ -443,5 +482,57 @@ RUN echo "========== Install atomesh binary ==========" && \
     strip target/release/atomesh && \
     cp target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
+
+# ========== LMCache (HIP c_ops) for KV offload ==========
+# ATOM's KV offload uses the LMCache connector, which needs LMCache's c_ops
+# built for ROCm. NEVER `pip install lmcache` — it pulls CUDA torch and breaks
+# the ROCm stack. Build from source pinned to a release tag, against the image's
+# torch. KEY: the install must be EDITABLE (`pip install -e .`); at this tag a
+# non-editable `pip install .` silently SKIPS the c_ops extension and falls back
+# to the slow python backend. Verified end-to-end (tp8 offload store via c_ops)
+# on gfx950. NOTE: tp>1 offload also needs aiter's eager-NCCL-init fix
+# (device_id= to init_process_group); that belongs in aiter (tracked separately),
+# not here — the CI build_aiter stage picks it up once merged.
+ARG LMCACHE_TAG=v0.4.5
+# PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
+# hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
+# ${GPU_ARCH} here — ARG does not cross FROM so it would be empty in this stage.
+RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+    git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
+    cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
+    "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
+    CXX=hipcc BUILD_WITH_HIP=1 \
+      "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
+    "${VENV_PYTHON}" -m pip install --no-deps \
+        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 && \
+    "${VENV_PYTHON}" -c "import torch, lmcache, lmcache.c_ops; \
+from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
+from lmcache.v1.memory_management import MemoryFormat; \
+from lmcache.v1.lookup_client.factory import LookupClientFactory; \
+from lmcache.v1.config import LMCacheEngineConfig; \
+from lmcache.v1.metadata import LMCacheMetadata; \
+assert 'rocm' in torch.__version__, torch.__version__; \
+assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
+print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
+
+# ========== SemiAnalysis aiperf agentic benchmark tool ==========
+# Install the SemiAnalysis fork pinned to the commit that supports the SA
+# agentic datasets (semianalysis_cc_traces_weka_062126*).
+ARG INSTALL_SA_AIPERF=1
+ARG SA_AIPERF_COMMIT="0d2aa0572ac685943d38c580675c4a61023581d3"
+RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
+        rm -rf /opt/aiperf && \
+        git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
+        cd /opt/aiperf && \
+        git checkout "${SA_AIPERF_COMMIT}" && \
+        "${VENV_PYTHON}" -m pip install -e . && \
+        "${VENV_PYTHON}" -m pip install --no-cache-dir "transformers==5.2.0" && \
+        "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
+        "${VENV_PYTHON}" -m pip show aiperf || true && \
+        command -v aiperf && aiperf --help >/dev/null; \
+    else \
+        echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
 
 CMD ["/bin/bash"]

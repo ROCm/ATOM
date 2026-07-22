@@ -2,8 +2,9 @@
 """Compute the benchmark cell matrix for the ATOM Benchmark workflow.
 
 Reads the GitHub event name and workflow_dispatch inputs from the environment
-and emits the fully-expanded list of benchmark cells (see ``catalog.build_cells``)
-to ``$GITHUB_OUTPUT`` as ``cells_json`` plus a ``has_cells`` flag.
+and emits the first-level matrix configs (variant × scenario, each carrying a
+concurrency list; see ``catalog.build_cell_configs``) to ``$GITHUB_OUTPUT`` as
+``configs_json`` plus a ``has_cells`` flag.
 
 Behaviour by event:
 - ``schedule``      -> all models, catalog ``default_scenarios`` (nightly grid).
@@ -23,7 +24,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from catalog import build_cells, load_variants, validate_dispatch_inputs  # noqa: E402
+from catalog import (  # noqa: E402
+    build_cell_configs,
+    load_variants,
+    validate_dispatch_inputs,
+)
 
 CATALOG = ".github/benchmark/models.json"
 DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
@@ -40,13 +45,17 @@ RESERVED_INPUTS = {
 }
 
 
-def _emit(cells: list[dict]) -> None:
-    payload = json.dumps(cells)
+def _emit(configs: list[dict]) -> None:
+    # One entry per first-level matrix config (variant × scenario); each carries
+    # a JSON `concurrency` list the reusable template fans out over. Grouping
+    # keeps both matrix levels far under GitHub's 256-job-per-matrix limit that a
+    # flat per-cell matrix would overflow.
+    payload = json.dumps(configs)
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a", encoding="utf-8") as f:
-            f.write(f"cells_json={payload}\n")
-            f.write(f"has_cells={'true' if cells else 'false'}\n")
+            f.write(f"configs_json={payload}\n")
+            f.write(f"has_cells={'true' if configs else 'false'}\n")
     else:
         print(payload)
 
@@ -73,14 +82,17 @@ def main() -> int:
         model_filter = {k for k in model_keys if inputs.get(k)}
         param_lists = inputs.get("param_lists") or DEFAULT_PARAM_LISTS
 
-    cells = build_cells(CATALOG, param_lists=param_lists, model_filter=model_filter)
-    _emit(cells)
+    configs = build_cell_configs(
+        CATALOG, param_lists=param_lists, model_filter=model_filter
+    )
+    _emit(configs)
 
-    n_models = len({c["prefix"] for c in cells})
+    n_cells = sum(len(json.loads(c["concurrency"])) for c in configs)
+    n_models = len({c["prefix"] for c in configs})
     n_total = len(load_variants(CATALOG))
     print(
-        f"Event={event}: {len(cells)} cells across {n_models} models "
-        f"({n_total} variants in catalog)",
+        f"Event={event}: {n_cells} cells across {n_models} models "
+        f"-> {len(configs)} matrix configs ({n_total} variants in catalog)",
         file=sys.stderr,
     )
     return 0

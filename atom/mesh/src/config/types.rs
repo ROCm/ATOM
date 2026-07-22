@@ -16,6 +16,40 @@ pub enum BackendType {
     Atom,
 }
 
+/// Strategy used by the ATOM PD router to map a selected prefill DP rank to
+/// the selected decode DP rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AtomPdRankMappingPolicy {
+    /// Do not rewrite the planner-selected prefill/decode DP ranks.
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    /// Map prefill rank N to decode rank N when both sides expose DP workers.
+    #[serde(rename = "idx2idx")]
+    Idx2Idx,
+}
+
+impl std::fmt::Display for AtomPdRankMappingPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Idx2Idx => write!(f, "idx2idx"),
+        }
+    }
+}
+
+impl std::str::FromStr for AtomPdRankMappingPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" | "disabled" | "off" => Ok(Self::None),
+            "idx2idx" | "index_to_index" | "same_index" => Ok(Self::Idx2Idx),
+            other => Err(format!("unsupported ATOM PD rank mapping policy: {other}")),
+        }
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -26,6 +60,8 @@ pub struct RouterConfig {
     pub connection_mode: ConnectionMode,
     #[serde(default)]
     pub atom_standalone: bool,
+    #[serde(default)]
+    pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
 
     pub policy: PolicyConfig,
     pub host: String,
@@ -357,6 +393,7 @@ impl Default for RouterConfig {
             health_check: HealthCheckConfig::default(),
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
+            atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,

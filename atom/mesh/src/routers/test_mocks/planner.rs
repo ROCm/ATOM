@@ -67,10 +67,7 @@ impl MockPdPlanner {
 
 #[async_trait]
 impl PdPlanner for MockPdPlanner {
-    async fn plan(
-        &self,
-        _req: &RequestDescriptor<'_>,
-    ) -> Result<PlacementPlan, PlacementError> {
+    async fn plan(&self, _req: &RequestDescriptor<'_>) -> Result<PlacementPlan, PlacementError> {
         match &self.mode {
             PlannerMode::Scripted(q) => q
                 .lock()

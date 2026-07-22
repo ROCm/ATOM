@@ -14,7 +14,12 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
-from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
+from atom.utils.tbo.ubatch_splitting import (
+    UBatchSlice,
+    attach_tbo_cpu_lens,
+    split_attn_metadata,
+)
+from atom.utils.tbo.ubatching import tbo_enabled
 from atom.utils.forward_context import AttentionMetaData, AttnState
 from torch import nn
 
@@ -167,6 +172,28 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return 0
 
+    # ------------------------------------------------------------------ #
+    # Paged sliding-window (SWA) pool — a separate, window-freed KV pool  #
+    # some attention types carve out of the main KV budget.              #
+    # ------------------------------------------------------------------ #
+    # ModelRunner queries these at startup to decide, model-agnostically,
+    # whether to reserve a `num_swa_blocks`-sized SWA pool and deduct its
+    # bytes from the main (compressed) KV pool. A builder that returns >0
+    # from `swa_pool_block_bytes()` opts into the pool; the default 0 means
+    # no separate SWA pool (standard attentions keep all KV in one pool).
+    # This keeps the arch-specific decision inside the builder, not in the
+    # runner.
+
+    def swa_pool_block_bytes(self) -> int:
+        """Bytes of ONE physical SWA-pool block across all attention layers,
+        or 0 (default) if this attention type has no separate paged-SWA pool."""
+        return 0
+
+    def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
+        """Number of blocks to reserve for the paged-SWA pool, or 0 (default).
+        Only consulted when `swa_pool_block_bytes()` > 0."""
+        return 0
+
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict[str, Any]:
@@ -265,6 +292,20 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         for i, block_table in enumerate(batch.block_tables):
             block_tables[i] = 0
             block_tables[i, : len(block_table)] = block_table
+        # paged-SWA: fill the parallel SWA block table in lockstep (decode
+        # path). -1 sentinels (window-freed) are copied verbatim but never
+        # indexed by the SWA kernels.
+        swa_buf = var.get("swa_block_tables")
+        swa_tables = getattr(batch, "swa_block_tables", None)
+        if swa_buf is not None and swa_tables is not None:
+            swa_np = swa_buf.np
+            for i, swa_table in enumerate(swa_tables):
+                swa_np[i] = 0
+                if len(swa_table):
+                    # Clamp window-freed sentinels (-1) to 0: those blocks are
+                    # out of window and never indexed by the SWA kernels, but a
+                    # raw -1 phys would compute a negative paged offset → OOB.
+                    swa_np[i, : len(swa_table)] = [max(0, b) for b in swa_table]
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (
@@ -443,6 +484,26 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     ) -> AttentionMetaData:
         del ubatch_idx  # only used by builders with per-ubatch plan buffers
         return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+
+    def _attach_tbo_prefill_cpu_lens(
+        self, attn_metadata: AttentionMetaData, bs: int
+    ) -> None:
+        """Publish CPU (numpy) copies of the per-request length arrays so that
+        split_attn_metadata can recompute per-ubatch max_seqlen_q/k and total_kv
+        on the host with zero device sync.
+        """
+        if not tbo_enabled():
+            return
+        var = self.model_runner.forward_vars
+        attach_tbo_cpu_lens(
+            attn_metadata, "context_lens", var["context_lens"].np[:bs].copy()
+        )
+        attach_tbo_cpu_lens(
+            attn_metadata, "cu_seqlens_q", var["cu_seqlens_q"].np[: bs + 1].copy()
+        )
+        attach_tbo_cpu_lens(
+            attn_metadata, "cu_seqlens_k", var["cu_seqlens_k"].np[: bs + 1].copy()
+        )
 
     def build(self, batch: ScheduledBatch, bs: int):
         is_prefill = batch.total_tokens_num_prefill > 0

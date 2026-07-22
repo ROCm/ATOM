@@ -4,6 +4,7 @@
 import contextlib
 import copy
 import hashlib
+import logging
 import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
@@ -14,6 +15,8 @@ import torch._inductor.compile_fx
 import torch.fx as fx
 from atom.config import Config
 from atom.utils import compilation_counter, is_torch_equal_or_newer
+
+logger = logging.getLogger("atom")
 
 
 def _patch_triton_cluster_dims_for_rocm() -> None:
@@ -618,8 +621,17 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Save the compiled artifact to disk in the specified path
         assert key is not None
         path = os.path.join(self.cache_dir, key)
-        compiled_graph.save(path=path, format="unpacked")
-        compilation_counter.num_compiled_artifacts_saved += 1
+        handle = None
+        try:
+            compiled_graph.save(path=path, format="unpacked")
+            compilation_counter.num_compiled_artifacts_saved += 1
+            handle = (key, path)
+        except AssertionError:
+            logger.warning(
+                "Skipping standalone compiled graph save for %s because "
+                "PyTorch did not emit a complete unpacked artifact.",
+                key,
+            )
 
         # Post-process generated wrapper Python files: wrap regions between
         # <prefix>_start / <prefix>_end graph markers with record_function("<prefix>").
@@ -628,7 +640,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
             # overhead / file churn in default runs).
             from atom.utils.graph_marker import is_graph_marker_enabled
 
-            if is_graph_marker_enabled():
+            if is_graph_marker_enabled() and handle is not None:
                 # Local import to avoid extra package-level side effects.
                 from .graph_marker_instrumentation import (
                     instrument_record_functions_in_dir,
@@ -638,7 +650,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
         except Exception:
             # Best-effort: never fail compilation due to instrumentation.
             pass
-        return compiled_graph, (key, path)
+        return compiled_graph, handle
 
     def load(
         self,

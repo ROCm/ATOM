@@ -381,11 +381,13 @@ def linear_attention_with_output_base_fake(
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    return core_attn_out
+    return torch.empty_like(core_attn_out)
 
 
 @mark_spliting_op(
-    is_custom=True, gen_fake=linear_attention_with_output_base_fake, mutates_args=[]
+    is_custom=True,
+    gen_fake=linear_attention_with_output_base_fake,
+    mutates_args=[],
 )
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
@@ -396,7 +398,8 @@ def linear_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    ret = self.impl.forward(mixed_qkv, b, a, core_attn_out, layer_name)
+    ret = torch.empty_like(core_attn_out)
+    ret = self.impl.forward(mixed_qkv, b, a, ret, layer_name)
     return ret
 
 

@@ -1583,6 +1583,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def _should_use_native_dense_mha(self, layer) -> bool:
         sliding_window_size = getattr(layer, "sliding_window_size", None)
+        is_minimax_m3 = bool(getattr(layer, "_atom_minimax_m3_dense_mha", False))
+        if (
+            is_minimax_m3
+            and not self.use_mla
+            and not layer.is_cross_attention
+            and layer.head_dim == 128
+            and layer.qk_head_dim == 128
+            and layer.v_head_dim == 128
+            and (sliding_window_size is None or sliding_window_size <= -1)
+        ):
+            return True
         return (
             not self.use_mla
             and not layer.is_cross_attention
@@ -1748,6 +1759,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         if self.use_mla:
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
+        if bool(getattr(layer, "_atom_minimax_m3_dense_mha", False)):
+            # M3 dense decode benefits from the native ragged path, but batched
+            # SGLang prefill is safer through the standard varlen extend path.
+            return self._forward_extend_mha(q, k, v, layer, forward_batch)
         if use_native_dense_mha:
             return self._forward_extend_native_dense_mha(q, layer, forward_batch)
         else:

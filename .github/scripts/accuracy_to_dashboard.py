@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert accuracy test JSON results to github-action-benchmark input."""
+"""Convert accuracy result JSON files to github-action-benchmark input."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 def _load_model_configs(models_path: Path) -> dict[str, dict]:
-    """Load models_accuracy.json and index by model_name."""
+    """Load the accuracy model catalog and index by model_name."""
     models = json.loads(models_path.read_text(encoding="utf-8"))
     return {m["model_name"]: m for m in models}
 
@@ -58,7 +58,7 @@ def build_entries(
         if run_url:
             extra_parts.append(f"Run: {run_url}")
 
-        threshold = cfg.get("accuracy_threshold")
+        threshold = cfg.get("accuracy_test_threshold", cfg.get("accuracy_threshold"))
         if threshold is not None:
             extra_parts.append(f"Threshold: {threshold}")
 
@@ -174,7 +174,10 @@ def main() -> None:
     parser.add_argument(
         "--models",
         required=True,
-        help="Path to models_accuracy.json (contains threshold, baseline, baseline_model)",
+        help=(
+            "Path to oot_models_accuracy.json "
+            "(contains runtime threshold, baseline, and baseline_model)"
+        ),
     )
     args = parser.parse_args()
 

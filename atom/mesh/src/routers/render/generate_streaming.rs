@@ -31,11 +31,7 @@ pub(crate) struct GenerateStreamConfig {
     pub backend_label: &'static str,
 }
 
-pub fn process(
-    stream: TokenHandle,
-    ctx: ResponseContext,
-    backend_label: &'static str,
-) -> Response {
+pub fn process(stream: TokenHandle, ctx: ResponseContext, backend_label: &'static str) -> Response {
     let generate_request = match &ctx.original {
         ProtocolRequest::Generate(r) => Arc::clone(r),
         ProtocolRequest::Chat(_) => {

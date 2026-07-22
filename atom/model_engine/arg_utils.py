@@ -8,7 +8,14 @@ from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
-from atom.config import CompilationConfig, SpeculativeConfig
+from atom.config import (
+    CompilationConfig,
+    CUDAGraphMode,
+    DSparkConfig,
+    SpeculativeConfig,
+    EPLBConfig,
+)
+from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
 logger = logging.getLogger("atom")
 
@@ -30,14 +37,17 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
+    index_cache_dtype: Optional[str] = None
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
+    long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
@@ -45,10 +55,12 @@ class EngineArgs:
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
-    load_dummy: bool = False
+    cudagraph_mode: str = "FULL"
+    load_dummy: Optional[str] = None
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
+    dp_load_balance: str = DP_LB_DEFAULT
     enable_tbo: Optional[str] = None
     all2all_backend: Optional[str] = None
     method: Optional[str] = None
@@ -58,6 +70,14 @@ class EngineArgs:
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
+    dspark_config: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        if self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
+
+    eplb_enable: bool = False
+    eplb_config: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -77,6 +97,14 @@ class EngineArgs:
             type=int,
             default=1,
             help="Tensor parallel size.",
+        )
+        parser.add_argument(
+            "--prefill-context-parallel-size",
+            "-pcp",
+            type=int,
+            default=1,
+            help="Prefill context parallel size. Independent dimension "
+            "(world = tp x pcp); splits the sequence during prefill.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -104,11 +132,21 @@ class EngineArgs:
             help="Engine internal port",
         )
         parser.add_argument(
+            "--kv-cache-dtype",
             "--kv_cache_dtype",
+            dest="kv_cache_dtype",
             choices=["bf16", "fp8"],
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'.",
+        )
+        parser.add_argument(
+            "--index-cache-dtype",
+            "--index_cache_dtype",
+            choices=["bf16", "fp8"],
+            type=str,
+            default=None,
+            help="Index cache type. Defaults to --kv_cache_dtype.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -129,7 +167,25 @@ class EngineArgs:
             "--level", type=int, default=3, help="The level of compilation (0-3)."
         )
         parser.add_argument(
-            "--load_dummy", action="store_true", help="Skip loading model weights."
+            "--cudagraph-mode",
+            type=str,
+            default="FULL",
+            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+            help="CUDA graph runtime mode. FULL = manual whole-forward capture "
+            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
+            "attention eager (requires --level 3).",
+        )
+        parser.add_argument(
+            "--load_dummy",
+            nargs="?",
+            const="empty",
+            default=None,
+            choices=["empty", "zero", "xavier"],
+            help="Use dummy weights instead of reading the checkpoint. Bare flag "
+            "or '=empty': skip loading (uninitialized, legacy behavior). '=zero': "
+            "all weights 0. '=xavier': xavier_uniform_ for bf16 weights and a "
+            "constant target magnitude for fp4/fp8 packed weights (finite, "
+            "roughly real-scale; fp4 is the validated path).",
         )
         parser.add_argument(
             "--enable-expert-parallel",
@@ -146,6 +202,20 @@ class EngineArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enable DP attention.",
+        )
+        parser.add_argument(
+            "--dp-load-balance",
+            type=str,
+            default=DP_LB_DEFAULT,
+            choices=list(DP_LB_STRATEGIES),
+            help="Strategy the CoreManager uses to route a request to a DP "
+            "engine rank. 'round_robin': legacy request-count-agnostic "
+            "rotation. 'least_requests' (default): route to the rank with the "
+            "fewest in-flight requests, breaking ties by the lighter in-flight "
+            "prompt-token load. 'least_tokens': route to the rank with "
+            "the lowest combined in-flight token load (prompt tokens + "
+            "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(
             "--enable-tbo",
@@ -171,7 +241,7 @@ class EngineArgs:
             "--method",
             type=str,
             default=None,
-            choices=["mtp", "eagle3"],
+            choices=["mtp", "eagle3", "dspark"],
             help="Speculative method",
         )
         parser.add_argument(
@@ -191,6 +261,17 @@ class EngineArgs:
             type=int,
             default=16384,
             help="Maximum number of tokens to batch together in async engine",
+        )
+        parser.add_argument(
+            "--long-prefill-token-threshold",
+            type=int,
+            default=0,
+            help=(
+                "For chunked prefill, cap a single request's per-step prefill "
+                "size at this many tokens. 0 disables the cap (request is only "
+                "bounded by max_num_batched_tokens). Useful to interleave long "
+                "prefills with decode for lower ITL."
+            ),
         )
         parser.add_argument(
             "--attn-prefill-chunk-size",
@@ -272,6 +353,65 @@ class EngineArgs:
                 '\'{"use_index_cache": true, "index_topk_freq": 4}\''
             ),
         )
+        parser.add_argument(
+            "--dspark-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "DSpark dynamic config as a JSON dict, parsed straight into a "
+                "DSparkConfig object (no env vars). Supported keys:\n"
+                '  - "confidence_schedule": bool, enable confidence-scheduled '
+                "verification (per-request verify length ell_r).\n"
+                '  - "ragged": bool, enable per-request ragged verify '
+                "(no batch-level q padding).\n"
+                '  - "ragged_graph_sizes": str, comma-separated per-seq CUDA-graph '
+                'query-length buckets to capture, e.g. "1,3,6" or "8".\n'
+                '  - "q_buckets": str, CUDA-graph query-length buckets for the '
+                "older batch-uniform q-bucket verify path.\n"
+                '  - "disable_sps_calib": bool, skip SPS calibration and use the '
+                "synthetic stub.\n"
+                "Example:\n"
+                """  '{"confidence_schedule": true, "ragged": true, """
+                """"ragged_graph_sizes": "8"}'"""
+            ),
+        )
+        eplb_group = parser.add_argument_group("EPLB options")
+        eplb_group.add_argument(
+            "--eplb-enable",
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB runtime load monitoring and expert rebalance.",
+        )
+        eplb_group.add_argument(
+            "--eplb-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "EPLB config as a JSON dict, parsed straight into an EPLBConfig "
+                "object (no per-field flags). --eplb-enable turns EPLB on; "
+                "--eplb-config only tunes it. Supported keys:\n"
+                '  - "load_window_size": int, non-dummy forwards accumulated '
+                "for EPLB load stats.\n"
+                '  - "rebalance_interval": int, forward-pass interval for '
+                "EPLB rebalance gating.\n"
+                '  - "rebalance_layers_per_chunk": int, MoE layers migrated '
+                "per EPLB rebalance chunk.\n"
+                '  - "num_redundant_experts": int, extra physical expert '
+                "slots per MoE layer for EPLB replicas.\n"
+                '  - "rebalance_min_balancedness": float, skip EPLB '
+                "rebalance when balancedness is at least this value.\n"
+                '  - "rebalance_balancedness_agg": "min"|"mean", layer '
+                "aggregation used by the EPLB balancedness gate.\n"
+                '  - "p2p_batch_chunk_size": int, P2P batch chunk size used '
+                "while migrating expert weights.\n"
+                '  - "placement_policy": "naive"|"biased", how to spend the '
+                "redundant budget: 'naive' (spread) or 'biased' (fully "
+                "replicate top-K hottest experts to all GPUs).\n"
+                "Example:\n"
+                """  '{"num_redundant_experts": 8, "placement_policy": """
+                """"biased"}'"""
+            ),
+        )
 
         return parser
 
@@ -298,6 +438,7 @@ class EngineArgs:
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
+            cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],
             cudagraph_capture_sizes=(
                 parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
                 if self.cudagraph_capture_sizes
@@ -333,6 +474,13 @@ class EngineArgs:
 
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+
+        # --dspark-config (JSON dict) → DSparkConfig object, passed through as
+        # Config.dspark (no env vars).
+        kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
+        # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
+        # is the master switch, --eplb-config only tunes it).
+        kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))
 
         logger.info(f"Engine kwargs: {kwargs}")
 

@@ -147,6 +147,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         if hasattr(self.model, "get_embed_and_head"):
             return self.model.get_embed_and_head()
 
+        if self.model_arch == "DeepseekV4ForCausalLM":
+            return self.model.model.embed.weight, self.model.model.head.weight
+
         embed_owner = (
             self.model.model
             if hasattr(self.model, "model")
@@ -207,24 +210,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 input_embeds=input_embeds,
                 set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
             ) as runtime:
-                if self.model_arch == "DeepseekV4ForCausalLM":
-                    from atom.plugin.sglang.deepseek_v4_bridge import (
-                        bind_deepseek_v4_proxy_cache_views,
-                        maybe_get_proxy_pool_from_sglang_backend,
-                        reset_deepseek_v4_state_slots,
-                    )
-
-                    proxy_pool, _ = maybe_get_proxy_pool_from_sglang_backend()
-                    if not bind_deepseek_v4_proxy_cache_views(self.model, proxy_pool):
-                        raise RuntimeError(
-                            "DeepSeek-V4 SGLang proxy KV pool is not initialized"
-                        )
-                    from atom.utils.forward_context import get_forward_context
-
-                    reset_slots = getattr(
-                        get_forward_context().attn_metadata, "reset_slots", None
-                    )
-                    reset_deepseek_v4_state_slots(self.model, reset_slots)
+                if self.model_arch_spec.bind_cache_views is not None:
+                    self.model_arch_spec.bind_cache_views(self.model, runtime)
 
                 metadata = SGLangForwardBatchMetadata.build(
                     runtime.forward_batch,
@@ -269,20 +256,13 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states = runtime.trim_output(hidden_states)
 
                 if self.pp_group.is_last_rank:
-                    if self.model_arch == "DeepseekV4ForCausalLM" and not getattr(
-                        forward_batch, "return_logprob", False
-                    ):
-                        if forward_batch.forward_mode.is_decode_or_idle():
-                            pruned_states = hidden_states
-                        elif forward_batch.forward_mode.is_extend():
-                            last_index = (
-                                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-                            )
-                            pruned_states = hidden_states[last_index]
-                        else:
-                            pruned_states = hidden_states
-                        return LogitsProcessorOutput(
-                            next_token_logits=self.model.compute_logits(pruned_states)
+                    if self.model_arch == "DeepseekV4ForCausalLM":
+                        return self.logits_processor(
+                            input_ids,
+                            hidden_states,
+                            self.logits_head,
+                            forward_batch,
+                            hidden_states_before_norm=hidden_states,
                         )
                     return self.logits_processor(
                         input_ids,

@@ -171,43 +171,52 @@ impl AtomStandaloneRouter {
         let service = Python::attach(|py| self.service.clone_ref(py));
         let stream_id_for_worker = stream_id.clone();
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
-        let _ = tokio::task::spawn_blocking(move || {
-            loop {
-                let chunks = Python::attach(|py| -> PyResult<Vec<String>> {
-                    service
-                        .bind(py)
-                        .call_method1(drain_method, (stream_id_for_worker.as_str(), 16usize, 0.05f64))?
-                        .extract::<Vec<String>>()
-                });
+        let _ = tokio::task::spawn_blocking(move || loop {
+            let chunks = Python::attach(|py| -> PyResult<Vec<String>> {
+                service
+                    .bind(py)
+                    .call_method1(
+                        drain_method,
+                        (stream_id_for_worker.as_str(), 16usize, 0.05f64),
+                    )?
+                    .extract::<Vec<String>>()
+            });
 
-                match chunks {
-                    Ok(chunks) => {
-                        if chunks.is_empty() {
-                            continue;
+            match chunks {
+                Ok(chunks) => {
+                    if chunks.is_empty() {
+                        continue;
+                    }
+                    for chunk in chunks {
+                        let done = chunk.trim() == "data: [DONE]";
+                        if tx.send(Ok(Bytes::from(chunk))).is_err() {
+                            Self::close_python_stream(
+                                &service,
+                                close_method,
+                                &stream_id_for_worker,
+                            );
+                            return;
                         }
-                        for chunk in chunks {
-                            let done = chunk.trim() == "data: [DONE]";
-                            if tx.send(Ok(Bytes::from(chunk))).is_err() {
-                                Self::close_python_stream(&service, close_method, &stream_id_for_worker);
-                                return;
-                            }
-                            if done {
-                                Self::close_python_stream(&service, close_method, &stream_id_for_worker);
-                                return;
-                            }
+                        if done {
+                            Self::close_python_stream(
+                                &service,
+                                close_method,
+                                &stream_id_for_worker,
+                            );
+                            return;
                         }
                     }
-                    Err(error) => {
-                        let error_chunk = json!({
-                            "error": {
-                                "message": error.to_string(),
-                                "type": "internal_server_error",
-                            }
-                        });
-                        let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_chunk))));
-                        Self::close_python_stream(&service, close_method, &stream_id_for_worker);
-                        return;
-                    }
+                }
+                Err(error) => {
+                    let error_chunk = json!({
+                        "error": {
+                            "message": error.to_string(),
+                            "type": "internal_server_error",
+                        }
+                    });
+                    let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_chunk))));
+                    Self::close_python_stream(&service, close_method, &stream_id_for_worker);
+                    return;
                 }
             }
         });
@@ -242,7 +251,10 @@ impl AtomStandaloneRouter {
 
         Python::attach(|py| -> PyResult<Value> {
             let request = Self::json_to_py(py, &request_value)?;
-            let response = self.service.bind(py).call_method1(method_name, (request,))?;
+            let response = self
+                .service
+                .bind(py)
+                .call_method1(method_name, (request,))?;
             Self::py_to_json(&response)
         })
         .map_err(|e| {
@@ -256,11 +268,7 @@ impl AtomStandaloneRouter {
     fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
         match value {
             Value::Null => Ok(py.None()),
-            Value::Bool(value) => Ok(value
-                .into_pyobject(py)?
-                .to_owned()
-                .into_any()
-                .unbind()),
+            Value::Bool(value) => Ok(value.into_pyobject(py)?.to_owned().into_any().unbind()),
             Value::Number(value) => {
                 if let Some(value) = value.as_i64() {
                     Ok(value.into_pyobject(py)?.into_any().unbind())
@@ -274,8 +282,10 @@ impl AtomStandaloneRouter {
             }
             Value::String(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
             Value::Array(values) => {
-                let items: PyResult<Vec<_>> =
-                    values.iter().map(|value| Self::json_to_py(py, value)).collect();
+                let items: PyResult<Vec<_>> = values
+                    .iter()
+                    .map(|value| Self::json_to_py(py, value))
+                    .collect();
                 Ok(PyList::new(py, items?)?.into_any().unbind())
             }
             Value::Object(values) => {
@@ -361,7 +371,8 @@ impl AtomStandaloneRouter {
 
 impl std::fmt::Debug for AtomStandaloneRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AtomStandaloneRouter").finish_non_exhaustive()
+        f.debug_struct("AtomStandaloneRouter")
+            .finish_non_exhaustive()
     }
 }
 

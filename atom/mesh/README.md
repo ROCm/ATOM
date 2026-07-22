@@ -217,6 +217,27 @@ Structured logging via `tracing`, optional file sink (`--log-dir`), and log leve
 
 ## Security
 
+### TLS
+
+Enable HTTPS by providing both a PEM certificate chain and a PEM private key:
+
+```bash
+./target/release/atomesh launch \
+  --tls-cert-path /path/to/fullchain.pem \
+  --tls-key-path /path/to/privkey.pem \
+  --worker-urls http://worker1:8000 http://worker2:8000
+
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
+  --tls-cert-path /path/to/fullchain.pem \
+  --tls-key-path /path/to/privkey.pem \
+  --worker-urls http://worker1:8000 http://worker2:8000
+```
+
+`--tls-cert-path` and `--tls-key-path` must be provided together. When TLS is
+enabled, the router serves HTTPS on the configured `--host` and `--port`.
+
+### API key
+
 Optional API key protection for router endpoints:
 
 ```bash

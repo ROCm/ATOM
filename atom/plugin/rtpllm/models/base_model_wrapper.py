@@ -14,6 +14,7 @@ from rtp_llm.model_factory_register import (
     register_model,
 )
 
+from atom.plugin.rtpllm.models.glm5 import ATOMGlm5Moe
 from atom.plugin.rtpllm.models.qwen3_5 import ATOMQwen35Moe
 
 
@@ -28,4 +29,12 @@ def _register_atom_qwen35_moe() -> None:
     _hf_architecture_2_ft["Qwen3_5MoeForConditionalGeneration"] = "qwen35_moe"
 
 
+def _register_atom_glm5_moe() -> None:
+    """Register ATOM's rtp-llm model hook for GLM5."""
+    register_model("atom_glm5_moe", ATOMGlm5Moe, [])
+    _model_factory["glm_5"] = ATOMGlm5Moe
+    _hf_architecture_2_ft["GlmMoeDsaForCausalLM"] = "glm_5"
+
+
 _register_atom_qwen35_moe()
+_register_atom_glm5_moe()

@@ -71,6 +71,126 @@ def _v4_decode_hca_compress_tail_kernel(
         tl.store(hca_indices_ptr + base + k, swa_pages + bt, mask=mask)
 
 
+@triton.jit
+def _v4_decode_indices_fused_kernel(
+    state_slot_per_seq_ptr,  # [bs] int32
+    batch_id_per_token_ptr,  # [>=T] int — sentinel -1 in CG pad tail
+    positions_ptr,  # [>=T] int — global token position
+    swa_indptr_ptr,  # [>=T+1] int32 — ragged SWA-prefix cumsum
+    csa_indptr_ptr,  # [>=T+1] int32 — ragged (SWA + CSA topk)
+    hca_indptr_ptr,  # [>=T+1] int32 — ragged (SWA + HCA committed)
+    swa_indices_ptr,  # [swa_total] int32 OUT
+    csa_indices_ptr,  # [csa_total] int32 OUT (SWA-prefix segment only)
+    hca_indices_ptr,  # [hca_total] int32 OUT (SWA prefix tail + HCA head)
+    n_committed_hca_per_seq_ptr,  # [num_reqs] int32 — per-seq HCA entry count
+    block_tables_ptr,  # [num_reqs, MAX_BLOCKS] int — per-seq paged block ids
+    bt_stride_bs,  # block_tables row stride (elements)
+    cs,  # win_with_spec — ring-index modulo / SWA-region stride
+    swa_pages,  # num_slots * cs — boundary into compress region
+    win: tl.constexpr,  # SWA window — max prefix slots
+    BLOCK_N: tl.constexpr,  # next_pow2(win)
+):
+    """Fused decode index build: one program per token writes BOTH the SWA
+    window prefix (slice TAIL of swa/csa/hca) and the HCA compress section
+    (slice HEAD of hca). Merges ``_v4_paged_decode_indices_kernel`` and
+    ``_v4_decode_hca_compress_tail_kernel`` into one launch — the two write
+    disjoint regions of each token's slice, so a single program covers both
+    with no cross-program race.
+    """
+    t = tl.program_id(0)
+    bid = tl.load(batch_id_per_token_ptr + t)
+    if bid < 0:
+        return  # CG-padded sentinel — leave outputs untouched
+
+    slot = tl.load(state_slot_per_seq_ptr + bid)
+    pos = tl.load(positions_ptr + t)
+
+    # --- SWA window prefix (slice TAIL of swa / csa / hca) ---
+    n = tl.minimum(pos + 1, win)
+    swa_end = tl.load(swa_indptr_ptr + t + 1)
+    csa_end = tl.load(csa_indptr_ptr + t + 1)
+    hca_end = tl.load(hca_indptr_ptr + t + 1)
+    i = tl.arange(0, BLOCK_N)
+    mask = i < n
+    abs_pos = pos - n + 1 + i
+    ring_idx = abs_pos % cs
+    paged = slot * cs + ring_idx
+    tl.store(swa_indices_ptr + swa_end - n + i, paged, mask=mask)
+    tl.store(csa_indices_ptr + csa_end - n + i, paged, mask=mask)
+    tl.store(hca_indices_ptr + hca_end - n + i, paged, mask=mask)
+
+    # --- HCA compress section (slice HEAD of hca) ---
+    n_hca = tl.load(n_committed_hca_per_seq_ptr + bid)
+    base = tl.load(hca_indptr_ptr + t)
+    bt_row_base = bid * bt_stride_bs
+    for j in tl.range(0, n_hca, BLOCK_N):
+        k = j + i
+        kmask = k < n_hca
+        bt = tl.load(block_tables_ptr + bt_row_base + k, mask=kmask, other=0)
+        tl.store(hca_indices_ptr + base + k, swa_pages + bt, mask=kmask)
+
+
+def write_v4_decode_indices_fused(
+    *,
+    state_slot_per_seq: torch.Tensor,
+    batch_id_per_token: torch.Tensor,
+    positions: torch.Tensor,
+    swa_indptr: torch.Tensor,
+    csa_indptr: torch.Tensor,
+    hca_indptr: torch.Tensor,
+    swa_indices: torch.Tensor,
+    csa_indices: torch.Tensor,
+    hca_indices: torch.Tensor,
+    n_committed_hca_per_seq: torch.Tensor,
+    block_tables: torch.Tensor,
+    T: int,
+    win: int,
+    cs: int,
+    swa_pages: int,
+) -> None:
+    """Single-launch fusion of ``write_v4_paged_decode_indices`` (SWA window
+    prefix) and ``write_v4_decode_hca_compress_tail`` (HCA compress section).
+
+    Both originals are ``grid=(T,)`` one-program-per-token kernels writing
+    disjoint regions of each token's ragged slice, so fusing halves the
+    per-step Triton host launch overhead with identical output. See those
+    functions for the per-segment layout contract.
+    """
+    if T == 0:
+        return
+    assert state_slot_per_seq.dim() == 1
+    assert batch_id_per_token.dim() == 1 and batch_id_per_token.shape[0] >= T
+    assert positions.dim() == 1 and positions.shape[0] >= T
+    assert swa_indptr.dim() == 1 and swa_indptr.shape[0] >= T + 1
+    assert csa_indptr.dim() == 1 and csa_indptr.shape[0] >= T + 1
+    assert hca_indptr.dim() == 1 and hca_indptr.shape[0] >= T + 1
+    assert swa_indices.dim() == 1
+    assert csa_indices.dim() == 1
+    assert hca_indices.dim() == 1
+    assert n_committed_hca_per_seq.dim() == 1
+    assert block_tables.dim() == 2
+
+    BLOCK_N = triton.next_power_of_2(win)
+    _v4_decode_indices_fused_kernel[(T,)](
+        state_slot_per_seq,
+        batch_id_per_token,
+        positions,
+        swa_indptr,
+        csa_indptr,
+        hca_indptr,
+        swa_indices,
+        csa_indices,
+        hca_indices,
+        n_committed_hca_per_seq,
+        block_tables,
+        block_tables.stride(0),
+        cs,
+        swa_pages,
+        win=win,
+        BLOCK_N=BLOCK_N,
+    )
+
+
 def write_v4_decode_hca_compress_tail(
     *,
     batch_id_per_token: torch.Tensor,

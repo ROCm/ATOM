@@ -416,9 +416,8 @@ mod b2_chat_aggregator_branches {
     #[tokio::test]
     async fn test_aggregator_propagates_request_build_failed_as_400() {
         use super::test_support::chat_ctx;
-        let stream = synthetic_single_stream(vec![Err(EngineError::RequestBuildFailed(
-            "rq".to_string(),
-        ))]);
+        let stream =
+            synthetic_single_stream(vec![Err(EngineError::RequestBuildFailed("rq".to_string()))]);
         let resp = chat_aggregator::process(stream, chat_ctx()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
@@ -522,9 +521,7 @@ mod b3_chat_aggregator_typed {
     use crate::routers::render::chat_aggregator;
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
-    use crate::routers::token_handle::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
     use crate::tokenizer::{traits::Tokenizer, MockTokenizer};
 
     fn meta() -> WorkerMeta {
@@ -620,7 +617,8 @@ mod b3_chat_aggregator_typed {
 
     #[tokio::test]
     async fn test_process_typed_returns_err_on_engine_error() {
-        let stream = synthetic_single_stream(vec![Err(EngineError::DecodeError("fail".to_string()))]);
+        let stream =
+            synthetic_single_stream(vec![Err(EngineError::DecodeError("fail".to_string()))]);
         let result = chat_aggregator::process_typed(stream, chat_ctx()).await;
         assert!(result.is_err());
     }
@@ -668,8 +666,7 @@ mod b3_chat_aggregator_typed {
 
     #[tokio::test]
     async fn test_process_typed_empty_content_yields_none_content() {
-        let stream =
-            synthetic_single_stream(vec![Ok(complete(vec![], FinishReason::Stop))]);
+        let stream = synthetic_single_stream(vec![Ok(complete(vec![], FinishReason::Stop))]);
         let result = chat_aggregator::process_typed(stream, chat_ctx()).await;
         let resp = result.unwrap();
         assert!(
@@ -1279,17 +1276,13 @@ mod c3_chat_streaming_parsers {
     use axum::http::StatusCode;
 
     use crate::protocols::chat::ChatCompletionRequest;
-    use crate::protocols::common::{
-        Function, FunctionChoice, Tool, ToolChoice, ToolChoiceValue,
-    };
+    use crate::protocols::common::{Function, FunctionChoice, Tool, ToolChoice, ToolChoiceValue};
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
     use crate::routers::render::chat_streaming;
     use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
-    use crate::routers::token_handle::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
     use crate::tokenizer::huggingface::HuggingFaceTokenizer;
     use crate::tokenizer::traits::Tokenizer;
 
@@ -1460,7 +1453,8 @@ mod c3_chat_streaming_parsers {
                 meta: meta(),
             }),
         ]);
-        let resp = chat_streaming::process(stream, ctx_with(req, None, Some("deepseek_r1")), "regular");
+        let resp =
+            chat_streaming::process(stream, ctx_with(req, None, Some("deepseek_r1")), "regular");
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
@@ -1631,7 +1625,11 @@ mod c4_chat_streaming_coverage {
                 meta: meta_with_weight("fp-v42"),
             }),
         ]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("fp-v42"));
     }
@@ -1837,10 +1835,7 @@ mod c4_chat_streaming_coverage {
         let s = body_of(resp).await;
         let role_count = s.matches("\"role\":\"assistant\"").count();
         assert!(role_count >= 1, "role should appear at least once in: {s}");
-        let content_chunks: Vec<&str> = s
-            .lines()
-            .filter(|l| l.contains("\"content\""))
-            .collect();
+        let content_chunks: Vec<&str> = s.lines().filter(|l| l.contains("\"content\"")).collect();
         assert!(
             content_chunks.len() >= 2,
             "expected multiple content chunks for multiple partials: {s}"
@@ -1976,10 +1971,7 @@ mod c4_chat_streaming_coverage {
         let resp = chat_streaming::process(stream, ctx_with_parsers(req), "regular");
         let s = body_of(resp).await;
         let name_count = s.matches("get_weather").count();
-        assert!(
-            name_count >= 1,
-            "expected tool name at least once: {s}"
-        );
+        assert!(name_count >= 1, "expected tool name at least once: {s}");
         assert!(s.contains("tool_calls"));
     }
 
@@ -2057,8 +2049,11 @@ mod c4_chat_streaming_coverage {
             }),
             Err(EngineError::DecodeError("midstream_fail".to_string())),
         ]);
-        let resp =
-            chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("error"));
         assert!(s.contains("midstream_fail"));
@@ -2072,10 +2067,15 @@ mod c4_chat_streaming_coverage {
                 token_ids: vec![1],
                 logprobs: None,
             }),
-            Err(EngineError::Transport(tonic::Status::internal("server crashed"))),
+            Err(EngineError::Transport(tonic::Status::internal(
+                "server crashed",
+            ))),
         ]);
-        let resp =
-            chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("error"));
         assert!(s.contains("[DONE]"));
@@ -2083,9 +2083,13 @@ mod c4_chat_streaming_coverage {
 
     #[tokio::test]
     async fn test_prefill_error_emits_error_sse() {
-        let stream = synthetic_single_stream(vec![Err(EngineError::Prefill("bad input".to_string()))]);
-        let resp =
-            chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let stream =
+            synthetic_single_stream(vec![Err(EngineError::Prefill("bad input".to_string()))]);
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("error"));
         assert!(s.contains("[DONE]"));
@@ -2094,8 +2098,11 @@ mod c4_chat_streaming_coverage {
     #[tokio::test]
     async fn test_prefill_early_close_emits_error_sse() {
         let stream = synthetic_single_stream(vec![Err(EngineError::PrefillEarlyClose)]);
-        let resp =
-            chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("error"));
         assert!(s.contains("[DONE]"));
@@ -2104,8 +2111,11 @@ mod c4_chat_streaming_coverage {
     #[tokio::test]
     async fn test_decode_incomplete_emits_error_sse() {
         let stream = synthetic_single_stream(vec![Err(EngineError::DecodeIncomplete)]);
-        let resp =
-            chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("error"));
         assert!(s.contains("[DONE]"));
@@ -2116,8 +2126,11 @@ mod c4_chat_streaming_coverage {
         let stream = synthetic_single_stream(vec![Err(EngineError::ConnectionAcquireFailed(
             "pool exhausted".to_string(),
         ))]);
-        let resp =
-            chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("error"));
         assert!(s.contains("[DONE]"));
@@ -2128,8 +2141,11 @@ mod c4_chat_streaming_coverage {
         let stream = synthetic_single_stream(vec![Err(EngineError::RequestBuildFailed(
             "invalid params".to_string(),
         ))]);
-        let resp =
-            chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("error"));
         assert!(s.contains("[DONE]"));
@@ -2146,7 +2162,11 @@ mod c4_chat_streaming_coverage {
             input_logprobs: None,
             meta: meta_with_weight("sys-fp-1"),
         })]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("\"stop\""));
         assert!(s.contains("[DONE]"));
@@ -2210,7 +2230,8 @@ mod c4_chat_streaming_coverage {
                 meta: meta_plain(),
             }),
         ]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "pd");
+        let resp =
+            chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "pd");
         assert_eq!(resp.status(), StatusCode::OK);
         let s = body_of(resp).await;
         assert!(s.contains("[DONE]"));
@@ -2307,7 +2328,11 @@ mod c4_chat_streaming_coverage {
             input_logprobs: None,
             meta: meta_plain(),
         })]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers().get("content-type").unwrap();
         assert_eq!(ct.to_str().unwrap(), "text/event-stream");
@@ -2334,9 +2359,16 @@ mod c4_chat_streaming_coverage {
                 meta: meta_plain(),
             }),
         ]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
-        assert!(s.contains("rid"), "expected request_id 'rid' in events: {s}");
+        assert!(
+            s.contains("rid"),
+            "expected request_id 'rid' in events: {s}"
+        );
     }
 
     #[tokio::test]
@@ -2356,17 +2388,18 @@ mod c4_chat_streaming_coverage {
                 meta: meta_plain(),
             }),
         ]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         let data_lines: Vec<&str> = s.lines().filter(|l| l.starts_with("data:")).collect();
         assert!(
             data_lines.len() >= 2,
             "expected at least 2 data lines (content + DONE): {s}"
         );
-        assert_eq!(
-            data_lines.last().unwrap().trim(),
-            "data: [DONE]"
-        );
+        assert_eq!(data_lines.last().unwrap().trim(), "data: [DONE]");
     }
 
     #[tokio::test]
@@ -2431,7 +2464,11 @@ mod c4_chat_streaming_coverage {
                 meta: meta_plain(),
             }),
         ]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("[DONE]"));
     }
@@ -2447,7 +2484,11 @@ mod c4_chat_streaming_coverage {
             input_logprobs: None,
             meta: meta_plain(),
         })]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("\"stop\""));
         assert!(s.contains("[DONE]"));
@@ -2464,7 +2505,11 @@ mod c4_chat_streaming_coverage {
             input_logprobs: None,
             meta: meta_plain(),
         })]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("<|im_end|>"));
     }
@@ -2480,7 +2525,11 @@ mod c4_chat_streaming_coverage {
             input_logprobs: None,
             meta: meta_plain(),
         })]);
-        let resp = chat_streaming::process(stream, ctx_with(ChatCompletionRequest::default()), "regular");
+        let resp = chat_streaming::process(
+            stream,
+            ctx_with(ChatCompletionRequest::default()),
+            "regular",
+        );
         let s = body_of(resp).await;
         assert!(s.contains("151643"));
     }
@@ -2653,7 +2702,7 @@ mod d2_generate_aggregator_branches {
     use crate::routers::render::generate_aggregator;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
-        FinishReason, MatchedStop, TokenChunk, TokenLogprob, TokenLogprobs, InputLogprobs, Usage,
+        FinishReason, InputLogprobs, MatchedStop, TokenChunk, TokenLogprob, TokenLogprobs, Usage,
         WorkerMeta,
     };
 
@@ -2857,7 +2906,8 @@ mod d2_generate_aggregator_branches {
     #[tokio::test]
     async fn test_aggregator_propagates_engine_decode_error() {
         use crate::routers::token_handle::engine_error::EngineError;
-        let stream = synthetic_single_stream(vec![Err(EngineError::DecodeError("bad".to_string()))]);
+        let stream =
+            synthetic_single_stream(vec![Err(EngineError::DecodeError("bad".to_string()))]);
         let resp = generate_aggregator::process(stream, generate_ctx()).await;
         assert!(resp.status().is_server_error());
     }
@@ -3020,7 +3070,9 @@ mod d3_logprob_conversion {
         let lp = TokenLogprobs { items: vec![] };
         let out = token_logprobs_to_chat(&lp, &tok());
         match out {
-            crate::protocols::common::ChatLogProbs::Detailed { content } => assert!(content.is_none()),
+            crate::protocols::common::ChatLogProbs::Detailed { content } => {
+                assert!(content.is_none())
+            }
             _ => panic!("expected Detailed"),
         }
     }
@@ -3036,7 +3088,10 @@ mod d3_logprob_conversion {
             }],
         };
         let out = token_logprobs_to_chat(&lp, &tok());
-        if let crate::protocols::common::ChatLogProbs::Detailed { content: Some(items) } = out {
+        if let crate::protocols::common::ChatLogProbs::Detailed {
+            content: Some(items),
+        } = out
+        {
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].token, " hi");
             assert_eq!(items[0].top_logprobs.len(), 1);
@@ -3057,7 +3112,10 @@ mod d3_logprob_conversion {
             }],
         };
         let out = token_logprobs_to_chat(&lp, &tok());
-        if let crate::protocols::common::ChatLogProbs::Detailed { content: Some(items) } = out {
+        if let crate::protocols::common::ChatLogProbs::Detailed {
+            content: Some(items),
+        } = out
+        {
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].top_logprobs.len(), 1);
         } else {
@@ -3184,9 +3242,7 @@ mod e1_generate_streaming_body_content {
     use super::test_support::generate_ctx;
     use crate::routers::render::generate_streaming;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
-    use crate::routers::token_handle::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn meta() -> WorkerMeta {
         WorkerMeta {
@@ -3324,7 +3380,7 @@ mod e2_generate_streaming_branches {
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
-        FinishReason, TokenChunk, TokenLogprob, TokenLogprobs, InputLogprobs, Usage, WorkerMeta,
+        FinishReason, InputLogprobs, TokenChunk, TokenLogprob, TokenLogprobs, Usage, WorkerMeta,
     };
     use crate::tokenizer::{traits::Tokenizer, MockTokenizer};
 
