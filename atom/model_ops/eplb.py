@@ -1472,12 +1472,12 @@ class ExpertLoadMonitor:
             )
 
     def on_forward_end(self, is_dummy_run: bool, is_pure_prefill: bool = True) -> None:
-        # Non-pure-prefill forwards (decode, DP-mixed) are treated like dummy
-        # runs: on_forward_pass_end still advances the rebalance step to keep all
-        # ranks lockstep, but their load is NOT committed to the window -- EPLB
-        # balances on prefill load only. Committing is a purely local op, so
-        # skipping it per-rank never desyncs the (step-driven, collective)
-        # rebalance.
+        # Commit this pass's load to the sliding window ONLY on a real
+        # (non-dummy) pure-prefill forward -- EPLB balances on prefill load
+        # only, so decode / DP-mixed / dummy passes are dropped here. Committing
+        # is a purely local op, so gating it per-rank never desyncs the
+        # (step-driven, collective) rebalance -- lockstep is enforced separately
+        # by on_forward_pass_end, which advances on a group-uniform prefill flag.
         if (
             not self.enabled
             or is_dummy_run
@@ -1631,6 +1631,13 @@ class EPLBManager:
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
         self._p2p_batch_chunk_size: int = 32
+        # True iff the DP group == the migration (EP) group. When True the DP
+        # sync's `any_rank_has_prefill` already spans exactly the migration
+        # collective, so the prefill gate reuses it for free (no extra collective).
+        # When False we OR the local prefill flag over the migration group
+        # ourselves. Resolved once in bind_runtime_owner (fail-safe default False
+        # => self-compute, which is always correct).
+        self._dp_is_migration_group: bool = False
 
     def bind_runtime_owner(self, owner: Any) -> None:
         """Scan the owner's model for EP MoE layers and build runtime metadata.
@@ -1741,6 +1748,21 @@ class EPLBManager:
             # new_group is collective over the default group; every rank calls it.
             ep_global_ranks = torch.distributed.get_process_group_ranks(self._ep_group)
             self._migration_group = torch.distributed.new_group(ranks=ep_global_ranks)
+            # If the DP group is exactly the migration group, the DP sync's
+            # any_rank_has_prefill already spans it -> reuse it (free). Otherwise
+            # keep False and OR the prefill flag over the migration group ourselves.
+            try:
+                from aiter.dist.parallel_state import get_dp_group
+
+                dp_ranks = torch.distributed.get_process_group_ranks(
+                    get_dp_group().device_group
+                )
+                self._dp_is_migration_group = sorted(dp_ranks) == sorted(
+                    ep_global_ranks
+                )
+            except Exception:
+                self._dp_is_migration_group = False
+            logger.info("EPLB dp_is_migration_group=%s", self._dp_is_migration_group)
         except Exception as exc:
             raise RuntimeError(
                 "EPLB is enabled but EP process group is unavailable; "
@@ -1976,10 +1998,40 @@ class EPLBManager:
     def last_balancedness(self) -> Optional[float]:
         return self._last_balancedness
 
-    def on_forward_pass_end(self, is_dummy_run: bool) -> None:
-        # Keep scheduler lockstep regardless of dummy/non-dummy.
-        _ = is_dummy_run
+    def on_forward_pass_end(
+        self,
+        local_has_prefill: bool,
+        dp_any_has_prefill: Optional[bool] = None,
+    ) -> None:
+        # Advance the rebalance generator ONLY on steps with prefill activity, so
+        # a pure-decode step never advances the counter nor triggers the (sync,
+        # default-stream) migration -- keeping decode off the EPLB critical path
+        # and tying the interval to prefill activity. The flag is reduced to a
+        # migration-group-uniform signal, so all ranks advance/freeze in lockstep.
+        # This has-prefill gate coincides with the recording gate's pure-prefill
+        # commit under ATOM's no-mixed-batch invariant (a pass is all-prefill or
+        # all-decode); revisit both together if mixed batches land.
         if not self.enabled:
+            return
+
+        # Resolve a migration-group-uniform has-prefill flag.
+        if self._dp_is_migration_group and dp_any_has_prefill is not None:
+            # DP group == migration group: reuse the DP sync's has-prefill OR for
+            # free (no extra collective).
+            has_prefill = dp_any_has_prefill
+        else:
+            # OR the local has-prefill flag over exactly the migration collective
+            # (the group the rebalance actually runs on).
+            flag = torch.tensor(
+                [1 if local_has_prefill else 0], device="cuda", dtype=torch.int32
+            )
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self._migration_group
+            )
+            has_prefill = bool(flag.item())
+
+        if not has_prefill:
+            # Pure-decode step across the migration group: do not advance.
             return
         next(self._gen)
 
@@ -2331,8 +2383,14 @@ def with_eplb_forward_monitor(fn):
                 getattr(batch, "total_tokens_num_prefill", 0) > 0
                 and getattr(batch, "total_tokens_num_decode", 0) == 0
             )
+            # Recording gate commits clean load on pure-prefill only (local op).
             monitor.on_forward_end(is_dummy_run, is_pure_prefill)
-            manager.on_forward_pass_end(is_dummy_run)
+            # Step gate advances on prefill ACTIVITY (has-prefill), reduced to a
+            # group-uniform flag. Coincides with the pure-prefill commit above
+            # under the no-mixed-batch invariant (see on_forward_pass_end).
+            local_has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
+            dp_any_has_prefill = getattr(self, "_eplb_any_rank_has_prefill", None)
+            manager.on_forward_pass_end(local_has_prefill, dp_any_has_prefill)
 
     return wrapper
 
