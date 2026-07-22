@@ -1893,6 +1893,18 @@ class DeepseekV4Attention(nn.Module):
             torch.zeros(1, args.window_size, self.head_dim),
             persistent=False,
         )
+        # Defensive defaults for the paged-attention KV views. These are set to
+        # real tensors (fp8 2buff pools) by the KV-buffer binding pass
+        # (`deepseek_v4_attn.build_kv_cache_tensor` in ATOM-native mode, or
+        # `bind_deepseek_v4_proxy_cache_views` in the SGLang/vLLM plugin bridge)
+        # before the first real forward. Initializing them to None here prevents
+        # an AttributeError if a module forward is reached before binding
+        # (e.g. NEXTN/DSpark draft layers during cudagraph capture). None is the
+        # valid bf16 value: the aiter sparse op treats unified_kv_rope=None as
+        # the bf16 path.
+        self.unified_kv = None
+        self.unified_kv_rope = None
+        self.swa_kv_rope = None
         # Classical KV cache (paper §3.6.1) lives entirely in the global
         # `csa_main_kv` / `hca_main_kv` pool (allocated by the V4 attention
         # builder as `[num_blocks, n_layers, k_per_block, head_dim]`).
@@ -2416,7 +2428,7 @@ class DeepseekV4Attention(nn.Module):
                 unified_kv_rope=self.unified_kv_rope,
                 q_packed_in=qkn.q_packed,
                 q_rope_in=qkn.q_rope,
-                qo_indptr=attn_md.qo_indptr,
+                qo_indptr=getattr(attn_md, "qo_indptr", None),
                 prefix=f"{self.layer_name}.sparse_attn_decode",
             )  # [S, H, head_dim]
         else:
