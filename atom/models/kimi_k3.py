@@ -532,11 +532,11 @@ class KimiFullAttention(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        # q already has the [nope | rope] head layout from q_b_proj; RoPE is
+        # applied inside self.attn, so there is no split/re-cat here (that would
+        # be an identity round-trip that just copies q).
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(-1, self.num_local_heads, self.q_head_dim)
-        q_nope, q_rope = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_latent, k_rope = torch.split(
@@ -544,15 +544,19 @@ class KimiFullAttention(nn.Module):
         )
         kv = self.kv_b_proj(self.kv_a_layernorm(k_latent))
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k_rope = k_rope.unsqueeze(1).expand(-1, self.num_local_heads, -1)
 
-        q = torch.cat((q_nope, q_rope), dim=-1)
-        k = torch.cat((k_nope, k_rope), dim=-1)
-        # Kimi MLA is stored in the standard paged-MHA cache: pad V to the query
-        # head dim so K and V share a cache entry, then slice V back afterwards.
-        v_padded = F.pad(v, (0, self.q_head_dim - self.v_head_dim)).reshape(
-            -1, self.local_q_size
+        # Fused assembly (one kernel instead of split + cat + pad): builds
+        # k = [k_nope (from kv) | k_rope (MQA-shared)] and v_padded = [v | 0].
+        # Kimi MLA is stored in the standard paged-MHA cache, so V is padded to
+        # the query head dim to share a cache entry with K (sliced back after).
+        from atom.models.kimi_k3_fused import fuse_mla_kv
+
+        k, v_padded = fuse_mla_kv(
+            kv,
+            k_rope,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+            self.qk_rope_head_dim,
         )
 
         # MLA-as-MHA at head_dim=192. self.attn both writes the paged KV cache
@@ -563,7 +567,7 @@ class KimiFullAttention(nn.Module):
         attn_out = self.attn(
             q.reshape(-1, self.local_q_size),
             k.reshape(-1, self.local_q_size),
-            v_padded,
+            v_padded.reshape(-1, self.local_q_size),
         )
         attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
             :, :, : self.v_head_dim
@@ -766,6 +770,11 @@ class KimiKDAAttention(nn.Module):
             k=k,
             v=v,
             g=g,
+            # Keep beta in fp32: fla computes b = sigmoid(beta) in-kernel with
+            # use_beta_sigmoid_in_kernel, and triton's sigmoid follows the input
+            # dtype -- a bf16 beta yields a bf16 write strength, which erodes the
+            # delta-rule state update across the 71 KDA layers (measured gsm8k
+            # regression). b_proj stays bf16; only this reduction is widened.
             beta=beta.float(),
             A_log=self.A_log,
             dt_bias=self.dt_bias,
@@ -814,8 +823,15 @@ class KimiKDAAttention(nn.Module):
         fused_in = tgemm.mm(
             hidden_states, self.in_proj_weight, None, otype=hidden_states.dtype
         )
-        mixed_qkv = fused_in[..., : 3 * lp].contiguous()
+        # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
+        # row stride 4*lp). Both causal-conv consumers read the token stride from
+        # the tensor itself — causal_conv1d_fn uses x.stride(1) after transpose
+        # (channel-last: stride(0)==1), and causal_conv1d_update only requires
+        # x.stride(1)==1 (feature-contiguous, which the slice preserves).
+        mixed_qkv = fused_in[..., : 3 * lp]
         out_gate = fused_in[..., 3 * lp : 4 * lp]
+        # beta is widened to fp32 inside _run_kda (see the note there): the KDA
+        # delta-rule write strength must stay fp32 for accuracy.
         beta = self.b_proj(hidden_states).unsqueeze(0)
         gate = self.f_b_proj(self.f_a_proj(hidden_states))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -844,8 +860,14 @@ class KimiKDAAttention(nn.Module):
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            initial = ssm_state[state_indices].contiguous()
-            initial[~gdn_metadata.has_initial_state, ...] = 0
+            # Fused masked gather: ssm_state[state_indices] with fresh
+            # sequences (~has_initial_state) written as zeros in one pass,
+            # replacing the gather + separate zero-write.
+            from atom.models.kimi_k3_fused import gather_kda_initial_state
+
+            initial = gather_kda_initial_state(
+                ssm_state, state_indices, gdn_metadata.has_initial_state
+            )
             # gfx1250 workaround: chunk_kda NaNs on short prompts (seq < chunk
             # size) and its `transpose_state_layout` output can mismatch the
             # decode-time fused_recurrent_kda reader, producing NaN on the first
@@ -864,9 +886,15 @@ class KimiKDAAttention(nn.Module):
                 True,
                 recurrent=_kda_force_recurrent,
             )
-            ssm_state[state_indices] = last_state.to(ssm_state.dtype)
+            # last_state already has ssm_state's dtype (fla preserves the
+            # initial_state dtype; the gathered initial is allocated as such),
+            # so no .to() cast is needed.
+            ssm_state[state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
         elif gdn_metadata.num_decodes > 0:
+            # Slice the per-token cache-slot indices once (was recomputed for
+            # the conv update, the state gather, and the state scatter-back).
+            decode_state_indices = state_indices[:num_actual_tokens]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -875,13 +903,16 @@ class KimiKDAAttention(nn.Module):
                 self.local_proj_size,
                 None,
                 self.activation,
-                conv_state_indices=state_indices[:num_actual_tokens],
+                conv_state_indices=decode_state_indices,
                 validate_data=True,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            initial = ssm_state[state_indices[:num_actual_tokens]].contiguous()
+            # Advanced indexing already returns a contiguous tensor, so no
+            # .contiguous() is needed. No zeroing here: decode sequences always
+            # carry an initial state.
+            initial = ssm_state[decode_state_indices]
             kda_out, last_state = self._run_kda(
                 q,
                 k,
@@ -893,9 +924,7 @@ class KimiKDAAttention(nn.Module):
                 True,
                 recurrent=True,
             )
-            ssm_state[state_indices[:num_actual_tokens]] = last_state.to(
-                ssm_state.dtype
-            )
+            ssm_state[decode_state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
         else:
             out.zero_()

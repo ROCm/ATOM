@@ -221,3 +221,163 @@ def _rmsnorm_gated_torch(x: torch.Tensor, weight: torch.Tensor, gate: torch.Tens
     var = x_f.pow(2).mean(dim=-1, keepdim=True)
     xn = x_f * torch.rsqrt(var + eps)
     return (xn.to(dtype) * weight.to(dtype)) * torch.sigmoid(gate)
+
+
+# --------------------------------------------------------------------------- #
+# KDA initial-state gather (masked)                                            #
+# --------------------------------------------------------------------------- #
+if _HAS_TRITON:
+
+    @triton.jit
+    def _gather_kda_state_kernel(
+        src_ptr,   # ssm_state viewed as [num_lines, S]
+        idx_ptr,   # state_indices [num_seqs]
+        mask_ptr,  # has_initial_state [num_seqs] int8 (unused when HAS_MASK=False)
+        dst_ptr,   # initial viewed as [num_seqs, S]
+        S,
+        stride_src,
+        stride_dst,
+        HAS_MASK: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        seq = tl.program_id(0)
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        col_mask = offs < S
+        if HAS_MASK:
+            keep = tl.load(mask_ptr + seq) != 0
+            load_mask = col_mask & keep
+        else:
+            load_mask = col_mask
+        # int64 offsets: line * S can exceed int32 for large state caches.
+        line = tl.load(idx_ptr + seq).to(tl.int64)
+        vals = tl.load(src_ptr + line * stride_src + offs, mask=load_mask, other=0.0)
+        tl.store(dst_ptr + seq.to(tl.int64) * stride_dst + offs, vals, mask=col_mask)
+
+
+def gather_kda_initial_state(
+    ssm_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gather ``ssm_state[state_indices]`` into a packed ``[num_seqs, ...]``
+    initial-state tensor, zeroing sequences whose ``has_initial_state`` is
+    False -- in a single kernel.
+
+    Fuses the ``ssm_state[idx].contiguous()`` gather with the
+    ``initial[~has_initial_state] = 0`` masking so fresh sequences are written
+    as zeros in the same pass instead of a gather followed by a separate
+    zero-write pass. Falls back to the torch path when triton is unavailable or
+    there are no sequences.
+    """
+    num_seqs = int(state_indices.shape[0])
+    if not _HAS_TRITON or num_seqs == 0:
+        initial = ssm_state[state_indices].contiguous()
+        if has_initial_state is not None:
+            initial[~has_initial_state] = 0
+        return initial
+    tail = ssm_state.shape[1:]
+    src = ssm_state.reshape(ssm_state.shape[0], -1)
+    S = src.shape[1]
+    initial = torch.empty(
+        (num_seqs, *tail), dtype=ssm_state.dtype, device=ssm_state.device
+    )
+    dst = initial.reshape(num_seqs, -1)
+    has_mask = has_initial_state is not None
+    mask_arg = has_initial_state.to(torch.int8) if has_mask else src
+    BLOCK = 1024
+    grid = (num_seqs, triton.cdiv(S, BLOCK))
+    _gather_kda_state_kernel[grid](
+        src, state_indices, mask_arg, dst, S,
+        src.stride(0), dst.stride(0),
+        HAS_MASK=has_mask, BLOCK=BLOCK,
+    )
+    return initial
+
+
+# --------------------------------------------------------------------------- #
+# MLA k/v assembly (fused cat + pad)                                           #
+# --------------------------------------------------------------------------- #
+if _HAS_TRITON:
+
+    @triton.jit
+    def _fuse_mla_kv_kernel(
+        kv_ptr,     # [T, NH, QK_NOPE + V_HEAD] contiguous ([k_nope | v] per head)
+        krope_ptr,  # [T, QK_ROPE] (MQA-shared rope, same for every head)
+        k_ptr,      # [T, NH, QHD] out  ([k_nope | k_rope])
+        vpad_ptr,   # [T, NH, QHD] out  ([v | 0])
+        stride_kv_t,
+        stride_kv_h,
+        stride_kr_t,
+        stride_out_t,
+        stride_out_h,
+        NH,
+        QK_NOPE: tl.constexpr,
+        V_HEAD: tl.constexpr,
+        QHD: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)  # one program per (t, h)
+        t = pid // NH
+        h = pid % NH
+        d = tl.arange(0, BLOCK)
+        dmask = d < QHD
+        is_nope = d < QK_NOPE
+
+        kv_base = kv_ptr + t * stride_kv_t + h * stride_kv_h
+        out_base = t * stride_out_t + h * stride_out_h
+
+        # k = [k_nope (kv[:QK_NOPE]) | k_rope (shared)]
+        k_nope = tl.load(kv_base + d, mask=dmask & is_nope, other=0.0)
+        krope = tl.load(
+            krope_ptr + t * stride_kr_t + (d - QK_NOPE),
+            mask=dmask & (~is_nope),
+            other=0.0,
+        )
+        tl.store(k_ptr + out_base + d, tl.where(is_nope, k_nope, krope), mask=dmask)
+
+        # v_padded = [v (kv[QK_NOPE:]) | 0]
+        is_v = d < V_HEAD
+        v_val = tl.load(kv_base + QK_NOPE + d, mask=dmask & is_v, other=0.0)
+        tl.store(vpad_ptr + out_base + d, v_val, mask=dmask)
+
+
+def fuse_mla_kv(
+    kv: torch.Tensor,
+    k_rope: torch.Tensor,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+    qk_rope_head_dim: int,
+):
+    """Assemble the MLA-as-MHA k and padded-v in one kernel.
+
+    ``kv`` is ``[T, NH, qk_nope_head_dim + v_head_dim]`` (kv_b output, laid out
+    as ``[k_nope | v]`` per head); ``k_rope`` is ``[T, qk_rope_head_dim]`` shared
+    across heads. Returns::
+
+        k        = [T, NH, q_head_dim]  == cat(k_nope, k_rope)
+        v_padded = [T, NH, q_head_dim]  == pad(v, 0..q_head_dim)
+
+    Fuses the ``cat`` + ``F.pad`` (which also reads kv twice via the split) into
+    a single pass. Torch fallback when triton is unavailable / T == 0.
+    """
+    T, nh, _ = kv.shape
+    qhd = qk_nope_head_dim + qk_rope_head_dim
+    if not _HAS_TRITON or T == 0:
+        k_nope, v = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
+        k_rope_e = k_rope.unsqueeze(1).expand(-1, nh, -1)
+        k = torch.cat((k_nope, k_rope_e), dim=-1)
+        v_padded = torch.nn.functional.pad(v, (0, qhd - v_head_dim))
+        return k, v_padded
+    kv = kv.contiguous()
+    k = torch.empty((T, nh, qhd), dtype=kv.dtype, device=kv.device)
+    v_padded = torch.empty((T, nh, qhd), dtype=kv.dtype, device=kv.device)
+    BLOCK = triton.next_power_of_2(qhd)
+    _fuse_mla_kv_kernel[(T * nh,)](
+        kv, k_rope, k, v_padded,
+        kv.stride(0), kv.stride(1),
+        k_rope.stride(0),
+        k.stride(0), k.stride(1),
+        nh,
+        QK_NOPE=qk_nope_head_dim, V_HEAD=v_head_dim, QHD=qhd, BLOCK=BLOCK,
+    )
+    return k, v_padded
