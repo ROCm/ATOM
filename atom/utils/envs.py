@@ -389,6 +389,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
+    # PP-boundary hidden_states/residual are TP-replicated; when on, each rank
+    # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
+    # link traffic by tp_size. Default on; set "0" for full-tensor sends.
+    "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
 }
 
 

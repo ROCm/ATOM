@@ -1452,11 +1452,13 @@ def _convert_req_index_to_global_index_kernel(
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr)  # int32
 
-        # Guard block_table access
-        valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        # Split masks: store_mask = column-valid, load_mask adds tok-bound
+        # guard to prevent OOB GPU fault (masked load yields 0 = valid page).
+        store_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        load_mask = store_mask & (tok >= 0) & (tok < kv_len)
         out_val = tl.load(
             kv_indices + kv_start + tok,
-            mask=valid_mask,
+            mask=load_mask,
             other=0,
         )
 
@@ -1465,7 +1467,7 @@ def _convert_req_index_to_global_index_kernel(
         tl.store(
             out_ptr_ij,
             out_val,
-            mask=valid_mask,
+            mask=store_mask,
         )
 
 

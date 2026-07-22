@@ -24,7 +24,14 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.distributed.pp_comm import (
+    async_send_intermediate_tensors,
+    commit_pp_send_work,
+    init_pp_aware_dist_env,
+    recv_intermediate_tensors,
+)
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.utils.cuda_graph import BatchDescriptor
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -35,6 +42,7 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.models.utils import get_pp_indices
 from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
@@ -43,7 +51,6 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.utils.cuda_graph import BatchDescriptor
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -110,7 +117,7 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = True
+        self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
 
         self.runner = runner
         device = runner.device
@@ -694,7 +701,12 @@ class ModelRunner:
         else:
             self.rank_name = f"rank_{rank}"
         if config.torch_profiler_dir is not None:
-            self.profiler_dir = os.path.join(config.torch_profiler_dir, self.rank_name)
+            rank_name = self.rank_name
+            if config.pipeline_parallel_size > 1:
+                rank_name = (
+                    f"pp{config.parallel_config.pipeline_parallel_rank}_{rank_name}"
+                )
+            self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self._setup_device_and_distributed(rank, config)
@@ -727,6 +739,7 @@ class ModelRunner:
         self.use_aux_hidden_state_outputs = False
         self.use_dspark_aux_capture = False
         self._aux_hidden_states = None
+        self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
@@ -855,6 +868,9 @@ class ModelRunner:
                 dp_gather_scatter=dp_gather_scatter,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
+        # forward_vars is fully populated here; build the per-slot ring so
+        # concurrent pipeline microbatches don't share staging buffers.
+        self._init_forward_vars_ring()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self.warmup_model()
@@ -928,16 +944,17 @@ class ModelRunner:
         return False
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
-        # Calculate local device rank considering both TP and DP
-        # When data parallelism is enabled on the same node, different DP ranks
-        # need to use different sets of GPUs
+        # Calculate local device rank considering DP, PP and PCP.
+        # On a single node the physical GPU index equals the global distributed
+        # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
+        # stage) owns a contiguous tp*pcp GPU slice. `rank` is this worker's
+        # local index (0..tp*pcp-1) within its stage.
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
-        local_device_rank = (
-            dp_rank_local
-            * config.tensor_parallel_size
-            * config.prefill_context_parallel_size
-            + rank
-        )
+        pp_rank = config.parallel_config.pipeline_parallel_rank
+        pp_size = config.pipeline_parallel_size
+        stage_span = config.tensor_parallel_size * config.prefill_context_parallel_size
+        engine_index = dp_rank_local * pp_size + pp_rank
+        local_device_rank = engine_index * stage_span + rank
         num_gpus = torch.cuda.device_count()
         if local_device_rank >= num_gpus:
             raise ValueError(
@@ -947,7 +964,8 @@ class ModelRunner:
         self.device = torch.device(f"cuda:{local_device_rank}")
         logger.info(
             f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, "
-            f"local_device_rank={local_device_rank}, device={self.device}"
+            f"pp_rank={pp_rank}, local_device_rank={local_device_rank}, "
+            f"device={self.device}"
         )
 
         torch.cuda.set_device(self.device)
@@ -957,15 +975,32 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
-        init_dist_env(
-            config.tensor_parallel_size,
-            rankID=rank,
-            backend="nccl",
-            distributed_init_method=distributed_init_method,
-            data_parallel_size=config.parallel_config.data_parallel_size,
-            data_parallel_rank=config.parallel_config.data_parallel_rank,
-            prefill_context_model_parallel_size=config.prefill_context_parallel_size,
-        )
+        if config.pipeline_parallel_size > 1:
+            # PP-aware init: builds the _PP group (aiter's init_dist_env pins pp=1).
+            dp_size = config.parallel_config.data_parallel_size
+            world_size = dp_size * pp_size * stage_span
+            dp_rank = config.parallel_config.data_parallel_rank
+            global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+            init_pp_aware_dist_env(
+                tensor_model_parallel_size=config.tensor_parallel_size,
+                pipeline_model_parallel_size=pp_size,
+                global_rank=global_rank,
+                world_size=world_size,
+                distributed_init_method=distributed_init_method,
+                backend="nccl",
+                data_parallel_size=dp_size,
+                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+            )
+        else:
+            init_dist_env(
+                config.tensor_parallel_size,
+                rankID=rank,
+                backend="nccl",
+                distributed_init_method=distributed_init_method,
+                data_parallel_size=config.parallel_config.data_parallel_size,
+                data_parallel_rank=config.parallel_config.data_parallel_rank,
+                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+            )
 
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
@@ -1418,6 +1453,76 @@ class ModelRunner:
                 self.max_bs, **i32_kwargs
             )
 
+    def _init_forward_vars_ring(self):
+        """Build a ring of independent ``forward_vars`` copies, one per possible
+        in-flight pipeline microbatch.
+
+        The head launches up to ``pp_size`` forwards back-to-back without a GPU
+        sync, so a single reused ``forward_vars`` set would let microbatch N+1's
+        ``prepare_inputs`` overwrite staging buffers microbatch N's kernels are
+        still reading. Each in-flight slot gets its own buffer set; reuse of a
+        slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
+        ``_record_forward_vars_event``), bounding the CPU's GPU lead to the ring
+        size even when the head pops middle-chunk batches without a GPU sync.
+
+        When ``pp_size == 1`` the ring is the single original dict and advance is
+        a no-op, so behavior is unchanged.
+        """
+        pp_size = self.config.pipeline_parallel_size
+        self._fv_idx = 0
+        if pp_size <= 1:
+            self._fv_ring = [self.forward_vars]
+            self._fv_slot_events = None
+            return
+
+        assert self.enforce_eager, (
+            "pipeline_parallel_size > 1 requires eager execution "
+            "(--enforce-eager): the forward_vars ring swaps metadata "
+            "buffers per microbatch, which is incompatible with CUDAGraph replay."
+        )
+
+        def _clone_slot(src: dict) -> dict:
+            # Only CpuGpuBuffers are per-forward host-pinned staging buffers that
+            # get overwritten each forward. Everything else (the eager `outputs`
+            # tensor, scalar `mtp_k`, ...) is either unused on the eager PP path
+            # or immutable, so share it by reference.
+            return {
+                k: (v.clone() if isinstance(v, CpuGpuBuffer) else v)
+                for k, v in src.items()
+            }
+
+        self._fv_ring = [self.forward_vars] + [
+            _clone_slot(self.forward_vars) for _ in range(pp_size - 1)
+        ]
+        # One event per slot, marking completion of the last forward that used
+        # it. Fresh (never-recorded) events synchronize immediately, so the
+        # first pass over the ring is unthrottled.
+        self._fv_slot_events = [torch.cuda.Event() for _ in range(pp_size)]
+        logger.info(f"forward_vars ring: {pp_size} slots (pipeline parallel)")
+
+    def _advance_forward_vars(self):
+        """Rotate to the next in-flight slot. Called once per real forward,
+        before any buffer is written. No-op when the ring has a single slot."""
+        if len(self._fv_ring) == 1:
+            return
+        self._fv_idx = (self._fv_idx + 1) % len(self._fv_ring)
+        # Block until this slot's previous forward finished reading it on the
+        # GPU before we overwrite its host-pinned staging buffers. No-op unless
+        # the CPU has raced > ring-size forwards ahead of the GPU.
+        self._fv_slot_events[self._fv_idx].synchronize()
+        self.forward_vars = self._fv_ring[self._fv_idx]
+        # `input_ids` is the one forward_vars buffer aliased outside the dict
+        # (tokenID_processor writes into it directly); repoint it at this slot.
+        self.tokenID_processor.input_ids = self.forward_vars["input_ids"]
+
+    def _record_forward_vars_event(self):
+        """Mark the current slot's forward as done on the GPU stream. Paired
+        with the synchronize() in ``_advance_forward_vars``. Called at the end of
+        every real forward. No-op when the ring has a single slot."""
+        if len(self._fv_ring) == 1:
+            return
+        self._fv_slot_events[self._fv_idx].record()
+
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
         hf_config = self.config.hf_config
@@ -1441,7 +1546,15 @@ class ModelRunner:
         through that builder, so they are NOT added here. Only MTP-style
         drafts that share the target's KV pool contribute.
         """
-        total = self.config.hf_config.num_hidden_layers
+        num_hidden = self.config.hf_config.num_hidden_layers
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1:
+            start, end = get_pp_indices(
+                num_hidden, pp_group.rank_in_group, pp_group.world_size
+            )
+            total = end - start
+        else:
+            total = num_hidden
         if self.config.speculative_config and hasattr(self, "drafter"):
             if not hasattr(self, "eagle3_draft_builder"):
                 draft_hf = self.config.speculative_config.draft_model_hf_config
@@ -1722,6 +1835,15 @@ class ModelRunner:
             self.num_swa_blocks = 0
             num_kvcache_blocks = available_for_pool // block_bytes
 
+        # PP stages compute different block counts; block ids must be valid on
+        # every stage's KV tensor, so reduce to the global minimum.
+        if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+            t = torch.tensor(
+                [num_kvcache_blocks], dtype=torch.int64, device=self.device
+            )
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+            num_kvcache_blocks = int(t.item())
+
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB, "
@@ -1825,7 +1947,7 @@ class ModelRunner:
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
         # Calculate total number of layers (target + draft)
-        total_num_layers = hf_config.num_hidden_layers
+        total_num_layers = self._get_total_num_layers()
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
@@ -1895,6 +2017,9 @@ class ModelRunner:
             models_to_bind.append(("draft", self.drafter.model))
 
         kv_cache_tensors = []
+        # Key by the module's global layer_num (what it looks up at forward time),
+        # not the local bind counter — under PP a stage's layer_num is offset.
+        kv_cache_keys = []
         layer_id = 0
         # Promote to self so the attention builder's build_kv_cache_tensor()
         # can access it without recomputing from drafter state. Heterogeneous
@@ -1927,6 +2052,7 @@ class ModelRunner:
                     )
                     if kv_cache_tensor is not None:
                         kv_cache_tensors.append(kv_cache_tensor)
+                        kv_cache_keys.append(getattr(module, "layer_num", layer_id))
                         layer_id += 1
                         continue
 
@@ -1942,12 +2068,15 @@ class ModelRunner:
                 )
                 if kv_cache_tensor is not None:
                     kv_cache_tensors.append(kv_cache_tensor)
+                    kv_cache_keys.append(getattr(module, "layer_num", layer_id))
                     layer_id += 1
 
-        # Store KVCacheConfig
+        # Store KVCacheConfig, keyed by each module's (global) layer_num so it
+        # matches the attention's own kv_cache_data[f"layer_{self.layer_num}"]
+        # lookup under pipeline parallel.
         kv_cache_data = {
-            f"layer_{i}": kv_cache_tensor
-            for i, kv_cache_tensor in enumerate(kv_cache_tensors)
+            f"layer_{key}": kv_cache_tensor
+            for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
         if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
@@ -2971,40 +3100,68 @@ class ModelRunner:
                         input_ids, text_embeds, vision_embeds
                     )
 
-                if inputs_embeds is None:
+                pp_group = get_pp_group()
+                pp_enabled = pp_group.world_size > 1
+
+                intermediate_tensors = None
+                if pp_enabled and not pp_group.is_first_rank:
+                    intermediate_tensors = recv_intermediate_tensors()
+
+                if pp_enabled:
+                    model_output = self.model(
+                        input_ids,
+                        positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                    )
+                elif inputs_embeds is None:
                     model_output = self.model(input_ids, positions)
                 else:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
-                # PCP+TBO prefill (request-boundary split): UBatchWrapper concatenated the two
-                # groups' 1/pcp output shards [g0_local | g1_local]. Restore each
-                # group independently: pcp_allgather_rerange its shard back to the
-                # group's global order, crop off the per-group pad, then concat to
-                # the full global sequence. Per-group (not single global) because
-                # each group was striped independently.
-                if _pcp_tbo_balanced:
-                    if self.use_aux_hidden_state_outputs:
-                        _h, _aux = model_output
-                        model_output = (
-                            self._restore_pcp_balanced_output(
-                                _h, _pcp_bal_groups, _pcp_size
-                            ),
-                            _aux,
-                        )
-                    else:
-                        model_output = self._restore_pcp_balanced_output(
-                            model_output, _pcp_bal_groups, _pcp_size
-                        )
-                if self.use_aux_hidden_state_outputs:
-                    hidden_states, self._aux_hidden_states = model_output
-                else:
-                    hidden_states = model_output
+                if pp_enabled and not pp_group.is_last_rank:
+                    if self._pp_pending_send:
+                        commit_pp_send_work(self._pp_pending_send)
+                    self._pp_pending_send = async_send_intermediate_tensors(
+                        model_output
+                    )
+                    hidden_states = None
                     self._aux_hidden_states = None
-                # DSpark captures aux hidden states via forward hooks (the model
-                # itself returns only hidden_states); assemble them in order.
-                self._collect_dspark_aux(hidden_states.shape[0])
-                logits = self.model.compute_logits(hidden_states)
+                    logits = None
+                elif self._is_pure_middle_chunk(batch):
+                    hidden_states = None
+                    self._aux_hidden_states = None
+                    logits = None
+                else:
+                    # PCP+TBO prefill (request-boundary split): UBatchWrapper concatenated the two
+                    # groups' 1/pcp output shards [g0_local | g1_local]. Restore each
+                    # group independently: pcp_allgather_rerange its shard back to the
+                    # group's global order, crop off the per-group pad, then concat to
+                    # the full global sequence. Per-group (not single global) because
+                    # each group was striped independently.
+                    if _pcp_tbo_balanced:
+                        if self.use_aux_hidden_state_outputs:
+                            _h, _aux = model_output
+                            model_output = (
+                                self._restore_pcp_balanced_output(
+                                    _h, _pcp_bal_groups, _pcp_size
+                                ),
+                                _aux,
+                            )
+                        else:
+                            model_output = self._restore_pcp_balanced_output(
+                                model_output, _pcp_bal_groups, _pcp_size
+                            )
+                    if self.use_aux_hidden_state_outputs:
+                        hidden_states, self._aux_hidden_states = model_output
+                    else:
+                        hidden_states = model_output
+                        self._aux_hidden_states = None
+                    # DSpark captures aux hidden states via forward hooks (the model
+                    # itself returns only hidden_states); assemble them in order.
+                    self._collect_dspark_aux(hidden_states.shape[0])
+                    logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
@@ -3081,6 +3238,12 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
 
         return logits, hidden_states
+
+    def flush_pp_send(self) -> bool:
+        """Flush pending PP isend. Returns True for call_func wait_out."""
+        if self._pp_pending_send:
+            commit_pp_send_work(self._pp_pending_send)
+        return True
 
     def postprocess(
         self,
@@ -3224,6 +3387,9 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        # Rotate to this microbatch's slot before prepare_inputs writes buffers.
+        if not batch.is_dummy_run:
+            self._advance_forward_vars()
         (
             input_ids,
             temperatures,
@@ -3233,6 +3399,22 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
+        # No token to sample when this isn't the last PP stage (no logits here)
+        # or the batch is a pure middle prefill chunk (not done yet).
+        pp_group = get_pp_group()
+        pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
+        if pp_non_last or self._is_pure_middle_chunk(batch):
+            reset_forward_context()
+            # Mark this slot's GPU work (attention consumed its metadata) done.
+            if not batch.is_dummy_run:
+                self._record_forward_vars_event()
+            return ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            )
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -3244,8 +3426,13 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
-
+        if not batch.is_dummy_run:
+            self._record_forward_vars_event()
         return fwd_output
+
+    @staticmethod
+    def _is_pure_middle_chunk(batch) -> bool:
+        return batch is not None and not batch.produces_output()
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
