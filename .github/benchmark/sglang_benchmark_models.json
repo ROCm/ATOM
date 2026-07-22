@@ -22,7 +22,8 @@
       "deepseek_v4_prefix_cache_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=true\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
       "glm52_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_USE_AITER=1\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
       "glm52_mi308_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
-      "qwen_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0"
+      "qwen_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+      "minimax_m3_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nTORCHINDUCTOR_COMPILE_THREADS=128\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models"
     }
   },
   "models": [
@@ -461,6 +462,22 @@
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
       "env_vars": "glm52_common"
+    },
+    {
+      "display": "MiniMax-M3-MXFP4 TP4",
+      "dashboard_model": "MiniMax-M3-MXFP4-tp4",
+      "workload_label": "SGLang-OOB",
+      "source_path": "amd/MiniMax-M3-MXFP4",
+      "path": "amd/MiniMax-M3-MXFP4",
+      "prefix": "minimax-m3-mxfp4-tp4",
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 4 --attention-backend aiter --page-size 128 --mem-fraction-static 0.8 --context-length 32768 --max-running-requests 128 --disable-radix-cache --disable-cuda-graph"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-aac-runner",
+      "nightly_group": "B",
+      "env_vars": "minimax_m3_common"
     },
     {
       "display": "GLM-5.2 FP8 TP8 MI308",
