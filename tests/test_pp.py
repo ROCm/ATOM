@@ -14,8 +14,23 @@ import torch
 import torch.nn as nn
 import zmq
 
-# Importing pp_comm pulls aiter.ops.communication.set_custom_all_reduce, which
-# needs a GPU build; stub it so the wrapper logic can be tested on CPU.
+# pp_comm imports aiter.dist.parallel_state and aiter.ops.communication, which
+# need a GPU build; stub them so the wrapper logic can be tested on CPU.
+sys.modules.setdefault("aiter", types.ModuleType("aiter"))
+sys.modules.setdefault("aiter.ops", types.ModuleType("aiter.ops"))
+sys.modules.setdefault("aiter.dist", types.ModuleType("aiter.dist"))
+
+_ps_stub = types.ModuleType("aiter.dist.parallel_state")
+for _fn in (
+    "get_pp_group",
+    "get_tp_group",
+    "init_distributed_environment",
+    "ensure_model_parallel_initialized",
+    "_split_tensor_dict",
+):
+    setattr(_ps_stub, _fn, MagicMock())
+sys.modules.setdefault("aiter.dist.parallel_state", _ps_stub)
+
 _comm_stub = types.ModuleType("aiter.ops.communication")
 _comm_stub.set_custom_all_reduce = lambda *a, **k: None
 sys.modules.setdefault("aiter.ops.communication", _comm_stub)
