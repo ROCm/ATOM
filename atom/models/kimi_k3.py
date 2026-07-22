@@ -255,6 +255,9 @@ class KimiSparseMoeBlock(nn.Module):
             activation=ActivationType.Situv2,
             config=config,
             prefix=f"{prefix}.experts",
+            # inter=3072/TP8=384 is a 128-multiple; pad to 128 (not the 256
+            # default) to avoid padding the MXFP4 MoE intermediate up to 512.
+            pad_align=128,
         )
         if getattr(config, "num_shared_experts", 0):
             self.shared_experts = KimiMLP(

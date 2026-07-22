@@ -49,6 +49,42 @@
     "_baseline_note": "Same base model as DeepSeek-V4-Pro FP8 (MTP-3)."
   },
   {
+    "model_name": "DeepSeek-V4-Pro EPLB r0",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.956,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "EP+DPA, EPLB pure rearrangement (num_redundant_experts=0, no extra memory), rebalance_interval=200. g64 8xMI355X measured GSM8K 5-shot flexible/strict = 0.9560/0.9568 (2026-07-20), 4 rebalances during the eval, 0 crashes. Guards the num_redundant>0 startup-OOM/migration-deadlock fixes (redundant=0 doesn't hit them, but shares the rebalance/migration code path)."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro EPLB r64 naive",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 64, \"placement_policy\": \"naive\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.956,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "EP+DPA, EPLB naive placement (64 redundant physical experts spread thinly via balanced_packing), rebalance_interval=200. Exercises fill_redundant init + runtime rebalance/migration end-to-end, guarding the num_redundant>0 startup-OOM/migration-deadlock fixes. g64 8xMI355X measured GSM8K 5-shot = 0.956 (2026-07-20), 4 rebalances including migration during the eval, 0 crashes."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro EPLB r64 biased",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 64, \"placement_policy\": \"biased\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.955,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "EP+DPA, EPLB biased placement (64 redundant physical experts = top-8 hottest fully replicated to all 8 GPUs), rebalance_interval=200. Exercises fill_redundant init + runtime rebalance/migration end-to-end, guarding the num_redundant>0 startup-OOM/migration-deadlock fixes. g64 8xMI355X measured GSM8K 5-shot flexible/strict = 0.9553/0.9560 (2026-07-20), 4 rebalances including migration during the eval, 0 crashes."
+  },
+  {
     "model_name": "DeepSeek-R1-0528 MTP",
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",

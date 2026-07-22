@@ -850,3 +850,120 @@ class TestScheduledBatchPDFirstDecodeMTP:
         )
 
         assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]
+
+
+# ── detailed annotation aggregates ──────────────────────────────────────────
+
+
+class TestComputeDetailedAggregates:
+    """Unit tests for Scheduler.compute_detailed_aggregates (pure Python).
+
+    The method only touches ``self.profile_active`` and the cached
+    ``self._detailed_annotation_enabled`` flag, so a lightweight
+    SimpleNamespace stands in for both the scheduler and the sequences — no
+    GPU or full Scheduler construction required.
+    """
+
+    @staticmethod
+    def _make_batch(num_scheduled_tokens):
+        return SimpleNamespace(
+            num_scheduled_tokens=num_scheduled_tokens,
+            detailed_sqsq=None,
+            detailed_sqsk=None,
+            detailed_sk=None,
+        )
+
+    @staticmethod
+    def _make_seqs():
+        # Two prefill requests + one decode request.
+        #   prefill A: N_Q=4, cached=2 -> N_KV=6  -> sqsq 16, sqsk 24, sk 6
+        #   prefill B: N_Q=3, cached=0 -> N_KV=3  -> sqsq  9, sqsk  9, sk 3
+        #   decode  C: N_Q=1,          -> N_KV=10 -> sqsq  1, sqsk 10, sk 10
+        return {
+            0: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=6, num_cached_tokens=2
+            ),
+            1: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=3, num_cached_tokens=0
+            ),
+            2: SimpleNamespace(
+                type=SequenceType.DECODE, num_tokens=10, num_cached_tokens=9
+            ),
+        }
+
+    def test_aggregates_when_enabled(self):
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.detailed_sqsq == 16 + 9 + 1
+        assert batch.detailed_sqsk == 24 + 9 + 10
+        assert batch.detailed_sk == 6 + 3 + 10
+
+    def test_noop_when_flag_disabled(self):
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=False
+        )
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.detailed_sqsq is None
+        assert batch.detailed_sqsk is None
+        assert batch.detailed_sk is None
+
+    def test_noop_when_profiling_inactive(self):
+        fake_self = SimpleNamespace(
+            profile_active=False, _detailed_annotation_enabled=True
+        )
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.detailed_sqsq is None
+        assert batch.detailed_sqsk is None
+        assert batch.detailed_sk is None
+
+    def test_no_int32_overflow_large_prefill(self):
+        # Regression: num_scheduled_tokens is np.int32, so nq*nq must not
+        # overflow for long prefills. np.int32(65536)**2 wraps to 0, which
+        # would silently corrupt the estimate the feature exists to produce.
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
+        nq = 65536
+        batch = self._make_batch(np.asarray([nq], dtype=np.int32))
+        seqs = {
+            0: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=nq, num_cached_tokens=0
+            )
+        }
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, seqs)
+
+        assert batch.detailed_sqsq == nq * nq  # 4294967296, not 0
+        assert batch.detailed_sqsk == nq * nq
+        assert batch.detailed_sk == nq
+        assert isinstance(batch.detailed_sqsq, int)
+
+    def test_decode_counts_scheduled_query_tokens(self):
+        # MTP/spec-decode schedules mtp_k+1 query tokens; nq must reflect the
+        # scheduled count rather than a hardcoded 1 (otherwise undercounted).
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
+        batch = self._make_batch(np.asarray([3], dtype=np.int32))
+        seqs = {
+            0: SimpleNamespace(
+                type=SequenceType.DECODE, num_tokens=100, num_cached_tokens=97
+            )
+        }
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, seqs)
+
+        assert batch.detailed_sqsq == 9  # 3^2
+        assert batch.detailed_sqsk == 300  # 3 * 100
+        assert batch.detailed_sk == 100

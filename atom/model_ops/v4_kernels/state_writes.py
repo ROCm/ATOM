@@ -55,6 +55,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 
 @triton.jit
 def _swa_write_kernel(
@@ -116,6 +118,7 @@ def _swa_write_kernel(
     tl.store(dst, src, mask=d_mask)
 
 
+@mark_trace
 def swa_write(
     kv: torch.Tensor,
     positions: torch.Tensor,
@@ -124,9 +127,24 @@ def swa_write(
     swa_region: torch.Tensor,
     block_size: int,
     write_per_batch: int,
+    *,
+    k_packed: torch.Tensor | None = None,
+    k_rope: torch.Tensor | None = None,
+    swa_region_rope: torch.Tensor | None = None,
+    prefix: str = "",
 ) -> None:
-    """paged-SWA in-place write. For the last
-    `min(tok_n_b, write_per_batch)` tokens of every seq `b ∈ [0, bs)` this fwd
+    """paged-SWA in-place write, dispatching on the kv-cache layout.
+
+    Native 2buff fp8 (``swa_region_rope`` provided): the op-quantized extend K
+    comes in as ``k_packed`` (fp8 NoPE) + ``k_rope`` (bf16 RoPE tail), in the
+    ``[T, *]`` or ``[T, 1, *]`` layout produced by the quant kernel; delegates to
+    :func:`swa_write_2buff_prepacked`, which scatters both into their paged pools
+    (``swa_region`` = NoPE pool, ``swa_region_rope`` = RoPE pool) — a pure
+    dtype-agnostic copy, no requant. The bf16 ``kv`` arg is unused on this path
+    (the caller may pass ``None``).
+
+    Otherwise (bf16): for the last `min(tok_n_b, write_per_batch)` tokens of
+    every seq `b ∈ [0, bs)` this fwd
     (`tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`, `bs = block_tables.shape[0]`),
     write `kv[r]` to the content-addressed SWA region:
         swa_region[block_tables[b, pos//block_size] * block_size
@@ -138,7 +156,8 @@ def swa_write(
     cached block instead of a stale ring (issue #1417).
 
     Args:
-        kv: [T, head_dim] per-fwd KV (BF16). `T = cu_seqlens_q[bs]`.
+        kv: [T, head_dim] per-fwd KV (BF16). bf16 path only; `T = cu_seqlens_q[bs]`.
+            May be ``None`` on the fp8 2buff path (``k_packed`` is used instead).
         positions: [T'] int — full forward_vars["positions"] (`T' >= T`).
         cu_seqlens_q: [bs+1] int — exact size (`bs == block_tables.shape[0]`).
         block_tables: [bs, max_blocks_per_seq] int32 — logical→physical block.
@@ -148,7 +167,28 @@ def swa_write(
         block_size: tokens per block (= V4 block_size, 128).
         write_per_batch: `min(max_q_len, block_size_window)` — max tokens
             written per seq this fwd (grid y dim, kernel `constexpr`).
+        k_packed: [T, 512] or [T, 1, 512] fp8 NoPE extend K — fp8 2buff path only.
+        k_rope: [T, rope_head_dim] or [T, 1, rope_head_dim] bf16 RoPE tail — fp8
+            2buff path only.
+        swa_region_rope: [num_pages, rope_head_dim] bf16 RoPE pool — presence
+            selects the fp8 2buff path.
     """
+    if swa_region_rope is not None:
+        # fp8 2buff: scatter the op-quantized extend K (k_packed/k_rope) into both
+        # paged SWA pools. Flatten the [T, 1, *] quant-kernel views to [T, *]; the
+        # bf16 `kv` source is unused here.
+        swa_write_2buff_prepacked(
+            k_packed.view(k_packed.shape[0], -1),
+            k_rope.view(k_rope.shape[0], -1),
+            positions,
+            cu_seqlens_q,
+            block_tables,
+            swa_region,
+            swa_region_rope,
+            block_size,
+            write_per_batch,
+        )
+        return
     assert kv.dim() == 2, f"kv must be [T, D], got {kv.shape}"
     assert positions.dim() == 1
     assert (
@@ -220,6 +260,71 @@ def swa_write_reference(
         phys = block_tables[b, blk].to(torch.long)
         dst_row = phys * block_size + (src_pos % block_size)
         swa_region[dst_row] = src_kv
+
+
+def swa_write_2buff_prepacked(
+    k_packed: torch.Tensor,
+    k_rope: torch.Tensor,
+    positions: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    swa_block_tables: torch.Tensor,
+    swa_region_nope: torch.Tensor,
+    swa_region_rope: torch.Tensor,
+    block_size: int,
+    write_per_batch: int,
+) -> None:
+    """Native 2buff fp8 paged SWA write: content-addressed scatter of the LAST
+    ``min(tok_n_b, write_per_batch)`` tokens of every seq into the two paged
+    SWA pools (fp8 NoPE + bf16 RoPE). The K is ALREADY in the 2buff layout
+    (nope-fp8 ``[T,512]`` + rope-bf16 ``[T,64]``), produced upstream by the
+    compute-only 2buff quant (:func:`qk_norm_rope_maybe_quant_fp8_2buff`). This
+    is a pure dtype-agnostic scatter (reuses the paged :func:`swa_write` once per
+    pool); NO torch quantization happens here.
+
+    Both pools are the flat content-addressed regions of ``unified_kv`` /
+    ``unified_kv_rope`` (``[num_pages, D]``), addressed by ``swa_block_tables``:
+    ``swa_region[block_tables[b, pos//block_size] * block_size + pos%block_size]``.
+    Replaces the pre-paged per-request ring variant (matches the paged bf16
+    :func:`swa_write` semantics; issue #1417).
+
+    Args:
+        k_packed:        [T, 512] fp8 — quantized K nope + inline e8m0 scale + pad.
+        k_rope:          [T, 64]  bf16 — rotated K-PE (not quantized).
+        swa_block_tables:[bs, max_blocks] int32 — paged-SWA logical→physical map.
+        swa_region_nope: [num_pages, 512] fp8 paged pool (2buff nope).
+        swa_region_rope: [num_pages, 64]  bf16 paged pool (rope).
+        block_size:      paging stride of both pools.
+        (other args as :func:`swa_write`.)
+    """
+    from atom.model_ops.v4_kernels.v4_quant import V4_DIM_QK_PACKED, V4_DIM_ROPE
+
+    assert (
+        k_packed.dim() == 2 and k_packed.shape[1] == V4_DIM_QK_PACKED
+    ), f"k_packed must be [T,{V4_DIM_QK_PACKED}] fp8, got {tuple(k_packed.shape)}"
+    assert (
+        k_rope.dim() == 2 and k_rope.shape[1] == V4_DIM_ROPE
+    ), f"k_rope must be [T,{V4_DIM_ROPE}] bf16, got {tuple(k_rope.shape)}"
+    assert swa_region_nope.dim() == 2 and swa_region_nope.shape[1] == V4_DIM_QK_PACKED
+    assert swa_region_rope.dim() == 2 and swa_region_rope.shape[1] == V4_DIM_ROPE
+
+    swa_write(
+        k_packed.contiguous(),
+        positions,
+        cu_seqlens_q,
+        swa_block_tables,
+        swa_region_nope,
+        block_size,
+        write_per_batch,
+    )
+    swa_write(
+        k_rope.contiguous(),
+        positions,
+        cu_seqlens_q,
+        swa_block_tables,
+        swa_region_rope,
+        block_size,
+        write_per_batch,
+    )
 
 
 # === Unified Compressor state save (plan path) ==========================
@@ -315,6 +420,7 @@ def _update_compressor_states_kernel(
     )
 
 
+@mark_trace
 def update_compressor_states(
     kv: torch.Tensor,
     score: torch.Tensor,
@@ -323,10 +429,10 @@ def update_compressor_states(
     score_state: torch.Tensor,
     *,
     write_plan: torch.Tensor,  # [num_write, 4] int32
-    num_write: int,
     state_slot_mapping: torch.Tensor,  # [bs] int32 — per-seq state slot
     ratio: int,
     overlap: bool,
+    prefix: str = "",
 ) -> None:
     """In-place update of Compressor's per-request `kv_state`/`score_state`
     ring buffer (size ≥ `K_pool = (1+overlap)*ratio`; V4-Pro widens to
@@ -349,10 +455,13 @@ def update_compressor_states(
       kv_state:     [num_slots, S, dim] in-place ring buffer. S ≥ K_pool;
                     V4-Pro: S = K_pool + max_spec_steps.
       score_state:  same shape as kv_state.
-      write_plan:   [num_write, 4] int32 — packed (ragged_id, batch_id,
-                    position, _); each row = one token to write.
-      num_write:    grid size (CPU scalar, == write_plan.shape[0] but kept
-                    explicit to avoid GPU sync).
+      write_plan:   [grid, 4] int32 — packed (ragged_id, batch_id, position, _);
+                    each active row = one token to write. `grid` (== shape[0])
+                    is the caller-supplied slice length: the decode-tight
+                    `graph_bs * min(qlen, K_pool)` on the CUDAGraph path, tight
+                    `num_write` on the eager path, or the full buffer capacity
+                    for the extend-shaped verify path. Inactive tail rows carry
+                    sentinel `position=-1` and are skipped.
       state_slot_mapping: [bs] int32 — per-seq state cache slot.
       ratio, overlap: compress geometry.
     """
@@ -368,11 +477,10 @@ def update_compressor_states(
     assert write_plan.dim() == 2 and write_plan.shape[1] == 4
     assert write_plan.dtype == torch.int32
     assert state_slot_mapping.dim() == 1 and state_slot_mapping.dtype == torch.int32
-    # Grid = plan buffer capacity (fixed at builder __init__ time), NOT the
-    # per-fwd `num_write`. Inactive rows past `num_write` carry sentinel
-    # `position=-1` (filled host-side in `make_compress_plans`); the kernel
-    # bails on those, so this is functionally identical to the variable-grid
-    # version while keeping the launch CUDAGraph-capturable.
+    # Grid = the write-plan slice length (fixed at capture on the CUDAGraph
+    # path). Inactive tail rows carry sentinel `position=-1` (filled host-side
+    # in `make_compress_plans`); the kernel bails on those, so a padded slice is
+    # functionally identical to a tight one while staying CUDAGraph-capturable.
     grid_size = write_plan.shape[0]
     if grid_size == 0:
         return
@@ -434,3 +542,301 @@ def update_compressor_states_reference(
         dst = position % state_size
         kv_state[slot, dst] = kv[ragged_id]
         score_state[slot, dst] = score[ragged_id] + ape[position % ratio]
+
+
+# === DSpark paged window gather (read side of paged-SWA migration) =======
+# DSpark's block drafter attends `[rolling target window ++ draft block]`. The
+# window KV now lives in the shared paged pool (`unified_kv`, draft layer slice
+# bound as `attn.swa_kv`), content-addressed by `swa_block_tables` exactly like
+# the V4 target SWA. The block-sparse attention still wants a DENSE `[B, W, D]`
+# window tensor (it concatenates the in-forward draft KV and runs `sparse_attn`),
+# so this kernel materialises that window from the pool.
+#
+# Window slot `s ∈ [0, W)` for seq `b` holds the target token at absolute
+# position `p = anchor_pos[b] - (W - 1) + s`. Slots with `p < 0` are unfilled
+# (the caller's `valid_target` mask drops them; we zero them here so a stray read
+# is harmless). Filled slots map to the pool via the same addressing as the
+# paged write:
+#     blk     = p // block_size
+#     phys    = swa_block_tables[b, blk]
+#     src_row = phys * block_size + (p % block_size)
+
+
+@triton.jit
+def _dspark_paged_window_gather_kernel(
+    swa_region_ptr,  # [num_pages, head_dim] flat SWA pool slice
+    swa_region_row_stride,  # = head_dim
+    block_tables_ptr,  # [B, max_blocks] int32 logical->physical
+    block_tables_stride,  # row stride = max_blocks
+    anchor_pos_ptr,  # [B] int — per-seq anchor absolute position
+    out_ptr,  # [B, W, head_dim] dense window output
+    out_seq_stride,  # = W * head_dim
+    out_slot_stride,  # = head_dim
+    head_dim,
+    block_size,
+    W: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """2D grid `(B, W)`. Program `(b, s)` gathers window slot `s` of seq `b`
+    from the paged pool into `out[b, s, :]`. Unfilled slots (`p < 0`) write 0."""
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+
+    anchor = tl.load(anchor_pos_ptr + b)
+    p = anchor - (W - 1) + s
+
+    d_offsets = tl.arange(0, BLOCK_D)
+    d_mask = d_offsets < head_dim
+    out_base = out_ptr + b * out_seq_stride + s * out_slot_stride
+
+    if p < 0:
+        # Unfilled slot: zero it (valid_target masks it out in attention anyway).
+        tl.store(
+            out_base + d_offsets,
+            tl.zeros([BLOCK_D], dtype=out_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
+        return
+
+    blk = p // block_size
+    phys = tl.load(block_tables_ptr + b * block_tables_stride + blk)
+    src_row = phys * block_size + (p % block_size)
+    src = tl.load(
+        swa_region_ptr + src_row * swa_region_row_stride + d_offsets,
+        mask=d_mask,
+    )
+    tl.store(out_base + d_offsets, src, mask=d_mask)
+
+
+def dspark_paged_window_gather(
+    swa_region: torch.Tensor,  # [num_pages, head_dim] pool slice (attn.swa_kv)
+    block_tables: torch.Tensor,  # [B, max_blocks] int32
+    anchor_pos: torch.Tensor,  # [B] int — anchor absolute position per seq
+    window: int,
+    block_size: int,
+) -> torch.Tensor:  # [B, window, head_dim]
+    """Materialise the dense `[B, W, head_dim]` rolling window from the paged
+    SWA pool, addressed by `block_tables` (mirrors `swa_write`). Slot `s` holds
+    absolute position `anchor_pos[b] - (W-1) + s`; `p < 0` slots are zeroed.
+    """
+    assert swa_region.dim() == 2, f"swa_region must be [P, D], got {swa_region.shape}"
+    assert (
+        block_tables.dim() == 2
+    ), f"block_tables must be [B, MB], got {block_tables.shape}"
+    B = block_tables.shape[0]
+    num_pages, head_dim = swa_region.shape
+    assert anchor_pos.shape[0] >= B
+    assert swa_region.is_contiguous()
+
+    out = torch.zeros(
+        B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype
+    )
+    if B == 0 or window == 0:
+        return out
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    grid = (B, window)
+    _dspark_paged_window_gather_kernel[grid](
+        swa_region,
+        swa_region.stride(0),
+        block_tables,
+        block_tables.stride(0),
+        anchor_pos.to(torch.int32),
+        out,
+        out.stride(0),
+        out.stride(1),
+        head_dim,
+        block_size,
+        W=window,
+        BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
+def dspark_paged_window_gather_reference(
+    swa_region: torch.Tensor,
+    block_tables: torch.Tensor,
+    anchor_pos: torch.Tensor,
+    window: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Pure-torch reference for `dspark_paged_window_gather` (unit tests)."""
+    B = block_tables.shape[0]
+    _, head_dim = swa_region.shape
+    out = torch.zeros(
+        B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype
+    )
+    for b in range(B):
+        anchor = int(anchor_pos[b].item())
+        for s in range(window):
+            p = anchor - (window - 1) + s
+            if p < 0:
+                continue
+            blk = p // block_size
+            phys = int(block_tables[b, blk].item())
+            src_row = phys * block_size + (p % block_size)
+            out[b, s] = swa_region[src_row]
+    return out
+
+
+# === DSpark paged window gather — native 2buff fp8 variant =================
+# fp8 KV cache stores the rolling target window in the SAME 2buff layout as the
+# V4 target: NoPE lanes fp8-quantized (per-64-elt e8m0 tile scale, inline in the
+# 512B `swa_region_nope` row) + RoPE lanes bf16 in a parallel `swa_region_rope`
+# pool, both paged and content-addressed by `swa_block_tables`. DSpark's block
+# attention wants a DENSE bf16 `[B, W, head_dim]` window, so this kernel gathers
+# BOTH pools and dequantizes the NoPE half on the fly (fp8_val * 2^(B-127)),
+# concatenating the bf16 RoPE tail — a fused analog of
+# `dspark_paged_window_gather` + `dequantize_v4_2buff_to_bf16`.
+
+
+@triton.jit
+def _dspark_paged_window_gather_2buff_kernel(
+    nope_fp8_ptr,  # [num_pages, 512] fp8 (NoPE 448 | dup-e8m0-scale 14 | pad 50)
+    nope_u8_ptr,  # same buffer, uint8 view — reads the e8m0 scale bytes
+    rope_ptr,  # [num_pages, ROPE] bf16 rope pool
+    nope_row_stride,  # = 512
+    rope_row_stride,  # = ROPE
+    block_tables_ptr,  # [B, max_blocks] int32
+    block_tables_stride,  # row stride
+    anchor_pos_ptr,  # [B] int
+    out_ptr,  # [B, W, NOPE+ROPE] bf16 dense window
+    out_seq_stride,  # = W * (NOPE+ROPE)
+    out_slot_stride,  # = NOPE+ROPE
+    block_size,
+    W: tl.constexpr,
+    NOPE: tl.constexpr,  # 448
+    ROPE: tl.constexpr,  # 64
+    TILE: tl.constexpr,  # 64
+    NUM_TILES: tl.constexpr,  # 7
+    PACK_OFF_SCALE: tl.constexpr,  # 448
+):
+    """2D grid `(B, W)`. Program `(b, s)` gathers + dequantizes window slot `s`
+    of seq `b` into `out[b, s, :]` (bf16). Unfilled slots (`p < 0`) write 0."""
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+
+    anchor = tl.load(anchor_pos_ptr + b)
+    p = anchor - (W - 1) + s
+    out_base = out_ptr + b * out_seq_stride + s * out_slot_stride
+
+    d_tile = tl.arange(0, TILE)
+    r_cols = tl.arange(0, ROPE)
+
+    if p < 0:
+        # Unfilled slot: zero it (valid_target masks it out in attention anyway).
+        zero_t = tl.zeros([TILE], dtype=out_ptr.dtype.element_ty)
+        for t in tl.static_range(NUM_TILES):
+            tl.store(out_base + t * TILE + d_tile, zero_t)
+        tl.store(
+            out_base + NOPE + r_cols,
+            tl.zeros([ROPE], dtype=out_ptr.dtype.element_ty),
+        )
+        return
+
+    blk = p // block_size
+    phys = tl.load(block_tables_ptr + b * block_tables_stride + blk)
+    src_row = phys * block_size + (p % block_size)
+
+    # NoPE: per-64-elt tile fp8 dequant. e8m0 byte B decodes to 2^(B-127); B==0
+    # is the all-zero-tile sentinel -> scale 0.0 (mirrors _e8m0_to_fp32_pow2).
+    for t in tl.static_range(NUM_TILES):
+        cols = t * TILE + d_tile
+        x = tl.load(nope_fp8_ptr + src_row * nope_row_stride + cols).to(tl.float32)
+        byte = tl.load(
+            nope_u8_ptr + src_row * nope_row_stride + PACK_OFF_SCALE + 2 * t
+        ).to(tl.int32)
+        scale = tl.where(byte > 0, tl.exp2((byte - 127).to(tl.float32)), 0.0)
+        tl.store(out_base + cols, (x * scale).to(out_ptr.dtype.element_ty))
+
+    # RoPE tail: bf16 passthrough.
+    r = tl.load(rope_ptr + src_row * rope_row_stride + r_cols)
+    tl.store(out_base + NOPE + r_cols, r.to(out_ptr.dtype.element_ty))
+
+
+def dspark_paged_window_gather_2buff(
+    swa_region_nope: torch.Tensor,  # [num_pages, 512] fp8
+    swa_region_rope: torch.Tensor,  # [num_pages, rope_head_dim] bf16
+    block_tables: torch.Tensor,  # [B, max_blocks] int32
+    anchor_pos: torch.Tensor,  # [B] int
+    window: int,
+    block_size: int,
+) -> torch.Tensor:  # [B, window, V4_DIM_QK] bf16
+    """Materialise + dequantize the dense bf16 `[B, W, 512]` rolling window from
+    the native 2buff fp8 paged SWA pools (NoPE fp8 + RoPE bf16), addressed by
+    `block_tables` (mirrors `swa_write_2buff_prepacked`). Slot `s` holds absolute
+    position `anchor_pos[b] - (W-1) + s`; `p < 0` slots are zeroed.
+    """
+    from atom.model_ops.v4_kernels.v4_quant import (
+        V4_DIM_NOPE,
+        V4_DIM_QK,
+        V4_DIM_QK_PACKED,
+        V4_DIM_ROPE,
+        V4_NUM_TILES,
+        V4_PACK_OFF_SCALE,
+        V4_TILE,
+    )
+
+    assert (
+        swa_region_nope.dim() == 2 and swa_region_nope.shape[1] == V4_DIM_QK_PACKED
+    ), (
+        f"swa_region_nope must be [P,{V4_DIM_QK_PACKED}] fp8, "
+        f"got {tuple(swa_region_nope.shape)}"
+    )
+    assert swa_region_rope.dim() == 2 and swa_region_rope.shape[1] == V4_DIM_ROPE, (
+        f"swa_region_rope must be [P,{V4_DIM_ROPE}] bf16, "
+        f"got {tuple(swa_region_rope.shape)}"
+    )
+    assert (
+        block_tables.dim() == 2
+    ), f"block_tables must be [B, MB], got {block_tables.shape}"
+    assert swa_region_nope.is_contiguous() and swa_region_rope.is_contiguous()
+    B = block_tables.shape[0]
+    out = torch.empty(
+        B, window, V4_DIM_QK, device=swa_region_nope.device, dtype=torch.bfloat16
+    )
+    if B == 0 or window == 0:
+        return out
+    grid = (B, window)
+    _dspark_paged_window_gather_2buff_kernel[grid](
+        swa_region_nope,
+        swa_region_nope.view(torch.uint8),
+        swa_region_rope,
+        swa_region_nope.stride(0),
+        swa_region_rope.stride(0),
+        block_tables,
+        block_tables.stride(0),
+        anchor_pos.to(torch.int32),
+        out,
+        out.stride(0),
+        out.stride(1),
+        block_size,
+        W=window,
+        NOPE=V4_DIM_NOPE,
+        ROPE=V4_DIM_ROPE,
+        TILE=V4_TILE,
+        NUM_TILES=V4_NUM_TILES,
+        PACK_OFF_SCALE=V4_PACK_OFF_SCALE,
+    )
+    return out
+
+
+def dspark_paged_window_gather_2buff_reference(
+    swa_region_nope: torch.Tensor,
+    swa_region_rope: torch.Tensor,
+    block_tables: torch.Tensor,
+    anchor_pos: torch.Tensor,
+    window: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Pure-torch reference for `dspark_paged_window_gather_2buff` (unit tests):
+    gather each 2buff pool with the single-pool reference, then dequantize.
+    """
+    from atom.model_ops.v4_kernels.v4_quant import dequantize_v4_2buff_to_bf16
+
+    nope = dspark_paged_window_gather_reference(
+        swa_region_nope, block_tables, anchor_pos, window, block_size
+    )  # [B, W, 512] fp8
+    rope = dspark_paged_window_gather_reference(
+        swa_region_rope, block_tables, anchor_pos, window, block_size
+    )  # [B, W, rope] bf16
+    return dequantize_v4_2buff_to_bf16(nope, rope)
