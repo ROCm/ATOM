@@ -8,8 +8,6 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
-from __future__ import annotations
-
 import os
 from typing import Optional, Union
 
@@ -54,8 +52,9 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.utils import envs
+from atom.utils import envs, mark_spliting_op
 from atom.utils.forward_context import get_forward_context
+from atom.utils.decorators import support_torch_compile
 
 
 def _text_config(config):
@@ -576,6 +575,35 @@ class KimiFullAttention(nn.Module):
         return self.o_proj(attn_out)
 
 
+def _kda_attention_with_output_fake(
+    hidden_states: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=_kda_attention_with_output_fake,
+    mutates_args=[],
+)
+def kda_attention_with_output(
+    hidden_states: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    """Opaque splitting-op boundary for the KDA mixer.
+
+    The KDA recurrence reads the forward context, calls fla causal-conv/kda
+    kernels and mutates the per-request conv/ssm cache in place. torch.compile
+    (level 3) mis-compiles that stateful path into garbage if it is allowed to
+    trace through it, so the whole mixer is wrapped in a custom op — inductor
+    treats it as opaque and the piecewise backend splits the graph here,
+    exactly as the GDN path does via aiter.linear_attention_with_output_base.
+    """
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self._forward_impl(hidden_states)
+
+
 class KimiKDAAttention(nn.Module):
     @property
     def mamba_type(self) -> str:
@@ -603,6 +631,16 @@ class KimiKDAAttention(nn.Module):
         self.layer_num = _extract_layer_idx(prefix)
         self.activation = "silu"
         self.base_linear_attention = True
+
+        # Register under a stable name so the kda_attention_with_output custom op
+        # can recover this module from the forward context. The op is the
+        # graph-split boundary that keeps torch.compile from tracing (and
+        # mis-compiling) the stateful KDA recurrence.
+        self.layer_name = prefix
+        compilation_config = atom_config.compilation_config
+        if self.layer_name in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer: {self.layer_name}")
+        compilation_config.static_forward_context[self.layer_name] = self
 
         # q/k/v/g/b input projections. These are loaded as separate modules
         # (unique, collision-free checkpoint names) and then concatenated into a
@@ -799,6 +837,11 @@ class KimiKDAAttention(nn.Module):
         return chunk_kda(**kwargs)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Route through the opaque custom op so torch.compile splits the graph
+        # here instead of tracing the stateful recurrence in _forward_impl.
+        return torch.ops.aiter.kda_attention_with_output(hidden_states, self.layer_name)
+
+    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         fwd_ctx = get_forward_context()
         gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
         if gdn_metadata is None:
@@ -929,9 +972,7 @@ class KimiKDAAttention(nn.Module):
         else:
             out.zero_()
 
-        out = self.o_norm(
-            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
-        )
+        out = self.o_norm(out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim))
         return self.o_proj(rearrange(out, "t h d -> t (h d)"))
 
 
@@ -1081,6 +1122,7 @@ def _apply_attn_res(
     return torch.matmul(probs, values_f).squeeze(1).to(prefix_sum.dtype)
 
 
+@support_torch_compile
 class KimiLinearModel(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
