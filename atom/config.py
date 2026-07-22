@@ -266,57 +266,16 @@ class QuantizationConfig:
     - ``quant_type``, ``quant_dtype``, ``is_dynamic`` convenience properties
     """
 
-    _ONLINE_QUANT_SOURCE_METHODS = frozenset({"", "fp8", "mxfp4", "mxfp8", "quark"})
-    _KIMI_MODEL_TYPES = frozenset({"kimi_k3", "kimi_linear"})
-    _KIMI_REQUIRED_SOURCE_EXCLUDES = frozenset(
+    _ONLINE_QUANT_SOURCE_METHODS = frozenset(
         {
-            "re:.*self_attn.*",
-            "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
+            "",
+            "fp8",
+            "mxfp4",
+            "mxfp8",
+            "quark",
+            "compressed-tensors",
         }
     )
-    _KIMI_FULL_MOE_ONLINE_EXCLUDE = "*block_sparse_moe*"
-    _KIMI_ROUTED_MOE_ONLINE_EXCLUDES = frozenset(
-        {
-            "*block_sparse_moe.experts*",
-            "*block_sparse_moe.routed_expert_*",
-        }
-    )
-
-    @staticmethod
-    def _exclude_pattern_set(patterns: Any) -> set[str]:
-        if isinstance(patterns, str):
-            return {patterns} if patterns else set()
-        if isinstance(patterns, (list, tuple)):
-            return {pattern for pattern in patterns if isinstance(pattern, str)}
-        return set()
-
-    @classmethod
-    def _supports_kimi_compressed_tensors_online_quant(
-        cls,
-        config: PretrainedConfig,
-        online_quant_config: dict,
-    ) -> bool:
-        if not isinstance(online_quant_config, dict):
-            return False
-        if getattr(config, "model_type", None) not in cls._KIMI_MODEL_TYPES:
-            return False
-
-        hf_quant_config = getattr(config, "quantization_config", None)
-        if not isinstance(hf_quant_config, dict):
-            return False
-        source_excludes = cls._exclude_pattern_set(hf_quant_config.get("ignore"))
-        online_excludes = cls._exclude_pattern_set(
-            online_quant_config.get("exclude_layer")
-        )
-
-        moe_source_is_protected = (
-            cls._KIMI_FULL_MOE_ONLINE_EXCLUDE in online_excludes
-            or cls._KIMI_ROUTED_MOE_ONLINE_EXCLUDES.issubset(online_excludes)
-        )
-        return (
-            cls._KIMI_REQUIRED_SOURCE_EXCLUDES.issubset(source_excludes)
-            and moe_source_is_protected
-        )
 
     def __init__(
         self,
@@ -358,17 +317,15 @@ class QuantizationConfig:
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
         self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
         self.online_exclude_layers: list[str] = []
-        online_source_supported = (
-            self.quant_method in self._ONLINE_QUANT_SOURCE_METHODS
-            or (
-                self.quant_method == "compressed-tensors"
-                and self._supports_kimi_compressed_tensors_online_quant(
-                    config, online_quant_config
-                )
-            )
-        )
+        online_source_supported = self.quant_method in self._ONLINE_QUANT_SOURCE_METHODS
         if online_quant_config and online_source_supported:
             self.online_quant = True
+            if self.quant_method == "compressed-tensors":
+                logger.warning(
+                    "Online quantization for compressed-tensors checkpoints "
+                    "relies on the caller's exclude_layer configuration. Ensure "
+                    "unsupported or already-quantized layers are excluded."
+                )
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec
