@@ -265,9 +265,7 @@ def test_generate_sglang_config_downgrades_dsv4_fp8_kv_cache_on_unsupported_gpu(
         atom_config_module, "CompilationConfig", _FakeCompilationConfig, raising=False
     )
 
-    fake_server_args = _make_fake_server_args(
-        kv_cache_dtype=requested_kv_cache_dtype
-    )
+    fake_server_args = _make_fake_server_args(kv_cache_dtype=requested_kv_cache_dtype)
 
     mock_sglang_server_args = MagicMock()
     mock_sglang_server_args.get_global_server_args.return_value = fake_server_args
