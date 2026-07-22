@@ -8,6 +8,12 @@ import numpy as np
 import torch
 
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+try:
+    from atom.model_ops.v4_kernels.v4_quant import (
+        V4_DIM_QK_PACKED as ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+    )
+except Exception:  # pragma: no cover - import fallback for partial runtime envs
+    ATOM_DEEPSEEK_V4_FP8_PACKED_DIM = 512
 
 
 def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
@@ -75,6 +81,20 @@ def _layer_counts(compress_ratios) -> tuple[list[int], int, int, int]:
     return ratios, dense, csa, hca
 
 
+def _is_fp8_dtype(dtype: Any) -> bool:
+    dtype_name = str(dtype).lower()
+    return "float8" in dtype_name or "fp8" in dtype_name or "e4m3" in dtype_name
+
+
+def _supports_dsv4_fp8_2buff() -> bool:
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx() in ("gfx950", "gfx1250")
+    except Exception:
+        return False
+
+
 def _resolve_sglang_spec_steps() -> int:
     try:
         from sglang.srt.server_args import get_global_server_args
@@ -133,6 +153,21 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         end_layer: Optional[int] = None,
         enable_hisparse: bool = False,
     ) -> None:
+        self.use_fp8_kv = _is_fp8_dtype(dtype) or _is_fp8_dtype(state_dtype)
+        if not self.use_fp8_kv:
+            try:
+                from atom.config import get_current_atom_config
+
+                atom_config = get_current_atom_config()
+                self.use_fp8_kv = _is_fp8_dtype(
+                    getattr(atom_config, "kv_cache_dtype", None)
+                )
+            except Exception:
+                pass
+        # aiter DSV4 native 2-buffer fp8 op4/op5 kernels are only available on
+        # gfx950/gfx1250. Keep unsupported GPUs on the bf16 layout.
+        if self.use_fp8_kv and not _supports_dsv4_fp8_2buff():
+            self.use_fp8_kv = False
         del c4_state_pool_size, c128_state_pool_size, dtype, state_dtype
         del enable_memory_saver, enable_hisparse
 
@@ -154,6 +189,14 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         self.qk_nope_head_dim = int(qk_nope_head_dim)
         self.qk_rope_head_dim = int(qk_rope_head_dim)
         self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        if self.use_fp8_kv and (
+            self.qk_nope_head_dim <= 0 or self.qk_rope_head_dim <= 0
+        ):
+            raise ValueError(
+                "DeepSeek-V4 fp8 proxy KV pool requires positive "
+                f"qk_nope_head_dim/qk_rope_head_dim, got "
+                f"{self.qk_nope_head_dim}/{self.qk_rope_head_dim}"
+            )
         self.indexer_head_dim = int(indexer_head_dim)
         self.index_dim = _aligned_index_dim(self.indexer_head_dim)
         self.compression_ratios = [int(r) for r in compression_ratios]
@@ -191,16 +234,37 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
 
     def _compute_raw_bytes(self) -> int:
         total = 0
-        swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
+        if self.use_fp8_kv:
+            swa_bytes = (
+                self.num_slots
+                * self.swa_cache_size
+                * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
+            )
+        else:
+            swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
         for ratio in self.stage_ratios:
             total += swa_bytes
             if ratio == 4:
                 k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
-                total += self.num_blocks * k * self.head_dim * 2
+                if self.use_fp8_kv:
+                    total += (
+                        self.num_blocks
+                        * k
+                        * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
+                    )
+                else:
+                    total += self.num_blocks * k * self.head_dim * 2
                 total += self.num_blocks * k * self.index_dim
             elif ratio == 128:
                 k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128
-                total += self.num_blocks * k * self.head_dim * 2
+                if self.use_fp8_kv:
+                    total += (
+                        self.num_blocks
+                        * k
+                        * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
+                    )
+                else:
+                    total += self.num_blocks * k * self.head_dim * 2
         return max(1, total)
 
     def _take(self, offset: int, nbytes: int) -> torch.Tensor:
@@ -221,12 +285,129 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
 
         offset = 0
         unified: list[torch.Tensor] = []
+        unified_rope: list[Optional[torch.Tensor]] = []
         swa: list[torch.Tensor] = []
+        swa_rope: list[Optional[torch.Tensor]] = []
         csa_main: list[torch.Tensor] = []
+        csa_main_rope: list[Optional[torch.Tensor]] = []
         csa_indexer: list[torch.Tensor] = []
         hca_main: list[torch.Tensor] = []
+        hca_main_rope: list[Optional[torch.Tensor]] = []
 
         for ratio in self.stage_ratios:
+            if self.use_fp8_kv:
+                k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // ratio if ratio in (4, 128) else 0
+                num_pages = self.num_slots * self.swa_cache_size + self.num_blocks * k
+
+                nope_start = offset
+                swa_nope_bytes = (
+                    self.num_slots
+                    * self.swa_cache_size
+                    * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
+                )
+                swa_view = (
+                    self._take(offset, swa_nope_bytes)
+                    .view(fp8_dtype)
+                    .view(
+                        self.num_slots,
+                        self.swa_cache_size,
+                        ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+                    )
+                )
+                offset += swa_nope_bytes
+
+                main_view = None
+                if ratio in (4, 128):
+                    main_nope_bytes = (
+                        self.num_blocks * k * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
+                    )
+                    main_view = (
+                        self._take(offset, main_nope_bytes)
+                        .view(fp8_dtype)
+                        .as_strided(
+                            size=(
+                                self.num_blocks,
+                                k,
+                                ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+                            ),
+                            stride=(
+                                k * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+                                ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+                                1,
+                            ),
+                        )
+                    )
+                    offset += main_nope_bytes
+
+                unified.append(
+                    self.raw_arena[nope_start:offset]
+                    .view(fp8_dtype)
+                    .view(num_pages, ATOM_DEEPSEEK_V4_FP8_PACKED_DIM)
+                )
+
+                rope_start = offset
+                swa_rope_bytes = (
+                    self.num_slots * self.swa_cache_size * self.qk_rope_head_dim * 2
+                )
+                swa_rope_view = (
+                    self._take(offset, swa_rope_bytes)
+                    .view(torch.bfloat16)
+                    .view(
+                        self.num_slots,
+                        self.swa_cache_size,
+                        self.qk_rope_head_dim,
+                    )
+                )
+                offset += swa_rope_bytes
+
+                main_rope_view = None
+                if ratio in (4, 128):
+                    main_rope_bytes = self.num_blocks * k * self.qk_rope_head_dim * 2
+                    main_rope_view = (
+                        self._take(offset, main_rope_bytes)
+                        .view(torch.bfloat16)
+                        .as_strided(
+                            size=(self.num_blocks, k, self.qk_rope_head_dim),
+                            stride=(
+                                k * self.qk_rope_head_dim,
+                                self.qk_rope_head_dim,
+                                1,
+                            ),
+                        )
+                    )
+                    offset += main_rope_bytes
+
+                unified_rope.append(
+                    self.raw_arena[rope_start:offset]
+                    .view(torch.bfloat16)
+                    .view(num_pages, self.qk_rope_head_dim)
+                )
+                swa.append(swa_view)
+                swa_rope.append(swa_rope_view)
+
+                if ratio == 4:
+                    assert main_view is not None
+                    assert main_rope_view is not None
+                    idx_bytes = self.num_blocks * k * self.index_dim
+                    idx = (
+                        self._take(offset, idx_bytes)
+                        .view(fp8_dtype)
+                        .as_strided(
+                            size=(self.num_blocks, k, self.index_dim),
+                            stride=(k * self.index_dim, self.index_dim, 1),
+                        )
+                    )
+                    offset += idx_bytes
+                    csa_main.append(main_view)
+                    csa_main_rope.append(main_rope_view)
+                    csa_indexer.append(idx)
+                elif ratio == 128:
+                    assert main_view is not None
+                    assert main_rope_view is not None
+                    hca_main.append(main_view)
+                    hca_main_rope.append(main_rope_view)
+                continue
+
             layer_start = offset
             swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
             swa_view = (
@@ -236,6 +417,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
             )
             offset += swa_bytes
             swa.append(swa_view)
+            swa_rope.append(None)
 
             if ratio == 4:
                 k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
@@ -257,6 +439,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                         self.head_dim,
                     )
                 )
+                unified_rope.append(None)
                 idx_bytes = self.num_blocks * k * self.index_dim
                 idx = (
                     self._take(offset, idx_bytes)
@@ -268,6 +451,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 )
                 offset += idx_bytes
                 csa_main.append(main)
+                csa_main_rope.append(None)
                 csa_indexer.append(idx)
             elif ratio == 128:
                 k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128
@@ -289,18 +473,25 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                         self.head_dim,
                     )
                 )
+                unified_rope.append(None)
                 hca_main.append(main)
+                hca_main_rope.append(None)
             else:
                 unified.append(
                     swa_view.view(self.num_slots * self.swa_cache_size, self.head_dim)
                 )
+                unified_rope.append(None)
 
         return {
             "unified": unified,
+            "unified_rope": unified_rope,
             "swa": swa,
+            "swa_rope": swa_rope,
             "csa_main": csa_main,
+            "csa_main_rope": csa_main_rope,
             "csa_indexer": csa_indexer,
             "hca_main": hca_main,
+            "hca_main_rope": hca_main_rope,
         }
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
@@ -348,7 +539,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         return torch.unique(pairs.cpu(), dim=0)
 
     @staticmethod
-    def _copy_block_views(views: list[torch.Tensor], block_pairs: torch.Tensor) -> None:
+    def _copy_block_views(
+        views: list[Optional[torch.Tensor]], block_pairs: torch.Tensor
+    ) -> None:
         """Copy compressed KV blocks between proxy views during radix relocation."""
         if not views or block_pairs.numel() == 0:
             return
@@ -356,6 +549,8 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         tgt_blocks = block_pairs[:, 0]
         src_blocks = block_pairs[:, 1]
         for view in views:
+            if view is None:
+                continue
             num_blocks = int(view.shape[0])
             valid = (
                 (src_blocks >= 0)
@@ -410,8 +605,10 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # compressed history by 128-token blocks, while SWA history lives in a
         # per-request state slot keyed by the request's first block.
         self._copy_block_views(self.views["csa_main"], block_pairs)
+        self._copy_block_views(self.views["csa_main_rope"], block_pairs)
         self._copy_block_views(self.views["csa_indexer"], block_pairs)
         self._copy_block_views(self.views["hca_main"], block_pairs)
+        self._copy_block_views(self.views["hca_main_rope"], block_pairs)
 
         allocator = getattr(self, "_atom_v4_slot_allocator", None)
         if allocator is not None:
@@ -443,6 +640,7 @@ def _bind_compressor_state(
     *,
     is_indexer: bool = False,
     head_dim: Optional[int] = None,
+    kv_cache_rope: Optional[torch.Tensor] = None,
 ) -> None:
     compressor.kv_state = torch.zeros(
         (num_slots, *compressor.kv_state.shape[1:]),
@@ -456,6 +654,7 @@ def _bind_compressor_state(
         device=kv_cache.device,
     )
     compressor.kv_cache = kv_cache
+    compressor.kv_cache_rope = kv_cache_rope
     if is_indexer:
         nb, k1, aligned_dim = kv_cache.shape
         if head_dim is None:
@@ -471,8 +670,12 @@ def _bind_compressor_state(
                 storage_offset=scale_fp32_offset,
             )
         )
+        compressor.write_mode = "indexer_fp8"
     else:
         compressor.cache_scale = None
+        compressor.write_mode = (
+            "main_2buff_fp8" if kv_cache_rope is not None else "bf16"
+        )
 
 
 def _iter_deepseek_v4_cache_blocks(model):
@@ -509,6 +712,8 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
         attn = block.attn
         ratio = int(attn.compress_ratio)
         attn.unified_kv = proxy_pool.views["unified"][local_layer_id]
+        attn.unified_kv_rope = proxy_pool.views["unified_rope"][local_layer_id]
+        attn.kv_fp8 = bool(proxy_pool.use_fp8_kv)
         # paged SWA ABI (#1423): the shared _attn_core / swa_write treat swa_kv as
         # a flat [pages, head_dim] region content-addressed by swa_block_tables.
         # Plugin keeps the ring pool but exposes it flat with block_size = cs, so
@@ -516,6 +721,12 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
         # `slot*cs + pos%cs`. See _build_swa_ring_block_tables.
         swa_view = proxy_pool.views["swa"][local_layer_id]
         attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
+        swa_rope_view = proxy_pool.views["swa_rope"][local_layer_id]
+        attn.swa_kv_rope = (
+            swa_rope_view.reshape(-1, swa_rope_view.shape[-1])
+            if swa_rope_view is not None
+            else None
+        )
         attn.swa_block_size = proxy_pool.swa_cache_size
         if ratio == 4:
             indexer_topk = int(attn.indexer.index_topk)
@@ -528,6 +739,7 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
                 attn.compressor,
                 proxy_pool.views["csa_main"][csa_i],
                 proxy_pool.num_slots,
+                kv_cache_rope=proxy_pool.views["csa_main_rope"][csa_i],
             )
             attn.indexer.kv_cache = proxy_pool.views["csa_indexer"][csa_i]
             attn.indexer._max_model_len_idx = max(
@@ -546,6 +758,7 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
                 attn.compressor,
                 proxy_pool.views["hca_main"][hca_i],
                 proxy_pool.num_slots,
+                kv_cache_rope=proxy_pool.views["hca_main_rope"][hca_i],
             )
             hca_i += 1
 
@@ -752,6 +965,8 @@ class _V4SGLangDecodeGraphBuffers:
         self.indptr_swa = i32(t + 1)
         self.indptr_csa = i32(t + 1)
         self.indptr_hca = i32(t + 1)
+        self.qo_indptr = i32(t + 1)
+        self.kv_last_page_lens = i32(t)
         self.idx_swa = i32(t * max(1, win))
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
@@ -884,6 +1099,25 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         graph_bs=bufs.decode_graph_bs,
         max_q_len=bufs.decode_q_len,
     )
+
+
+def _stage_decode_fp8_page_metadata(md, total: int, padded_total: int, *, bufs=None):
+    """Populate per-token page metadata for the DeepSeek-V4 FP8 decode kernel."""
+    total = max(0, int(total))
+    padded_total = max(total, int(padded_total))
+    qo_indptr_np = np.empty(padded_total + 1, dtype=np.int32)
+    qo_indptr_np[: total + 1] = np.arange(total + 1, dtype=np.int32)
+    if padded_total > total:
+        qo_indptr_np[total + 1 :] = total
+    if bufs is not None:
+        md.qo_indptr = bufs.stage(bufs.qo_indptr, qo_indptr_np, padded_total + 1)
+        bufs.kv_last_page_lens.np[:padded_total] = 1
+        md.kv_last_page_lens = bufs.kv_last_page_lens.copy_to_gpu(padded_total)
+        return
+
+    device = md.cu_seqlens_q.device
+    md.qo_indptr = torch.from_numpy(qo_indptr_np).to(device=device, dtype=torch.int32)
+    md.kv_last_page_lens = torch.ones(padded_total, dtype=torch.int32, device=device)
 
 
 def _get_extend_lens_cpu(
@@ -1290,6 +1524,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.kv_indptr_swa = swa_indptr
     md.kv_indptr_csa = csa_indptr
     md.kv_indptr_hca = hca_indptr
+    _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
     cu_committed_cpu = np.concatenate(
         [
             np.zeros(1, dtype=np.int32),
@@ -1734,6 +1969,7 @@ def build_atom_v4_attention_metadata_from_sglang(
 
     if is_decode:
         _populate_decode_indices(md, block_tables, pos_np, device)
+        _stage_decode_fp8_page_metadata(md, total, total)
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
     _populate_indexer(md, batch_np, positions[:total], device)
@@ -1989,6 +2225,13 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
                     sorted(slots), dtype=torch.long, device=swa.device
                 )
             swa[idx] = 0
+        swa_rope = getattr(attn, "swa_kv_rope", None)
+        if isinstance(swa_rope, torch.Tensor):
+            if idx is None:
+                idx = torch.as_tensor(
+                    sorted(slots), dtype=torch.long, device=swa_rope.device
+                )
+            swa_rope[idx] = 0
         for compressor in (
             getattr(attn, "compressor", None),
             getattr(getattr(attn, "indexer", None), "compressor", None),
