@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -354,6 +355,14 @@ class ScheduledBatch:
         self.dspark_dp_bs = None
         self.dspark_dp_total_tokens = None
 
+        # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
+        # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
+        # None on the normal path; consumed by ModelRunner.run_model to extend
+        # the prefill[]/decode[] trace labels.
+        self.detailed_sqsq: int | None = None  # sum N_Q^2
+        self.detailed_sqsk: int | None = None  # sum N_Q*N_KV
+        self.detailed_sk: int | None = None  # sum N_KV
+
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
         for seq in seqs.values():
@@ -476,6 +485,11 @@ class Scheduler:
         self.cache_stats: Optional[CacheStats] = (
             CacheStats() if config.enable_prefix_caching else None
         )
+        self.profile_active = False
+        # Cache the env flag once (env vars are fixed at process start) so the
+        # per-iteration compute_detailed_aggregates never pays an os.getenv.
+        self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
+
         self.enable_chunked_prefill = config.enable_chunked_prefill
         # V4 SWA correctness on a prefix-cache hit is now handled entirely in
         # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
@@ -1728,6 +1742,61 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
+
+    def compute_detailed_aggregates(
+        self,
+        scheduled_batch: ScheduledBatch,
+        seqs: dict[int, Sequence],
+    ) -> None:
+        """Attach detailed attention aggregates to *scheduled_batch* in place.
+
+        Only the quadratic terms genuinely needed for a downstream attention-FLOP
+        estimate are computed here. The request counts and total query tokens are
+        already emitted by the ``prefill[]``/``decode[]`` labels in
+        :meth:`ModelRunner.run_model`, so this avoids duplicating them.
+
+        The following batch-level sums are stored on the batch and appended to
+        those labels by the runner:
+
+            sqsq  — sum of N_Q^2      (per request)
+            sqsk  — sum of N_Q*N_KV   (per request)
+            sk    — sum of N_KV       (per request)
+
+        where ``N_Q`` is the number of query tokens scheduled for a request and
+        ``N_KV`` is its KV length (cached + new tokens for prefill, full
+        sequence length for decode). Aggregating over every request in the
+        batch gives the total for that single forward, which is exactly the
+        quantity a per-iteration attention-FLOP estimate needs. For MTP/spec-decode a
+        decode step schedules ``mtp_k + 1`` query tokens, so the scheduled
+        token count is used as ``N_Q`` for both branches (rather than a
+        hardcoded 1) to avoid undercounting.
+
+        This is a no-op (leaves the fields ``None``) unless profiling is active
+        and ``ATOM_ENABLE_DETAILED_ANNOTATION`` is set.
+        """
+        if not self.profile_active or not self._detailed_annotation_enabled:
+            return
+
+        sqsq = 0  # sum N_Q^2
+        sqsk = 0  # sum N_Q*N_KV
+        sk = 0  # sum N_KV
+        for seq, num_tokens in zip(seqs.values(), scheduled_batch.num_scheduled_tokens):
+            # Cast to Python int: num_scheduled_tokens is np.int32, so nq*nq /
+            # nq*nkv would overflow once a prefill/chunk exceeds ~46341 tokens
+            # (e.g. np.int32(65536)**2 == 0), silently corrupting the estimate.
+            nq = int(num_tokens)  # query tokens scheduled this forward
+            if seq.type == SequenceType.DECODE:
+                nkv = int(seq.num_tokens)  # full sequence length
+            else:
+                # PREFILL: KV length = cached + new tokens.
+                nkv = int(seq.num_cached_tokens) + nq
+            sqsq += nq * nq
+            sqsk += nq * nkv
+            sk += nkv
+
+        scheduled_batch.detailed_sqsq = sqsq
+        scheduled_batch.detailed_sqsk = sqsk
+        scheduled_batch.detailed_sk = sk
 
     def _connector_flag(self, name: str) -> bool:
         return bool(getattr(self.kv_connector, name, False))

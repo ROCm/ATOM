@@ -961,6 +961,23 @@ def _sparse_attn_v4_paged_decode_asm(
     device = q_packed.device
     N, H, _ = q_packed.shape
 
+    # gqa (== H, since num_kv_heads==1 for V4 MQA) head-count padding.
+    # The gfx950 v4 nm asm decode kernel only ships gqa in {16, 32, 64, 128}
+    # at qSeqLen=1 (aiter asm_mla_v4.cu heuristic); a TP sharding with fewer
+    # local heads (e.g. TP8 -> 8) hits "no shipped variant for gqa:8". Pad the
+    # Q heads up to the smallest supported gqa (16) — the extra heads compute
+    # discardable output that we slice off after the kernel. attn_sink is
+    # per-head so it pads too. Padded heads carry zero Q (finite scores, no
+    # NaN) and their outputs are never read.
+    H_real = H
+    _GQA_MIN = 16
+    if H < _GQA_MIN:
+        pad_h = _GQA_MIN - H
+        q_packed = torch.nn.functional.pad(q_packed, (0, 0, 0, pad_h))  # [N,16,512]
+        q_rope = torch.nn.functional.pad(q_rope, (0, 0, 0, pad_h))  # [N,16,64]
+        attn_sink = torch.nn.functional.pad(attn_sink, (0, pad_h))  # [16]
+        H = _GQA_MIN
+
     assert unified_kv.dim() == 2 and unified_kv.shape[-1] == V4_DIM_QK_PACKED, (
         f"asm v4 nm: native fp8 unified_kv must be [P, {V4_DIM_QK_PACKED}] fp8, "
         f"got {tuple(unified_kv.shape)}"
@@ -1024,7 +1041,9 @@ def _sparse_attn_v4_paged_decode_asm(
         sm_scale=softmax_scale,
         num_kv_splits=num_kv_splits,
     )
-    return output
+    # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
+    # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
+    return output[:, :H_real].contiguous() if H_real != H else output
 
 
 @mark_trace
