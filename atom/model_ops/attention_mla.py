@@ -666,64 +666,73 @@ class MLAAttention(nn.Module):
         )
 
         # Step 2: chunked cached-prefix attention.
-        k_workspace = chunk_meta.k_workspace
-        v_workspace = chunk_meta.v_workspace
         chunked_out: Optional[torch.Tensor] = None
         chunked_lse: Optional[torch.Tensor] = None
-        for c in range(chunk_meta.num_chunks):
-            n_tok = chunk_meta.total_tokens[c]
-            if n_tok == 0:
-                continue
-            k_chunk = k_workspace[:n_tok]
-            v_chunk = v_workspace[:n_tok]
-            self._gather_cached_kv_b_proj(
-                kv_cache,
-                chunk_meta.kv_indptr[c],
-                chunk_meta.kv_indices[c],
-                chunk_meta.cu_seqlens_k[c],
-                k_chunk,
-                v_chunk,
-                shuffle_kv_block_indptr=(
-                    chunk_meta.shuffle_kv_block_indptr[c]
-                    if chunk_meta.shuffle_kv_block_indptr is not None
-                    else None
-                ),
-                shuffle_kv_block_indices=(
-                    chunk_meta.shuffle_kv_block_indices[c]
-                    if chunk_meta.shuffle_kv_block_indices is not None
-                    else None
-                ),
+        if getattr(chunk_meta, "is_dcp", False):
+            # DCP: the cached context KV is sharded (interleaved) across ranks,
+            # so the per-chunk gather becomes gather-local -> AllGather ->
+            # reorg -> kv_b_proj (Scheme A). The rest of the merge logic below
+            # is identical to the non-DCP path.
+            chunked_out, chunked_lse = self._dcp_compute_prefill_context(
+                prefill_q, kv_cache, attn_metadata, chunk_meta
             )
-            suf_out, suf_lse = flash_attn_varlen_func(
-                q=prefill_q,
-                k=k_chunk,
-                v=v_chunk,
-                cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                cu_seqlens_k=chunk_meta.cu_seqlens_k[c],
-                max_seqlen_q=attn_metadata.max_seqlen_q,
-                max_seqlen_k=chunk_meta.max_seqlen_k[c],
-                min_seqlen_q=attn_metadata.min_seqlen_q,
-                dropout_p=attn_metadata.dropout_p,
-                softmax_scale=self.scale,
-                causal=False,
-                return_lse=True,
-            )
-            if chunked_out is None:
-                chunked_out = suf_out
-                chunked_lse = suf_lse
-            else:
-                tmp_out = torch.empty_like(new_out)
-                tmp_lse = torch.empty_like(new_lse)
-                merge_attn_states(
-                    output=tmp_out,
-                    output_lse=tmp_lse,
-                    prefix_output=chunked_out,
-                    prefix_lse=chunked_lse,
-                    suffix_output=suf_out,
-                    suffix_lse=suf_lse,
+        else:
+            k_workspace = chunk_meta.k_workspace
+            v_workspace = chunk_meta.v_workspace
+            for c in range(chunk_meta.num_chunks):
+                n_tok = chunk_meta.total_tokens[c]
+                if n_tok == 0:
+                    continue
+                k_chunk = k_workspace[:n_tok]
+                v_chunk = v_workspace[:n_tok]
+                self._gather_cached_kv_b_proj(
+                    kv_cache,
+                    chunk_meta.kv_indptr[c],
+                    chunk_meta.kv_indices[c],
+                    chunk_meta.cu_seqlens_k[c],
+                    k_chunk,
+                    v_chunk,
+                    shuffle_kv_block_indptr=(
+                        chunk_meta.shuffle_kv_block_indptr[c]
+                        if chunk_meta.shuffle_kv_block_indptr is not None
+                        else None
+                    ),
+                    shuffle_kv_block_indices=(
+                        chunk_meta.shuffle_kv_block_indices[c]
+                        if chunk_meta.shuffle_kv_block_indices is not None
+                        else None
+                    ),
                 )
-                chunked_out = tmp_out
-                chunked_lse = tmp_lse
+                suf_out, suf_lse = flash_attn_varlen_func(
+                    q=prefill_q,
+                    k=k_chunk,
+                    v=v_chunk,
+                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                    cu_seqlens_k=chunk_meta.cu_seqlens_k[c],
+                    max_seqlen_q=attn_metadata.max_seqlen_q,
+                    max_seqlen_k=chunk_meta.max_seqlen_k[c],
+                    min_seqlen_q=attn_metadata.min_seqlen_q,
+                    dropout_p=attn_metadata.dropout_p,
+                    softmax_scale=self.scale,
+                    causal=False,
+                    return_lse=True,
+                )
+                if chunked_out is None:
+                    chunked_out = suf_out
+                    chunked_lse = suf_lse
+                else:
+                    tmp_out = torch.empty_like(new_out)
+                    tmp_lse = torch.empty_like(new_lse)
+                    merge_attn_states(
+                        output=tmp_out,
+                        output_lse=tmp_lse,
+                        prefix_output=chunked_out,
+                        prefix_lse=chunked_lse,
+                        suffix_output=suf_out,
+                        suffix_lse=suf_lse,
+                    )
+                    chunked_out = tmp_out
+                    chunked_lse = tmp_lse
 
         # Step 3: merge cached prefix (prefix) with new tokens (suffix).
         # If every seq happened to have zero cached tokens this iter, fall
@@ -741,6 +750,108 @@ class MLAAttention(nn.Module):
                 suffix_lse=new_lse,
             )
         return self.o_proj(output.flatten(start_dim=-2))
+
+    def _dcp_compute_prefill_context(
+        self,
+        prefill_q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        chunk_meta,
+    ):
+        """DCP chunked cached-prefix context attention.
+
+        Per chunk: index_select this rank's local compressed KV, AllGather it
+        across the DCP group, ``reorg_kvcache`` back to per-sequence contiguous
+        layout, ``kv_b_proj``-decompress, run flash_attn(causal=False), and
+        LSE-merge across chunks. The context attention is unmasked, so the
+        rank-major token order produced by reorg does not affect the result.
+        """
+        from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
+        from atom.model_ops.dcp_ops import dcp_gather_compressed_kv, reorg_kvcache
+
+        if self.kv_cache_dtype.startswith("fp8"):
+            raise NotImplementedError(
+                "DCP prefix-cache prefill does not support fp8 KV cache yet."
+            )
+
+        chunked_out: Optional[torch.Tensor] = None
+        chunked_lse: Optional[torch.Tensor] = None
+        for c in range(chunk_meta.num_chunks):
+            toks = chunk_meta.seq_tot[c]
+            if toks == 0:
+                continue
+            # 1. gather this rank's local compressed KV for the chunk.
+            local_kv = dcp_gather_compressed_kv(kv_cache, chunk_meta.local_slot_ids[c])
+            # 2. AllGather across DCP ranks -> [toks * dcp_world_size, d].
+            ag_kv = self.dcp_group.all_gather(local_kv, dim=0)
+
+            sum_seq_len = int(chunk_meta.cu_seqlens_k[c][-1].item())
+            if sum_seq_len == 0:
+                # All tokens in this chunk are padding for every seq (tail
+                # chunk); collective already ran, just skip the compute.
+                continue
+
+            # 3. reorg interleaved AllGather blocks -> per-seq contiguous.
+            ag_kv_c, ag_k_pe = ag_kv.unsqueeze(1).split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            kv_c_normed, k_pe = reorg_kvcache(
+                ag_kv_c,
+                ag_k_pe,
+                padded_local_chunk_seq_lens_lst=chunk_meta.padded_local_chunk_seq_lens[
+                    c
+                ],
+                local_context_lens_allranks=chunk_meta.local_context_lens_allranks,
+                sum_seq_len=sum_seq_len,
+                max_seq_len=chunk_meta.max_seqlen_k[c],
+                chunk_size=chunk_meta.chunk_size,
+                chunk_idx=c,
+                toks=toks,
+            )
+
+            # 4. kv_b_proj decompress -> k_nope, v; concat k_pe -> k.
+            kv_c_normed = kv_c_normed.squeeze(1)
+            kv_nope = self.kv_b_proj(kv_c_normed).view(
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+
+            # 5. flash attention over the (unmasked) context chunk.
+            ctx_out, ctx_lse = flash_attn_varlen_func(
+                q=prefill_q,
+                k=k,
+                v=v,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=chunk_meta.cu_seqlens_k[c],
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=chunk_meta.max_seqlen_k[c],
+                min_seqlen_q=attn_metadata.min_seqlen_q,
+                dropout_p=attn_metadata.dropout_p,
+                softmax_scale=self.scale,
+                causal=False,
+                return_lse=True,
+            )
+
+            # 6. LSE-merge across chunks.
+            if chunked_out is None:
+                chunked_out = ctx_out
+                chunked_lse = ctx_lse
+            else:
+                tmp_out = torch.empty_like(ctx_out)
+                tmp_lse = torch.empty_like(ctx_lse)
+                merge_attn_states(
+                    output=tmp_out,
+                    output_lse=tmp_lse,
+                    prefix_output=chunked_out,
+                    prefix_lse=chunked_lse,
+                    suffix_output=ctx_out,
+                    suffix_lse=ctx_lse,
+                )
+                chunked_out = tmp_out
+                chunked_lse = tmp_lse
+
+        return chunked_out, chunked_lse
 
     def _forward_prefill_mha(
         self,
