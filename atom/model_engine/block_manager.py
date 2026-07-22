@@ -17,6 +17,7 @@ from atom.distributed.kv_events import (
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.swa_pool import SlidingWindowPool
+from atom.utils import envs
 
 
 def _make_block_stored(
@@ -88,6 +89,9 @@ class BlockManager:
             block_size=block_size,
             max_num_batched_tokens=getattr(config, "max_num_batched_tokens", 0),
             mtp_k=_mtp_k,
+            full_retain=envs.ATOM_SWA_FULL_RETAIN,
+            retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
+            checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
         )
 
     @property
@@ -182,6 +186,10 @@ class BlockManager:
         # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
         # the hit.
         num_cached_blocks = self.swa.bounded_hit(seq, compressed_hit, block_hashes)
+        # Instrumentation: record the pre-gate compressed hit so CacheStats can
+        # separate reuse lost to the SWA tail gate (compressed_hit -
+        # num_cached_blocks) from reuse lost to compressed eviction.
+        seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = seq.num_blocks

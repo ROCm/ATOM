@@ -255,6 +255,9 @@ def _generate_atom_config_from_sglang_config(config: Any):
         "online_quant_config", None
     )
     server_args.model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
+    hf_overrides = json.loads(
+        getattr(server_args, "json_model_override_args", None) or "{}"
+    )
 
     sgl_model_config = SglangModelConfig.from_server_args(server_args)
     sgl_model_opt_config = ModelOptConfig(
@@ -349,12 +352,19 @@ def _generate_atom_config_from_sglang_config(config: Any):
         sglang_port_args=sglang_port_args,
     )
 
-    # force max num batched tokens to 16K because sgl doesn't have
-    # concept for max num batched tokens
+    max_num_batched_tokens = max(
+        int(getattr(server_args, "max_prefill_tokens", 0) or 0),
+        int(getattr(server_args, "chunked_prefill_size", 0) or 0),
+        16384,
+    )
+    atom_kv_cache_dtype = server_args.kv_cache_dtype
+    if str(atom_kv_cache_dtype).startswith("fp8"):
+        atom_kv_cache_dtype = "fp8"
+
     return Config(
         model=server_args.model_path,
         trust_remote_code=server_args.trust_remote_code,
-        max_num_batched_tokens=16384,
+        max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=server_args.max_running_requests or 512,
         max_model_len=server_args.context_length,
         gpu_memory_utilization=server_args.mem_fraction_static,
@@ -365,7 +375,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
         # preventing double-compile.
         enforce_eager=True,
         parallel_config=sgl_parallel_config,
-        kv_cache_dtype=server_args.kv_cache_dtype,
+        kv_cache_dtype=atom_kv_cache_dtype,
+        index_cache_dtype=atom_kv_cache_dtype,
         enable_prefix_caching=False,
         port=None,
         torch_profiler_dir=None,
@@ -377,6 +388,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         enable_dp_attention=server_args.enable_dp_attention,
         plugin_config=plugin_config,
         online_quant_config=online_quant_config,
+        hf_overrides=hf_overrides,
     )
 
 

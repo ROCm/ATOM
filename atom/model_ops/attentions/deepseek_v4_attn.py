@@ -531,6 +531,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ceil(max_model_len/bs) (e.g. 1024 → ~66 blocks at 131072/8192/128/128).
         """
         bs = self.block_size
+        # NOTE: full-retain (ATOM_SWA_FULL_RETAIN) does NOT size the pool here.
+        # It sizes num_swa_blocks == num_kvcache_blocks from the shared memory
+        # budget in ModelRunner._compute_kv_budget (lockstep with the compressed
+        # pool), which is memory-bounded. Sizing on max_model_len here would
+        # explode to ~TB at DSV4's 1M max_position_embeddings. This method is only
+        # consulted for the default (window-only) pool below.
         # per_decode uses win_with_spec (= window + max_spec_steps), not window
         # alone: under MTP each decoding seq writes up to `max_spec_steps` draft
         # tokens into the SWA pool before the next window-free, so its peak

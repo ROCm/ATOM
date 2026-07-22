@@ -1671,16 +1671,39 @@ class ModelRunner:
         b = self.attn_metadata_builder
         swa_block_bytes = b.swa_pool_block_bytes()
         if swa_block_bytes > 0:
-            num_swa_blocks = b.swa_pool_num_blocks(
-                config.max_num_seqs, config.max_model_len
-            )
-            swa_reserved = num_swa_blocks * swa_block_bytes
             # block_bytes (from _compute_block_bytes) currently includes the SWA
             # term; strip it so the compressed pool is sized on compressed bytes.
             compressed_block_bytes = block_bytes - swa_block_bytes
-            num_kvcache_blocks = max(
-                0, (available_for_pool - swa_reserved) // compressed_block_bytes
-            )
+            if envs.ATOM_SWA_FULL_RETAIN:
+                # Full-retain: give the SWA tail pool a small fraction `f` of the
+                # budget; the rest stays with the compressed pool. One SWA block is
+                # ~7x the bytes of one compressed block, so a 1:1 mirror
+                # (num_swa == num_kvcache) starves the compressed prefix index
+                # (measured: 298k -> 36.8k blocks -> hit rate collapsed). A small
+                # f keeps compressed near full while retaining the hot-boundary
+                # tail working set (LRU-evicted, same eviction discipline as
+                # vLLM's FreeKVCacheBlockQueue). Memory-bounded regardless of
+                # max_model_len. Live SWA footprint stays ~window/seq (window-free
+                # is kept); the tail pool holds lazily-freed-but-cached tails.
+                f = min(0.9, max(1e-3, envs.ATOM_SWA_TAIL_BUDGET_FRAC))
+                swa_budget = int(available_for_pool * f)
+                compressed_budget = available_for_pool - swa_budget
+                num_swa_blocks = swa_budget // swa_block_bytes
+                num_kvcache_blocks = compressed_budget // compressed_block_bytes
+                swa_reserved = num_swa_blocks * swa_block_bytes
+                logger.info(
+                    f"paged-SWA full-retain: tail_budget_frac={f:.3f}, "
+                    f"swa_budget={swa_budget / (1 << 30):.2f}GB, "
+                    f"compressed_budget={compressed_budget / (1 << 30):.2f}GB"
+                )
+            else:
+                num_swa_blocks = b.swa_pool_num_blocks(
+                    config.max_num_seqs, config.max_model_len
+                )
+                swa_reserved = num_swa_blocks * swa_block_bytes
+                num_kvcache_blocks = max(
+                    0, (available_for_pool - swa_reserved) // compressed_block_bytes
+                )
             config.num_swa_blocks = int(num_swa_blocks)
             config.swa_window_size = int(
                 getattr(hf_config, "sliding_window", 128) or 128

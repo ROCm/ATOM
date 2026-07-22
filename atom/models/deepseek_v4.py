@@ -139,6 +139,7 @@ _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+_V4_SWA_FULL_RETAIN = envs.ATOM_SWA_FULL_RETAIN
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
@@ -2551,7 +2552,19 @@ class DeepseekV4Attention(nn.Module):
                 swa_block_tables_gpu,
                 self.swa_kv,
                 swa_block_size,
-                min(self.window_size, attn_md.max_seqlen_q),
+                # Full-retain (ATOM_SWA_FULL_RETAIN): persist the WHOLE chunk's
+                # SWA KV (every token) so the content-addressed cache holds the
+                # full history for cross-request prefix reuse. Default: window-only
+                # (trailing `window` tokens) — see the OPT note above. Pairs with
+                # SlidingWindowPool.ensure_for_tokens materializing all chunk
+                # blocks (free_before=0) so every dst block is valid here.
+                # K source is the PCP all-gathered full extend K (k_*_full); off
+                # PCP it falls back to qkn.k_packed/k_rope (single-rank identical).
+                (
+                    attn_md.max_seqlen_q
+                    if _V4_SWA_FULL_RETAIN
+                    else min(self.window_size, attn_md.max_seqlen_q)
+                ),
                 k_packed=k_packed_full,
                 k_rope=k_rope_full,
                 swa_region_rope=self.swa_kv_rope,
