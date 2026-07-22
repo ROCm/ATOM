@@ -109,14 +109,14 @@ concurrency → higher aggregate throughput/GPU but lower per-user interactivity
 
 | Conc | req/s | tput/GPU | input tok/s | output tok/s | TTFT p50 | ITL p50 | p90 intvty | realized prefix hit | errors |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 0.039 | 1,495 | 11,906 | 53.7 | 1.42 s | 16.1 ms | 72.96 | 96.9% | 0/142 |
 | 8 | 0.388 | 6,497 | 51,627 | 351.6 | 1.05 s | 22.6 ms | 54.88 | 96.4% | 0/1408 |
 | 16 | 0.501 | 11,182 | 88,982 | 471.5 | 1.32 s | 29.8 ms | 42.76 | 96.4% | 1/1825 |
 | 48 | 0.776 | 13,816 | 109,848 | 680.4 | 1.99 s | 54.7 ms | 24.9 | 94.1% (95–96% ss) | 2/2825 |
-| 1 | _running_ | — | — | — | — | — | — | — | — |
 
 Higher concurrency → higher aggregate tput/GPU but lower per-user interactivity.
-Realized prefix hit stays ~96% at C=8/16 and ~94% at C=48 (lower concurrency =
-less live-window churn, so more checkpoints survive). (C=1 appended when done.)
+Realized prefix hit stays ~96–97% at C=1/8/16 and ~94% at C=48 (lower concurrency
+= less live-window churn, so more checkpoints survive). All errors ≤ 0.06%.
 
 ## How to run
 
