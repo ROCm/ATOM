@@ -18,6 +18,7 @@ vllm serve "${MODEL}" \
     --host localhost \
     --port 8001 \
     --dtype auto \
+    --kv-cache-dtype fp8 \
     --tensor-parallel-size "${TP}" \
     --distributed-executor-backend mp \
     --trust-remote-code \
@@ -25,16 +26,20 @@ vllm serve "${MODEL}" \
     --max-num-seqs 512 \
     --tokenizer-mode deepseek_v4 \
     --async-scheduling \
-    --no-enable-prefix-caching \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
 
+The command above turns on every optimization the ATOM-vLLM DeepSeek-V4 backend supports: the fp8 2-buffer KV cache, cross-request prefix caching, and MTP speculative decoding. Drop the corresponding flag from any feature you do not want.
+
 Notes:
-- `ATOM_USE_TRITON_MOE=1` enables the Triton MoE path used by this configuration.
 - `--tokenizer-mode deepseek_v4` selects the DeepSeek-V4 tokenizer mode required by the vLLM-ATOM adapter.
 - Keep `--max-num-seqs` at or below `512` for this configuration; larger values may OOM.
 - The command above serves on port `8001`; update the accuracy command below if you change the port.
-- The profiler writes torch traces to `./vllm_profile`. Remove `--profiler-config` if profiling is not needed.
+
+Feature flags:
+- `--kv-cache-dtype fp8` enables the fp8 2-buffer KV cache (fp8 NoPE pool + a parallel bf16 RoPE pool), which lowers KV-cache memory and raises the token budget / max concurrency. It requires AMD `gfx950`/`gfx1250`; on other GPUs the plugin automatically falls back to a bf16 KV cache, so the flag is safe to leave on. Omit it to force bf16.
+- `--speculative-config '{"model":"...","num_speculative_tokens":1}'` enables MTP speculative decoding. The draft is the model's own next-token-prediction layer, so `model` points to the same checkpoint. `num_speculative_tokens` must be `<= num_nextn_predict_layers` (which is `1` for DeepSeek-V4-Flash).
 
 ## Step 3: Performance Benchmark
 
