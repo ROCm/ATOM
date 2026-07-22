@@ -308,6 +308,7 @@ jobs:
               git clone "${GITHUB_REPO_URL}" /app/ATOM && \
               cd /app/ATOM && \
               git checkout "${GITHUB_COMMIT_SHA}" && \
+              ulimit -n 1048576 || true && \
               pip install -e . --no-deps && \
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
           RUN pip show amd-aiter atom sglang torch triton mori || true
