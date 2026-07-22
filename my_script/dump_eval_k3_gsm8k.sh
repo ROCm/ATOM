@@ -9,10 +9,17 @@ MODEL=/data/models/Kimi-k2.7-xiaobing
 
 # SHOT=${SHOT:-20}
 SHOT=${SHOT:-5}
+LIMIT=${LIMIT:-50}
 NUM_CONCURRENT=${NUM_CONCURRENT:-16}
+
+LIMIT_ARG=()
+if [[ -n "${LIMIT}" ]]; then
+  LIMIT_ARG+=(--limit "${LIMIT}")
+fi
 
 echo "MODEL: ${MODEL}"
 echo "SHOT: ${SHOT}"
+echo "LIMIT: ${LIMIT:-full}"
 echo "NUM_CONCURRENT: ${NUM_CONCURRENT}"
 echo "OUTPUT_PATH: ${OUTPUT_PATH}"
 
@@ -21,6 +28,7 @@ lm_eval --model local-completions \
   --tasks gsm8k \
   --num_fewshot ${SHOT} \
   --seed 42 \
+  "${LIMIT_ARG[@]}" \
   --log_samples \
   --output_path "${OUTPUT_PATH}" 2>&1 | tee log.lmeval.log
 
@@ -143,15 +151,23 @@ def normalize(sample):
     }
 
 
-correct_rows = []
-incorrect_rows = []
+rows_by_doc_id = {}
+duplicate_doc_ids = {}
 for sample_file in sample_files:
     for sample in load_records(sample_file):
         row = normalize(sample)
-        if row["correct"]:
-            correct_rows.append(row)
-        else:
-            incorrect_rows.append(row)
+        doc_id = row["doc_id"]
+        if doc_id is None:
+            raise ValueError(f"sample without doc_id in {sample_file}: {row}")
+        if doc_id in rows_by_doc_id:
+            duplicate_doc_ids.setdefault(doc_id, 1)
+            duplicate_doc_ids[doc_id] += 1
+            continue
+        rows_by_doc_id[doc_id] = row
+
+rows = [rows_by_doc_id[doc_id] for doc_id in sorted(rows_by_doc_id)]
+correct_rows = [row for row in rows if row["correct"]]
+incorrect_rows = [row for row in rows if not row["correct"]]
 
 correct_path = root / "gsm8k_correct.jsonl"
 incorrect_path = root / "gsm8k_incorrect.jsonl"
@@ -165,6 +181,15 @@ with incorrect_path.open("w", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 print(f"[dump] sample files: {', '.join(str(p) for p in sample_files)}")
+if duplicate_doc_ids:
+    examples = ", ".join(str(doc_id) for doc_id in sorted(duplicate_doc_ids)[:10])
+    print(
+        f"[dump] skipped duplicate doc_id rows: "
+        f"{sum(count - 1 for count in duplicate_doc_ids.values())} "
+        f"across {len(duplicate_doc_ids)} docs"
+        f"{' (examples: ' + examples + ')' if examples else ''}"
+    )
+print(f"[dump] total unique: {len(rows)}")
 print(f"[dump] correct:   {len(correct_rows)} -> {correct_path}")
 print(f"[dump] incorrect: {len(incorrect_rows)} -> {incorrect_path}")
 PY
