@@ -702,6 +702,40 @@ function buildAtomeshBenchmarkRows(data) {
 
 const atomeshBenchmarkRows = buildAtomeshBenchmarkRows(rawData);
 
+function buildAtomeshHistoryRows(data) {
+  const runs = Object.values(data?.entries || {}).flat().sort((a, b) => (b.date || 0) - (a.date || 0));
+  const rowsByKey = {};
+  let idx = 0;
+  for (const run of runs) {
+    const runDay = localDay(run.date || Date.now());
+    const commitId = run.commit?.id || '';
+    const cid7 = commitId.slice(0, 7);
+    for (const bench of run.benches || []) {
+      const parsed = parseAtomeshPerfPointExtra(bench.extra);
+      if (!parsed?.point || parsed.point.source !== 'ATOMesh') continue;
+      const row = atomeshPointRow(parsed.point, parsed.meta, idx++);
+      const key = `${row.backend}|${row.hardware}|${row.model}|${row.topology}|${row.islOsl}|${row.concurrency}|${runDay}|${cid7}`;
+      const current = rowsByKey[key];
+      const nextRow = { ...row, commit: run.commit, runDay, cid7, date: row.date || run.date };
+      if (!current) {
+        rowsByKey[key] = nextRow;
+        continue;
+      }
+      const currentScore = atomeshPointScore(current);
+      const nextScore = atomeshPointScore(nextRow);
+      if (
+        (Number.isFinite(nextScore) && (!Number.isFinite(currentScore) || nextScore > currentScore))
+        || (nextScore === currentScore && (nextRow.date || 0) > (current.date || 0))
+      ) {
+        rowsByKey[key] = nextRow;
+      }
+    }
+  }
+  return Object.values(rowsByKey).sort((a, b) => (b.date || 0) - (a.date || 0));
+}
+
+const atomeshHistoricalRows = buildAtomeshHistoryRows(rawData);
+
 function atomeshMergedModelName(row) {
   const text = `${row.model || ''} ${row.topology || ''} ${row.id || ''}`.toLowerCase();
   if (text.includes('eagle3') && !String(row.model || '').toLowerCase().includes('eagle3')) {
@@ -1096,6 +1130,7 @@ const state = {
   activeTab: 'performance',
   perfMetric: 'Total Tput',
   trendModelKey: allTrendModelKeys[0] || '',
+  atomeshTrendModel: '',
   dataView: 'table',
   dataSort: { column: 'date', direction: 'desc' },
 };
@@ -1437,7 +1472,7 @@ function appendDashboardModeSelector(bar) {
 function setDashboardMode(mode) {
   if (!DASHBOARD_MODES.includes(mode) || state.dashboardMode === mode) return;
   state.dashboardMode = mode;
-  if (mode === 'Disaggregated' && !['performance', 'accuracy'].includes(state.activeTab)) {
+  if (mode === 'Disaggregated' && !['performance', 'trends', 'accuracy'].includes(state.activeTab)) {
     state.activeTab = 'performance';
   }
   renderFilters();
@@ -1605,7 +1640,7 @@ document.addEventListener('click', closeAllDropdowns);
    ================================================================ */
 function updateDashboardTabs() {
   const allowedTabs = state.dashboardMode === 'Disaggregated'
-    ? ['performance', 'accuracy']
+    ? ['performance', 'trends', 'accuracy']
     : ['performance', 'tradeoff', 'trends', 'data', 'accuracy'];
   if (!allowedTabs.includes(state.activeTab)) state.activeTab = 'performance';
   document.querySelectorAll('#tabs-nav .tab').forEach(tab => {
@@ -1822,6 +1857,7 @@ function renderActiveTab() {
   updateDashboardTabs();
   if (state.dashboardMode === 'Disaggregated') {
     if (state.activeTab === 'accuracy') renderAtomeshAccuracyTab();
+    else if (state.activeTab === 'trends') renderAtomeshTrendsTab();
     else renderAtomeshPerformanceTab();
     syncHeaderH();
     return;
@@ -3465,6 +3501,43 @@ function atomeshRows() {
   return _atomeshRowsCache;
 }
 
+function atomeshHistoryRows() {
+  return atomeshHistoricalRows.length ? atomeshHistoricalRows : atomeshRows();
+}
+
+function atomeshDisplayModel(row) {
+  return atomeshMergedModelName(row);
+}
+
+function filteredAtomeshHistoryRows({ includeModelFilter = true } = {}) {
+  return atomeshHistoryRows().filter(row => {
+    const model = atomeshDisplayModel(row);
+    return state.filters.backends.includes(row.backend || ATOMESH_DATA.backend)
+      && (!includeModelFilter || state.filters.models.includes(model))
+      && state.filters.islOsl.includes(row.islOsl)
+      && state.filters.conc.includes(row.concurrency)
+      && state.filters.hardware.includes(row.hardware || 'unknown');
+  });
+}
+
+function atomeshRowDate(row) {
+  return row.date || ATOMESH_DATA.updatedAt;
+}
+
+function dedupeAtomeshHistoryByDay(rows, valueKey) {
+  const bestByDay = {};
+  for (const row of rows) {
+    const date = atomeshRowDate(row);
+    if (!date) continue;
+    const value = parseAtomeshNumber(row[valueKey]);
+    if (!Number.isFinite(value)) continue;
+    const day = localDay(date);
+    const current = bestByDay[day];
+    if (!current || date > current.date) bestByDay[day] = { row, date, value };
+  }
+  return Object.values(bestByDay).sort((a, b) => a.date - b.date);
+}
+
 function atomeshCompletedCases() {
   return filteredAtomeshRows().filter(c => c.status === 'completed' && Number.isFinite(c.interactivity) && Number.isFinite(c.totalTputPerGpu));
 }
@@ -3672,6 +3745,206 @@ function renderAtomeshPerformanceTab() {
   bindFixedThead(container);
 }
 
+function renderAtomeshTrendsTab() {
+  const container = document.getElementById('tab-trends');
+  destroyChartsIn(container);
+  const rows = filteredAtomeshHistoryRows();
+  const trendModels = [...new Set(rows.map(atomeshDisplayModel))].sort(_lc);
+  if (!trendModels.length) {
+    container.innerHTML = '<div class="chart-empty">No ATOMesh historical throughput row matches the current filters.</div>';
+    return;
+  }
+  if (!state.atomeshTrendModel || !trendModels.includes(state.atomeshTrendModel)) {
+    state.atomeshTrendModel = trendModels[0];
+  }
+
+  let html = `<div class="section-container"><div class="section-header">
+    <span class="section-title">ATOMesh Historical Trends</span>
+    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">Token Throughput per GPU history from benchmark-action data.js</span>
+  </div>
+  <div class="model-selector" style="margin-bottom:var(--gap-md);justify-content:flex-start">
+    <span class="sel-label">Model:</span>
+    ${trendModels.map(model => {
+      const color = getModelColor(ATOMESH_DATA.backend, model);
+      const active = model === state.atomeshTrendModel;
+      return `<button class="sel-btn ${active ? 'active' : ''}" data-atomesh-trend-model="${escHTML(model)}" style="border-color:${color.border};color:${active ? '#fff' : color.text};${active ? 'background:' + color.border : ''}">${escHTML(model)}</button>`;
+    }).join('')}
+  </div>
+  <div class="chart-card hero">
+    <h3>${escHTML(state.atomeshTrendModel)} — Token Throughput per GPU</h3>
+    <div class="chart-wrap"><canvas id="atomesh-throughput-trend"></canvas></div>
+  </div></div>`;
+  container.innerHTML = html;
+
+  container.querySelectorAll('[data-atomesh-trend-model]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.atomeshTrendModel = btn.dataset.atomeshTrendModel;
+      renderAtomeshTrendsTab();
+    });
+  });
+
+  const selectedRows = rows.filter(row => atomeshDisplayModel(row) === state.atomeshTrendModel && Number.isFinite(parseAtomeshNumber(row.totalTputPerGpu)));
+  const seriesGroups = {};
+  for (const row of selectedRows) {
+    const seriesKey = `${row.sourceTopology || row.topology || 'unknown'}|${row.islOsl}|${row.concurrency}|${row.hardware || 'unknown'}`;
+    if (!seriesGroups[seriesKey]) seriesGroups[seriesKey] = [];
+    seriesGroups[seriesKey].push(row);
+  }
+
+  const series = [];
+  const color = getModelColor(ATOMESH_DATA.backend, state.atomeshTrendModel);
+  const dashPatterns = [[], [6, 3], [2, 2], [8, 4, 2, 4]];
+  let idx = 0;
+  for (const [seriesKey, seriesRows] of Object.entries(seriesGroups).sort(([a], [b]) => a.localeCompare(b))) {
+    const [topology, islOsl, concurrency, hardware] = seriesKey.split('|');
+    const points = dedupeAtomeshHistoryByDay(seriesRows, 'totalTputPerGpu');
+    if (!points.length) continue;
+    const pointMap = {};
+    const rowMap = {};
+    for (const point of points) {
+      const day = localDay(point.date);
+      pointMap[day] = point.value;
+      rowMap[day] = point.row;
+    }
+    series.push({
+      label: `${fmtIslOsl(islOsl)} c=${concurrency} · ${topology}`,
+      pointMap,
+      rowMap,
+      borderColor: idx === 0 ? color.border : `hsl(${(getModelHue(ATOMESH_DATA.backend, state.atomeshTrendModel) + idx * 37) % 360}, 55%, 65%)`,
+      backgroundColor: color.bg,
+      borderWidth: 2,
+      borderDash: dashPatterns[idx % dashPatterns.length],
+      pointRadius: 4,
+      pointHoverRadius: 6,
+      showLine: true,
+      spanGaps: true,
+      tension: 0.2,
+    });
+    idx++;
+  }
+
+  if (!series.length) {
+    const card = container.querySelector('.chart-card');
+    if (card) card.innerHTML += '<div class="chart-empty">No historical throughput values for this model.</div>';
+    return;
+  }
+  const labels = [...new Set(series.flatMap(s => Object.keys(s.pointMap)))].sort();
+  const datasets = series.map(s => ({
+    label: s.label,
+    data: labels.map(label => s.pointMap[label] ?? null),
+    borderColor: s.borderColor,
+    backgroundColor: s.backgroundColor,
+    borderWidth: s.borderWidth,
+    borderDash: s.borderDash,
+    pointRadius: s.pointRadius,
+    pointHoverRadius: s.pointHoverRadius,
+    showLine: s.showLine,
+    spanGaps: s.spanGaps,
+    tension: s.tension,
+    _rowMap: s.rowMap,
+  }));
+
+  new Chart(document.getElementById('atomesh-throughput-trend'), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { top: 8, right: 16 } },
+      plugins: {
+        legend: { labels: { color: C_LEGEND, font: { size: 9 }, boxWidth: 10, usePointStyle: true } },
+        tooltip: { ...chartTooltipOpts(), callbacks: {
+          title: items => `${state.atomeshTrendModel} · ${items[0].label}`,
+          label: item => ` ${item.dataset.label}: ${fmtNum(item.raw, 2)} tok/s/gpu`,
+          afterBody: items => {
+            const row = items[0].dataset._rowMap?.[items[0].label];
+            const parts = [];
+            if (row?.commit?.id) parts.push(`Commit: ${row.commit.id.slice(0, 7)}`);
+            if (row?.runUrl) parts.push(`Run: ${row.runUrl}`);
+            return parts;
+          },
+        }},
+        datalabels: { display: false },
+      },
+      scales: {
+        x: { type: 'category', grid: chartGridOpts(), title: { display: true, text: 'Date', color: C_TICK }, ticks: { color: C_TICK } },
+        y: { grid: chartGridOpts(), title: { display: true, text: 'Token Throughput per GPU (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '8%' },
+      },
+      onClick: (_e, elems) => {
+        if (!elems.length) return;
+        const ds = datasets[elems[0].datasetIndex];
+        const row = ds?._rowMap?.[labels[elems[0].index]];
+        if (row) showAtomeshPopover(row);
+      },
+    },
+  });
+}
+
+function renderAtomeshAccuracyHistoryChart(row, canvasId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const existing = Chart.getChart(canvas);
+  if (existing) existing.destroy();
+  const model = atomeshDisplayModel(row);
+  const allModelRows = atomeshHistoryRows().filter(h => atomeshDisplayModel(h) === model && Number.isFinite(parseAtomeshNumber(h.gsm8k)));
+  const exactRows = allModelRows.filter(h =>
+    h.islOsl === row.islOsl
+    && h.concurrency === row.concurrency
+    && (h.hardware || 'unknown') === (row.hardware || 'unknown')
+  );
+  const chartRows = exactRows.length ? exactRows : allModelRows;
+  const points = dedupeAtomeshHistoryByDay(chartRows, 'gsm8k');
+  if (!points.length) return;
+  const color = getModelColor(ATOMESH_DATA.backend, model);
+
+  new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: points.map(p => localDay(p.date)),
+      datasets: [{
+        label: 'GSM8K accuracy',
+        data: points.map(p => p.value * 100),
+        borderColor: color.border,
+        backgroundColor: color.bg,
+        borderWidth: 2,
+        pointRadius: 4,
+        pointHoverRadius: 6,
+        tension: 0.25,
+        fill: false,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
+        tooltip: { ...chartTooltipOpts(), callbacks: {
+          title: items => `${model} · ${items[0].label}`,
+          label: item => ` Accuracy: ${fmtNum(item.raw, 2)}%`,
+          afterBody: items => {
+            const histRow = points[items[0].dataIndex]?.row;
+            const parts = [];
+            if (histRow?.commit?.id) parts.push(`Commit: ${histRow.commit.id.slice(0, 7)}`);
+            if (histRow?.runUrl) parts.push(`Run: ${histRow.runUrl}`);
+            return parts;
+          },
+        }},
+        datalabels: { display: false },
+      },
+      scales: {
+        x: { grid: chartGridOpts(), title: { display: true, text: 'Date', color: C_TICK }, ticks: { color: C_TICK } },
+        y: {
+          min: Math.max(0, Math.floor((Math.min(...points.map(p => p.value * 100)) - 3) / 5) * 5),
+          suggestedMax: 100,
+          grid: chartGridOpts(),
+          title: { display: true, text: 'Accuracy (%)', color: C_TICK },
+          ticks: { color: C_TICK, callback: v => v + '%' },
+        },
+      },
+    },
+  });
+}
+
 function renderAtomeshAccuracyTab() {
   const container = document.getElementById('tab-accuracy');
   destroyChartsIn(container);
@@ -3690,8 +3963,9 @@ function renderAtomeshAccuracyTab() {
     <th class="num">Recovery</th><th class="num">Threshold</th><th class="num">Margin</th>
     <th class="num">Trend</th><th class="num">Fewshot</th><th>Last Tested</th><th>Run</th>
   </tr></thead><tbody>`;
-  for (const c of rows) {
-    html += `<tr>
+  rows.forEach((c, idx) => {
+    const canvasId = `atomesh-acc-history-${idx}`;
+    html += `<tr data-atomesh-acc-row="${idx}" style="cursor:pointer">
       <td style="white-space:nowrap;font-weight:600">${escHTML(ATOMESH_DATA.backend)}</td>
       <td class="model-name" style="color:${getModelColor(ATOMESH_DATA.backend, c.model).text}">${escHTML(c.model)}</td>
       <td>${escHTML(c.sourceTopology || c.topology)}</td>
@@ -3708,9 +3982,35 @@ function renderAtomeshAccuracyTab() {
       <td>${fmtDate(c.date || ATOMESH_DATA.updatedAt)}</td>
       <td>${atomeshRunCell(c)}</td>
     </tr>`;
-  }
+    html += `<tr class="detail-row" data-atomesh-acc-detail="${idx}">
+      <td colspan="15">
+        <div class="detail-inner">
+          <div class="chart-card hero" style="margin:0">
+            <h3>${escHTML(c.model)} — GSM8K Accuracy History</h3>
+            <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
+          </div>
+        </div>
+      </td>
+    </tr>`;
+  });
   html += '</tbody></table></div></div></div>';
   container.innerHTML = html;
+  const accCharts = {};
+  container.querySelectorAll('tr[data-atomesh-acc-row]').forEach(rowEl => {
+    rowEl.addEventListener('click', (e) => {
+      if (e.target.closest('a') || e.target.closest('button')) return;
+      const idx = Number(rowEl.dataset.atomeshAccRow);
+      const detail = container.querySelector(`tr[data-atomesh-acc-detail="${idx}"]`);
+      if (!detail) return;
+      const expanding = !detail.classList.contains('expanded');
+      detail.classList.toggle('expanded');
+      rowEl.classList.toggle('row-open');
+      if (expanding && !accCharts[idx]) {
+        accCharts[idx] = true;
+        requestAnimationFrame(() => renderAtomeshAccuracyHistoryChart(rows[idx], `atomesh-acc-history-${idx}`));
+      }
+    });
+  });
   syncHeaderH();
   bindFixedThead(container);
 }
