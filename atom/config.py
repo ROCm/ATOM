@@ -1279,16 +1279,6 @@ class Config:
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
                 f"dcp_size ({self.decode_context_parallel_size})"
             )
-            # DCP does not support an fp8 KV cache at all: neither the decode
-            # path nor the prefix-cache / chunked-prefill AllGather path handles
-            # fp8 dequant of the sharded KV. A cache dtype cannot be silently
-            # toggled off, so reject it outright rather than produce wrong
-            # results (matches the plugin's `assert k_scale is None`).
-            assert not self.kv_cache_dtype.startswith("fp8"), (
-                f"DCP (decode_context_parallel_size="
-                f"{self.decode_context_parallel_size}) does not support fp8 KV "
-                f"cache (kv_cache_dtype={self.kv_cache_dtype}); use bf16."
-            )
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )

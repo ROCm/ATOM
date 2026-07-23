@@ -671,7 +671,7 @@ class MLAAttention(nn.Module):
         if getattr(chunk_meta, "is_dcp", False):
             # DCP: the cached context KV is sharded (interleaved) across ranks,
             # so the per-chunk gather becomes gather-local -> AllGather ->
-            # reorg -> kv_b_proj (Scheme A). The rest of the merge logic below
+            # reorg -> kv_b_proj. The rest of the merge logic below
             # is identical to the non-DCP path.
             chunked_out, chunked_lse = self._dcp_compute_prefill_context(
                 prefill_q, kv_cache, attn_metadata, chunk_meta
@@ -769,10 +769,7 @@ class MLAAttention(nn.Module):
         from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
         from atom.model_ops.dcp_ops import dcp_gather_compressed_kv, reorg_kvcache
 
-        if self.kv_cache_dtype.startswith("fp8"):
-            raise NotImplementedError(
-                "DCP prefix-cache prefill does not support fp8 KV cache yet."
-            )
+        is_fp8_kv = self.kv_cache_dtype.startswith("fp8")
 
         chunked_out: Optional[torch.Tensor] = None
         chunked_lse: Optional[torch.Tensor] = None
@@ -780,10 +777,23 @@ class MLAAttention(nn.Module):
             toks = chunk_meta.seq_tot[c]
             if toks == 0:
                 continue
-            # 1. gather this rank's local compressed KV for the chunk.
+            # 1. gather this rank's local compressed KV for the chunk (keeps the
+            #    cache dtype, so fp8 stays fp8 here).
             local_kv = dcp_gather_compressed_kv(kv_cache, chunk_meta.local_slot_ids[c])
-            # 2. AllGather across DCP ranks -> [toks * dcp_world_size, d].
+            # 2. AllGather across DCP ranks -> [toks * dcp_world_size, d]. This is
+            #    a copy-only collective, so an fp8 payload is safe (no fp8
+            #    arithmetic, unlike an all-reduce).
             ag_kv = self.dcp_group.all_gather(local_kv, dim=0)
+            if is_fp8_kv:
+                # Dequant the fp8 compressed KV -> model dtype before reorg /
+                # kv_b_proj (which expect a bf16 latent). dequant = stored *
+                # scale mirrors the write-side quant (value / scale); _k_scale
+                # is 1.0 for MLA today. AllGather-then-dequant keeps the wire
+                # payload at fp8 (half the bf16 traffic). Tensor arithmetic (not
+                # float()/.item()): _k_scale may be a GPU tensor and a host sync
+                # is illegal under cudagraph capture; a 0-dim scale broadcasts on
+                # device with no sync.
+                ag_kv = ag_kv.to(self.dtype) * self._k_scale
 
             sum_seq_len = int(chunk_meta.cu_seqlens_k[c][-1].item())
             if sum_seq_len == 0:
@@ -1467,6 +1477,21 @@ class MLAAttention(nn.Module):
                     # always computed for every token.
                     self.rotary_emb(positions, q_rope, k_rope)
                     q_out = torch.cat([q_nope, q_rope], dim=-1)
+                    if q_out.dtype != attn_metadata.dtype_q:
+                        # fp8 KV cache: the decode / prefill-mla kernel expects an
+                        # fp8 query (dtype_q == kv dtype). The non-DCP fused
+                        # kernel quantizes q with _q_scale; replicate here since
+                        # the DCP split-op workaround bypasses it. quant = value /
+                        # scale matches the kernel's dequant (stored * scale);
+                        # The gathered fp8 q is all-gathered below (a copy-only
+                        # collective, safe for fp8 — unlike an fp8 all-reduce).
+                        # Use tensor arithmetic (NOT float()/.item()): _q_scale
+                        # may be a GPU tensor (fp8 models load a real scale onto
+                        # device), and a host sync here is illegal during
+                        # cudagraph capture ("operation not permitted when stream
+                        # is capturing"). A 0-dim scale tensor is broadcast on
+                        # device with no sync.
+                        q_out = (q_out / self._q_scale).to(attn_metadata.dtype_q)
                     concat_and_cache_mla(
                         k_nope,
                         k_rope.squeeze(1),
