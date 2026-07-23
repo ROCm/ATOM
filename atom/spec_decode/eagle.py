@@ -310,6 +310,22 @@ class EagleProposer:
 
         self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
 
+        draft_hf = self.speculative_config.draft_model_hf_config
+        mtp_inner = getattr(self.model, "model", None)
+        self._share_mtp_indices = (
+            not self.use_dspark
+            and self.speculative_config.method == "mtp"
+            and getattr(draft_hf, "index_share_for_mtp_iteration", False)
+            and hasattr(draft_hf, "index_topk")
+            and mtp_inner is not None
+            and hasattr(mtp_inner, "set_skip_topk")
+        )
+        if self._share_mtp_indices:
+            logger.info(
+                "MTP draft index_share_for_mtp_iteration enabled: "
+                "step 0 computes indexer top-k, steps 1+ reuse the buffer."
+            )
+
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
@@ -645,6 +661,10 @@ class EagleProposer:
                         positions,
                         hidden_states,
                     )
+                # index_share_for_mtp_iteration: step 0 runs the MTP indexer;
+                # steps 1+ skip it and read the compacted sparse_kv buffer.
+                if self._share_mtp_indices and i == 0:
+                    self.model.model.set_skip_topk(False)
                 ret_hidden_states = self.model(
                     input_ids=d_input_ids,
                     positions=d_positions,
@@ -654,6 +674,9 @@ class EagleProposer:
                     ret_hidden_states = pcp_allgather_rerange(
                         ret_hidden_states, pcp_ws
                     )[:n_global_draft]
+                if self._share_mtp_indices and i == 0:
+                    self.model.model.set_skip_topk(True)
+                    self.model.model.compact_topk_indices(last_token_indices)
 
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
