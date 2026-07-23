@@ -118,7 +118,10 @@ def _variant_record(model: dict[str, Any], variant: dict[str, Any]) -> dict[str,
     label = variant.get("label", "")
     return {
         "display": model["display"] + (f" {label}" if label else ""),
-        "path": model["path"],
+        # A variant may point at a different checkpoint (e.g. a spec-decode
+        # draft baked into a separate repo) while still sharing the parent
+        # model's dispatch checkbox / prefix. Falls back to the model path.
+        "path": variant.get("path", model["path"]),
         "prefix": model["prefix"],
         "args": build_args(model.get("config", {}), variant),
         "bench_args": variant.get("bench_args", ""),
