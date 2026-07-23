@@ -120,6 +120,25 @@ def _port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return dp_rank * tp_size + tp_rank
 
 
+def _prefill_context_parallel_rank_and_size() -> tuple[int, int]:
+    try:
+        from aiter.dist.parallel_state import (
+            get_prefill_context_model_parallel_rank,
+            get_prefill_context_model_parallel_world_size,
+        )
+
+        rank = get_prefill_context_model_parallel_rank()
+        size = get_prefill_context_model_parallel_world_size()
+    except Exception:
+        return 0, 1
+    return rank, max(1, size)
+
+
+def _transfer_rank_and_size(tp_rank: int, tp_size: int) -> tuple[int, int]:
+    pcp_rank, pcp_size = _prefill_context_parallel_rank_and_size()
+    return pcp_rank * tp_size + tp_rank, pcp_size * tp_size
+
+
 def _ip_for_ib_device(ib_device: str, fallback: str) -> str:
     """Return the IPv4 address bound to the netdev backing an RDMA HCA."""
     net_root = f"/sys/class/infiniband/{ib_device}/device/net"
@@ -243,7 +262,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.handshake_port = get_open_port()
         self.base_handshake_port = kv_transfer_config.get("handshake_port", 6301)
         self.engine_id = "None"
-        self.tp_size = config.tensor_parallel_size
+        pcp_size = max(1, getattr(config, "prefill_context_parallel_size", 1))
+        self.tp_size = config.tensor_parallel_size * pcp_size
         self.dp_size = config.parallel_config.data_parallel_size
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.host_ip = get_ip()
@@ -394,6 +414,9 @@ class MooncakeConnector(KVConnectorBase):
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_size = get_tp_group().world_size
         self.dp_size = get_dp_group().world_size
+        self.transfer_tp_rank, self.transfer_tp_size = _transfer_rank_and_size(
+            self.tp_rank, self.tp_size
+        )
 
         kv_transfer_config = config.kv_transfer_config
         default_local_ip = get_ip()
@@ -413,7 +436,7 @@ class MooncakeConnector(KVConnectorBase):
         # Side channel port (ZMQ) — deterministic from config for proxy relay
         self.base_handshake_port = kv_transfer_config.get("handshake_port", 6301)
         self._side_channel_port = self.base_handshake_port + _port_offset(
-            self.dp_rank, self.tp_rank, self.tp_size
+            self.dp_rank, self.transfer_tp_rank, self.transfer_tp_size
         )
 
         # --- Mooncake TransferEngine initialization ---
@@ -445,11 +468,13 @@ class MooncakeConnector(KVConnectorBase):
             ib_device = _auto_select_ib_device(phys_idx)
             logger.info(
                 "Auto-selecting RDMA device %s for physical GPU %d "
-                "(visible_idx=%d, tp_rank=%d)",
+                "(visible_idx=%d, tp_rank=%d, transfer_tp_rank=%d/%d)",
                 ib_device,
                 phys_idx,
                 visible_idx,
                 self.tp_rank,
+                self.transfer_tp_rank,
+                self.transfer_tp_size,
             )
 
         rdma_local_ip = _ip_for_ib_device(ib_device, default_local_ip)
@@ -751,10 +776,10 @@ class MooncakeConnector(KVConnectorBase):
 
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_tp_size = meta.tp_size
-            if remote_tp_size != self.tp_size:
-                remote_tp_rank = self.tp_rank % remote_tp_size
+            if remote_tp_size != self.transfer_tp_size:
+                remote_tp_rank = self.transfer_tp_rank % remote_tp_size
             else:
-                remote_tp_rank = self.tp_rank
+                remote_tp_rank = self.transfer_tp_rank
             remote_port = meta.remote_handshake_port + _port_offset(
                 meta.remote_dp_rank, remote_tp_rank, remote_tp_size
             )
@@ -792,7 +817,7 @@ class MooncakeConnector(KVConnectorBase):
                         "dst_block_ids": meta.local_block_ids,
                         "notify_host": self.local_ip,
                         "notify_port": self._notification_port,
-                        "consumer_tp_size": self.tp_size,
+                        "consumer_tp_size": self.transfer_tp_size,
                         "has_slot_regions": True,
                         "dst_slot_index": meta.local_slot_index,
                         "consumer_block_base_addrs": [
@@ -818,7 +843,7 @@ class MooncakeConnector(KVConnectorBase):
                 logger.info(
                     "[CONSUMER] Sending write_request for req %s (transfer_id=%s) "
                     "to %s (handshake_port=%d, dp_rank=%d, "
-                    "local_tp=%d, remote_tp=%d/%d), "
+                    "local_transfer_tp=%d/%d, remote_transfer_tp=%d/%d), "
                     "dst_block_ids=%s, num_regions=%d, "
                     "bytes/block=%s, num_blocks=%d",
                     req_id,
@@ -826,7 +851,8 @@ class MooncakeConnector(KVConnectorBase):
                     remote_addr,
                     meta.remote_handshake_port,
                     meta.remote_dp_rank,
-                    self.tp_rank,
+                    self.transfer_tp_rank,
+                    self.transfer_tp_size,
                     remote_tp_rank,
                     remote_tp_size,
                     meta.local_block_ids[:10],
@@ -844,7 +870,7 @@ class MooncakeConnector(KVConnectorBase):
                         "dst_block_ids": meta.local_block_ids,
                         "notify_host": self.local_ip,
                         "notify_port": self._notification_port,
-                        "consumer_tp_size": self.tp_size,
+                        "consumer_tp_size": self.transfer_tp_size,
                     }
                 )
 
@@ -969,8 +995,10 @@ class MooncakeConnector(KVConnectorBase):
             dst_block_ids = request_data["dst_block_ids"]
             notify_host = request_data["notify_host"]
             notify_port = request_data["notify_port"]
-            consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
-            consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
+            consumer_tp_size = request_data.get(
+                "consumer_tp_size", self.transfer_tp_size
+            )
+            consumers_per_rank = max(1, consumer_tp_size // self.transfer_tp_size)
             has_slot_data = request_data.get("has_slot_regions", False)
 
             logger.info(
