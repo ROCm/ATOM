@@ -10,6 +10,7 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
@@ -794,6 +795,70 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     return getattr(module, obj_name)
 
 
+_DYNAMO_METRICS_CONFIG_LOCK = threading.RLock()
+
+
+def _patch_torch_dynamo_metrics_config_logging() -> None:
+    """Keep callable logging ignores out of Torch Dynamo metrics JSON.
+
+    Torch 2.11 aliases ``ignore_logger_methods`` to the canonical
+    ``ignore_logging_functions`` config key, but some builds only exclude the
+    old alias when serializing compilation metrics.  Preserve the callable set
+    used by Dynamo tracing while temporarily hiding it from that private
+    metrics serializer.
+    """
+    config = torch._dynamo.config
+    if not hasattr(config, "ignore_logging_functions"):
+        return
+
+    try:
+        from torch._dynamo import utils as dynamo_utils
+    except ImportError:
+        return
+
+    original = getattr(dynamo_utils, "_get_dynamo_config_for_logging", None)
+    if original is None or getattr(
+        original, "_atom_ignore_logging_functions_patched", False
+    ):
+        return
+
+    try:
+        original()
+    except TypeError:
+        pass
+    else:
+        return
+
+    # Only patch when the callable ignore set is the source of the TypeError.
+    with _DYNAMO_METRICS_CONFIG_LOCK:
+        ignored_logging_functions = config.ignore_logging_functions
+        config.ignore_logging_functions = set()
+        try:
+            original()
+        except TypeError:
+            return
+        finally:
+            config.ignore_logging_functions = ignored_logging_functions
+
+    def wrapped_get_dynamo_config_for_logging():
+        with _DYNAMO_METRICS_CONFIG_LOCK:
+            ignored_logging_functions = config.ignore_logging_functions
+            config.ignore_logging_functions = set()
+            try:
+                return original()
+            finally:
+                config.ignore_logging_functions = ignored_logging_functions
+
+    setattr(
+        wrapped_get_dynamo_config_for_logging,
+        "_atom_ignore_logging_functions_patched",
+        True,
+    )
+    dynamo_utils._get_dynamo_config_for_logging = (
+        wrapped_get_dynamo_config_for_logging
+    )
+
+
 def getLogger():
     global logger
     if not logger.handlers:
@@ -816,14 +881,25 @@ def getLogger():
         console_handler.setLevel(logging.INFO)
 
         logger.addHandler(console_handler)
-        if hasattr(torch._dynamo.config, "ignore_logger_methods"):
-            torch._dynamo.config.ignore_logger_methods = (
-                logging.Logger.info,
-                logging.Logger.warning,
-                logging.Logger.debug,
-                logger.warning,
-                logger.info,
-                logger.debug,
+        ignored_logger_methods = {
+            logging.Logger.info,
+            logging.Logger.warning,
+            logging.Logger.debug,
+            logger.warning,
+            logger.info,
+            logger.debug,
+        }
+        if hasattr(torch._dynamo.config, "ignore_logging_functions"):
+            torch._dynamo.config.ignore_logging_functions = set(
+                torch._dynamo.config.ignore_logging_functions
+            )
+            torch._dynamo.config.ignore_logging_functions.update(
+                ignored_logger_methods
+            )
+            _patch_torch_dynamo_metrics_config_logging()
+        elif hasattr(torch._dynamo.config, "ignore_logger_methods"):
+            torch._dynamo.config.ignore_logger_methods = tuple(
+                ignored_logger_methods
             )
 
     return logger
