@@ -35,7 +35,6 @@ import os
 import random
 import time
 import warnings
-from argparse import ArgumentParser as FlexibleArgumentParser
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
@@ -48,6 +47,7 @@ from atom.entrypoints.openai.chat_encoders import (
     apply_chat_template,
     load_custom_message_encoder,
 )
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 from .backend_request_func import (
     ASYNC_REQUEST_FUNCS,

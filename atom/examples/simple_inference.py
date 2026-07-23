@@ -9,9 +9,10 @@ from atom.entrypoints.openai.chat_encoders import (
     load_custom_message_encoder,
 )
 from atom.model_engine.arg_utils import EngineArgs
+from atom.utils.arg_parser import FlexibleArgumentParser
 from transformers import AutoTokenizer
 
-parser = argparse.ArgumentParser(
+parser = FlexibleArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config of test",
 )
