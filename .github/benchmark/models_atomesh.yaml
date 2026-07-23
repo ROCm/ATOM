@@ -211,6 +211,7 @@ models:
               decode_max_num_seqs: 64
               max_num_batched_tokens: 131072
               decode_max_num_batched_tokens: 262144
+              disable_prefix_caching: false
               online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
           prefill:
             workers: 1
@@ -271,6 +272,35 @@ models:
         - <<: *glm52_agentic_lmcache
           name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c32
           concurrency: [32]
+
+        - <<: *glm52_agentic_lmcache
+          name: glm-52-mxfp4-1p1d-tp2-pcp2-agentic-lmcache-1m-c48
+          topology: 1p1d-tp4-pcp2
+          pd_worker_layout: multi_node
+          concurrency: [48]
+          prefill:
+            workers: 1
+            tp: 4
+            extra_args: >-
+              --prefill-context-parallel-size 2
+              --attn-prefill-chunk-size 131072
+              --long-prefill-token-threshold 131072
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: none
+          env:
+            common:
+              PYTHONHASHSEED: "0"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+              LMCACHE_CHUNK_SIZE: "256"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              MAX_JOBS: "16"
 
     accuracy:
       task: gsm8k
