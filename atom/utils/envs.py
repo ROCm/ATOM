@@ -194,6 +194,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Stream online quantization during weight loading. When set, each eligible
+    # Linear layer (unquantized/BF16 source re-quantized to an online target) is
+    # allocated on the meta device at construction, materialized when its weights
+    # finish loading, quantized immediately, and its source BF16 freed -- instead
+    # of loading the whole BF16 model then quantizing it in a second pass. This
+    # lowers peak load-time memory for `--online_quant_config`. Loading is forced
+    # single-threaded while active so cross-rank collectives (TP gather in
+    # `online_quantize_weight`) stay deterministically ordered. Default off.
+    "ATOM_ONLINE_QUANT_STREAMING": lambda: (
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING", "0").lower() in ("1", "true")
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

@@ -23,7 +23,11 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from atom.config import QuantizationConfig, get_current_atom_config
-from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
+from atom.quant_spec import (
+    LayerQuantConfig,
+    should_skip_online_quant,
+    should_stream_online_quant,
+)
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -414,6 +418,20 @@ class LinearBase(nn.Module):
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
 
+        # Decide whether this layer streams its online quantization: quantize it
+        # right after its weights finish loading (freeing the source BF16),
+        # instead of loading the whole model then quantizing. Same decision as
+        # FusedMoE (see quant_spec.should_stream_online_quant). When enabled the
+        # weight is allocated on the meta device and the loader materializes it
+        # on first touch (see model_loader/loader.py).
+        self._stream_online = self.source_quant_dtype is None and (
+            should_stream_online_quant(quant_config, prefix, quant_type, params_dtype)
+        )
+        # Capture the intended device now: the model is constructed under
+        # `set_default_device(self.device)`, but by load time the default is
+        # reset, so we must remember where to materialize.
+        self._load_device = torch.empty(0).device if self._stream_online else None
+
         if self.source_quant_dtype is not None:
             weight_size = (self.output_size, self.input_size)
             self.weight = atom_parameter(
@@ -425,7 +443,13 @@ class LinearBase(nn.Module):
                 if params_dtype not in [dtypes.fp4x2, dtypes.i4x2]
                 else (self.output_size, self.input_size // 2)
             )
-            self.weight = atom_parameter(torch.empty(weight_size, dtype=params_dtype))
+            self.weight = atom_parameter(
+                torch.empty(
+                    weight_size,
+                    dtype=params_dtype,
+                    device="meta" if self._stream_online else None,
+                )
+            )
         if bias:
             output_type = get_current_atom_config().torch_dtype
             self.bias = atom_parameter(torch.empty(self.output_size, dtype=output_type))
