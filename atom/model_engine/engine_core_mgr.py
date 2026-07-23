@@ -248,75 +248,53 @@ class CoreManager:
                         )
                         break
 
-                    try:
-                        obj = output_socket.recv(copy=False)
-                        request_type, data = pickle.loads(obj)
-                        if request_type == EngineCoreRequestType.SHUTDOWN:
-                            logger.debug(
-                                f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
-                            )
-                            self._shutdown_engine_core_rank(dp_rank)
-                            break
-                        elif request_type == EngineCoreRequestType.STREAM:
-                            stream_outputs = (
-                                data  # List of (seq_id, RequestOutput) tuples
-                            )
-                            logger.debug(
-                                f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
-                            )
-                            self.stream_outputs_queue.put_nowait(stream_outputs)
-                            # Also call callbacks if registered
-                            for seq_id, request_output in stream_outputs:
-                                callback = self._seq_id_to_callback.get(seq_id)
-                                logger.debug(
-                                    f"{self.label}: seq_id={seq_id}, callback={'found' if callback is not None else 'NOT FOUND'}, tokens={request_output.output_tokens}"
-                                )
-                                if callback is not None:
-                                    try:
-                                        callback(request_output)
-                                        logger.debug(
-                                            f"{self.label}: Successfully called callback for seq_id={seq_id}"
-                                        )
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"Error calling stream_callback for sequence {seq_id}: {e}",
-                                            exc_info=True,
-                                        )
-                                if request_output.finished:
-                                    self._seq_id_to_callback.pop(seq_id, None)
-                                    self._release_seq_load(seq_id)
-                                    logger.debug(
-                                        f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
-                                    )
-                        elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
-                            self.utility_response_queue.put_nowait(data)
-                        elif request_type == EngineCoreRequestType.ADD:
-                            # logger.info(f"Engine core output sequence id: {seq.id}")
-                            seqs = data
-                            # Offline (non-streaming) completions arrive here as
-                            # finished sequences; release their in-flight DP load.
-                            for seq in seqs:
-                                self._release_seq_load(seq.id)
-                            self.outputs_queue.put_nowait(seqs)
-                    except zmq.error.ContextTerminated:
-                        # Context destroyed during shutdown — recv can't
-                        # complete. Exit the loop cleanly.
+                    obj = output_socket.recv(copy=False)
+                    request_type, data = pickle.loads(obj)
+                    if request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(
-                            f"{self.label} (DP {dp_rank}): output thread context "
-                            f"terminated, exiting"
+                            f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
                         )
+                        self._shutdown_engine_core_rank(dp_rank)
                         break
-                    except Exception:
-                        # A single malformed or unexpected message must NOT kill
-                        # the delivery thread: if it did, the engine would keep
-                        # processing requests while every subsequent response is
-                        # silently dropped (the socket's only reader is gone).
-                        # Log with traceback and keep draining the socket.
-                        logger.exception(
-                            f"{self.label} (DP {dp_rank}): error handling output "
-                            f"message; dropping it and continuing"
+                    elif request_type == EngineCoreRequestType.STREAM:
+                        stream_outputs = data  # List of (seq_id, RequestOutput) tuples
+                        logger.debug(
+                            f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
                         )
-                        continue
+                        self.stream_outputs_queue.put_nowait(stream_outputs)
+                        # Also call callbacks if registered
+                        for seq_id, request_output in stream_outputs:
+                            callback = self._seq_id_to_callback.get(seq_id)
+                            logger.debug(
+                                f"{self.label}: seq_id={seq_id}, callback={'found' if callback is not None else 'NOT FOUND'}, tokens={request_output.output_tokens}"
+                            )
+                            if callback is not None:
+                                try:
+                                    callback(request_output)
+                                    logger.debug(
+                                        f"{self.label}: Successfully called callback for seq_id={seq_id}"
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Error calling stream_callback for sequence {seq_id}: {e}",
+                                        exc_info=True,
+                                    )
+                            if request_output.finished:
+                                self._seq_id_to_callback.pop(seq_id, None)
+                                self._release_seq_load(seq_id)
+                                logger.debug(
+                                    f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
+                                )
+                    elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
+                        self.utility_response_queue.put_nowait(data)
+                    elif request_type == EngineCoreRequestType.ADD:
+                        # logger.info(f"Engine core output sequence id: {seq.id}")
+                        seqs = data
+                        # Offline (non-streaming) completions arrive here as
+                        # finished sequences; release their in-flight DP load.
+                        for seq in seqs:
+                            self._release_seq_load(seq.id)
+                        self.outputs_queue.put_nowait(seqs)
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
@@ -963,21 +941,33 @@ class DisaggCoreManager(CoreManager):
         self.engine_core_identities = []
         self.shutdown_paths = []
         self.output_threads = []
-
-        # DP load-balancing state. DisaggCoreManager does not call
-        # super().__init__() (that would spawn CoreManager's own engine
-        # processes), so it must initialize the same fields CoreManager sets up.
-        # Disagg overrides add_request() with a prefill/decode fan-out and never
-        # routes through _dispatch_to_dp_ranks, so no load is ever charged and
-        # _seq_load stays empty — but the inherited output thread still calls
-        # _release_seq_load() on every finished sequence, so _lb_lock and
-        # _seq_load MUST exist or the output thread dies on the first finish and
-        # all responses stop coming back.
+        # Fair-rotation cursor, advanced once per selection. round_robin picks the
+        # rank directly (cursor % n); the load-aware strategies use it only to seed
+        # the argmin start offset so fully-tied ranks rotate instead of always
+        # resolving to rank 0.
         self._rank_rotation_cursor = 0
+
+        # --- DP request load balancing (see _select_dp_rank_locked) ---
+        # DisaggCoreManager fans out via its own add_request() and never routes
+        # through _dispatch_to_dp_ranks, so load is never charged and _seq_load
+        # stays empty. But the inherited output thread still calls
+        # _release_seq_load() on every finished sequence, so these fields MUST
+        # exist or the output thread dies on the first finish and responses stop.
+        # Strategy: "round_robin" | "least_requests" | "least_tokens" (validated
+        # at the CLI by argparse choices=DP_LB_STRATEGIES).
         self._dp_lb_strategy = config.dp_load_balance
+        # Token-equivalent weight of one in-flight request for "least_tokens".
+        # Read once here: this is a construction-time config value (CoreManager
+        # is built after env/args are finalized), not a runtime-tunable knob.
         self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
+        # Authoritative in-flight load per rank, maintained locally: incremented
+        # on dispatch, decremented on finish/abort. Guarded by _lb_lock because
+        # dispatch runs on the request thread while release runs on the per-rank
+        # output threads.
         self._rank_reqs = [0] * self.local_engine_count
         self._rank_tokens = [0] * self.local_engine_count
+        # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
+        # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
         self._lb_lock = Lock()
 
