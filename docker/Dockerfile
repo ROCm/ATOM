@@ -177,7 +177,6 @@ LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
-COPY docker/patches/sglang/topk-v2-rocm.patch /tmp/sglang-patches/topk-v2-rocm.patch
 COPY docker/patches/sglang/cohere2-moe-drop-invalid-hf-strict.patch /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
@@ -199,7 +198,6 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     git clone "${SGLANG_REPO}" /app/sglang && \
     cd /app/sglang && \
     git checkout "${SGLANG_REF}" && \
-    git apply /tmp/sglang-patches/topk-v2-rocm.patch && \
     git apply /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch && \
     git submodule update --init --recursive && \
     echo "sglang ref:" && \
@@ -274,12 +272,6 @@ RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && 
     rm -rf /tmp/triton-base-backup && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton
-
-RUN echo "========== [SGLANG-ATOM 4.5/6] Drop stale GLM-5.2 AITER JIT artifacts ==========" && \
-    if [ -d /app/aiter-test/aiter/jit ]; then \
-      rm -f /app/aiter-test/aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage2.so && \
-      rm -rf /app/aiter-test/aiter/jit/build/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage2; \
-    fi
 
 RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
@@ -471,10 +463,6 @@ RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
 COPY --from=build_aiter /app/aiter-test /app/aiter-test
 RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
     pip show amd-aiter
-
-RUN echo "========== [ATOM] Drop stale GLM-5.2 AITER JIT artifacts ==========" && \
-    rm -f /app/aiter-test/aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage2.so && \
-    rm -rf /app/aiter-test/aiter/jit/build/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage2
 
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
 RUN pip install rocm-trace-lite && \

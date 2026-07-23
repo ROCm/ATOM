@@ -13,7 +13,6 @@ LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
-COPY docker/patches/sglang/topk-v2-rocm.patch /tmp/sglang-patches/topk-v2-rocm.patch
 COPY docker/patches/sglang/cohere2-moe-drop-invalid-hf-strict.patch /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
@@ -35,7 +34,6 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     git clone "${SGLANG_REPO}" /app/sglang && \
     cd /app/sglang && \
     git checkout "${SGLANG_REF}" && \
-    git apply /tmp/sglang-patches/topk-v2-rocm.patch && \
     git apply /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch && \
     git submodule update --init --recursive && \
     echo "sglang ref:" && \
