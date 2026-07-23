@@ -33,6 +33,10 @@ class PPEngineCoreProc(EngineCore):
             pc.pp_token_addr,
         )
         self._in_flight: deque = deque()
+        # Middle chunked-prefill batches awaiting prefix-hash registration.
+        self._pending_prefix_hash: deque = deque()
+        bm = self.scheduler.block_manager
+        self._defer_prefix_hash: bool = bm.enable_prefix_caching and not bm.swa_enabled
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
@@ -107,8 +111,13 @@ class PPEngineCoreProc(EngineCore):
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
             if not needs_output:
+                # Middle chunk: no token flows back, so it never reaches
+                # postprocess. Defer its hash registration to the next recv.
+                # Skipped under SWA (deferred ring slots may be overwritten).
                 self._in_flight.popleft()
                 self.scheduler.release_pp_inflight(scheduled_batch)
+                if self._defer_prefix_hash:
+                    self._pending_prefix_hash.append(scheduled_batch)
                 continue
 
             fwd_out = self.pp_transport.recv_tokens(timeout_ms=poll_ms)
@@ -123,6 +132,9 @@ class PPEngineCoreProc(EngineCore):
 
             self._in_flight.popleft()
             self.scheduler.release_pp_inflight(scheduled_batch)
+            # FIFO recv confirms earlier chunks' KV is written; hash them before
+            # postprocess so a final chunk's parent-hash chain is in place.
+            self._flush_pending_prefix_hashes()
             finished_seqs = self.scheduler.postprocess(
                 seqs.values(),
                 fwd_out,
@@ -137,6 +149,10 @@ class PPEngineCoreProc(EngineCore):
                 pass
             if finished_seqs:
                 self.output_queue.put_nowait(finished_seqs)
+
+    def _flush_pending_prefix_hashes(self):
+        while self._pending_prefix_hash:
+            self.scheduler.register_prefill_hashes(self._pending_prefix_hash.popleft())
 
     def _downstream_busy_loop(self):
         shutdown = False

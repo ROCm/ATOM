@@ -1505,6 +1505,29 @@ class Scheduler:
         for req_id in self._pp_inflight_req_ids(batch):
             self._pp_inflight_token_block.discard(req_id)
 
+    def register_prefill_hashes(self, batch: ScheduledBatch) -> None:
+        """Publish prefix-cache hashes for a prefill batch without full
+        postprocess. Used by the PP head for middle chunked-prefill chunks,
+        whose batches produce no output and so never reach postprocess (the
+        only other hash_blocks caller). Uses the batch's frozen per-seq offsets.
+
+        Safe to defer: under PP the scheduler has no prefill_delayer, so Phase 1
+        always resumes partials before the decode/preempt path runs — a
+        mid-prefill seq is never preempted, so its block table stays valid.
+        """
+        if not self.block_manager.enable_prefix_caching:
+            return
+        if batch.is_final_chunk is None:
+            return
+        running_by_id = {seq.id: seq for seq in self.running}
+        for i, req_id in enumerate(batch.req_ids):
+            seq = running_by_id.get(req_id)
+            if seq is None:
+                continue
+            chunk = int(batch.num_scheduled_tokens[i])
+            start_tokens = int(batch.num_cached_tokens[i])
+            self.block_manager.hash_blocks(seq, chunk, start_tokens=start_tokens)
+
     def postprocess(
         self,
         seqs: list[Sequence],

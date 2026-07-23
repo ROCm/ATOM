@@ -591,3 +591,62 @@ def _batch(total_seqs_num_decode=0, is_final_chunk=None):
 )
 def test_produces_output(decode, final, expected):
     assert _batch(decode, final).produces_output() is expected
+
+
+# ---------------------------------------------------------------------------
+# PP chunked-prefill prefix-hash registration (register_prefill_hashes)
+# ---------------------------------------------------------------------------
+
+
+def _drive_pp_prefill(sched, prompt_len, block_size=16):
+    """Run one seq's prefill through the head defer/flush loop and return it."""
+    import numpy as np
+
+    seq = _make_seq(prompt_len, block_size=block_size)
+    sched.add(seq)
+    pending = []
+    for _ in range(400):
+        res = sched.schedule()
+        if res is None:
+            break
+        batch, seqs = res
+        if not batch.req_ids:
+            break
+        if batch.produces_output():
+            for b in pending:
+                sched.register_prefill_hashes(b)
+            pending.clear()
+            n = len(batch.req_ids)
+            fwd = ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[(0,)] * n,
+                num_rejected=np.zeros(n, dtype=np.int32),
+                num_bonus=np.zeros(n, dtype=np.int32),
+                draft_token_ids=None,
+                is_deferred_out=False,
+            )
+            sched.postprocess(list(seqs.values()), fwd, batch=batch)
+        else:
+            pending.append(batch)
+        if (
+            seq.num_cached_tokens >= seq.num_prompt_tokens
+            and not seq.is_partial_prefill
+        ):
+            break
+    return seq
+
+
+def test_pp_chunked_prefill_registers_prefix_hashes():
+    bs = 16
+    cfg = _pp_config(
+        enable_prefix_caching=True,
+        max_num_batched_tokens=64,
+        kv_cache_block_size=bs,
+        long_prefill_token_threshold=0,
+    )
+    sched = Scheduler(cfg)
+    prompt = 512  # 32 blocks, 8 chunks of 64 -> 7 middle chunks
+    _drive_pp_prefill(sched, prompt, block_size=bs)
+    # A fresh same-prefix request must hit the whole prompt minus the last block.
+    hit = sched.block_manager.can_allocate(_make_seq(prompt, block_size=bs))
+    assert hit == prompt // bs - 1
