@@ -210,7 +210,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
         flash_layout: bool = False,
-        rotary_already_applied: bool = False,
     ):
         num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
         x = 16 // k_cache.element_size()
@@ -311,7 +310,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                     k_scale=k_scale,
                     v_scale=v_scale,
                 )
-        elif use_triton_attn and self.rotary_emb is not None and not rotary_already_applied:
+        elif use_triton_attn and self.rotary_emb is not None:
             k_scale = v_scale = self.per_tensor_scale
             self.per_token_quant = False
             q, k, _k_cache, _v_cache = fused_qk_rope_reshape_and_cache(
@@ -339,7 +338,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             asm_layout = True
             if use_triton_attn:
                 asm_layout = False
-            if self.rotary_emb is not None and not rotary_already_applied:
+            if self.rotary_emb is not None:
                 assert position is not None
                 q, k = self.rotary_emb(position, q, k)
             if self.q_norm is not None:
@@ -743,6 +742,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         if position is None:
             sfc = get_current_atom_config().compilation_config.static_forward_context
             position = sfc.get("positions")
+        query = query.view(-1, self.num_heads, self.head_dim)
+        key = key.view(-1, self.num_kv_heads, self.head_dim)
+        value = value.view(-1, self.num_kv_heads, self.head_dim)
+        output = output.view(-1, self.num_heads, self.head_dim)
+
         num_actual_tokens = attn_metadata.num_actual_tokens
         k_cache, v_cache = kv_cache.unbind(0)
         num_blocks, block_size, num_kv_heads, _ = k_cache.shape
@@ -769,8 +773,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 self.k_scale = self.kv_scale[0]
                 self.v_scale = self.kv_scale[1]
 
-        # As vLLM cuda graph capture padding mechanism, here split q/k/v/o to the
-        # actual tokens before applying model-level position-dependent transforms.
+        # as vLLM cuda graph capture padding mechanism, here split the qkvo with
+        # the actual tokens
         query = query[:num_actual_tokens]
         # vLLM can call plugin attention without fused qkv/position tensors for
         # some dense-model paths (for example Llama). Slice them only when present.
@@ -782,21 +786,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             key = key[:num_actual_tokens]
         if value is not None:
             value = value[:num_actual_tokens]
-
-        rotary_already_applied = False
-        if self.rotary_emb is not None and self.q_norm is None and self.k_norm is None:
-            # Match vLLM's Llama-style path: apply RoPE on the flat q/k projection
-            # tensors before reshaping to [tokens, heads, head_dim]. Applying the
-            # same rotary object after the reshape is not equivalent for Llama3
-            # rope scaling and regresses long-context accuracy.
-            assert position is not None
-            query, key = self.rotary_emb(position, query, key)
-            rotary_already_applied = True
-
-        query = query.view(-1, self.num_heads, self.head_dim)
-        key = key.view(-1, self.num_kv_heads, self.head_dim)
-        value = value.view(-1, self.num_kv_heads, self.head_dim)
-        output = output.view(-1, self.num_heads, self.head_dim)
         output_actual_tokens = output[:num_actual_tokens]
         # rope and cache flush fusion. ATOM always use shuffle layout for kv cache
         result = self.rope_cache(
@@ -811,7 +800,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             k_scale=self.k_scale,
             v_scale=self.v_scale,
             flash_layout=False,
-            rotary_already_applied=rotary_already_applied,
         )
         query, key, value, k_cache, v_cache, k_scale, v_scale = result
 
