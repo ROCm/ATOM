@@ -16,13 +16,13 @@ except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
-from atom.kv_transfer.offload.connector import (
-    LMCacheOffloadConnector,
-    LMCacheOffloadConnectorScheduler,
+from atom.kv_transfer.offload.dense.connector import (
+    DenseOffloadConnector,
+    DenseOffloadScheduler,
 )
-from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
-from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
-    ATOMLMCacheGPUConnector,
+from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+from atom.kv_transfer.offload.dense.gpu_connector import (
+    DenseGPUConnector,
 )
 from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
 from atom.model_engine.scheduler import Scheduler
@@ -40,8 +40,8 @@ class _LookupClient:
         self.cleared.append(lookup_id)
 
 
-def _scheduler() -> LMCacheOffloadConnectorScheduler:
-    sched = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)
+def _scheduler() -> DenseOffloadScheduler:
+    sched = DenseOffloadScheduler.__new__(DenseOffloadScheduler)
     sched._config = SimpleNamespace()
     sched.kv_role = "offload"
     sched.block_size = 4
@@ -61,7 +61,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     return sched
 
 
-def _install_fake_fused_chunk_major(codec: ATOMKVByteCodec) -> None:
+def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
     def _pack(
         segments,
         seg_block_bytes,
@@ -155,8 +155,8 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
 
     assert connector._ranges_to_block_ids(
         [4],
@@ -201,8 +201,8 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
     _install_fake_fused_chunk_major(codec)
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
 
@@ -215,7 +215,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         "gpu_to_chunk_major_device_buffer",
         lambda device_buf, block_id_groups, stream=None: (
             pack_groups.append([list(group) for group in block_id_groups]),
-            ATOMKVByteCodec.gpu_to_chunk_major_device_buffer(
+            DenseKVByteCodec.gpu_to_chunk_major_device_buffer(
                 codec, device_buf, block_id_groups, stream=None
             ),
         )[-1],
@@ -225,7 +225,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         "chunk_major_device_buffer_to_gpu",
         lambda device_buf, block_id_groups, stream=None: (
             unpack_groups.append([list(group) for group in block_id_groups]),
-            ATOMKVByteCodec.chunk_major_device_buffer_to_gpu(
+            DenseKVByteCodec.chunk_major_device_buffer_to_gpu(
                 codec, device_buf, block_id_groups, stream=None
             ),
         )[-1],
@@ -331,8 +331,8 @@ def test_lmcache_connector_requires_fused_chunk_major_staging():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
     memory_objs = [
         SimpleNamespace(
             tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
@@ -362,8 +362,8 @@ def test_lmcache_connector_rejects_oversized_memory_obj():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
     memory_obj = SimpleNamespace(
         tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
     )
@@ -392,8 +392,8 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 3
     assert connector.gpu_staging_buffer_bytes == 3 * connector.gpu_staging_chunk_bytes
@@ -416,8 +416,8 @@ def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 2
     assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
@@ -445,7 +445,7 @@ def test_codec_chunk_major_device_buffer_layout():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
+    codec = DenseKVByteCodec(kv_caches)
     _install_fake_fused_chunk_major(codec)
     block_id_groups = [[0, 1], [2, 3]]
     device_buf = torch.empty(
@@ -503,7 +503,7 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
         )
         for name, layer in original.items()
     }
-    codec = ATOMKVByteCodec(kv_caches)
+    codec = DenseKVByteCodec(kv_caches)
     _install_fake_fused_chunk_major(codec)
     block_id_groups = [[4, 1, 3], [0]]
     device_buf = torch.empty(
@@ -543,7 +543,7 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
+    codec = DenseKVByteCodec(kv_caches)
     device_buf = torch.empty(3 * codec.bytes_per_block, dtype=torch.uint8)
 
     with pytest.raises(ValueError, match="duplicate block ids"):
@@ -828,7 +828,7 @@ def test_load_failure_allows_recomputed_hit_range_to_be_saved():
 
 
 def test_worker_completes_noop_load_when_hbm_satisfies():
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._failed_load = set()
@@ -851,7 +851,7 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
 
 
 def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._failed_load = set()
@@ -887,7 +887,7 @@ def test_worker_save_uses_lmcache_engine_store():
         def store(self, tokens, mask=None, **kwargs) -> None:
             self.calls.append((tokens.tolist(), mask.tolist(), kwargs))
 
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
     conn.chunk_size = 4
@@ -930,7 +930,7 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
         def lookup_unpin(self, ids) -> None:
             self.unpinned.extend(ids)
 
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._failed_load = set()
@@ -973,7 +973,7 @@ def test_worker_load_partial_retrieve_marks_failed():
         def lookup_unpin(self, ids) -> None:
             self.unpinned.extend(ids)
 
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._failed_load = set()
@@ -996,7 +996,7 @@ def test_worker_load_partial_retrieve_marks_failed():
 
 
 def test_load_exception_is_reported_as_failed_recving():
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._done_save = set()
@@ -1150,7 +1150,7 @@ def test_finished_recv_matches_string_req_id():
 # from it (segment_bytes / num_blocks) rather than assuming dim 0 == blocks.
 
 
-def _install_byte_addressing_fused(codec: ATOMKVByteCodec) -> None:
+def _install_byte_addressing_fused(codec: DenseKVByteCodec) -> None:
     """Mock fused staging that addresses each physical block as a raw byte
     slice — block ``b`` maps to bytes ``[b*nbytes : (b+1)*nbytes]`` of the
     flattened segment, exactly like the Triton kernel. Unlike the block-major
@@ -1214,7 +1214,7 @@ def test_codec_mla_token_major_block_accounting():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
 
     # Block count comes from the explicit arg, not tensor.shape[0] (= tokens).
     assert codec.num_blocks == num_blocks
@@ -1223,7 +1223,7 @@ def test_codec_mla_token_major_block_accounting():
 
     # A segment whose element count is not divisible by num_blocks is rejected.
     with pytest.raises(ValueError):
-        ATOMKVByteCodec(
+        DenseKVByteCodec(
             {
                 "l0": SimpleNamespace(
                     k_cache=torch.arange(7, dtype=torch.uint8),
@@ -1252,7 +1252,7 @@ def test_codec_mla_round_trip_byte_identical():
             k_cache=original.clone(), v_cache=None, k_scale=None, v_scale=None
         )
     }
-    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
     _install_byte_addressing_fused(codec)
 
     block_id_groups = [[0, 1], [2, 3]]

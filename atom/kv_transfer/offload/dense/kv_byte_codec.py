@@ -37,7 +37,7 @@ import torch
 logger = logging.getLogger("atom")
 
 
-class ATOMKVByteCodec:
+class DenseKVByteCodec:
     """Per-block byte mover between paged GPU KV tensors and flat buffers."""
 
     def __init__(self, kv_caches: dict, num_blocks: int | None = None) -> None:
@@ -74,7 +74,7 @@ class ATOMKVByteCodec:
                     self._segments.append(t)
 
         if not self._segments:
-            raise ValueError("ATOMKVByteCodec: no movable KV tensors registered")
+            raise ValueError("DenseKVByteCodec: no movable KV tensors registered")
 
         first = self._segments[0]
         self._device = first.device
@@ -83,20 +83,20 @@ class ATOMKVByteCodec:
         )
         if self.num_blocks <= 0:
             raise ValueError(
-                f"ATOMKVByteCodec: num_blocks must be > 0, got {self.num_blocks}"
+                f"DenseKVByteCodec: num_blocks must be > 0, got {self.num_blocks}"
             )
         for seg in self._segments:
             if seg.device != self._device:
                 raise ValueError(
-                    "ATOMKVByteCodec: all KV tensors must be on the same device"
+                    "DenseKVByteCodec: all KV tensors must be on the same device"
                 )
             if not seg.is_contiguous():
                 raise ValueError(
-                    "ATOMKVByteCodec: KV tensors must be contiguous for byte copy"
+                    "DenseKVByteCodec: KV tensors must be contiguous for byte copy"
                 )
             if seg.numel() % self.num_blocks != 0:
                 raise ValueError(
-                    "ATOMKVByteCodec: KV tensor size "
+                    "DenseKVByteCodec: KV tensor size "
                     f"{seg.numel()} not divisible by num_blocks={self.num_blocks} "
                     f"(shape={tuple(seg.shape)})"
                 )
@@ -118,7 +118,7 @@ class ATOMKVByteCodec:
                 self._fused_kv_staging = triton_offload_gather
             except Exception:
                 logger.warning(
-                    "ATOMKVByteCodec: Triton KV staging unavailable; "
+                    "DenseKVByteCodec: Triton KV staging unavailable; "
                     "fused chunk-major staging unavailable",
                     exc_info=True,
                 )
@@ -141,14 +141,14 @@ class ATOMKVByteCodec:
         try:
             normalized = [operator.index(bid) for bid in block_ids]
         except TypeError as exc:
-            raise ValueError("ATOMKVByteCodec: block_ids must be integers") from exc
+            raise ValueError("DenseKVByteCodec: block_ids must be integers") from exc
         if not normalized:
             return normalized
         min_bid = min(normalized)
         max_bid = max(normalized)
         if min_bid < 0 or max_bid >= self.num_blocks:
             raise ValueError(
-                "ATOMKVByteCodec: block id out of range "
+                "DenseKVByteCodec: block id out of range "
                 f"[0, {self.num_blocks}); min={min_bid} max={max_bid}"
             )
         return normalized
@@ -164,21 +164,21 @@ class ATOMKVByteCodec:
         ]
         flat = [bid for block_ids in groups for bid in block_ids]
         if reject_repeated and len(set(flat)) != len(flat):
-            raise ValueError("ATOMKVByteCodec: duplicate block ids are not supported")
+            raise ValueError("DenseKVByteCodec: duplicate block ids are not supported")
         return groups, flat, [len(block_ids) for block_ids in groups]
 
     def _validate_device_buf(self, device_buf: torch.Tensor, nblocks: int) -> None:
         if device_buf.dtype != torch.uint8:
-            raise TypeError("ATOMKVByteCodec: device_buf must be a uint8 tensor")
+            raise TypeError("DenseKVByteCodec: device_buf must be a uint8 tensor")
         if device_buf.device != self._device:
             raise TypeError(
-                "ATOMKVByteCodec: device_buf must be on the KV cache device "
+                "DenseKVByteCodec: device_buf must be on the KV cache device "
                 f"{self._device}, got {device_buf.device}"
             )
         required = int(nblocks) * self.bytes_per_block
         if int(device_buf.numel()) < required:
             raise ValueError(
-                "ATOMKVByteCodec: device_buf is too small "
+                "DenseKVByteCodec: device_buf is too small "
                 f"for {nblocks} blocks; need {required} bytes, "
                 f"got {int(device_buf.numel())}"
             )
@@ -205,7 +205,7 @@ class ATOMKVByteCodec:
             return
         if self._fused_kv_staging is None:
             raise RuntimeError(
-                "ATOMKVByteCodec requires Triton fused chunk-major staging"
+                "DenseKVByteCodec requires Triton fused chunk-major staging"
             )
         with self._device_ctx():
             stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
@@ -234,7 +234,7 @@ class ATOMKVByteCodec:
             return
         if self._fused_kv_staging is None:
             raise RuntimeError(
-                "ATOMKVByteCodec requires Triton fused chunk-major staging"
+                "DenseKVByteCodec requires Triton fused chunk-major staging"
             )
         with self._device_ctx():
             stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()

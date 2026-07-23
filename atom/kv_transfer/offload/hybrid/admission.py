@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Worker-side admission & lifecycle bookkeeping for DSV4 checkpoint saves.
+"""Worker-side admission & lifecycle bookkeeping for hybrid-family checkpoint saves.
 
 Two independent resources bound how many terminal checkpoints can be saved
 concurrently without ever stalling the running request (see
@@ -12,11 +12,11 @@ concurrently without ever stalling the running request (see
 * **in-flight save credits** — a cap on concurrent background saves (one temp /
   stream budget in V1).
 
-:class:`DSV4CheckpointAdmission` hands out a ``(pool_idx, credit)`` pair or
+:class:`CheckpointAdmission` hands out a ``(pool_idx, credit)`` pair or
 refuses (``None``) when either resource is exhausted. Refusal means *skip this
 checkpoint* — the current request continues unblocked.
 
-:class:`DSV4SwaIoPins` reference-counts physical SWA pages that an in-flight save
+:class:`SwaIoPins` reference-counts physical SWA pages that an in-flight save
 is still reading. The SWA allocator must treat ``io_ref > 0`` pages as
 non-reusable even after the sequence drops its own reference
 (``free_after_prefill_chunk``), so an async gather never races page reuse.
@@ -29,14 +29,14 @@ from collections import defaultdict
 from typing import Iterable
 
 
-class DSV4CheckpointAdmission:
+class CheckpointAdmission:
     """Bounded, non-blocking admission for concurrent checkpoint saves."""
 
     def __init__(self, *, state_pool_size: int, max_inflight_saves: int) -> None:
         self._pool_size = int(state_pool_size)
         self._max_inflight = int(max_inflight_saves)
         if self._pool_size < 0 or self._max_inflight < 0:
-            raise ValueError("DSV4CheckpointAdmission: sizes must be >= 0")
+            raise ValueError("CheckpointAdmission: sizes must be >= 0")
         self._lock = threading.Lock()
         self._free_slots: list[int] = list(range(self._pool_size))
         self._inflight: int = 0
@@ -67,17 +67,17 @@ class DSV4CheckpointAdmission:
         with self._lock:
             if not (0 <= int(pool_idx) < self._pool_size):
                 raise ValueError(
-                    f"DSV4CheckpointAdmission: bad pool_idx {pool_idx}"
+                    f"CheckpointAdmission: bad pool_idx {pool_idx}"
                 )
             if pool_idx in self._free_slots:
                 raise ValueError(
-                    f"DSV4CheckpointAdmission: pool_idx {pool_idx} double-released"
+                    f"CheckpointAdmission: pool_idx {pool_idx} double-released"
                 )
             self._free_slots.append(int(pool_idx))
             self._inflight = max(0, self._inflight - 1)
 
 
-class DSV4SwaIoPins:
+class SwaIoPins:
     """Reference counts on physical SWA pages held by in-flight saves."""
 
     def __init__(self) -> None:
@@ -100,7 +100,7 @@ class DSV4SwaIoPins:
                     continue
                 cur = self._refs.get(p, 0)
                 if cur <= 0:
-                    raise ValueError(f"DSV4SwaIoPins: page {p} unpinned below zero")
+                    raise ValueError(f"SwaIoPins: page {p} unpinned below zero")
                 if cur == 1:
                     del self._refs[p]
                 else:

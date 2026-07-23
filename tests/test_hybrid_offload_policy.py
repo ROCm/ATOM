@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from atom.kv_transfer.offload.dsv4.policy import (
+from atom.kv_transfer.offload.hybrid.policy import (
     candidate_boundaries,
     checkpoint_key,
     select_resume_boundary,

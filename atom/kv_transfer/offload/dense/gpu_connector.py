@@ -18,7 +18,7 @@ from typing import Any
 
 import torch
 
-from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
+from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_staging import (
     _PipelineStage,
     _StagingBuffer,
@@ -48,12 +48,12 @@ class _TransferGroup:
     nbytes: int
 
 
-class ATOMLMCacheGPUConnector:
+class DenseGPUConnector:
     """LMCache GPUConnectorInterface for ATOM's opaque KV-block byte layout."""
 
     def __init__(
         self,
-        codec: ATOMKVByteCodec,
+        codec: DenseKVByteCodec,
         block_size: int,
         *,
         chunk_size: int | None = None,

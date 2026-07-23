@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Scheduler-side policy for DSV4 terminal checkpoints (pure decisions).
+"""Scheduler-side policy for hybrid terminal checkpoints (pure decisions).
 
 These are the Phase 0 / Phase 3 decisions the scheduler connector makes, factored
 out so they can be unit-tested without a live scheduler:
@@ -68,7 +68,7 @@ def candidate_boundaries(
         dropped = len(boundaries) - int(max_probes)
         boundaries = boundaries[: int(max_probes)]
         logger.debug(
-            "DSV4 offload: capping resume-boundary probes to %d for prompt_len=%d "
+            "offload[hybrid]: capping resume-boundary probes to %d for prompt_len=%d "
             "(dropped %d smaller candidates)",
             max_probes,
             L,

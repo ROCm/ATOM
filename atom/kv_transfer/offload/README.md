@@ -31,7 +31,7 @@ Two ideas carry the whole module:
    AITER attention stores K **x-packed and head-major** (`K=(nb,H,D//x,bs,x)`,
    `x = 16 // elem`) and V strided (`nb,H,D,bs`). So we hand LMCache an
    ATOM-owned `GPUConnectorInterface` that moves **opaque per-block bytes**
-   (`ATOMKVByteCodec`) — a byte-identical round-trip the attention kernel reads
+   (`DenseKVByteCodec`) — a byte-identical round-trip the attention kernel reads
    back in its own layout. LMCache never needs to understand the layout.
 
 2. **Copies run off the RPC thread, after `forward`.**
@@ -40,94 +40,200 @@ Two ideas carry the whole module:
    `get_finished` post-forward. This is the fix for the classic "loading KV
    blocks/starves the running prefill" coupling.
 
+3. **One connector name, two layout families.**
+   Every model uses `kv_connector: "lmcache_offload"`. `connector.py::select_variant`
+   picks **dense** (token-dense KV, LMCache chunk incremental — DSV2/V3 MLA, MHA)
+   or **hybrid** (terminal opaque offload bundles — DSV4, Qwen3-Next, …). Hybrid
+   models further resolve a **profile** (`hybrid/profiles/`) that declares which GPU
+   regions (block / swa / slot / staging) compose each bundle. New hybrid target =
+   new profile, not a new connector.
+
 ## Module Map
 
 | File | Role |
 |------|------|
-| `__init__.py` | Registers the `lmcache_offload` backend with `KVConnectorFactory`. |
-| `connector.py` | The two halves: `LMCacheOffloadConnectorScheduler` (EngineCore process) and `LMCacheOffloadConnector` (worker). The core orchestration. |
+| `__init__.py` | Registers the single `lmcache_offload` backend with `KVConnectorFactory` (points at `connector.py`). |
+| `connector.py` | Public entry: `select_variant(config)` (→ `"dense"` \| `"hybrid"`) + the two shells `LMCacheOffloadConnector` / `LMCacheOffloadConnectorScheduler` that pick a family from `config` and delegate every hook to the impl. |
+| `dense/` | The **dense** family: `DenseOffloadConnector` / `DenseOffloadScheduler` + `gpu_connector.py` (`DenseGPUConnector`) + `kv_byte_codec.py` (`DenseKVByteCodec`). LMCache token-chunk incremental; DSV2/V3 MLA + MHA. |
+| `hybrid/` | The **hybrid** family: `HybridOffloadConnector` / `HybridOffloadScheduler` + `kv_bundle.py`/`kv_bundle_codec.py` (opaque N-component bundle) + `gpu_connector.py`/`store.py`/`admission.py`/`policy.py`. |
+| `hybrid/profiles/` | `HybridProfile` + `BundleSources`: declare a model's bundle components (block/swa/slot/staging). Add an offload target = add a profile (`dsv4.py`, `qwen3_next.py`). |
 | `config.py` | Builds the per-rank `LMCacheEngineConfig` + `LMCacheMetadata` from `LMCACHE_*` env and `kv_transfer_config` extras. |
-| `metadata.py` | `ATOMRawBytesLMCacheMetadata` (opaque uint8 allocation) + per-request transfer descriptors (`LoadSpec`, `SaveSpec`, `LMCacheReqMeta`, `LMCacheOffloadMetadata`). |
-| `atom_kv_byte_codec.py` | `ATOMKVByteCodec`: maps a token range → AITER KV blocks and packs/unpacks them as raw bytes. The layout-bridging core. |
-| `atom_lmcache_gpu_connector.py` | `ATOMLMCacheGPUConnector`: LMCache `GPUConnectorInterface` impl. Bounded GPU staging + two-stage (pack ↔ copy) pipeline. |
+| `metadata.py` | `ATOMRawBytesLMCacheMetadata` (opaque uint8 allocation) + per-request transfer descriptors (`LoadSpec`, `SaveSpec`, `LMCacheReqMeta`, `LMCacheOffloadMetadata`). Hybrid uses `HybridOffloadMetadata` in `hybrid/connector.py`. |
+| `_offload_common.py` | Shared worker plumbing: `OffloadWorkerMixin`, `build_offload_engine()`, copy executors. |
+| `dense/kv_byte_codec.py` | `DenseKVByteCodec`: maps a token range → AITER KV blocks and packs/unpacks them as raw bytes. |
+| `dense/gpu_connector.py` | `DenseGPUConnector`: LMCache `GPUConnectorInterface` impl. Bounded GPU staging + two-stage (pack ↔ copy) pipeline. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
-| `triton_kv_staging.py` | Triton fused chunk-major pack/unpack kernels (the fast staging path). |
+| `triton_offload_gather.py` | Triton byte gather/scatter: chunk-major pack/unpack (dense) + region gather/scatter (hybrid). |
 
 ## Architecture
 
-The connector is split across two processes, mirroring ATOM's P/D split:
+One backend name (`lmcache_offload`), registered in `__init__.py` and implemented
+by `connector.py`. That module both **selects the layout family** from `config`
+(`select_variant` → `"dense"` | `"hybrid"`, same answer on scheduler and worker)
+and exposes the two public classes — `LMCacheOffloadConnectorScheduler` and
+`LMCacheOffloadConnector` — as thin shells that delegate every hook to the chosen
+family impl. Hybrid models add a second dispatch inside `hybrid/profiles/`:
+`select_profile()` picks DSV4, Qwen3-Next, etc.
+
+The connector runs split across two processes (EngineCore scheduler ↔ TP workers),
+mirroring ATOM's P/D split:
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Public entry · connector.py"]
+        REG["KVConnectorFactory.register('lmcache_offload')"]
+        SEL["select_variant(config)<br/>offload_layout override → dense | hybrid<br/>auto: compress_ratios / linear_num_key_heads → hybrid<br/>else → dense"]
+        SHELL_S["LMCacheOffloadConnectorScheduler"]
+        SHELL_W["LMCacheOffloadConnector"]
+        REG --> SHELL_S & SHELL_W
+        SHELL_S --> SEL
+        SHELL_W --> SEL
+    end
+
+    SEL -->|"dense"| DENSE
+    SEL -->|"hybrid"| HYBRID
+
+    subgraph DENSE["dense/ — token-dense KV (DSV2/V3 MLA, MHA)"]
+        direction TB
+        DS["DenseOffloadScheduler"]
+        DW["DenseOffloadConnector"]
+        D_CODEC["DenseKVByteCodec"]
+        D_GPU["DenseGPUConnector"]
+        D_META["LMCacheOffloadMetadata"]
+        D_STORE["CacheEngine.store() / retrieve()"]
+        D_LOOKUP["ZMQ LookupClient ↔ LookupServer"]
+        DS --> D_META
+        DS --> D_LOOKUP
+        DW --> D_CODEC --> D_GPU --> D_STORE
+    end
+
+    subgraph HYBRID["hybrid/ — terminal offload bundle (DSV4, Qwen3-Next…)"]
+        direction TB
+        PROF_SEL["profiles/select_profile()"]
+        HS["HybridOffloadScheduler"]
+        HW["HybridOffloadConnector"]
+        PROF["HybridProfile"]
+        SRC["BundleSources"]
+        BUNDLE["kv_bundle + kv_bundle_codec"]
+        H_GPU["BundleGPUConnector"]
+        H_STORE["LMCacheBundleStore.put/get"]
+        H_KEYS["本地 checkpoint key set"]
+        H_META["HybridOffloadMetadata"]
+        PROF_SEL --> PROF --> SRC
+        HS --> PROF_SEL
+        HW --> PROF_SEL
+        HS --> H_KEYS
+        HS --> H_META
+        HW --> SRC --> H_GPU --> BUNDLE --> H_STORE
+    end
+
+    subgraph SHARED["Shared plumbing"]
+        COMMON["_offload_common.py"]
+        CFG["config.py"]
+        STG["atom_lmcache_staging.py"]
+        TRITON["triton_offload_gather.py"]
+    end
+
+    DENSE & HYBRID --> SHARED
+    D_STORE & H_STORE --> TIER[("CPU DRAM / NVMe")]
+
+    TT["attn builder<br/>get_kv_transfer_tensors()"] -->|"block / swa / slot / staging regions"| HW
+```
+
+### Family comparison
+
+| | **dense** | **hybrid** |
+|---|-----------|------------|
+| Models | DSV2/V3 MLA, MHA | DSV4, Qwen3-Next (via profile) |
+| Save cadence | Incremental, chunk-aligned as frontier advances | Terminal boundary `B` (profile cadence) |
+| Storage API | `CacheEngine.store()` / `retrieve()` | `LMCacheBundleStore.put()` / `get()` |
+| Load lookup | ZMQ `LookupClient` ↔ `LookupServer` | Session-local `checkpoint_key` set |
+| Payload | Raw AITER block bytes per LMCache chunk | N-component `kv_bundle` (AOB1 + CRC) |
+| Pre-save sync | None | `gather_slot` for STAGING components |
+| Metadata | `LMCacheOffloadMetadata` | `HybridOffloadMetadata` |
+
+### Save / load data paths
 
 ```mermaid
 flowchart LR
-    subgraph SCHED["SCHEDULER · EngineCore process"]
-        direction TB
-        S1["① get_num_new_matched_tokens(seq)<br/>park seq + record LoadSpec if hit &gt; HBM"]
-        S2["② build_connector_meta()<br/>LMCacheOffloadMetadata { LMCacheReqMeta }"]
-        S3["③ get_finished() → wake<br/>finished_recving · failed_recving · finished_saving"]
-        S1 --> S2 --> S3
+    subgraph D_SAVE["dense SAVE"]
+        D1["frontier 推进<br/>chunk-aligned 增量"] --> D2["SaveSpec"] --> D3["engine.store()"] --> D4["DenseGPUConnector<br/>pack AITER block bytes"]
     end
 
-    subgraph WORK["WORKER · one per TP rank"]
-        direction TB
-        LK["LookupServer<br/>(rank 0 authoritative)"]
-        SL["start_load_kv() — enqueue only<br/>load_executor (1) · save_executor (N)"]
-        CE["CacheEngine.retrieve() / .store()<br/>ATOMLMCacheGPUConnector + ATOMKVByteCodec"]
-        SL --> CE
+    subgraph D_LOAD["dense LOAD"]
+        DL1["ZMQ lookup hit"] --> DL2["LoadSpec(hbm, lmc)"] --> DL3["engine.retrieve()"] --> DL4["unpack → HBM pages"]
     end
 
-    TIER[("CPU DRAM / NVMe")]
-    HBM[("HBM KV blocks")]
+    subgraph H_SAVE["hybrid SAVE"]
+        H1["terminal boundary B"] --> H2["gather_slot (STAGING)"] --> H3["BundleGPUConnector"] --> H4["kv_bundle → BundleStore.put"]
+    end
 
-    S1 -- "ZMQ lookup" --> LK
-    LK -- "# cached tokens" --> S1
-    S2 -- "RPC: metadata" --> SL
-    CE -- "poll completion sets<br/>(post-forward)" --> S3
-    HBM <-- "Triton pack / unpack<br/>via bounded staging" --> CE
-    CE <-- "MemoryObj put / get" --> TIER
+    subgraph H_LOAD["hybrid LOAD"]
+        HL1["本地 key set 命中"] --> HL2["BundleStore.get"] --> HL3["validate + scatter"] --> HL4["scatter_slot → suffix prefill"]
+    end
 ```
 
 ### Scheduler side (`LMCacheOffloadConnectorScheduler`)
 
 Runs in the EngineCore process. It decides **what** to load/save; it never
-touches GPU memory.
+touches GPU memory. The shell delegates to `DenseOffloadScheduler` or
+`HybridOffloadScheduler`.
 
-- **`get_num_new_matched_tokens(seq)`** — on a new request, queries the worker's
-  `LookupServer` over ZMQ for how many prompt tokens LMCache holds. If the hit
-  exceeds what HBM already has, it records a `LoadSpec` and returns
-  `(need, True)` to **park the sequence** in `WAITING_FOR_REMOTE_KVS`.
-- **`update_state_after_alloc` / `should_park_for_load_after_alloc`** — after
-  block allocation, re-reads the *real* HBM-cached count (the lookup ran before
-  the HBM prefix match, so `num_cached_tokens` was stale). Loads only the gap
-  `[hbm_cached, lmcache_hit)`, chunk-aligned, and only if it clears
-  `OFFLOAD_MIN_LOAD_TOKENS`. Loading below the HBM floor would overwrite shared
-  prefix-cache blocks → output corruption, so that floor is strict.
-- **`build_connector_meta()`** — emits one `LMCacheReqMeta` per load/save into
-  `LMCacheOffloadMetadata`, the snapshot forwarded to the worker each step.
-  Saves walk a persistent `_save_tracker` that stores newly-computed prompt
-  chunks as the computed frontier (`num_cached_tokens`) advances.
-- **Save/free coordination** — `should_defer_free` holds blocks until their
-  in-flight save lands; `save_finished` / `load_failed` reconcile the trackers
-  (a failed load lowers the save floor so the recomputed chunks get persisted).
+**Dense family:**
+
+- **`get_num_new_matched_tokens(seq)`** — queries the worker's `LookupServer` over
+  ZMQ for how many prompt tokens LMCache holds. If the hit exceeds HBM, records a
+  `LoadSpec` and parks the sequence in `WAITING_FOR_REMOTE_KVS`.
+- **`update_state_after_alloc` / `should_park_for_load_after_alloc`** — re-reads the
+  real HBM-cached count; loads only the gap `[hbm_cached, lmcache_hit)`, chunk-
+  aligned, and only if it clears `OFFLOAD_MIN_LOAD_TOKENS`.
+- **`build_connector_meta()`** — emits `LMCacheReqMeta` per load/save into
+  `LMCacheOffloadMetadata`. Saves walk a persistent `_save_tracker` as the
+  computed frontier advances.
+- **Dense-only hooks** — `adjust_prefill_chunk_after_alloc`,
+  `should_park_partial_prefill_for_load` (no-op on hybrid via shell fallback).
+
+**Hybrid family:**
+
+- **`get_num_new_matched_tokens(seq)`** — scans the session-local checkpoint key set
+  for the largest stored boundary `B < prompt_len`; parks if a resume boundary exists.
+- **`build_connector_meta()`** — emits `HybridReqMeta` with boundary `B`, checkpoint
+  key, block/swa/slot ids into `HybridOffloadMetadata`.
+- Save is terminal-only: triggered when prefill reaches a profile-aligned boundary
+  (`should_save_at` / `is_checkpoint_boundary`).
+
+Both families share save/free coordination: `should_defer_free`, `save_finished`,
+`load_failed`.
 
 ### Worker side (`LMCacheOffloadConnector`)
 
-Runs in each TP-rank worker. It does the actual byte movement.
+Runs in each TP-rank worker. It does the actual byte movement. The shell delegates
+to `DenseOffloadConnector` or `HybridOffloadConnector`.
 
-- **`register_kv_caches`** — builds the `ATOMKVByteCodec` over the registered KV
-  tensors, the LMCache engine, and (on rank 0) the `LookupServer`.
-- **`start_load_kv(metadata)`** — *enqueue only*. For each request, `submit`s a
-  load to `_load_executor` and/or a save to `_save_executor`, then returns. **No
-  copy happens on the RPC thread.**
-- **`_do_load_req` / `_do_save_req`** — run on the daemon threads. They call
-  `engine.retrieve()` / `engine.store()`, which flow through the ATOM GPU
-  connector. Loads are all-or-nothing per shard: a missing shard fails the load
-  and the scheduler recomputes.
-- **`get_finished()`** — polled post-forward; returns completion sets that the
-  scheduler turns into wakes (see protocol below).
+**Dense family:**
+
+- **`register_kv_caches`** — builds `DenseKVByteCodec`, LMCache engine, and (rank 0)
+  `LookupServer`.
+- **`start_load_kv(metadata)`** — enqueue only; `_do_load_req` / `_do_save_req` call
+  `engine.retrieve()` / `engine.store()` via `DenseGPUConnector`.
+- Loads are all-or-nothing per shard.
+
+**Hybrid family:**
+
+- **`register_kv_caches(transfer_tensors=...)`** — calls `select_profile()`, builds
+  `BundleSources`, `BundleGPUConnector`, `BundleCodec`, `LMCacheBundleStore`.
+- **Save** — `gather_slot` for STAGING components runs synchronously on the RPC
+  thread; component gather + D2H + store run on the save executor.
+- **Load** — validates bundle CRC/geometry, scatters components into HBM pages and
+  pool slots, then `scatter_slot` into the compute slot.
+
+Both families: **`get_finished()`** is polled post-forward and returns completion
+sets the scheduler turns into wakes (see protocol below).
 
 ## Request Lifecycle
 
-Following one request end to end ties the pieces together:
+The steps below follow the **dense** family end to end. Hybrid uses terminal bundle
+save/load at profile-aligned boundaries — see [Architecture](#architecture).
 
 1. **Lookup.** A new request arrives; the scheduler's
    `get_num_new_matched_tokens` asks the rank-0 `LookupServer` over ZMQ how many
@@ -140,7 +246,7 @@ Following one request end to end ties the pieces together:
    `start_load_kv` submits the load to the load daemon and returns — the RPC
    thread stays free to run `forward`.
 4. **Move.** The daemon runs `engine.retrieve`, which drives
-   `ATOMLMCacheGPUConnector`: MemoryObj → staging buffer → HBM blocks (Triton
+   `DenseGPUConnector`: MemoryObj → staging buffer → HBM blocks (Triton
    unpack), bit-identical.
 5. **Wake.** Post-forward, `get_finished` returns `finished_recving` (success) or
    `failed_recving` (recompute). The scheduler wakes the seq, which prefills only
@@ -164,7 +270,7 @@ correctness — note the deliberate asymmetry vs a P/D producer:
 `is_offload = True` on the scheduler opts into offload-wake (suffix prefill)
 rather than the P/D decode-jump in `Scheduler.schedule()`.
 
-## Save / Load Data Flow
+## Save / Load Data Flow (dense family)
 
 **Save (HBM → CPU/NVMe), fire-and-forget after a prefill chunk computes:**
 
@@ -173,7 +279,7 @@ flowchart LR
     A["seq.num_cached_tokens<br/>advances"] --> B["scheduler:<br/>SaveSpec(skip_leading_tokens)<br/>new chunk-aligned tokens only"]
     B --> C["worker _do_save_req:<br/>engine.store(tokens, mask, block_ids)"]
     C --> D["batched_from_gpu"]
-    subgraph PIPE_S["ATOMLMCacheGPUConnector (2-stage)"]
+    subgraph PIPE_S["DenseGPUConnector (2-stage)"]
         direction LR
         D --> E["stage A — Triton pack<br/>HBM blocks → uint8 staging buf"]
         E --> F["stage B — copy<br/>staging buf → MemoryObj"]
@@ -188,7 +294,7 @@ flowchart LR
     A["lookup hit &gt; HBM<br/>seq parked WAITING_FOR_REMOTE_KVS<br/>blocks allocated"] --> B["scheduler:<br/>LoadSpec(hbm_cached, lmcache_cached)"]
     B --> C["worker _do_load_req:<br/>engine.retrieve(tokens, mask=skip HBM, block_ids)"]
     C --> D["batched_to_gpu"]
-    subgraph PIPE_L["ATOMLMCacheGPUConnector (2-stage)"]
+    subgraph PIPE_L["DenseGPUConnector (2-stage)"]
         direction LR
         S[("CPU DRAM / NVMe")] --> E["stage A — copy<br/>MemoryObj → uint8 staging buf"]
         E --> F["stage B — Triton unpack<br/>staging buf → HBM blocks"]
@@ -294,16 +400,16 @@ what lets us bypass LMCache's layout assumptions entirely. The round-trip
 ### fp8 KV and per-block scales
 
 Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale`.
-`ATOMKVByteCodec` enumerates **four** segments per layer when present — `k_cache`,
+`DenseKVByteCodec` enumerates **four** segments per layer when present — `k_cache`,
 `v_cache`, `k_scale`, `v_scale` — and moves them all as part of one block's bytes
-(`atom_kv_byte_codec.py`). The scales travel with the quantized data, so a
+(`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
 ### Invariants enforced in code
 
 | Invariant | Where | Why |
 |-----------|-------|-----|
-| `chunk_size % block_size == 0` | `metadata.py`, `atom_lmcache_gpu_connector.py` ctor | An LMCache chunk must map to a whole number of ATOM blocks, or a chunk would straddle a block boundary. |
+| `chunk_size % block_size == 0` | `metadata.py`, `dense/gpu_connector.py` ctor | An LMCache chunk must map to a whole number of ATOM blocks, or a chunk would straddle a block boundary. |
 | Never load below the HBM floor | scheduler `_decide_load_after_alloc` | Loading under `num_cached_tokens` overwrites prefix-cache blocks shared with other seqs → corruption. |
 | Load is all-or-nothing per shard | worker `_do_load_req` | A half-loaded prefix is worse than none; a missing shard fails the whole load → recompute. |
 | Chunk-aligned load/save only | scheduler + worker | LMCache keys are per-chunk; an unaligned write has no valid key. |
@@ -336,12 +442,13 @@ corrupt write:
 
 ## Key Modules in Depth
 
-`connector.py` (the scheduler/worker orchestration) is covered under
+`connector.py` (family selection + scheduler/worker shells) is covered under
 [Architecture](#architecture). The rest of this section details the
-**byte-movement stack** — the part that makes ATOM's KV layout work with LMCache —
-and the two support files.
+**dense byte-movement stack** — the part that makes ATOM's KV layout work with
+LMCache — plus shared support files. Hybrid bundle format lives under
+`hybrid/kv_bundle.py` and `hybrid/kv_bundle_codec.py`.
 
-### `atom_kv_byte_codec.py` — the layout bridge
+### `dense/kv_byte_codec.py` — the layout bridge
 
 This is the keystone. The two sides store KV in incompatible layouts:
 
@@ -419,11 +526,13 @@ rejects duplicate blocks, and requires a `uint8` device buffer. Both directions
 **require** the Triton fused staging kernel — there is no slow Python fallback on
 the production path.
 
-### `triton_kv_staging.py` — fused chunk-major pack/unpack
+### `triton_offload_gather.py` — fused byte gather/scatter
 
-The fast path the codec stands on. Two JIT kernels (`_pack_chunk_major_kernel`,
-`_unpack_chunk_major_kernel`) move every `(chunk, segment)` tile in **one launch**
-instead of thousands of per-block copies.
+The fast path the dense codec stands on. Two chunk-major JIT kernels
+(`fused_pack_chunk_major`, `fused_unpack_chunk_major`) move every
+`(chunk, segment)` tile in **one launch** instead of thousands of per-block copies.
+The same module also provides region gather/scatter (`gather_regions` /
+`scatter_regions`) used by the hybrid `BundleGPUConnector`.
 
 - **Grid** — `(num_chunks × num_segments, ceil(max_tile_bytes / 1024))`: one
   program per `(chunk, segment)` per 1 KiB tile.
@@ -434,7 +543,7 @@ instead of thousands of per-block copies.
   and per-chunk block/byte offsets as device int64 tensors, so the kernel does
   pure address arithmetic. Also validates `device_buf` size and `block_ids` length.
 
-### `atom_lmcache_gpu_connector.py` — the LMCache `GPUConnectorInterface`
+### `dense/gpu_connector.py` — the LMCache `GPUConnectorInterface`
 
 The adapter LMCache's `engine.store()` / `engine.retrieve()` actually call. It
 turns LMCache's *token ranges* into ATOM *block ranges* and drives bounded staging.
@@ -503,9 +612,9 @@ LMCache version, these are what to re-check.**
 
 | Ours | Replaces (LMCache default) | Why it must change | How it's wired / what changed |
 |---|---|---|---|
-| **`ATOMLMCacheGPUConnector`** | LMCache's stock vLLM `GPUConnectorInterface` (the GPU↔MemoryObj mover) | The stock connectors only emit **token-major** KV (`KV_2LTD` etc.) via `normalize_kv_and_discover_format`, which rejects ATOM's x-packed head-major AITER layout | Passed as the `gpu_connector` arg to `get_or_create`. LMCache's engine calls our `batched_from_gpu` / `batched_to_gpu` instead of its own. **This is the main hook.** |
+| **`DenseGPUConnector`** | LMCache's stock vLLM `GPUConnectorInterface` (the GPU↔MemoryObj mover) | The stock connectors only emit **token-major** KV (`KV_2LTD` etc.) via `normalize_kv_and_discover_format`, which rejects ATOM's x-packed head-major AITER layout | Passed as the `gpu_connector` arg to `get_or_create`. LMCache's engine calls our `batched_from_gpu` / `batched_to_gpu` instead of its own. **This is the main hook.** |
 | **`ATOMRawBytesLMCacheMetadata`** | `LMCacheMetadata`'s allocation shape/dtype | MemoryObjs must be allocated as **opaque `uint8` blobs** (`nblocks × bytes_per_block`), not typed KV tensors | Wraps the base metadata and overrides `get_shapes()` / `get_dtypes()` / `get_num_groups()`; passed as `meta` to `get_or_create` |
-| **`ATOMKVByteCodec`** | *(nothing — new component)* | LMCache has no concept of AITER's paged x-packed byte layout | Owned by `ATOMLMCacheGPUConnector`; does the actual block-byte gather/scatter via Triton |
+| **`DenseKVByteCodec`** | *(nothing — new component)* | LMCache has no concept of AITER's paged x-packed byte layout | Owned by `DenseGPUConnector`; does the actual block-byte gather/scatter via Triton |
 | `engine.fmt = KV_2LTD` + `post_init()` | the format LMCache would pick for allocation | `BINARY` (the honest format for raw bytes) is **rejected** by the LocalCPU allocator; we set an *accepted* format only to pass that check — the real shape is forced by our metadata, so the value is otherwise inert | `connector.py` `register_kv_caches` |
 | `get_or_create(…, lambda t,s: None, lambda o,s: o)` | LMCache's trailing token-processing / output-transform callbacks | We don't use LMCache's token-shaping hooks — our codec moves raw bytes | Passed as no-op / identity callables |
 | `cfg.lookup_server_worker_ids = [0]` | default: every rank answers lookup, client takes `min()` | At TP>1 a non-rank-0 shard returning 0 would zero out a real hit; rank 0 is made authoritative | `config.py` (see [TP > 1 Notes](#tp--1-notes)) |
@@ -548,6 +657,13 @@ Connector-specific tuning (env):
 
 `kv_transfer_config` may also override any LMCache field via a
 `"lmcache.<field>": value` extra.
+
+Family and profile selection (`kv_transfer_config` extras):
+
+| Key | Values | Purpose |
+|-----|--------|---------|
+| `offload_layout` | `"dense"` \| `"hybrid"` | Force the layout family. Legacy aliases `"chunked"`, `"chunked_mla"` → dense; `"terminal_unit"` → hybrid. Auto-inferred from `hf_config` when omitted. |
+| `offload_profile` | `"deepseek-v4"` \| `"qwen3-next"` | Force the hybrid profile. Auto-inferred from `compress_ratios` / `linear_num_key_heads` when omitted. |
 
 ## How to Run
 
@@ -715,7 +831,7 @@ python3 multi-round-qa.py \
 - **Per-block staging cost.** The codec stages KV one block at a time through the
   bounded buffer. For very long prefixes this dominates reload latency; a
   bulk/contiguous copy path would cut it substantially. The Triton fused
-  chunk-major kernel (`triton_kv_staging.py`) is the current fast path.
+  chunk-major kernel (`triton_offload_gather.py`) is the current fast path.
 - **Reload only pays off above `OFFLOAD_MIN_LOAD_TOKENS`.** Small hits are skipped
   because, at the current copy speed, recompute is cheaper. The break-even point
   is workload- and hardware-dependent — tune the threshold per deployment.

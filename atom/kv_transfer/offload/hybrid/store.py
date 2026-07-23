@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""LMCache-backed :class:`UnitStore` for DSV4 offload units.
+"""LMCache-backed :class:`LMCacheBundleStore` for hybrid offload bundles.
 
 Unlike the MHA/MLA offload path (which drives ``engine.store``/``retrieve`` with
-LMCache's token-major ChunkedTokenDatabase), a DSV4 terminal checkpoint is *one*
+LMCache's token-major ChunkedTokenDatabase), a hybrid terminal checkpoint is *one*
 opaque object addressed by an exact (prefix, B) key. We therefore go one level
 below the token database and use LMCache's ``StorageManager`` directly:
 ``allocate`` a uint8 MemoryObj, fill it, ``put`` under a ``CacheEngineKey`` whose
@@ -35,7 +35,7 @@ def _key_to_chunk_hash(key_str: str) -> int:
     ) & _HASH_MASK
 
 
-class LMCacheUnitStore:
+class LMCacheBundleStore:
     """One-object-per-checkpoint store over an LMCache ``StorageManager``."""
 
     def __init__(
@@ -51,7 +51,7 @@ class LMCacheUnitStore:
         self._engine = engine
         self._sm = engine.storage_manager
         if self._sm is None:
-            raise RuntimeError("LMCacheUnitStore: engine.storage_manager is None")
+            raise RuntimeError("LMCacheBundleStore: engine.storage_manager is None")
         self._model_name = str(model_name)
         self._world_size = int(world_size)
         self._worker_id = int(worker_id)
@@ -74,7 +74,7 @@ class LMCacheUnitStore:
         try:
             return self._sm.contains(self._ce_key(key)) is not None
         except Exception:
-            logger.exception("LMCacheUnitStore.contains failed key=%s", key)
+            logger.exception("LMCacheBundleStore.contains failed key=%s", key)
             return False
 
     def put(self, key: str, unit_host: torch.Tensor) -> bool:
@@ -83,7 +83,7 @@ class LMCacheUnitStore:
         mem = self._sm.allocate(torch.Size((nbytes,)), torch.uint8, fmt=self._fmt)
         if mem is None:
             # Eviction couldn't free room; drop this offload opportunity.
-            logger.debug("LMCacheUnitStore: allocate returned None key=%s", key)
+            logger.debug("LMCacheBundleStore: allocate returned None key=%s", key)
             return False
         try:
             dst = mem.tensor
@@ -94,7 +94,7 @@ class LMCacheUnitStore:
             self._sm.batched_put([self._ce_key(key)], [mem])
             return True
         except Exception:
-            logger.exception("LMCacheUnitStore.put failed key=%s", key)
+            logger.exception("LMCacheBundleStore.put failed key=%s", key)
             # Best-effort: release the object we failed to hand off.
             try:
                 mem.ref_count_down()
@@ -106,7 +106,7 @@ class LMCacheUnitStore:
         try:
             mem = self._sm.get(self._ce_key(key))
         except Exception:
-            logger.exception("LMCacheUnitStore.get failed key=%s", key)
+            logger.exception("LMCacheBundleStore.get failed key=%s", key)
             return None
         if mem is None:
             return None
