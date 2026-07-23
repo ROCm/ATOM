@@ -191,6 +191,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
             mla_v_up_proj,
         )
         from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+        from atom.models.deepseek_v2 import _pcp_active
 
         q = self._project_q(q_input, q_scale)
         k_nope = kv_c_normed.unsqueeze(1)
@@ -206,7 +207,17 @@ class SGLangDeepseekMLAAttention(nn.Module):
         ):
             q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        atom_pcp_on = _pcp_active()
+        if atom_pcp_on:
+            from atom.distributed.pcp_utils import (
+                get_pcp_world_size,
+                pcp_allgather_rerange,
+            )
+
+            pcp_ws = get_pcp_world_size()
+            k_nope = pcp_allgather_rerange(k_nope.squeeze(1), pcp_ws).unsqueeze(1)
+            k_pe = pcp_allgather_rerange(k_pe.squeeze(1), pcp_ws).unsqueeze(1)
+        elif nsa_use_prefill_cp(forward_batch):
             latent_cache = torch.cat([k_nope.squeeze(1), k_pe.squeeze(1)], dim=-1)
             k_nope, k_pe = attn.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -215,7 +226,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
         save_kv_cache = True
         topk_indices = self._get_sparse_topk_indices(q_input.shape[0])
         q_descale = None
-        if attn.use_fused_qk_rope_concat_and_cache_mla:
+        if attn.use_fused_qk_rope_concat_and_cache_mla and not atom_pcp_on:
             mla_attn = _get_sglang_radix_attn(self.base_attn)
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(mla_attn.layer_id)
             q_cache_scale = getattr(mla_attn, "q_scale", None)
