@@ -3,6 +3,7 @@
 
 import contextlib
 import ipaddress
+import json
 import logging
 import multiprocessing
 import os
@@ -10,7 +11,6 @@ import signal
 import socket
 import sys
 import tempfile
-import threading
 import time
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
@@ -795,18 +795,33 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     return getattr(module, obj_name)
 
 
-_DYNAMO_METRICS_CONFIG_LOCK = threading.RLock()
+_DYNAMO_METRICS_CONFIG_BLOCKLIST = {
+    "TYPE_CHECKING",
+    "log_file_name",
+    "verbose",
+    "repro_after",
+    "repro_level",
+    "repro_forward_only",
+    "repro_tolerance",
+    "repro_ignore_non_fp",
+    "same_two_models_use_fp64",
+    "base_dir",
+    "debug_dir_root",
+    "_save_config_ignore",
+    "log_compilation_metrics",
+    "inject_BUILD_SET_unimplemented_TESTING_ONLY",
+    "_autograd_backward_strict_mode_banned_ops",
+    "reorderable_logging_functions",
+    "ignore_logger_methods",
+    "ignore_logging_functions",
+    "traceable_tensor_subclasses",
+    "nontraceable_tensor_subclasses",
+    "_custom_ops_profile",
+}
 
 
 def _patch_torch_dynamo_metrics_config_logging() -> None:
-    """Keep callable logging ignores out of Torch Dynamo metrics JSON.
-
-    Torch 2.11 aliases ``ignore_logger_methods`` to the canonical
-    ``ignore_logging_functions`` config key, but some builds only exclude the
-    old alias when serializing compilation metrics.  Preserve the callable set
-    used by Dynamo tracing while temporarily hiding it from that private
-    metrics serializer.
-    """
+    """Exclude callable logging ignores from Torch Dynamo metrics JSON."""
     config = torch._dynamo.config
     if not hasattr(config, "ignore_logging_functions"):
         return
@@ -829,25 +844,19 @@ def _patch_torch_dynamo_metrics_config_logging() -> None:
     else:
         return
 
-    # Only patch when the callable ignore set is the source of the TypeError.
-    with _DYNAMO_METRICS_CONFIG_LOCK:
-        ignored_logging_functions = config.ignore_logging_functions
-        config.ignore_logging_functions = set()
-        try:
-            original()
-        except TypeError:
-            return
-        finally:
-            config.ignore_logging_functions = ignored_logging_functions
-
     def wrapped_get_dynamo_config_for_logging():
-        with _DYNAMO_METRICS_CONFIG_LOCK:
-            ignored_logging_functions = config.ignore_logging_functions
-            config.ignore_logging_functions = set()
-            try:
-                return original()
-            finally:
-                config.ignore_logging_functions = ignored_logging_functions
+        config_dict = {
+            key: sorted(value) if isinstance(value, set) else value
+            for key, value in config.get_config_copy().items()
+            if key not in _DYNAMO_METRICS_CONFIG_BLOCKLIST
+        }
+        return json.dumps(config_dict, sort_keys=True)
+
+    # Verify the copied serializer before replacing Torch's private helper.
+    try:
+        wrapped_get_dynamo_config_for_logging()
+    except (TypeError, ValueError):
+        return
 
     setattr(
         wrapped_get_dynamo_config_for_logging,

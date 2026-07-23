@@ -373,14 +373,16 @@ class RMSNorm(nn.Module):
                         )
                     )
                     return (x, x_scale, x_bf16), residual
-                x, residual, x_scale = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-                    x.contiguous(),
-                    residual,
-                    self.weight,
-                    self.eps,
-                    quant_type=self.quant_type,
-                    group_size=128,
-                    transpose_scale=self._aiter_transpose_scale,
+                x, residual, x_scale = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                        x.contiguous(),
+                        residual,
+                        self.weight,
+                        self.eps,
+                        quant_type=self.quant_type,
+                        group_size=128,
+                        transpose_scale=self._aiter_transpose_scale,
+                    )
                 )
                 return (x, x_scale), residual
             # tensor_model_parallel_fused_allreduce_rmsnorm does not support non-contiguous input

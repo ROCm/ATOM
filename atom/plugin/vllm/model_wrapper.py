@@ -268,6 +268,27 @@ def _select_model_arch(vllm_config: VllmConfig) -> str:
     return model_arch
 
 
+def _get_draft_step_idx_from_forward_context() -> int:
+    try:
+        from vllm.forward_context import get_forward_context
+
+        attn_metadata = get_forward_context().attn_metadata
+    except (ImportError, AssertionError):
+        return 0
+
+    metadata_groups = (
+        attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+    )
+    draft_indices = [
+        int(draft_index)
+        for metadata_by_layer in metadata_groups
+        if metadata_by_layer is not None
+        for metadata in metadata_by_layer.values()
+        if (draft_index := getattr(metadata, "draft_index", None)) is not None
+    ]
+    return max(draft_indices, default=0)
+
+
 def _patch_required_act_dtype_post_load_hooks(
     module: nn.Module,
     act_dtype: torch.dtype,
@@ -900,6 +921,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     hidden_states = self.model(input_ids=input_ids, positions=positions)
                     self._mtp_target_hidden_states = hidden_states
         else:
+            if (
+                self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
+                and "spec_step_idx" not in model_kwargs
+            ):
+                model_kwargs["spec_step_idx"] = (
+                    _get_draft_step_idx_from_forward_context()
+                )
             hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -911,9 +939,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.model_arch == "DeepSeekMTPModel":
-            # vLLM 0.25.x expects DeepSeek MTP draft forwards to return
-            # (logit_hidden, recycle_hidden). ATOM uses the same tensor for both.
-            return hidden_states, hidden_states
+            # vLLM samples from the pre-final-norm state, but recycles the
+            # post-final-norm state into the next MTP step.
+            spec_step_idx = int(model_kwargs.get("spec_step_idx", 0))
+            recycle_hidden = self.model.get_recycle_hidden(
+                hidden_states, spec_step_idx
+            )
+            return hidden_states, recycle_hidden
 
         return hidden_states
 

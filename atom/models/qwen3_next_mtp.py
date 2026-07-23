@@ -141,6 +141,7 @@ class Qwen3NextMTP(nn.Module):
         # (mtp.layers.<num_hidden_layers>.*) so vLLM allocates distinct draft KV
         # layers. Keep quant excludes aligned with the runtime prefixes.
         mtp_start = config.num_hidden_layers
+        num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1) or 1
         mtp_atom_config = atom_config
         if atom_config.quant_config is not None and mtp_start > 0:
             pat = re.compile(r"^mtp\.layers\.(\d+)\.")
@@ -149,9 +150,12 @@ class Qwen3NextMTP(nn.Module):
             for entry in atom_config.quant_config.exclude_layers:
                 m = pat.match(entry)
                 if m:
-                    changed = True
                     old_idx = int(m.group(1))
-                    entry = pat.sub(f"mtp.layers.{mtp_start + old_idx}.", entry)
+                    if old_idx < num_mtp_layers:
+                        changed = True
+                        entry = pat.sub(
+                            f"mtp.layers.{mtp_start + old_idx}.", entry
+                        )
                 new_excludes.append(entry)
             if changed:
                 mtp_atom_config = copy.copy(atom_config)
