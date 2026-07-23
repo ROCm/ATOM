@@ -78,9 +78,6 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
-        # Genuine prefix-cache hit, snapshotted at admission before
-        # num_cached_tokens is repurposed for chunked-prefill progress. A PD
-        # decode consumer inherits this from the prefill node (see below).
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
@@ -138,9 +135,6 @@ class Sequence:
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
-        # PD decode consumer: inherit the prefill node's prefix-cache hit via the
-        # KV-transfer meta channel. Decode never runs prefix matching, so this is
-        # the only source of a nonzero value on the consumer side.
         if kv_transfer_params:
             self.prefix_cache_hit_tokens = kv_transfer_params.get(
                 "prefix_cache_hit_tokens", 0
