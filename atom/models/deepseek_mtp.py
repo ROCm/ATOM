@@ -180,6 +180,15 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             current_step_idx,
         )
 
+    def get_recycle_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        return mtp_layer.shared_head(hidden_states)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -289,6 +298,13 @@ class DeepSeekMTP(nn.Module):
             input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
         )
         return hidden_states
+
+    def get_recycle_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.model.get_recycle_hidden(hidden_states, spec_step_idx)
 
     def compute_logits(
         self,

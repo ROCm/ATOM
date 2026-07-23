@@ -30,7 +30,7 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_OOT_IMAGE_TAG: rocm/atom-dev:vllm-latest
-  VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
+  VLLM_COMMIT: "752a3a504485790a2e8491cacbb35c137339ad34"
 
 jobs:
   # ---------- OOT CI path (pull_request only) ----------
@@ -175,8 +175,8 @@ jobs:
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
-      VLLM_COMMIT: 0b3ba88f165976e77ca5e6a7a3f5bba4562b80af
-      VLLM_VERSION: "0.22.0"
+      VLLM_COMMIT: 752a3a504485790a2e8491cacbb35c137339ad34
+      VLLM_VERSION: "0.25.1"
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:

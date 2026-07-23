@@ -255,9 +255,21 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
             layer=self._layer,
         )
 
-    def run_prefill_new_tokens(self, q, k, v, return_softmax_lse):
+    def run_prefill_new_tokens(
+        self,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        out=None,
+        output_scale=None,
+    ):
         if self._layer is None:
             raise RuntimeError("ATOM MLA prefill backend is not bound to a layer.")
+        if out is not None or output_scale is not None:
+            raise NotImplementedError(
+                "ATOM MLA prefill does not support fused quantized output."
+            )
         return self._layer._run_prefill_new_tokens(
             self._prefill_metadata,
             q,

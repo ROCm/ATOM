@@ -42,22 +42,6 @@ def get_aiter_kv_cache_dtype(config) -> torch.dtype:
     return dtypes.d_dtypes[kv_cache_dtype]
 
 
-def get_mla_metadata_v1_compat(*args, dtype_q=None, dtype_kv=None, **kwargs):
-    try:
-        return get_mla_metadata_v1(*args, dtype_q=dtype_q, dtype_kv=dtype_kv, **kwargs)
-    except RuntimeError as exc:
-        if "Unknown keyword argument 'dtype_q'" not in str(exc):
-            raise
-        return get_mla_metadata_v1(
-            *args,
-            dtype_q_nope=dtype_q,
-            dtype_q_rope=dtype_q,
-            dtype_kv_nope=dtype_kv,
-            dtype_kv_rope=dtype_kv,
-            **kwargs,
-        )
-
-
 @dataclass
 class AiterMhaPhaseMetadata:
     max_query_len: int
@@ -133,6 +117,7 @@ class AiterMhaMetadataForVllm:
     use_cascade: bool = False
     common_prefix_len: int = 0
     total_tokens: int = 0
+    draft_index: int = 0
 
 
 @dataclass
@@ -997,6 +982,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             use_cascade=False,
             common_prefix_len=0,
             total_tokens=self.total_tokens,
+            draft_index=draft_index,
         )
 
     # this method will be called by vllm, so it follows the vllm's interface convention
@@ -1174,7 +1160,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
-        get_mla_metadata_v1_compat(
+        get_mla_metadata_v1(
             cu_seqlens_q,
             self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
             self.paged_kv_last_page_len[:bs],
@@ -1953,7 +1939,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 clamped_seq_lens.to(torch.int32).numpy().tobytes(),
             )
         if metadata_key is None or metadata_key != self._prev_metadata_key:
-            get_mla_metadata_v1_compat(
+            get_mla_metadata_v1(
                 qo_indptr,
                 paged_kv_indptr,
                 paged_kv_last_page_len,

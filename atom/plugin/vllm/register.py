@@ -186,15 +186,7 @@ def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
 
 
 def _patch_vllm_harmony_parser_manager() -> None:
-    """Keep GPT-OSS harmony parsing enabled on vLLM builds with parser manager.
-
-    Some vLLM versions route chat-completions parsing through
-    ``ParserManager.get_parser``. Its contract says ``is_harmony=True`` should
-    always return ``HarmonyParser``, but the implementation can return ``None``
-    first when no explicit tool/reasoning parser is configured. That exposes
-    raw GPT-OSS analysis/final channel text as ``message.content`` and breaks
-    accuracy evaluation.
-    """
+    """Restore vLLM's documented Harmony parser selection contract."""
     try:
         from vllm.parser import ParserManager
         from vllm.parser.harmony import HarmonyParser
@@ -205,6 +197,13 @@ def _patch_vllm_harmony_parser_manager() -> None:
     if getattr(original, "_atom_harmony_parser_patched", False):
         return
 
+    # Do nothing after upstream fixes the early return for is_harmony=True.
+    try:
+        if original(ParserManager, is_harmony=True) is not None:
+            return
+    except TypeError:
+        return
+
     def get_parser(
         cls,
         tool_parser_name=None,
@@ -213,13 +212,7 @@ def _patch_vllm_harmony_parser_manager() -> None:
         model_name=None,
         is_harmony=False,
     ):
-        if is_harmony and not tool_parser_name and not reasoning_parser_name:
-            from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
-
-            HarmonyParser.reasoning_parser_cls = GptOssReasoningParser
-            HarmonyParser.tool_parser_cls = None
-            return HarmonyParser
-        return original(
+        parser_cls = original(
             cls,
             tool_parser_name=tool_parser_name,
             reasoning_parser_name=reasoning_parser_name,
@@ -227,46 +220,17 @@ def _patch_vllm_harmony_parser_manager() -> None:
             model_name=model_name,
             is_harmony=is_harmony,
         )
+        if parser_cls is not None or not is_harmony:
+            return parser_cls
+
+        from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
+
+        HarmonyParser.reasoning_parser_cls = GptOssReasoningParser
+        HarmonyParser.tool_parser_cls = None
+        return HarmonyParser
 
     setattr(get_parser, "_atom_harmony_parser_patched", True)
     ParserManager.get_parser = classmethod(get_parser)
-
-    original_parse = HarmonyParser.parse
-    if getattr(original_parse, "_atom_harmony_parse_fallback_patched", False):
-        return
-
-    def parse_with_raw_content_fallback(
-        self,
-        model_output,
-        request,
-        enable_auto_tools=False,
-        model_output_token_ids=(),
-    ):
-        try:
-            reasoning, content, tool_calls = original_parse(
-                self,
-                model_output,
-                request,
-                enable_auto_tools=enable_auto_tools,
-                model_output_token_ids=model_output_token_ids,
-            )
-        except Exception as exc:
-            if exc.__class__.__name__ != "HarmonyError":
-                raise
-            return None, model_output or None, None
-
-        if reasoning:
-            return reasoning, reasoning, tool_calls
-        if content is None and model_output:
-            return reasoning, model_output, tool_calls
-        return reasoning, content, tool_calls
-
-    setattr(
-        parse_with_raw_content_fallback,
-        "_atom_harmony_parse_fallback_patched",
-        True,
-    )
-    HarmonyParser.parse = parse_with_raw_content_fallback
 
 
 def register_model() -> None:
