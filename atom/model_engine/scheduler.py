@@ -1112,6 +1112,11 @@ class Scheduler:
                 break
             self.block_manager.allocate(seq, num_cached_blocks)
 
+            if not seq.prefix_cache_hit_tokens:
+                seq.prefix_cache_hit_tokens = (
+                    num_cached_blocks * self.block_manager.block_size
+                )
+
             self._notify_connector_after_prefill_alloc(seq)
 
             needs_remote_load = self._confirm_remote_load_after_alloc(
