@@ -1583,9 +1583,45 @@ class ModelRunner:
         non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
         available_for_kv_budget = budget - non_kv_overhead
 
-        # Physical clamp: never exceed what's actually free on the GPU.
-        # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv_budget, free)
+        # Peak-activation headroom, taken from ACTUAL free memory.
+        #
+        # `peak_torch` is the warmup high-watermark, but it under-protects the
+        # KV pool in two ways: (1) warmup can under-measure the true serving
+        # prefill activation (e.g. DeepSeek-V4 short-circuits its
+        # sparse-attention path under `is_dummy_run`), and (2) it only counts
+        # torch-allocator memory, missing this process's non-torch resident
+        # (NCCL/RCCL comm buffers, HIP context, custom-all-reduce / P2P IPC),
+        # which on TP lands unevenly across ranks (coordinator ranks carry tens
+        # of GB more). Both are already reflected in the per-rank `free`, so
+        # reserving headroom off `free` (not off the utilization budget)
+        # protects the tightest rank from an OOM on the first large prefill.
+        # Fraction is env-tunable. See ROCm/ATOM#1483.
+        prefill_headroom = int(
+            float(os.environ.get("ATOM_KV_PREFILL_HEADROOM_FRAC", "0.08")) * total
+        )
+
+        # Physical clamp: never exceed what is actually free on the GPU (also
+        # prevents OOM when other processes share the GPU) and keep the
+        # prefill-activation headroom in reserve.
+        available_for_kv = min(available_for_kv_budget, free - prefill_headroom)
+
+        # The KV pool must be the SAME size on every TP rank, but per-rank
+        # `free` differs (uneven non-torch overhead above). Size the pool for
+        # the TIGHTEST rank; otherwise heavy ranks overshoot
+        # gpu_memory_utilization and OOM on a large prefill. On balanced setups
+        # the utilization budget still binds on every rank, so this reduces to
+        # a no-op (num_kvcache_blocks unchanged) with no throughput impact.
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            _min_kv = torch.tensor(
+                [available_for_kv], dtype=torch.int64, device=self.device
+            )
+            torch.distributed.all_reduce(
+                _min_kv,
+                op=torch.distributed.ReduceOp.MIN,
+                group=tp_group.device_group,
+            )
+            available_for_kv = int(_min_kv.item())
 
         torch.set_default_device("cpu")
 
