@@ -1827,16 +1827,32 @@ class EPLBManager:
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
         num_local = self.live_metadata.num_local_physical_experts
-        names = (
-            "w13_weight",
-            "w2_weight",
-            "w13_weight_scale",
-            "w2_weight_scale",
-            "w13_input_scale",
-            "w2_input_scale",
-            "w13_bias",
-            "w2_bias",
-        )
+        # MegaMoE fused EP (ATOM_USE_FLYDSL_FUSED=1) empties w13/w2_weight in
+        # process_weights_after_loading and keeps the real weights on _mega_*
+        # (shuffle_weight_w4 / shuffle_scale_w4 / shuffle_weight / e8m0_shuffle,
+        # then .view(-1) -> 1-D). Those shuffles are all per-expert (their permute
+        # never touches dim0=experts), so the flattened [E*S] buffers stay
+        # expert-contiguous and the per-slot slicing below relocates correct bytes.
+        # Migrate _mega_* instead of the emptied w13/w2_weight.
+        _is_mega = getattr(layer, "_mega_w1", None) is not None
+        if _is_mega:
+            names = (
+                "_mega_w1",
+                "_mega_w1_scale",
+                "_mega_w2",
+                "_mega_w2_scale",
+            )
+        else:
+            names = (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_input_scale",
+                "w2_input_scale",
+                "w13_bias",
+                "w2_bias",
+            )
         # Infer the per-rank expert count from a reliable per-expert weight tensor
         # (w13/w2_weight have dim0 == #experts on this rank). Shuffled FP4 scales
         # are FLATTENED to [#experts * per_expert_rows, K] (expert-contiguous), so
@@ -1845,11 +1861,18 @@ class EPLBManager:
         # one expert) and migration moves the wrong scale bytes → relocated experts
         # get mismatched scales → wrong FP4 dequant → accuracy loss (no crash).
         ref_experts = None
-        for _nm in ("w13_weight", "w2_weight"):
-            _t = getattr(layer, _nm, None)
-            if isinstance(_t, torch.Tensor) and _t.dim() > 0:
-                ref_experts = int(_t.shape[0])
-                break
+        if _is_mega:
+            # w13_weight is emptied under mega; the authoritative per-rank physical
+            # expert count is num_local (== build-time _mega_local_E == num_physical
+            # // ep_size, redundant included). All _mega_* are 1-D [E*S], so the
+            # flattened-view branch below reshapes each to per-expert [E, S] and slices.
+            ref_experts = int(num_local)
+        else:
+            for _nm in ("w13_weight", "w2_weight"):
+                _t = getattr(layer, _nm, None)
+                if isinstance(_t, torch.Tensor) and _t.dim() > 0:
+                    ref_experts = int(_t.shape[0])
+                    break
         tensors: list[torch.Tensor] = []
         for name in names:
             tensor = getattr(layer, name, None)
