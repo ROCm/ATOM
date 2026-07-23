@@ -190,6 +190,88 @@ models:
           run_eval: true
           eval_concurrency: [65]
 
+        # Keep each AgentX concurrency in its own job so every measurement starts
+        # from a fresh ATOM/LMCache service instead of inheriting another run's cache.
+        - &glm52_agentic_lmcache
+          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c1
+          topology: 1p1d
+          display_topology: 1P1D-TP8-agentic-LMCache
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [1]
+          server:
+            common_args:
+              kv_cache_dtype: fp8
+              block_size: 16
+              gpu_memory_utilization: 0.85
+              max_model_len: 1048576
+              max_num_seqs: 512
+              decode_max_num_seqs: 64
+              max_num_batched_tokens: 131072
+              decode_max_num_batched_tokens: 262144
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: >-
+              --attn-prefill-chunk-size 131072
+              --long-prefill-token-threshold 131072
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: none
+          env:
+            common:
+              PYTHONHASHSEED: "0"
+            prefill:
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+              LMCACHE_CHUNK_SIZE: "256"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              MAX_JOBS: "16"
+          benchmark:
+            kind: aiperf_agentic
+            aiperf_commit: 0d2aa0572ac685943d38c580675c4a61023581d3
+            scenario: inferencex-agentx-mvp
+            public_dataset: semianalysis_cc_traces_weka_062126
+            max_context_length: 1048576
+            num_dataset_entries: 393
+            benchmark_duration: 3600
+            agentic_cache_warmup_duration: 600
+            warmup_grace_period: 1800
+            trajectory_start_min_ratio: 0.25
+            trajectory_start_max_ratio: 0.75
+            failed_request_threshold: 0.10
+            slice_duration: 1.0
+            cancel_drain_timeout: 300
+            http_tcp_user_timeout: 900000
+            dataset_weka_live_assistant_responses: 0
+            dataset_configuration_timeout: 1800
+            service_profile_configure_timeout: 1800
+            wait_server_timeout: 4500
+            wait_router_timeout: 600
+          run_eval: false
+
+        - <<: *glm52_agentic_lmcache
+          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c2
+          concurrency: [2]
+
+        - <<: *glm52_agentic_lmcache
+          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c4
+          concurrency: [4]
+
+        - <<: *glm52_agentic_lmcache
+          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c16
+          concurrency: [16]
+
+        - <<: *glm52_agentic_lmcache
+          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c32
+          concurrency: [32]
+
     accuracy:
       task: gsm8k
       fewshot: 20
