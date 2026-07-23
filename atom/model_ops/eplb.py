@@ -2506,10 +2506,10 @@ if _EPLB_HAS_TRITON:
 
     @triton.jit
     def _eplb_map_record_kernel(
-        topk_ids_ptr,      # [numel]        logical ids (in dtype)
-        dispatch_ptr,      # [num_logical]  this rank's logical->physical (int32)
-        out_ids_ptr,       # [numel]        output physical ids (in dtype)
-        load_ptr,          # [num_physical] _cur_pass_count[layer_id]; dummy if !RECORD
+        topk_ids_ptr,  # [numel]        logical ids (in dtype)
+        dispatch_ptr,  # [num_logical]  this rank's logical->physical (int32)
+        out_ids_ptr,  # [numel]        output physical ids (in dtype)
+        load_ptr,  # [num_physical] _cur_pass_count[layer_id]; dummy if !RECORD
         num_logical,
         id_delta,
         num_physical,
@@ -2526,7 +2526,9 @@ if _EPLB_HAS_TRITON:
         is_tail = lid >= num_logical
 
         safe_lid = tl.where(valid, lid, 0)
-        mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(tl.int64)
+        mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(
+            tl.int64
+        )
         # valid -> dispatch[lid]; tail -> lid + id_delta; invalid(<0) -> lid (keep)
         phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
         tl.store(out_ids_ptr + offs, phys, mask=mask)
