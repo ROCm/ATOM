@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from collections import deque
+from collections import OrderedDict, deque
 
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
@@ -36,11 +36,40 @@ class SlidingWindowPool:
         block_size: int,
         max_num_batched_tokens: int,
         mtp_k: int,
+        full_retain: bool = False,
+        retention_interval: int = 0,
+        checkpoint_frac: float = 0.5,
     ):
         self.enabled: bool = num_blocks > 0
         self.window: int = window
         self.block_size: int = block_size
         self.max_num_batched_tokens: int = max_num_batched_tokens
+        # Full-retention mode (ATOM_SWA_FULL_RETAIN): write + materialize EVERY
+        # SWA block of a prefill chunk (not only the trailing window), so the
+        # content-addressed cache holds the full history for cross-request replay
+        # hits. The live sliding-window free stays on (bounds active refs); the
+        # larger pool keeps freed-but-cached blocks resident until reuse.
+        self.full_retain: bool = bool(full_retain)
+        # Sparse checkpoint-tail retention (ATOM_SWA_RETENTION_INTERVAL, tokens).
+        # 0 = dense (retain every written tail, relies on pool size). >0 = keep a
+        # SWA tail only once per `retention_interval`-token segment plus at each
+        # request's prompt boundary, and PIN those checkpoint blocks (an extra
+        # ref so free_out_of_window / eviction skip them) so live-window churn
+        # cannot overwrite them. Mirrors vLLM's SlidingWindowManager sparse
+        # reachable_block_mask, adapted to ATOM's separate (small, isolated) SWA
+        # pool where masking alone is insufficient — the pin is required. LRU-
+        # capped at `checkpoint_frac` of the pool so live churn keeps headroom.
+        self.retention_blocks: int = (
+            retention_interval // block_size
+            if (retention_interval > 0 and block_size > 0)
+            else 0
+        )
+        self.sparse_retain: bool = self.full_retain and self.retention_blocks > 0
+        self.checkpoint_capacity: int = (
+            int(num_blocks * checkpoint_frac) if self.sparse_retain else 0
+        )
+        # block_id -> None, ordered by pin/access recency (front = LRU).
+        self.checkpoint_lru: OrderedDict[int, None] = OrderedDict()
         # Prefix-cache hit gate: a hit only needs the trailing window before the
         # boundary to be SWA-present (SWA is local). `tail_blocks` = contiguous
         # blocks covering win_with_spec = window + mtp_k (spec-decode tail tokens
@@ -82,6 +111,41 @@ class SlidingWindowPool:
         self.free_block_ids.append(block_id)
         self.free_block_ids_set.add(block_id)
 
+    # ------------------------ sparse checkpoint pins ----------------------- #
+    def _is_checkpoint(self, seq: Sequence, i: int) -> bool:
+        """Whether logical block `i` is a retained checkpoint tail: it sits in the
+        trailing `tail_blocks` of a `retention_blocks`-sized segment, OR in the
+        trailing `tail_blocks` before the prompt boundary (a proven reuse point).
+        Mirrors vLLM SlidingWindowManager.reachable_block_mask (segment tails +
+        reachable-boundary tails)."""
+        if not self.sparse_retain:
+            return True
+        need = self.tail_blocks
+        rb = self.retention_blocks
+        if i % rb >= rb - need:  # last `need` blocks of this segment
+            return True
+        prompt_blocks = seq.num_prompt_tokens // self.block_size
+        if i >= prompt_blocks - need:  # trailing tail before the prompt boundary
+            return True
+        return False
+
+    def _pin_checkpoint(self, block_id: int) -> None:
+        """Pin a checkpoint SWA block: hold an extra ref so free_out_of_window
+        never returns it to the free list, keeping its content-addressed tail
+        resident for cross-request reuse. LRU-evict the oldest pin when over
+        capacity. Idempotent per block_id (a re-pin just refreshes recency)."""
+        if block_id in self.checkpoint_lru:
+            self.checkpoint_lru.move_to_end(block_id)
+            return
+        self.blocks[block_id].ref_count += 1  # the pin ref
+        self.checkpoint_lru[block_id] = None
+        while len(self.checkpoint_lru) > self.checkpoint_capacity:
+            old_id, _ = self.checkpoint_lru.popitem(last=False)  # LRU
+            blk = self.blocks[old_id]
+            blk.ref_count -= 1  # drop the pin ref
+            if blk.ref_count == 0:  # no live seq holds it → reclaim
+                self._dealloc(old_id)
+
     # --------------------------- admission / hit --------------------------- #
     def has_free(self, n: int) -> bool:
         """Whether the pool has at least `n` free blocks. Disabled → True (never
@@ -100,6 +164,15 @@ class SlidingWindowPool:
         `seq.num_blocks` since SWA is filled incrementally + window-freed."""
         if not self.enabled:
             return 0
+        if self.full_retain:
+            # Full-retain materializes the whole current chunk (ensure_for_tokens
+            # free_before=0), so the peak concurrent footprint per prefill step is
+            # the chunk's block span (bounded by max_num_batched_tokens), NOT the
+            # trailing window. Freed after each chunk, so this is the per-step peak
+            # not the whole prompt. Capped by the prompt's block count.
+            bs = self.block_size
+            chunk_peak = (self.max_num_batched_tokens + bs - 1) // bs + 1
+            return min(chunk_peak, seq.num_blocks)
         cap = self.tail_blocks + 1
         return min(cap, seq.num_blocks)
 
@@ -152,6 +225,9 @@ class SlidingWindowPool:
             block.ref_count = 1
             self.free_block_ids_set.discard(swa_id)
             self.used_block_ids.add(swa_id)
+        # Cross-request reuse of a pinned checkpoint → refresh its LRU recency.
+        if swa_id in self.checkpoint_lru:
+            self.checkpoint_lru.move_to_end(swa_id)
         seq.swa_block_table.append(swa_id)
 
     def alloc_placeholder(self, seq: Sequence):
@@ -194,7 +270,11 @@ class SlidingWindowPool:
         # matching free_out_of_window's sentinel. Cuts prefill SWA allocation
         # from O(chunk_len/bs) to O(window/bs) — pairs with the window-only
         # swa_write in deepseek_v4.py. free_before mirrors free_out_of_window.
-        free_before = max(0, (seq_len - self.window) // bs)
+        # Full-retain: materialize every block of this chunk (free_before=0) so
+        # the full-chunk swa_write below has a valid physical dst for every token,
+        # and every block gets published for cross-request reuse. Default:
+        # window-only (only the trailing-window blocks the SWA read touches).
+        free_before = 0 if self.full_retain else max(0, (seq_len - self.window) // bs)
         start_blk = max(start_blk, free_before)
         table = seq.swa_block_table
         for i in range(start_blk, end_blk + 1):
@@ -289,6 +369,12 @@ class SlidingWindowPool:
             block = self.blocks[swa_id]
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+            # Sparse retention: pin this tail iff it is a checkpoint (segment or
+            # prompt-boundary tail), so live-window free/churn cannot overwrite it
+            # before a branch reuses it. Non-checkpoints stay unpinned and are
+            # reclaimed normally.
+            if self.sparse_retain and self._is_checkpoint(seq, i):
+                self._pin_checkpoint(swa_id)
 
     def release(self, seq: Sequence):
         """Release all of seq's SWA blocks (skipping -1 window-freed slots) and

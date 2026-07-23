@@ -9,20 +9,16 @@ import os
 import pickle
 import queue
 import weakref
-from threading import Thread
-from typing import List
+from threading import Lock, Thread
+from typing import List, Optional
 
 import zmq
 import zmq.asyncio
 from atom.config import Config
-from atom.model_engine.engine_core import (
-    DecodeEngineCore,
-    EngineCore,
-    EngineCoreRequestType,
-    PrefillEngineCore,
-)
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
+    envs,
     get_open_zmq_inproc_path,
     get_open_zmq_ipc_path,
     make_zmq_socket,
@@ -30,6 +26,12 @@ from atom.utils import (
 )
 
 logger = logging.getLogger("atom")
+
+# Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
+# Single source of truth for argparse (choices + default) so the CLI flag and
+# the Config field can never diverge.
+DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
+DP_LB_DEFAULT = "least_requests"
 
 
 class CoreManager:
@@ -58,7 +60,30 @@ class CoreManager:
         self.engine_core_identities = []
         self.shutdown_paths = []
         self.output_threads = []
-        self._rr_counter = 0
+        # Fair-rotation cursor, advanced once per selection. round_robin picks the
+        # rank directly (cursor % n); the load-aware strategies use it only to seed
+        # the argmin start offset so fully-tied ranks rotate instead of always
+        # resolving to rank 0.
+        self._rank_rotation_cursor = 0
+
+        # --- DP request load balancing (see _select_dp_rank_locked) ---
+        # Strategy: "round_robin" | "least_requests" | "least_tokens" (validated
+        # at the CLI by argparse choices=DP_LB_STRATEGIES).
+        self._dp_lb_strategy = config.dp_load_balance
+        # Token-equivalent weight of one in-flight request for "least_tokens".
+        # Read once here: this is a construction-time config value (CoreManager
+        # is built after env/args are finalized), not a runtime-tunable knob.
+        self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
+        # Authoritative in-flight load per rank, maintained locally: incremented
+        # on dispatch, decremented on finish/abort. Guarded by _lb_lock because
+        # dispatch runs on the request thread while release runs on the per-rank
+        # output threads.
+        self._rank_reqs = [0] * self.local_engine_count
+        self._rank_tokens = [0] * self.local_engine_count
+        # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
+        # what dispatch added, and only for ranks that were actually charged.
+        self._seq_load = {}
+        self._lb_lock = Lock()
 
         import torch
 
@@ -223,48 +248,75 @@ class CoreManager:
                         )
                         break
 
-                    obj = output_socket.recv(copy=False)
-                    request_type, data = pickle.loads(obj)
-                    if request_type == EngineCoreRequestType.SHUTDOWN:
-                        logger.debug(
-                            f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
-                        )
-                        self._shutdown_engine_core_rank(dp_rank)
-                        break
-                    elif request_type == EngineCoreRequestType.STREAM:
-                        stream_outputs = data  # List of (seq_id, RequestOutput) tuples
-                        logger.debug(
-                            f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
-                        )
-                        self.stream_outputs_queue.put_nowait(stream_outputs)
-                        # Also call callbacks if registered
-                        for seq_id, request_output in stream_outputs:
-                            callback = self._seq_id_to_callback.get(seq_id)
+                    try:
+                        obj = output_socket.recv(copy=False)
+                        request_type, data = pickle.loads(obj)
+                        if request_type == EngineCoreRequestType.SHUTDOWN:
                             logger.debug(
-                                f"{self.label}: seq_id={seq_id}, callback={'found' if callback is not None else 'NOT FOUND'}, tokens={request_output.output_tokens}"
+                                f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
                             )
-                            if callback is not None:
-                                try:
-                                    callback(request_output)
-                                    logger.debug(
-                                        f"{self.label}: Successfully called callback for seq_id={seq_id}"
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Error calling stream_callback for sequence {seq_id}: {e}",
-                                        exc_info=True,
-                                    )
-                            if request_output.finished:
-                                self._seq_id_to_callback.pop(seq_id, None)
+                            self._shutdown_engine_core_rank(dp_rank)
+                            break
+                        elif request_type == EngineCoreRequestType.STREAM:
+                            stream_outputs = (
+                                data  # List of (seq_id, RequestOutput) tuples
+                            )
+                            logger.debug(
+                                f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
+                            )
+                            self.stream_outputs_queue.put_nowait(stream_outputs)
+                            # Also call callbacks if registered
+                            for seq_id, request_output in stream_outputs:
+                                callback = self._seq_id_to_callback.get(seq_id)
                                 logger.debug(
-                                    f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
+                                    f"{self.label}: seq_id={seq_id}, callback={'found' if callback is not None else 'NOT FOUND'}, tokens={request_output.output_tokens}"
                                 )
-                    elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
-                        self.utility_response_queue.put_nowait(data)
-                    elif request_type == EngineCoreRequestType.ADD:
-                        # logger.info(f"Engine core output sequence id: {seq.id}")
-                        seqs = data
-                        self.outputs_queue.put_nowait(seqs)
+                                if callback is not None:
+                                    try:
+                                        callback(request_output)
+                                        logger.debug(
+                                            f"{self.label}: Successfully called callback for seq_id={seq_id}"
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"Error calling stream_callback for sequence {seq_id}: {e}",
+                                            exc_info=True,
+                                        )
+                                if request_output.finished:
+                                    self._seq_id_to_callback.pop(seq_id, None)
+                                    self._release_seq_load(seq_id)
+                                    logger.debug(
+                                        f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
+                                    )
+                        elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
+                            self.utility_response_queue.put_nowait(data)
+                        elif request_type == EngineCoreRequestType.ADD:
+                            # logger.info(f"Engine core output sequence id: {seq.id}")
+                            seqs = data
+                            # Offline (non-streaming) completions arrive here as
+                            # finished sequences; release their in-flight DP load.
+                            for seq in seqs:
+                                self._release_seq_load(seq.id)
+                            self.outputs_queue.put_nowait(seqs)
+                    except zmq.error.ContextTerminated:
+                        # Context destroyed during shutdown — recv can't
+                        # complete. Exit the loop cleanly.
+                        logger.debug(
+                            f"{self.label} (DP {dp_rank}): output thread context "
+                            f"terminated, exiting"
+                        )
+                        break
+                    except Exception:
+                        # A single malformed or unexpected message must NOT kill
+                        # the delivery thread: if it did, the engine would keep
+                        # processing requests while every subsequent response is
+                        # silently dropped (the socket's only reader is gone).
+                        # Log with traceback and keep draining the socket.
+                        logger.exception(
+                            f"{self.label} (DP {dp_rank}): error handling output "
+                            f"message; dropping it and continuing"
+                        )
+                        continue
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
@@ -408,40 +460,208 @@ class CoreManager:
                 copy=False,
             )
         else:
-            # DP ranks: honor an explicit atomesh DPA routing hint when present;
-            # otherwise keep the existing round-robin behavior.
-            dp_seqs = [[] for _ in range(self.local_engine_count)]
-            for seq in seqs:
-                requested_dp_rank = getattr(seq, "data_parallel_rank", None)
-                if requested_dp_rank is not None:
-                    dp_rank = int(requested_dp_rank)
-                    if not 0 <= dp_rank < self.local_engine_count:
-                        raise ValueError(
-                            f"Invalid data_parallel_rank={dp_rank}; "
-                            f"local_engine_count={self.local_engine_count}"
-                        )
-                else:
-                    dp_rank = self._rr_counter % self.local_engine_count
-                    self._rr_counter += 1
-                dp_seqs[dp_rank].append(seq)
+            self._dispatch_to_dp_ranks(seqs)
 
+    def _resolve_and_validate_hints(self, seqs: List[Sequence]) -> List[Optional[int]]:
+        """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
+        the whole batch, once.
+
+        Returns the per-seq resolved hint (an int rank, or None for a
+        load-balanced seq) so the dispatch loop can reuse it instead of calling
+        getattr/int a second time per seq.
+
+        Validation runs BEFORE any load is charged so a bad hint in the middle
+        of a batch cannot leave earlier siblings charged-but-undispatched (a
+        permanent in-flight-load leak).
+        """
+        hints: List[Optional[int]] = []
+        for seq in seqs:
+            raw = getattr(seq, "data_parallel_rank", None)
+            hint = None if raw is None else int(raw)
+            if hint is not None and not 0 <= hint < self.local_engine_count:
+                raise ValueError(
+                    f"Invalid data_parallel_rank={hint}; "
+                    f"local_engine_count={self.local_engine_count}"
+                )
+            hints.append(hint)
+        return hints
+
+    def _dispatch_to_dp_ranks(self, seqs: List[Sequence]) -> None:
+        """Route a batch across DP ranks and send each rank its sub-batch.
+
+        Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
+        via ``_select_dp_rank_locked`` (load-aware by default). Selection and the
+        in-flight-load charge happen atomically under ``_lb_lock`` so a burst of
+        requests spreads across ranks instead of all landing on the current
+        minimum.
+        """
+        # Resolve + validate all hints in one pass first — no charging until the
+        # whole batch is known good, so a rejected batch never leaks partial
+        # load. The resolved hints are reused in the loop below to avoid a second
+        # getattr/int pass per seq.
+        hints = self._resolve_and_validate_hints(seqs)
+
+        # round_robin is load-agnostic and skips the charge/release bookkeeping;
+        # the load-aware strategies track per-rank load.
+        track_load = self._dp_lb_strategy != "round_robin"
+        dp_seqs = [[] for _ in range(self.local_engine_count)]
+        reqs_snapshot = tokens_snapshot = None
+        with self._lb_lock:
+            for seq, hint in zip(seqs, hints):
+                dp_rank = hint if hint is not None else self._select_dp_rank_locked()
+                if track_load:
+                    self._charge_seq_load_locked(seq, dp_rank)
+                dp_seqs[dp_rank].append(seq)
+            # Copy the counters under the lock so the snapshot log below is a
+            # consistent instant, not a torn read racing _release_seq_load.
+            if track_load:
+                reqs_snapshot = list(self._rank_reqs)
+                tokens_snapshot = list(self._rank_tokens)
+
+        # Track which ranks were actually handed off, plus a compact per-rank
+        # delta ("rankR:Nreq/Ttok") for the single summary log after the loop. If
+        # a send fails partway, the seqs on the not-yet-dispatched ranks were
+        # charged above but will never produce a finished output to release them,
+        # so we roll back their in-flight load before propagating — otherwise
+        # routing skews forever.
+        dispatched = [False] * self.local_engine_count
+        added = []
+        try:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
-                if rank_seqs:
-                    request_ids = [seq.id for seq in rank_seqs]
-                    logger.info(
-                        "%s: Add %d request(s) to DP rank %d, sequence ids: %s",
-                        self.label,
-                        len(rank_seqs),
-                        dp_rank,
-                        request_ids,
-                    )
-                    self.input_sockets[dp_rank].send_multipart(
-                        [
-                            self.engine_core_identities[dp_rank],
-                            pickle.dumps((EngineCoreRequestType.ADD, rank_seqs)),
-                        ],
-                        copy=False,
-                    )
+                if not rank_seqs:
+                    continue
+                self.input_sockets[dp_rank].send_multipart(
+                    [
+                        self.engine_core_identities[dp_rank],
+                        pickle.dumps((EngineCoreRequestType.ADD, rank_seqs)),
+                    ],
+                    copy=False,
+                )
+                dispatched[dp_rank] = True
+                batch_prefill_tokens = sum(
+                    int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
+                )
+                added.append(
+                    f"rank{dp_rank}: {len(rank_seqs)} req / {batch_prefill_tokens} tok"
+                )
+        except Exception:
+            # Roll back only ranks we never handed off. _release_seq_load is
+            # idempotent (pops from _seq_load), so even if a failing send had
+            # already delivered its frames and the engine finished + released
+            # those seqs on an output thread, this rollback cannot double-count:
+            # whichever release runs first wins, the other is a no-op.
+            if track_load:
+                for dp_rank, rank_seqs in enumerate(dp_seqs):
+                    if rank_seqs and not dispatched[dp_rank]:
+                        for seq in rank_seqs:
+                            self._release_seq_load(seq.id)
+            raise
+
+        # One line per add: the per-rank delta this add placed, plus (for the
+        # load-aware strategies) the resulting in-flight distribution across all
+        # ranks, so a single grep shows both what changed and how balanced it is.
+        if reqs_snapshot is not None:
+            logger.info(
+                "%s: add %s | in-flight reqs=%s prefill_tokens=%s",
+                self.label,
+                ", ".join(added),
+                reqs_snapshot,
+                tokens_snapshot,
+            )
+        else:
+            logger.info("%s: add %s", self.label, ", ".join(added))
+
+    def _select_dp_rank_locked(self) -> int:
+        """Pick a DP engine rank for a new request. Caller must hold _lb_lock.
+
+        - "round_robin": load-agnostic rotation.
+        - "least_requests" (default): fewest in-flight requests, ties broken by
+          the lighter in-flight prompt-token load. Request count keeps the
+          lockstep DP ranks in phase; the token tie-break packs pending prefill
+          work evenly across the equal-request ranks.
+        - "least_tokens": lowest combined load ``tokens + req_equiv * reqs``
+          (prefill pressure + decode-slot pressure).
+
+        Fully-tied ranks are resolved by a rotating cursor so selection does not
+        always fall on rank 0. See docs/distributed_guide.md for the rationale.
+        """
+        n = self.local_engine_count
+        if self._dp_lb_strategy == "round_robin":
+            dp_rank = self._rank_rotation_cursor % n
+            self._rank_rotation_cursor += 1
+            return dp_rank
+
+        # argmin over per-rank load, scanned from a rotating start offset so a run
+        # of fully-equal ranks spreads evenly. Scores are computed inline (no
+        # intermediate list) — the loop reads the counters directly.
+        least_requests = self._dp_lb_strategy == "least_requests"
+        best_rank = 0
+        best_score = None
+        offset = self._rank_rotation_cursor % n
+        for i in range(n):
+            r = (offset + i) % n
+            if least_requests:
+                # Lexicographic (request count, prompt-token load): tuples compare
+                # element-wise, so tokens only decide among request-count ties.
+                score = (self._rank_reqs[r], self._rank_tokens[r])
+            else:  # "least_tokens"
+                score = (
+                    self._rank_tokens[r] + self._dp_lb_req_equiv * self._rank_reqs[r]
+                )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_rank = r
+        self._rank_rotation_cursor += 1
+        return best_rank
+
+    def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
+        """Record a seq's in-flight load on dp_rank. Caller must hold _lb_lock."""
+        req_cost = 1
+        tok_cost = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        self._rank_reqs[dp_rank] += req_cost
+        self._rank_tokens[dp_rank] += tok_cost
+        self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
+
+    def _release_seq_load(self, seq_id) -> None:
+        """Undo a seq's in-flight load when it finishes or is aborted.
+
+        Idempotent: a seq is only charged once and released once, so a repeated
+        call (e.g. finish followed by abort) is a no-op.
+        """
+        with self._lb_lock:
+            entry = self._seq_load.pop(seq_id, None)
+            if entry is None:
+                return
+            dp_rank, req_cost, tok_cost = entry
+            self._rank_reqs[dp_rank] -= req_cost
+            self._rank_tokens[dp_rank] -= tok_cost
+
+    def reset_dp_router(self) -> None:
+        """Reset all DP routing state (rotation cursor + in-flight load).
+
+        Called at the start of a fresh offline ``generate()`` batch so counts do
+        not leak across independent batches and DP assignment is deterministic.
+
+        Precondition: the previous batch has fully drained. If any request is
+        still charged when this runs (e.g. this CoreManager is being shared with
+        a concurrent streaming path), that request's later release becomes a
+        no-op and the per-rank counters would drift — so we warn loudly instead
+        of corrupting accounting silently.
+        """
+        with self._lb_lock:
+            if self._seq_load:
+                logger.warning(
+                    "%s: reset_dp_router() called with %d request(s) still "
+                    "charged in-flight; dropping their load. Expected only "
+                    "between fully-drained offline batches — a shared/concurrent "
+                    "CoreManager will see counters drift.",
+                    self.label,
+                    len(self._seq_load),
+                )
+            self._rank_rotation_cursor = 0
+            self._rank_reqs = [0] * self.local_engine_count
+            self._rank_tokens = [0] * self.local_engine_count
+            self._seq_load.clear()
 
     def get_stream_outputs(self):
         try:
@@ -482,6 +702,10 @@ class CoreManager:
         scheduler finishes the seq at its next step via the normal stop path,
         freeing its KV blocks. Fire-and-forget; safe if the seq already finished.
         """
+        # Release DP load bookkeeping now: an aborted seq may never emit a
+        # finished STREAM output, so relying on the finish path alone would leak
+        # its in-flight count. _release_seq_load is idempotent.
+        self._release_seq_load(req_id)
         try:
             self.broadcast_utility_command("abort_request", req_id=req_id)
         except Exception as e:
@@ -575,6 +799,12 @@ def launch_engine_core(config: Config, dp_rank: int = 0):
     input_address = get_open_zmq_ipc_path()
     output_address = get_open_zmq_ipc_path()
     import torch
+
+    # Imported here, not at module scope: EngineCore pulls the heavy
+    # engine_core -> async_proc -> aiter chain. Spawning a worker is inherently a
+    # GPU-side operation, so the cost belongs here and keeps CoreManager (routing
+    # only) importable on a CPU-only runner.
+    from atom.model_engine.engine_core import EngineCore
 
     if torch.multiprocessing.get_start_method(allow_none=True) is None:
         torch.multiprocessing.set_start_method("spawn", force=False)
@@ -694,6 +924,8 @@ class DisaggCoreManager(CoreManager):
         decode_input_addr = get_open_zmq_ipc_path()
         decode_output_addr = get_open_zmq_ipc_path()
 
+        from atom.model_engine.engine_core import PrefillEngineCore, DecodeEngineCore
+
         prefill_proc = multiprocessing.Process(
             target=PrefillEngineCore.run_engine,
             name="PrefillEngineCore",
@@ -731,7 +963,23 @@ class DisaggCoreManager(CoreManager):
         self.engine_core_identities = []
         self.shutdown_paths = []
         self.output_threads = []
-        self._rr_counter = 0
+
+        # DP load-balancing state. DisaggCoreManager does not call
+        # super().__init__() (that would spawn CoreManager's own engine
+        # processes), so it must initialize the same fields CoreManager sets up.
+        # Disagg overrides add_request() with a prefill/decode fan-out and never
+        # routes through _dispatch_to_dp_ranks, so no load is ever charged and
+        # _seq_load stays empty — but the inherited output thread still calls
+        # _release_seq_load() on every finished sequence, so _lb_lock and
+        # _seq_load MUST exist or the output thread dies on the first finish and
+        # all responses stop coming back.
+        self._rank_rotation_cursor = 0
+        self._dp_lb_strategy = config.dp_load_balance
+        self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
+        self._rank_reqs = [0] * self.local_engine_count
+        self._rank_tokens = [0] * self.local_engine_count
+        self._seq_load = {}
+        self._lb_lock = Lock()
 
         import weakref
 

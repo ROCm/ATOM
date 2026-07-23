@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import enum
 import logging
 import pickle
 import queue
@@ -14,6 +13,7 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
@@ -30,28 +30,6 @@ from atom.utils.distributed.utils import (
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 
 logger = logging.getLogger("atom")
-
-
-class EngineCoreRequestType(enum.Enum):
-    """
-    Request types defined as hex byte strings, so it can be sent over sockets
-    without separate encoding step.
-    """
-
-    ADD = b"\x00"
-    ABORT = b"\x01"
-    START_DP_WAVE = b"\x02"
-    UTILITY = b"\x03"
-    # Sentinel used within EngineCoreProc.
-    EXECUTOR_FAILED = b"\x04"
-    # Sentinel used within EngineCore.
-    SHUTDOWN = b"\x05"
-    # Stream output for callbacks
-    STREAM = b"\x06"
-    # Signal that EngineCore is fully initialized and ready
-    READY = b"\x07"
-    # Response to a synchronous utility command
-    UTILITY_RESPONSE = b"\x08"
 
 
 class EngineCore:
@@ -89,7 +67,6 @@ class EngineCore:
         )
         self.input_thread.start()
 
-        self.profile_enbaled = config.torch_profiler_dir is not None
         self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
         self._init_data_parallel(config)
@@ -127,23 +104,14 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
-            # Decode in disagg mode defers CUDA graph capture until after kvcache
-            # IPC import — the capture runs from DecodeEngineCore.__init__ instead.
             if not config.enforce_eager and not config.disagg_is_decode:
-                # Start profiler before cudagraph capture only if mark-trace is enabled.
-                if self.profile_enbaled and self.mark_trace:
-                    self.runner_mgr.call_func(
-                        "start_profiler", "capture_graph", wait_out=True
-                    )
-                cap_cost, bs = self.runner_mgr.call_func(
+                cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
                 logger.info(
-                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
+                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} "
+                    f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
-                if self.profile_enbaled and self.mark_trace:
-                    # Persist a dedicated capture-graph trace immediately.
-                    self.runner_mgr.call_func("stop_profiler", wait_out=True)
             good = True
         finally:
             logger.info(
@@ -322,6 +290,7 @@ class EngineCore:
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
+            self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
@@ -746,7 +715,7 @@ class PrefillEngineCore(EngineCore):
         bootstrap was already sent inside _send_ready_signal(), so _init_disagg
         only needs to set up the per-request BlockAssignment/PrefillDone channel.
         """
-        # --- Create pool of CU-masked CUDA streams for prefill ---
+        # # --- Create pool of CU-masked CUDA streams for prefill ---
         logger.info("PrefillEngineCore: creating prefill stream pool...")
         self.runner_mgr.call_func("create_prefill_stream_pool", wait_out=True)
         logger.info("PrefillEngineCore: prefill stream pool created")
@@ -935,24 +904,14 @@ class DecodeEngineCore(EngineCore):
 
         # --- Capture CUDA graphs now that kvcache is real ---
         config.num_kvcache_blocks = num_kvcache_blocks
-        # if not config.enforce_eager:
-        #     cap_cost, bs = self.runner_mgr.call_func("capture_cudagraph", wait_out=True)
-        #     logger.info(
-        #         f"DecodeEngineCore: cudagraph capture{bs} cost: {cap_cost:.2f}s"
-        #     )
 
         if not config.enforce_eager:
-            if self.profile_enbaled and self.mark_trace:
-                self.runner_mgr.call_func(
-                    "start_profiler", "capture_graph", wait_out=True
-                )
-            cap_cost, bs = self.runner_mgr.call_func("capture_cudagraph", wait_out=True)
+            cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
+                "capture_cudagraph", wait_out=True
+            )
             logger.info(
                 f"DecodeEngineCore: cudagraph capture{bs} cost: {cap_cost:.2f}s"
             )
-            if self.profile_enbaled and self.mark_trace:
-                # Persist a dedicated capture-graph trace immediately.
-                self.runner_mgr.call_func("stop_profiler", wait_out=True)
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
         self.scheduler = DecodeScheduler(

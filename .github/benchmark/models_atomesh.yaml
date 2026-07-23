@@ -86,6 +86,24 @@ models:
           concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
           run_eval: true
 
+        - name: ds-v4-1p1d-dpa-tp8
+          topology: 1p1d_dpa
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512]
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo"
+          benchmark:
+            wait_server_timeout: 4500
+
         - name: ds-v4-2p1d-dpa-tp8
           topology: 2p1d_dpa
           pd_worker_layout: multi_node
@@ -230,6 +248,34 @@ models:
           run_eval: true
           eval_concurrency: [64, 256]
 
+        - name: kimi-k25-1p1d-tp4-tp8
+          topology: 1p1d_tp4_tp8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: >-
+              [8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+          server:
+            common_args:
+              decode_max_num_seqs: 512
+          env:
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [64, 256]
+        
         - name: kimi-k25-2p1d-tp4
           topology: 2p1d
           pd_worker_layout: prefill_single_node

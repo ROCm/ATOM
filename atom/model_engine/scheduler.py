@@ -31,6 +31,7 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 import struct
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -140,9 +141,11 @@ class CacheStats:
         "total_requests",
         "total_cached_tokens",
         "total_full_tokens",
+        "total_compressed_tokens",
         "_interval_requests",
         "_interval_cached_tokens",
         "_interval_full_tokens",
+        "_interval_compressed_tokens",
     )
 
     def __init__(self, log_interval: int = 100):
@@ -150,18 +153,29 @@ class CacheStats:
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
+        # Pre-SWA-gate compressed-prefix hit tokens. total - cached separates
+        # reuse lost to the SWA tail gate from reuse lost to compressed eviction.
+        self.total_compressed_tokens: int = 0
         self._interval_requests: int = 0
         self._interval_cached_tokens: int = 0
         self._interval_full_tokens: int = 0
+        self._interval_compressed_tokens: int = 0
 
-    def update(self, num_cached_tokens: int, num_full_tokens: int) -> None:
+    def update(
+        self,
+        num_cached_tokens: int,
+        num_full_tokens: int,
+        num_compressed_tokens: int = 0,
+    ) -> None:
         """Record cache stats for one prefill sequence."""
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
         self.total_full_tokens += num_full_tokens
+        self.total_compressed_tokens += num_compressed_tokens
         self._interval_requests += 1
         self._interval_cached_tokens += num_cached_tokens
         self._interval_full_tokens += num_full_tokens
+        self._interval_compressed_tokens += num_compressed_tokens
 
         if self.total_requests % self._log_interval == 0:
             self._log()
@@ -177,22 +191,40 @@ class CacheStats:
         self._interval_requests = 0
         self._interval_cached_tokens = 0
         self._interval_full_tokens = 0
+        self._interval_compressed_tokens = 0
+
+    @staticmethod
+    def _rate(num: int, den: int) -> float:
+        return num / den if den > 0 else 0.0
 
     def _log(self) -> None:
-        iv_rate = (
-            self._interval_cached_tokens / self._interval_full_tokens
-            if self._interval_full_tokens > 0
-            else 0.0
+        # compressed = pre-SWA-gate prefix hit; cached = post-gate (admitted).
+        # (compressed - cached) is reuse lost to a missing SWA tail; (full -
+        # compressed) is reuse lost to compressed eviction / no logical reuse.
+        iv_hit = self._rate(self._interval_cached_tokens, self._interval_full_tokens)
+        iv_comp = self._rate(
+            self._interval_compressed_tokens, self._interval_full_tokens
+        )
+        iv_gate = self._rate(
+            self._interval_compressed_tokens - self._interval_cached_tokens,
+            self._interval_full_tokens,
         )
         logger.info(
             f"[Cache Stats Interval] Reqs: {self._interval_requests}, "
-            f"Cached/Total tokens: {self._interval_cached_tokens}/{self._interval_full_tokens}, "
-            f"Hit rate: {iv_rate:.2%}"
+            f"Cached/Total: {self._interval_cached_tokens}/{self._interval_full_tokens}, "
+            f"Hit: {iv_hit:.2%}, Compressed-hit: {iv_comp:.2%}, "
+            f"Lost-to-SWA-gate: {iv_gate:.2%}"
+        )
+        tot_comp = self._rate(self.total_compressed_tokens, self.total_full_tokens)
+        tot_gate = self._rate(
+            self.total_compressed_tokens - self.total_cached_tokens,
+            self.total_full_tokens,
         )
         logger.info(
             f"[Cache Stats         ] Reqs: {self.total_requests}, "
-            f"Cached/Total tokens: {self.total_cached_tokens}/{self.total_full_tokens}, "
-            f"Hit rate: {self.hit_rate:.2%}"
+            f"Cached/Total: {self.total_cached_tokens}/{self.total_full_tokens}, "
+            f"Hit: {self.hit_rate:.2%}, Compressed-hit: {tot_comp:.2%}, "
+            f"Lost-to-SWA-gate: {tot_gate:.2%}"
         )
 
 
@@ -369,6 +401,25 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
+        self.num_spec_query_tokens = num_spec_step + 1
+        # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
+        # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when
+        # set, consumers use it (per-seq) instead of the scalar above.
+        self.dynamic_spec_query_tokens_per_req = None
+
+        # DSpark DP graph-shape sync (see model_runner._apply_dspark_shape_max):
+        # DP-max decode bs / ragged token total, so every DP rank replays the same
+        # cudagraph shape. None outside DSpark-under-DP steps.
+        self.dspark_dp_bs = None
+        self.dspark_dp_total_tokens = None
+
+        # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
+        # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
+        # None on the normal path; consumed by ModelRunner.run_model to extend
+        # the prefill[]/decode[] trace labels.
+        self.detailed_sqsq: int | None = None  # sum N_Q^2
+        self.detailed_sqsk: int | None = None  # sum N_Q*N_KV
+        self.detailed_sk: int | None = None  # sum N_KV
 
         # Key into ModelRunner's stream pool for CU-masked disagg streams.
         # None means full-CU fallback (no mask).
@@ -410,6 +461,7 @@ class ScheduledBatchOutput:
         is_deferred_out: bool = False,
         is_prev_prefill=False,
         logprobs=None,
+        dspark_ell: Optional[np.ndarray] = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -419,6 +471,11 @@ class ScheduledBatchOutput:
         self.is_deferred_out = is_deferred_out
         self.is_prev_prefill = is_prev_prefill
         self.logprobs = logprobs  # Optional[dict[int, float]]
+        # DSpark Phase 2: {req_id: ell_r} from this step's propose() — the
+        # scheduler-chosen verify length per request. Rides back to the
+        # (main-process) scheduler so the NEXT step can size each request's
+        # verification to ell_r+1. None when DSpark scheduling is off.
+        self.dspark_ell = dspark_ell
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: Optional[dict[int, int]] = None
 
@@ -489,6 +546,11 @@ class Scheduler:
         self.cache_stats: Optional[CacheStats] = (
             CacheStats() if config.enable_prefix_caching else None
         )
+        self.profile_active = False
+        # Cache the env flag once (env vars are fixed at process start) so the
+        # per-iteration compute_detailed_aggregates never pays an os.getenv.
+        self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
+
         self.enable_chunked_prefill = config.enable_chunked_prefill
         # V4 SWA correctness on a prefix-cache hit is now handled entirely in
         # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
@@ -1328,7 +1390,11 @@ class Scheduler:
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
         if self.cache_stats:
-            self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
+            self.cache_stats.update(
+                seq.num_cached_tokens,
+                seq.num_tokens,
+                seq.num_compressed_hit_blocks * self.block_manager.block_size,
+            )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
@@ -1538,12 +1604,17 @@ class Scheduler:
                     self.spec_stats.update(num_new_token)
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
+                # DSpark Phase 2: stash this step's scheduler-chosen ell on the
+                # seq so the NEXT decode schedule can size its verification to
+                # ell+1. Keyed by req_id (order-safe). Missing -> leave default
+                # (mtp_k), so a request never gets under-verified.
+                if fwd_output.dspark_ell is not None:
+                    ell_r = fwd_output.dspark_ell.get(seq.id)
+                    if ell_r is not None:
+                        seq.dspark_next_ell = int(ell_r)
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
-                # logger.info(
-                #     f"{seq.id=}, {num_new_token=} {num_rejected=} {self.mtp_k} {token_ids=} {seq.token_ids[-8:]=}"
-                # )
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob
@@ -1736,6 +1807,61 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
+
+    def compute_detailed_aggregates(
+        self,
+        scheduled_batch: ScheduledBatch,
+        seqs: dict[int, Sequence],
+    ) -> None:
+        """Attach detailed attention aggregates to *scheduled_batch* in place.
+
+        Only the quadratic terms genuinely needed for a downstream attention-FLOP
+        estimate are computed here. The request counts and total query tokens are
+        already emitted by the ``prefill[]``/``decode[]`` labels in
+        :meth:`ModelRunner.run_model`, so this avoids duplicating them.
+
+        The following batch-level sums are stored on the batch and appended to
+        those labels by the runner:
+
+            sqsq  — sum of N_Q^2      (per request)
+            sqsk  — sum of N_Q*N_KV   (per request)
+            sk    — sum of N_KV       (per request)
+
+        where ``N_Q`` is the number of query tokens scheduled for a request and
+        ``N_KV`` is its KV length (cached + new tokens for prefill, full
+        sequence length for decode). Aggregating over every request in the
+        batch gives the total for that single forward, which is exactly the
+        quantity a per-iteration attention-FLOP estimate needs. For MTP/spec-decode a
+        decode step schedules ``mtp_k + 1`` query tokens, so the scheduled
+        token count is used as ``N_Q`` for both branches (rather than a
+        hardcoded 1) to avoid undercounting.
+
+        This is a no-op (leaves the fields ``None``) unless profiling is active
+        and ``ATOM_ENABLE_DETAILED_ANNOTATION`` is set.
+        """
+        if not self.profile_active or not self._detailed_annotation_enabled:
+            return
+
+        sqsq = 0  # sum N_Q^2
+        sqsk = 0  # sum N_Q*N_KV
+        sk = 0  # sum N_KV
+        for seq, num_tokens in zip(seqs.values(), scheduled_batch.num_scheduled_tokens):
+            # Cast to Python int: num_scheduled_tokens is np.int32, so nq*nq /
+            # nq*nkv would overflow once a prefill/chunk exceeds ~46341 tokens
+            # (e.g. np.int32(65536)**2 == 0), silently corrupting the estimate.
+            nq = int(num_tokens)  # query tokens scheduled this forward
+            if seq.type == SequenceType.DECODE:
+                nkv = int(seq.num_tokens)  # full sequence length
+            else:
+                # PREFILL: KV length = cached + new tokens.
+                nkv = int(seq.num_cached_tokens) + nq
+            sqsq += nq * nq
+            sqsk += nq * nkv
+            sk += nkv
+
+        scheduled_batch.detailed_sqsq = sqsq
+        scheduled_batch.detailed_sqsk = sqsk
+        scheduled_batch.detailed_sk = sk
 
     def _connector_flag(self, name: str) -> bool:
         return bool(getattr(self.kv_connector, name, False))

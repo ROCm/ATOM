@@ -43,7 +43,7 @@ on:
         default: ''
         type: string
       case_names:
-        description: 'Overrides model_names. Comma-separated: ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-2p1d-dpa-tp8,glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,kimi-k25-1p1d-tp4,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3'
+        description: 'Overrides model_names. Comma-separated: ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,ds-v4-2p1d-dpa-tp8,glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3'
         required: false
         default: ''
         type: string

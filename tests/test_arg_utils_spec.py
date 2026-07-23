@@ -31,8 +31,12 @@ if _atom_config_stub is not None:
             "CUDAGraphMode",
             {"NONE": 0, "PIECEWISE": 1, "FULL": 2, "FULL_AND_PIECEWISE": 3},
         )
-
-import argparse  # noqa: E402
+    if not hasattr(_atom_config_stub, "DSparkConfig"):
+        # arg_utils imports DSparkConfig and calls DSparkConfig.from_dict() to
+        # build the DSpark runtime config from --dspark-config/--dspark-debug.
+        _atom_config_stub.DSparkConfig = MagicMock(
+            from_dict=lambda cfg, debug=False: MagicMock(cfg=cfg, debug=debug)
+        )
 
 from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
 

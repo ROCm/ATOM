@@ -12,7 +12,10 @@ Kinds (label prefix — groups in Perfetto UI, greppable):
   - ``dummy_prefill``      warmup dummy prefill
 
 Fields (``key=value`` inside brackets):
-  - ``bs``   effective batch size
+  - ``bs``   effective (real) batch size; on the CUDAGraph path shown as
+             ``<real>/<graph>`` when the replayed graph is padded above the real
+             batch (e.g. ``bs=117/128``). ``parse_trace.py`` reads the leading
+             ``\\d+`` so the real batch is still what it extracts.
   - ``tok``  total scheduled tokens
   - ``ctx``  per-seq context lengths (prefill/eager paths; truncated if many)
   - ``p``/``d``  prefill / decode seq counts (cudagraph decode path)
@@ -40,14 +43,27 @@ def build_run_label(
     tbo_on: bool,
     bs: int,
     batch: Optional["ScheduledBatch"],
+    detailed_suffix: str = "",
+    graph_bs: Optional[int] = None,
 ) -> str:
     """Build the ``record_function`` label for one forward pass.
 
     Pure function (no runtime state) — see module docstring for the taxonomy.
+
+    ``detailed_suffix`` is an already-formatted ``" key=value ..."`` fragment
+    (empty on the normal path) appended inside the brackets; see
+    ``ModelRunner._detailed_label_suffix``.
+
+    ``graph_bs`` is the padded batch size the CUDAGraph actually replays. When it
+    is given and exceeds the real ``bs`` (CUDAGraph path only), the label shows
+    ``bs=<real>/<graph>`` so the padding is visible in the trace.
     """
     if use_cudagraph:
         kind = "dummy_decode" if is_dummy else "decode"
-        label = f"{kind}[bs={bs}"
+        if graph_bs is not None and graph_bs > bs:
+            label = f"{kind}[bs={bs}/{graph_bs}"
+        else:
+            label = f"{kind}[bs={bs}"
         if batch is not None:
             label += f" tok={batch.total_tokens_num}"
             if batch.total_seqs_num_prefill > 0:
@@ -70,6 +86,7 @@ def build_run_label(
             else:
                 ctx_str = f"{ctx[:3].tolist()}...+{len(ctx) - 3}"
             label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
+    label += detailed_suffix
     if tbo_on:
         label += " tbo=1"
     label += "]"

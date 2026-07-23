@@ -601,9 +601,7 @@ def sparse_attn_v4_paged_prefill(
     prefix pool and ``unified_kv_rope`` the bf16 RoPE prefix pool; the
     op-quantized fp8 Q (``q_packed`` / ``q_rope``) and extend K
     (``k_packed`` / ``k_rope``) are fed directly, no dequant of the prefix and no
-    torch quant. gfx950/gfx1250. (fp8 + PCP is out of scope: the extend K is this
-    fwd's shard and is not PCP all-gathered — the caller must pass the sharded
-    ``k_packed`` / ``k_rope``.)
+    torch quant. gfx950/gfx1250.
 
     Otherwise (bf16): the existing OPUS / Triton / reference path over ``q`` and
     the bf16 extend ``kv``.

@@ -12,7 +12,7 @@ from glob import glob
 from typing import Generator, Tuple
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import safetensors
 import safetensors.torch
@@ -124,7 +124,14 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight)
     elif loaded_weight.numel() // get_tp_group().world_size == param.data.numel():
         loaded_weight_per_rank = loaded_weight.numel() // get_tp_group().world_size
-        tp_rank_start = loaded_weight_per_rank * get_tp_group().rank
+        # Offset MUST use the TP-group-local rank (rank_in_group), NOT the global
+        # rank: `.world_size` above is the TP group size, so the two must be from
+        # the same (TP-group) frame. `.rank` is torch.distributed.get_rank()
+        # (global). They coincide only when world == tp (pure TP); under PCP/DP/PP
+        # the world splits into multiple TP groups, so a group's global ranks
+        # (e.g. PCP rank 1 = global 4..7) exceed its world_size (4), making this
+        # slice out of bounds → empty → copy_ fails.
+        tp_rank_start = loaded_weight_per_rank * get_tp_group().rank_in_group
         tp_rank_end = tp_rank_start + loaded_weight_per_rank
         param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
     else:
@@ -202,6 +209,7 @@ def load_model_in_plugin_mode(
     load_fused_expert_weights_fn=None,
     spec_decode: bool = False,
     hf_config_override: AutoConfig | None = None,
+    model_name_or_path_override: str | None = None,
 ) -> set[str]:
 
     # during loading model, the outplace operation may consume more
@@ -216,7 +224,9 @@ def load_model_in_plugin_mode(
     assert (
         config.plugin_config is not None and config.plugin_config.is_plugin_mode
     ), "ATOM is not running in plugin mode"
-    if config.plugin_config.is_vllm:
+    if model_name_or_path_override is not None:
+        model_name_or_path = model_name_or_path_override
+    elif config.plugin_config.is_vllm:
         model_name_or_path = config.plugin_config.model_config.model
     elif config.plugin_config.is_sglang:
         model_name_or_path = config.plugin_config.model_config.model_path
@@ -280,11 +290,69 @@ def _save_online_quant_info(
     logger.info("Online quantization info saved to %s", filepath)
 
 
+# Dummy-weight init constants (see initialize_dummy_weights).
+_DUMMY_WEIGHT_STD = 2.0**-4  # ~0.0625, a plausible transformer weight magnitude
+_FP4_UNIT_BYTE = 0x22  # e2m1 fp4x2: both nibbles = 0b0010 = 1.0
+_E8M0_UNIT_CODE = 123  # e8m0 exponent code for 2^(123-127) = 2^-4 = _DUMMY_WEIGHT_STD
+
+
+def initialize_dummy_weights(model: nn.Module, mode: str) -> None:
+    """Fill skipped-load (``--load_dummy``) params with finite values in place.
+
+    ``mode="zero"``   -> every param zeroed (works for fp4/fp8/int/bf16 alike).
+    ``mode="xavier"`` -> constant-magnitude init that keeps the forward finite and
+    roughly at real-weight scale:
+
+    - bf16/fp16/fp32 2D weight        -> ``xavier_uniform_``
+    - 1D norm weight (non-bias)        -> 1.0
+    - bias                             -> 0.0
+    - float weight_scale              -> ``_DUMMY_WEIGHT_STD``
+    - input_scale                      -> 1.0
+    - fp8 packed weight               -> 1.0
+    - fp4x2 packed weight (uint8-view) -> ``_FP4_UNIT_BYTE`` (each fp4 = 1.0)
+    - e8m0 (uint8) block scale        -> ``_E8M0_UNIT_CODE`` (= 2^-4)
+
+    Quantized weights are filled with a *constant* magnitude (not a true random
+    distribution), so the effective weights survive the shuffle/swizzle in each
+    quant method's ``process_weights_after_loading`` (a permutation of identical
+    bytes is a no-op). FP4 (MXFP4) is the validated path; FP8 and other formats
+    are made finite but not distribution-realistic.
+    """
+    for name, param in model.named_parameters():
+        data = param.data
+        if mode == "zero":
+            # zero_() works in place for every dtype (incl. fp4x2/fp8/int) and
+            # every shape; a uint8 byte-view would crash on 0-dim scalar or
+            # non-contiguous params (view requires stride(-1)==1, dim>0).
+            data.zero_()
+            continue
+        # mode == "xavier"
+        dt = data.dtype
+        if "input_scale" in name:
+            data.fill_(1.0)
+        elif "scale" in name:
+            if dt == torch.uint8:  # e8m0 block scale (fp4)
+                data.fill_(_E8M0_UNIT_CODE)
+            else:  # fp8/bf16 float scale
+                data.fill_(_DUMMY_WEIGHT_STD)
+        elif dt in (torch.float32, torch.float16, torch.bfloat16):
+            if data.dim() >= 2:
+                nn.init.xavier_uniform_(data)
+            elif "bias" in name:
+                data.zero_()
+            else:  # 1D norm weight etc.
+                data.fill_(1.0)
+        elif dt in (torch.float8_e4m3fn, torch.float8_e5m2):
+            data.fill_(1.0)  # fp8 packed weight
+        else:  # fp4x2 packed weight, viewable as uint8
+            data.view(torch.uint8).fill_(_FP4_UNIT_BYTE)
+
+
 def load_model(
     model: nn.Module,
     model_name_or_path: str,
     hf_config: AutoConfig,
-    load_dummy: bool = False,
+    load_dummy: Optional[str] = None,
     spec_decode: bool = False,
     prefix: str = "",
     is_plugin_mode: bool = False,
@@ -477,8 +545,19 @@ def load_model(
             _fallback(param, full_param_name, shard_id, global_expert_id, loaded_weight)
             return
 
+        # Map to this rank's local expert id BEFORE touching staging_map. Under
+        # expert parallelism every rank iterates all global experts, but a
+        # non-local expert contributes nothing to this rank's staging. If such a
+        # straggler ran after the param already reached `expected` and flushed
+        # (which deletes its staging entry), creating an entry here would leave a
+        # fresh, never-filled entry that is miscounted as "under-filled" at the
+        # end of loading. Return early so non-local shards never create entries.
+        moe = _lookup_moe_module(full_param_name)
+        local_eid = moe._map_global_expert_id_to_local_expert_id(global_expert_id)
+        if local_eid == -1:
+            return
+
         if entry is None:
-            moe = _lookup_moe_module(full_param_name)
             new_entry = {
                 "staging": _make_staging(param),
                 "arrived": 0,
@@ -498,11 +577,6 @@ def load_model(
                     param, full_param_name, shard_id, global_expert_id, loaded_weight
                 )
                 return
-
-        moe = entry["moe"]
-        local_eid = moe._map_global_expert_id_to_local_expert_id(global_expert_id)
-        if local_eid == -1:
-            return
 
         ok = moe.stage_expert_weight(
             param=param,
@@ -888,6 +962,12 @@ def load_model(
 
     # Avoid holding stale Parameter refs that prevent storage release.
     del params_dict
+
+    # Dummy modes other than "empty" fill the skipped-load params with finite
+    # values before post-processing, so shuffle/swizzle runs on clean constants.
+    if load_dummy and load_dummy != "empty":
+        initialize_dummy_weights(model, load_dummy)
+
     has_online_quant = any(
         getattr(m, "online_quant", False)
         or (
