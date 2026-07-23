@@ -76,6 +76,10 @@ def _register_custom_attention_to_sglang() -> None:
     from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
         ATOMDeepseekV4BackendForSgl,
     )
+    from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
+        ATOMGLM52DSABackendForSgl,
+    )
+    from atom.plugin.sglang.runtime import is_glm52_dsa_config
 
     # here register the custom attention backend with the name "aiter"
     # as sglang defines the fixed attention backend choices, which must be
@@ -90,12 +94,18 @@ def _register_custom_attention_to_sglang() -> None:
 
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
-        arches = getattr(runner.model_config.hf_config, "architectures", None) or []
+        hf_config = runner.model_config.hf_config
+        arches = getattr(hf_config, "architectures", None) or []
         if any("DeepseekV4" in str(arch) for arch in arches):
             logger.info(
                 "Use ATOMDeepseekV4BackendForSgl for DeepSeek-V4 through SGLang aiter backend choice"
             )
             return ATOMDeepseekV4BackendForSgl(runner)
+        if is_glm52_dsa_config(hf_config):
+            logger.info(
+                "Use ATOMGLM52DSABackendForSgl for GLM-5.2 through SGLang aiter backend choice"
+            )
+            return ATOMGLM52DSABackendForSgl(runner)
         return ATOMAttnBackendForSgl(runner)
 
     @register_attention_backend("dsv4")
@@ -104,6 +114,18 @@ def _register_custom_attention_to_sglang() -> None:
             "Create ATOMDeepseekV4BackendForSgl through SGLang dsv4 backend choice"
         )
         return ATOMDeepseekV4BackendForSgl(runner)
+
+    @register_attention_backend("nsa")
+    def create_atom_nsa_backend(runner):
+        hf_config = runner.model_config.hf_config
+        if is_glm52_dsa_config(hf_config):
+            logger.info(
+                "Use ATOMGLM52DSABackendForSgl for GLM-5.2 through SGLang nsa backend choice"
+            )
+            return ATOMGLM52DSABackendForSgl(runner)
+        from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+
+        return NativeSparseAttnBackend(runner)
 
 
 def _patch_sglang_dsv4_draft_backends() -> None:

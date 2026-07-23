@@ -14,6 +14,7 @@ from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from aiter.tuned_gemm import tgemm
 
@@ -103,14 +104,47 @@ def masked_embedding(
     return _masked_embedding_launcher(x, weight, vocab_start_idx, vocab_end_idx)
 
 
+def _replicated_embedding_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.empty(
+        x.numel(),
+        weight.shape[1],
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_replicated_embedding_fake)
+def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # Keep the lookup opaque to torch.compile: inductor otherwise fuses the
+    # embedding gather into the surrounding graph, which corrupts the MTP draft
+    # rollout (acceptance collapses ~69%->45%) — the same reason
+    # VocabParallelEmbedding routes through the masked_embedding custom op.
+    #
+    # Route through the masked kernel with the full-table range [0, num_rows) so
+    # out-of-range ids never reach a raw gather. Under async scheduling + MTP
+    # spec-decode, input_ids can transiently carry the optimistic placeholder
+    # token -1 (an unresolved "assumed-accepted" draft/bonus slot, produced in
+    # gpu_model_runner and read back via prepare_next_token_ids_padded's backup
+    # before the deferred correction lands) — for BOTH the target and the shared
+    # draft embedding. A raw F.embedding(-1) reads the row before the table ->
+    # random illegal memory access. The masked load returns a zero vector for any
+    # out-of-range id: bit-identical to F.embedding for every valid token, and
+    # matching vLLM's VocabParallelEmbedding (which masks the same -1 to 0) so the
+    # unverified -1 slots — whose output is discarded/corrected by async
+    # spec-decode — see the same value native does. No accuracy change.
+    return _masked_embedding_launcher(x, weight, 0, weight.shape[0])
+
+
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
+        prefix: str = "",
     ):
         super().__init__()
+        self.prefix = prefix
         self.tp_rank = get_tp_group().rank_in_group
         self.tp_size = get_tp_group().world_size
         assert num_embeddings % self.tp_size == 0
@@ -131,6 +165,7 @@ class VocabParallelEmbedding(nn.Module):
         assert param_data.size() == loaded_weight.size()
         param_data.copy_(loaded_weight)
 
+    @mark_trace
     def forward(self, x: torch.Tensor):
         # Torch compile will make logical_and, mask, embedding in a fused triton kernel, but make accuracy issue in MTP.
         if self.tp_size > 1:
@@ -184,7 +219,7 @@ class ReplicatedEmbedding(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
-        return F.embedding(x, self.weight)
+        return replicated_embedding(x, self.weight)
 
 
 class ParallelLMHead(VocabParallelEmbedding):

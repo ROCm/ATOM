@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+# The CI checkout is mounted into the container. Avoid leaving root-owned
+# __pycache__ files in that host workspace between matrix jobs.
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+
 # Usage:
 #   .github/scripts/atom_sglang_test.sh start
 #   .github/scripts/atom_sglang_test.sh launch
@@ -28,6 +32,7 @@ set -euo pipefail
 #   LM_EVAL_NUM_FEWSHOT
 #   LM_EVAL_NUM_CONCURRENT
 #   LM_EVAL_EXTRA_MODEL_ARGS
+#   LM_EVAL_USE_CHAT_COMPLETIONS
 
 TYPE=${1:-launch}
 if [[ "${TYPE}" != "start" && "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
@@ -38,7 +43,8 @@ fi
 MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
 SGLANG_PORT=${SGLANG_PORT:-8000}
-SGLANG_HOST=${SGLANG_HOST:-localhost}
+# Prefer IPv4 loopback: Docker often sets disable_ipv6=1 while localhost still resolves to ::1.
+SGLANG_HOST=${SGLANG_HOST:-127.0.0.1}
 SGLANG_PID_FILE=${SGLANG_PID_FILE:-/tmp/atom_sglang.pid}
 SGLANG_LOG_FILE=${SGLANG_LOG_FILE:-/tmp/atom_sglang.log}
 RESULT_DIR=${RESULT_DIR:-/tmp/atom_sglang_accuracy_results}
@@ -49,6 +55,7 @@ LM_EVAL_TASK=${LM_EVAL_TASK:-gsm8k}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LM_EVAL_NUM_CONCURRENT=${LM_EVAL_NUM_CONCURRENT:-65}
 LM_EVAL_EXTRA_MODEL_ARGS=${LM_EVAL_EXTRA_MODEL_ARGS:-}
+LM_EVAL_USE_CHAT_COMPLETIONS=${LM_EVAL_USE_CHAT_COMPLETIONS:-0}
 
 MODEL_NAME=${SGLANG_MODEL_NAME:-}
 MODEL_PATH=${SGLANG_MODEL_PATH:-}
@@ -64,15 +71,24 @@ if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
 fi
 
 prepare_runtime_paths() {
-  if [[ -d /app/sglang/python && -d /app/ATOM ]]; then
-    local path_prefix="/app/sglang/python:/app/ATOM"
-    if [[ -d /app/aiter-test ]]; then
-      path_prefix="/app/aiter-test:${path_prefix}"
-    fi
-    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
-    cd /app
-  elif [[ -d /workspace ]]; then
+  local path_prefix=""
+  if [[ -d /app/aiter-test ]]; then
+    path_prefix="/app/aiter-test"
+  fi
+  if [[ -d /app/sglang/python ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/sglang/python"
+  fi
+  if [[ -d /workspace ]]; then
+    # The CI checkout is mounted at /workspace; prefer it over the ATOM copy
+    # baked into the base image so validation covers the current branch.
+    path_prefix="${path_prefix:+${path_prefix}:}/workspace"
     cd /workspace
+  elif [[ -d /app/ATOM ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/ATOM"
+    cd /app
+  fi
+  if [[ -n "${path_prefix}" ]]; then
+    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
   fi
 }
 
@@ -105,17 +121,10 @@ emit_new_sglang_logs() {
 }
 
 wait_server_ready() {
+  local expected_model_path="${1:-}"
   echo ""
   echo "========== Waiting for SGLang server (${MODEL_NAME}) =========="
   for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
-    if curl -fsS "http://127.0.0.1:${SGLANG_PORT}/v1/models" >/dev/null 2>&1; then
-      emit_new_sglang_logs
-      echo "SGLang server is ready for ${MODEL_NAME}."
-      return 0
-    fi
-
-    emit_new_sglang_logs
-
     if [[ -f "${SGLANG_PID_FILE}" ]]; then
       local pid
       pid=$(cat "${SGLANG_PID_FILE}")
@@ -127,6 +136,45 @@ wait_server_ready() {
       fi
     fi
 
+    local models_response
+    models_response=$(curl -fsS "http://127.0.0.1:${SGLANG_PORT}/v1/models" 2>/dev/null || true)
+    if [[ -n "${models_response}" ]]; then
+      if [[ -z "${expected_model_path}" ]] || \
+        MODELS_RESPONSE="${models_response}" EXPECTED_MODEL_PATH="${expected_model_path}" python3 - <<'PY'
+import json
+import os
+import sys
+
+
+def normalize_model_id(model_id: str) -> str:
+    model_id = model_id.rstrip("/")
+    if model_id.startswith("/models/"):
+        return model_id[len("/models/") :]
+    return model_id
+
+
+expected_model = normalize_model_id(os.environ["EXPECTED_MODEL_PATH"])
+try:
+    payload = json.loads(os.environ["MODELS_RESPONSE"])
+except Exception:
+    sys.exit(1)
+
+served_models = {
+    normalize_model_id(item.get("id", ""))
+    for item in payload.get("data", [])
+    if isinstance(item, dict) and isinstance(item.get("id"), str)
+}
+
+sys.exit(0 if expected_model in served_models else 1)
+PY
+      then
+        emit_new_sglang_logs
+        echo "SGLang server is ready for ${MODEL_NAME}."
+        return 0
+      fi
+    fi
+
+    emit_new_sglang_logs
     echo "Waiting for SGLang server... (${i}/${MAX_WAIT_RETRIES})"
     sleep "${WAIT_INTERVAL_SEC}"
   done
@@ -215,7 +263,7 @@ PY
   echo "Server PID: $(cat "${SGLANG_PID_FILE}")"
 
   if [[ "${wait_for_ready}" == "1" ]]; then
-    wait_server_ready
+    wait_server_ready "${resolved_model_path}"
   fi
 }
 
@@ -242,16 +290,28 @@ run_accuracy() {
   echo "========== Running SGLang accuracy =========="
   echo "Model name: ${MODEL_NAME}"
 
+  local lm_eval_model="local-completions"
+  local lm_eval_endpoint_path="/v1/completions"
+  local -a lm_eval_extra_args=()
   local lm_eval_model_args
-  lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}/v1/completions,num_concurrent=${LM_EVAL_NUM_CONCURRENT},max_retries=1,tokenized_requests=False,trust_remote_code=True"
+
+  if [[ "${LM_EVAL_USE_CHAT_COMPLETIONS}" == "1" || "${LM_EVAL_USE_CHAT_COMPLETIONS}" == "true" ]]; then
+    lm_eval_model="local-chat-completions"
+    lm_eval_endpoint_path="/v1/chat/completions"
+    lm_eval_extra_args+=(--batch_size 65 --apply_chat_template --fewshot_as_multiturn)
+    lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT}"
+  else
+    lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT},max_retries=1,tokenized_requests=False,trust_remote_code=True"
+  fi
   if [[ -n "${LM_EVAL_EXTRA_MODEL_ARGS}" ]]; then
     lm_eval_model_args="${lm_eval_model_args},${LM_EVAL_EXTRA_MODEL_ARGS#,}"
   fi
 
-  lm_eval --model local-completions \
+  lm_eval --model "${lm_eval_model}" \
     --model_args "${lm_eval_model_args}" \
     --tasks "${LM_EVAL_TASK}" \
     --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+    "${lm_eval_extra_args[@]}" \
     --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
   # Capture lm_eval exit code explicitly; tee always exits 0 so PIPESTATUS is needed.
   lm_eval_exit="${PIPESTATUS[0]}"

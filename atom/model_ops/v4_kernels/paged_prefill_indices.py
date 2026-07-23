@@ -47,6 +47,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 
 @triton.jit
 def _v4_paged_prefill_indices_kernel(
@@ -172,6 +174,7 @@ def _v4_paged_prefill_indices_kernel(
         )
 
 
+@mark_trace
 def write_v4_paged_prefill_indices(
     *,
     positions: torch.Tensor,
@@ -195,6 +198,7 @@ def write_v4_paged_prefill_indices(
     block_size: int,
     swa_pages: int,
     hca_ratio: int = 128,
+    prefix: str = "",
 ) -> None:
     """One-shot GPU build of the V4 paged-prefill index buffers.
 

@@ -254,9 +254,45 @@ scancel_slurm_job() {
     else
       scancel "${JOB_ID}" || true
     fi
+    wait_for_slurm_cancel "${JOB_ID}" "TERM" || true
   else
     echo "WARNING: scancel not found; unable to cancel Slurm job ${JOB_ID}" >&2
   fi
+}
+
+slurm_job_in_queue() {
+  local job_id="$1"
+  local squeue_cmd=(squeue)
+
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    squeue_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+
+  [[ -n "$("${squeue_cmd[@]}" -h -j "${job_id}" 2>/dev/null)" ]]
+}
+
+wait_for_slurm_cancel() {
+  local job_id="$1"
+  local initial_signal="$2"
+  local deadline=$(( $(date +%s) + ${SLURM_CANCEL_WAIT_SECONDS:-60} ))
+  local kill_deadline
+
+  while slurm_job_in_queue "${job_id}"; do
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      echo "=== Slurm job ${job_id} still queued after ${initial_signal}; sending KILL ===" >&2
+      if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+        scancel --controller "${SPUR_CONTROLLER_ADDR}" --signal=KILL "${job_id}" || true
+      else
+        scancel --signal=KILL "${job_id}" || true
+      fi
+      kill_deadline=$(( $(date +%s) + ${SLURM_CANCEL_KILL_WAIT_SECONDS:-30} ))
+      while slurm_job_in_queue "${job_id}" && [[ "$(date +%s)" -lt "${kill_deadline}" ]]; do
+        sleep 5
+      done
+      break
+    fi
+    sleep 5
+  done
 }
 
 parse_sbatch_job_id() {
@@ -313,16 +349,42 @@ write_slurm_cancel_helper() {
     cat > "${helper}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+job_id="${job_id}"
+job_in_queue() {
+  command -v squeue >/dev/null 2>&1 || return 1
+  [[ -n "\$(squeue --controller "${SPUR_CONTROLLER_ADDR}" -h -j "\${job_id}" 2>/dev/null)" ]]
+}
 if command -v scancel >/dev/null 2>&1; then
-  scancel --controller "${SPUR_CONTROLLER_ADDR}" "${job_id}" || true
+  scancel --controller "${SPUR_CONTROLLER_ADDR}" "\${job_id}" || true
+  deadline=\$(( \$(date +%s) + \${SLURM_CANCEL_WAIT_SECONDS:-60} ))
+  while job_in_queue; do
+    if [[ "\$(date +%s)" -ge "\${deadline}" ]]; then
+      scancel --controller "${SPUR_CONTROLLER_ADDR}" --signal=KILL "\${job_id}" || true
+      break
+    fi
+    sleep 5
+  done
 fi
 EOF
   else
     cat > "${helper}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+job_id="${job_id}"
+job_in_queue() {
+  command -v squeue >/dev/null 2>&1 || return 1
+  [[ -n "\$(squeue -h -j "\${job_id}" 2>/dev/null)" ]]
+}
 if command -v scancel >/dev/null 2>&1; then
-  scancel "${job_id}" || true
+  scancel "\${job_id}" || true
+  deadline=\$(( \$(date +%s) + \${SLURM_CANCEL_WAIT_SECONDS:-60} ))
+  while job_in_queue; do
+    if [[ "\$(date +%s)" -ge "\${deadline}" ]]; then
+      scancel --signal=KILL "\${job_id}" || true
+      break
+    fi
+    sleep 5
+  done
 fi
 EOF
   fi

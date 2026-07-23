@@ -36,6 +36,7 @@ def _hash_topk_kernel(
     stride_oid_row,
     stride_ow_row,
     vocab,
+    n_routed,
     topk,
     scaling,
     RENORM: tl.constexpr,
@@ -51,6 +52,11 @@ def _hash_topk_kernel(
 
     # tid2eid[tok, :topk] -> selected expert ids.
     eid = tl.load(tid2eid_ptr + tok * stride_tid_row + offs_k, mask=mask, other=0)
+    # Clamp the expert id into the valid routed-expert range. A garbage tid2eid
+    # table (e.g. under --load_dummy, or a corrupt checkpoint) would otherwise
+    # produce out-of-range expert ids: both the gating gather below and the
+    # downstream MoE expert-weight gather would read OOB and fault the GPU.
+    eid = tl.minimum(tl.maximum(eid, 0), n_routed - 1)
     eid64 = eid.to(tl.int64)
 
     # Gather gating logits at the selected experts, compute sqrt(softplus(.)).
@@ -90,6 +96,7 @@ def hash_topk_triton(
     if num_tokens == 0:
         return
     vocab, topk = tid2eid.shape
+    n_routed = gating_output.shape[1]
     grid = (num_tokens,)
     _hash_topk_kernel[grid](
         ids,
@@ -103,6 +110,7 @@ def hash_topk_triton(
         out_ids.stride(0),
         out_weights.stride(0),
         vocab,
+        n_routed,
         topk,
         scaling,
         RENORM=renormalize,

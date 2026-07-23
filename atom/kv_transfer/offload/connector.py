@@ -372,8 +372,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
     # -- per-step (RPC thread, post-forward): poll completions ------------
     def get_finished(self) -> KVConnectorOutput:
         # Offload uses extended completion states:
-        # - finished_recving wakes successfully loaded requests.
-        # - failed_recving wakes them for recompute using already allocated blocks.
+        # - finished_loading wakes successfully loaded requests.
+        # - failed_loading wakes them for recompute using already allocated blocks.
         # - finished_saving releases blocks whose free was deferred during save.
         with self._lock:
             dl = set(self._done_load)
@@ -384,8 +384,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._failed_load.clear()
         return KVConnectorOutput(
             finished_sending=set(),
-            finished_recving=dl,
-            failed_recving=fl,
+            finished_loading=dl,
+            failed_loading=fl,
             finished_saving=ds,
         )
 

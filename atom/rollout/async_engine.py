@@ -133,7 +133,7 @@ class AsyncLLMEngine(LLMEngine):
             ids if isinstance(ids, list) else ids.tolist() for ids in input_ids_list
         ]
 
-        self.core_mgr._rr_counter = 0
+        self.core_mgr.reset_dp_router()
         self.add_request(prompts, sampling_params, request_ids=data_ids)
 
         outputs = {}
