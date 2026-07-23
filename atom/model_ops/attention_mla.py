@@ -1470,27 +1470,18 @@ class MLAAttention(nn.Module):
                     device=q_nope.device,
                 )
             if kv_cache.numel() > 0:
-                if self.dcp_world_size > 1:
-                    # DCP workaround: the fused kernel returns early (skipping
-                    # Q RoPE) when slot_mapping=-1, leaving q_out uninitialised
-                    # for non-local tokens. Split into separate ops so Q RoPE is
-                    # always computed for every token.
+                if self.dcp_world_size > 1 and context.is_prefill:
+                    # Sparse prefill-MLA + DCP: the fused *prefill* CK kernel
+                    # still early-returns on slot=-1 (Q RoPE skipped), so keep the
+                    # split workaround here. (Decode + DCP below uses the fixed
+                    # fused kernel, which now computes Q RoPE for every token and
+                    # writes KV only for owned slots.)
                     self.rotary_emb(positions, q_rope, k_rope)
                     q_out = torch.cat([q_nope, q_rope], dim=-1)
                     if q_out.dtype != attn_metadata.dtype_q:
-                        # fp8 KV cache: the decode / prefill-mla kernel expects an
-                        # fp8 query (dtype_q == kv dtype). The non-DCP fused
-                        # kernel quantizes q with _q_scale; replicate here since
-                        # the DCP split-op workaround bypasses it. quant = value /
-                        # scale matches the kernel's dequant (stored * scale);
-                        # The gathered fp8 q is all-gathered below (a copy-only
-                        # collective, safe for fp8 — unlike an fp8 all-reduce).
-                        # Use tensor arithmetic (NOT float()/.item()): _q_scale
-                        # may be a GPU tensor (fp8 models load a real scale onto
-                        # device), and a host sync here is illegal during
-                        # cudagraph capture ("operation not permitted when stream
-                        # is capturing"). A 0-dim scale tensor is broadcast on
-                        # device with no sync.
+                        # fp8: match the fused kernel's q quant (value / scale);
+                        # tensor arithmetic only (a host sync is illegal under
+                        # cudagraph capture).
                         q_out = (q_out / self._q_scale).to(attn_metadata.dtype_q)
                     concat_and_cache_mla(
                         k_nope,
@@ -1499,6 +1490,31 @@ class MLAAttention(nn.Module):
                         attn_metadata.slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=self._k_scale,
+                    )
+                elif self.dcp_world_size > 1:
+                    # Decode + DCP: the fixed CK fused kernel computes Q RoPE for
+                    # every token (needed by all ranks after the head all-gather)
+                    # and writes KV only where slot_mapping >= 0 (owned tokens).
+                    # q is quantized to fp8 internally via _q_scale when needed.
+                    fused_qk_rope_concat_and_cache_mla(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        q_out,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        is_nope_first=True,
                     )
                 elif envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
