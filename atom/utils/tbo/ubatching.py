@@ -342,9 +342,7 @@ def tbo_get_ubatch_tp_comm(ubatch_id: int):
     # exactly like the shared pynccl_comm.
     comms = []
     for _ in range(_NUM_UBATCHES):
-        comms.append(
-            PyNcclCommunicator(group=tp.cpu_group, device=tp.device)
-        )
+        comms.append(PyNcclCommunicator(group=tp.cpu_group, device=tp.device))
     _TBO_TP_UBATCH_COMMS = comms
     return _TBO_TP_UBATCH_COMMS[ubatch_id]
 
