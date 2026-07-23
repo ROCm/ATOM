@@ -41,6 +41,7 @@ allow = (
     "KV_CACHE_DTYPE",
     "BLOCK_SIZE",
     "MEM_FRACTION",
+    "ENABLE_PREFIX_CACHING",
     "MAX_MODEL_LEN",
     "MAX_NUM_SEQS",
     "MAX_NUM_BATCHED_TOKENS",

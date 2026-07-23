@@ -45,6 +45,7 @@ HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-false}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-}"
@@ -289,8 +290,11 @@ server_common=(
   --kv_cache_dtype "${KV_CACHE_DTYPE}"
   --block-size "${BLOCK_SIZE}"
   --gpu-memory-utilization "${MEM_FRACTION}"
-  --no-enable_prefix_caching
 )
+
+if [[ "${ENABLE_PREFIX_CACHING}" != "true" && "${ENABLE_PREFIX_CACHING}" != "1" ]]; then
+  server_common+=(--no-enable_prefix_caching)
+fi
 
 if [[ -n "${MAX_MODEL_LEN}" ]]; then
   server_common+=(--max-model-len "${MAX_MODEL_LEN}")

@@ -106,7 +106,6 @@ python3 -m atom.entrypoints.openai_server \
   --attn-prefill-chunk-size 131072 \
   --long-prefill-token-threshold 131072 \
   --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
-  --no-enable_prefix_caching \
   --kv-transfer-config '{"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}' \
   2>&1 | tee "${LOG_PATH}"
 ```
@@ -115,8 +114,8 @@ Notes:
 
 - The 131072-token prefill budget and chunk size are intended for the 1M-context
   Weka workload.
-- `--no-enable_prefix_caching` keeps reuse on the LMCache path rather than
-  ATOM's native HBM prefix cache.
+- Native HBM prefix caching remains enabled. LMCache acts as the lower CPU
+  offload tier when reusable blocks are evicted from HBM.
 - `LMCACHE_CHUNK_SIZE=256` is an integer multiple of `--block-size 16`.
 
 ## Step 2: Start the Decode Node
@@ -144,7 +143,6 @@ python3 -m atom.entrypoints.openai_server \
   --max-num-seqs 64 \
   --max-num-batched-tokens 262144 \
   --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
-  --no-enable_prefix_caching \
   --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
   2>&1 | tee "${LOG_PATH}"
 ```

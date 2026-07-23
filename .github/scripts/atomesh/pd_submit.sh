@@ -163,6 +163,9 @@ exports = {
     "KV_CACHE_DTYPE": server_args.get("kv_cache_dtype", "fp8"),
     "BLOCK_SIZE": server_args.get("block_size", 16),
     "MEM_FRACTION": server_args.get("gpu_memory_utilization", 0.85),
+    "ENABLE_PREFIX_CACHING": str(
+        server_args.get("enable_prefix_caching", False)
+    ).lower(),
     "MAX_MODEL_LEN": server_args.get("max_model_len", ""),
     "MAX_NUM_SEQS": server_args.get("max_num_seqs", 256),
     "DECODE_MAX_NUM_SEQS": server_args.get("decode_max_num_seqs", ""),

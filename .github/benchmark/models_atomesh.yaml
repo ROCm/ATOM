@@ -208,6 +208,7 @@ models:
               gpu_memory_utilization: 0.85
               max_model_len: 1048576
               max_num_seqs: 512
+              enable_prefix_caching: true
               decode_max_num_seqs: 64
               max_num_batched_tokens: 131072
               decode_max_num_batched_tokens: 262144
