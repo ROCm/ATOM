@@ -113,9 +113,9 @@ class ATOMKVByteCodec:
         self._fused_kv_staging = None
         if self._device.type == "cuda":
             try:
-                from atom.kv_transfer.offload import triton_kv_staging
+                from atom.kv_transfer.offload import triton_offload_gather
 
-                self._fused_kv_staging = triton_kv_staging
+                self._fused_kv_staging = triton_offload_gather
             except Exception:
                 logger.warning(
                     "ATOMKVByteCodec: Triton KV staging unavailable; "

@@ -14,17 +14,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_staging import (
+    _PipelineStage,
     _StagingBuffer,
     _ThreadTransferState,
     _env_flag,
     _env_int,
     _env_optional_int,
+    run_staged_pipeline,
 )
 
 
@@ -44,18 +46,6 @@ class _TransferChunk:
 class _TransferGroup:
     chunks: list[_TransferChunk]
     nbytes: int
-
-
-@dataclass(frozen=True)
-class _PipelineStage:
-    """One leg of the two-stage staging pipeline.
-
-    ``stream`` is the CUDA stream the work is issued on; ``run(group,
-    device_buf)`` does the work.
-    """
-
-    stream: Any
-    run: Callable[[_TransferGroup, torch.Tensor], None]
 
 
 class ATOMLMCacheGPUConnector:
@@ -358,37 +348,17 @@ class ATOMLMCacheGPUConnector:
         stage_a: _PipelineStage,
         stage_b: _PipelineStage,
     ) -> None:
-        """Drive an event-synced two-stage staging pipeline.
-
-        Each group flows ``stage_a`` -> ``stage_b`` on their respective streams,
-        handed off via the staging buffer's ready event; the free event gates a
-        later group's reuse of the same buffer. ``stage_b``'s stream produces
-        the observable result, so it is the one synchronized at the end.
-        """
+        """Chunk-major transfer via the shared two-stream staging pipeline."""
         self._assert_fused_chunk_major_available()
-        staging_buffer = state.staging_buffer
-        used_buffer = False
-        try:
-            for group in groups:
-                device_buf = self._ensure_staging_buffer(staging_buffer, group.nbytes)
-                used_buffer = True
-                if staging_buffer.free_event_valid:
-                    stage_a.stream.wait_event(staging_buffer.free_event)
-                with state.stream_ctx(stage_a.stream):
-                    stage_a.run(group, device_buf)
-                staging_buffer.ready_event.record(stage_a.stream)
-                stage_b.stream.wait_event(staging_buffer.ready_event)
-                with state.stream_ctx(stage_b.stream):
-                    stage_b.run(group, device_buf)
-                staging_buffer.free_event.record(stage_b.stream)
-                staging_buffer.free_event_valid = True
-            stage_b.stream.synchronize()
-        except Exception:
-            staging_buffer.free_event_valid = False
-            raise
-        finally:
-            if used_buffer:
-                self._release_staging_buffer_if_requested(staging_buffer)
+        run_staged_pipeline(
+            state,
+            groups,
+            stage_a=stage_a,
+            stage_b=stage_b,
+            ensure_buffer=self._ensure_staging_buffer,
+            group_nbytes=lambda group: group.nbytes,
+            release_buffer=self._release_staging_buffer_if_requested,
+        )
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:
         self.batched_from_gpu([memory_obj], [start], [end], **kwargs)

@@ -26,9 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -36,8 +34,11 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput, ReqId
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._offload_common import (
+    OffloadWorkerMixin,
+    build_offload_engine,
+)
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
     ATOMLMCacheGPUConnector,
@@ -56,41 +57,18 @@ logger = logging.getLogger("atom")
 # =====================================================================
 # Worker side
 # =====================================================================
-class LMCacheOffloadConnector(KVConnectorBase):
+class LMCacheOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # Offload is a *consumer* from the scheduler's POV (it loads KV back). Saves
     # are fire-and-forget on the worker and must NOT be reported as
     # finished_sending (the scheduler frees blocks on finished_sending — a P/D
     # producer semantic that would wrongly deallocate live offload blocks).
-    is_producer = False
+    # Executor plumbing + get_finished come from OffloadWorkerMixin.
 
     def __init__(self, config) -> None:
         self._config = config
-        kvc = getattr(config, "kv_transfer_config", {}) or {}
-        self.kv_role = kvc.get("kv_role", "offload")
-        self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
-        self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
+        self._init_worker_common(config)  # kv_role, executors, lock, tallies
         self.block_size = int(config.kv_cache_block_size)
         self.chunk_size: int | None = None
-
-        # Copy daemons: keep GPU<->host copies off the RPC thread. SEPARATE
-        # executors for LOAD vs SAVE so a load (on the TTFT critical path — a
-        # parked seq is waiting for it) never queues behind a backlog of fire-
-        # and-forget saves (Phase 4 root cause: with one shared serial daemon, a
-        # reload sat behind ~N filler saves -> request hung well past timeout).
-        # The ATOM LMCache GPU connector owns per-thread staging streams.
-        # OFFLOAD_COPY_WORKERS tunes the SAVE pool only.
-        n_save_workers = int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
-        self._load_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="lmc-offload-load"
-        )
-        self._save_executor = ThreadPoolExecutor(
-            max_workers=n_save_workers, thread_name_prefix="lmc-offload-save"
-        )
-        self._lock = threading.Lock()
-        self._done_load: set[ReqId] = set()
-        self._done_save: set[ReqId] = set()
-        self._failed_load: set[ReqId] = set()
-
         self._engine = None
         self._codec: ATOMKVByteCodec | None = None
         self._lookup_server = None
@@ -100,47 +78,29 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:
         from aiter.dist.parallel_state import get_tp_group
-        from lmcache.v1.cache_engine import LMCacheEngineBuilder
-        from lmcache.v1.memory_management import MemoryFormat
 
         tp = get_tp_group()
         rank, world = tp.rank_in_group, tp.world_size
         self._rank = rank
 
-        cfg = offcfg.build_lmcache_config()
-        offcfg.apply_extra_overrides(
-            cfg, getattr(self._config, "kv_transfer_config", None)
-        )
-        self.chunk_size = int(cfg.chunk_size)
         # num_blocks is the physical block count (num_physical_kvcache_blocks),
         # threaded from the model runner. MLA stores its KV token-major, so the
         # codec can't infer the block count from tensor.shape[0]; pass it.
         self._codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
-        base_meta = offcfg.build_lmcache_metadata(self._config, cfg, world, rank)
-        meta = ATOMRawBytesLMCacheMetadata(
-            base_meta,
-            atom_block_size=self.block_size,
+        # Shared opaque-uint8 engine build; the chunked GPU connector needs
+        # cfg.chunk_size, so it's built inside the factory once cfg exists.
+        self._engine, cfg, meta = build_offload_engine(
+            self._config,
+            engine_id=f"atom-offload-{rank}",
+            block_size=self.block_size,
             bytes_per_block=self._codec.bytes_per_block,
+            gpu_connector_factory=lambda cfg, meta: ATOMLMCacheGPUConnector(
+                self._codec, self.block_size, chunk_size=int(cfg.chunk_size)
+            ),
+            world=world,
+            rank=rank,
         )
-        gpu_connector = ATOMLMCacheGPUConnector(
-            self._codec,
-            self.block_size,
-            chunk_size=self.chunk_size,
-        )
-
-        self._engine = LMCacheEngineBuilder.get_or_create(
-            f"atom-offload-{rank}",
-            cfg,
-            meta,
-            gpu_connector,
-            lambda t, s: None,
-            lambda o, s: o,
-        )
-        # LMCache's LocalCPU allocator does not accept BINARY for normal
-        # MemoryObj allocation. The metadata shape/dtype already make this an
-        # opaque uint8 object, so keep a supported tensor MemoryFormat.
-        self._engine.fmt = MemoryFormat.KV_2LTD
-        self._engine.post_init()
+        self.chunk_size = int(cfg.chunk_size)
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
@@ -152,6 +112,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         except Exception as e:  # lookup server optional for save-only smoke
             logger.warning("LMCache offload: lookup server not started: %s", e)
 
+        gpu_connector = self._engine.gpu_connector
         logger.info(
             "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
             "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
@@ -178,22 +139,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
             if req.save_spec is not None and self._do_save:
                 self._save_executor.submit(self._guard, "save", self._do_save_req, req)
 
-    def _guard(self, kind: str, fn, req) -> None:
-        try:
-            fn(req)
-        except Exception:
-            logger.exception(
-                "LMCache offload: %s failed for %s", fn.__name__, req.req_id
-            )
-            if kind == "load":
-                self._lookup_unpin(req.req_id)
-            with self._lock:
-                if kind == "load":
-                    self._failed_load.add(req.req_id)
-                else:
-                    # A failed save should not keep blocks pinned forever. The
-                    # request simply loses this offload opportunity.
-                    self._done_save.add(req.req_id)
+    def _on_load_fail(self, req_id) -> None:
+        # Release the LMCache lookup pin held by this load (mixin _guard hook).
+        self._lookup_unpin(req_id)
 
     def _lookup_unpin(self, req_id) -> None:
         if getattr(self, "_engine", None) is None:
@@ -369,30 +317,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 total_ms,
             )
 
-    # -- per-step (RPC thread, post-forward): poll completions ------------
-    def get_finished(self) -> KVConnectorOutput:
-        # Offload uses extended completion states:
-        # - finished_recving wakes successfully loaded requests.
-        # - failed_recving wakes them for recompute using already allocated blocks.
-        # - finished_saving releases blocks whose free was deferred during save.
-        with self._lock:
-            dl = set(self._done_load)
-            fl = set(self._failed_load)
-            ds = set(self._done_save)
-            self._done_save.clear()
-            self._done_load.clear()
-            self._failed_load.clear()
-        return KVConnectorOutput(
-            finished_sending=set(),
-            finished_recving=dl,
-            failed_recving=fl,
-            finished_saving=ds,
-        )
-
-    def get_finished_recv_blocks(self) -> list[int]:
-        # Local CUDA copies are ordered by the copy stream + synchronize() before
-        # we mark done; no RDMA-style GPU fence needed.
-        return []
+    # get_finished / get_finished_recv_blocks inherited from OffloadWorkerMixin
+    # (finished_recving wakes loaded reqs, failed_recving -> recompute,
+    # finished_saving releases deferred frees).
 
 
 # =====================================================================

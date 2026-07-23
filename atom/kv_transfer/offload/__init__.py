@@ -18,3 +18,14 @@ KVConnectorFactory.register(
     scheduler_module="atom.kv_transfer.offload.connector",
     scheduler_class="LMCacheOffloadConnectorScheduler",
 )
+
+# DSV4 terminal-checkpoint offload (one opaque offload unit per 128-aligned
+# boundary). Enable via
+# --kv-transfer-config '{"kv_connector":"dsv4_offload","kv_role":"offload"}'
+KVConnectorFactory.register(
+    "dsv4_offload",
+    worker_module="atom.kv_transfer.offload.dsv4.connector",
+    worker_class="DSV4OffloadConnector",
+    scheduler_module="atom.kv_transfer.offload.dsv4.connector",
+    scheduler_class="DSV4OffloadConnectorScheduler",
+)

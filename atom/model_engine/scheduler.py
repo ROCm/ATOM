@@ -886,7 +886,15 @@ class Scheduler:
                 # the trailing-window SWA blocks now — matching the producer's
                 # post-free swa_block_table positions — so the RDMA transfer has
                 # real dst slots to write the sliding-window KV into.
-                self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
+                #
+                # DSV4 offload resumes at a checkpoint boundary B < prompt_len
+                # (offload_loaded_tokens), so materialize the trailing window at
+                # B, not the full prompt. Non-SWA offload: no-op either way. PD
+                # (no offload_loaded_tokens): falls back to prompt length.
+                _mat_len = int(
+                    getattr(seq, "offload_loaded_tokens", 0) or seq.num_prompt_tokens
+                )
+                self.block_manager.swa.materialize_window(seq, _mat_len)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
