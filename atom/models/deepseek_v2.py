@@ -94,6 +94,7 @@ from atom.utils.custom_register import direct_register_custom_op
 # `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.distributed.pcp_utils import (
+    pcp_all_reduce,
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_is_enabled,
@@ -1205,6 +1206,40 @@ class DeepseekV2MoE(nn.Module):
         )
         return final_hidden_states
 
+    def _pcp_moe_merge_active(self) -> bool:
+        if not bool(envs.ATOM_PCP_MOE_MERGE) or get_pcp_world_size() <= 1:
+            return False
+        ctx = get_forward_context()
+        context = getattr(ctx, "context", None)
+        if context is None or bool(getattr(context, "is_dummy_run", False)):
+            return False
+        return True
+
+    def _pcp_moe_merge_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shared_output = None
+        if (
+            self.n_shared_experts is not None
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
+        ):
+            # Shared-expert weights are still sharded only by ATOM TP, not by the
+            # folded PCP*TP routed-expert sharding. Keep shared experts on local
+            # query rows; only routed experts use PCP merge collectives.
+            shared_output = self.shared_experts(hidden_states)
+
+        # Match native ATOM PCP MoE semantics: routed MoE runs on this rank's
+        # local token rows.  ATOM_PCP_MOE_MERGE folds the PCP dimension into the
+        # routed-expert weight partitioning, so the missing PCP partial is a
+        # hidden-dimension partial sum, not missing token rows.  Therefore use a
+        # PCP all-reduce over the local output and avoid per-layer full-token
+        # all-gather/reduce-scatter.
+        routed_output = self.routed_expert_forward(hidden_states)
+        routed_output = pcp_all_reduce(routed_output, get_pcp_world_size())
+
+        final_hidden_states = self.combine_outputs(
+            routed_output, shared_output, hidden_states
+        )
+        return final_hidden_states
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert (
             hidden_states.dim() == 2
@@ -1212,6 +1247,9 @@ class DeepseekV2MoE(nn.Module):
         assert (
             hidden_states.shape[1] == self.experts.hidden_size
         ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
+
+        if self._pcp_moe_merge_active():
+            return self._pcp_moe_merge_forward(hidden_states)
 
         if self._use_dual_stream:
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
