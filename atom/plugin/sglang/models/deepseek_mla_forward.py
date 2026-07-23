@@ -25,6 +25,7 @@ from atom.models.deepseek_v2 import (
     _mxfp4_activation_quant_layout,
 )
 from atom.models.utils import maybe_prefix
+from atom.plugin.sglang.kv_pool import get_sglang_token_to_kv_pool
 
 try:
     from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -494,7 +495,11 @@ def _set_mla_kv_buffer_for_non_absorbed(
 ) -> None:
     attn_non_absorbed = _get_sglang_radix_attn(attn.attn_non_absorbed)
     cache_k = torch.cat([kv_a.unsqueeze(1), k_pe], dim=-1)
-    forward_batch.token_to_kv_pool.set_kv_buffer(
+    token_to_kv_pool = get_sglang_token_to_kv_pool(
+        forward_batch,
+        caller="SGLang DeepSeek MLA non-absorbed cache path",
+    )
+    token_to_kv_pool.set_kv_buffer(
         attn_non_absorbed,
         forward_batch.out_cache_loc,
         cache_k,
