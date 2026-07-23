@@ -138,9 +138,50 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         )
 
 
+def _filter_shards_by_layer_count(
+    hf_weights_files: list[str],
+    index_path: str,
+    num_hidden_layers: int,
+) -> list[str]:
+    """Keep only shard files that contain at least one needed weight.
+
+    Uses the safetensors index (weight_map) to determine which shards
+    contain weights for layers < num_hidden_layers or non-layer weights
+    (embeddings, norms, lm_head, etc.).  Shards that only carry weights
+    for layers >= num_hidden_layers are dropped, avoiding expensive I/O.
+    This matters when num_hidden_layers has been reduced (e.g. via
+    --hf-overrides for the fake-EP/fake-TP harness): without it the loader
+    opens all 64 shards even though only the first few hold the kept layers.
+    """
+    if not os.path.isfile(index_path):
+        return hf_weights_files
+
+    with open(index_path) as f:
+        weight_map = json.load(f).get("weight_map", {})
+
+    needed_shards: set[str] = set()
+    for tensor_name, shard_name in weight_map.items():
+        # This DSv4 checkpoint names layers "layers.N." (no "model." prefix);
+        # also tolerate an optional "model." prefix for HF-style checkpoints.
+        m = re.search(r"(?:^|\.)layers\.(\d+)\.", tensor_name)
+        if m is None or int(m.group(1)) < num_hidden_layers:
+            needed_shards.add(shard_name)
+
+    filtered = [f for f in hf_weights_files if os.path.basename(f) in needed_shards]
+    if len(filtered) < len(hf_weights_files):
+        logger.info(
+            "Layer-count shard filter: keeping %d / %d shards (num_hidden_layers=%d)",
+            len(filtered),
+            len(hf_weights_files),
+            num_hidden_layers,
+        )
+    return filtered
+
+
 def safetensors_weights_iterator(
     model_name_or_path: str,
     disable_mmap: bool = False,
+    num_hidden_layers: int | None = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     logger.info(f"disable_mmap: {disable_mmap}")
@@ -154,6 +195,12 @@ def safetensors_weights_iterator(
     hf_weights_files = filter_duplicate_safetensors_files(
         glob(os.path.join(path, "*.safetensors")), path, SAFE_WEIGHTS_INDEX_NAME
     )
+    if num_hidden_layers is not None:
+        hf_weights_files = _filter_shards_by_layer_count(
+            hf_weights_files,
+            os.path.join(path, SAFE_WEIGHTS_INDEX_NAME),
+            num_hidden_layers,
+        )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -419,7 +466,9 @@ def load_model(
     try:
         disable_mmap = envs.ATOM_DISABLE_MMAP
         for name, weight_tensor in safetensors_weights_iterator(
-            model_name_or_path, disable_mmap=disable_mmap
+            model_name_or_path,
+            disable_mmap=disable_mmap,
+            num_hidden_layers=getattr(hf_config, "num_hidden_layers", None),
         ):
             _orig_ckpt_name = name  # preserve for ckpt-side coverage report
             if weights_mapper is not None:

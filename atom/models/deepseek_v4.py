@@ -47,6 +47,10 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
 from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
+from aiter.ops.flydsl.batched_gemm_mxfp4 import (
+    flydsl_batched_gemm_a8w4_v2,
+    quant_act_mxfp8_mbn,
+)
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.jit.utils.chip_info import get_gfx
 from atom.config import (
@@ -1695,6 +1699,16 @@ class DeepseekV4Attention(nn.Module):
         # Cached at construction (non-compiled) so `_attn_post` — now traced into
         # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
         self._is_gfx1250 = get_gfx() == "gfx1250"
+        # Route wo_a (grouped output LoRA) through the flydsl strided-batched
+        # a8w4 kernel instead of the BF16 batched GEMM / einsum. gfx1250-only;
+        # gated by ATOM_WO_A_USE_FLYDSL (default "never"). The a8w4 weight +
+        # scale buffers are prepared once in process_weights_after_loading.
+        self._use_flydsl_wo_a = self._is_gfx1250 and envs.ATOM_WO_A_USE_FLYDSL in (
+            "auto",
+            "always",
+        )
+        self.wo_a_fp4 = None  # [B, N//16, (K//2)*16] uint8 MXFP4 codes (shuffled)
+        self.wo_a_wscale = None  # [B, N//32, (K//32)*32] uint8 e8m0 n32k4
 
         # ----- Compressor (and Indexer for CSA) -----
         if self.compress_ratio:
@@ -1792,6 +1806,9 @@ class DeepseekV4Attention(nn.Module):
         """
         w = self.wo_a.weight
         if w.dtype == torch.bfloat16:
+            # Already BF16 on disk (e.g. V4-Flash-FP8) — still build the a8w4
+            # buffers from it when the flydsl wo_a path is enabled.
+            self._maybe_build_wo_a_a8w4(w.data)
             return  # already dequanted
         scale = getattr(self.wo_a, "weight_scale", None)
         if w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) or scale is None:
@@ -1827,6 +1844,28 @@ class DeepseekV4Attention(nn.Module):
         # batched-FP8 kernel. See attention_mla.py:211 for reference.
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
+        # Build the flydsl a8w4 (MXFP4 codes + n32k4 e8m0 scale) buffers from the
+        # freshly-dequanted BF16 weight when the flydsl wo_a path is enabled.
+        self._maybe_build_wo_a_a8w4(bf16)
+
+    def _maybe_build_wo_a_a8w4(self, wo_a_bf16: torch.Tensor) -> None:
+        """Quantize + preshuffle wo_a to the flydsl a8w4 kernel layout (once).
+
+        ``wo_a_bf16`` is the [n_groups*o_lora_rank, in_per_group] BF16 weight.
+        Reshaped to [B=n_local_groups, N=o_lora_rank, K=in_per_group] and turned
+        into (MXFP4 codes, e8m0 n32k4 scale) stored on ``self.wo_a_fp4`` /
+        ``self.wo_a_wscale``. No-op unless ``self._use_flydsl_wo_a``.
+        """
+        if not self._use_flydsl_wo_a:
+            return
+        from aiter.ops.flydsl.batched_gemm_mxfp4 import preshuffle_a8w4_weight_mbn
+
+        w = wo_a_bf16.view(self.n_local_groups, self.o_lora_rank, -1).contiguous()
+        w_codes, w_scales = preshuffle_a8w4_weight_mbn(w.to(torch.bfloat16))
+        # Register as non-persistent buffers so .to(device)/dtype moves track them
+        # but they are not re-saved to a checkpoint.
+        self.wo_a_fp4 = w_codes
+        self.wo_a_wscale = w_scales
 
     def maybe_compressors_async(
         self, x, plan, state_slot_mapping, block_tables
@@ -1955,20 +1994,37 @@ class DeepseekV4Attention(nn.Module):
     def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
         """Grouped output LoRA + wo_b (graphable, num_tokens-shaped)."""
         num_tokens = o.shape[0]
-        o = o.view(num_tokens, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if num_tokens <= 32 or self._is_gfx1250:
-            y = torch.empty(
-                num_tokens,
-                self.n_local_groups,
-                self.o_lora_rank,
+        o = o.view(num_tokens, self.n_local_groups, -1)  # [M, B(groups), K]
+        if self._use_flydsl_wo_a and self.wo_a_fp4 is not None:
+            # a8w4 path: quantize the attention output to MXFP8 (ADDED pre-quant)
+            # then run the flydsl strided-batched a8w4 GEMM against the
+            # preshuffled MXFP4 wo_a. Output stays BF16 -> wo_b's own input quant
+            # (per-128 blockscale FP8) after this is unchanged.
+            a_fp8, a_scales = quant_act_mxfp8_mbn(o)  # [M,B,K], [M//32,B,(K//32)*32]
+            y = flydsl_batched_gemm_a8w4_v2(
+                a_fp8,
+                self.wo_a_fp4,
+                a_scales,
+                self.wo_a_wscale,
+                N=self.o_lora_rank,
                 dtype=o.dtype,
-                device=o.device,
-            ).transpose(0, 1)
-            y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
-            o = y.transpose(0, 1)
+                layout="mbn",
+            )  # [B, M, N] view of a [M, B, N] physical buffer
+            o = y.transpose(0, 1)  # -> [M, B, N]
         else:
-            o = torch.einsum("sgd,grd->sgr", o, wo_a)
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            if num_tokens <= 32 or self._is_gfx1250:
+                y = torch.empty(
+                    num_tokens,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    dtype=o.dtype,
+                    device=o.device,
+                ).transpose(0, 1)
+                y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
+                o = y.transpose(0, 1)
+            else:
+                o = torch.einsum("sgd,grd->sgr", o, wo_a)
         return self.wo_b(o.flatten(1))
 
     def forward_impl(

@@ -55,6 +55,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
+    # --- Fake Expert Parallelism (single-GPU EP simulation) ---
+    # Pretend EP=N while running a single real GPU (real tp=dp=world=1).  When
+    # >0, FusedMoEParallelConfig.make forces (use_ep=True, ep_size=N, ep_rank=
+    # ATOM_FAKE_EP_RANK, dp_size=1).  Effect: only this rank's N-th slice of
+    # experts (E//N) is allocated + loaded, expert_map/expert_mask are built,
+    # and dp_size=1 disables the mori all2all path so the direct masked
+    # fused_moe runs locally -- no cross-GPU dispatch/combine.  Pair with
+    # --fake-eplb so routing is redirected onto the local expert block (see
+    # init_balance_router_logits) and the loaded experts carry a full EP rank's
+    # load.  Benchmarking harness only (output is not meaningful).
+    "ATOM_FAKE_EP": lambda: int(os.getenv("ATOM_FAKE_EP", "0")),
+    # Which EP rank (0..ATOM_FAKE_EP-1) to simulate; selects which contiguous
+    # expert block [rank*L, (rank+1)*L) is loaded/routed.  Ranks are symmetric
+    # when E is divisible by ATOM_FAKE_EP, so 0 is the representative default.
+    "ATOM_FAKE_EP_RANK": lambda: int(os.getenv("ATOM_FAKE_EP_RANK", "0")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
@@ -65,6 +80,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # across the full range on V4-Pro (1.1x small N → 2-3x at N≥4096).
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
+    ).lower(),
+    # wo_a (grouped output LoRA) batched GEMM backend on gfx1250. Default keeps
+    # the proven BF16 Triton/einsum path. "always"/"auto" route it through the
+    # flydsl strided-batched a8w4 kernel (MXFP8 act x MXFP4 wo_a): the attention
+    # output is quantized to MXFP8 before the GEMM (an ADDED pre-quant) and the
+    # existing wo_b input quant after it is unchanged. This trades a few-percent
+    # numeric error for a faster GEMM + halved wo_a weight bandwidth, so validate
+    # accuracy (test_flydsl_batched_gemm_a8w4_wo_a.py) before enabling in prod.
+    "ATOM_WO_A_USE_FLYDSL": lambda: os.getenv(
+        "ATOM_WO_A_USE_FLYDSL", "never"
     ).lower(),
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
