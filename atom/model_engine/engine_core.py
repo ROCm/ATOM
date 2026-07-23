@@ -643,7 +643,6 @@ class PrefillEngineCore(EngineCore):
 
         # Maps seq_id → BlockAssignment, populated by the receiver thread.
         self._pending_assignments: dict = {}
-        # self._pending_lock = threading.Lock()
 
         # ZMQ context for disagg sockets (separate from the main engine sockets).
         self._disagg_ctx = zmq.Context()
