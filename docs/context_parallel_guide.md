@@ -1,3 +1,20 @@
+# Context Parallel Guide (PCP & DCP)
+
+ATOM has two independent context-parallel dimensions that shard the **token
+sequence** instead of weights/heads:
+
+- **[Prefill Context Parallel (PCP)](#prefill-context-parallel-pcp-guide)** —
+  shards the **prefill** token sequence to lower long-prefill TTFT. Adds GPUs
+  (`world = tp × pcp`). Decode is untouched.
+- **[Decode Context Parallel (DCP)](#decode-context-parallel-dcp-guide)** —
+  shards the **KV cache** (and decode attention) along the sequence across
+  existing TP GPUs (`world = tp`, `tp % dcp == 0`) to cut per-GPU KV memory and
+  decode attention cost. Prefill KV writes are sharded too.
+
+They target opposite phases and can be used independently.
+
+---
+
 # Prefill Context Parallel (PCP) Guide
 
 For long-context serving, prefill is bottlenecked on the **sequence dimension**:
@@ -211,3 +228,132 @@ PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 | `atom/model_ops/attentions/deepseek_v4_attn.py` | PCP attention metadata (incl. PCP + TBO prefill) |
 | `atom/model_engine/model_runner.py` | PCP token split and PCP + TBO grouping |
 | `atom/model_engine/llm_engine.py` | PCP / TBO / DP-attention validation |
+
+---
+
+# Decode Context Parallel (DCP) Guide
+
+For long-context / large-batch decode, the bottleneck is the **KV cache**. With
+**MLA** (Multi-head Latent Attention, e.g. DeepSeek) the KV is a single latent
+head, so Tensor Parallel (TP) cannot shard it — every TP rank holds the **full**
+KV cache and repeats the full decode attention. KV memory therefore does not
+shrink with TP, capping context length and batch size.
+
+**Decode Context Parallel (DCP)** shards the KV cache along the **sequence
+dimension** across a DCP process group: token `i` lives on rank `i % dcp`, so
+each GPU stores only `1/dcp` of the KV and does `1/dcp` of the decode attention
+work. This lowers per-GPU KV memory (longer context / larger batch) and decode
+attention cost. Unlike PCP, **DCP does not add GPUs** — it sub-partitions the
+existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
+
+```
+  dcp = 2, KV tokens: 0 1 2 3 4 5
+    GPU (dcp rank 0):  0   2   4      ← each GPU keeps 1/dcp of the KV cache
+    GPU (dcp rank 1):    1   3   5
+  Decode: all-gather Q (all heads) → each rank runs attention over its local
+  1/dcp KV (returns LSE) → LSE-correct + reduce-scatter combines the partial
+  outputs back to each rank's head slice.
+```
+
+> **Model support.** DCP supports **MLA** models (e.g. DeepSeek-V3 / R1). Both
+> the ATOM server and the vllm-atom plugin paths are supported.
+
+## When to use DCP
+
+- **Best fit**: long-context / large-batch **decode** on MLA models, where the
+  full-replicated KV cache limits context length or batch size.
+- **Requires**: `tp % dcp == 0`; `world = tp` (DCP reuses TP GPUs, it does *not*
+  add any). E.g. `-tp 8 -dcp 8` or `-tp 8 -dcp 2` on 8 GPUs.
+- **Composes with**: prefix caching and chunked prefill (both supported under
+  DCP); `--kv-cache-dtype fp8` (per-tensor scale).
+- **Little benefit / avoid**: short-context, KV-memory-plentiful workloads —
+  DCP adds per-step decode communication (Q all-gather + output reduce-scatter)
+  that isn't worth it when KV memory isn't the constraint.
+
+## Quick Reference
+
+| Flag / Variable | Default | Purpose |
+|-----------------|---------|---------|
+| `-dcp N` / `--decode-context-parallel-size N` | `1` | Enable DCP with size `N`. `world = tp`; requires `tp % N == 0` |
+| `--kv-cache-dtype fp8` | `auto` | Supported with DCP (per-tensor scale). `auto`/`bf16` also fine |
+| `--enable_prefix_caching` | off | Supported with DCP |
+| `--enable_chunked_prefill` / `--no-enable_chunked_prefill` | on | Chunked prefill is supported with DCP; on by default |
+
+| Goal (8 GPUs) | Command |
+|------|---------|
+| Max KV capacity (all ranks in one DCP group) | `-tp 8 -dcp 8` |
+| Partial DCP | `-tp 8 -dcp 2` (four DCP groups of 2) |
+| Disable DCP (baseline) | `-tp 8 -dcp 1` (or omit `-dcp`) |
+
+## CLI usage
+
+```bash
+-dcp N                          # or --decode-context-parallel-size N; world = tp, tp % N == 0
+```
+
+## Launching server
+
+### ATOM server — DeepSeek-R1: TP8 + DCP8 (8 GPUs)
+
+```bash
+python -m atom.entrypoints.openai_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    -tp 8 -dcp 8 \
+    --kv_cache_dtype fp8        # or bf16; fp8 uses a per-tensor scale
+```
+
+### vllm-atom plugin — DeepSeek-R1: TP8 + DCP8 (8 GPUs)
+
+```bash
+vllm serve deepseek-ai/DeepSeek-R1 \
+    --tensor-parallel-size 8 \
+    --decode-context-parallel-size 8 \
+    --kv-cache-dtype bfloat16 \
+    --async-scheduling \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+```
+
+Tips:
+- `-tp 8 -dcp 1` (or omitting `-dcp`) disables DCP and serves as the baseline.
+- `--kv_cache_dtype fp8` further lowers KV memory; DCP uses a per-tensor scale
+  (per-token / per-group fp8 layouts are not yet supported).
+
+## How it works
+
+1. **KV cache layout.** The cache is interleaved across the DCP group: token `i`
+   → rank `i % dcp`. Block allocation uses a *virtual block* of
+   `block_size × dcp` tokens, so each physical block holds one rank's `block_size`
+   interleaved tokens and the block table shrinks by `dcp`.
+2. **Prefill KV write.** New-token KV is written interleaved via `slot_mapping`
+   (`-1` for tokens this rank does not own). Prefix-cache / chunked-prefill
+   context is read by gathering the local compressed KV, **AllGather** across the
+   DCP group, reorganizing to per-sequence layout (`reorg_kvcache`), then
+   `kv_b_proj` + attention + LSE merge (compressed-KV AllGather).
+3. **Decode.** All-gather Q (all heads) → each rank runs attention over its local
+   `1/dcp` KV and returns per-token LSE → all-gather LSE, correct each rank's
+   partial output, and reduce-scatter so every rank ends with its head slice.
+4. **fp8 KV cache.** Per-tensor scale. Decode all-gathers the *quantized* fp8 Q
+   (a copy-only collective — safe); the prefill context path dequantizes the
+   AllGathered compressed KV before `kv_b_proj`.
+
+## Constraints & Compatibility
+
+| Constraint | Notes |
+|-----------|-------|
+| Models | MLA only (DeepSeek-V3 / R1, …) |
+| World size | `world = tp`, `tp % dcp == 0` (DCP does not add GPUs) |
+| fp8 KV cache | Supported, **per-tensor scale only** (per-token / per-group not supported) |
+| prefix caching / chunked prefill | Supported |
+| DCP + PCP | Independent dimensions (different phases); combined use not validated here |
+
+## Source Files
+
+| File | Description |
+|------|-------------|
+| `atom/model_engine/arg_utils.py` | `--decode-context-parallel-size` / `-dcp` CLI |
+| `atom/config.py` | DCP validation (`tp % dcp == 0`) |
+| `atom/model_engine/block_manager.py` | Interleaved block allocation; prefix-cache virtual-block accounting |
+| `atom/model_ops/dcp_ops.py` | AG+RS LSE-combine, `reorg_kvcache`, local compressed-KV gather |
+| `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context |
+| `atom/model_ops/attentions/aiter_mla.py`, `attentions/backends.py` | DCP decode / prefill metadata (interleaved slot_mapping, local seq lens) |
+| `atom/plugin/vllm/attention/layer_mla.py` | vllm-atom plugin DCP decode + prefill context |
