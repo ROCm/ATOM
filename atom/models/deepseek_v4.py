@@ -1749,6 +1749,24 @@ class Indexer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _tbo_aware_tp_reduce(tp_size: int) -> bool:
+    """True iff a pure-TP all_reduce should route through the TBO-aware custom op.
+
+    Only the pure TP+TBO case (tp>1, TBO on, no DP) benefits: the ubatch's AR
+    then overlaps the partner ubatch's compute. Non-TBO keeps the plain
+    all_reduce (no custom-op / Dynamo-barrier indirection), and TBO+DP is left
+    untouched (that path overlaps via DP gather/scatter, not this pure-TP AR).
+    Shared by attention (wo_b) and MoE (combine_outputs) so both gate identically.
+    """
+    if tp_size <= 1:
+        return False
+    cfg = get_current_atom_config()
+    return (
+        getattr(cfg, "enable_tbo", False)
+        and cfg.parallel_config.data_parallel_size <= 1
+    )
+
+
 class DeepseekV4Attention(nn.Module):
     """Hybrid attention: MQA + grouped output LoRA + sliding window + attn_sink.
 
@@ -1791,6 +1809,10 @@ class DeepseekV4Attention(nn.Module):
             args.o_groups % tp_size == 0
         ), f"o_groups={args.o_groups} not divisible by tp={tp_size}"
         self.tp_size = tp_size
+        # Route wo_b's TP all_reduce through the TBO-aware custom op only for the
+        # pure TP+TBO case (see _tbo_aware_tp_reduce). Non-TBO / TBO+DP keep the
+        # original all_reduce untouched.
+        self.tbo_aware = _tbo_aware_tp_reduce(tp_size)
         self.n_local_heads = args.n_heads // tp_size
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
@@ -1854,6 +1876,7 @@ class DeepseekV4Attention(nn.Module):
             self.dim,
             bias=False,
             quant_config=qc,
+            tbo_aware=self.tbo_aware,
             prefix=f"{p}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
@@ -2141,7 +2164,11 @@ class DeepseekV4Attention(nn.Module):
         return torch.einsum("sgd,grd->sgr", o, wo_a)
 
     def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
-        """Grouped output LoRA + wo_b (graphable, num_tokens-shaped)."""
+        """Grouped output LoRA + wo_b (graphable, num_tokens-shaped).
+
+        wo_b is built with tbo_aware=True, so its built-in TP all_reduce is
+        TBO-aware (overlaps the partner ubatch's compute under TBO).
+        """
         o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
         return self.wo_b(o.flatten(1))
 
@@ -2773,6 +2800,9 @@ class MoE(nn.Module):
         self.routed_scaling_factor = args.route_scale
         self.swiglu_limit = args.swiglu_limit
         self.tp_size = get_tensor_model_parallel_world_size()
+        # Pure TP+TBO: route combine_outputs' TP all_reduce through the TBO-aware
+        # custom op (overlap with partner ubatch). Non-TBO / TBO+DP unchanged.
+        self.tbo_aware = _tbo_aware_tp_reduce(self.tp_size)
         self.alt_stream = alt_stream
         qc = args.quant_config
 
@@ -3003,7 +3033,15 @@ class MoE(nn.Module):
                 shared = shared * (1.0 / get_pcp_world_size())
             routed = routed + shared
         if self.tp_size > 1:
-            routed = tensor_model_parallel_all_reduce(routed)
+            if self.tbo_aware:
+                # Pure TP+TBO: TBO-aware AR (custom op) overlaps this ubatch's TP
+                # all_reduce with the partner ubatch's compute. The custom op is a
+                # Dynamo barrier so no tbo_active() branch lands in the (possibly
+                # compiled) call site — see module_dispatch_ops.tbo_all_reduce.
+                routed = torch.ops.aiter.tbo_all_reduce(routed)
+            else:
+                # Non-TBO / TBO+DP: original plain TP all_reduce, untouched.
+                routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
     def single_stream_moe_forward(

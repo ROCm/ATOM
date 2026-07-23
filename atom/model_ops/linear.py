@@ -924,7 +924,10 @@ class LinearBase(nn.Module):
                 if self.bias is not None:
                     y += self.bias
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
-            y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
+            if getattr(self, "tbo_aware", False):
+                y = torch.ops.aiter.tbo_all_reduce(y)
+            else:
+                y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 
 
@@ -1818,6 +1821,7 @@ class RowParallelLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        tbo_aware: bool = False,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -1833,6 +1837,10 @@ class RowParallelLinear(LinearBase):
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
         )
+        # When True, the built-in TP reduce goes through the TBO-aware custom op
+        # (overlaps with the partner ubatch under TBO). Default off so all other
+        # RowParallelLinear layers keep the plain all_reduce unchanged.
+        self.tbo_aware = tbo_aware
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
