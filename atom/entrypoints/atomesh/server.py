@@ -149,8 +149,9 @@ def json_object_arg(raw_value: str) -> dict[str, Any]:
 
 def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = argparse.ArgumentParser(
+    parser = FlexibleArgumentParser(
         description="Atomesh Python interface",
         allow_abbrev=False,
     )
