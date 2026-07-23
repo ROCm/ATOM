@@ -375,11 +375,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
     # "0": MoE runs on each rank's 1/W token shard with no extra comm.
     "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
-    # Debug: in split_attn_metadata, cross-check the host-computed per-ubatch
-    # max_seqlen_q/k against the device tensors and fall back to the device value
-    # (with a warning) on mismatch. Off by default — turn on to diagnose stale
-    # attach_tbo_cpu_lens snapshots. Adds two .item() D2H syncs per ubatch.
-    "ATOM_TBO_DEBUG_CHECK": lambda: (os.getenv("ATOM_TBO_DEBUG_CHECK", "0") == "1"),
     # Pure-TP TBO all_reduce overlap mode (see module_dispatch_ops.tbo_all_reduce):
     #   "overlap" (default): move the AR onto the comm stream so it overlaps the
     #             partner ubatch's compute. Per-ubatch pynccl comms keep the
