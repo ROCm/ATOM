@@ -266,6 +266,17 @@ class QuantizationConfig:
     - ``quant_type``, ``quant_dtype``, ``is_dynamic`` convenience properties
     """
 
+    _ONLINE_QUANT_SOURCE_METHODS = frozenset(
+        {
+            "",
+            "fp8",
+            "mxfp4",
+            "mxfp8",
+            "quark",
+            "compressed-tensors",
+        }
+    )
+
     def __init__(
         self,
         config: PretrainedConfig = None,
@@ -306,14 +317,15 @@ class QuantizationConfig:
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
         self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
         self.online_exclude_layers: list[str] = []
-        if online_quant_config and self.quant_method in [
-            "",
-            "fp8",
-            "mxfp4",
-            "mxfp8",
-            "quark",
-        ]:
+        online_source_supported = self.quant_method in self._ONLINE_QUANT_SOURCE_METHODS
+        if online_quant_config and online_source_supported:
             self.online_quant = True
+            if self.quant_method == "compressed-tensors":
+                logger.warning(
+                    "Online quantization for compressed-tensors checkpoints "
+                    "relies on the caller's exclude_layer configuration. Ensure "
+                    "unsupported or already-quantized layers are excluded."
+                )
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec

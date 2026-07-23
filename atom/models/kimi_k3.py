@@ -12,9 +12,7 @@ import os
 from typing import Optional, Union
 
 import torch
-import torch.nn.functional as F
 from aiter import ActivationType, QuantType
-from aiter.tuned_gemm import tgemm
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -110,6 +108,21 @@ def _normalize_kimi_config(config) -> None:
             "rope_theta": getattr(config, "rope_theta", 10000.0),
             "rope_type": "default",
         }
+
+
+def _kda_packed_modules_mapping(
+    kda_layer_indices: list[int],
+) -> dict[str, tuple[str, int]]:
+    mapping = {
+        ".gate_proj": (".gate_up_proj", 0),
+        ".up_proj": (".gate_up_proj", 1),
+    }
+    projection_names = ("q_proj", "k_proj", "v_proj", "g_proj")
+    for layer_idx in kda_layer_indices:
+        prefix = f".layers.{layer_idx}.self_attn."
+        for shard_id, projection_name in enumerate(projection_names):
+            mapping[f"{prefix}{projection_name}"] = (f"{prefix}in_proj", shard_id)
+    return mapping
 
 
 def _extract_layer_idx(prefix: str) -> int:
@@ -237,7 +250,7 @@ class KimiSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.gate.e_score_correction_bias = atom_parameter(
-            torch.empty(config.num_experts, dtype=torch.float32)
+            torch.empty(config.num_experts, dtype=torch.bfloat16)
         )
         self.experts = FusedMoE(
             num_experts=config.num_experts,
@@ -376,7 +389,7 @@ class KimiSparseMoeBlock(nn.Module):
             shared_partial = self.shared_experts(identity)
 
         # Routed experts on the main stream.
-        router_logits = F.linear(hidden_states.float(), self.gate.weight.float(), None)
+        router_logits = self.gate(hidden_states)
         routed_input = (
             self.routed_expert_down_proj(hidden_states)
             if self.use_latent_moe
@@ -407,12 +420,7 @@ class KimiSparseMoeBlock(nn.Module):
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
-        # Match the reference Kimi router: route in fp32 before sigmoid/top-k.
-        router_logits = F.linear(
-            hidden_states.float(),
-            self.gate.weight.float(),
-            None,
-        )
+        router_logits = self.gate(hidden_states)
         routed_input = (
             self.routed_expert_down_proj(hidden_states)
             if self.use_latent_moe
@@ -645,33 +653,29 @@ class KimiKDAAttention(nn.Module):
             raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
 
-        # q/k/v/g/b input projections. These are loaded as separate modules
-        # (unique, collision-free checkpoint names) and then concatenated into a
-        # single fused in-proj weight in process_weights_after_loading so the
-        # runtime does one GEMM ([q | k | v | g | b]). g_proj cannot be merged
-        # via packed_modules_mapping because its name is shared with the MLA
-        # layers' g_proj (the loader matches by substring), so all five go
-        # through the post-load concat path instead.
-        self.q_proj = ColumnParallelLinear(
+        # The top-level model maps four separate checkpoint projections
+        # directly into this fused [q | k | v | g] parameter. Mapping keys
+        # include the KDA layer index so KimiFullAttention.g_proj is untouched.
+        self.in_proj = MergedColumnParallelLinear(
             self.hidden_size,
-            self.proj_size,
+            [
+                self.proj_size,
+                self.proj_size,
+                self.proj_size,
+                self.proj_size,
+            ],
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.q_proj",
+            prefix=f"{prefix}.in_proj",
         )
-        self.k_proj = ColumnParallelLinear(
+        # Keep beta separate so the fused in-proj output width remains the
+        # tile-aligned 4 * local_proj_size. Beta is widened to fp32 in _run_kda.
+        self.b_proj = ColumnParallelLinear(
             self.hidden_size,
-            self.proj_size,
+            self.num_heads,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.k_proj",
-        )
-        self.v_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.proj_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.v_proj",
+            quant_config=None,
+            prefix=f"{prefix}.b_proj",
         )
 
         self.q_conv1d = ColumnParallelLinear(
@@ -718,20 +722,6 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
-        self.b_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.b_proj",
-        )
-        self.g_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.proj_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.g_proj",
-        )
         self.o_norm = KimiRMSNormGated(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
             self.proj_size,
@@ -742,39 +732,9 @@ class KimiKDAAttention(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Fuse q/k/v/g into a single in-proj weight (one runtime GEMM).
-
-        The four hidden-input projections are loaded as separate modules
-        (their checkpoint names are unique and collision-free; g_proj in
-        particular cannot go through packed_modules_mapping because its name is
-        shared with the MLA layers' g_proj under the loader's substring match).
-        Here they are concatenated into one ``[q | k | v | g]`` weight and the
-        per-projection storage is released, so ``forward`` runs a single
-        ``tgemm.mm`` instead of four. Runs once; idempotent.
-
-        b_proj is deliberately left out: its output width is num_heads (tiny),
-        which would make the fused N = 4*local_proj + num_heads a non-multiple
-        of the GEMM tile and cost more than the extra kernel it saves. It stays
-        a standalone ColumnParallelLinear (its own tgemm call).
-
-        Assumes bf16 (unquantized) attention weights, which the Kimi-K3
-        checkpoint guarantees (``re:.*self_attn.*`` is in the quant ignore
-        list). A quantized-attention checkpoint would need per-shard scale
-        handling and is rejected loudly rather than silently mis-fused.
-        """
-        if getattr(self, "_in_proj_fused", False):
+        """Pre-concatenate the static q/k/v causal-conv weights."""
+        if hasattr(self, "conv_weight"):
             return
-        subs = (self.q_proj, self.k_proj, self.v_proj, self.g_proj)
-        assert all(m.quant_type == QuantType.No for m in subs), (
-            "KDA in-proj fusion assumes unquantized (bf16) attention weights; "
-            "this checkpoint quantizes self_attn projections."
-        )
-        fused = torch.cat([m.weight.data for m in subs], dim=0).contiguous()
-        self.in_proj_weight = nn.Parameter(fused, requires_grad=False)
-        # Release the per-projection weight storage. The modules stay as empty
-        # shells; their bf16 post-load hooks are no-ops and are never re-run.
-        for m in subs:
-            m.weight.data = m.weight.data.new_empty(0)
 
         # Pre-concatenate the static q/k/v causal-conv weights once here instead
         # of rebuilding the [3*local_proj_size, K] tensor on every forward.
@@ -786,8 +746,6 @@ class KimiKDAAttention(nn.Module):
             ],
             dim=0,
         ).contiguous()
-
-        self._in_proj_fused = True
 
     def _conv_weights(self) -> torch.Tensor:
         return self.conv_weight
@@ -866,9 +824,7 @@ class KimiKDAAttention(nn.Module):
         # is a clean multiple of the GEMM tile (b_proj's tiny num_heads width is
         # kept out so it does not misalign N).
         lp = self.local_proj_size
-        fused_in = tgemm.mm(
-            hidden_states, self.in_proj_weight, None, otype=hidden_states.dtype
-        )
+        fused_in = self.in_proj(hidden_states)
         # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
         # row stride 4*lp). Both causal-conv consumers read the token stride from
         # the tensor itself — causal_conv1d_fn uses x.stride(1) after transpose
@@ -1245,10 +1201,7 @@ class KimiLinearModel(nn.Module):
 
 
 class KimiLinearForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        ".gate_proj": (".gate_up_proj", 0),
-        ".up_proj": (".gate_up_proj", 1),
-    }
+    packed_modules_mapping = _kda_packed_modules_mapping([])
     weights_mapping = {
         "weight_packed": "weight",
     }
@@ -1256,8 +1209,12 @@ class KimiLinearForCausalLM(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         config = _text_config(atom_config.hf_config)
+        _normalize_kimi_config(config)
         self.config = config
         self.quant_config = atom_config.quant_config
+        self.packed_modules_mapping = _kda_packed_modules_mapping(
+            config.kimi_kda_layers
+        )
         self.model = KimiLinearModel(atom_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1321,6 +1278,9 @@ class KimiK3ForCausalLM(nn.Module):
             _normalize_kimi_config(root_config)
         self.config = _text_config(root_config)
         self.quant_config = atom_config.quant_config
+        self.packed_modules_mapping = _kda_packed_modules_mapping(
+            self.config.kimi_kda_layers
+        )
         self.language_model = KimiLinearForCausalLM(
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "language_model"),
