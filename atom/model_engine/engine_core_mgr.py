@@ -408,14 +408,6 @@ class CoreManager:
                 except (ValueError, OSError):
                     pass
 
-        # Clean up dynamic CU partitioning shared memory (if created).
-        if getattr(self, "_cu_shm", None) is not None:
-            try:
-                self._cu_shm.close()
-                self._cu_shm.unlink()
-            except Exception:
-                pass
-
         logger.info(f"{self.label}: All EngineCores shut down")
 
     def add_request(self, seqs: List[Sequence]):
@@ -1063,3 +1055,13 @@ class DisaggCoreManager(CoreManager):
             [self.engine_core_identities[0], prefill_payload],
             copy=False,
         )
+
+    def close(self):
+        super().close()
+        # Clean up dynamic CU partitioning shared memory (if created).
+        if getattr(self, "_cu_shm", None) is not None:
+            try:
+                self._cu_shm.close()
+                self._cu_shm.unlink()
+            except Exception:
+                pass
