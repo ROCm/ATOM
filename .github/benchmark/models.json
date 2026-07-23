@@ -88,7 +88,7 @@
       "config": {
         "tp": 4,
         "kv_cache_dtype": "fp8",
-        "extra_args": "--no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"mxfp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}'"
+        "extra_args": "--no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}'"
       },
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },

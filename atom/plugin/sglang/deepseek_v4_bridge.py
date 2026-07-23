@@ -1527,7 +1527,8 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.kv_indptr_swa = swa_indptr
     md.kv_indptr_csa = csa_indptr
     md.kv_indptr_hca = hca_indptr
-    _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
+    if proxy_pool.use_fp8_kv:
+        _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
     cu_committed_cpu = np.concatenate(
         [
             np.zeros(1, dtype=np.int32),
@@ -1972,7 +1973,8 @@ def build_atom_v4_attention_metadata_from_sglang(
 
     if is_decode:
         _populate_decode_indices(md, block_tables, pos_np, device)
-        _stage_decode_fp8_page_metadata(md, total, total)
+        if proxy_pool.use_fp8_kv:
+            _stage_decode_fp8_page_metadata(md, total, total)
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
     _populate_indexer(md, batch_np, positions[:total], device)
