@@ -302,18 +302,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # They are configured via --dspark-config (JSON dict) and carried in
     # config.dspark (see atom/config.py DSparkConfig). See
     # recipes/DeepSeek-V4-DSpark.md.
-    # --- PrefillDelayer (prefill coalescer) ---
-    # Master switch / kill switch; default on. Set "0" to disable construction.
-    # The delayer is a prefill COALESCER: it holds back prefill admission until
-    # the accumulated prefill fills a worthwhile forward, so fragmented
-    # short-input prefills / small partial tail chunks batch into one forward
-    # instead of firing many tiny ones.
-    # Enabled in two cases:
-    #   - DP (data_parallel_size > 1): always on with this switch — also enforces
-    #     cross-rank prefill alignment (reduces over dp_group).
-    #   - TP-only / single-rank with TBO on: rides on TBO, since a fuller forward
-    #     is exactly what TBO needs to split into two useful ubatches. Runs in
-    #     single-rank mode (no all_reduce). This switch still force-disables it.
+    # --- PrefillDelayer (cross-DP prefill alignment) ---
+    # Master switch; default on. Set "0" to disable construction.
+    # The delayer is a prefill COALESCER: it holds back prefill admission under
+    # DP-attention until the accumulated prefill fills a worthwhile forward, so
+    # fragmented short-input prefills / small partial tail chunks batch into one
+    # forward instead of firing many tiny ones.
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
         os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
     ),
