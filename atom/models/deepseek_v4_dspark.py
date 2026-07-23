@@ -330,6 +330,9 @@ try:
         dspark_paged_window_gather,
         swa_write,
     )
+    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (  # noqa: E402
+        qk_norm_rope_maybe_quant,
+    )
 
     _ATOM_V4_AVAILABLE = True
 except Exception:  # pragma: no cover - exercised only in the stubbed test sandbox
@@ -526,28 +529,37 @@ class DSparkLayer(Block):  # type: ignore[misc]
             q = _linear_out(a.wq_b(qr_q, x_scale=qr_scale))
         else:
             q = _linear_out(a.wq_b(qr_normed))
-        q = q.view(B * T, a.n_local_heads, a.head_dim)
-        # Per-head Q RMSNorm (weightless), matching the V4 reference.
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + a.eps).to(
-            q.dtype
-        )
-        kv = a.kv_norm(kv).view(B * T, 1, a.head_dim)
+        # q stays 2-D [B*T, H*D], kv 2-D [B*T, D] — the fused kernel wants 2-D.
 
         # Draft positions: anchor+1 .. anchor+T.
         draft_pos = positions.view(B, 1) + torch.arange(
             1, T + 1, device=x.device, dtype=positions.dtype
         ).view(1, T)
         rope_dim = a.rope_head_dim
-        dp_flat = draft_pos.reshape(-1)
-        # RoPE via the shared aiter fused kernel (rope_cached_positions_2c, GPT-J
-        # interleaved = the draft's former hand-rolled triton layout). In-place on
-        # the rope-slice of q and kv together; both are fresh local tensors. Guard
-        # rope_dim > 0 so rope_dim == 0 doesn't turn `[..., -rope_dim:]` into the
-        # whole head.
-        if rope_dim:
-            a.rotary_emb.forward(dp_flat, q[..., -rope_dim:], kv[..., -rope_dim:])
+        # Per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE in ONE
+        # fused kernel — the same `qk_norm_rope_maybe_quant` the V4 target runs
+        # every layer (bf16 path: quant off, no SWA fusion — DSpark scatters its
+        # window separately). Replaces the draft's hand-written weightless Q-norm
+        # + kv_norm + the `rotary_emb.forward` (_V4RoPE) RoPE launch. `kv` is
+        # passed PRE-norm; the kernel applies kv_norm.weight internally.
+        qkn = qk_norm_rope_maybe_quant(
+            q,
+            kv,
+            a.kv_norm.weight,
+            a.rotary_emb.cos_cache,
+            a.rotary_emb.sin_cache,
+            draft_pos.reshape(-1),
+            a.n_local_heads,
+            a.head_dim,
+            rope_dim,
+            a.eps,
+            quant_q=False,
+            quant_k=False,
+            prefix=f"{a.layer_name}.dspark_qk_norm_rope",
+        )
+        q = qkn.q_sa.view(B, T, a.n_local_heads, a.head_dim)
+        kv = qkn.kv.view(B * T, 1, a.head_dim)
         _apply_dspark_kv_qat_(kv, rope_dim)
-        q = q.view(B, T, a.n_local_heads, a.head_dim)
         kv = kv.view(B, T, a.head_dim)
 
         # Assemble [window ++ draft block] KV and the window-validity mask.
