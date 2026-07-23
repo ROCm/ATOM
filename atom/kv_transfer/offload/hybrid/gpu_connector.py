@@ -39,7 +39,7 @@ from atom.kv_transfer.offload.hybrid.kv_bundle_codec import (
     BundleCodec,
     BundleError,
 )
-from atom.kv_transfer.offload.triton_offload_gather import (
+from atom.kv_transfer.offload.triton_kv_staging import (
     GatherRegion,
     gather_regions,
     scatter_regions,

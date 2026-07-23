@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from atom.kv_transfer.offload.triton_offload_gather import (
+from atom.kv_transfer.offload.triton_kv_staging import (
     GatherRegion,
     gather_regions,
     scatter_regions,

@@ -63,7 +63,7 @@ Two ideas carry the whole module:
 | `dense/kv_byte_codec.py` | `DenseKVByteCodec`: maps a token range → AITER KV blocks and packs/unpacks them as raw bytes. |
 | `dense/gpu_connector.py` | `DenseGPUConnector`: LMCache `GPUConnectorInterface` impl. Bounded GPU staging + two-stage (pack ↔ copy) pipeline. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
-| `triton_offload_gather.py` | Triton byte gather/scatter: chunk-major pack/unpack (dense) + region gather/scatter (hybrid). |
+| `triton_kv_staging.py` | Triton byte gather/scatter: chunk-major pack/unpack (dense) + region gather/scatter (hybrid). |
 
 ## Architecture
 
@@ -131,7 +131,7 @@ flowchart TB
         COMMON["_offload_common.py"]
         CFG["config.py"]
         STG["atom_lmcache_staging.py"]
-        TRITON["triton_offload_gather.py"]
+        TRITON["triton_kv_staging.py"]
     end
 
     DENSE & HYBRID --> SHARED
@@ -526,7 +526,7 @@ rejects duplicate blocks, and requires a `uint8` device buffer. Both directions
 **require** the Triton fused staging kernel — there is no slow Python fallback on
 the production path.
 
-### `triton_offload_gather.py` — fused byte gather/scatter
+### `triton_kv_staging.py` — fused byte gather/scatter
 
 The fast path the dense codec stands on. Two chunk-major JIT kernels
 (`fused_pack_chunk_major`, `fused_unpack_chunk_major`) move every
@@ -831,7 +831,7 @@ python3 multi-round-qa.py \
 - **Per-block staging cost.** The codec stages KV one block at a time through the
   bounded buffer. For very long prefixes this dominates reload latency; a
   bulk/contiguous copy path would cut it substantially. The Triton fused
-  chunk-major kernel (`triton_offload_gather.py`) is the current fast path.
+  chunk-major kernel (`triton_kv_staging.py`) is the current fast path.
 - **Reload only pays off above `OFFLOAD_MIN_LOAD_TOKENS`.** Small hits are skipped
   because, at the current copy speed, recompute is cheaper. The break-even point
   is workload- and hardware-dependent — tune the threshold per deployment.
