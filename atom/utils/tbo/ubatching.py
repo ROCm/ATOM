@@ -305,6 +305,49 @@ _THREAD_ID_TO_CONTEXT: dict[int, int] = {}
 _CURRENT_CONTEXTS: list["TBOContext | None"] = []
 _NUM_UBATCHES: int = 2
 
+_TP_AR_ORDER_EVENT: "torch.cuda.Event | None" = None
+
+
+def tbo_get_tp_ar_order_event() -> "torch.cuda.Event | None":
+    """Shared event that serializes the pure-TP all_reduce across ubatches."""
+    return _TP_AR_ORDER_EVENT
+
+
+# Per-ubatch independent pynccl TP communicators for the pure-TP all_reduce
+# overlap (see `tbo_all_reduce`).
+_TBO_TP_UBATCH_COMMS: "list | None" = None
+
+
+def tbo_get_ubatch_tp_comm(ubatch_id: int):
+    """Return this ubatch's dedicated pynccl TP communicator, building the pair
+    lazily on first use. Returns None if TP world size == 1 (no AR needed)."""
+    global _TBO_TP_UBATCH_COMMS
+    if _TBO_TP_UBATCH_COMMS is not None:
+        return _TBO_TP_UBATCH_COMMS[ubatch_id]
+
+    from aiter.dist.device_communicators.communicator_pynccl import (
+        PyNcclCommunicator,
+    )
+    from aiter.dist.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    if tp.world_size == 1:
+        _TBO_TP_UBATCH_COMMS = [None] * _NUM_UBATCHES
+        return None
+
+    # One independent communicator per ubatch. Construction runs a warmup
+    # all_reduce (a collective), so every rank must build the same number in the
+    # same order — guaranteed here because all ranks run TBO in lockstep and hit
+    # this on the same forward. Bound to the TP cpu_group (non-NCCL backend),
+    # exactly like the shared pynccl_comm.
+    comms = []
+    for _ in range(_NUM_UBATCHES):
+        comms.append(
+            PyNcclCommunicator(group=tp.cpu_group, device=tp.device)
+        )
+    _TBO_TP_UBATCH_COMMS = comms
+    return _TBO_TP_UBATCH_COMMS[ubatch_id]
+
 
 class TBOContext:
     """Context manager for micro-batch dual-thread overlap.
@@ -555,13 +598,18 @@ def make_tbo_contexts(
     Threading events are arranged in a ring so that each context's
     ``cpu_signal_event`` is the *next* context's ``cpu_wait_event``.
     """
-    global _NUM_UBATCHES, _CURRENT_CONTEXTS
+    global _NUM_UBATCHES, _CURRENT_CONTEXTS, _TP_AR_ORDER_EVENT
     assert num_micro_batches > 1
 
     _NUM_UBATCHES = num_micro_batches
     # Grow the global context list if needed
     while len(_CURRENT_CONTEXTS) < num_micro_batches:
         _CURRENT_CONTEXTS.append(None)
+
+    # Fresh per-step event that serializes the pure-TP all_reduce across
+    # ubatches (see `_TP_AR_ORDER_EVENT` note above). A new event each step
+    # means the first ubatch's AR never waits on a prior step's recording.
+    _TP_AR_ORDER_EVENT = torch.cuda.Event()
 
     cpu_events = [threading.Event() for _ in range(num_micro_batches)]
     gpu_comm_done_events = [torch.Event() for _ in range(num_micro_batches)]

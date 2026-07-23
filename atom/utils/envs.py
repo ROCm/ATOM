@@ -302,12 +302,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # They are configured via --dspark-config (JSON dict) and carried in
     # config.dspark (see atom/config.py DSparkConfig). See
     # recipes/DeepSeek-V4-DSpark.md.
-    # --- PrefillDelayer (cross-DP prefill alignment) ---
-    # Master switch; default on. Set "0" to disable construction.
-    # The delayer is a prefill COALESCER: it holds back prefill admission under
-    # DP-attention until the accumulated prefill fills a worthwhile forward, so
-    # fragmented short-input prefills / small partial tail chunks batch into one
-    # forward instead of firing many tiny ones.
+    # --- PrefillDelayer (prefill coalescer) ---
+    # Master switch / kill switch; default on. Set "0" to disable construction.
+    # The delayer is a prefill COALESCER: it holds back prefill admission until
+    # the accumulated prefill fills a worthwhile forward, so fragmented
+    # short-input prefills / small partial tail chunks batch into one forward
+    # instead of firing many tiny ones.
+    # Enabled in two cases:
+    #   - DP (data_parallel_size > 1): always on with this switch — also enforces
+    #     cross-rank prefill alignment (reduces over dp_group).
+    #   - TP-only / single-rank with TBO on: rides on TBO, since a fuller forward
+    #     is exactly what TBO needs to split into two useful ubatches. Runs in
+    #     single-rank mode (no all_reduce). This switch still force-disables it.
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
         os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
     ),
@@ -375,6 +381,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
     # "0": MoE runs on each rank's 1/W token shard with no extra comm.
     "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
+    # Debug: in split_attn_metadata, cross-check the host-computed per-ubatch
+    # max_seqlen_q/k against the device tensors and fall back to the device value
+    # (with a warning) on mismatch. Off by default — turn on to diagnose stale
+    # attach_tbo_cpu_lens snapshots. Adds two .item() D2H syncs per ubatch.
+    "ATOM_TBO_DEBUG_CHECK": lambda: (
+        os.getenv("ATOM_TBO_DEBUG_CHECK", "0") == "1"
+    ),
+    # Pure-TP TBO all_reduce overlap mode (see module_dispatch_ops.tbo_all_reduce):
+    #   "overlap" (default): move the AR onto the comm stream so it overlaps the
+    #             partner ubatch's compute. Per-ubatch pynccl comms keep the
+    #             cross-rank enqueue order consistent (hang-free).
+    #   "inline": run the AR on the current stream, no overlap. Kill switch —
+    #             the Plan-A baseline; fall back here if an overlap-path hang
+    #             ever resurfaces on some shape/topology.
+    "ATOM_TBO_TP_AR_MODE": lambda: os.getenv("ATOM_TBO_TP_AR_MODE", "overlap"),
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.

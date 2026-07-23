@@ -122,6 +122,29 @@ class EngineCore:
 
         self.scheduler = Scheduler(config)
 
+        # Enable delayer prefill when TP TBO on
+        if (
+            config.enable_tbo
+            and envs.ATOM_ENABLE_PREFILL_DELAYER
+            and config.parallel_config.data_parallel_size <= 1
+        ):
+            from atom.model_engine.prefill_delayer import PrefillDelayer
+
+            self.scheduler.set_prefill_delayer(
+                PrefillDelayer(
+                    dp_size=1,
+                    cpu_group=None,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                )
+            )
+
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         if self.kv_transfer_enabled:
             self.kv_aggregator = KVOutputAggregator(
