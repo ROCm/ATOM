@@ -182,8 +182,7 @@ def test_generate_sglang_config_translates_core_fields(monkeypatch):
     assert cfg.model == "/fake/model"
     assert cfg.trust_remote_code is True
     assert cfg.tensor_parallel_size == 4
-    assert cfg.kv_cache_dtype == "fp8"
-    assert cfg.index_cache_dtype == "fp8"
+    assert cfg.kv_cache_dtype == "fp8_e4m3fn"
     assert cfg.max_model_len == 16384
     assert cfg.max_num_seqs == 128
     assert cfg.enforce_eager is True
@@ -191,124 +190,6 @@ def test_generate_sglang_config_translates_core_fields(monkeypatch):
     assert cfg.plugin_config.is_plugin_mode is True
     assert cfg.plugin_config.is_sglang is True
     assert cfg.plugin_config.is_vllm is False
-
-
-def test_generate_sglang_config_preserves_dsv4_fp8_kv_cache_dtype_on_supported_gpu(
-    monkeypatch,
-):
-    """DSV4 native 2-buffer gating must not downgrade supported FP8 KV cache."""
-    import atom.config as atom_config_module
-
-    monkeypatch.setattr(atom_config_module, "Config", _FakeConfig, raising=False)
-    monkeypatch.setattr(
-        atom_config_module, "ParallelConfig", _FakeParallelConfig, raising=False
-    )
-    monkeypatch.setattr(
-        atom_config_module, "CompilationConfig", _FakeCompilationConfig, raising=False
-    )
-
-    fake_server_args = _make_fake_server_args(kv_cache_dtype="fp8_e4m3")
-
-    mock_sglang_server_args = MagicMock()
-    mock_sglang_server_args.get_global_server_args.return_value = fake_server_args
-    mock_sglang_server_args.PortArgs = _Obj
-
-    mock_sglang_distributed = MagicMock()
-    mock_sglang_distributed.get_tensor_model_parallel_rank.return_value = 0
-
-    mock_sglang_model_config = MagicMock()
-    fake_model_config = _Obj(hf_config=_Obj(architectures=["DeepseekV4ForCausalLM"]))
-    mock_sglang_model_config.ModelConfig.from_server_args.return_value = (
-        fake_model_config
-    )
-
-    mock_sglang_modelopt_config = MagicMock()
-    mock_sglang_modelopt_config.ModelOptConfig.return_value = _Obj()
-
-    mock_sglang_load_config = MagicMock()
-    mock_sglang_load_config.LoadConfig.return_value = _Obj()
-
-    monkeypatch.setattr(plugin_config, "supports_dsv4_fp8_2buff", lambda: True)
-
-    sgl_mods = _make_sglang_sys_modules(
-        mock_sglang_server_args,
-        mock_sglang_distributed,
-        mock_sglang_model_config,
-        mock_sglang_modelopt_config,
-        mock_sglang_load_config,
-    )
-
-    with (
-        patch.dict(sys.modules, sgl_mods),
-        patch("torch.distributed.get_rank", return_value=0),
-    ):
-        cfg = plugin_config._generate_atom_config_from_sglang_config(
-            config=_Obj(architectures=["DeepseekV4ForCausalLM"])
-        )
-
-    assert cfg.kv_cache_dtype == "fp8"
-    assert cfg.index_cache_dtype == "fp8"
-    assert fake_server_args.kv_cache_dtype == "fp8_e4m3"
-
-
-@pytest.mark.parametrize("requested_kv_cache_dtype", ["fp8_e4m3", "fp8"])
-def test_generate_sglang_config_downgrades_dsv4_fp8_kv_cache_on_unsupported_gpu(
-    monkeypatch,
-    requested_kv_cache_dtype,
-):
-    """DSV4 SGLang proxy path should use bf16 KV on non-gfx950/gfx1250 GPUs."""
-    import atom.config as atom_config_module
-
-    monkeypatch.setattr(atom_config_module, "Config", _FakeConfig, raising=False)
-    monkeypatch.setattr(
-        atom_config_module, "ParallelConfig", _FakeParallelConfig, raising=False
-    )
-    monkeypatch.setattr(
-        atom_config_module, "CompilationConfig", _FakeCompilationConfig, raising=False
-    )
-
-    fake_server_args = _make_fake_server_args(kv_cache_dtype=requested_kv_cache_dtype)
-
-    mock_sglang_server_args = MagicMock()
-    mock_sglang_server_args.get_global_server_args.return_value = fake_server_args
-    mock_sglang_server_args.PortArgs = _Obj
-
-    mock_sglang_distributed = MagicMock()
-    mock_sglang_distributed.get_tensor_model_parallel_rank.return_value = 0
-
-    mock_sglang_model_config = MagicMock()
-    fake_model_config = _Obj(hf_config=_Obj(architectures=["DeepseekV4ForCausalLM"]))
-    mock_sglang_model_config.ModelConfig.from_server_args.return_value = (
-        fake_model_config
-    )
-
-    mock_sglang_modelopt_config = MagicMock()
-    mock_sglang_modelopt_config.ModelOptConfig.return_value = _Obj()
-
-    mock_sglang_load_config = MagicMock()
-    mock_sglang_load_config.LoadConfig.return_value = _Obj()
-
-    monkeypatch.setattr(plugin_config, "supports_dsv4_fp8_2buff", lambda: False)
-
-    sgl_mods = _make_sglang_sys_modules(
-        mock_sglang_server_args,
-        mock_sglang_distributed,
-        mock_sglang_model_config,
-        mock_sglang_modelopt_config,
-        mock_sglang_load_config,
-    )
-
-    with (
-        patch.dict(sys.modules, sgl_mods),
-        patch("torch.distributed.get_rank", return_value=0),
-    ):
-        cfg = plugin_config._generate_atom_config_from_sglang_config(
-            config=_Obj(architectures=["DeepseekV4ForCausalLM"])
-        )
-
-    assert cfg.kv_cache_dtype == "bf16"
-    assert cfg.index_cache_dtype == "bf16"
-    assert fake_server_args.kv_cache_dtype == "bf16"
 
 
 def test_generate_sglang_config_raises_on_none_server_args(monkeypatch):

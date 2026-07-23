@@ -2,8 +2,7 @@ diff --git a/python/sglang/srt/configs/cohere2_moe.py b/python/sglang/srt/config
 index cd470bd69f..374c1f17ec 100644
 --- a/python/sglang/srt/configs/cohere2_moe.py
 +++ b/python/sglang/srt/configs/cohere2_moe.py
-@@ -3,16 +3,6 @@
- 
+@@ -4,15 +4,5 @@
  from transformers.configuration_utils import PreTrainedConfig
  from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 -

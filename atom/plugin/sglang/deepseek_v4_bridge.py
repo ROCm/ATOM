@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
 import torch
-
-from atom.plugin.config import supports_dsv4_fp8_2buff
 
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
 try:
@@ -16,6 +15,10 @@ try:
     )
 except Exception:  # pragma: no cover - import fallback for partial runtime envs
     ATOM_DEEPSEEK_V4_FP8_PACKED_DIM = 512
+_V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
+_V4_FP8_DOWNGRADE_WARNED = False
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
@@ -108,6 +111,29 @@ def _is_fp8_dtype(dtype: Any) -> bool:
     return "float8" in dtype_name or "fp8" in dtype_name or "e4m3" in dtype_name
 
 
+def _get_gfx_name() -> Optional[str]:
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx()
+    except Exception:
+        return None
+
+
+def _warn_dsv4_fp8_downgrade(gfx: Optional[str]) -> None:
+    global _V4_FP8_DOWNGRADE_WARNED
+    if _V4_FP8_DOWNGRADE_WARNED:
+        return
+    _V4_FP8_DOWNGRADE_WARNED = True
+    logger.warning(
+        "DeepSeek-V4 fp8 KV cache was requested, but native 2-buffer fp8 "
+        "kernels are only supported on %s (current arch: %s); falling back to "
+        "the bf16 proxy KV layout.",
+        "/".join(_V4_FP8_SUPPORTED_GFX),
+        gfx or "unknown",
+    )
+
+
 try:
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 except Exception:  # pragma: no cover - SGLang import-time fallback
@@ -166,8 +192,11 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # aiter DSV4 native 2-buffer fp8 op4/op5 kernels are not shipped for
         # MI308/gfx942.  Match the native ATOM builder: keep gfx950/gfx1250 on
         # the fp8 fast path and fall back to the bf16/Triton path elsewhere.
-        if self.use_fp8_kv and not supports_dsv4_fp8_2buff():
-            self.use_fp8_kv = False
+        if self.use_fp8_kv:
+            gfx = _get_gfx_name()
+            if gfx not in _V4_FP8_SUPPORTED_GFX:
+                _warn_dsv4_fp8_downgrade(gfx)
+                self.use_fp8_kv = False
         del c4_state_pool_size, c128_state_pool_size, dtype, state_dtype
         del c4_state_dtype, c128_state_dtype, sliding_window
         del enable_memory_saver, enable_hisparse, online_mtp_max_draft_tokens
