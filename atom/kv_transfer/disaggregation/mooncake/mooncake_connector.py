@@ -374,6 +374,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
             "local_slot_index": getattr(seq, "per_req_cache_group", -1),
+            "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
 
         if not self.is_producer:

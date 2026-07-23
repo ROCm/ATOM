@@ -1036,11 +1036,14 @@ class Scheduler:
             # Snapshot the genuine prefix-cache hit at admission. After this,
             # num_cached_tokens is repurposed to track chunked-prefill progress
             # (it grows to the full prompt length in postprocess), so it can't be
-            # used to report the cache hit. Set once per seq (Phase-2 admission
-            # only); Phase-1 resume doesn't recompute num_cached_blocks.
-            seq.prefix_cache_hit_tokens = (
-                num_cached_blocks * self.block_manager.block_size
-            )
+            # used to report the cache hit. A PD decode consumer does no local
+            # prefix match (num_cached_blocks == 0) but inherits the prefill
+            # node's real hit in Sequence.__init__; the guard keeps that inherited
+            # value from being clobbered here and across any later re-admission.
+            if not seq.prefix_cache_hit_tokens:
+                seq.prefix_cache_hit_tokens = (
+                    num_cached_blocks * self.block_manager.block_size
+                )
 
             self._notify_connector_after_prefill_alloc(seq)
 
