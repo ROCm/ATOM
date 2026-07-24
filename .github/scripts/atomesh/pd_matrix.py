@@ -245,10 +245,16 @@ def build_cell(
     )
     required_nodes = required_node_count(pd_worker_layout, prefill_cfg, decode_cfg)
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
-    allow_auto_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
+    allow_auto_nodes = slurm_submit_runner in {
+        "atomesh-cicd-mi350",
+        "atomesh-cicd-crusoe-mi355",
+    }
+    requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
 
     nodes = resolve_nodes(suite_cfg.get("nodes"))
-    if allow_auto_nodes:
+    if allow_auto_nodes and not requires_explicit_candidate_nodes:
+        nodes = []
+    if allow_auto_nodes and requires_explicit_candidate_nodes:
         if not nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs a non-empty "
