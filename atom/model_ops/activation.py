@@ -9,10 +9,15 @@ from aiter import silu_and_mul
 from atom.config import QuantizationConfig
 from atom.quant_spec import LayerQuantConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from atom.utils.arch import aiter_hip_kernels_supported
 
 from aiter import (
     QuantType,
 )
+
+# aiter HIP silu_and_mul emits gfx9-only instructions; route to torch-native
+# (F.silu(x) * y) on RDNA/other unsupported arches.
+_AITER_HIP_ACT_SUPPORTED = aiter_hip_kernels_supported()
 
 
 def mxfp4_act_mul_quant_fuse_fake(
@@ -105,6 +110,8 @@ class SiluAndMul(nn.Module):
         ):
             return mxfp4_act_mul_quant_fuse(x, shuffle=True)
         else:
+            if not _AITER_HIP_ACT_SUPPORTED:
+                return self.forward_native(x, x_scale)
             out = torch.empty(
                 [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
             )
