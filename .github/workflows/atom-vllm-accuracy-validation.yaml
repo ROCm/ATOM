@@ -1006,6 +1006,11 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
+          if [ "${CONTAINER_ENGINE}" = "podman" ]; then
+            GROUP_ADD_FLAG="--group-add keep-groups"
+          else
+            GROUP_ADD_FLAG="--group-add video"
+          fi
 
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -1022,7 +1027,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add keep-groups \
+            --ipc=host $GROUP_ADD_FLAG \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
