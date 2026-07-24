@@ -1470,53 +1470,11 @@ class MLAAttention(nn.Module):
                     device=q_nope.device,
                 )
             if kv_cache.numel() > 0:
-                if self.dcp_world_size > 1 and context.is_prefill:
-                    # Sparse prefill-MLA + DCP: the fused *prefill* CK kernel
-                    # still early-returns on slot=-1 (Q RoPE skipped), so keep the
-                    # split workaround here. (Decode + DCP below uses the fixed
-                    # fused kernel, which now computes Q RoPE for every token and
-                    # writes KV only for owned slots.)
-                    self.rotary_emb(positions, q_rope, k_rope)
-                    q_out = torch.cat([q_nope, q_rope], dim=-1)
-                    if q_out.dtype != attn_metadata.dtype_q:
-                        # fp8: match the fused kernel's q quant (value / scale);
-                        # tensor arithmetic only (a host sync is illegal under
-                        # cudagraph capture).
-                        q_out = (q_out / self._q_scale).to(attn_metadata.dtype_q)
-                    concat_and_cache_mla(
-                        k_nope,
-                        k_rope.squeeze(1),
-                        kv_cache,
-                        attn_metadata.slot_mapping.flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
-                    )
-                elif self.dcp_world_size > 1:
-                    # Decode + DCP: the fixed CK fused kernel computes Q RoPE for
-                    # every token (needed by all ranks after the head all-gather)
-                    # and writes KV only where slot_mapping >= 0 (owned tokens).
-                    # q is quantized to fp8 internally via _q_scale when needed.
-                    fused_qk_rope_concat_and_cache_mla(
-                        q_nope,
-                        q_rope,
-                        k_nope,
-                        k_rope,
-                        kv_cache.view(
-                            kv_cache.shape[0],
-                            -1,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                        ),
-                        q_out,
-                        attn_metadata.slot_mapping,
-                        self._k_scale,
-                        self._q_scale,
-                        positions,
-                        self.rotary_emb.cos_cache,
-                        self.rotary_emb.sin_cache,
-                        is_neox=self.rotary_emb.is_neox_style,
-                        is_nope_first=True,
-                    )
-                elif envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                if (
+                    envs.ATOM_USE_TRITON_MLA
+                    and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV
+                    and self.dcp_world_size == 1
+                ):
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_fused_qk_rope_cat_and_cache_mla(
                         q_nope,
@@ -1535,7 +1493,7 @@ class MLAAttention(nn.Module):
                         q_out=q_out,
                         shuffled_kv_cache=True,
                     )
-                elif self.use_seg_mla:
+                elif self.use_seg_mla and self.dcp_world_size == 1:
                     kv_cache_seg = self._seg_kv_cache_view(kv_cache)
                     fused_qk_rope_concat_and_cache_mla_seg(
                         q_nope,
@@ -1554,6 +1512,9 @@ class MLAAttention(nn.Module):
                         is_neox=self.rotary_emb.is_neox_style,
                     )
                 else:
+                    # DCP: q_out is head all-gathered, so every rank must compute
+                    # Q RoPE for all tokens (incl. slot=-1 non-owned). Non-DCP
+                    # keeps the default (early-return on padded tokens).
                     fused_qk_rope_concat_and_cache_mla(
                         q_nope,
                         q_rope,
@@ -1573,6 +1534,7 @@ class MLAAttention(nn.Module):
                         self.rotary_emb.sin_cache,
                         is_neox=self.rotary_emb.is_neox_style,
                         is_nope_first=True,
+                        compute_all_q=self.dcp_world_size > 1,
                     )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 

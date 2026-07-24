@@ -1076,6 +1076,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     self.rotary_emb.sin_cache,
                     is_neox=self.rotary_emb.is_neox_style,
                     is_nope_first=True,
+                    # DCP: q_out is head all-gathered, so every rank must compute
+                    # Q RoPE for all tokens (incl. slot=-1 non-owned). Non-DCP
+                    # keeps the default (early-return on padded tokens).
+                    compute_all_q=self.dcp_world_size > 1,
                 )
             else:
                 if fp8_attention:
@@ -1320,6 +1324,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 self.rotary_emb.sin_cache,
                 is_neox=self.rotary_emb.is_neox_style,
                 is_nope_first=True,
+                # DCP: compute Q RoPE for all tokens (q_out is head all-gathered);
+                # non-DCP keeps the default early-return on slot=-1 padded tokens.
+                compute_all_q=self.dcp_world_size > 1,
             )
 
         if self.head_repeat_factor > 1:
