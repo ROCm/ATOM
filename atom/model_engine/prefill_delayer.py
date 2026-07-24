@@ -14,6 +14,14 @@ prefill is worth a forward, then release** — Nagle's algorithm for prefill.
 While it holds, decode keeps running (nothing is wasted); TTFT is bounded so a
 held request never starves.
 
+Single-rank / TP-only mode
+--------------------------
+With ``cpu_group=None`` (``dp_size=1``) the delayer runs the same coalescer
+locally and skips the cross-rank ``all_reduce`` — a single scheduler drives all
+TP workers, so there is no cross-rank phase to align. Only the batching value
+remains (fill / stall / ttft / kv bounds decide FIRE/HOLD from this rank's own
+counts); the ``n_prefillable < dp_size`` alignment gate is vacuous.
+
 It is NOT about mixing prefill+decode in one forward. It DOES preserve cross-DP
 phase alignment: it only releases when every rank is prefill-ready (so all ranks
 enter prefill together and the MoE collective stays aligned), except when a
@@ -282,19 +290,20 @@ class PrefillDelayer:
         self._reduce_buf[4] = 1 if kv_low else 0
         self._reduce_buf[5] = 1 if has_partial else 0
         self._reduce_buf[6] = 1 if queue_hot else 0
-        try:
-            torch.distributed.all_reduce(
-                self._reduce_buf,
-                op=torch.distributed.ReduceOp.SUM,
-                group=self.cpu_group,
-            )
-        except RuntimeError:
-            logger.warning(
-                "PrefillDelayer all_reduce failed (peer down?); admitting prefill "
-                "and deferring to the DP-state shutdown barrier."
-            )
-            self._reset()
-            return True
+        if self.cpu_group is not None:
+            try:
+                torch.distributed.all_reduce(
+                    self._reduce_buf,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.cpu_group,
+                )
+            except RuntimeError:
+                logger.warning(
+                    "PrefillDelayer all_reduce failed (peer down?); admitting "
+                    "prefill and deferring to the DP-state shutdown barrier."
+                )
+                self._reset()
+                return True
 
         # One host<-device readback for all 7 slots (a single .tolist() beats
         # seven .item() boundary crossings on this per-tick hot path).

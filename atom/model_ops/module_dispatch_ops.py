@@ -149,3 +149,56 @@ direct_register_custom_op(
     fake_impl=_indexer_score_topk_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
+
+
+def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if not tbo_active():
+        return tensor_model_parallel_all_reduce(x)
+
+    # Default "inline": correct Plan-A baseline (no overlap, never hangs). Only
+    # move the AR onto the comm stream when explicitly opted into "overlap".
+    if envs.ATOM_TBO_TP_AR_MODE != "overlap":
+        return tensor_model_parallel_all_reduce(x)
+
+    from atom.utils.tbo.ubatching import (
+        tbo_current_ubatch_id,
+        tbo_get_comm_stream,
+        tbo_get_ubatch_tp_comm,
+        tbo_switch_to_compute_sync,
+        tbo_yield_and_switch_from_compute_to_comm,
+    )
+
+    ubatch_id = tbo_current_ubatch_id()
+
+    ub_comm = tbo_get_ubatch_tp_comm(ubatch_id)
+    if ub_comm is None:
+        # world_size == 1: nothing to reduce.
+        return x
+
+    # Hand the CPU baton to the partner ubatch and move onto the comm stream,
+    # so this AR overlaps the partner's compute.
+    tbo_yield_and_switch_from_compute_to_comm()
+    comm_stream = tbo_get_comm_stream()
+    # out-of-place all_reduce on this ubatch's dedicated communicator, launched
+    # on the comm stream (current stream after the switch above).
+    x = ub_comm.all_reduce(x, stream=comm_stream)
+
+    tbo_switch_to_compute_sync()
+    return x
+
+
+def _tbo_all_reduce_fake(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="tbo_all_reduce",
+    op_func=tbo_all_reduce,
+    mutates_args=(),
+    fake_impl=_tbo_all_reduce_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)

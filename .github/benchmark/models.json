@@ -36,6 +36,14 @@
           "conc_max": 256
         },
         {
+          "label": "TBO",
+          "suffix": "-tbo",
+          "extra_args": "--enable-tbo",
+          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
+          "conc_min": 64,
+          "conc_max": 256
+        },
+        {
           "label": "DPA",
           "suffix": "-dpa",
           "extra_args": "--enable-dp-attention",
