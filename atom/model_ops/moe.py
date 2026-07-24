@@ -2407,6 +2407,19 @@ direct_register_custom_op(
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
+def get_aiter_topk_metadata_max_tokens(atom_config: Config, use_ep: bool) -> int:
+    """Return the topK metadata capacity required by the active MoE layout.
+
+    In DP-attention + EP, MoE/topK operates on the token view gathered across
+    DP ranks, so buffers sized only for the local per-rank token budget are too
+    small. Keep non-DP-attention paths unchanged to avoid unnecessary memory use.
+    """
+
+    max_num_tokens = int(atom_config.max_num_batched_tokens)
+    if bool(atom_config.enable_dp_attention) and use_ep:
+        dp_size = int(getattr(atom_config.parallel_config, "data_parallel_size", 1))
+        max_num_tokens *= max(1, dp_size)
+    return max_num_tokens
 
 @FusedMoEDecoratorForPluginMode
 class FusedMoE(torch.nn.Module):
@@ -2572,7 +2585,8 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=atom_config.max_num_batched_tokens,
+                max_num_tokens=get_aiter_topk_metadata_max_tokens(atom_config, self.use_ep), 
+                # max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
         if fuse_shared_experts:

@@ -51,14 +51,33 @@ def _materialize_atom_dummy_forward(
     ForwardBatch,
 ]:
     """Convert an empty SGLang IDLE batch into ATOM-style dummy inputs."""
+    # if positions is None and input_ids is None and input_embeds is None:
+    #     raise RuntimeError("SGLang dummy forward materialization requires positions,input ids, input embeds")
+    # if positions is None:
+    #     raise RuntimeError("SGLang dummy forward materialization requires positions")
+    # if input_ids is None:
+    # raise RuntimeError("SGLang dummy forward materialization requires input_ids")
+    if positions is not None:
+        reference = positions
+    elif input_ids is not None:
+        reference = input_ids
+    elif input_embeds is not None:
+        reference = input_embeds
+    else:
+        raise RuntimeError(
+            "SGLang dummy forward materialization requires positions,input ids, input embeds"
+        )
 
-    if positions is None:
-        raise RuntimeError("SGLang dummy forward materialization requires positions")
-    if input_ids is None:
-        raise RuntimeError("SGLang dummy forward materialization requires input_ids")
-
-    dummy_positions = positions.new_zeros((1,))
-    dummy_input_ids = input_ids.new_zeros((1,))
+    dummy_positions = (
+        positions.new_zeros((1,))
+        if positions is not None
+        else torch.zeros((1,), dtype=torch.long, device=reference.device)
+    )
+    dummy_input_ids = (
+        input_ids.new_zeros((1,))
+        if input_ids is not None
+        else torch.zeros((1,), dtype=torch.long, device=reference.device)
+    )
     dummy_input_embeds = _pad_dummy_like(input_embeds, length=1, fill_value=0)
 
     model_forward_batch = copy.copy(forward_batch)
@@ -86,7 +105,6 @@ def _resolve_num_tokens_across_dp(
     atom_config: Any,
     forward_batch: ForwardBatch,
     num_tokens: int,
-    is_dummy_run: bool,
 ) -> torch.Tensor:
     """Resolve per-DP token counts for ATOM's CPU-side DPMetadata."""
 
@@ -117,11 +135,10 @@ def _resolve_num_tokens_across_dp(
             (dp_size,), num_tokens, dtype=torch.int32, device="cpu"
         )
 
-    if is_dummy_run:
-        # SGLang reports idle ranks as 0 tokens, but ATOM materializes them
-        # as one local dummy token so collectives and DPMetadata stay aligned.
-        dp_rank = atom_config.parallel_config.data_parallel_rank
-        num_tokens_across_dp[dp_rank] = num_tokens
+    # SGLang reports idle ranks as 0 tokens, but ATOM materializes every idle
+    # rank as one physical dummy token. Normalize the complete vector on every
+    # rank so collectives and DPMetadata use identical sizes.
+    num_tokens_across_dp.clamp_min_(1)
     return num_tokens_across_dp
 
 
@@ -378,16 +395,29 @@ def _set_atom_forward_context(
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
     is_prefill = forward_mode.is_prefill()
-    num_tokens = int(positions.shape[0])
+    # Qwen-VL mRoPE positions use [3, num_tokens], while ordinary position
+    # tensors use [num_tokens]. The token dimension is therefore the last
+    # dimension for mRoPE rather than the leading coordinate dimension.
+    num_tokens = int(
+        positions.shape[-1]
+        if positions.ndim == 2 and positions.shape[0] == 3
+        else positions.shape[0]
+    )
 
-    if bool(atom_config.enable_dp_attention):
+    enable_dp_attention = bool(atom_config.enable_dp_attention)
+    if enable_dp_attention:
         num_tokens_across_dp = _resolve_num_tokens_across_dp(
-            atom_config, forward_batch, num_tokens, is_dummy_run
+            atom_config, forward_batch, num_tokens
         )
         graph_bs = int(torch.max(num_tokens_across_dp).item())
     else:
         num_tokens_across_dp = None
         graph_bs = num_tokens if is_prefill else batch_size
+
+    global_forward_mode = getattr(forward_batch, "global_forward_mode", None)
+    dp_uniform_decode = not enable_dp_attention or bool(
+        global_forward_mode is not None and global_forward_mode.is_decode_or_idle()
+    )
 
     context = Context(
         positions=positions,
@@ -395,6 +425,7 @@ def _set_atom_forward_context(
         is_dummy_run=is_dummy_run,
         batch_size=batch_size,
         graph_bs=graph_bs,
+        dp_uniform_decode=dp_uniform_decode,
     )
     set_forward_context(
         attn_metadata=attn_metadata,
