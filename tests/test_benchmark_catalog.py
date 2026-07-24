@@ -157,9 +157,15 @@ def test_param_lists_override_and_conc_band():
     cells = catalog.build_cells(
         CATALOG, param_lists="1024,1024,512,0.7", model_filter={"deepseek-v4-pro"}
     )
-    assert sorted(c["suffix"] for c in cells) == ["-dpa", "-dpa-mtp3", "-dpa-tbo"]
+    assert sorted(c["suffix"] for c in cells) == [
+        "-dpa",
+        "-dpa-dspark",
+        "-dpa-mtp3",
+        "-dpa-tbo",
+    ]
     rfs = {c["result_filename"] for c in cells}
     assert "deepseek-v4-pro-dpa-1024-1024-512-0.7" in rfs
+    assert "deepseek-v4-pro-dpa-dspark-1024-1024-512-0.7" in rfs
     assert "deepseek-v4-pro-dpa-mtp3-1024-1024-512-0.7" in rfs
     assert "deepseek-v4-pro-dpa-tbo-1024-1024-512-0.7" in rfs
 

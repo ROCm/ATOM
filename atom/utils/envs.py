@@ -84,6 +84,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # DeepSeek-V4 paged-SWA: retain the FULL sliding-window KV history in the
+    # content-addressed SWA cache instead of the default window-only prefill
+    # write. Default OFF preserves the window-only optimization (writes only each
+    # prefill chunk's trailing `window` tokens). When ON, swa_write persists the
+    # whole chunk and ensure_for_tokens materializes every block, so cross-request
+    # prefix hits can reuse the middle SWA blocks (agentic branch/replay reuse) —
+    # the live sliding-window free is UNCHANGED (out-of-window refs still released
+    # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
+    # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
+    # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
+    "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
+    # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
+    # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
+    # the bytes of one compressed block, so a 1:1 mirror starves the compressed
+    # prefix index; a small fraction keeps compressed near full while retaining
+    # the hot-boundary tail working set (LRU-evicted). Only consulted when
+    # ATOM_SWA_FULL_RETAIN=1. Default 0.2; tune 0.15-0.25 with cache-hit
+    # instrumentation. Clamped to (0, 0.9).
+    "ATOM_SWA_TAIL_BUDGET_FRAC": lambda: float(
+        os.getenv("ATOM_SWA_TAIL_BUDGET_FRAC", "0.2")
+    ),
+    # DeepSeek-V4 paged-SWA sparse checkpoint retention (only with
+    # ATOM_SWA_FULL_RETAIN=1). Tokens per retained SWA-tail checkpoint: 0 = dense
+    # (retain every written tail, relies on pool size — floods a small pool);
+    # >0 = keep a tail only once per this-many-tokens segment plus at each prompt
+    # boundary, and PIN those so live-window churn cannot overwrite them (mirrors
+    # vLLM VLLM_PREFIX_CACHE_RETENTION_INTERVAL / SlidingWindowManager sparse
+    # reachable_block_mask). Should be a multiple of the KV block size; 32768
+    # matches the vLLM trace-replay tuning. Default 0 (dense).
+    "ATOM_SWA_RETENTION_INTERVAL": lambda: int(
+        os.getenv("ATOM_SWA_RETENTION_INTERVAL", "0")
+    ),
+    # Fraction of the SWA pool that pinned checkpoint tails may occupy (LRU-capped)
+    # when sparse retention is on; the rest stays free for live-window churn.
+    "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(
+        os.getenv("ATOM_SWA_CHECKPOINT_FRAC", "0.5")
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
@@ -137,6 +174,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
+    # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
+    "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
+        os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
+    ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
@@ -255,6 +297,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
+    # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
+    # They are configured via --dspark-config (JSON dict) and carried in
+    # config.dspark (see atom/config.py DSparkConfig). See
+    # recipes/DeepSeek-V4-DSpark.md.
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under
@@ -267,25 +314,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fill target: release prefill once accumulated pending tokens reach
     # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
     # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT
-    # cost. Default 0.7.
+    # cost. Default 0.9.
     "ATOM_PREFILL_DELAYER_TARGET_FILL": lambda: float(
-        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.7")
+        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.9")
     ),
     # TTFT bound: max consecutive scheduler ticks a held prefill waits before
     # force-release (deterministic across ranks; replaces the old wall-clock +
     # pass-count pair).
     "ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "30")
+        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "200")
     ),
     # Tight bound (ticks) for a held mid-chunked-prefill: a partial holds already
     # allocated KV, so it force-releases sooner than a fresh prefill.
     "ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "8")
+        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "100")
     ),
     # Consecutive non-growing ticks after which the coalescer gives up waiting
     # (burst ended, more won't come) and releases.
     "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "3")
+        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "10")
     ),
     # KV high watermark: at/above this KV usage a prefillable rank force-releases
     # (can't accumulate a bigger batch anyway).
@@ -320,6 +367,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
+    # --- PCP MoE comm mode ---
+    # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
+    # Only meaningful when prefill_context_parallel_size > 1;
+    # Default "1": all-gather hidden 1/W -> full before MoE and slice
+    # full -> 1/W after, so MoE sees the complete token set (MoE itself is
+    # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
+    # "0": MoE runs on each rank's 1/W token shard with no extra comm.
+    "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.

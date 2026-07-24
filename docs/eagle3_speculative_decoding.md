@@ -1,4 +1,4 @@
-# EAGLE 3 / EAGLE 3.1 Speculative Decoding
+# EAGLE 3 / EAGLE 3.1 speculative decoding
 
 ATOM supports the EAGLE-family speculative decoding methods through the
 `--method eagle3` CLI flag. This guide covers both the original EAGLE 3 path
@@ -8,9 +8,7 @@ in May 2026 (`fc_norm`, post-norm hidden state feedback, MLA draft variant).
 For the framework that hosts both methods, see
 [`serving_benchmarking_guide.md` § 6](serving_benchmarking_guide.md).
 
----
-
-## 1. EAGLE 3 vs EAGLE 3.1
+## EAGLE 3 vs EAGLE 3.1
 
 EAGLE 3 is a self-distilled drafter that runs one transformer decoder layer
 per speculative step over the concatenation of an embedding tensor and a
@@ -38,9 +36,7 @@ per-user output throughput at concurrency 1** on Kimi-K2.6-NVFP4 + vLLM TP=4
 (GB200). See the [vLLM blog post](https://vllm.ai/blog/2026-05-26-eagle-3-1)
 and the original integration in [vLLM PR #42764](https://github.com/vllm-project/vllm/pull/42764).
 
----
-
-## 2. Drafter architectures
+## Drafter architectures
 
 ATOM ships two EAGLE 3 drafter classes, both routed through
 `atom.spec_decode.eagle.support_eagle_model_arch_dict` based on the draft
@@ -58,9 +54,7 @@ re-implementing it. Because its KV shape is identical to the target's, no
 parallel `Eagle3MLADraftBuilder` is needed — the draft slots into the target
 pool as one additional layer (accounted for by `num_nextn_predict_layers`).
 
----
-
-## 3. Drafter forward contract
+## Drafter forward contract
 
 To support post-norm feedback, `forward()` on EAGLE 3.1 drafters returns a
 tuple:
@@ -79,11 +73,9 @@ hidden_for_logits, hidden_for_next_step = model(input_ids, positions, hidden_sta
 `isinstance(model_out, tuple)`, so legacy drafters returning a single tensor
 continue to work without changes.
 
----
+## Usage
 
-## 4. Usage
-
-### 4.1 K2.6 + EAGLE 3.1 MLA draft
+### K2.6 + EAGLE 3.1 MLA draft
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -101,7 +93,7 @@ The draft `config.json` should expose `fc_norm: true`, `norm_output: true`,
 `eagle_config.eagle_aux_hidden_state_layer_ids` list. These drive the routing
 and toggles automatically — no extra CLI flags.
 
-### 4.2 K2.5 + legacy EAGLE 3 draft (backward-compat)
+### K2.5 + legacy EAGLE 3 draft (backward-compat)
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -118,25 +110,21 @@ The legacy draft's `config.json` has none of the new fields, so all `getattr`
 toggles fall through to their EAGLE 3 defaults. Behavior is byte-equivalent
 to pre-EAGLE-3.1 ATOM.
 
----
-
-## 5. Runtime acceptance stats
+## Runtime acceptance stats
 
 ATOM's scheduler already emits per-window acceptance via the `SpecStats`
 class (`atom/model_engine/scheduler.py`). With
 `num_speculative_tokens=3`, a `[MTP Stats]` line appears every 1000 decode
 steps in the server log:
 
-```
+```text
 [MTP Stats] acceptance: 59.62%  avg toks/fwd: 2.79  dist 0/1/2/3: 21.69/19.53/16.97/41.80%
 ```
 
 No instrumentation needed — read these directly from the server's stdout log
 (`docker logs <container>` or the `tee` target you launched it under).
 
----
-
-## 6. Reference: 8× MI355X validation
+## Reference: 8× MI355X validation
 
 Measured 2026-05-27 on the `rocm/atom-dev:latest` container, TP=8, MXFP4
 targets, gsm8k 5-shot, 1319 samples.
@@ -157,9 +145,7 @@ rather than the long-context production workload EAGLE 3.1 was designed for.
 A direct K2.6-target ablation requires an additional K2.5-style EAGLE 3
 draft sized to K2.6, which is not yet publicly available.
 
----
-
-## 7. Implementation notes for contributors
+## Implementation notes for contributors
 
 - **Adding a new MLA target's EAGLE 3.1 draft**: register an HF arch rewrite
   in `Config.hf_config_override` (`atom/config.py`), add the entry to
@@ -179,9 +165,7 @@ draft sized to K2.6, which is not yet publicly available.
   EAGLE-related changes — instrument at call sites (`EagleProposer.propose`,
   `ModelRunner.run_model`) instead. See the project `CLAUDE.md`.
 
----
-
-## 8. References
+## References
 
 - vLLM integration PR (merged main, ships v0.22.0): https://github.com/vllm-project/vllm/pull/42764
 - TorchSpec training PR: https://github.com/lightseekorg/TorchSpec/pull/97

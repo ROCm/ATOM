@@ -7,8 +7,9 @@ from transformers import AutoTokenizer
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.utils.arg_parser import FlexibleArgumentParser
 
-parser = argparse.ArgumentParser(
+parser = FlexibleArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="Offline profiling example for Atom LLM Engine",
 )

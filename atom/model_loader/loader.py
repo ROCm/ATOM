@@ -124,7 +124,14 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight)
     elif loaded_weight.numel() // get_tp_group().world_size == param.data.numel():
         loaded_weight_per_rank = loaded_weight.numel() // get_tp_group().world_size
-        tp_rank_start = loaded_weight_per_rank * get_tp_group().rank
+        # Offset MUST use the TP-group-local rank (rank_in_group), NOT the global
+        # rank: `.world_size` above is the TP group size, so the two must be from
+        # the same (TP-group) frame. `.rank` is torch.distributed.get_rank()
+        # (global). They coincide only when world == tp (pure TP); under PCP/DP/PP
+        # the world splits into multiple TP groups, so a group's global ranks
+        # (e.g. PCP rank 1 = global 4..7) exceed its world_size (4), making this
+        # slice out of bounds → empty → copy_ fails.
+        tp_rank_start = loaded_weight_per_rank * get_tp_group().rank_in_group
         tp_rank_end = tp_rank_start + loaded_weight_per_rank
         param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
     else:
@@ -202,6 +209,7 @@ def load_model_in_plugin_mode(
     load_fused_expert_weights_fn=None,
     spec_decode: bool = False,
     hf_config_override: AutoConfig | None = None,
+    model_name_or_path_override: str | None = None,
 ) -> set[str]:
 
     # during loading model, the outplace operation may consume more
@@ -216,7 +224,9 @@ def load_model_in_plugin_mode(
     assert (
         config.plugin_config is not None and config.plugin_config.is_plugin_mode
     ), "ATOM is not running in plugin mode"
-    if config.plugin_config.is_vllm:
+    if model_name_or_path_override is not None:
+        model_name_or_path = model_name_or_path_override
+    elif config.plugin_config.is_vllm:
         model_name_or_path = config.plugin_config.model_config.model
     elif config.plugin_config.is_sglang:
         model_name_or_path = config.plugin_config.model_config.model_path

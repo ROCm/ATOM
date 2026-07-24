@@ -3,7 +3,7 @@
     {
       "isl": 1024,
       "osl": 1024,
-      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512],
       "random_range_ratio": 0.8
     },
     {
@@ -40,7 +40,7 @@
           "suffix": "-dpa",
           "extra_args": "--enable-dp-attention",
           "conc_min": 64,
-          "conc_max": 1024
+          "conc_max": 2048
         },
         {
           "label": "DPA TBO",
@@ -48,7 +48,7 @@
           "extra_args": "--enable-dp-attention --enable-tbo",
           "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
           "conc_min": 256,
-          "conc_max": 1024
+          "conc_max": 2048
         },
         {
           "label": "DPA MTP3",
@@ -57,6 +57,15 @@
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 1024
+        },
+        {
+          "label": "DPA DSpark",
+          "suffix": "-dpa-dspark",
+          "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode PIECEWISE --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
+          "bench_args": "--use-chat-template",
+          "conc_min": 64,
+          "conc_max": 512
         }
       ]
     },
@@ -88,7 +97,7 @@
       "config": {
         "tp": 4,
         "kv_cache_dtype": "fp8",
-        "extra_args": "--no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"mxfp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}'"
+        "extra_args": "--no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}'"
       },
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },

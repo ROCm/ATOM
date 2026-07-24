@@ -138,6 +138,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
 
+        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
+        if self.dcp_world_size > 1:
+            from aiter.dist.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
+        else:
+            self.dcp_rank = 0
+
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
             (work_meta_data_size, work_meta_data_type),
@@ -1024,6 +1032,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta(batch, bs)
 
         attn_metadata.dtype_q = self.dtype_q
+        # TBO: publish CPU length copies for zero-sync ubatch splits.
+        # Attached last, once all metadata is finalized. No-op unless TBO is on.
+        self._attach_tbo_prefill_cpu_lens(attn_metadata, bs)
         return attn_metadata, positions
 
     def _build_mla_chunk_meta(
@@ -1243,12 +1254,30 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     for pos in range(seq_len - max_seqlen_q, seq_len)
                 ]
             else:
-                slot_mapping = [
-                    block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                    for block_table, last_block_num in zip(
-                        block_tables, batch.last_block_num_tokens
-                    )
-                ]
+                if self.dcp_world_size > 1:
+                    slot_mapping = []
+                    block_size = self.model_runner.block_size
+                    virtual_block_size = block_size * self.dcp_world_size
+                    for block_table, seq_len in zip(block_tables, context_lens):
+                        pos = seq_len - 1
+                        if pos % self.dcp_world_size == self.dcp_rank:
+                            blk_idx = pos // virtual_block_size
+                            vb_offset = pos % virtual_block_size
+                            local_offset = vb_offset // self.dcp_world_size
+                            slot_mapping.append(
+                                block_table[blk_idx] * block_size + local_offset
+                            )
+                        else:
+                            slot_mapping.append(-1)
+                else:
+                    slot_mapping = [
+                        block_table[-1] * self.model_runner.block_size
+                        + last_block_num
+                        - 1
+                        for block_table, last_block_num in zip(
+                            block_tables, batch.last_block_num_tokens
+                        )
+                    ]
         positions = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
@@ -1262,7 +1291,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0
 
-        if any(batch.is_first_decode_without_local_prefill):
+        if self.dcp_world_size > 1:
+            from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+
+            local_context_lens = get_dcp_local_seq_lens(
+                context_lens, self.dcp_world_size, self.dcp_rank
+            )
+            num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
+        elif any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
                 (
                     len(batch.block_tables[i])
@@ -1284,9 +1320,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.prepare_block_tables(batch)
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
-        var["kv_last_page_lens"].np[:scheduled_bs] = (
-            batch.last_block_num_tokens if self.block_size != 1 else 1
-        )
+        if self.dcp_world_size > 1 and self.block_size != 1:
+            local_last = local_context_lens % self.block_size
+            var["kv_last_page_lens"].np[:scheduled_bs] = np.where(
+                local_last == 0,
+                np.where(local_context_lens > 0, self.block_size, 0),
+                local_last,
+            )
+        else:
+            var["kv_last_page_lens"].np[:scheduled_bs] = (
+                batch.last_block_num_tokens if self.block_size != 1 else 1
+            )
         var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
         vars_used = [
             ("slot_mapping", bs * max_seqlen_q),
@@ -1337,17 +1381,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 vars_used.append(("sparse_kv_indptr", bs + 1))
                 metadata_deps.add("sparse_kv_indptr")
 
-        prep_stream = self.prep_stream
         vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
         vars_remaining = [(el, num) for el, num in vars_used if el not in metadata_deps]
         max_seqlen_k = context_lens.max()
 
+        # The side prep_stream overlaps the metadata H2D copies + kv_indices
+        # generation with the main stream. Under intra-GPU disagg the decode runs
+        # on a CU-masked stream, and the prep_stream's wait_stream barriers
+        # serialize against it, adding per-step decode latency. So in disagg mode
+        # do the copies synchronously on the current stream; otherwise keep the
+        # async overlap.
+        disagg = self.model_runner.config.enable_rapidserve
         ctx = {}
         ctx["kv_indptr"] = var["kv_indptr"].copy_to_gpu(bs + 1)
-        # prep_stream does remaining copies + kv_indices
-        current_stream = torch.cuda.current_stream()
-        prep_stream.wait_stream(current_stream)
-        with torch.cuda.stream(prep_stream):
+        if disagg:
             ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
             ctx.update(ctx_rest)
             ctx["kv_indices"] = var["kv_indices"].gpu
@@ -1358,9 +1405,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.block_ratio,
                 max_seqlen_k,
             )
+        else:
+            prep_stream = self.prep_stream
+            current_stream = torch.cuda.current_stream()
+            prep_stream.wait_stream(current_stream)
+            with torch.cuda.stream(prep_stream):
+                ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
+                ctx.update(ctx_rest)
+                ctx["kv_indices"] = var["kv_indices"].gpu
+                kv_indices_generate_triton(
+                    ctx["block_tables"],
+                    ctx["kv_indices"],
+                    ctx["kv_indptr"],
+                    self.block_ratio,
+                    max_seqlen_k,
+                )
 
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
-        # metadata copies on main_stream
+        # metadata copies on main stream
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
 
@@ -1374,7 +1436,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
             ctx_mla_ps_sparse = None
         ctx.update(ctx_mla_ps)
-        current_stream.wait_stream(prep_stream)
+        if not disagg:
+            current_stream.wait_stream(prep_stream)
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,

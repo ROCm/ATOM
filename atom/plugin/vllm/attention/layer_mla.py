@@ -305,6 +305,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self.cp_kv_cache_interleave_size = (
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
         )
+        self.need_to_return_lse_for_decode = (
+            get_current_vllm_config().parallel_config.decode_context_parallel_size > 1
+        )
         self.is_aiter_triton_fp4_bmm_enabled = (
             envs.ATOM_USE_TRITON_MXFP4_BMM
             and self.kv_b_proj.weight.dtype == torch.bfloat16
@@ -545,6 +548,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 toks=toks,
             )
 
+            kv_c_normed = kv_c_normed.squeeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
@@ -803,9 +807,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
         B = q.shape[0]
+        num_heads_q = q.shape[1]
         o = torch.empty(
             B,
-            self.padded_num_heads,
+            num_heads_q,
             self.kv_lora_rank,
             dtype=attn_metadata.decode.attn_out_dtype,
             device=q.device,
@@ -813,8 +818,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
+        # DCP decode needs LSE from mla_decode_fwd; persistent mode does not
+        # return it, so disable persistent mode whenever DCP is active.
         use_persistent_mode = attn_metadata.decode.use_persistent_metadata and not (
-            self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
+            self.dcp_world_size > 1
         )
         if not use_persistent_mode:
             work_meta_data = None
@@ -861,7 +868,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             q = q.view(new_total_s, new_nhead, -1)
             o = o.view(new_total_s, new_nhead, -1)
 
-        mla_decode_fwd(
+        return_lse = self.dcp_world_size > 1
+
+        _, lse = mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
@@ -879,12 +888,15 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             reduce_partial_map=reduce_partial_map,
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
+            return_lse=return_lse,
         )
         if do_fold:
             o = o.view(ori_total_s, ori_nhead, -1)
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :]
-        return o, None
+            if lse is not None:
+                lse = lse[:, :: self.head_repeat_factor]
+        return o, lse
 
     def forward_impl(
         self,
@@ -993,7 +1005,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 self._has_fused_rope_cache = hasattr(
                     ops, "concat_and_cache_mla_rope_fused"
                 )
-            if kv_cache.numel() > 0 and self._has_fused_rope_cache:
+            if (
+                kv_cache.numel() > 0
+                and self._has_fused_rope_cache
+                and self.dcp_world_size <= 1
+            ):
+                # Need to adjust the fused kernel for DCP. As for now, we
+                # just skip concat_and_cache_mla_rope_fused when enable DCP.
                 ops.concat_and_cache_mla_rope_fused(
                     positions,
                     q[..., self.qk_nope_head_dim :],
@@ -1070,37 +1088,60 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 )
 
             if decode_only:
-                decode_q = torch.empty(
-                    (
-                        decode_ql_nope.shape[0],
-                        self.num_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=(
-                        dtypes.fp8
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else self.dtype
-                    ),
-                    device=decode_ql_nope.device,
-                )
-                aiter.fused_qk_rope_concat_and_cache_mla(
-                    decode_ql_nope,
-                    decode_q_pe,
-                    k_c_normed,
-                    k_pe.squeeze(1),
-                    kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                    ),
-                    decode_q,
-                    attn_metadata.slot_mapping,
-                    self._k_scale,
-                    self._q_scale,
-                    positions,
-                    self.rotary_emb.cos_cache,
-                    self.rotary_emb.sin_cache,
-                    is_neox=self.rotary_emb.is_neox_style,
-                    is_nope_first=True,
-                )
+                if self.dcp_world_size > 1:
+                    # DCP workaround: aiter.fused_qk_rope_concat_and_cache_mla
+                    # has DCP bug: slot_idx < 0 causes early return,
+                    # skipping Q RoPE and q_out write.
+                    # Split into separate RoPE + concat + cache write.
+                    self.rotary_emb(positions, decode_q_pe, k_pe)
+                    decode_q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
+                    if kv_cache.numel() > 0:
+                        aiter.concat_and_cache_mla(
+                            k_c_normed,
+                            k_pe.squeeze(1),
+                            kv_cache.view(
+                                kv_cache.shape[0],
+                                -1,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                            ),
+                            attn_metadata.slot_mapping.flatten(),
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            scale=self._k_scale,
+                        )
+                else:
+                    decode_q = torch.empty(
+                        (
+                            decode_ql_nope.shape[0],
+                            self.num_heads,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        dtype=(
+                            dtypes.fp8
+                            if self.kv_cache_dtype.startswith("fp8")
+                            else self.dtype
+                        ),
+                        device=decode_ql_nope.device,
+                    )
+                    aiter.fused_qk_rope_concat_and_cache_mla(
+                        decode_ql_nope,
+                        decode_q_pe,
+                        k_c_normed,
+                        k_pe.squeeze(1),
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        decode_q,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        is_nope_first=True,
+                    )
             else:
                 if fp8_attention:
                     assert decode_ql_nope.shape[0] == decode_q_pe.shape[0]

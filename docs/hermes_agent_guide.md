@@ -8,7 +8,7 @@
 - Python 3.10+
 - `pip` or `uv` package manager
 
-## Step 1: Start ATOM
+## Step 1: start ATOM
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -27,7 +27,7 @@ curl http://localhost:8000/v1/models
 
 Note the model ID from the response — you will use it in Step 3.
 
-## Step 2: Install Hermes Agent
+## Step 2: install Hermes Agent
 
 ```bash
 # Clone the repo
@@ -40,7 +40,7 @@ source ~/.hermes-venv/bin/activate
 uv pip install -e ".[all]"
 ```
 
-## Step 3: Configure Hermes to use ATOM
+## Step 3: configure Hermes to use ATOM
 
 Create (or edit) `~/.hermes/config.yaml`:
 
@@ -70,7 +70,7 @@ custom_providers:
     model: "Qwen/Qwen3-32B"
 ```
 
-## Step 4: Run Hermes
+## Step 4: run Hermes
 
 ```bash
 source ~/.hermes-venv/bin/activate
@@ -80,7 +80,7 @@ hermes
 
 You should see the Hermes Agent TUI with your ATOM model name in the header.
 
-## Alternative: Environment Variables
+## Alternative: Environment variables
 
 Instead of `config.yaml`, you can configure via environment variables in a `.env` file in the `hermes-agent` directory:
 
@@ -90,13 +90,13 @@ OPENAI_BASE_URL=http://localhost:8000/v1
 OPENAI_API_KEY=dummy
 ```
 
-## Alternative: CLI Flags
+## Alternative: CLI flags
 
 ```bash
 hermes --provider custom --model <model-id>
 ```
 
-## How It Works
+## How it works
 
 Hermes Agent treats ATOM as any OpenAI-compatible endpoint via the `custom` provider (same as vLLM, LM Studio, or llama.cpp). All inference requests go through the standard `/v1/chat/completions` API. Features supported:
 
