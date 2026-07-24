@@ -1237,7 +1237,7 @@ class Config:
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
-    # EPLB master switch + sub-config (vLLM style).
+    # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 

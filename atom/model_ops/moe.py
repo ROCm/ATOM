@@ -27,6 +27,7 @@ from atom.config import (
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.eplb import (
     eplb_map_logical_to_physical,
+    eplb_map_and_record_fused,
     record_eplb_expert_load,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
@@ -446,8 +447,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        topk_physical = eplb_map_logical_to_physical(layer, topk_logical)
-        record_eplb_expert_load(layer, topk_physical)
+        # Fused logical->physical remap + expert-load record (one Triton
+        # launch, replaces the ~18-op map+record pair; big decode win).
+        topk_physical = eplb_map_and_record_fused(layer, topk_logical)
         return topk_weights, topk_physical
 
     @staticmethod
@@ -1091,6 +1093,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_swizzle_layout = w2_swizzle_layout
             return
 
+        # FlyDSL MegaMoE fused (ATOM_USE_FLYDSL_FUSED=1): build MegaMoE-layout
+        # weights from the RAW mxfp4 w13/w2 BEFORE atom's own shuffle overwrites them.
+        from atom.model_ops.fused_moe.mori_prepare_finalize import _use_flydsl_fused
+
+        if _use_flydsl_fused():
+            from atom.model_ops.fused_moe.flydsl_mega_experts import (
+                build_mega_weights,
+            )
+
+            build_mega_weights(layer)
+            print("[MEGA] built MegaMoE-layout weights for fused EP", flush=True)
+            # 坑2: under fused EP, apply() early-returns run_mega_moe (uses _mega_*),
+            # so the raw aiter-layout w13/w2 are a DEAD fallback. Releasing them (and
+            # skipping the redundant shuffle) avoids storing MoE weights twice, which
+            # otherwise crushes the KV cache ~35x (see PERF_REPORT §6.6).
+            import torch as _torch
+
+            layer.w13_weight.data = _torch.empty(
+                0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
+            )
+            layer.w2_weight.data = _torch.empty(
+                0, dtype=layer.w2_weight.dtype, device=layer.w2_weight.device
+            )
+            return
+
         if self.use_triton_decode:
             # Triton decode is GGUU-only (gate/up separated). Snapshot only the
             # raw SCALES (small) before the FlyDSL shuffle overwrites them — the
@@ -1390,6 +1417,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
+        # FlyDSL MegaMoE fused EP: replace the whole experts step (dispatch +
+        # gemm1 + quant + gemm2 + combine) with MegaMoE.forward.
+        from atom.model_ops.fused_moe.mori_prepare_finalize import _use_flydsl_fused
+
+        if _use_flydsl_fused() and getattr(layer, "_mega_w1", None) is not None:
+            from atom.model_ops.fused_moe.flydsl_mega_experts import run_mega_moe
+
+            return run_mega_moe(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                model_dim=self.hidden_size,
+                inter_dim=self.intermediate_size,
+                experts=global_num_experts,
+                topk=top_k,
+                quant="a8w4",
+            )
+
         if self.fused_experts is None:
             return fused_moe(
                 x,

@@ -10,6 +10,14 @@ from typing import Any, Optional
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+try:
+    import triton
+    import triton.language as tl
+
+    _EPLB_HAS_TRITON = True
+except ImportError:
+    _EPLB_HAS_TRITON = False
+
 import logging
 
 logger = logging.getLogger("atom")
@@ -1448,6 +1456,21 @@ class ExpertLoadMonitor:
             return
         self._cur_pass_count.zero_()
 
+    def pass_count_buffer(
+        self, layer_id: int, num_physical: int
+    ) -> Optional[torch.Tensor]:
+        """Return the [num_physical] cur-pass load row for layer_id, or None
+        if recording is disabled / uninitialized / out of capacity. Lets the
+        fused EPLB map+record kernel atomic_add straight into the live buffer
+        (same target as record())."""
+        if not self.enabled or self._cur_pass_count is None:
+            return None
+        if layer_id < 0 or layer_id >= self._num_layers:
+            return None
+        if num_physical != self._num_physical:
+            return None
+        return self._cur_pass_count[layer_id]
+
     def record(
         self, *, layer_id: int, topk_physical: torch.Tensor, num_physical: int
     ) -> None:
@@ -1472,12 +1495,12 @@ class ExpertLoadMonitor:
             )
 
     def on_forward_end(self, is_dummy_run: bool, is_pure_prefill: bool = True) -> None:
-        # Non-pure-prefill forwards (decode, DP-mixed) are treated like dummy
-        # runs: on_forward_pass_end still advances the rebalance step to keep all
-        # ranks lockstep, but their load is NOT committed to the window -- EPLB
-        # balances on prefill load only. Committing is a purely local op, so
-        # skipping it per-rank never desyncs the (step-driven, collective)
-        # rebalance.
+        # Commit this pass's load to the sliding window ONLY on a real
+        # (non-dummy) pure-prefill forward -- EPLB balances on prefill load
+        # only, so decode / DP-mixed / dummy passes are dropped here. Committing
+        # is a purely local op, so gating it per-rank never desyncs the
+        # (step-driven, collective) rebalance -- lockstep is enforced separately
+        # by on_forward_pass_end, which advances on a group-uniform prefill flag.
         if (
             not self.enabled
             or is_dummy_run
@@ -1631,6 +1654,13 @@ class EPLBManager:
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
         self._p2p_batch_chunk_size: int = 32
+        # True iff the DP group == the migration (EP) group. When True the DP
+        # sync's `any_rank_has_prefill` already spans exactly the migration
+        # collective, so the prefill gate reuses it for free (no extra collective).
+        # When False we OR the local prefill flag over the migration group
+        # ourselves. Resolved once in bind_runtime_owner (fail-safe default False
+        # => self-compute, which is always correct).
+        self._dp_is_migration_group: bool = False
 
     def bind_runtime_owner(self, owner: Any) -> None:
         """Scan the owner's model for EP MoE layers and build runtime metadata.
@@ -1741,6 +1771,21 @@ class EPLBManager:
             # new_group is collective over the default group; every rank calls it.
             ep_global_ranks = torch.distributed.get_process_group_ranks(self._ep_group)
             self._migration_group = torch.distributed.new_group(ranks=ep_global_ranks)
+            # If the DP group is exactly the migration group, the DP sync's
+            # any_rank_has_prefill already spans it -> reuse it (free). Otherwise
+            # keep False and OR the prefill flag over the migration group ourselves.
+            try:
+                from aiter.dist.parallel_state import get_dp_group
+
+                dp_ranks = torch.distributed.get_process_group_ranks(
+                    get_dp_group().device_group
+                )
+                self._dp_is_migration_group = sorted(dp_ranks) == sorted(
+                    ep_global_ranks
+                )
+            except Exception:
+                self._dp_is_migration_group = False
+            logger.info("EPLB dp_is_migration_group=%s", self._dp_is_migration_group)
         except Exception as exc:
             raise RuntimeError(
                 "EPLB is enabled but EP process group is unavailable; "
@@ -1782,16 +1827,32 @@ class EPLBManager:
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
         num_local = self.live_metadata.num_local_physical_experts
-        names = (
-            "w13_weight",
-            "w2_weight",
-            "w13_weight_scale",
-            "w2_weight_scale",
-            "w13_input_scale",
-            "w2_input_scale",
-            "w13_bias",
-            "w2_bias",
-        )
+        # MegaMoE fused EP (ATOM_USE_FLYDSL_FUSED=1) empties w13/w2_weight in
+        # process_weights_after_loading and keeps the real weights on _mega_*
+        # (shuffle_weight_w4 / shuffle_scale_w4 / shuffle_weight / e8m0_shuffle,
+        # then .view(-1) -> 1-D). Those shuffles are all per-expert (their permute
+        # never touches dim0=experts), so the flattened [E*S] buffers stay
+        # expert-contiguous and the per-slot slicing below relocates correct bytes.
+        # Migrate _mega_* instead of the emptied w13/w2_weight.
+        _is_mega = getattr(layer, "_mega_w1", None) is not None
+        if _is_mega:
+            names = (
+                "_mega_w1",
+                "_mega_w1_scale",
+                "_mega_w2",
+                "_mega_w2_scale",
+            )
+        else:
+            names = (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_input_scale",
+                "w2_input_scale",
+                "w13_bias",
+                "w2_bias",
+            )
         # Infer the per-rank expert count from a reliable per-expert weight tensor
         # (w13/w2_weight have dim0 == #experts on this rank). Shuffled FP4 scales
         # are FLATTENED to [#experts * per_expert_rows, K] (expert-contiguous), so
@@ -1800,11 +1861,18 @@ class EPLBManager:
         # one expert) and migration moves the wrong scale bytes → relocated experts
         # get mismatched scales → wrong FP4 dequant → accuracy loss (no crash).
         ref_experts = None
-        for _nm in ("w13_weight", "w2_weight"):
-            _t = getattr(layer, _nm, None)
-            if isinstance(_t, torch.Tensor) and _t.dim() > 0:
-                ref_experts = int(_t.shape[0])
-                break
+        if _is_mega:
+            # w13_weight is emptied under mega; the authoritative per-rank physical
+            # expert count is num_local (== build-time _mega_local_E == num_physical
+            # // ep_size, redundant included). All _mega_* are 1-D [E*S], so the
+            # flattened-view branch below reshapes each to per-expert [E, S] and slices.
+            ref_experts = int(num_local)
+        else:
+            for _nm in ("w13_weight", "w2_weight"):
+                _t = getattr(layer, _nm, None)
+                if isinstance(_t, torch.Tensor) and _t.dim() > 0:
+                    ref_experts = int(_t.shape[0])
+                    break
         tensors: list[torch.Tensor] = []
         for name in names:
             tensor = getattr(layer, name, None)
@@ -1976,10 +2044,40 @@ class EPLBManager:
     def last_balancedness(self) -> Optional[float]:
         return self._last_balancedness
 
-    def on_forward_pass_end(self, is_dummy_run: bool) -> None:
-        # Keep scheduler lockstep regardless of dummy/non-dummy.
-        _ = is_dummy_run
+    def on_forward_pass_end(
+        self,
+        local_has_prefill: bool,
+        dp_any_has_prefill: Optional[bool] = None,
+    ) -> None:
+        # Advance the rebalance generator ONLY on steps with prefill activity, so
+        # a pure-decode step never advances the counter nor triggers the (sync,
+        # default-stream) migration -- keeping decode off the EPLB critical path
+        # and tying the interval to prefill activity. The flag is reduced to a
+        # migration-group-uniform signal, so all ranks advance/freeze in lockstep.
+        # This has-prefill gate coincides with the recording gate's pure-prefill
+        # commit under ATOM's no-mixed-batch invariant (a pass is all-prefill or
+        # all-decode); revisit both together if mixed batches land.
         if not self.enabled:
+            return
+
+        # Resolve a migration-group-uniform has-prefill flag.
+        if self._dp_is_migration_group and dp_any_has_prefill is not None:
+            # DP group == migration group: reuse the DP sync's has-prefill OR for
+            # free (no extra collective).
+            has_prefill = dp_any_has_prefill
+        else:
+            # OR the local has-prefill flag over exactly the migration collective
+            # (the group the rebalance actually runs on).
+            flag = torch.tensor(
+                [1 if local_has_prefill else 0], device="cuda", dtype=torch.int32
+            )
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self._migration_group
+            )
+            has_prefill = bool(flag.item())
+
+        if not has_prefill:
+            # Pure-decode step across the migration group: do not advance.
             return
         next(self._gen)
 
@@ -2331,8 +2429,14 @@ def with_eplb_forward_monitor(fn):
                 getattr(batch, "total_tokens_num_prefill", 0) > 0
                 and getattr(batch, "total_tokens_num_decode", 0) == 0
             )
+            # Recording gate commits clean load on pure-prefill only (local op).
             monitor.on_forward_end(is_dummy_run, is_pure_prefill)
-            manager.on_forward_pass_end(is_dummy_run)
+            # Step gate advances on prefill ACTIVITY (has-prefill), reduced to a
+            # group-uniform flag. Coincides with the pure-prefill commit above
+            # under the no-mixed-batch invariant (see on_forward_pass_end).
+            local_has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
+            dp_any_has_prefill = getattr(self, "_eplb_any_rank_has_prefill", None)
+            manager.on_forward_pass_end(local_has_prefill, dp_any_has_prefill)
 
     return wrapper
 
@@ -2387,3 +2491,115 @@ def record_eplb_expert_load(layer: Any, topk_physical: "torch.Tensor") -> None:
     monitor.record(
         layer_id=layer_id, topk_physical=topk_physical, num_physical=num_physical
     )
+
+
+# ---------------------------------------------------------------------------
+# Fused logical->physical remap + expert-load record (one Triton launch).
+# Replaces eplb_map_logical_to_physical (~10 ops) + record_eplb_expert_load
+# (~8 ops) on the hot path; decode (few tokens) is launch-overhead bound, so
+# collapsing ~18 ops/layer to 1 kernel/layer is a large decode win.
+# Semantics preserved exactly: per-rank dispatch gather (NOT vLLM per-token
+# replica hash), tail id -> +id_delta, invalid(<0) kept, record into
+# _cur_pass_count[layer_id]. Mirrors vLLM _eplb_map_and_record_i32_kernel.
+# ---------------------------------------------------------------------------
+if _EPLB_HAS_TRITON:
+
+    @triton.jit
+    def _eplb_map_record_kernel(
+        topk_ids_ptr,  # [numel]        logical ids (in dtype)
+        dispatch_ptr,  # [num_logical]  this rank's logical->physical (int32)
+        out_ids_ptr,  # [numel]        output physical ids (in dtype)
+        load_ptr,  # [num_physical] _cur_pass_count[layer_id]; dummy if !RECORD
+        num_logical,
+        id_delta,
+        num_physical,
+        numel,
+        RECORD: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < numel
+
+        lid = tl.load(topk_ids_ptr + offs, mask=mask, other=-1).to(tl.int64)
+        valid = (lid >= 0) & (lid < num_logical)
+        is_tail = lid >= num_logical
+
+        safe_lid = tl.where(valid, lid, 0)
+        mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(
+            tl.int64
+        )
+        # valid -> dispatch[lid]; tail -> lid + id_delta; invalid(<0) -> lid (keep)
+        phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
+        tl.store(out_ids_ptr + offs, phys, mask=mask)
+
+        if RECORD:
+            in_range = (phys >= 0) & (phys < num_physical)
+            rec_mask = mask & in_range
+            safe_phys = tl.where(in_range, phys, 0)
+            tl.atomic_add(load_ptr + safe_phys, 1, mask=rec_mask)
+
+
+def eplb_map_and_record_fused(layer: Any, topk_ids: "torch.Tensor") -> "torch.Tensor":
+    """Fused logical->physical remap + expert-load record (one Triton launch).
+
+    Drop-in replacement for the sequence
+        topk_physical = eplb_map_logical_to_physical(layer, topk_logical)
+        record_eplb_expert_load(layer, topk_physical)
+    Returns topk_ids unchanged when EPLB metadata is unavailable (non-EP /
+    pre-rebalance). Falls back to the original two-function path if Triton is
+    unavailable.
+    """
+    meta = get_live_expert_location_metadata()
+    layer_id = getattr(layer, "layer_id", None)
+    if meta is None or not isinstance(layer_id, int):
+        return topk_ids
+
+    if not _EPLB_HAS_TRITON:
+        topk_physical = eplb_map_logical_to_physical(layer, topk_ids)
+        record_eplb_expert_load(layer, topk_physical)
+        return topk_physical
+
+    numel = topk_ids.numel()
+    if numel == 0:
+        return topk_ids
+
+    # Per-rank dispatch table (int32, [num_logical]); a fixed-address view into
+    # the meta tensor (rebalance writes it in place via copy_), cudagraph-safe.
+    dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id]
+    if dispatch.device != topk_ids.device:
+        dispatch = dispatch.to(topk_ids.device)
+    num_logical = int(dispatch.numel())
+    num_physical = int(meta.num_physical_experts)
+    id_delta = num_physical - num_logical
+
+    # Resolve record buffer (== _cur_pass_count[layer_id]); None disables it.
+    # eplb_enable is static (server lifetime), so RECORD is a compile-time
+    # constexpr -> cudagraph capture fixes it, no per-step host branch.
+    from atom.config import get_current_atom_config
+
+    load_buf = None
+    atom_cfg = get_current_atom_config()
+    if bool(getattr(atom_cfg, "eplb_enable", False)):
+        monitor = get_expert_load_monitor(
+            enabled=True, window_size=atom_cfg.eplb_config.load_window_size
+        )
+        load_buf = monitor.pass_count_buffer(layer_id, num_physical)
+    record = load_buf is not None
+
+    out = torch.empty_like(topk_ids)
+    topk_c = topk_ids.contiguous()
+    grid = lambda meta_kw: (triton.cdiv(numel, meta_kw["BLOCK"]),)
+    _eplb_map_record_kernel[grid](
+        topk_c,
+        dispatch,
+        out,
+        load_buf if record else out,  # dummy ptr when !RECORD (never written)
+        num_logical,
+        id_delta,
+        num_physical,
+        numel,
+        RECORD=record,
+        BLOCK=256,
+    )
+    return out
