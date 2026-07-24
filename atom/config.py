@@ -588,6 +588,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
+    "minimax_m3_vl": "text_config",
 }
 
 # multimodal models fully supported by plugin mode
@@ -632,10 +633,20 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             and "quantization_config" in config_dict
         ):
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
-        text_model_type = text_config_dict.get("model_type", "deepseek_v3")
-        mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        config_class = AutoConfig.for_model(mapped_type)
-        hf_config = config_class.from_dict(text_config_dict)
+        if "model_type" not in text_config_dict:
+            # The text sub-config declares no `model_type` of its own (e.g.
+            # MiniMax-M3's minimax_m3_vl wrapper). Parse it with the base
+            # config so every field is retained and no foreign (e.g. deepseek
+            # MLA) defaults are injected; the model class reads its own fields
+            # via getattr. Stamp the model_type from the top-level type so
+            # downstream policy can key off it.
+            hf_config = PretrainedConfig(**text_config_dict)
+            hf_config.model_type = model_type.removesuffix("_vl")
+        else:
+            text_model_type = text_config_dict.get("model_type", "deepseek_v3")
+            mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
+            config_class = AutoConfig.for_model(mapped_type)
+            hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.
         original_arch = config_dict.get("architectures", [])
