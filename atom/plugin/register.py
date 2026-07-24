@@ -494,8 +494,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if bool(torch.equal(graph_accept_lens, accept_lens)):
                     return original_draft_extend_for_decode(self, batch, batch_result)
             except (
-                Exception
-            ):  # noqa: BLE001 - preserve upstream behavior on probing errors
+                Exception  # noqa: BLE001 - preserve upstream behavior on probing errors
+            ):
                 return original_draft_extend_for_decode(self, batch, batch_result)
 
             # SGLang's accept_lens includes the target bonus token, but
