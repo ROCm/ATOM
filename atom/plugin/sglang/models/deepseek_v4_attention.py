@@ -39,14 +39,22 @@ def _install_draft_extend_fused_swa_patch() -> None:
             # swa_kv is now the flat [pages, head_dim] paged pool (project 024);
             # the ring stride (== swa_cache_size == cs) lives on attn.swa_block_size.
             cache_size = int(attn.swa_block_size)
+            kv_fp8 = bool(getattr(attn, "kv_fp8", False))
             kwargs.update(
-                swa_kv=attn.swa_kv,
+                fp8_2buff=kv_fp8,
                 swa_block_tables=attn_md.swa_block_tables,
                 swa_block_size=cache_size,
                 batch_id_per_token=attn_md.batch_id_per_token,
                 swa_cu_seqlens_q=attn_md.cu_seqlens_q,
                 swa_write_per_batch=min(int(attn_md.max_seqlen_q), cache_size),
             )
+            if kv_fp8:
+                kwargs.update(
+                    swa_nope_scale_buff=attn.swa_kv,
+                    swa_rope_buff=attn.swa_kv_rope,
+                )
+            else:
+                kwargs["swa_kv"] = attn.swa_kv
         return original_qk_norm_rope_maybe_quant(*args, **kwargs)
 
     def swa_write(*args, **kwargs):

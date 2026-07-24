@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import ctypes
 import bisect
 import gc
 import inspect
@@ -753,24 +754,8 @@ class ModelRunner:
                 model_class, "quant_exclude_name_mapping", {}
             ),
         )
-        self.model = model_class(config)
-        fused_shared_expert_load_fn = None
-        if hasattr(self.model, "load_fused_expert_weights"):
-            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
-        torch.set_default_device(None)
-        load_start = time.perf_counter()
-        load_model(
-            self.model,
-            config.model,
-            config.hf_config,
-            config.load_dummy,
-            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
-        )
-        load_elapsed = time.perf_counter() - load_start
-        logger.info(
-            f"[{self.rank_name}] Model load done: {config.model} "
-            f"(weights loaded in {load_elapsed:.2f}s)"
-        )
+
+        self._build_and_load_model(model_class)
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -857,8 +842,7 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
-        self.warmup_model()
-        logger.info(f"Model warmup done: {config.model}")
+        self._maybe_warmup()
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -869,6 +853,44 @@ class ModelRunner:
                 self.drafter.model = torch.compile(
                     self.drafter.model, fullgraph=True, backend="eager"
                 )
+
+    def _build_and_load_model(self, model_class):
+        """Construct the model and load its weights from disk.
+
+        Override point: subclasses (e.g. the rapidserve decode process) may
+        construct on the meta device and import weights via IPC instead.
+        """
+        config = self.config
+        self.model = model_class(config)
+        fused_shared_expert_load_fn = None
+        if hasattr(self.model, "load_fused_expert_weights"):
+            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
+        torch.set_default_device(None)
+        load_start = time.perf_counter()
+        load_model(
+            self.model,
+            config.model,
+            config.hf_config,
+            config.load_dummy,
+            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
+        )
+        load_elapsed = time.perf_counter() - load_start
+        logger.info(
+            f"[{self.rank_name}] Model load done: {config.model} "
+            f"(weights loaded in {load_elapsed:.2f}s)"
+        )
+
+    def _maybe_warmup(self):
+        """Run model warmup. Override point: the rapidserve decode process
+        skips warmup since it imports weights/kvcache from prefill later."""
+        self.warmup_model()
+        logger.info(f"Model warmup done: {self.config.model}")
+
+    def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
+        """Extra GPU bytes to hold back from the KV cache budget beyond the
+        base overhead. Base runner reserves nothing; override point for
+        setups that share the GPU with another process."""
+        return 0
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -1584,6 +1606,8 @@ class ModelRunner:
         available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
+        # Subclasses may reserve extra headroom (override point).
+        available_for_kv_budget -= self._kv_budget_extra_reserve(total)
         # This prevents OOM when other processes share the GPU.
         available_for_kv = min(available_for_kv_budget, free)
 
@@ -3236,6 +3260,7 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
+
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -3246,6 +3271,7 @@ class ModelRunner:
             hidden_states,
             needs_independent_noise=needs_independent_noise,
         )
+
         reset_forward_context()
 
         return fwd_output
@@ -3986,3 +4012,508 @@ class ModelRunner:
             token_points[-1],
             sps_table.numel(),
         )
+
+
+class RapidServeModelRunner(ModelRunner):
+    """ModelRunner for intra-GPU prefill/decode disaggregation.
+
+    The same class runs in both the prefill and decode processes; behavior that
+    differs between them keys off config.disagg_is_decode.
+    """
+
+    def __init__(self, rank, config):
+        if not config.disagg_is_decode:
+            self.forward = self.prefill_forward
+        super().__init__(rank, config)
+        import hashlib
+
+        # Session ID derived from the disagg IPC address so IPC handoff temp
+        # files from different engine runs never collide.
+        self._disagg_session_id = hashlib.md5(
+            config.disagg_kvcache_ipc_addr.encode()
+        ).hexdigest()[:12]
+
+    @staticmethod
+    @contextmanager
+    def _init_weight_params_on_meta():
+        """Construct a model with all `nn.Parameter`s on the meta device (no
+        persistent GPU weight allocation), leaving the default device unchanged
+        so init code that explicitly targets CUDA (e.g. aiter RoPE) and buffers
+        work normally. Each parameter is briefly created on the real device then
+        replaced with a meta tensor, so the transient peak is one parameter, not
+        the whole model. Used by decode in disagg, which fills params from
+        prefill via IPC.
+        """
+        orig_register = torch.nn.Module.register_parameter
+
+        def register_parameter(self, name, param):
+            orig_register(self, name, param)
+            p = self._parameters.get(name)
+            if p is not None:
+                self._parameters[name] = torch.nn.Parameter(
+                    p.detach().to("meta"), requires_grad=p.requires_grad
+                )
+
+        torch.nn.Module.register_parameter = register_parameter
+        try:
+            yield
+        finally:
+            torch.nn.Module.register_parameter = orig_register
+
+    # ------------------------------------------------------------------
+    # Base ModelRunner override points
+    # ------------------------------------------------------------------
+
+    def _build_and_load_model(self, model_class):
+        config = self.config
+        if not config.disagg_is_decode:
+            super()._build_and_load_model(model_class)
+            return
+        # Decode imports prefill's weights via CUDA IPC and owns no weight
+        # memory. Build on the meta device so construction allocates zero GPU
+        # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
+        # import_model_weight_ipc_handles() materializes params from prefill,
+        # and RoPE caches are recomputed locally.
+        with self._init_weight_params_on_meta():
+            self.model = model_class(config)
+        torch.set_default_device(None)
+
+    def _maybe_warmup(self):
+        # Decode owns no GPU memory yet (weights/kvcache imported from prefill
+        # later), so warmup would run against meta-device tensors — skip it.
+        if self.config.disagg_is_decode:
+            return
+        super()._maybe_warmup()
+
+    def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
+        # Two processes share the GPU in disagg mode; reserve extra headroom so
+        # NCCL/system allocs (e.g. the 512MB NCCL barrier buffer) don't OOM.
+        safety_margin = int(total_bytes * 0.02)
+        return 4 * safety_margin
+
+    def get_num_blocks(self) -> dict[str, int]:
+        # Decode in disagg mode owns no GPU memory — kvcache is imported from
+        # prefill.
+        if self.config.disagg_is_decode:
+            return {"num_kvcache_blocks": 0}
+        return super().get_num_blocks()
+
+    def allocate_kv_cache(self, num_kvcache_blocks):
+        # Decode in disagg mode: kvcache is imported from prefill, not allocated.
+        if self.config.disagg_is_decode:
+            logger.info("decode skipping kv cache allocation")
+            return True
+        return super().allocate_kv_cache(num_kvcache_blocks)
+
+    @torch.inference_mode()
+    def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        # Decode runs the model forward on a dynamically selected (optionally
+        # CU-masked) stream so it doesn't contend with prefill on the shared
+        # GPU; postprocess (sampling + async CPU copy) stays on the default
+        # stream. The stream pool is created by DecodeEngineCore via
+        # create_decode_stream_pool().
+        stream = self._decode_streams[batch.cu_stream_fraction]
+        self._done_event.record()
+        stream.wait_event(self._done_event)
+        with torch.cuda.stream(stream):
+            (
+                input_ids,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise,
+            ) = self.prepare_model(batch)
+            logits, hidden_states = self.run_model(input_ids, batch)
+        self._model_fwd_event.record(stream)
+        torch.cuda.current_stream().wait_event(self._model_fwd_event)
+
+        # postprocess (sampling + async CPU copy) always runs on default stream.
+        fwd_output = self.postprocess(
+            batch,
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            hidden_states,
+            needs_independent_noise=needs_independent_noise,
+        )
+
+        reset_forward_context()
+        return fwd_output
+
+    # ------------------------------------------------------------------
+    # Disagg IPC helpers (TP-aware)
+    #
+    # With TP>1, AsyncIOProcManager broadcasts each RPC to all ranks but only
+    # rank 0's return value reaches the engine (the other ranks' output sockets
+    # are wired to None).  For IPC handle exchange we therefore use a per-rank
+    # temp-file rendezvous: every rank pickles its local handles to
+    #   /tmp/atom_disagg_<tag>_rank<N>.pkl
+    # Rank 0 waits until all N files exist, then returns the list of paths to
+    # the engine.  On the import side every rank reads its own file (index=self.rank).
+    # ------------------------------------------------------------------
+
+    def _disagg_rank_file_path(self, tag: str, rank: int) -> str:
+        import tempfile
+
+        return os.path.join(
+            tempfile.gettempdir(),
+            f"atom_disagg_{self._disagg_session_id}_{tag}_rank{rank}.pkl",
+        )
+
+    def _disagg_write_rank_file(self, tag: str, payload) -> str:
+        """Pickle *payload* to a session-unique per-rank temp file.
+
+        Uses a session ID derived from the disagg IPC address so that files
+        from different engine runs never collide.  No deletion: all ranks
+        write concurrently when they receive the broadcast RPC, so rank 0
+        must never delete sibling files.
+        """
+        import pickle
+
+        path = self._disagg_rank_file_path(tag, self.rank)
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)
+        return path
+
+    def _disagg_collect_rank_files(self, tag: str) -> list[str] | None:
+        """Rank 0: poll until all world_size rank files exist, return paths.
+        Other ranks: return None immediately (rank 0 is the sole publisher).
+        """
+        import time
+
+        if self.rank != 0:
+            return None
+        paths = [self._disagg_rank_file_path(tag, r) for r in range(self.world_size)]
+        deadline = time.monotonic() + 120  # 2 min timeout
+        while time.monotonic() < deadline:
+            if all(os.path.exists(p) for p in paths):
+                return paths
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"Timed out waiting for disagg rank files for tag={tag!r}: "
+            + str([p for p in paths if not os.path.exists(p)])
+        )
+
+    def export_model_weight_ipc_handles(self) -> list[str] | None:
+        """Export all model parameters as CUDA IPC handles (prefill process only).
+
+        TP-aware: each rank writes its own handles to a temp file.  Rank 0 waits
+        for all ranks' files and returns the list of paths; other ranks return None.
+        Decode calls import_model_weight_ipc_handles(paths) to replace its own
+        weight tensors with zero-copy views into prefill's allocation.
+        """
+        from atom.model_engine.ipc_utils import export_model_weight_handles
+
+        logger.info(f"ModelRunner rank {self.rank}: export_model_weight_ipc_handles")
+        handles = export_model_weight_handles(self.model)
+        self._disagg_write_rank_file("weights", handles)
+        paths = self._disagg_collect_rank_files("weights")
+        if paths is not None:
+            logger.info(f"ModelRunner rank 0: all {self.world_size} weight files ready")
+        return paths  # non-None only for rank 0
+
+    def import_model_weight_ipc_handles(self, paths: list[str]) -> bool:
+        """Replace model parameters with views into prefill's GPU allocation.
+
+        TP-aware: each rank reads its own handles file (index=self.rank) and
+        deletes it after import.  Returns True as sentinel for wait_out=True.
+        """
+        from atom.model_engine.ipc_utils import import_model_weights
+        import gc
+        import pickle
+
+        path = paths[self.rank]
+        logger.info(f"ModelRunner rank {self.rank}: reading weight handles from {path}")
+        with open(path, "rb") as f:
+            handles = pickle.load(f)
+        os.remove(path)
+        import_model_weights(self.model, handles)
+        gc.collect()
+        torch.cuda.empty_cache()
+        # Surface any tensor prefill didn't export (would crash later in forward).
+        leftover = [n for n, p in self.model.named_parameters() if p.is_meta] + [
+            n
+            for n, b in self.model.named_buffers()
+            if isinstance(b, torch.Tensor) and b.is_meta
+        ]
+        if leftover:
+            logger.warning(
+                f"ModelRunner rank {self.rank}: {len(leftover)} tensors still on "
+                f"meta after IPC import (not materialized): {leftover[:10]}"
+            )
+        logger.info(
+            f"ModelRunner rank {self.rank}: weight IPC import complete — own weights freed"
+        )
+        return True
+
+    def export_kv_cache_ipc_handle(self) -> list[str] | None:
+        """Export self.kv_cache (and self.kv_scale for fp8) as CUDA IPC handles.
+
+        TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
+        all ranks and returns the list of paths; other ranks return None.
+        """
+        from atom.model_engine.ipc_utils import export_kv_cache_handle
+
+        logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
+        kv_scale = getattr(self, "kv_scale", None)
+        handles = export_kv_cache_handle(self.kv_cache, kv_scale)
+        self._disagg_write_rank_file("kvcache", handles)
+        paths = self._disagg_collect_rank_files("kvcache")
+        if paths is not None:
+            logger.info(
+                f"ModelRunner rank 0: all {self.world_size} kvcache files ready"
+            )
+        return paths  # non-None only for rank 0
+
+    def import_kv_cache_ipc_handle(
+        self, paths: list[str], num_kvcache_blocks: int
+    ) -> bool:
+        """Import kvcache from prefill's GPU allocation into this (decode) process.
+
+        TP-aware: each rank reads its own handles file (index=self.rank) and
+        deletes it after import.  Also imports kv_scale when present (fp8).
+        Returns True as sentinel for wait_out=True.
+        """
+        from atom.model_engine.ipc_utils import import_kv_cache
+        import pickle
+
+        self.num_physical_kvcache_blocks = (
+            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
+        )
+        path = paths[self.rank]
+        logger.info(
+            f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"
+        )
+        with open(path, "rb") as f:
+            meta = pickle.load(f)
+        os.remove(path)
+        logger.info(f"ModelRunner rank {self.rank}: hipIpcOpenMemHandle for kvcache...")
+        self.kv_cache, kv_scale = import_kv_cache(meta)
+        if kv_scale is not None:
+            self.kv_scale = kv_scale
+        logger.info(
+            f"ModelRunner rank {self.rank}: kvcache IPC import done, binding..."
+        )
+        self._bind_kv_cache_to_modules()
+        logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
+        return True
+
+    def _bind_kv_cache_to_modules(self):
+        """Bind self.kv_cache (and self.kv_scale if present) to all attention
+        modules.  Called after replacing self.kv_cache with an IPC-imported
+        tensor (decode process), where the builder-based binding path in
+        allocate_kv_cache() is skipped."""
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads >= self.world_size:
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            num_kv_heads = 1
+        x = 16 // self.kv_cache.element_size()
+
+        models_to_bind = [("target", self.model)]
+        if self.config.speculative_config and hasattr(self, "drafter"):
+            models_to_bind.append(("draft", self.drafter.model))
+
+        kv_cache_tensors = []
+        layer_id = 0
+        for _model_name, model in models_to_bind:
+            for module in model.modules():
+                if hasattr(module, "base_attention"):
+                    if hasattr(module, "use_mla") and not module.use_mla:
+                        if self.is_qwen_next():
+                            attn_idx = layer_id // self.full_attention_interval
+                        else:
+                            attn_idx = layer_id
+                        k_cache = self.kv_cache[0, attn_idx].view(
+                            self.num_physical_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim // x,
+                            self.physical_block_size,
+                            x,
+                        )
+                        v_cache = self.kv_cache[1, attn_idx].view(
+                            self.num_physical_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim,
+                            self.physical_block_size,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        if config.kv_cache_dtype == "fp8":
+                            module.k_scale = self.kv_scale[0, attn_idx]
+                            module.v_scale = self.kv_scale[1, attn_idx]
+                        from atom.config import KVCacheTensor
+
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                layer_num=layer_id,
+                                k_cache=k_cache,
+                                v_cache=v_cache,
+                                k_scale=module.k_scale,
+                                v_scale=module.v_scale,
+                            )
+                        )
+                        module.k_cache = k_cache
+                        module.v_cache = v_cache
+                        layer_id += 1
+                    elif hasattr(module, "use_mla") and module.use_mla:
+                        kv_cache = self.kv_cache[layer_id].view(
+                            self.num_physical_kvcache_blocks * self.physical_block_size,
+                            1,
+                            576,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        from atom.config import KVCacheTensor
+
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                layer_num=layer_id,
+                                k_cache=kv_cache,
+                                v_cache=None,
+                                k_scale=None,
+                                v_scale=None,
+                            )
+                        )
+                        module.kv_cache = kv_cache
+                        layer_id += 1
+
+        from atom.utils.forward_context import set_kv_cache_data
+
+        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
+        set_kv_cache_data(kv_cache_data)
+
+    # ------------------------------------------------------------------
+    # CU-masked stream pools + prefill forward
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stream_with_cu_mask(mask_bits: list[int]) -> torch.cuda.ExternalStream:
+        """Create a HIP stream restricted to the CUs described by mask_bits.
+
+        mask_bits is a list of uint32 words; bit i of word w represents
+        CU (w*32 + i).  Uses hipExtStreamCreateWithCUMask (ROCm only).
+        """
+        hip = ctypes.CDLL("libamdhip64.so")
+        hip.hipExtStreamCreateWithCUMask.restype = ctypes.c_int
+        hip.hipExtStreamCreateWithCUMask.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        raw_stream = ctypes.c_void_p()
+        mask_arr = (ctypes.c_uint * len(mask_bits))(*mask_bits)
+        ret = hip.hipExtStreamCreateWithCUMask(
+            ctypes.byref(raw_stream), len(mask_bits), mask_arr
+        )
+        assert ret == 0, f"HIP err {ret} creating masked stream"
+        return torch.cuda.ExternalStream(raw_stream.value)
+
+    @staticmethod
+    def _cu_mask_for_fraction(fraction: float, upper: bool) -> list[int]:
+        """Return CU mask bits for the given fraction.
+
+        For upper=False (prefill): CUs [0, split).
+        For upper=True  (decode):  CUs [split, total).
+        split = round(total * fraction).
+        """
+        total = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        split = max(1, min(total - 1, round(total * fraction)))
+        start = split if upper else 0
+        end = total if upper else split
+        num_words = (total + 31) // 32
+        words = [0] * num_words
+        for cu in range(start, end):
+            words[cu // 32] |= 1 << (cu % 32)
+        side = "decode" if upper else "prefill"
+        logger.info(
+            f"CU mask ({side}): CUs [{start},{end}) "
+            f"(fraction={fraction}, total={total})"
+        )
+        return words
+
+    # CU fractions for which we pre-create masked streams.
+    _CU_POOL_FRACTIONS = [0.5]
+
+    def create_prefill_stream_pool(self) -> bool:
+        """Create a pool of CUDA streams for disaggregated prefill.
+
+        Called once by PrefillEngineCore._init_disagg() after IPC import.
+        In constrained mode, pre-creates one CU-masked stream per fraction
+        in _CU_POOL_FRACTIONS plus a full-CU fallback (None key);
+        prefill_forward() selects the stream dynamically each iteration via
+        _optimal_cu_fraction().  In unconstrained mode, only the plain
+        full-CU stream (None key) is created.
+        """
+        self._prefill_streams = {}
+        if getattr(self.config, "disagg_constrained", False):
+            for f in self._CU_POOL_FRACTIONS:
+                mask = self._cu_mask_for_fraction(f, upper=False)
+                self._prefill_streams[f] = self._stream_with_cu_mask(mask)
+        # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
+        self._prefill_streams[None] = torch.cuda.Stream()
+        logger.info(
+            f"Prefill stream pool created: fractions={list(self._prefill_streams.keys())}"
+        )
+        return True
+
+    def create_decode_stream_pool(self) -> bool:
+        """Create a pool of CUDA streams for disaggregated decode.
+
+        Called once by DecodeEngineCore._init_disagg().  In constrained mode,
+        complementary to the prefill pool: for fraction F, decode gets CUs
+        [F*total, total).  forward() selects the stream dynamically each
+        iteration.  In unconstrained mode, only the plain full-CU stream
+        (None key) is created.
+        """
+        self._decode_streams = {}
+        if getattr(self.config, "disagg_constrained", False):
+            for f in self._CU_POOL_FRACTIONS:
+                mask = self._cu_mask_for_fraction(f, upper=True)
+                self._decode_streams[f] = self._stream_with_cu_mask(mask)
+        # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
+        self._decode_streams[None] = torch.cuda.Stream()
+        self._model_fwd_event = torch.cuda.Event()
+        self._done_event = torch.cuda.Event()
+        logger.info(
+            f"Decode stream pool created: fractions={list(self._decode_streams.keys())}"
+        )
+        return True
+
+    @torch.inference_mode()
+    def prefill_forward(self, batch: ScheduledBatch) -> list[int]:
+        """Run a prefill forward pass on a dynamically selected CU-masked stream.
+
+        Writes KV for all prompt tokens, samples the first generated token for
+        each sequence, then synchronizes before returning so decode's default
+        stream sees all KV writes.  Returns a list of sampled token IDs (one
+        per sequence, in batch order) — these are included in PrefillDone so
+        the decode process can append them before the first decode step,
+        matching the num_tokens state that non-disagg postprocess would produce.
+        """
+        prefill_streams = getattr(self, "_prefill_streams", None)
+        if prefill_streams is not None:
+            stream = self._prefill_streams[batch.cu_stream_fraction]
+        else:
+            stream = torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            (
+                input_ids,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise,
+            ) = self.prepare_model(batch)
+            logits, _ = self.run_model(input_ids, batch)
+            # Sample the first generated token from each sequence's last logit
+            sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            sampled_cpu = sampled.view(-1).tolist()
+        # Synchronize so decode's default stream sees all KV writes.
+        stream.synchronize()
+        reset_forward_context()
+        return sampled_cpu

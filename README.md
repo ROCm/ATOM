@@ -132,6 +132,9 @@ python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --kv
 
 > **Note:** First-time execution may take approximately 10 minutes for model compilation.
 
+> **Flags accept both spellings:** every long flag can be written kebab-case or
+> snake_case interchangeably (e.g. `--kv-cache-dtype` == `--kv_cache_dtype`).
+
 ### Serving
 
 Start an OpenAI-compatible server:

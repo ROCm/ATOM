@@ -31,6 +31,7 @@ if "atom.model_engine.engine_core_mgr" not in sys.modules:
             self.added.extend(reqs)
 
     _stub.CoreManager = _StubCoreManager
+    _stub.DisaggCoreManager = _StubCoreManager
     sys.modules["atom.model_engine.engine_core_mgr"] = _stub
 
 from atom.model_engine.llm_engine import InputOutputProcessor  # noqa: E402
