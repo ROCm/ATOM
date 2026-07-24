@@ -21,7 +21,9 @@ from atom.model_ops.v4_kernels.fused_compress import (
     fused_compress_attn,
     fused_compress_attn_reference,
 )
-from atom.model_ops.v4_kernels.indexer_weights import scale_indexer_weights
+from atom.model_ops.v4_kernels.indexer_weights import (
+    scale_indexer_weights,
+)
 from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_decode_reference,
@@ -32,6 +34,7 @@ from atom.model_ops.v4_kernels.paged_prefill import (
 )
 from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
 from atom.model_ops.v4_kernels.paged_decode_indices import (
+    hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_decode_indices_reference,
 )
@@ -67,6 +70,7 @@ __all__ = [
     "make_compress_plans",
     "inverse_rope_inplace",
     "scale_indexer_weights",
+    "hca_compress_paged_offsets",
     "write_v4_paged_decode_indices",
     "write_v4_paged_decode_indices_reference",
     "write_v4_paged_prefill_indices",

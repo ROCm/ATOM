@@ -403,12 +403,11 @@ def fused_compress_attn(
     quant: bool = False,
     cache_scale: Optional[
         torch.Tensor
-    ] = None,  # fp32 [NB, k_per_block]; required when quant=True
+    ] = None,  # fp32 [NB, k_per_block] (FP8) / uint8 (FP4); required when quant
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
-    fp8_max: Optional[
-        float
-    ] = None,  # E4M3 max; required only on the quant (indexer_fp8) path
+    fp8_max: Optional[float] = None,  # E4M3 max; required for FP8 quant
+    quant_mode: Optional[str] = None,  # "none"|"fp8"|"fp4"; default from `quant`
     # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
     # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
     # e8m0 nope-fp8 + inline dup-scale into `kv_cache` (fp8 [NB,k,512]) and bf16
@@ -444,6 +443,18 @@ def fused_compress_attn(
     num_compress = plan.num_compress
     if plan_capacity == 0:
         return  # nothing to do — no plan rows ever populated.
+
+    # Resolve quant mode (single source of truth). `quant_mode` is the unified
+    # selector; the legacy `quant` bool is only a fallback for callers that don't
+    # pass quant_mode ("fp8" if quant else "none").
+    _mode = quant_mode if quant_mode is not None else ("fp8" if quant else "none")
+    _fp4 = _mode == "fp4"
+    # `quant` = the Indexer-inner per-row fp8/fp4 scatter (needs cache_scale /
+    # fp8_max, takes the quant validation + Triton fallback path). Derive it from
+    # the mode so callers only pass quant_mode. CSA/HCA Main group_fp8 is NOT
+    # `quant` — its 2buff scatter is driven by `main_2buff_fp8` — and `none`/bf16
+    # is plain. (Back-compat: legacy quant=True → quant_mode None → _mode "fp8".)
+    quant = _mode in ("fp8", "per_row_fp8", "fp4")
 
     # ------------------------------------------------------------------
     # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
@@ -526,10 +537,20 @@ def fused_compress_attn(
             cache_scale=cache_scale,
             use_ue8m0=use_ue8m0,
             preshuffle=preshuffle and not main_2buff_fp8,
-            quant_mode="group_fp8" if main_2buff_fp8 else "per_row_fp8",
+            quant_mode="group_fp8" if main_2buff_fp8 else _mode,
             k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
         )
         return
+
+    if _fp4:
+        # FP4 indexer scatter only exists in the flydsl kernel — the Triton
+        # fallback below has no FP4 path. Reaching here means flydsl is
+        # unavailable or the shape is unsupported.
+        raise RuntimeError(
+            "quant_mode='fp4' requires the flydsl fused_compress_attn kernel "
+            f"(available={flydsl_fused_compress_attn is not None}, "
+            f"shape_ok={_flydsl_shape_ok}, mode={_flydsl_mode})."
+        )
 
     # Validate shapes
     dim_full = (2 if overlap else 1) * head_dim
