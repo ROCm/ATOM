@@ -43,12 +43,13 @@ def bind_glm52_dsa_cache_views(model, token_to_kv_pool) -> bool:
 
         layer_id = int(module.layer_num)
         mla_attn = module.mla_attn
+        native_mla_attn = getattr(mla_attn, "native_attention", mla_attn)
         kv_cache_data[f"layer_{layer_id}"] = KVCacheTensor(
             layer_num=layer_id,
             k_cache=token_to_kv_pool.get_key_buffer(layer_id),
             v_cache=empty_value_cache,
-            k_scale=getattr(mla_attn, "_k_scale", None),
-            v_scale=getattr(mla_attn, "_k_scale", None),
+            k_scale=getattr(native_mla_attn, "_k_scale", None),
+            v_scale=getattr(native_mla_attn, "_k_scale", None),
         )
 
         indexer = getattr(module, "indexer", None)
@@ -58,10 +59,11 @@ def bind_glm52_dsa_cache_views(model, token_to_kv_pool) -> bool:
             indexer.k_cache.kv_cache[0] = index_cache.view(
                 -1, page_size, index_entry_dim
             )
+            indexer._atom_glm52_native_sparse_kv_indices_buffer = shared_sparse
             indexer.sparse_kv_indices_buffer = shared_sparse
 
-        if hasattr(mla_attn, "sparse_kv_indices_buffer"):
-            mla_attn.sparse_kv_indices_buffer = shared_sparse
+        if hasattr(native_mla_attn, "sparse_kv_indices_buffer"):
+            native_mla_attn.sparse_kv_indices_buffer = shared_sparse
 
     if not kv_cache_data:
         return False

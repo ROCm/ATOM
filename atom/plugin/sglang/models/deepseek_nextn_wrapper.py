@@ -95,7 +95,7 @@ def _retag_mtp_runtime_layer_ids(model: nn.Module) -> None:
             if attn_obj is None:
                 continue
             _set_runtime_layer_id(attn_obj, local_layer_id)
-            for nested_name in ("attn",):
+            for nested_name in ("attn", "native_attention"):
                 nested_attn = getattr(attn_obj, nested_name, None)
                 if nested_attn is not None:
                     _set_runtime_layer_id(nested_attn, local_layer_id)
@@ -150,7 +150,18 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
         self._is_glm_moe_dsa_nextn = (
             str(getattr(config, "model_type", "")).lower() == "glm_moe_dsa"
         )
-        self._atom_glm52_uses_generic_draft_frontend = self._is_glm_moe_dsa_nextn
+        self._atom_glm52_uses_native_draft_frontend = (
+            self._is_glm_moe_dsa_nextn
+            and os.environ.get("ATOM_GLM52_ENABLE_NATIVE_DRAFT_BACKEND", "0").lower()
+            in ("1", "true", "yes", "on")
+        )
+        self._atom_glm52_uses_hybrid_draft_frontend = (
+            self._atom_glm52_uses_native_draft_frontend
+        )
+        self._atom_glm52_uses_generic_draft_frontend = (
+            self._is_glm_moe_dsa_nextn
+            and not self._atom_glm52_uses_native_draft_frontend
+        )
         if self._is_glm_moe_dsa_nextn:
             self.draft_model_name = "GLM DSA MTP"
 
@@ -213,16 +224,34 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             set_attn_cls()
             init_aiter_dist(config=self.atom_config)
 
-            self.model = DeepSeekMTP(atom_config=self.atom_config)
+            if self._atom_glm52_uses_native_draft_frontend:
+                from atom.plugin.sglang.models.glm52_dsa_attention import (
+                    glm52_hybrid_draft_attention_construction,
+                )
+
+                construction_context = glm52_hybrid_draft_attention_construction()
+            else:
+                construction_context = contextlib.nullcontext()
+            with construction_context:
+                self.model = DeepSeekMTP(atom_config=self.atom_config)
             if self.use_standalone_draft:
                 _install_local_nextn_weight_remap(self.model)
             self.model.atom_config = self.atom_config
-            setup_deepseek_for_sglang(self.model)
+            if self._atom_glm52_uses_native_draft_frontend:
+                setup_deepseek_for_sglang(
+                    self.model, hybrid_native_draft_decode=True
+                )
+            else:
+                setup_deepseek_for_sglang(self.model)
             _retag_mtp_runtime_layer_ids(self.model)
             first_attention = self._first_mtp_layer().mtp_block.self_attn
             logger.info(
                 "GLM-5.2 draft model attention frontend mode=%s class=%s",
-                "generic",
+                (
+                    "hybrid-native-draft-decode"
+                    if self._atom_glm52_uses_native_draft_frontend
+                    else "generic"
+                ),
                 type(first_attention.mla_attn).__name__,
             )
 
@@ -290,7 +319,18 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             raise ValueError(
                 f"{self.draft_model_name} draft forward requires speculative info"
             )
-        forward_batch._atom_glm52_generic_draft_frontend = True
+        from atom.plugin.sglang.glm52_mtp.draft_decode import (
+            is_draft_decode_metadata,
+        )
+
+        use_native_this_forward = (
+            self._atom_glm52_uses_native_draft_frontend
+            and is_draft_decode_metadata(forward_batch)
+        )
+        if not use_native_this_forward:
+            forward_batch._atom_glm52_generic_draft_frontend = True
+        elif hasattr(forward_batch, "_atom_glm52_generic_draft_frontend"):
+            delattr(forward_batch, "_atom_glm52_generic_draft_frontend")
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             with SGLangPluginRuntime(
@@ -300,6 +340,21 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
                 input_ids=input_ids,
                 input_embeds=input_embeds,
             ) as runtime:
+                if use_native_this_forward:
+                    from atom.plugin.sglang.glm52_mtp.cache_bind import (
+                        bind_glm52_dsa_cache_views,
+                    )
+                    from atom.plugin.sglang.glm52_mtp.common import (
+                        maybe_get_glm52_dsa_pools_from_sglang_backend,
+                    )
+
+                    token_to_kv_pool, _ = maybe_get_glm52_dsa_pools_from_sglang_backend(
+                        runtime.forward_batch
+                    )
+                    if not bind_glm52_dsa_cache_views(self.model, token_to_kv_pool):
+                        raise RuntimeError(
+                            "GLM-5.2 native draft cache views are unavailable"
+                        )
                 model_input_ids = runtime.input_ids
                 model_input_embeds = runtime.input_embeds
                 num_model_tokens = int(runtime.positions.shape[0])

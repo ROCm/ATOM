@@ -158,8 +158,8 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     native DeepSeekV4TokenToKVPool, while ATOM plugin mode uses a proxy KV pool,
     so patch the factory methods to return the ATOM shim.
 
-    GLM-5.2 uses SGLang's AITER multi-step lifecycle with ATOM's general
-    attention backend.
+    GLM-5.2 native draft attention is opt-in. The default AITER multi-step
+    backend remains unchanged for the production route.
     """
 
     try:
@@ -187,6 +187,25 @@ def _patch_sglang_dsv4_draft_backends() -> None:
             "hf_config",
             None,
         )
+        enable_native = os.environ.get(
+            "ATOM_GLM52_ENABLE_NATIVE_DRAFT_BACKEND", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        if enable_native and is_glm52_dsa_config(hf_config):
+            from atom.plugin.sglang.attention_backend.glm52_native_draft_backend import (
+                GLM52NativeMultiStepDraftBackend,
+            )
+
+            backend = GLM52NativeMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            logger.info(
+                "Use GLM52NativeMultiStepDraftBackend topk=%d steps=%d",
+                self.topk,
+                self.speculative_num_steps,
+            )
+            return backend
         backend = original_create_decode_backend(self)
         if is_glm52_dsa_config(hf_config):
             per_step = [

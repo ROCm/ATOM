@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
+from torch import nn
 
 from atom.model_ops.attention_mla import MLAAttention
 
@@ -29,6 +30,34 @@ def glm52_native_mla_attention_construction():
         return previous(*args, **kwargs)
 
     deepseek_v2.Attention = _build_glm52_native_mla_attention
+    try:
+        yield
+    finally:
+        deepseek_v2.Attention = previous
+
+
+@contextmanager
+def glm52_hybrid_draft_attention_construction():
+    """Construct independent generic and native frontends for native draft decode."""
+
+    import atom.models.deepseek_v2 as deepseek_v2
+
+    previous = deepseek_v2.Attention
+
+    def _build_glm52_hybrid_draft_attention(*args: Any, **kwargs: Any):
+        mla_modules = kwargs.get("mla_modules", None)
+        if (
+            kwargs.get("use_mla", False)
+            and mla_modules is not None
+            and getattr(mla_modules, "is_sparse", False)
+        ):
+            return SGLangGLM52DraftHybridAttention(
+                previous(*args, **kwargs),
+                SGLangATOMGLM52MLAAttention(*args, **kwargs),
+            )
+        return previous(*args, **kwargs)
+
+    deepseek_v2.Attention = _build_glm52_hybrid_draft_attention
     try:
         yield
     finally:
@@ -133,3 +162,27 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
             )
 
             return self.forward_impl(q_input, kv_c_normed, k_pe, positions, q_scale)
+
+
+class SGLangGLM52DraftHybridAttention(nn.Module):
+    """Use native ATOM attention only for marked draft-decode substeps."""
+
+    def __init__(self, generic_attention: nn.Module, native_attention: nn.Module):
+        super().__init__()
+        self.generic_attention = generic_attention
+        self.native_attention = native_attention
+
+    @property
+    def attn(self):
+        return getattr(self.generic_attention, "attn", self.generic_attention)
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        from atom.plugin.sglang.glm52_mtp.draft_decode import (
+            is_draft_decode_metadata,
+        )
+        from atom.plugin.sglang.runtime import get_current_forward_batch
+
+        forward_batch = get_current_forward_batch()
+        if forward_batch is not None and is_draft_decode_metadata(forward_batch):
+            return self.native_attention(*args, **kwargs)
+        return self.generic_attention(*args, **kwargs)

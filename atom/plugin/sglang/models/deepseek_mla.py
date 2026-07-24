@@ -26,7 +26,9 @@ if TYPE_CHECKING:
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
 
 
-def setup_deepseek_for_sglang(model) -> None:
+def setup_deepseek_for_sglang(
+    model, *, hybrid_native_draft_decode: bool = False
+) -> None:
     """Patch a DeepSeek V2/V3 model for SGLang plugin mode."""
     config = model.config
 
@@ -53,6 +55,7 @@ def setup_deepseek_for_sglang(model) -> None:
                 module,
                 config,
                 kv_cache_dtype,
+                hybrid_native_draft_decode=hybrid_native_draft_decode,
             )
             if getattr(module, "use_nsa", False):
                 indexer = getattr(module, "indexer", None)
@@ -67,20 +70,48 @@ def _patch_mla_attention_for_sglang(
     attn: "DeepseekV2MLAAttention",
     config: Any,
     kv_cache_dtype: str = "bf16",
+    *,
+    hybrid_native_draft_decode: bool = False,
 ) -> None:
     """Patch one DeepSeek MLA layer for SGLang plugin mode."""
     _align_qknorm_fusion_for_sglang(attn)
     init_sgl_attrs(attn, config, kv_cache_dtype)
     _patch_attention_projs_for_sglang_mxfp4(attn)
-    _patch_indexer_for_sglang_sparse_mla(attn)
-    if not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
+    _patch_indexer_for_sglang_sparse_mla(
+        attn, hybrid_native_draft_decode=hybrid_native_draft_decode
+    )
+    if hybrid_native_draft_decode:
+        from atom.plugin.sglang.models.glm52_dsa_attention import (
+            SGLangATOMGLM52MLAAttention,
+            SGLangGLM52DraftHybridAttention,
+        )
+
+        if not isinstance(attn.mla_attn, SGLangGLM52DraftHybridAttention):
+            raise RuntimeError(
+                "GLM-5.2 hybrid draft setup requires construction-time hybrid "
+                "attention"
+            )
+        generic_attention = SGLangDeepseekMLAAttention(
+            attn, attn.mla_attn.generic_attention
+        )
+        native_attention = attn.mla_attn.native_attention
+        if not isinstance(native_attention, SGLangATOMGLM52MLAAttention):
+            raise RuntimeError(
+                "GLM-5.2 hybrid draft setup requires a native ATOM base attention"
+            )
+        attn.mla_attn = SGLangGLM52DraftHybridAttention(
+            generic_attention, native_attention
+        )
+    elif not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
         attn.mla_attn = SGLangDeepseekMLAAttention(attn, attn.mla_attn)
     attn.process_weights_after_loading = lambda: process_mla_kv_b_proj_after_loading(
         attn
     )
 
 
-def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None:
+def _patch_indexer_for_sglang_sparse_mla(
+    attn: "DeepseekV2MLAAttention", *, hybrid_native_draft_decode: bool = False
+) -> None:
     """Adapt DeepSeek-V3.2 sparse indexer buffers for SGLang plugin mode."""
     indexer = getattr(attn, "indexer", None)
     if indexer is None or getattr(indexer, "_atom_sglang_topk_buffer_patched", False):
@@ -90,6 +121,9 @@ def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None
     import atom.plugin.sglang.attention_backend.sparse_mla_indexer  # noqa: F401
 
     original_forward = indexer.forward
+    native_sparse_attn_indexer_impl = indexer.sparse_attn_indexer_impl
+    native_use_qk_rope_cache_fusion = indexer.use_qk_rope_cache_fusion
+    native_sparse_kv_indices_buffer = indexer.sparse_kv_indices_buffer
     indexer.use_qk_rope_cache_fusion = False
     generic_sparse_attn_indexer_impl = (
         torch.ops.aiter.sparse_attn_indexer_sglang_plugin_mode
@@ -97,6 +131,23 @@ def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None
     indexer.sparse_attn_indexer_impl = generic_sparse_attn_indexer_impl
 
     def _forward_with_topk_buffer(self, hidden_states, *args, **kwargs):
+        if hybrid_native_draft_decode:
+            from atom.plugin.sglang.glm52_mtp.draft_decode import (
+                is_draft_decode_metadata,
+            )
+            from atom.plugin.sglang.runtime import get_current_forward_batch
+
+            forward_batch = get_current_forward_batch()
+            if forward_batch is not None and is_draft_decode_metadata(forward_batch):
+                self.use_qk_rope_cache_fusion = native_use_qk_rope_cache_fusion
+                self.sparse_attn_indexer_impl = native_sparse_attn_indexer_impl
+                self.sparse_kv_indices_buffer = getattr(
+                    self,
+                    "_atom_glm52_native_sparse_kv_indices_buffer",
+                    native_sparse_kv_indices_buffer,
+                )
+                return original_forward(hidden_states, *args, **kwargs)
+
         self.use_qk_rope_cache_fusion = False
         self.sparse_attn_indexer_impl = generic_sparse_attn_indexer_impl
         num_tokens = int(hidden_states.shape[0])
