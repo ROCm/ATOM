@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
@@ -247,13 +248,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.device = model_runner.device
         config = model_runner.config
         hf_config = config.hf_config
-        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
-        if self.dcp_world_size > 1:
-            from aiter.dist.parallel_state import get_dcp_group
-
-            self.dcp_rank = get_dcp_group().rank_in_group
-        else:
-            self.dcp_rank = 0
+        self.dcp_world_size = get_dcp_world_size()
+        self.dcp_rank = get_dcp_rank()
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (

@@ -16,6 +16,7 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_is_enabled,
@@ -159,13 +160,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
 
-        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
-        if self.dcp_world_size > 1:
-            from aiter.dist.parallel_state import get_dcp_group
-
-            self.dcp_rank = get_dcp_group().rank_in_group
-        else:
-            self.dcp_rank = 0
+        self.dcp_world_size = get_dcp_world_size()
+        self.dcp_rank = get_dcp_rank()
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (

@@ -40,6 +40,11 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 )
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
+from atom.distributed.dcp_utils import (
+    get_dcp_group,
+    get_dcp_rank,
+    get_dcp_world_size,
+)
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
@@ -298,14 +303,12 @@ class MLAAttention(nn.Module):
         # Decode context parallel (DCP): KV cache is sharded across TP ranks, so
         # decode attention runs locally then combines via all-gather LSE +
         # reduce-scatter. Disabled (world_size==1) unless -dcp is set.
-        config = get_current_atom_config()
-        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
+        self.dcp_world_size = get_dcp_world_size()
         if self.dcp_world_size > 1:
-            from aiter.dist.parallel_state import get_dcp_group
             from atom.model_ops.dcp_ops import CPTritonContext
 
             self.dcp_group = get_dcp_group()
-            self.dcp_rank = self.dcp_group.rank_in_group
+            self.dcp_rank = get_dcp_rank()
             self._cp_triton_ctx = CPTritonContext()
         else:
             self.dcp_group = None
@@ -1243,10 +1246,7 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            if self.dcp_world_size > 1:
-                num_kv_splits = max(1, 16 // self.dcp_world_size)
-            else:
-                num_kv_splits = 16
+            num_kv_splits = max(1, 16 // self.dcp_world_size)
 
             # TODO refactor this
             if envs.ATOM_MLA_PAGE_SIZE is not None:
@@ -1473,7 +1473,7 @@ class MLAAttention(nn.Module):
                 if (
                     envs.ATOM_USE_TRITON_MLA
                     and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV
-                    and self.dcp_world_size == 1
+                    and self.dcp_world_size <= 1
                 ):
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_fused_qk_rope_cat_and_cache_mla(
@@ -1493,7 +1493,7 @@ class MLAAttention(nn.Module):
                         q_out=q_out,
                         shuffled_kv_cache=True,
                     )
-                elif self.use_seg_mla and self.dcp_world_size == 1:
+                elif self.use_seg_mla and self.dcp_world_size <= 1:
                     kv_cache_seg = self._seg_kv_cache_view(kv_cache)
                     fused_qk_rope_concat_and_cache_mla_seg(
                         q_nope,
@@ -1556,20 +1556,19 @@ class MLAAttention(nn.Module):
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
-            else:
-                if self.dcp_world_size > 1:
-                    q_out = self.dcp_group.all_gather(q_out, dim=1)
-                    o, lse = self._forward_decode(
-                        q_out, kv_cache, attn_metadata, return_lse=True
-                    )
-                    from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
+            elif self.dcp_world_size > 1:
+                # DCP decode: AllGather Q on the head dim, decode locally with LSE,
+                # then combine partial outputs across ranks (AG LSE + correct + RS).
+                q_out = self.dcp_group.all_gather(q_out, dim=1)
+                o, lse = self._forward_decode(
+                    q_out, kv_cache, attn_metadata, return_lse=True
+                )
+                from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
 
-                    o = cp_lse_ag_out_rs(
-                        o, lse, self.dcp_group, ctx=self._cp_triton_ctx
-                    )
-                    output = self._v_up_proj_and_o_proj(o)
-                else:
-                    output = self._forward_decode(q_out, kv_cache, attn_metadata)
+                o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
+                output = self._v_up_proj_and_o_proj(o)
+            else:
+                output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
         return output
 

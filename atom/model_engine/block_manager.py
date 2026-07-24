@@ -51,7 +51,7 @@ class BlockManager:
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
         self.block_size = block_size
-        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
+        self.dcp_world_size = config.decode_context_parallel_size
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
         # (rank 0). DCP rank is used only to compute local token counts for
         # memory reservation; the actual per-rank routing is done in the workers.
