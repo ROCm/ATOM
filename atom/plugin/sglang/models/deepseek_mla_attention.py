@@ -27,7 +27,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
 
     def __init__(
         self,
-        owner_attn: "DeepseekV2MLAAttention",
+        owner_attn: DeepseekV2MLAAttention,
         base_attn: nn.Module,
     ) -> None:
         super().__init__()
@@ -187,6 +187,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
     ) -> torch.Tensor:
         attn = self.owner_attn
         from aiter import dtypes
+
         from atom.model_ops.attention_mla import fused_qk_rope_concat_and_cache_mla
         from atom.plugin.sglang.models.deepseek_mla_forward import (
             _get_sglang_radix_attn,
@@ -370,10 +371,11 @@ class SGLangDeepseekMLAAttention(nn.Module):
         attn = self.owner_attn
         forward_batch = self._get_forward_batch(kwargs)
 
+        from sglang.srt.layers.communicator import get_attn_tp_context
+
         from atom.plugin.sglang.models.deepseek_mla_forward import (
             _can_run_non_absorbed_mla_now,
         )
-        from sglang.srt.layers.communicator import get_attn_tp_context
 
         attn_tp_context = get_attn_tp_context()
         with attn_tp_context.maybe_input_scattered(forward_batch):

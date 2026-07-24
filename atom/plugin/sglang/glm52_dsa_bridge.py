@@ -31,7 +31,7 @@ def maybe_get_glm52_dsa_pools_from_sglang_backend(forward_batch=None):
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         backend = get_attn_backend()
-    except Exception:
+    except Exception:  # noqa: BLE001 - forward context is optional
         backend = None
 
     token_to_kv_pool = getattr(backend, "token_to_kv_pool", None)
@@ -126,7 +126,7 @@ def _get_index_topk(atom_config) -> int:
 
 def _local_num_attention_heads(atom_config) -> int:
     hf_config = atom_config.hf_config
-    num_heads = int(getattr(hf_config, "num_attention_heads"))
+    num_heads = int(hf_config.num_attention_heads)
     tp_size = int(getattr(atom_config, "tensor_parallel_size", 1))
     return max(1, num_heads // max(1, tp_size))
 
@@ -751,7 +751,7 @@ def bind_glm52_dsa_cache_views(model, token_to_kv_pool) -> bool:
         indexer = getattr(module, "indexer", None)
         if indexer is not None:
             index_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
-            index_entry_dim = int(getattr(indexer, "head_dim")) + 4
+            index_entry_dim = int(indexer.head_dim) + 4
             indexer.k_cache.kv_cache[0] = index_cache.view(
                 -1, page_size, index_entry_dim
             )
