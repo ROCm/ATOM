@@ -469,6 +469,46 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         setattr(EAGLEDraftExtendCudaGraphRunner, extend_replay_method, replay)
         EAGLEDraftExtendCudaGraphRunner._atom_dsv4_execute_patched = True
 
+    if not getattr(EagleDraftWorker, "_atom_dsv4_accept_lens_patched", False):
+        original_draft_extend_for_decode = EagleDraftWorker._draft_extend_for_decode
+
+        def _draft_extend_for_decode(self, batch, batch_result):
+            if not _is_dsv4_nextn_runner(getattr(self, "draft_runner", None)):
+                return original_draft_extend_for_decode(self, batch, batch_result)
+
+            num_draft_tokens = int(
+                getattr(self, "speculative_num_draft_tokens", 0)
+                or getattr(self.server_args, "speculative_num_draft_tokens", 0)
+                or 0
+            )
+            accept_lens = getattr(batch_result, "accept_lens", None)
+            if num_draft_tokens <= 0 or accept_lens is None:
+                return original_draft_extend_for_decode(self, batch, batch_result)
+
+            try:
+                import torch
+
+                if not torch.is_tensor(accept_lens):
+                    return original_draft_extend_for_decode(self, batch, batch_result)
+                graph_accept_lens = accept_lens.clamp(min=1, max=num_draft_tokens)
+                if bool(torch.equal(graph_accept_lens, accept_lens)):
+                    return original_draft_extend_for_decode(self, batch, batch_result)
+            except Exception:  # noqa: BLE001 - preserve upstream behavior on probing errors
+                return original_draft_extend_for_decode(self, batch, batch_result)
+
+            # SGLang's accept_lens includes the target bonus token, but
+            # DRAFT_EXTEND_V2 graph/eager outputs have exactly num_draft_tokens
+            # rows per request.  Clamp only while selecting the next draft seed
+            # so row indexing cannot spill into the next request.
+            batch_result.accept_lens = graph_accept_lens
+            try:
+                return original_draft_extend_for_decode(self, batch, batch_result)
+            finally:
+                batch_result.accept_lens = accept_lens
+
+        EagleDraftWorker._draft_extend_for_decode = _draft_extend_for_decode
+        EagleDraftWorker._atom_dsv4_accept_lens_patched = True
+
     if not getattr(EagleDraftWorker, "_atom_dsv4_init_cuda_graphs_patched", False):
         original_init_cuda_graphs = EagleDraftWorker.init_cuda_graphs
 
