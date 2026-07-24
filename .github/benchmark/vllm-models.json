@@ -1,0 +1,32 @@
+[
+  {
+    "display": "DeepSeek-R1-0528",
+    "path": "deepseek-ai/DeepSeek-R1-0528",
+    "prefix": "deepseek-r1-0528",
+    "args": "--kv-cache-dtype fp8 --tensor-parallel-size 8",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "GLM-5-FP8",
+    "path": "zai-org/GLM-5-FP8",
+    "prefix": "glm-5-fp8",
+    "args": "--kv-cache-dtype fp8 --tensor-parallel-size 8",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "Kimi-K2-Thinking-MXFP4",
+    "path": "amd/Kimi-K2-Thinking-MXFP4",
+    "prefix": "kimi-k2-thinking-mxfp4",
+    "args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  }
+]
