@@ -155,7 +155,9 @@ jobs:
           MODEL_MOUNT_PATH="/models"
           HF_CACHE_ROOT=""
 
-          if [ -d "/shared/data/WRH/models" ]; then
+          if [ -d "/mnt/dcgpuval" ]; then
+            MODEL_CACHE_ROOT="/mnt/dcgpuval"
+          elif [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_ROOT="/shared/data/WRH/models"
           elif [ -d "/mnt/raid0/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"

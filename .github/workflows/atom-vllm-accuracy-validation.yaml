@@ -960,27 +960,34 @@ jobs:
       - name: Prepare model cache mount
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
+          MODEL_CACHE_ROOT=""
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/shared/data/WRH/models" ]; then
-            MODEL_CACHE_MOUNT="-v /shared/data/WRH/models:/models"
-            MODEL_CACHE_DESC="/shared/data/WRH/models (shared host path)"
+          MODEL_MOUNT_PATH="/models"
+          if [ -d "/mnt/dcgpuval" ]; then
+            MODEL_CACHE_ROOT="/mnt/dcgpuval"
+          elif [ -d "/shared/data/WRH/models" ]; then
+            MODEL_CACHE_ROOT="/shared/data/WRH/models"
           elif [ -d "/it-share/models" ]; then
-            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
-            MODEL_CACHE_DESC="/it-share/models (shared host path)"
+            MODEL_CACHE_ROOT="/it-share/models"
           elif [ -d "/models" ]; then
-            MODEL_CACHE_MOUNT="-v /models:/models"
-            MODEL_CACHE_DESC="/models (shared host path)"
+            MODEL_CACHE_ROOT="/models"
           elif [ -d "/data/models" ]; then
-            MODEL_CACHE_MOUNT="-v /data/models:/models"
-            MODEL_CACHE_DESC="/data/models (shared host path)"
+            MODEL_CACHE_ROOT="/data/models"
+          fi
+
+          if [ -n "${MODEL_CACHE_ROOT}" ]; then
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (shared host path)"
           else
-            echo "No shared host model cache found; using container-local /models."
+            echo "No shared host model cache found; using container-local ${MODEL_MOUNT_PATH}."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+          echo "MODEL_MOUNT_PATH=${MODEL_MOUNT_PATH}" >> "$GITHUB_ENV"
 
       - name: Clean up old containers
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
@@ -1186,7 +1193,7 @@ jobs:
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           set -euo pipefail
-          model_dir="/models/${{ matrix.model_path }}"
+          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           if [ "${OOT_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
             echo "Using local model path ${OOT_RESOLVED_MODEL_PATH}; skip download."
             exit 0
@@ -1248,7 +1255,7 @@ jobs:
               exit 1
             fi
           else
-            echo "/models directory not mounted; skipping model download"
+            echo "${MODEL_MOUNT_PATH} directory not mounted; skipping model download"
           fi
 
       - name: Resolve OOT model path
@@ -1259,8 +1266,8 @@ jobs:
             exit 0
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
-            echo "Using mounted model path: /models/${{ matrix.model_path }}"
+            echo "OOT_RESOLVED_MODEL_PATH=${MODEL_MOUNT_PATH}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: ${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           else
             echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
