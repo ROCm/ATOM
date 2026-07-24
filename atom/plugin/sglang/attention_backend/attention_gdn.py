@@ -20,6 +20,7 @@ from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
     _forward_kv_cache_context,
+    get_forward_context,
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
@@ -79,12 +80,20 @@ class SGLangGDNForwardContext:
         num_tokens = (
             forward_batch.seq_lens_sum if mode.is_extend() else forward_batch.batch_size
         )
+        atom_config = get_current_atom_config()
+        enable_dp_attention = bool(getattr(atom_config, "enable_dp_attention", False))
+        global_forward_mode = getattr(forward_batch, "global_forward_mode", None)
+        dp_uniform_decode = not enable_dp_attention or bool(
+            global_forward_mode is not None and global_forward_mode.is_decode_or_idle()
+        )
         return (
             Context(
                 positions=forward_batch.positions,
                 is_prefill=is_prefill,
+                is_dummy_run=mode.is_idle(),
                 batch_size=forward_batch.batch_size,
                 graph_bs=forward_batch.batch_size,
+                dp_uniform_decode=dp_uniform_decode,
             ),
             num_tokens,
         )
@@ -200,17 +209,33 @@ class SGLangGDNForwardContext:
             return
 
         prev_kv = _forward_kv_cache_context.kv_cache_data
+        current_context = get_forward_context()
+        reuse_current_context = current_context.context is not None
+        prev_attn_metadata = current_context.attn_metadata
+        prev_context_kv = current_context.kv_cache_data
         try:
             set_kv_cache_data(forward_context.kv_cache_data)
             attn_md = AttentionMetaData()
             attn_md.gdn_metadata = forward_context.gdn_metadata
-            set_forward_context(
-                attn_metadata=attn_md,
-                atom_config=get_current_atom_config(),
-                context=forward_context.context,
-                num_tokens=forward_context.num_tokens,
-            )
+            if reuse_current_context:
+                # SGLangPluginRuntime already created the cross-rank-consistent
+                # Context and DPMetadata. Rebuilding it here would issue a second
+                # CPU all-reduce only on ranks where GDN metadata exists; idle
+                # ranks skip this binder and would never join that collective.
+                current_context.attn_metadata = attn_md
+                current_context.kv_cache_data = forward_context.kv_cache_data
+            else:
+                set_forward_context(
+                    attn_metadata=attn_md,
+                    atom_config=get_current_atom_config(),
+                    context=forward_context.context,
+                    num_tokens=forward_context.num_tokens,
+                )
             yield
         finally:
-            reset_forward_context()
+            if reuse_current_context:
+                current_context.attn_metadata = prev_attn_metadata
+                current_context.kv_cache_data = prev_context_kv
+            else:
+                reset_forward_context()
             set_kv_cache_data(prev_kv if prev_kv is not None else {})
