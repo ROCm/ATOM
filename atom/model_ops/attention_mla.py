@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import Optional
+from typing import Optional, Protocol
 
 import torch
 import triton
@@ -183,6 +183,18 @@ class MLAModules:
     topk_tokens: Optional[int] = None
 
 
+class _MLAOutputShape(Protocol):
+    o_proj: nn.Module
+    num_heads: int
+    v_head_dim: int
+
+
+def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
+    if isinstance(getattr(impl, "o_proj", None), nn.Identity):
+        return impl.num_heads * impl.v_head_dim
+    return hidden_size
+
+
 def dynamic_per_batched_tensor_quant(
     x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
 ):
@@ -216,18 +228,19 @@ class MLAAttention(nn.Module):
         self.dtype = dtype
 
         self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
-        self.head_repeat_factor = self.padded_num_heads // num_heads
-        if self.head_repeat_factor > 1:
-            assert self.padded_num_heads % num_heads == 0, (
-                f"Padded head count ({self.padded_num_heads}) must be divisible "
-                f"by num_heads ({num_heads}) for head repeat"
-            )
-            if not getattr(MLAAttention, "_head_repeat_logged", False):
-                MLAAttention._head_repeat_logged = True
-                logger.info(
-                    f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
-                    f"(repeat factor {self.head_repeat_factor})"
-                )
+        self.head_repeat_factor = 1
+        self.head_pad = 0
+        if self.padded_num_heads != num_heads:
+            if self.padded_num_heads % num_heads == 0:
+                self.head_repeat_factor = self.padded_num_heads // num_heads
+                if not getattr(MLAAttention, "_head_repeat_logged", False):
+                    MLAAttention._head_repeat_logged = True
+                    logger.info(
+                        f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
+                        f"(repeat factor {self.head_repeat_factor})"
+                    )
+            else:
+                self.head_pad = self.padded_num_heads - num_heads
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -294,6 +307,20 @@ class MLAAttention(nn.Module):
                     "which are not available in the installed aiter build. Upgrade "
                     "aiter or set ATOM_MLA_PAGE_SIZE=1."
                 )
+
+    def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
+        if self.head_repeat_factor > 1:
+            return q.repeat_interleave(self.head_repeat_factor, dim=1)
+        if self.head_pad > 0:
+            return torch.nn.functional.pad(q, (0, 0, 0, self.head_pad))
+        return q
+
+    def _restore_query_heads(self, output: torch.Tensor) -> torch.Tensor:
+        if self.head_repeat_factor > 1:
+            return output[:, :: self.head_repeat_factor, :].contiguous()
+        if self.head_pad > 0:
+            return output[:, : self.num_heads, :].contiguous()
+        return output
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Reshape the KV cache buffer into the page-level flat seg layout
@@ -847,8 +874,7 @@ class MLAAttention(nn.Module):
         assert attn_metadata is not None
         B = q.shape[0]
 
-        if self.head_repeat_factor > 1:
-            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+        q = self._pad_query_heads(q)
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -933,8 +959,7 @@ class MLAAttention(nn.Module):
                     None,
                 )
 
-        if self.head_repeat_factor > 1:
-            o = o[:, :: self.head_repeat_factor, :].contiguous()
+        o = self._restore_query_heads(o)
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -969,8 +994,7 @@ class MLAAttention(nn.Module):
         assert attn_metadata is not None
         B = q.shape[0]
 
-        if self.head_repeat_factor > 1:
-            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+        q = self._pad_query_heads(q)
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -1127,8 +1151,7 @@ class MLAAttention(nn.Module):
                 kv_scale=self._k_scale,
             )
 
-        if self.head_repeat_factor > 1:
-            o = o[:, :: self.head_repeat_factor, :].contiguous()
+        o = self._restore_query_heads(o)
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -1190,7 +1213,9 @@ class MLAAttention(nn.Module):
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
-            output_shape[-1] = atom_config.hf_config.hidden_size
+            output_shape[-1] = _mla_output_width(
+                self, atom_config.hf_config.hidden_size
+            )
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output

@@ -680,6 +680,8 @@ class ModelRunner:
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
         self.use_v4 = self.is_deepseek_v4()
+        self.use_kimi_mla = self.is_kimi_linear()
+
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
         self.is_deepseek_v32 = (
@@ -715,6 +717,7 @@ class ModelRunner:
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
             use_v4=self.use_v4,
+            use_kimi_mla=self.use_kimi_mla,
         )
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
