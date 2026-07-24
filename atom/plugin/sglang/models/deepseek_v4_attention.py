@@ -40,7 +40,24 @@ def _install_v4_nm_aiter_compat_patch() -> None:
         parameters = inspect.signature(original).parameters
     except (TypeError, ValueError):
         return
-    if "kv_last_page_lens" not in parameters:
+    # AITER briefly inserted ``kv_last_page_lens`` before ``max_seqlen_q`` as
+    # a required positional argument. Latest main keeps the legacy 9-argument
+    # frontend and exposes it only as an optional keyword-only argument, so
+    # presence alone is not enough to identify the transitional ABI.
+    positional_names = [
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    try:
+        kv_last_page_lens_index = positional_names.index("kv_last_page_lens")
+    except ValueError:
+        return
+    if positional_names[kv_last_page_lens_index : kv_last_page_lens_index + 2] != [
+        "kv_last_page_lens",
+        "max_seqlen_q",
+    ]:
         return
 
     def mla_decode_fwd_v4_nm(*args, **kwargs):
