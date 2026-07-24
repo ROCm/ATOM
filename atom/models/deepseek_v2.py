@@ -94,11 +94,14 @@ from atom.utils.custom_register import direct_register_custom_op
 # `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.distributed.pcp_utils import (
+    pcp_all_reduce,
+    pcp_allgather_rankmajor,
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_is_enabled,
     pcp_pad_dense,
     pcp_pad_len,
+    pcp_reduce_scatter,
     pcp_round_robin_split,
 )
 from atom.utils.decorators import mark_trace, support_torch_compile
@@ -1114,6 +1117,12 @@ class DeepseekV2MoE(nn.Module):
         self._use_dual_stream = False
         self.alt_stream = alt_stream
         self.prefix = prefix
+        # Keep the structural dispatch decision independent of the current
+        # forward context. Runtime prefill/decode/dummy gating stays inside the
+        # opaque custom op so torch.compile cannot bake a dummy-run result.
+        self._pcp_moe_merge_enabled = (
+            bool(envs.ATOM_PCP_MOE_MERGE) and get_pcp_world_size() > 1
+        )
         self.is_rocm_aiter_fusion_shared_expert_enabled = (
             is_rocm_aiter_fusion_shared_expert_enabled(
                 shared_expert_prefix=f"{prefix}.shared_experts",
@@ -1126,8 +1135,6 @@ class DeepseekV2MoE(nn.Module):
                 tbo_active = get_current_atom_config().enable_tbo
                 if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
-                    compilation_config = get_current_atom_config().compilation_config
-                    compilation_config.static_forward_context[prefix] = self
                 intermediate_size = (
                     config.moe_intermediate_size * config.n_shared_experts
                 )
@@ -1139,6 +1146,10 @@ class DeepseekV2MoE(nn.Module):
                     reduce_results=False,
                     prefix=f"{prefix}.shared_experts",
                 )
+
+        if self._pcp_moe_merge_enabled or self._use_dual_stream:
+            compilation_config = get_current_atom_config().compilation_config
+            compilation_config.static_forward_context[prefix] = self
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate(hidden_states)
@@ -1205,6 +1216,64 @@ class DeepseekV2MoE(nn.Module):
         )
         return final_hidden_states
 
+    def _pcp_moe_merge_active(self) -> bool:
+        if not bool(envs.ATOM_PCP_MOE_MERGE) or get_pcp_world_size() <= 1:
+            return False
+        ctx = get_forward_context()
+        context = getattr(ctx, "context", None)
+        if context is None or bool(getattr(context, "is_dummy_run", False)):
+            return False
+        return True
+
+    def _pcp_moe_merge_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        ctx = get_forward_context()
+        is_prefill = bool(getattr(ctx.context, "is_prefill", False))
+        pcp_query_split = is_prefill and _pcp_active()
+        pcp_size = get_pcp_world_size()
+
+        shared_output = None
+        if (
+            self.n_shared_experts is not None
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
+        ):
+            # Shared-expert weights are still sharded only by ATOM TP, not by the
+            # folded PCP*TP routed-expert sharding. Keep shared experts on local
+            # query rows; only routed experts use PCP merge collectives.
+            shared_output = self.shared_experts(hidden_states)
+
+        # ATOM_PCP_MOE_MERGE folds PCP into routed-expert weight sharding.
+        # Round-robin prefill gives each PCP rank different token rows, so every
+        # routed-weight shard must first evaluate the same rank-major full-token
+        # input. reduce_scatter then sums the partials and restores this rank's
+        # original local stripe. Decode and short dense prefill already hold the
+        # same token rows on every PCP rank and only need an all-reduce.
+        if pcp_query_split:
+            routed_input = pcp_allgather_rankmajor(hidden_states, pcp_size)
+            expected_full_tokens = int(hidden_states.shape[0]) * pcp_size
+            assert int(routed_input.shape[0]) == expected_full_tokens, (
+                "PCP MoE gather returned an unexpected token count: "
+                f"local={hidden_states.shape[0]}, pcp={pcp_size}, "
+                f"gathered={routed_input.shape[0]}"
+            )
+        else:
+            routed_input = hidden_states
+
+        routed_output = self.routed_expert_forward(routed_input)
+        if pcp_query_split:
+            routed_output = pcp_reduce_scatter(routed_output, pcp_size)
+            assert routed_output.shape == hidden_states.shape, (
+                "PCP MoE reduce-scatter did not restore the local token shape: "
+                f"expected={tuple(hidden_states.shape)}, "
+                f"got={tuple(routed_output.shape)}"
+            )
+        else:
+            routed_output = pcp_all_reduce(routed_output, pcp_size)
+
+        final_hidden_states = self.combine_outputs(
+            routed_output, shared_output, hidden_states
+        )
+        return final_hidden_states
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert (
             hidden_states.dim() == 2
@@ -1213,11 +1282,47 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[1] == self.experts.hidden_size
         ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
 
+        if self._pcp_moe_merge_enabled:
+            return torch.ops.aiter.deepseek_v2_moe_pcp_merge_forward(
+                hidden_states, self.prefix
+            )
+
         if self._use_dual_stream:
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
 
         # Non-dual-stream path: shared experts + routed experts sequentially
         return self.single_stream_moe_forward(hidden_states)
+
+
+def deepseek_v2_moe_pcp_merge_forward(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Dispatch V2 PCP MoE merge without baking runtime context into Dynamo."""
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    if moe._pcp_moe_merge_active():
+        return moe._pcp_moe_merge_forward(hidden_states)
+    # Dummy/warmup must follow the ordinary MoE path because model inputs were
+    # not round-robin split. Reuse the exact non-PCP dual-stream gating logic.
+    return _module_dispatch_ops.maybe_dual_stream_forward(hidden_states, layer_name)
+
+
+def _deepseek_v2_moe_pcp_merge_forward_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="deepseek_v2_moe_pcp_merge_forward",
+    op_func=deepseek_v2_moe_pcp_merge_forward,
+    mutates_args=(),
+    fake_impl=_deepseek_v2_moe_pcp_merge_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

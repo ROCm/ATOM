@@ -807,8 +807,12 @@ def init_aiter_dist(config: Config) -> None:
 
     distributed_init_method = get_distributed_init_method(dp_master_ip, dp_master_port)
 
+    prefill_context_parallel_size = config.prefill_context_parallel_size
     logger.info(
-        f"Initialize aiter dist for using aiter custom collective op for plugin mode, rank:{rank}"
+        "Initialize aiter dist for using aiter custom collective op for "
+        f"plugin mode, rank:{rank}, tp:{tensor_parallel_size}, "
+        f"pcp:{prefill_context_parallel_size}, dp:{config.parallel_config.data_parallel_size}, "
+        f"dp_rank:{config.parallel_config.data_parallel_rank}"
     )
     init_dist_env(
         tensor_model_parallel_size=tensor_parallel_size,
@@ -817,4 +821,5 @@ def init_aiter_dist(config: Config) -> None:
         distributed_init_method=distributed_init_method,
         data_parallel_size=config.parallel_config.data_parallel_size,
         data_parallel_rank=config.parallel_config.data_parallel_rank,
+        prefill_context_model_parallel_size=prefill_context_parallel_size,
     )
