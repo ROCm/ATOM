@@ -135,13 +135,17 @@ if use_triton_gemm():
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_DS_QKNORM_FUSION = envs.ATOM_ENABLE_DS_QKNORM_FUSION
-ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+# DEEP-ALIGN cause 3/4 (ported to mainline): force these three fusions OFF so the
+# GLM-5.2 sparse-MLA indexer/residual path is construct-time deterministic (NV-aligned).
+# The `if not ENABLE_...` unfused branches already exist in this file. Do NOT also
+# disable ENABLE_DS_QKNORM*/ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION -- disabling those
+# was empirically WORSE (their unfused path is buggier). Env can't reach EngineCore,
+# so hardcode rather than rely on ATOM_* env.
+ENABLE_ALLREDUCE_RMSNORM_FUSION = False  # cause 3
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
-ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
-    envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
-)
+ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = False  # cause 4
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
-ENABLE_GLM_FUSED_INDEXER = envs.ATOM_ENABLE_GLM_FUSED_INDEXER
+ENABLE_GLM_FUSED_INDEXER = False  # cause 4
 _FP8_DTYPES = tuple(
     dtype
     for dtype in (

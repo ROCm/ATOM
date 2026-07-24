@@ -73,6 +73,11 @@ from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
 
+# Opt-in pre-sample logit NaN/Inf check (2026-07-23 corruption root-cause
+# hunt). See ModelRunner._check_logits_finite. Off by default (device-sync
+# cost per decode step).
+_DEBUG_LOGIT_NANCHECK = os.getenv("ATOM_DEBUG_LOGIT_NANCHECK") == "1"
+
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
@@ -3109,6 +3114,60 @@ class ModelRunner:
 
         return logits, hidden_states
 
+    def _check_logits_finite(self, logits: torch.Tensor) -> None:
+        """Opt-in diagnostic: warn if any pre-sample logit is NaN/Inf.
+
+        Gated by ATOM_DEBUG_LOGIT_NANCHECK=1 (default off, zero cost) --
+        added 2026-07-23 to help root-cause GLM-5.2 long-generation
+        corruption (see project-glm52-deep-align-nv-complete memory).
+        `torch.isfinite` + `.any()` forces a device sync every call, so this
+        must never run in the default hot path.
+        """
+        if not _DEBUG_LOGIT_NANCHECK:
+            return
+        bad = ~torch.isfinite(logits)
+        if bad.any():
+            row_mask = bad.any(dim=-1)
+            rows = row_mask.nonzero(as_tuple=True)[0].tolist()
+            logger.warning(
+                "[nan_check] non-finite logits: rows=%s total_bad=%d "
+                "nan=%d posinf=%d neginf=%d",
+                rows,
+                int(bad.sum()),
+                int(torch.isnan(logits).sum()),
+                int(torch.isposinf(logits).sum()),
+                int(torch.isneginf(logits).sum()),
+            )
+
+    def _apply_penalties(self, logits: torch.Tensor, batch: ScheduledBatch) -> None:
+        """Subtract frequency/presence penalties from logits in place.
+
+        `batch.penalty_rows/penalty_token_ids/penalty_values` are the sparse
+        (row, vocab_id, penalty) triples built once in ScheduledBatch.__init__
+        from each seq's `token_counts` -- absent entirely (None) unless at
+        least one in-batch request actually has a nonzero penalty, so this is
+        a no-op for the common case. `penalty_rows` indexes `logits`' rows in
+        the same order as `batch.req_ids`, i.e. this must be called against
+        the full per-request batch logits, not an already index_select'd
+        subset (see the speculative-decode branch in postprocess()).
+        """
+        if batch.penalty_rows is None:
+            return
+        device = logits.device
+        rows = torch.from_numpy(batch.penalty_rows).to(device, non_blocking=True)
+        token_ids = torch.from_numpy(batch.penalty_token_ids).to(device, non_blocking=True)
+        # index_put_(accumulate=True) requires the value tensor's dtype to
+        # match `logits` exactly (e.g. bf16 logits reject a float32 value
+        # tensor) -- cast explicitly rather than relying on the numpy source
+        # dtype, since `logits` dtype varies by model/quant config.
+        values = torch.from_numpy(batch.penalty_values).to(
+            device, dtype=logits.dtype, non_blocking=True
+        )
+        # accumulate=True sums into existing logit values (no duplicate
+        # (row, token_id) pairs within a row, so this is a plain deterministic
+        # scatter-add, not an order-dependent race).
+        logits.index_put_((rows, token_ids), -values, accumulate=True)
+
     def postprocess(
         self,
         batch: ScheduledBatch,
@@ -3124,6 +3183,8 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
+            self._apply_penalties(logits, batch)
+            self._check_logits_finite(logits)
             sampled_tokens = self.sampler(
                 logits,
                 temperatures,
@@ -3141,6 +3202,14 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            # NOTE: frequency/presence penalties are not applied on the
+            # speculative-decode path (bonus_logits/target_logits use a
+            # different, index_select'd row ordering than batch.penalty_rows,
+            # and target_logits additionally scores multiple draft positions
+            # per request, which token_counts as-is doesn't disambiguate).
+            # Not exercised by this deployment (spec decode is off by
+            # default); requests with a nonzero penalty should disable
+            # speculative decoding until this is wired up.
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
