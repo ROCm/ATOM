@@ -50,6 +50,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
 DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-}"
+DISABLE_PREFIX_CACHING="${DISABLE_PREFIX_CACHING:-true}"
 ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
@@ -289,8 +290,15 @@ server_common=(
   --kv_cache_dtype "${KV_CACHE_DTYPE}"
   --block-size "${BLOCK_SIZE}"
   --gpu-memory-utilization "${MEM_FRACTION}"
-  --no-enable_prefix_caching
 )
+
+case "${DISABLE_PREFIX_CACHING}" in
+  false|False|FALSE|0|no|No|NO|off|Off|OFF)
+    ;;
+  *)
+    server_common+=(--no-enable_prefix_caching)
+    ;;
+esac
 
 if [[ -n "${MAX_MODEL_LEN}" ]]; then
   server_common+=(--max-model-len "${MAX_MODEL_LEN}")

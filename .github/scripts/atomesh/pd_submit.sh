@@ -170,6 +170,9 @@ exports = {
     "DECODE_MAX_NUM_BATCHED_TOKENS": server_args.get(
         "decode_max_num_batched_tokens", ""
     ),
+    "DISABLE_PREFIX_CACHING": str(
+        server_args.get("disable_prefix_caching", True)
+    ).lower(),
     "ONLINE_QUANT_CONFIG": server_args.get("online_quant_config", ""),
     "HF_OVERRIDES": server_args.get("hf_overrides", ""),
     "SPEC_METHOD": server_args.get("method", ""),
