@@ -863,10 +863,9 @@ def dual_rmsnorm(
     k_weight: torch.Tensor,
     k_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q = q.contiguous()
-    k = k.contiguous()
-    q_out = torch.empty_like(q)
-    k_out = torch.empty_like(k)
+    # The AITER kernel honors row strides; K3 split views have inner stride 1.
+    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     _aiter_fused_qk_rmsnorm_kernel(
         q,
         q_weight,
