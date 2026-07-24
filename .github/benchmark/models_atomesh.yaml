@@ -319,6 +319,38 @@ models:
             decode:
               MAX_JOBS: "16"
 
+        - <<: *glm52_agentic_lmcache
+          name: glm-52-mxfp4-1p1d-tp4-pcp2-dpa-agentic-lmcache-1m-c48
+          topology: 1p1d-tp4-pcp2-dpa
+          pd_worker_layout: multi_node
+          concurrency: [48]
+          prefill:
+            workers: 1
+            tp: 4
+            extra_args: >-
+              --prefill-context-parallel-size 2
+              --enable-dp-attention
+              --enable-tbo
+              --attn-prefill-chunk-size 131072
+              --long-prefill-token-threshold 131072
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: none
+            extra_args: "--enable-dp-attention --enable-tbo"
+          env:
+            common:
+              PYTHONHASHSEED: "0"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+              LMCACHE_CHUNK_SIZE: "256"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              MAX_JOBS: "16"
+
     accuracy:
       task: gsm8k
       fewshot: 20
