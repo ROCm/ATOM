@@ -10,6 +10,18 @@ syntax, ready-to-run recipes for the most common model families, how to verify
 the result, and troubleshooting tips. For the dataclass-level field reference,
 see [`configuration_guide.md` § Online quantization at load time](./configuration_guide.md#online-quantization-at-load-time).
 
+## Online vs. offline quantization
+
+Online quantization lets you reuse an already-supported `quant_method` and freely
+tune the quantization granularity, which makes it well suited for fast
+quantization experiments and validation. It is, however, plain round-to-nearest
+(RTN) quantization, so the accuracy it can recover is limited; on top of that,
+the set of schemes it currently supports is also limited. Once you have settled
+on the quantization scheme you need and want to push for higher accuracy and a
+real reduction in on-disk footprint, you should switch to offline quantization
+with Quark, which can apply accuracy-recovery techniques such as rotation,
+SmoothQuant, and more.
+
 ## When to use online quantization
 
 Use online quantization when one of the following holds:
