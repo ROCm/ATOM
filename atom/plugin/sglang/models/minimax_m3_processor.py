@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 try:
     from sglang.srt.managers.schedule_batch import Modality
     from sglang.srt.multimodal.processors.transformers_auto import (
         TransformersAutoMultimodalProcessor,
     )
-except Exception:
+except Exception:  # noqa: BLE001 - SGLang multimodal symbols are optional
     Modality = None
     TransformersAutoMultimodalProcessor = object
 else:
@@ -26,7 +28,10 @@ class MiniMaxM3SparseForConditionalGeneration:
 class MiniMaxM3TextOnlyProcessor(TransformersAutoMultimodalProcessor):
     """Use SGLang's generic HF processor path for MiniMax-M3 inputs."""
 
-    models = [MiniMaxM3SparseForCausalLM, MiniMaxM3SparseForConditionalGeneration]
+    models: ClassVar[list[type]] = [
+        MiniMaxM3SparseForCausalLM,
+        MiniMaxM3SparseForConditionalGeneration,
+    ]
     supports_transformers_backend = True
 
     def __init__(self, *args, **kwargs):
@@ -61,7 +66,7 @@ def register_minimax_m3_text_only_processor() -> None:
 
     try:
         from sglang.srt.managers.multimodal_processor import PROCESSOR_MAPPING
-    except Exception:
+    except Exception:  # noqa: BLE001 - processor mapping is optional outside SGLang
         return
 
     PROCESSOR_MAPPING.setdefault(MiniMaxM3SparseForCausalLM, MiniMaxM3TextOnlyProcessor)

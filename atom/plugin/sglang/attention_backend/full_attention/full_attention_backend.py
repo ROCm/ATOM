@@ -10,13 +10,11 @@ from __future__ import annotations
 # attention layer — KV cache management and attention kernel dispatch will then
 # be handled by ATOM's native backend, making sglang-specific overrides
 # unnecessary.
-
 import math
-from typing import TYPE_CHECKING, Optional
-
-import torch
+from typing import TYPE_CHECKING
 
 import sglang.srt.layers.attention.aiter_backend as _sglang_aiter
+import torch
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
@@ -32,7 +30,11 @@ from atom.plugin.sglang.attention_backend.full_attention.kv_cache import (
 from atom.plugin.sglang.attention_backend.full_attention.metadata import ForwardMetadata
 from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     allocate_pa_metadata_buffers as _allocate_pa_metadata_buffers,
+)
+from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     build_pa_metadata_for_decode as _build_pa_metadata_for_decode,
+)
+from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     build_pa_metadata_for_prefill as _build_pa_metadata_for_prefill,
 )
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
@@ -46,10 +48,10 @@ if TYPE_CHECKING:
 try:
     from aiter import (
         QuantType,
-        flash_attn_varlen_func,
         dtypes,
-        get_pa_metadata_info_v1,
+        flash_attn_varlen_func,
         get_hip_quant,
+        get_pa_metadata_info_v1,
         mha_batch_prefill_func,
         pa_fwd_asm,
         pa_persistent_fwd,
@@ -77,8 +79,7 @@ try:
 except ImportError:
     pass
 try:
-    from aiter.mla import mla_prefill_fwd
-    from aiter.mla import mla_decode_fwd
+    from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     pass
 try:
@@ -102,7 +103,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
-        kv_indptr_buf: Optional[torch.Tensor] = None,
+        kv_indptr_buf: torch.Tensor | None = None,
         topk: int = 1,
     ):
         super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
@@ -200,12 +201,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                         if pool is None:
                             full_backend = getattr(backend, "full_attn_backend", None)
                             pool = getattr(full_backend, attr, None)
-                except Exception:
+                except Exception:  # noqa: BLE001 - forward context is optional
                     pool = None
             if pool is not None:
                 try:
                     setattr(forward_batch, attr, pool)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
@@ -264,7 +265,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """ATOM's full-attention metadata is prepared outside the captured graph."""
-        return None
+        return
 
     def _init_forward_metadata_decode(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -814,7 +815,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         self,
         max_bs: int,
         max_num_tokens: int,
-        kv_indices_buf: Optional[torch.Tensor] = None,
+        kv_indices_buf: torch.Tensor | None = None,
     ):
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int, device=self.device
@@ -947,9 +948,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
+        encoder_lens: torch.Tensor | None,
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        spec_info: SpecInput | None,
     ):
         num_kv_splits = None
         work_metadata = None
@@ -1279,11 +1280,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
+        encoder_lens: torch.Tensor | None,
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: Optional[torch.Tensor] = None,
+        spec_info: SpecInput | None,
+        seq_lens_cpu: torch.Tensor | None,
+        out_cache_loc: torch.Tensor | None = None,
     ):
         num_kv_splits = None
         work_metadata = None
@@ -1620,7 +1621,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor] = None,
+        seq_lens_cpu: torch.Tensor | None = None,
         static_columns: bool = False,
     ):
         page_table_persistent = self.page_table

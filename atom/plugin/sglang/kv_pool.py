@@ -13,7 +13,7 @@ def _maybe_get_current_attn_backend() -> Any | None:
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         return get_attn_backend()
-    except Exception:
+    except Exception:  # noqa: BLE001 - forward context is optional
         return None
 
 
@@ -22,7 +22,7 @@ def _maybe_setattr(obj: Any, name: str, value: Any) -> None:
         return
     try:
         setattr(obj, name, value)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - best-effort compatibility patch
         pass
 
 

@@ -1,21 +1,21 @@
 import logging
 import os
 
-from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.models.qwen3_moe import Qwen3MoeForCausalLM
-from atom.models.glm4_moe import Glm4MoeForCausalLM
+from atom.config import Config
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
+from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
 from atom.models.minimax_m3 import (
     MiniMaxM3SparseForCausalLM,
     MiniMaxM3SparseForConditionalGeneration,
 )
+from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_5 import (
-    Qwen3_5MoeForConditionalGenerationTextOnly,
     Qwen3_5ForConditionalGenerationTextOnly,
+    Qwen3_5MoeForConditionalGenerationTextOnly,
 )
-from atom.config import Config
-from atom.plugin.prepare import is_vllm, is_sglang, is_rtpllm
+from atom.models.qwen3_moe import Qwen3MoeForCausalLM
+from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
 logger = logging.getLogger("atom")
 
@@ -35,12 +35,12 @@ _ATOM_SUPPORTED_MODELS = {
 
 if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
-    from atom.models.qwen3_next import Qwen3NextForCausalLM
+    from atom.models.kimi_k25 import KimiK25ForCausalLM
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
         Qwen3_5MoeForCausalLM,
     )
-    from atom.models.kimi_k25 import KimiK25ForCausalLM
+    from atom.models.qwen3_next import Qwen3NextForCausalLM
 
     _ATOM_SUPPORTED_MODELS.update(
         {
@@ -67,15 +67,15 @@ def _register_custom_attention_to_sglang() -> None:
     """
     import sglang.srt.layers.attention.aiter_backend as sglang_aiter_backend
     import sglang.srt.layers.attention.dsa_backend as sglang_dsa_backend
-
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
     )
-    from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
-        ATOMAttnBackendForSgl,
-    )
+
     from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
         ATOMDeepseekV4BackendForSgl,
+    )
+    from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
+        ATOMAttnBackendForSgl,
     )
     from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
         ATOMGLM52DSABackendForSgl,
@@ -150,10 +150,11 @@ def _patch_sglang_dsv4_draft_backends() -> None:
 
     try:
         from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
         from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
             ATOMDeepseekV4BackendForSgl,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - optional SGLang symbols vary by version
         logger.debug("Skip patching SGLang DSV4 draft backends: %s", exc)
         return
 
@@ -202,7 +203,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             EAGLEDraftExtendCudaGraphRunner,
         )
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - optional SGLang symbols vary by version
         logger.debug("Skip patching SGLang DSV4 spec cuda graph: %s", exc)
         return
 
@@ -217,7 +218,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 or []
             )
             return any("DeepseekV4ForCausalLMNextN" in str(arch) for arch in arches)
-        except Exception:
+        except Exception:  # noqa: BLE001 - defensive runner introspection
             return False
 
     def _is_dsv4_runner(runner) -> bool:
@@ -231,7 +232,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 or []
             )
             return any("DeepseekV4" in str(arch) for arch in arches)
-        except Exception:
+        except Exception:  # noqa: BLE001 - defensive runner introspection
             return False
 
     def _flatten_spec_hidden_states(forward_batch):
@@ -343,7 +344,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     and not getattr(model_runner, "is_draft_worker", False)
                     and _target_verify_graph_enabled()
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - optional graph cap detection
                 should_cap = False
 
             try:
@@ -395,7 +396,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     return False
                 if is_dsv4 and is_draft_extend:
                     return False
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - fall back to original can_run
                 pass
             return original_can_run(self, forward_batch)
 
@@ -470,10 +471,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 output = runner.output_buffers.get(bs)
                 logits = getattr(output, "next_token_logits", None)
                 expected = bs * num_draft_tokens
-                if logits is None or int(logits.shape[0]) < expected:
-                    return False
-                return True
-            except Exception:
+                return logits is not None and int(logits.shape[0]) >= expected
+            except Exception:  # noqa: BLE001 - graph buffer shape probing
                 return False
 
         def can_run(self, forward_batch):
@@ -714,7 +713,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     selected_hidden_states,
                 )
                 return None
-            except Exception:
+            except Exception:  # noqa: TRY203
                 raise
 
         EagleDraftWorker._draft_extend_for_decode = _draft_extend_for_decode
@@ -779,7 +778,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             )
                 elif _is_dsv4_nextn_runner(getattr(self, "draft_runner", None)):
                     self.cuda_graph_runner_for_draft_extend = None
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Failed to enable DSV4 draft-extend cuda graph in ATOM plugin: %s",
                     exc,
