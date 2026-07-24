@@ -208,6 +208,41 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         normed = mtp_layer.shared_head(hidden_states)
         return mtp_layer.shared_head.head.compute_argmax_token(normed)
 
+    def set_skip_topk(self, skip: bool) -> None:
+        """Toggle ``skip_topk`` on MTP sparse-attention layers.
+
+        Used by ``EagleProposer`` for ``index_share_for_mtp_iteration``: draft
+        step 0 sets ``skip=False`` (compute indexer top-k), steps 1+ set
+        ``skip=True`` (reuse step 0's ``sparse_kv_indices_buffer``).
+        Matches vLLM ``DeepSeekMultiTokenPredictor.set_skip_topk``.
+        """
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is None:
+                continue
+            self_attn = getattr(mtp_block, "self_attn", None)
+            if self_attn is None or not hasattr(self_attn, "skip_topk"):
+                continue
+            if getattr(self_attn, "indexer", None) is not None:
+                self_attn.skip_topk = skip
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        """Gather sparse top-k rows at ``slot_ids`` to the front of each buffer."""
+        num_slots = slot_ids.numel()
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is None:
+                continue
+            self_attn = getattr(mtp_block, "self_attn", None)
+            if self_attn is None:
+                continue
+            mla_attn = getattr(self_attn, "mla_attn", None)
+            if mla_attn is None:
+                continue
+            sparse_buf = getattr(mla_attn, "sparse_kv_indices_buffer", None)
+            if sparse_buf is not None and sparse_buf.numel() > 0:
+                sparse_buf[:num_slots] = sparse_buf[slot_ids]
+
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module):
@@ -310,6 +345,12 @@ class DeepSeekMTP(nn.Module):
         reductions. See DeepSeekMultiTokenPredictor.compute_draft_token.
         """
         return self.model.compute_draft_token(hidden_states, spec_step_idx)
+
+    def set_skip_topk(self, skip: bool) -> None:
+        self.model.set_skip_topk(skip)
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        self.model.compact_topk_indices(slot_ids)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
