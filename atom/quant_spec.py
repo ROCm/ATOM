@@ -60,6 +60,62 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     )
 
 
+def should_stream_online_quant(
+    quant_config,
+    prefix: str,
+    source_quant_type,
+    source_quant_dtype,
+    *,
+    allow_per_tensor_source: bool = True,
+) -> bool:
+    """Whether a layer should stream its online quantization during loading.
+
+    Streaming = allocate the large weight on the meta device at construction,
+    materialize + (dequant →) re-quantize it as soon as its weights finish
+    loading, then free the source weight -- instead of loading the whole model
+    then quantizing it in a second pass. Shared by ``LinearBase`` and
+    ``FusedMoE`` so both decide identically.
+
+    The eligibility is **capability-driven**, not a hard-coded format list: the
+    incoming checkpoint can be BF16, ptpc_fp8 (``per_Token``), block FP8
+    (``per_1x128``), per-tensor FP8, MXFP8 (``per_1x32``), etc. A layer streams
+    whenever ALL of these hold:
+
+    - ``ATOM_ONLINE_QUANT_STREAMING`` is set;
+    - online quantization is active on ``quant_config``;
+    - the source can actually be dequantized back to float on the fly, per
+      :func:`can_dequant_weight_online` (the same authority the requant paths
+      use). MXFP4 / other 4-bit sources are target-only and therefore excluded --
+      they fall back to the classic two-pass flow;
+    - the online target is a real format for this layer (not excluded and not
+      already equal to the source);
+    - the source layout is supported by *this* layer's requant path. Callers pass
+      ``allow_per_tensor_source=False`` when their path can't requant
+      ``per_Tensor`` (e.g. ``FusedMoE._online_quant``).
+
+    :param allow_per_tensor_source: whether ``per_Tensor`` FP8 is a streamable
+        source for the calling layer type. ``True`` for Linear, ``False`` for MoE.
+    """
+    # Imported lazily to avoid a module-load cycle (envs/quark pull in config
+    # which can pull in quant_spec).
+    from atom.utils import envs
+    from atom.quantization.quark.utils import can_dequant_weight_online
+
+    if not envs.ATOM_ONLINE_QUANT_STREAMING:
+        return False
+    if quant_config is None or not getattr(quant_config, "online_quant", False):
+        return False
+    # Source must be one the requant path can dequantize (No == already float).
+    if not can_dequant_weight_online(source_quant_type, source_quant_dtype):
+        return False
+    if not allow_per_tensor_source and source_quant_type == QuantType.per_Tensor:
+        return False
+    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+    return not should_skip_online_quant(
+        source_quant_type, source_quant_dtype, online_cfg
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Structured parsed config
 # ──────────────────────────────────────────────────────────────────────
