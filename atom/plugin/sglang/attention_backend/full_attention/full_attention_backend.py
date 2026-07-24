@@ -1760,9 +1760,15 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         if self.use_mla:
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
         if bool(getattr(layer, "_atom_minimax_m3_dense_mha", False)):
-            # M3 dense decode benefits from the native ragged path, but batched
-            # SGLang prefill is safer through the standard varlen extend path.
-            return self._forward_extend_mha(q, k, v, layer, forward_batch)
+            # M3 dense extend always uses the prefix-aware path (radix-cache fix).
+            #
+            # The plain varlen path builds cu_seqlens_q from the FULL seq_lens
+            # while q holds only the new (extend) tokens and attends solely over
+            # the passed k/v -- it cannot see the cached prefix KV. That is only
+            # correct when prefix_len == 0; on a radix prefix hit
+            # (extend_prefix_lens > 0) the cu_seqlens_q overcount reads q/k/v out
+            # of bounds -> GPU memory access fault.
+            return self._forward_extend_mha_prefix_aware(q, layer, forward_batch)
         if use_native_dense_mha:
             return self._forward_extend_native_dense_mha(q, layer, forward_batch)
         else:
@@ -1817,6 +1823,48 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=self.forward_metadata.max_q_len,
             max_seqlen_k=self.forward_metadata.max_kv_len,
+            min_seqlen_q=0,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=(-1, -1, 0),
+            sink_ptr=None,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_extend_mha_prefix_aware(self, q, layer, forward_batch):
+        """Prefix-aware non-MLA extend for MiniMax-M3 dense layers.
+
+        Gathers the full K/V (cached prefix + freshly written new tokens) from
+        the KV pool via the token-level kv_indices, then runs the same stable
+        flash_attn_varlen_func as :meth:`_forward_extend_mha`. cu_seqlens_q spans
+        the new (extend) tokens and cu_seqlens_k spans the full sequence, so
+        causal attention correctly places new-token i at absolute position
+        prefix_len + i. Unlike the plain varlen path this reads the cached prefix
+        KV, so it is correct on radix prefix hits / chunked prefill.
+        """
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        md = self.forward_metadata
+        bs = forward_batch.batch_size
+        qo_indptr = md.qo_indptr[: bs + 1]
+        kv_indptr = md.kv_indptr[: bs + 1]
+        total_kv = int(kv_indptr[-1].item())
+        idx = md.kv_indices[:total_kv].to(torch.long)
+
+        k_full = k_cache[idx].view(-1, layer.tp_k_head_num, layer.head_dim)
+        v_full = v_cache[idx].view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        q3 = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if q3.dtype != k_full.dtype and k_full.dtype == dtypes.fp8:
+            q3 = q3.to(dtypes.fp8)
+
+        o = flash_attn_varlen_func(
+            q3,
+            k_full,
+            v_full,
+            cu_seqlens_q=qo_indptr,
+            cu_seqlens_k=kv_indptr,
+            max_seqlen_q=md.max_q_len,
+            max_seqlen_k=md.max_kv_len,
             min_seqlen_q=0,
             dropout_p=0.0,
             softmax_scale=self.scale,
