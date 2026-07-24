@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
+from atom.plugin.sglang.runtime.context import is_draft_extend_mode
+
 logger = logging.getLogger("atom.plugin.sglang.attention_backend.deepseek_v4")
 
 
@@ -45,10 +47,8 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
         self.forward_metadata = forward_batch
-        is_draft_extend = bool(
-            getattr(
-                forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False
-            )(include_v2=True)
+        is_draft_extend = is_draft_extend_mode(
+            forward_batch.forward_mode, include_v2=True
         )
         draft_extend_runner = getattr(
             self, "_atom_dsv4_draft_extend_graph_runner", None
@@ -92,10 +92,8 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
                     model=atom_model,
                 )
             )
-        elif forward_batch.forward_mode.is_target_verify() or bool(
-            getattr(
-                forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False
-            )(include_v2=True)
+        elif forward_batch.forward_mode.is_target_verify() or is_draft_extend_mode(
+            forward_batch.forward_mode, include_v2=True
         ):
             self.atom_v4_graph_metadata = (
                 build_atom_v4_verify_graph_metadata_from_sglang(
@@ -225,10 +223,8 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
         spec_info=None,
         actual_forward_mode=None,
     ) -> None:
-        is_graph_extend = forward_mode.is_target_verify() or bool(
-            getattr(forward_mode, "is_draft_extend", lambda **kwargs: False)(
-                include_v2=True
-            )
+        is_graph_extend = forward_mode.is_target_verify() or is_draft_extend_mode(
+            forward_mode, include_v2=True
         )
         if not is_graph_extend:
             self.atom_v4_graph_metadata = None

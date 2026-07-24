@@ -202,7 +202,7 @@ jobs:
               TORCHINDUCTOR_COMPILE_THREADS=128
               ATOM_USE_TRITON_MOE=0
               ATOM_SGLANG_V4_DISABLE_PRO_DRAFT_TRITON_MOE=1
-              ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG=1
+              ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1
             lm_eval_num_fewshot: 5
             lm_eval_num_concurrent: 8
             accuracy_test_threshold: 0.94

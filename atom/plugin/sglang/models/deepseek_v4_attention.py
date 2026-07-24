@@ -16,6 +16,85 @@ _draft_extend_fused_swa_ctx = contextvars.ContextVar(
     "atom_sglang_dsv4_draft_extend_fused_swa_ctx",
     default=None,
 )
+_v4_nm_last_page_lens_cache: dict[tuple[str, int | None, int], torch.Tensor] = {}
+
+
+def _install_v4_nm_aiter_compat_patch() -> None:
+    """Adapt native DSV4's legacy op5 call to the current AITER ABI.
+
+    Native ATOM still calls ``mla_decode_fwd_v4_nm`` without
+    ``kv_last_page_lens`` and consumes its in-place ``output`` tensor. Keep that
+    frontend contract unchanged and install the compatibility shim only in
+    SGLang plugin mode.
+    """
+
+    import inspect
+
+    import aiter.mla
+
+    original = aiter.mla.mla_decode_fwd_v4_nm
+    if getattr(original, "_atom_sglang_v4_nm_compat", False):
+        return
+
+    try:
+        parameters = inspect.signature(original).parameters
+    except (TypeError, ValueError):
+        return
+    if "kv_last_page_lens" not in parameters:
+        return
+
+    def mla_decode_fwd_v4_nm(*args, **kwargs):
+        # Legacy native ATOM passes max_seqlen_q as positional argument 9.
+        # Current AITER inserts kv_last_page_lens before it.
+        is_legacy_call = (
+            len(args) == 9
+            and not torch.is_tensor(args[8])
+            and "max_seqlen_q" not in kwargs
+        )
+        if not is_legacy_call:
+            return original(*args, **kwargs)
+
+        (
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            output,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            max_seqlen_q,
+        ) = args
+        num_seqs = int(qo_indptr.shape[0]) - 1
+        cache_key = (q.device.type, q.device.index, num_seqs)
+        kv_last_page_lens = _v4_nm_last_page_lens_cache.get(cache_key)
+        if kv_last_page_lens is None:
+            kv_last_page_lens = torch.ones(
+                num_seqs,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            _v4_nm_last_page_lens_cache[cache_key] = kv_last_page_lens
+
+        logits, attn_lse = original(
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            output,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            max_seqlen_q,
+            **kwargs,
+        )
+        if int(kwargs.get("out_16_nosplit", 0) or 0) == 0 and int(logits.shape[1]) == 1:
+            output.copy_(logits[:, 0])
+        return logits, attn_lse
+
+    mla_decode_fwd_v4_nm._atom_sglang_v4_nm_compat = True
+    aiter.mla.mla_decode_fwd_v4_nm = mla_decode_fwd_v4_nm
 
 
 def _install_draft_extend_fused_swa_patch() -> None:
@@ -23,6 +102,7 @@ def _install_draft_extend_fused_swa_patch() -> None:
 
     import atom.models.deepseek_v4 as dsv4
 
+    _install_v4_nm_aiter_compat_patch()
     if getattr(dsv4, "_atom_sglang_draft_extend_fused_swa_patched", False):
         return
 

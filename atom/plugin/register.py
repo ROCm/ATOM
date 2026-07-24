@@ -203,6 +203,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             EAGLEDraftExtendCudaGraphRunner,
         )
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        from atom.plugin.sglang.runtime.context import is_draft_extend_mode
     except Exception as exc:  # noqa: BLE001 - optional SGLang symbols vary by version
         logger.debug("Skip patching SGLang DSV4 spec cuda graph: %s", exc)
         return
@@ -244,9 +246,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         input_ids = getattr(forward_batch, "input_ids", None)
         num_tokens = int(input_ids.shape[0]) if hasattr(input_ids, "shape") else 0
         mode = getattr(forward_batch, "forward_mode", None)
-        is_draft_extend = bool(
-            getattr(mode, "is_draft_extend", lambda **kwargs: False)(include_v2=True)
-        )
+        is_draft_extend = is_draft_extend_mode(mode, include_v2=True)
         if is_draft_extend and num_tokens > 0 and flattened.shape[0] != num_tokens:
             if num_tokens % int(flattened.shape[0]) != 0:
                 raise RuntimeError(
@@ -387,11 +387,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 is_target_verify = bool(
                     getattr(mode, "is_target_verify", lambda: False)()
                 )
-                is_draft_extend = bool(
-                    getattr(mode, "is_draft_extend", lambda **kwargs: False)(
-                        include_v2=True
-                    )
-                )
+                is_draft_extend = is_draft_extend_mode(mode, include_v2=True)
                 if is_dsv4 and is_target_verify and not _target_verify_graph_enabled():
                     return False
                 if is_dsv4 and is_draft_extend:
@@ -427,7 +423,9 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         setattr(EAGLEDraftCudaGraphRunner, draft_replay_method, replay)
         EAGLEDraftCudaGraphRunner._atom_dsv4_replay_patched = True
 
-    if not getattr(EAGLEDraftExtendCudaGraphRunner, "_atom_dsv4_replay_patched", False):
+    if not getattr(
+        EAGLEDraftExtendCudaGraphRunner, "_atom_dsv4_execute_patched", False
+    ):
         extend_replay_method = (
             "execute"
             if hasattr(EAGLEDraftExtendCudaGraphRunner, "execute")
@@ -436,51 +434,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         original_extend_replay = getattr(
             EAGLEDraftExtendCudaGraphRunner, extend_replay_method
         )
-        extend_can_run_method = (
-            "can_run_graph"
-            if hasattr(EAGLEDraftExtendCudaGraphRunner, "can_run_graph")
-            else "can_run"
-        )
-        original_extend_can_run = getattr(
-            EAGLEDraftExtendCudaGraphRunner, extend_can_run_method
-        )
-
-        def _dsv4_draft_extend_graph_layout_ok(runner, forward_batch=None):
-            try:
-                num_draft_tokens = int(getattr(runner, "num_tokens_per_bs", 0) or 0)
-                if num_draft_tokens <= 0:
-                    return False
-                raw_bs = int(getattr(forward_batch, "batch_size", 0) or 0)
-                if raw_bs <= 0:
-                    raw_bs = min(getattr(runner, "capture_bs", [0]) or [0])
-                if raw_bs <= 0:
-                    return False
-                if forward_batch is not None and getattr(
-                    runner, "require_mlp_tp_gather", False
-                ):
-                    max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-                    max_batch_size = max_num_tokens // num_draft_tokens
-                else:
-                    max_batch_size = raw_bs
-                import bisect
-
-                index = bisect.bisect_left(runner.capture_bs, max_batch_size)
-                if index >= len(runner.capture_bs):
-                    return False
-                bs = runner.capture_bs[index]
-                output = runner.output_buffers.get(bs)
-                logits = getattr(output, "next_token_logits", None)
-                expected = bs * num_draft_tokens
-                return logits is not None and int(logits.shape[0]) >= expected
-            except Exception:  # noqa: BLE001 - graph buffer shape probing
-                return False
-
-        def can_run(self, forward_batch):
-            if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
-                return original_extend_can_run(self, forward_batch)
-            if not original_extend_can_run(self, forward_batch):
-                return False
-            return _dsv4_draft_extend_graph_layout_ok(self, forward_batch)
 
         def replay(self, forward_batch):
             if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
@@ -497,55 +450,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if backend is not None
                 else None
             )
-            previous_replay_batch = (
-                getattr(backend, "_replay_forward_batch", None)
-                if backend is not None
-                else None
-            )
             try:
                 if backend is not None:
                     backend._atom_dsv4_draft_extend_graph_runner = self
-                    buffers = getattr(self, "buffers", None)
-                    input_ids = getattr(forward_batch, "input_ids", None)
-                    num_tokens = (
-                        int(input_ids.shape[0]) if hasattr(input_ids, "shape") else 0
-                    )
-                    if buffers is not None and num_tokens > 0:
-                        from types import SimpleNamespace
-
-                        backend._replay_forward_batch = SimpleNamespace(
-                            forward_mode=getattr(forward_batch, "forward_mode", None),
-                            positions=getattr(buffers, "positions", None)[:num_tokens],
-                            out_cache_loc=getattr(buffers, "out_cache_loc", None)[
-                                :num_tokens
-                            ],
-                        )
-                out = original_extend_replay(self, forward_batch)
-                try:
-                    # EAGLE V2 consumes draft-extend logits with a fixed
-                    # `seq * speculative_num_draft_tokens + offset` layout.
-                    # SGLang's runner trims to the actual compact token count,
-                    # which makes that indexing OOB when fewer than the padded
-                    # graph tokens were materialized.  Return the captured
-                    # padded output buffer for DSV4 so downstream indexing stays
-                    # within the fixed graph layout.
-                    if bool(
-                        getattr(
-                            getattr(self, "forward_mode", None),
-                            "is_draft_extend_v2",
-                            lambda: False,
-                        )()
-                    ):
-                        padded_out = getattr(self, "output_buffers", {}).get(
-                            getattr(self, "bs", None)
-                        )
-                        if padded_out is not None:
-                            out = padded_out
-                except Exception:
-                    logger.exception(
-                        "Failed to restore padded DSV4 draft-extend graph output"
-                    )
-                return out
+                return original_extend_replay(self, forward_batch)
             finally:
                 if backend is not None:
                     if previous_runner is None:
@@ -555,169 +463,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             pass
                     else:
                         backend._atom_dsv4_draft_extend_graph_runner = previous_runner
-                    if previous_replay_batch is None:
-                        try:
-                            delattr(backend, "_replay_forward_batch")
-                        except AttributeError:
-                            pass
-                    else:
-                        backend._replay_forward_batch = previous_replay_batch
                 if original_hidden_states is not None:
                     forward_batch.spec_info.hidden_states = original_hidden_states
 
-        setattr(EAGLEDraftExtendCudaGraphRunner, extend_can_run_method, can_run)
         setattr(EAGLEDraftExtendCudaGraphRunner, extend_replay_method, replay)
-        EAGLEDraftExtendCudaGraphRunner._atom_dsv4_replay_patched = True
-
-    if not getattr(EagleDraftWorker, "_atom_dsv4_draft_extend_accept_patched", False):
-        original_draft_extend_for_decode = EagleDraftWorker._draft_extend_for_decode
-
-        def _draft_extend_for_decode(self, batch, batch_result):
-            try:
-                if (
-                    not _is_dsv4_nextn_runner(getattr(self, "draft_runner", None))
-                    or getattr(self, "cuda_graph_runner_for_draft_extend", None) is None
-                ):
-                    return original_draft_extend_for_decode(self, batch, batch_result)
-
-                import torch
-                from sglang.srt.speculative.eagle_info import EagleDraftInput
-                from sglang.srt.speculative.spec_utils import fast_topk
-
-                num_draft_tokens = int(
-                    getattr(self, "speculative_num_draft_tokens", 0)
-                    or getattr(self.server_args, "speculative_num_draft_tokens", 0)
-                    or 0
-                )
-                if num_draft_tokens <= 0:
-                    return original_draft_extend_for_decode(self, batch, batch_result)
-
-                if not _dsv4_draft_extend_graph_layout_ok(
-                    self.cuda_graph_runner_for_draft_extend
-                ):
-                    runner = self.cuda_graph_runner_for_draft_extend
-                    self.cuda_graph_runner_for_draft_extend = None
-                    try:
-                        return original_draft_extend_for_decode(
-                            self, batch, batch_result
-                        )
-                    finally:
-                        self.cuda_graph_runner_for_draft_extend = runner
-
-                accept_lens = getattr(batch_result, "accept_lens", None)
-                if not torch.is_tensor(accept_lens):
-                    return original_draft_extend_for_decode(self, batch, batch_result)
-
-                # DRAFT_EXTEND_V2 materializes exactly `num_draft_tokens` slots
-                # per sequence.  `accept_lens` includes the target bonus token,
-                # so the value can be `num_draft_tokens + 1`; using that directly
-                # in the fixed-layout index points one slot past the graph output.
-                graph_accept_lens = accept_lens.clamp(min=1, max=num_draft_tokens)
-
-                draft_input = EagleDraftInput(
-                    hidden_states=batch_result.logits_output.hidden_states,
-                    num_tokens_per_req=self.speculative_num_steps + 1,
-                    num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
-                )
-                select_index = (
-                    torch.arange(len(batch.seq_lens), device=self.device)
-                    * num_draft_tokens
-                    + graph_accept_lens
-                    - 1
-                )
-
-                with self.plan_stream_ctx:
-                    forward_batch = (
-                        draft_input.prepare_for_extend_to_fill_draft_kvcache(
-                            batch,
-                            batch_result.next_token_ids,
-                            num_draft_tokens,
-                            self.draft_runner,
-                            self.cuda_graph_runner_for_draft_extend,
-                        )
-                    )
-
-                if self.plan_stream:
-                    torch.get_device_module(self.device).current_stream().wait_stream(
-                        self.plan_stream
-                    )
-
-                # The graph only fills draft slots.  Keep the scheduler-facing
-                # `batch_result.accept_lens` untouched, but make the graph's
-                # per-sequence counts match the fixed draft-token layout.
-                forward_batch.spec_info.num_correct_drafts = graph_accept_lens - 1
-                forward_batch.spec_info.num_accept_tokens = graph_accept_lens
-
-                graph_runner = self.cuda_graph_runner_for_draft_extend
-                graph_can_run = None
-                if graph_runner is not None:
-                    graph_can_run = getattr(
-                        graph_runner, "can_run_graph", None
-                    ) or getattr(graph_runner, "can_run", None)
-                can_cuda_graph = graph_can_run is not None and graph_can_run(
-                    forward_batch
-                )
-                if can_cuda_graph:
-                    graph_execute = getattr(
-                        self.cuda_graph_runner_for_draft_extend, "execute", None
-                    ) or getattr(
-                        self.cuda_graph_runner_for_draft_extend, "replay", None
-                    )
-                    draft_logits_output = graph_execute(forward_batch)
-                else:
-                    draft_logits_output = self.draft_runner.forward(
-                        forward_batch, skip_attn_backend_init=True
-                    ).logits_output
-
-                output_len = int(draft_logits_output.next_token_logits.shape[0])
-                max_index = (
-                    int(select_index.max().detach().cpu())
-                    if select_index.numel()
-                    else -1
-                )
-                if max_index >= output_len and can_cuda_graph:
-                    draft_logits_output = self.draft_runner.forward(
-                        forward_batch, skip_attn_backend_init=True
-                    ).logits_output
-                    can_cuda_graph = False
-                    output_len = int(draft_logits_output.next_token_logits.shape[0])
-                if max_index >= output_len:
-                    raise RuntimeError(
-                        "DSV4 DRAFT_EXTEND_V2 output/index layout mismatch: "
-                        f"max_index={max_index}, output_len={output_len}, "
-                        f"batch={len(batch.seq_lens)}, "
-                        f"num_draft_tokens={num_draft_tokens}, "
-                        f"can_cuda_graph={bool(can_cuda_graph)}"
-                    )
-
-                selected_logits = draft_logits_output.next_token_logits.index_select(
-                    0, select_index
-                )
-                selected_hidden_states = draft_logits_output.hidden_states
-                if draft_logits_output.hidden_states is not None:
-                    selected_hidden_states = (
-                        draft_logits_output.hidden_states.index_select(0, select_index)
-                    )
-
-                probs = torch.softmax(selected_logits, dim=-1)
-                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-
-                next_draft_input = batch_result.next_draft_input
-                (
-                    next_draft_input.topk_p,
-                    next_draft_input.topk_index,
-                    next_draft_input.hidden_states,
-                ) = (
-                    ret_topk_p,
-                    ret_topk_index,
-                    selected_hidden_states,
-                )
-                return None
-            except Exception:  # noqa: TRY203
-                raise
-
-        EagleDraftWorker._draft_extend_for_decode = _draft_extend_for_decode
-        EagleDraftWorker._atom_dsv4_draft_extend_accept_patched = True
+        EAGLEDraftExtendCudaGraphRunner._atom_dsv4_execute_patched = True
 
     if not getattr(EagleDraftWorker, "_atom_dsv4_init_cuda_graphs_patched", False):
         original_init_cuda_graphs = EagleDraftWorker.init_cuda_graphs
@@ -778,11 +528,16 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             )
                 elif _is_dsv4_nextn_runner(getattr(self, "draft_runner", None)):
                     self.cuda_graph_runner_for_draft_extend = None
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "Failed to enable DSV4 draft-extend cuda graph in ATOM plugin: %s",
                     exc,
                 )
+                if _env_flag("ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG"):
+                    raise RuntimeError(
+                        "DSV4 draft-extend CUDA graph was explicitly enabled but "
+                        "capture failed"
+                    ) from exc
             return ret
 
         EagleDraftWorker.init_cuda_graphs = init_cuda_graphs

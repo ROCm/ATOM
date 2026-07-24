@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: UP045
 
 import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import Any, Union
+from typing import Any, Dict, Optional, Set, Union
 
 import numpy as np
 import torch
@@ -56,7 +57,7 @@ class DPMetadata:
     max_tokens_across_dp_cpu: torch.Tensor
     cu_tokens_across_dp_cpu: torch.Tensor
     max_tokens_across_dp: int  # Pre-computed int value for cudagraph compatibility
-    local_sizes: list[int] | None = None
+    local_sizes: Optional[list[int]] = None
 
     @staticmethod
     def num_tokens_across_dp(
@@ -82,7 +83,7 @@ class DPMetadata:
         parallel_config: ParallelConfig,
         # attn_metadata: Any,
         num_tokens: int,
-        num_tokens_across_dp: torch.Tensor | None = None,
+        num_tokens_across_dp: Optional[torch.Tensor] = None,
     ) -> "DPMetadata":
 
         assert parallel_config.data_parallel_size > 1
@@ -142,7 +143,7 @@ class DPMetadata:
         finally:
             self.local_sizes = None
 
-    def get_chunk_sizes_across_dp_rank(self) -> list[int] | None:
+    def get_chunk_sizes_across_dp_rank(self) -> Optional[list[int]]:
         return self.local_sizes
 
     def get_sizes_across_dp(self) -> list[int]:
@@ -321,12 +322,12 @@ class Context:
     # Set by prepare_inputs via ForwardMode.decide(). None only on legacy
     # paths that haven't been routed through it (run_model falls back to
     # the original four-OR derivation in that case for back-compat).
-    forward_mode: ForwardMode | None = None
+    forward_mode: Optional[ForwardMode] = None
     # Optional flat token ids for the current forward. Read by callbacks
     # invoked inside Dynamo-opaque custom ops (e.g. V4 MoE hash routing)
     # that need the token ids but cannot receive them as a function arg
     # (the op signature is fixed by the consumer's plugin contract).
-    input_ids: torch.Tensor | None = None
+    input_ids: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -337,8 +338,8 @@ class Context:
         graph_bs: int = 0,
         is_draft: bool = False,
         dp_uniform_decode: bool = True,
-        forward_mode: ForwardMode | None = None,
-        input_ids: torch.Tensor | None = None,
+        forward_mode: Optional[ForwardMode] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -355,14 +356,14 @@ class Context:
 class AttentionMetaData:
     """Attention metadata for prefill and decode batched together."""
 
-    cu_seqlens_q: torch.Tensor | None = None
-    cu_seqlens_k: torch.Tensor | None = None
+    cu_seqlens_q: Optional[torch.Tensor] = None
+    cu_seqlens_k: Optional[torch.Tensor] = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
     min_seqlen_q: int = 0
-    slot_mapping: torch.Tensor | None = None
-    context_lens: torch.Tensor | None = None
-    block_tables: torch.Tensor | None = None
+    slot_mapping: Optional[torch.Tensor] = None
+    context_lens: Optional[torch.Tensor] = None
+    block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
     state: AttnState = AttnState.PREFILL_NATIVE
@@ -372,62 +373,62 @@ class AttentionMetaData:
     Backends that don't need the NATIVE/PREFIX distinction can treat
     `any PREFILL_*` as prefill. See ``AttnState`` for full semantics."""
 
-    kv_indptr: torch.Tensor | None = None
-    kv_indices: torch.Tensor | None = None
-    qo_indptr: torch.Tensor | None = None
-    kv_last_page_lens: torch.Tensor | None = None
-    cu_seqlen_ks: torch.Tensor | None = None
-    cu_seqlen_ke: torch.Tensor | None = None
-    sparse_kv_indptr: torch.Tensor | None = None
+    kv_indptr: Optional[torch.Tensor] = None
+    kv_indices: Optional[torch.Tensor] = None
+    qo_indptr: Optional[torch.Tensor] = None
+    kv_last_page_lens: Optional[torch.Tensor] = None
+    cu_seqlen_ks: Optional[torch.Tensor] = None
+    cu_seqlen_ke: Optional[torch.Tensor] = None
+    sparse_kv_indptr: Optional[torch.Tensor] = None
     # Last-page lens for sparse (DSA) attention: all 1s, one per query token in
     # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
     # (the dense per-seq buffer) so the two never clobber each other.
-    sparse_kv_last_page_lens: torch.Tensor | None = None
+    sparse_kv_last_page_lens: Optional[torch.Tensor] = None
 
-    work_meta_data: torch.Tensor | None = None
-    work_indptr: torch.Tensor | None = None
-    work_info_set: torch.Tensor | None = None
-    reduce_indptr: torch.Tensor | None = None
-    reduce_final_map: torch.Tensor | None = None
-    reduce_partial_map: torch.Tensor | None = None
+    work_meta_data: Optional[torch.Tensor] = None
+    work_indptr: Optional[torch.Tensor] = None
+    work_info_set: Optional[torch.Tensor] = None
+    reduce_indptr: Optional[torch.Tensor] = None
+    reduce_final_map: Optional[torch.Tensor] = None
+    reduce_partial_map: Optional[torch.Tensor] = None
 
     # for prefix cache
     has_cached: bool = False
-    total_kv: int | None = None
-    num_cached_tokens: torch.Tensor | None = None
-    seq_starts: torch.Tensor | None = None
+    total_kv: Optional[int] = None
+    num_cached_tokens: Optional[torch.Tensor] = None
+    seq_starts: Optional[torch.Tensor] = None
 
     def __init__(
         self,
-        cu_seqlens_q: torch.Tensor | None = None,
-        cu_seqlens_k: torch.Tensor | None = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_k: Optional[torch.Tensor] = None,
         max_seqlen_q: int = 0,
         max_seqlen_k: int = 0,
         min_seqlen_q: int = 0,
-        slot_mapping: torch.Tensor | None = None,
-        context_lens: torch.Tensor | None = None,
-        block_tables: torch.Tensor | None = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        context_lens: Optional[torch.Tensor] = None,
+        block_tables: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
         state: AttnState = AttnState.PREFILL_NATIVE,
-        kv_indptr: torch.Tensor | None = None,
-        kv_indices: torch.Tensor | None = None,
-        qo_indptr: torch.Tensor | None = None,
-        kv_last_page_lens: torch.Tensor | None = None,
-        cu_seqlen_ks: torch.Tensor | None = None,
-        cu_seqlen_ke: torch.Tensor | None = None,
-        sparse_kv_indptr: torch.Tensor | None = None,
-        work_meta_data: torch.Tensor | None = None,
-        work_indptr: torch.Tensor | None = None,
-        work_info_set: torch.Tensor | None = None,
-        reduce_indptr: torch.Tensor | None = None,
-        reduce_final_map: torch.Tensor | None = None,
-        reduce_partial_map: torch.Tensor | None = None,
-        sparse_cu_seqlens_q: torch.Tensor | None = None,
-        token_to_seq_idxs: torch.Tensor | None = None,
+        kv_indptr: Optional[torch.Tensor] = None,
+        kv_indices: Optional[torch.Tensor] = None,
+        qo_indptr: Optional[torch.Tensor] = None,
+        kv_last_page_lens: Optional[torch.Tensor] = None,
+        cu_seqlen_ks: Optional[torch.Tensor] = None,
+        cu_seqlen_ke: Optional[torch.Tensor] = None,
+        sparse_kv_indptr: Optional[torch.Tensor] = None,
+        work_meta_data: Optional[torch.Tensor] = None,
+        work_indptr: Optional[torch.Tensor] = None,
+        work_info_set: Optional[torch.Tensor] = None,
+        reduce_indptr: Optional[torch.Tensor] = None,
+        reduce_final_map: Optional[torch.Tensor] = None,
+        reduce_partial_map: Optional[torch.Tensor] = None,
+        sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
+        token_to_seq_idxs: Optional[torch.Tensor] = None,
         has_cached: bool = False,
-        total_kv: int | None = None,
-        num_cached_tokens: torch.Tensor | None = None,
-        seq_starts: torch.Tensor | None = None,
+        total_kv: Optional[int] = None,
+        num_cached_tokens: Optional[torch.Tensor] = None,
+        seq_starts: Optional[torch.Tensor] = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
@@ -459,7 +460,7 @@ class AttentionMetaData:
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
 
-    def asdict_zerocopy(self, skip_fields: set[str] | None = None) -> dict[str, Any]:
+    def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
         if skip_fields is None:
             skip_fields = set()
@@ -510,26 +511,26 @@ class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
     no_compile_layers: dict[int, Any] = field(default_factory=dict)
 
-    attn_metadata: (
+    attn_metadata: Optional[
         Union["AttentionMetaData", dict[str, "AttentionMetaData"]]
-    ) | None = None
+    ] = None
 
     kv_cache_data: dict[str, KVCacheTensor] = None
 
-    context: Context | None = None
+    context: Optional[Context] = None
 
-    dp_metadata: DPMetadata | None = None
+    dp_metadata: Optional[DPMetadata] = None
 
-    spec_decode_metadata: SpecDecodeMetadata | None = None
+    spec_decode_metadata: Optional[SpecDecodeMetadata] = None
 
-    ubatch_slices: list[Any] | None = None
+    ubatch_slices: Optional[list[Any]] = None
 
     # Cross-DP MAX of per-ubatch token counts, precomputed in
     # ``ModelRunner._preprocess`` and propagated here so
     # ``UBatchWrapper._compute_ub_graph_bs`` no longer needs its own
     # per-ubatch all_reduce. Shape: tuple of length N == len(ubatch_slices).
     # None when DP is off or when TBO is not active this step.
-    ub_max_tokens_across_dp: tuple | None = None
+    ub_max_tokens_across_dp: Optional[tuple] = None
 
     # Cached current_stream() captured at set_forward_context() time, so
     # downstream code (V4 attention / MoE / metadata builder) doesn't have
@@ -540,7 +541,7 @@ class ForwardContext:
     # threads each call set_forward_context() inside their own stream
     # context, so the cached value is correct for the captured graph or
     # active thread.
-    main_stream: torch.cuda.Stream | None = None
+    main_stream: Optional[torch.cuda.Stream] = None
 
     # True only while the model forward runs inside a CUDAGraph capture
     # block (model_runner.capture_model loop). Components that gate
@@ -558,7 +559,7 @@ class ForwardContext:
     # the key (num_tokens). None defaults keep wrappers inert until model_runner
     # sets them. Typed Any to dodge a CUDAGraphMode circular import.
     cudagraph_runtime_mode: Any = None
-    batch_descriptor: Any | None = None
+    batch_descriptor: Optional[Any] = None
 
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
@@ -567,8 +568,8 @@ class ForwardContext:
             self.attn_metadata = {}
 
 
-_forward_context: ForwardContext | None = ForwardContext()
-_forward_kv_cache_context: ForwardContext | None = ForwardContext()
+_forward_context: Optional[ForwardContext] = ForwardContext()
+_forward_kv_cache_context: Optional[ForwardContext] = ForwardContext()
 
 # Cached once at module import — CUDA availability does not change at
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
@@ -597,15 +598,15 @@ def set_forward_context(
     attn_metadata: AttentionMetaData,
     atom_config: Config,
     context: Context,
-    num_tokens: int | None = None,
-    num_tokens_across_dp: torch.Tensor | None = None,
-    spec_decode_metadata: SpecDecodeMetadata | None = None,
-    ubatch_slices: list[Any] | None = None,
+    num_tokens: Optional[int] = None,
+    num_tokens_across_dp: Optional[torch.Tensor] = None,
+    spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
+    ubatch_slices: Optional[list[Any]] = None,
     in_hipgraph: bool = False,
-    ub_max_tokens_across_dp: tuple | None = None,
+    ub_max_tokens_across_dp: Optional[tuple] = None,
 ) -> None:
     global _forward_context
-    dp_metadata: DPMetadata | None = None
+    dp_metadata: Optional[DPMetadata] = None
     if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
         dp_metadata = DPMetadata.make(
             atom_config.parallel_config,
@@ -641,11 +642,11 @@ def reset_forward_context() -> None:
 
 _logger = logging.getLogger("atom")
 
-_global_kvconnector: Any | None = None
-_global_kvconnector_scheduler: Any | None = None
+_global_kvconnector: Optional[Any] = None
+_global_kvconnector_scheduler: Optional[Any] = None
 
 
-def get_kvconnector(role: str = "worker", config: Config | None = None) -> Any:
+def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> Any:
     """Get or lazily initialize the global KV connector instance.
 
     The connector is role-dependent:
@@ -672,7 +673,7 @@ def get_kvconnector(role: str = "worker", config: Config | None = None) -> Any:
 
         try:
             tp_rank = get_tp_group().rank_in_group
-        except (RuntimeError, AssertionError, ValueError):
+        except Exception:
             _logger.warning(
                 "get_tp_group() failed (dist not initialized?), returning None"
             )
@@ -703,9 +704,9 @@ def get_kvconnector(role: str = "worker", config: Config | None = None) -> Any:
 
 def set_kv_cache_data(
     kv_cache_data: dict[int, KVCacheTensor],
-    config: Config | None = None,
+    config: Optional[Config] = None,
     transfer_tensors: Any = None,
-    num_blocks: int | None = None,
+    num_blocks: Optional[int] = None,
 ) -> None:
     """Register KV cache data globally and with the KV connector if enabled.
 
@@ -713,6 +714,8 @@ def set_kv_cache_data(
     it to byte-slice MLA's token-major latent cache (where tensor.shape[0] is
     the token count, not the block count).
     """
+    global _forward_kv_cache_context
+
     if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
         connector = get_kvconnector(config=config)
         if connector is not None:

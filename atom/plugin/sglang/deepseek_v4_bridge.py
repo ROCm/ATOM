@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from atom.plugin.sglang.runtime.context import is_draft_extend_mode
+
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
 try:
     from atom.model_ops.v4_kernels.v4_quant import (
@@ -1621,11 +1623,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         positions = padded_positions
     else:
         positions = positions[:total]
-    is_draft_extend = bool(
-        getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
-            include_v2=True
-        )
-    )
+    is_draft_extend = is_draft_extend_mode(forward_batch.forward_mode, include_v2=True)
     use_replay_input_positions = (
         is_draft_extend
         and hasattr(forward_batch, "actual_forward_mode")
@@ -1874,11 +1872,7 @@ def build_atom_v4_attention_metadata_from_sglang(
     num_reqs = int(forward_batch.batch_size)
     seq_np = _get_seq_lens_cpu(forward_batch)[:num_reqs]
     is_decode = forward_batch.forward_mode.is_decode_or_idle()
-    is_draft_extend = bool(
-        getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
-            include_v2=True
-        )
-    )
+    is_draft_extend = is_draft_extend_mode(forward_batch.forward_mode, include_v2=True)
 
     if is_decode:
         lens = np.ones(num_reqs, dtype=np.int32)
