@@ -314,6 +314,41 @@ class ScheduledBatch:
         ]
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
+        self.frequency_penalties = np.asarray(
+            [seq.frequency_penalty for seq in seqs.values()], dtype=np.float32
+        )
+        self.presence_penalties = np.asarray(
+            [seq.presence_penalty for seq in seqs.values()], dtype=np.float32
+        )
+        # Sparse (row, vocab_id, penalty_value) triples for every completion
+        # token any in-batch seq has already emitted, built only when at least
+        # one row actually has a nonzero penalty (matches the top_k/top_p
+        # "skip the feature entirely when unused" pattern -- Sequence.token_counts
+        # itself is also only populated when that seq's penalties are nonzero,
+        # see Sequence.append_token). Applied to logits once per row's
+        # unique token id: presence_penalty * 1 + frequency_penalty * count.
+        self.penalty_rows: Optional[np.ndarray] = None
+        self.penalty_token_ids: Optional[np.ndarray] = None
+        self.penalty_values: Optional[np.ndarray] = None
+        if (self.frequency_penalties != 0.0).any() or (self.presence_penalties != 0.0).any():
+            rows: list[int] = []
+            token_ids: list[int] = []
+            values: list[float] = []
+            for row, seq in enumerate(seqs.values()):
+                if not seq.token_counts:
+                    continue
+                fp = seq.frequency_penalty
+                pp = seq.presence_penalty
+                if fp == 0.0 and pp == 0.0:
+                    continue
+                for token_id, cnt in seq.token_counts.items():
+                    rows.append(row)
+                    token_ids.append(token_id)
+                    values.append(pp + fp * cnt)
+            if rows:
+                self.penalty_rows = np.asarray(rows, dtype=np.int64)
+                self.penalty_token_ids = np.asarray(token_ids, dtype=np.int64)
+                self.penalty_values = np.asarray(values, dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
         # and therefore requires fresh per-row random noise at the sampler
         # rather than the cached shared exponential tensor.
@@ -1613,8 +1648,10 @@ class Scheduler:
                     if ell_r is not None:
                         seq.dspark_next_ell = int(ell_r)
                 for i, el in enumerate(token_ids):
-                    seq.token_ids[-num_placeholder - offset + i] = el
-                    seq.output_tokens[-num_placeholder - offset + i] = el
+                    pos = -num_placeholder - offset + i
+                    seq.replace_output_token(pos, el)
+                    seq.token_ids[pos] = el
+                    seq.output_tokens[pos] = el
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob

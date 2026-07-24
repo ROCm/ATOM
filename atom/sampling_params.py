@@ -20,6 +20,12 @@ class SamplingParams:
     # outputs diverge when temperature > 0.
     n: int = 1
     logprobs: Optional[Union[bool, int]] = None
+    # OpenAI-style penalties applied to already-generated completion tokens
+    # before sampling the next one: logit -= presence_penalty * (count > 0)
+    # + frequency_penalty * count. 0.0 disables each (no engine overhead).
+    # Positive values discourage repeating tokens; negative values encourage it.
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
 
     def __post_init__(self):
         if self.top_k != -1 and self.top_k < 1:
@@ -28,3 +34,7 @@ class SamplingParams:
             raise ValueError("top_p must be in range (0.0, 1.0]")
         if self.n < 1:
             raise ValueError("n must be >= 1")
+        if not (-2.0 <= self.frequency_penalty <= 2.0):
+            raise ValueError("frequency_penalty must be in range [-2.0, 2.0]")
+        if not (-2.0 <= self.presence_penalty <= 2.0):
+            raise ValueError("presence_penalty must be in range [-2.0, 2.0]")

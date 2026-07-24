@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections import Counter
 from copy import copy
 from enum import Enum, auto
 from itertools import count
@@ -106,6 +107,13 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
+        self.frequency_penalty = sampling_params.frequency_penalty
+        self.presence_penalty = sampling_params.presence_penalty
+        # Sparse per-vocab-id count of completion tokens generated so far
+        # (prompt tokens excluded, matching OpenAI's penalty semantics).
+        # Only populated/consulted when a penalty is actually enabled -- see
+        # append_token()/replace_token() and ModelRunner's penalty application.
+        self.token_counts: Counter = Counter()
         self.stop_token_sequences = stop_token_sequences or []
         self.is_first_decode = False
         # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
@@ -206,6 +214,30 @@ class Sequence:
         self.last_token = token_id
         self.output_tokens.append(token_id)
         self.num_tokens += 1
+        if self.frequency_penalty != 0.0 or self.presence_penalty != 0.0:
+            self.token_counts[token_id] += 1
+
+    def replace_output_token(self, index: int, token_id: int):
+        """Overwrite a previously-appended completion token in place.
+
+        `index` is the same (typically negative, counted from the end) index
+        already used to write both `token_ids[index]` and `output_tokens[index]`
+        in the deferred-output / speculative-decode path -- both lists share
+        their tail, so one index addresses the same logical token in each.
+        Pre-reserved placeholder tokens are corrected to the real sampled
+        value once it lands; this keeps `token_counts` consistent with the
+        final tokens by undoing the placeholder's count before applying the
+        real one. Caller is still responsible for the `token_ids`/
+        `output_tokens` assignments themselves -- this only updates counts.
+        """
+        if self.frequency_penalty == 0.0 and self.presence_penalty == 0.0:
+            return
+        old_token_id = self.output_tokens[index]
+        if old_token_id != token_id:
+            self.token_counts[old_token_id] -= 1
+            if self.token_counts[old_token_id] <= 0:
+                del self.token_counts[old_token_id]
+            self.token_counts[token_id] += 1
 
     # def __getstate__(self):
     #     return (
