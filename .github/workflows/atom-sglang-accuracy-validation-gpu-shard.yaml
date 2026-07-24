@@ -349,7 +349,7 @@ jobs:
             lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
             if ! $CONTAINER_ENGINE exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
-              -e MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT}" \
+              -e MODEL_MOUNT_PATH="${MODEL_MOUNT_PATH}" \
               -e MODEL_PATH="${{ matrix.model_path }}" \
               -e MODEL_DIR="$model_dir" \
               -e RUNNER_NAME="${{ matrix.runner }}" \
@@ -382,7 +382,7 @@ jobs:
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
                   download_model
                 else
-                  lock_dir="${MODEL_CACHE_ROOT}/.cache/atom-download-locks"
+                  lock_dir="${MODEL_MOUNT_PATH}/.cache/atom-download-locks"
                   mkdir -p "$lock_dir"
                   lock_file="$lock_dir/${LOCK_SUFFIX}.lock"
                   exec 9>"$lock_file"
