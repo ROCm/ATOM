@@ -67,6 +67,7 @@ class BlockManager:
         self.free_block_ids_set: set[int] = set(range(num_blocks))
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
+        self.total_evicted_blocks: int = 0
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -134,6 +135,7 @@ class BlockManager:
         # eviction event.
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
+            self.total_evicted_blocks += 1
             if self._event_log is not None:
                 self._event_log.append(_make_block_removed([block.hash]))
         block.reset()
@@ -160,13 +162,6 @@ class BlockManager:
     def _effective_block_size(self):
         return self.block_size * self.dcp_world_size
 
-    # --- Prefix-cache block accounting granularity ---------------------------
-    # Under DCP one entry of `block_table` maps to a VIRTUAL block spanning
-    # `block_size * dcp_world_size` consecutive global tokens (each rank stores
-    # its `block_size` interleaved tokens in that physical block). So prefix
-    # cache hashing / reuse must be done per virtual block, not per physical
-    # block — otherwise the logical block index runs past the (dcp-shrunk)
-    # block_table. For dcp_world_size == 1 this reduces to the physical size.
     def _hash_block_size(self) -> int:
         return self.hash_block_size
 
@@ -177,6 +172,19 @@ class BlockManager:
     def _hash_block_tokens(self, seq: Sequence, i: int) -> list[int]:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
+
+    def pool_occupancy(self) -> dict[str, int]:
+        used = len(self.used_block_ids)
+        free = len(self.free_block_ids_set)
+        hashed = len(self.hash_to_block_id)
+        return {
+            "used": used,
+            "free": free,
+            "total": len(self.blocks),
+            "hashed": hashed,
+            "retained": max(0, hashed - used),
+            "evicted_total": self.total_evicted_blocks,
+        }
 
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
