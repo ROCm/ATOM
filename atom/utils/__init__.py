@@ -2,6 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import contextlib
+import copy
+import dataclasses
+import importlib
 import ipaddress
 import json
 import logging
@@ -12,6 +15,7 @@ import socket
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
@@ -24,16 +28,11 @@ import psutil
 import torch
 import zmq
 import zmq.asyncio
-from atom.utils.custom_register import direct_register_custom_op
-from transformers import PretrainedConfig
-
-import copy
-import dataclasses
-import importlib
-from contextlib import contextmanager
-
 from packaging import version
 from packaging.version import Version
+from transformers import PretrainedConfig
+
+from atom.utils.custom_register import direct_register_custom_op
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -858,18 +857,11 @@ def _patch_torch_dynamo_metrics_config_logging() -> None:
     except (TypeError, ValueError):
         return
 
-    setattr(
-        wrapped_get_dynamo_config_for_logging,
-        "_atom_ignore_logging_functions_patched",
-        True,
-    )
-    dynamo_utils._get_dynamo_config_for_logging = (
-        wrapped_get_dynamo_config_for_logging
-    )
+    wrapped_get_dynamo_config_for_logging._atom_ignore_logging_functions_patched = True
+    dynamo_utils._get_dynamo_config_for_logging = wrapped_get_dynamo_config_for_logging
 
 
 def getLogger():
-    global logger
     if not logger.handlers:
         logger.setLevel(logging.DEBUG)
 
@@ -902,14 +894,10 @@ def getLogger():
             torch._dynamo.config.ignore_logging_functions = set(
                 torch._dynamo.config.ignore_logging_functions
             )
-            torch._dynamo.config.ignore_logging_functions.update(
-                ignored_logger_methods
-            )
+            torch._dynamo.config.ignore_logging_functions.update(ignored_logger_methods)
             _patch_torch_dynamo_metrics_config_logging()
         elif hasattr(torch._dynamo.config, "ignore_logger_methods"):
-            torch._dynamo.config.ignore_logger_methods = tuple(
-                ignored_logger_methods
-            )
+            torch._dynamo.config.ignore_logger_methods = tuple(ignored_logger_methods)
 
     return logger
 

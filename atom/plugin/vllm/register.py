@@ -3,9 +3,10 @@ from typing import Optional
 
 import torch
 from transformers import AutoConfig, PretrainedConfig
+
 from atom.plugin.prepare import _set_framework_backbone
-from atom.utils import envs
 from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -181,7 +182,7 @@ def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
     def wrapped(self, act_dtype: "torch.dtype" = torch.bfloat16):
         return orig(self, act_dtype)
 
-    setattr(wrapped, "_atom_default_act_dtype_patched", True)
+    wrapped._atom_default_act_dtype_patched = True
     attention.process_weights_after_loading = wrapped
 
 
@@ -229,7 +230,7 @@ def _patch_vllm_harmony_parser_manager() -> None:
         HarmonyParser.tool_parser_cls = None
         return HarmonyParser
 
-    setattr(get_parser, "_atom_harmony_parser_patched", True)
+    get_parser._atom_harmony_parser_patched = True
     ParserManager.get_parser = classmethod(get_parser)
 
 

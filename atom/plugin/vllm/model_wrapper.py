@@ -942,9 +942,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # vLLM samples from the pre-final-norm state, but recycles the
             # post-final-norm state into the next MTP step.
             spec_step_idx = int(model_kwargs.get("spec_step_idx", 0))
-            recycle_hidden = self.model.get_recycle_hidden(
-                hidden_states, spec_step_idx
-            )
+            recycle_hidden = self.model.get_recycle_hidden(hidden_states, spec_step_idx)
             return hidden_states, recycle_hidden
 
         return hidden_states
