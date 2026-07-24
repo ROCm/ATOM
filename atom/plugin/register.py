@@ -253,7 +253,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
     try:
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-        from sglang.srt.model_executor.model_runner import ModelRunner
         from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
             EAGLEDraftCudaGraphRunner,
         )
@@ -261,6 +260,9 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             EAGLEDraftExtendCudaGraphRunner,
         )
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+        from atom.plugin.sglang.glm52_mtp.common import (
+            GLM52_GRAPH_SEQ_LEN_CAPACITY,
+        )
     except Exception as exc:
         logger.debug("Skip patching SGLang DSV4 spec cuda graph: %s", exc)
         return
@@ -315,48 +317,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         return bool(
             getattr(model, "_atom_glm52_uses_generic_draft_frontend", False)
         )
-
-    def _glm52_cg_stage() -> int:
-        raw = os.environ.get("ATOM_GLM52_CG_STAGE", "0")
-        try:
-            stage = int(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"ATOM_GLM52_CG_STAGE must be an integer from 0 through 4, got {raw!r}"
-            ) from exc
-        if stage < 0 or stage > 4:
-            raise ValueError(
-                f"ATOM_GLM52_CG_STAGE must be an integer from 0 through 4, got {stage}"
-            )
-        return stage
-
-    if not getattr(ModelRunner, "_atom_glm52_init_device_graphs_patched", False):
-        original_init_device_graphs = ModelRunner.init_device_graphs
-
-        def init_device_graphs(self):
-            is_glm52_target = (
-                _is_glm52_runner(self)
-                and not bool(getattr(self, "is_draft_worker", False))
-                and bool(
-                    getattr(
-                        getattr(self, "spec_algorithm", None),
-                        "is_speculative",
-                        lambda: False,
-                    )()
-                )
-            )
-            if is_glm52_target and _glm52_cg_stage() < 2:
-                self.graph_runner = None
-                self.graph_mem_usage = 0
-                logger.info(
-                    "GLM-5.2 CG stage %d: keep target verify eager",
-                    _glm52_cg_stage(),
-                )
-                return None
-            return original_init_device_graphs(self)
-
-        ModelRunner.init_device_graphs = init_device_graphs
-        ModelRunner._atom_glm52_init_device_graphs_patched = True
 
     def _is_dsv4_runner(runner) -> bool:
         try:
@@ -507,11 +467,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
                         return False
                     max_seq_len = int(max(seq_lens_cpu))
-                    max_graph_seq_len = int(
-                        os.environ.get(
-                            "ATOM_GLM52_TARGET_VERIFY_CG_SEQ_LEN_FILL", "4096"
-                        )
-                    )
+                    max_graph_seq_len = GLM52_GRAPH_SEQ_LEN_CAPACITY
                     if max_seq_len > max_graph_seq_len:
                         logger.info(
                             "[ATOM_GLM52_VERIFY_GRAPH] eager_fallback "
@@ -622,11 +578,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
                     return False
                 max_seq_len = int(max(seq_lens_cpu))
-                max_graph_seq_len = int(
-                    os.environ.get(
-                        "ATOM_GLM52_DRAFT_EXTEND_CG_SEQ_LEN_FILL", "4096"
-                    )
-                )
+                max_graph_seq_len = GLM52_GRAPH_SEQ_LEN_CAPACITY
                 return base_can_run and max_seq_len <= max_graph_seq_len
             if not _is_dsv4_nextn_runner(model_runner):
                 return original_extend_can_run(self, forward_batch)
@@ -869,49 +821,25 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         def init_cuda_graphs(self):
             draft_runner = getattr(self, "draft_runner", None)
             is_glm52 = _is_glm52_nextn_runner(draft_runner)
-            glm52_stage = _glm52_cg_stage() if is_glm52 else 0
-            if is_glm52 and glm52_stage >= 1:
-                seq_len_fill = int(
-                    os.environ.get("ATOM_GLM52_DRAFT_CG_SEQ_LEN_FILL", "4096")
-                )
+            if is_glm52:
                 for backend in self.draft_attn_backend.attn_backends:
                     backend.get_cuda_graph_seq_len_fill_value = (
-                        lambda value=seq_len_fill: value
+                        lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                     )
-                if glm52_stage >= 3:
-                    draft_extend_seq_len_fill = int(
-                        os.environ.get(
-                            "ATOM_GLM52_DRAFT_EXTEND_CG_SEQ_LEN_FILL", "4096"
+                for backend in (
+                    getattr(self.draft_runner, "attn_backend", None),
+                    getattr(self, "draft_extend_attn_backend", None),
+                ):
+                    if backend is not None:
+                        backend.get_cuda_graph_seq_len_fill_value = (
+                            lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
-                    )
-                    for backend in (
-                        getattr(self.draft_runner, "attn_backend", None),
-                        getattr(self, "draft_extend_attn_backend", None),
-                    ):
-                        if backend is not None:
-                            backend.get_cuda_graph_seq_len_fill_value = (
-                                lambda value=draft_extend_seq_len_fill: value
-                            )
-            saved_draft_extend_backend = None
-            if is_glm52 and glm52_stage < 3:
-                saved_draft_extend_backend = self.draft_extend_attn_backend
-                self.draft_extend_attn_backend = None
-            try:
-                ret = original_init_cuda_graphs(self)
-            finally:
-                if saved_draft_extend_backend is not None:
-                    self.draft_extend_attn_backend = saved_draft_extend_backend
+            ret = original_init_cuda_graphs(self)
             if is_glm52:
-                if glm52_stage < 1:
-                    self.cuda_graph_runner = None
-                if glm52_stage < 3:
-                    self.cuda_graph_runner_for_draft_extend = None
                 logger.info(
-                    "GLM-5.2 CG stage %d: draft_decode=%s target_verify=%s "
+                    "GLM-5.2 CUDA graph initialization: draft_decode=%s "
                     "draft_extend=%s",
-                    glm52_stage,
                     self.cuda_graph_runner is not None,
-                    glm52_stage >= 2,
                     self.cuda_graph_runner_for_draft_extend is not None,
                 )
             try:

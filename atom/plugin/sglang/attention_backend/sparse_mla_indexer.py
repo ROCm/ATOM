@@ -30,6 +30,7 @@ import triton
 import triton.language as tl
 
 from atom.utils.custom_register import direct_register_custom_op
+from atom.plugin.sglang.glm52_mtp.common import GLM52_GRAPH_SEQ_LEN_CAPACITY
 
 
 logger = logging.getLogger("atom")
@@ -560,10 +561,7 @@ def _get_or_create_sparse_mla_indexer_graph_buffers(
     batch_size = int(forward_batch.batch_size)
     tokens_per_req = _mtp_spec_tokens_per_req(forward_batch)
     num_tokens = int(forward_batch.input_ids.shape[0])
-    seq_len_fill = int(
-        os.environ.get("ATOM_GLM52_DRAFT_EXTEND_CG_SEQ_LEN_FILL", "4096")
-    )
-    context_capacity = seq_len_fill + tokens_per_req
+    context_capacity = GLM52_GRAPH_SEQ_LEN_CAPACITY + tokens_per_req
     if batch_size <= 0 or tokens_per_req <= 0 or batch_size * tokens_per_req != num_tokens:
         raise RuntimeError(
             "Sparse MLA indexer graph requires fixed bs * tokens_per_req rows: "
