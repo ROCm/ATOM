@@ -21,6 +21,12 @@ Two on-the-wire formats are auto-detected and normalized into the OpenAI
     </function>
     </tool_call>
 
+3. Hermes format (Qwen3 default chat template)::
+
+    <tool_call>
+    {"name": "NAME", "arguments": {...}}
+    </tool_call>
+
 The Qwen XML carries no value types, so when the request's ``tools`` schema is
 supplied each parameter is coerced to the declared JSON-Schema type (int, float,
 bool, null, object, array); otherwise it is left as a string. This mirrors the
@@ -74,6 +80,87 @@ _QWEN_PARAM_RE = re.compile(
 def _is_qwen_xml(text: str) -> bool:
     """Detect the Qwen3 XML tool-call format (and not the Kimi token format)."""
     return _QWEN_TOOL_PREFIX in text and "<|tool_calls_section_begin|>" not in text
+
+
+# ---------------------------------------------------------------------------
+# Hermes tool-call format (Qwen3 default chat template, NousResearch Hermes)
+#   <tool_call>
+#   {"name": "NAME", "arguments": {...}}
+#   </tool_call>
+# JSON body inside <tool_call> rather than the qwen3_coder <function=> XML.
+# ---------------------------------------------------------------------------
+
+_HERMES_TOOL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_HERMES_TOOL_UNCLOSED_RE = re.compile(r"<tool_call>\s*(\{.*)$", re.DOTALL)
+
+
+def _is_hermes(text: str) -> bool:
+    """Detect the Hermes JSON-in-<tool_call> format (not qwen_coder XML / Kimi)."""
+    return (
+        "<tool_call>" in text
+        and _QWEN_TOOL_PREFIX not in text
+        and "<|tool_calls_section_begin|>" not in text
+    )
+
+
+def _hermes_call_from_obj(obj: Any) -> Optional[ToolCall]:
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name")
+    if not name:
+        return None
+    args = obj.get("arguments", obj.get("parameters", {}))
+    if not isinstance(args, str):
+        args = json.dumps(args, ensure_ascii=False)
+    return ToolCall(
+        id=_unique_tool_call_id(),
+        type="function",
+        function={"name": name, "arguments": args},
+    )
+
+
+def _parse_hermes(text: str, tools: Optional[list] = None) -> Tuple[str, List[ToolCall]]:
+    """Parse Hermes ``<tool_call>{json}</tool_call>`` blocks into ToolCalls."""
+    first = text.find("<tool_call>")
+    content = text[:first] if first != -1 else text
+    tool_calls: List[ToolCall] = []
+    for m in _HERMES_TOOL_RE.finditer(text):
+        try:
+            obj = json.loads(m.group(1))
+        except Exception:
+            continue
+        tc = _hermes_call_from_obj(obj)
+        if tc is not None:
+            tool_calls.append(tc)
+    if not tool_calls:
+        # Tolerate an unclosed trailing block (streaming truncation).
+        um = _HERMES_TOOL_UNCLOSED_RE.search(text)
+        if um:
+            try:
+                obj = json.loads(um.group(1))
+                tc = _hermes_call_from_obj(obj)
+                if tc is not None:
+                    tool_calls.append(tc)
+            except Exception:
+                pass
+    return content.strip(), tool_calls
+
+
+def _is_xmlish(text: str) -> bool:
+    """Detect either qwen_coder XML or Hermes JSON tool calls (not Kimi tokens)."""
+    return (
+        _QWEN_TOOL_PREFIX in text or "<tool_call>" in text
+    ) and "<|tool_calls_section_begin|>" not in text
+
+
+def _parse_xmlish(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+    """Parse a <tool_call> region as qwen_coder XML, falling back to Hermes JSON."""
+    content, calls = _parse_qwen_xml(text, tools)
+    if calls:
+        return content, calls
+    if "<tool_call>" in text:
+        return _parse_hermes(text, tools)
+    return content, calls
 
 
 def _build_param_types(tools: Optional[list]) -> Dict[str, Dict[str, Any]]:
@@ -198,9 +285,9 @@ def parse_tool_calls(
         Tuple of (content_text, list_of_tool_calls). ``content_text`` has the
         tool-call sections removed.
     """
-    # Qwen3 XML format
-    if _is_qwen_xml(text):
-        return _parse_qwen_xml(text, tools)
+    # Qwen3 XML (qwen_coder) or Hermes (<tool_call>{json}</tool_call>) format
+    if _is_xmlish(text):
+        return _parse_xmlish(text, tools)
 
     # Kimi-K2 special-token format
     section_match = re.search(
@@ -341,7 +428,7 @@ class ToolCallStreamParser:
                 self.buf = ""
             return results
         # state 1: parse the complete (or trailing) tool-call block.
-        _content, tool_calls = _parse_qwen_xml(self.buf, self.tools)
+        _content, tool_calls = _parse_xmlish(self.buf, self.tools)
         self.buf = ""
         for tc in tool_calls:
             tc.id = _unique_tool_call_id()
