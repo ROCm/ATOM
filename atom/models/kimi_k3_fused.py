@@ -6,16 +6,19 @@ several separate torch ops (each a kernel launch + full HBM round-trip):
 - ``situ_and_mul``      : SiTU(gate) * linear(up)  (dense/shared-expert MLP act)
 - ``rmsnorm_gated``     : rmsnorm(x) * weight * sigmoid(gate)  (KDA o_norm)
 - ``apply_attn_res``    : block-residual soft-attention mix (attn_res boundaries)
+- ``dual_rmsnorm``      : q + k RMSNorm in one AITER kernel (MLA a_layernorm)
 
 The activation and gated-rmsnorm kernels remain gated behind ``ATOM_K3_FUSED``
-in kimi_k3.py, with the torch reference implementations at the bottom of this
-module doubling as the no-triton fallback. ``apply_attn_res`` is the production
-path and is not env-gated.
+in kimi_k3.py. ``apply_attn_res`` is the production path; correctness is checked
+against a local torch reference in my_script/optest_fused.py. ``dual_rmsnorm`` is
+ungated and always invokes the fused AITER q/k RMSNorm kernel.
 """
 
 from __future__ import annotations
 
 import torch
+from aiter import QuantType as _QuantType
+from aiter import fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm
 
 try:
     import triton
@@ -835,3 +838,29 @@ def fuse_mla_kv(
         BLOCK=BLOCK,
     )
     return k, v_padded
+
+
+def dual_rmsnorm(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_eps: float,
+    k: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q = q.contiguous()
+    k = k.contiguous()
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+    _aiter_fused_qk_rmsnorm(
+        q_out_quantized=q_out,
+        q=q,
+        q_weight=q_weight,
+        q_epsilon=q_eps,
+        k_out=k_out,
+        k=k,
+        k_weight=k_weight,
+        k_epsilon=k_eps,
+        quant_type=_QuantType.No,
+    )
+    return q_out, k_out
