@@ -1235,6 +1235,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 use_grouped_topk=use_grouped_topk,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                # Expert parallelism: remap global->local expert ids / local hist.
+                expert_map=expert_map,
+                local_num_experts=(
+                    layer.local_num_experts if expert_map is not None else None
+                ),
             )
             return triton_kernel_fused_experts_a8w4_silu_gguu(
                 x,
@@ -1293,6 +1298,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     use_grouped_topk=use_grouped_topk,
                     num_expert_group=num_expert_group,
                     topk_group=topk_group,
+                    # Expert parallelism: remap global->local expert ids and size
+                    # the routing histogram to the rank-local experts held in
+                    # layer.w13_weight, so the GEMM never indexes local weights
+                    # with a global id.
+                    expert_map=expert_map,
+                    local_num_experts=(
+                        layer.local_num_experts if expert_map is not None else None
+                    ),
                 )
                 # Routed-only gate count (no shared-expert widening).
                 n_expts_act = routing_data.n_expts_act
