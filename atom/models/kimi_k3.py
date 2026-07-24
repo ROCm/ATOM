@@ -31,6 +31,7 @@ from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -116,6 +117,8 @@ def _kda_packed_modules_mapping(
     mapping = {
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
+        ".q_a_proj": (".fused_qkv_a_proj", 0),
+        ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
     }
     projection_names = ("q_proj", "k_proj", "v_proj", "g_proj")
     for layer_idx in kda_layer_indices:
@@ -421,12 +424,12 @@ class KimiFullAttention(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_local_heads = self.num_heads // self.tp_size
 
-        self.q_a_proj = ReplicatedLinear(
+        self.fused_qkv_a_proj = MergedReplicatedLinear(
             self.hidden_size,
-            self.q_lora_rank,
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.q_a_proj",
+            prefix=f"{prefix}.fused_qkv_a_proj",
         )
         self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=1e-6)
         self.q_b_proj = ColumnParallelLinear(
@@ -435,13 +438,6 @@ class KimiFullAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
-        )
-        self.kv_a_proj_with_mqa = ReplicatedLinear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=1e-6)
         self.kv_b_proj = ColumnParallelLinear(
@@ -507,12 +503,21 @@ class KimiFullAttention(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        q = self.q_a_layernorm(self.q_a_proj(hidden_states))
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        kv, k_rope = torch.split(
-            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        from atom.models.kimi_k3_fused import dual_rmsnorm
+
+        q, kv, k_rope = torch.split(
+            self.fused_qkv_a_proj(hidden_states),
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
         )
-        kv = self.kv_a_layernorm(kv)
+        q, kv = dual_rmsnorm(
+            q,
+            self.q_a_layernorm.weight,
+            self.q_a_layernorm.eps,
+            kv,
+            self.kv_a_layernorm.weight,
+            self.kv_a_layernorm.eps,
+        )
         attn_out = self.attn(q, kv, k_rope, positions)
         attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))
         return self.o_proj(attn_out)
