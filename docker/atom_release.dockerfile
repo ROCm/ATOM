@@ -1,6 +1,9 @@
 # Default base image
 ARG BASE_IMAGE="rocm/pytorch:latest"
 ARG GPU_ARCH="gfx942;gfx950"
+ARG TORCH_ROCM_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0%2Brocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl"
+ARG TORCHVISION_ROCM_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchvision-0.26.0%2Brocm7.2.2.git336d36e8-cp312-cp312-linux_x86_64.whl"
+ARG TORCHAUDIO_ROCM_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchaudio-2.10.0%2Brocm7.2.2.git5047768f-cp312-cp312-linux_x86_64.whl"
 
 # ====================================================================
 # ATOM image: multi-stage parallel build
@@ -21,10 +24,18 @@ ARG GPU_ARCH="gfx942;gfx950"
 FROM ${BASE_IMAGE} AS base
 
 ARG GPU_ARCH
+ARG TORCH_ROCM_WHEEL_URL
+ARG TORCHVISION_ROCM_WHEEL_URL
+ARG TORCHAUDIO_ROCM_WHEEL_URL
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 
 RUN pip install --upgrade pip && \
+    pip install --no-deps --force-reinstall \
+        "${TORCH_ROCM_WHEEL_URL}" \
+        "${TORCHVISION_ROCM_WHEEL_URL}" \
+        "${TORCHAUDIO_ROCM_WHEEL_URL}" && \
+    python -c "import torch, torchvision, torchaudio; print(f'torch={torch.__version__}'); print(f'hip={torch.version.hip}'); print(f'torchvision={torchvision.__version__}'); print(f'torchaudio={torchaudio.__version__}'); assert torch.version.hip is not None" && \
     apt-get update && \
     apt --fix-broken install -y && \
     apt-get install -y \
@@ -114,10 +125,13 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
             librdmacm-dev rdmacm-utils infiniband-diags perftest ethtool \
             libibverbs-dev rdma-core \
             openssh-server openmpi-common && \
-        cd /app/mooncake && bash dependencies.sh -y && \
+        cd /app/mooncake && \
+        sed -i 's|tar -C /usr/local -xzf|tar --no-same-owner --no-same-permissions -C /usr/local -xzf|' dependencies.sh && \
+        bash dependencies.sh -y && \
         rm -rf /usr/local/go && \
         wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
-        tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
+        tar --no-same-owner --no-same-permissions \
+            -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
         rm go1.22.2.linux-amd64.tar.gz; \
     fi
 
