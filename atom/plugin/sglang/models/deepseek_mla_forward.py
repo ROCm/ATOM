@@ -26,7 +26,6 @@ from atom.models.deepseek_v2 import (
     _mxfp4_activation_quant_layout,
 )
 from atom.models.utils import maybe_prefix
-from atom.plugin.sglang.kv_pool import get_sglang_token_to_kv_pool
 
 try:
     from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -76,6 +75,20 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _get_sglang_token_to_kv_pool_from_backend(caller: str) -> Any:
+    """Resolve SGLang 0.5.15 token KV pool from the active attention backend."""
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    backend = get_attn_backend()
+    token_to_kv_pool = getattr(backend, "token_to_kv_pool", None)
+    if token_to_kv_pool is None:
+        raise RuntimeError(
+            f"{caller} requires SGLang token_to_kv_pool, but it could not be "
+            "resolved from the current attention backend."
+        )
+    return token_to_kv_pool
 
 
 # bmm_fp8 custom-op wrapper (adapted from sglang forward_mla.py)
@@ -496,9 +509,8 @@ def _set_mla_kv_buffer_for_non_absorbed(
 ) -> None:
     attn_non_absorbed = _get_sglang_radix_attn(attn.attn_non_absorbed)
     cache_k = torch.cat([kv_a.unsqueeze(1), k_pe], dim=-1)
-    token_to_kv_pool = get_sglang_token_to_kv_pool(
-        forward_batch,
-        caller="SGLang DeepSeek MLA non-absorbed cache path",
+    token_to_kv_pool = _get_sglang_token_to_kv_pool_from_backend(
+        "SGLang DeepSeek MLA non-absorbed cache path"
     )
     token_to_kv_pool.set_kv_buffer(
         attn_non_absorbed,

@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
-from atom.plugin.sglang.kv_pool import get_sglang_token_to_kv_pool
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
 if TYPE_CHECKING:
@@ -191,6 +190,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
         from atom.model_ops.attention_mla import fused_qk_rope_concat_and_cache_mla
         from atom.plugin.sglang.models.deepseek_mla_forward import (
             _get_sglang_radix_attn,
+            _get_sglang_token_to_kv_pool_from_backend,
             mla_absorbed_bmm,
             mla_v_up_proj,
         )
@@ -227,9 +227,8 @@ class SGLangDeepseekMLAAttention(nn.Module):
         q_descale = None
         if attn.use_fused_qk_rope_concat_and_cache_mla:
             mla_attn = _get_sglang_radix_attn(self.base_attn)
-            token_to_kv_pool = get_sglang_token_to_kv_pool(
-                forward_batch,
-                caller="SGLang DeepSeek MLA fused cache path",
+            token_to_kv_pool = _get_sglang_token_to_kv_pool_from_backend(
+                "SGLang DeepSeek MLA fused cache path"
             )
             kv_cache = token_to_kv_pool.get_key_buffer(mla_attn.layer_id)
             q_cache_scale = getattr(mla_attn, "q_scale", None)
