@@ -324,6 +324,16 @@ def _prepare_multimodal_inputs(
     return inputs["input_ids"][0].tolist(), multimodal_data
 
 
+# Per-request incremental detokenization state (vLLM-style sliding window).
+# Decoding each step's new tokens in isolation splits multi-byte UTF-8 chars
+# (byte-BPE tokenizers split one CJK char / emoji across several byte-tokens)
+# into U+FFFD. Keep accumulated tokens + prefix/read offsets so we only emit
+# fully-formed characters, holding a trailing partial char until the next step.
+# LOCAL OVERLAY: this is the ONLY change vs native api_server.py (fixes streaming
+# U+FFFD; does NOT touch sampling defaults / top_p / temperature).
+_stream_detok_state: dict = {}
+
+
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
@@ -333,10 +343,8 @@ def _send_stream_chunk_direct(
     """Send stream chunk directly to the queue."""
     global tokenizer
 
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     started_at = _request_start_times.get(request_id)
     chunk_data = {
-        "text": new_text,
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
@@ -346,6 +354,34 @@ def _send_stream_chunk_direct(
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
+
+    # Incremental per-request detokenization: emit only fully-formed chars; hold
+    # a trailing partial multi-byte char until the next step so byte-BPE
+    # tokenizers don't split one char into U+FFFD (see _stream_detok_state).
+    st = _stream_detok_state.get(request_id)
+    if st is None:
+        st = _stream_detok_state[request_id] = {
+            "tokens": [],
+            "prefix_offset": 0,
+            "read_offset": 0,
+        }
+    toks = st["tokens"]
+    toks.extend(request_output.output_tokens)
+    prefix_text = tokenizer.decode(
+        toks[st["prefix_offset"] : st["read_offset"]], skip_special_tokens=True
+    )
+    new_text = tokenizer.decode(toks[st["prefix_offset"] :], skip_special_tokens=True)
+    if len(new_text) > len(prefix_text) and not new_text.endswith("�"):
+        chunk_data["text"] = new_text[len(prefix_text) :]
+        st["prefix_offset"] = st["read_offset"]
+        st["read_offset"] = len(toks)
+    elif request_output.finished:
+        chunk_data["text"] = new_text[len(prefix_text) :]
+    else:
+        chunk_data["text"] = ""
+    if request_output.finished:
+        _stream_detok_state.pop(request_id, None)
+
     loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
 
 
@@ -1381,12 +1417,28 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         sampling_params = _build_sampling_params(
-            temperature=request.temperature or 1.0,
+            # LOCAL OVERLAY (balanced): native was `request.temperature or 1.0`,
+            # which forced explicit temperature=0.0 to 1.0 (Python `0.0 or 1.0`==1.0),
+            # silently breaking greedy for clients (e.g. Claude Code tool calls) that
+            # ask for it. GLM-5.2 on this stack has TWO opposite failure modes:
+            #   - greedy (temp=0) over a long generation -> pathological repetition
+            #     loop ("复读机", same line x30);
+            #   - full-tail sampling (temp>=1, top_p=1) -> occasional foreign-script
+            #     salad (Bug C), which on tool-call args -> "Invalid tool parameters".
+            # Balance: RESPECT an explicit temperature (0.0 now really is greedy --
+            # right for short structured/tool-call requests, which don't loop), but
+            # default a missing one to 1.0 (no repetition loop on long generations),
+            # and default top_p to 0.9 to truncate the bad-token tail that causes the
+            # salad. Do NOT default temperature to 0 (that caused the repetition
+            # regression) nor top_p to 1.0 (that leaves the salad tail open).
+            temperature=(
+                request.temperature if request.temperature is not None else 1.0
+            ),
             max_tokens=request.max_tokens,
             stop_strings=request.stop_sequences,
             ignore_eos=False,
             top_k=request.top_k if request.top_k is not None else -1,
-            top_p=request.top_p if request.top_p is not None else 1.0,
+            top_p=request.top_p if request.top_p is not None else 0.9,
         )
 
         request_id = uuid.uuid4().hex[:24]
