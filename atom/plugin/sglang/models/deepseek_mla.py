@@ -49,7 +49,11 @@ def setup_deepseek_for_sglang(model) -> None:
     last_sparse_indexer = None
     for module in model.modules():
         if isinstance(module, DeepseekV2MLAAttention):
-            _patch_mla_attention_for_sglang(module, config, kv_cache_dtype)
+            _patch_mla_attention_for_sglang(
+                module,
+                config,
+                kv_cache_dtype,
+            )
             if getattr(module, "use_nsa", False):
                 indexer = getattr(module, "indexer", None)
                 if indexer is not None and not getattr(module, "skip_topk", False):
@@ -87,11 +91,14 @@ def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None
 
     original_forward = indexer.forward
     indexer.use_qk_rope_cache_fusion = False
-    indexer.sparse_attn_indexer_impl = (
+    generic_sparse_attn_indexer_impl = (
         torch.ops.aiter.sparse_attn_indexer_sglang_plugin_mode
     )
+    indexer.sparse_attn_indexer_impl = generic_sparse_attn_indexer_impl
 
     def _forward_with_topk_buffer(self, hidden_states, *args, **kwargs):
+        self.use_qk_rope_cache_fusion = False
+        self.sparse_attn_indexer_impl = generic_sparse_attn_indexer_impl
         num_tokens = int(hidden_states.shape[0])
         topk_tokens = int(self.topk_tokens)
         buffer = getattr(self, "topk_indices_buffer", None)

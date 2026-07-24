@@ -194,6 +194,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Skip irrelevant safetensor shards/keys when loading MTP draft models.
+    "ATOM_SPEC_DECODE_FAST_LOADER": lambda: (
+        os.getenv("ATOM_SPEC_DECODE_FAST_LOADER", "1").lower() != "0"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

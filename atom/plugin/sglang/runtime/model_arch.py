@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable, Optional
 
 GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
+logger = logging.getLogger("atom.plugin.sglang.runtime.model_arch")
+
+
+def _glm52_all_full_enabled() -> bool:
+    return os.environ.get("ATOM_GLM52_DRAFT_ATTN_MODE", "native").strip().lower() == (
+        "all_full"
+    )
 
 
 def is_glm52_dsa_config(config: Any) -> bool:
@@ -124,6 +133,12 @@ def _install_deepseek_mla_adapters(model: Any) -> None:
 
 
 def _glm52_dsa_construction_context():
+    if _glm52_all_full_enabled():
+        logger.info(
+            "GLM-5.2 all-full: keep AttentionForSGLang during target construction"
+        )
+        return nullcontext()
+
     from atom.plugin.sglang.models.glm52_dsa_attention import (
         glm52_native_mla_attention_construction,
     )
@@ -132,6 +147,12 @@ def _glm52_dsa_construction_context():
 
 
 def _install_glm52_dsa_native_adapters(model: Any) -> None:
+    if _glm52_all_full_enabled():
+        logger.info("GLM-5.2 all-full: install generic DeepSeek MLA adapters")
+        _install_deepseek_mla_adapters(model)
+        model._atom_sglang_uses_glm52_all_full = True
+        return
+
     from atom.plugin.sglang.models.glm52_dsa import setup_glm52_dsa_for_sglang
 
     setup_glm52_dsa_for_sglang(model)
@@ -171,6 +192,9 @@ def _bind_deepseek_v4_cache_views(model: Any, runtime: Any) -> None:
 
 
 def _bind_glm52_dsa_cache_views(model: Any, runtime: Any) -> None:
+    if _glm52_all_full_enabled():
+        return
+
     if getattr(runtime.forward_batch.forward_mode, "is_idle", lambda: False)():
         return
 

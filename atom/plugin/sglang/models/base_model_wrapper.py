@@ -253,19 +253,60 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                             **self._filter_model_forward_kwargs(model_call_kwargs)
                         )
 
+                try:
+                    import os
+
+                    mode = getattr(forward_batch, "forward_mode", None)
+                    if (
+                        os.environ.get("ATOM_GLM52_HIDDEN_DEBUG", "0")
+                        in ("1", "true", "True")
+                        and mode is not None
+                        and bool(getattr(mode, "is_target_verify", lambda: False)())
+                        and torch.is_tensor(hidden_states)
+                    ):
+                        rows = hidden_states[
+                            : min(4, int(hidden_states.shape[0]))
+                        ].detach().float()
+                        logger.info(
+                            "[GLM52_HIDDEN_DEBUG] post_model shape=%s norm=%s absmax=%s",
+                            tuple(hidden_states.shape),
+                            rows.norm(dim=-1).cpu().tolist(),
+                            rows.abs().amax(dim=-1).cpu().tolist(),
+                        )
+                except Exception:
+                    logger.exception("Failed GLM52 hidden debug log")
+
                 hidden_states = runtime.trim_output(hidden_states)
+                logits_input_ids = input_ids
+                try:
+                    mode = getattr(forward_batch, "forward_mode", None)
+                    spec_info = getattr(forward_batch, "spec_info", None)
+                    draft_token_num = int(getattr(spec_info, "draft_token_num", 0) or 0)
+                    target_verify_rows = int(forward_batch.batch_size) * draft_token_num
+                    if (
+                        mode is not None
+                        and bool(getattr(mode, "is_target_verify", lambda: False)())
+                        and target_verify_rows > 0
+                        and torch.is_tensor(hidden_states)
+                        and hidden_states.shape[0] != target_verify_rows
+                    ):
+                        hidden_states = hidden_states[:target_verify_rows]
+                        if torch.is_tensor(logits_input_ids):
+                            logits_input_ids = logits_input_ids[:target_verify_rows]
+                except Exception:
+                    logger.exception("Failed to trim target-verify outputs for logits")
 
                 if self.pp_group.is_last_rank:
                     if self.model_arch == "DeepseekV4ForCausalLM":
                         return self.logits_processor(
-                            input_ids,
+                            logits_input_ids,
                             hidden_states,
                             self.logits_head,
                             forward_batch,
                             hidden_states_before_norm=hidden_states,
                         )
                     return self.logits_processor(
-                        input_ids,
+                        logits_input_ids,
                         hidden_states,
                         self.logits_head,
                         forward_batch,

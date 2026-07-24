@@ -6,7 +6,10 @@ actual draft core to ATOM's `DeepSeekMTP`.
 """
 
 import copy
+import contextlib
 import logging
+import os
+import re
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -69,20 +72,33 @@ def _retag_mtp_runtime_layer_ids(model: nn.Module) -> None:
     Rebind only the runtime ids used by the attention/KV-cache path.
     """
 
-    for local_layer_id, mtp_layer in enumerate(model.model.layers.values()):
+    for local_layer_id, (global_layer_id, mtp_layer) in enumerate(
+        model.model.layers.items()
+    ):
         mtp_block = mtp_layer.mtp_block
         self_attn = mtp_block.self_attn
 
         _set_runtime_layer_id(self_attn, local_layer_id)
+        indexer = getattr(self_attn, "indexer", None)
+        if indexer is not None:
+            k_cache = getattr(indexer, "k_cache", None)
+            if k_cache is not None and hasattr(k_cache, "prefix"):
+                k_cache.prefix = re.sub(
+                    rf"\.layers\.{re.escape(str(global_layer_id))}\.",
+                    f".layers.{local_layer_id}.",
+                    k_cache.prefix,
+                    count=1,
+                )
 
         for attr_name in ("mla_attn", "attn_non_absorbed", "attn_mha"):
             attn_obj = getattr(self_attn, attr_name, None)
             if attn_obj is None:
                 continue
             _set_runtime_layer_id(attn_obj, local_layer_id)
-            nested_attn = getattr(attn_obj, "attn", None)
-            if nested_attn is not None:
-                _set_runtime_layer_id(nested_attn, local_layer_id)
+            for nested_name in ("attn",):
+                nested_attn = getattr(attn_obj, nested_name, None)
+                if nested_attn is not None:
+                    _set_runtime_layer_id(nested_attn, local_layer_id)
 
 
 def _install_local_nextn_weight_remap(model: nn.Module) -> None:
@@ -113,6 +129,8 @@ def _install_local_nextn_weight_remap(model: nn.Module) -> None:
 class DeepseekV3ForCausalLMNextN(nn.Module):
     """SGLang-compatible draft wrapper backed by ATOM's `DeepSeekMTP`."""
 
+    draft_model_name = "DeepSeek MTP"
+
     def __init__(
         self,
         config,
@@ -129,6 +147,12 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.unpadded_vocab_size = config.vocab_size
+        self._is_glm_moe_dsa_nextn = (
+            str(getattr(config, "model_type", "")).lower() == "glm_moe_dsa"
+        )
+        self._atom_glm52_uses_generic_draft_frontend = self._is_glm_moe_dsa_nextn
+        if self._is_glm_moe_dsa_nextn:
+            self.draft_model_name = "GLM DSA MTP"
 
         with plugin_runtime_scope(framework="sglang"):
             self.atom_config = generate_atom_config_for_plugin_mode(config)
@@ -152,14 +176,30 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             self.atom_config.hf_config.quantization_config = copy.deepcopy(
                 config.quantization_config
             )
-        SpeculativeConfig.hf_config_override(
-            self.atom_config.hf_config, model_path=draft_model_path
-        )
+        if self._is_glm_moe_dsa_nextn:
+            n_predict = int(
+                getattr(self.atom_config.hf_config, "num_nextn_predict_layers", 1) or 1
+            )
+            self.atom_config.hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "num_nextn_predict_layers": n_predict,
+                }
+            )
+        else:
+            SpeculativeConfig.hf_config_override(
+                self.atom_config.hf_config, model_path=draft_model_path
+            )
         if use_standalone_draft:
             self.atom_config.quant_config = AtomQuantizationConfig(
                 self.atom_config.hf_config,
                 self.atom_config.online_quant_config,
             )
+        self._prepare_atom_config_for_nextn(
+            config=config,
+            draft_model_path=draft_model_path,
+            use_standalone_draft=use_standalone_draft,
+        )
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             from atom.plugin.register import (
@@ -179,9 +219,40 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             self.model.atom_config = self.atom_config
             setup_deepseek_for_sglang(self.model)
             _retag_mtp_runtime_layer_ids(self.model)
+            first_attention = self._first_mtp_layer().mtp_block.self_attn
+            logger.info(
+                "GLM-5.2 draft model attention frontend mode=%s class=%s",
+                "generic",
+                type(first_attention.mla_attn).__name__,
+            )
 
         self.logits_processor = LogitsProcessor(config)
         self.lm_head = self._first_mtp_layer().shared_head.head
+
+    def _prepare_atom_config_for_nextn(
+        self,
+        *,
+        config,
+        draft_model_path: str,
+        use_standalone_draft: bool,
+    ) -> None:
+        del config, draft_model_path, use_standalone_draft
+        if not getattr(self, "_is_glm_moe_dsa_nextn", False):
+            return None
+
+        # GLM-5.x quant configs name the DSA indexer projection as
+        # `indexers_proj`; ATOM's shared DSA/MTP module uses `indexer.weights_proj`.
+        # Also run the standard DeepSeek/GLM packed-module remap so excludes for
+        # q_a_proj/kv_a_proj follow ATOM's fused_qkv_a_proj module in MTP blocks.
+        quant_config = getattr(self.atom_config, "quant_config", None)
+        if quant_config is not None:
+            quant_config.remap_layer_name(
+                self.atom_config.hf_config,
+                quant_exclude_name_mapping={
+                    "indexers_proj": "indexer.weights_proj",
+                },
+            )
+        return None
 
     def _mtp_layers(self):
         return list(self.model.model.layers.values())
@@ -216,7 +287,10 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
         **kwargs,
     ):
         if forward_batch.spec_info is None:
-            raise ValueError("DeepSeek MTP draft forward requires speculative info")
+            raise ValueError(
+                f"{self.draft_model_name} draft forward requires speculative info"
+            )
+        forward_batch._atom_glm52_generic_draft_frontend = True
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             with SGLangPluginRuntime(
@@ -226,26 +300,121 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
                 input_ids=input_ids,
                 input_embeds=input_embeds,
             ) as runtime:
+                model_input_ids = runtime.input_ids
+                model_input_embeds = runtime.input_embeds
+                num_model_tokens = int(runtime.positions.shape[0])
+                if (
+                    torch.is_tensor(model_input_ids)
+                    and model_input_ids.shape[0] != num_model_tokens
+                ):
+                    if num_model_tokens % int(model_input_ids.shape[0]) == 0:
+                        model_input_ids = model_input_ids.repeat_interleave(
+                            num_model_tokens // int(model_input_ids.shape[0]), dim=0
+                        )
+                    elif int(model_input_ids.shape[0]) == 1:
+                        model_input_ids = model_input_ids.expand(num_model_tokens)
+                    else:
+                        raise RuntimeError(
+                            f"{self.draft_model_name} draft input_ids/positions "
+                            "layout mismatch: "
+                            f"input_ids={tuple(model_input_ids.shape)}, "
+                            f"positions={tuple(runtime.positions.shape)}"
+                        )
+                if (
+                    torch.is_tensor(model_input_embeds)
+                    and model_input_embeds.shape[0] != num_model_tokens
+                ):
+                    if num_model_tokens % int(model_input_embeds.shape[0]) == 0:
+                        model_input_embeds = model_input_embeds.repeat_interleave(
+                            num_model_tokens // int(model_input_embeds.shape[0]), dim=0
+                        )
+                    elif int(model_input_embeds.shape[0]) == 1:
+                        model_input_embeds = model_input_embeds.expand(
+                            num_model_tokens, -1
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"{self.draft_model_name} draft input_embeds/positions "
+                            "layout mismatch: "
+                            f"input_embeds={tuple(model_input_embeds.shape)}, "
+                            f"positions={tuple(runtime.positions.shape)}"
+                        )
+
                 model_hidden_states = forward_batch.spec_info.hidden_states
+                # Save the incoming (target) hidden BEFORE any shape adjustment.
+                # GLM-5.2 MTP expects target hidden at every sub-step (native
+                # EagleProposer never updates hidden_states in its loop).
+                # SGLang EAGLE chains logits_output.hidden_states between steps,
+                # so we must restore the incoming target hidden as the chained
+                # state to avoid feeding draft output → hnorm (wrong space).
+                _incoming_hidden_for_chain = model_hidden_states
                 if runtime.forward_batch is not forward_batch:
                     model_hidden_states = _materialize_dummy_hidden_states(
                         model_hidden_states,
-                        length=int(runtime.positions.shape[0]),
+                        length=num_model_tokens,
                     )
+                elif (
+                    torch.is_tensor(model_hidden_states)
+                    and model_hidden_states.shape[0] != num_model_tokens
+                ):
+                    tokens_per_req = int(
+                        getattr(
+                            getattr(runtime.forward_batch, "spec_info", None),
+                            "num_tokens_per_req",
+                            0,
+                        )
+                        or 0
+                    )
+                    if (
+                        tokens_per_req > 0
+                        and model_hidden_states.shape[0] * tokens_per_req
+                        == num_model_tokens
+                    ):
+                        model_hidden_states = model_hidden_states.repeat_interleave(
+                            tokens_per_req, dim=0
+                        )
+                    elif model_hidden_states.shape[0] == 1:
+                        model_hidden_states = model_hidden_states.expand(
+                            num_model_tokens, -1
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"{self.draft_model_name} draft-extend hidden layout "
+                            "mismatch: "
+                            f"hidden={tuple(model_hidden_states.shape)}, "
+                            f"input_tokens={num_model_tokens}, "
+                            f"tokens_per_req={tokens_per_req}"
+                        )
                 hidden_states = self.model(
-                    input_ids=runtime.input_ids,
+                    input_ids=model_input_ids,
                     positions=runtime.positions,
                     hidden_states=model_hidden_states,
-                    inputs_embeds=runtime.input_embeds,
+                    inputs_embeds=model_input_embeds,
                 )
 
             if self.pp_group.is_last_rank:
                 hidden_states = runtime.trim_output(hidden_states)
+                wrapper_mode = os.environ.get(
+                    "ATOM_GLM52_MTP_WRAPPER_MODE", "current"
+                ).strip().lower()
+                if wrapper_mode not in ("current", "pr1578"):
+                    raise ValueError(
+                        "ATOM_GLM52_MTP_WRAPPER_MODE must be 'current' or "
+                        f"'pr1578', got {wrapper_mode!r}"
+                    )
+                normed_hidden = self._first_mtp_layer().shared_head(hidden_states)
+                if wrapper_mode == "pr1578":
+                    logits_hidden = hidden_states
+                    hidden_states_before_norm = None
+                else:
+                    logits_hidden = normed_hidden
+                    hidden_states_before_norm = _incoming_hidden_for_chain
                 return self.logits_processor(
                     input_ids,
-                    hidden_states,
+                    logits_hidden,
                     self.lm_head,
                     forward_batch,
+                    hidden_states_before_norm=hidden_states_before_norm,
                 )
             return hidden_states
 
@@ -268,4 +437,23 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             )
 
 
-EntryClass = [DeepseekV3ForCausalLMNextN]
+class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    """SGLang-compatible GLM-5.2 MTP draft wrapper backed by ATOM `DeepSeekMTP`."""
+
+    draft_model_name = "GLM DSA MTP"
+
+    def _prepare_atom_config_for_nextn(
+        self,
+        *,
+        config,
+        draft_model_path: str,
+        use_standalone_draft: bool,
+    ) -> None:
+        return super()._prepare_atom_config_for_nextn(
+            config=config,
+            draft_model_path=draft_model_path,
+            use_standalone_draft=use_standalone_draft,
+        )
+
+
+EntryClass = [DeepseekV3ForCausalLMNextN, GlmMoeDsaForCausalLMNextN]

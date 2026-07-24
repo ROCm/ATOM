@@ -92,6 +92,34 @@ def _register_custom_attention_to_sglang() -> None:
     # the plugin backend.
     sglang_aiter_backend.AiterAttnBackend = ATOMAttnBackendForSgl
 
+    def create_glm52_backend(runner, registry_name: str):
+        is_draft_worker = bool(getattr(runner, "is_draft_worker", False))
+        draft_mode = os.environ.get(
+            "ATOM_GLM52_DRAFT_ATTN_MODE", "native"
+        ).strip().lower()
+        if draft_mode not in ("all_full", "full", "native"):
+            raise ValueError(
+                "ATOM_GLM52_DRAFT_ATTN_MODE must be 'all_full', 'full', or "
+                "'native', "
+                f"got {draft_mode!r}"
+            )
+
+        if draft_mode == "all_full" or (
+            is_draft_worker and draft_mode == "full"
+        ):
+            backend_cls = ATOMAttnBackendForSgl
+        else:
+            backend_cls = ATOMGLM52DSABackendForSgl
+
+        logger.info(
+            "GLM-5.2 attention route registry=%s role=%s draft_mode=%s backend=%s",
+            registry_name,
+            "draft" if is_draft_worker else "target",
+            draft_mode,
+            backend_cls.__name__,
+        )
+        return backend_cls(runner)
+
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
         hf_config = runner.model_config.hf_config
@@ -102,10 +130,7 @@ def _register_custom_attention_to_sglang() -> None:
             )
             return ATOMDeepseekV4BackendForSgl(runner)
         if is_glm52_dsa_config(hf_config):
-            logger.info(
-                "Use ATOMGLM52DSABackendForSgl for GLM-5.2 through SGLang aiter backend choice"
-            )
-            return ATOMGLM52DSABackendForSgl(runner)
+            return create_glm52_backend(runner, "aiter")
         return ATOMAttnBackendForSgl(runner)
 
     @register_attention_backend("dsv4")
@@ -119,22 +144,22 @@ def _register_custom_attention_to_sglang() -> None:
     def create_atom_nsa_backend(runner):
         hf_config = runner.model_config.hf_config
         if is_glm52_dsa_config(hf_config):
-            logger.info(
-                "Use ATOMGLM52DSABackendForSgl for GLM-5.2 through SGLang nsa backend choice"
-            )
-            return ATOMGLM52DSABackendForSgl(runner)
+            return create_glm52_backend(runner, "nsa")
         from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
         return NativeSparseAttnBackend(runner)
 
 
 def _patch_sglang_dsv4_draft_backends() -> None:
-    """Route SGLang's hard-coded DSV4 speculative factories to ATOM.
+    """Route hard-coded speculative factories to ATOM-owned backends.
 
     DraftBackendFactory constructs DeepSeek-V4 draft backends directly instead
     of going through the attention registry.  SGLang's native backend asserts a
     native DeepSeekV4TokenToKVPool, while ATOM plugin mode uses a proxy KV pool,
     so patch the factory methods to return the ATOM shim.
+
+    GLM-5.2 uses SGLang's AITER multi-step lifecycle with ATOM's general
+    attention backend.
     """
 
     try:
@@ -148,6 +173,51 @@ def _patch_sglang_dsv4_draft_backends() -> None:
 
     if getattr(DraftBackendFactory, "_atom_dsv4_draft_backend_patched", False):
         return
+
+    original_create_decode_backend = DraftBackendFactory.create_decode_backend
+    original_create_draft_extend_backend = (
+        DraftBackendFactory.create_draft_extend_backend
+    )
+
+    def _create_atom_decode_backend(self):
+        from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+        hf_config = getattr(
+            getattr(self.draft_model_runner, "model_config", None),
+            "hf_config",
+            None,
+        )
+        backend = original_create_decode_backend(self)
+        if is_glm52_dsa_config(hf_config):
+            per_step = [
+                type(item).__name__
+                for item in getattr(backend, "attn_backends", [])
+            ]
+            logger.info(
+                "GLM-5.2 draft decode backend selection=%s multi_step=%s "
+                "per_step=%s",
+                getattr(self, "draft_attn_backend", None),
+                type(backend).__name__,
+                per_step,
+            )
+        return backend
+
+    def _create_atom_draft_extend_backend(self):
+        from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+        backend = original_create_draft_extend_backend(self)
+        hf_config = getattr(
+            getattr(self.draft_model_runner, "model_config", None),
+            "hf_config",
+            None,
+        )
+        if is_glm52_dsa_config(hf_config):
+            logger.info(
+                "GLM-5.2 draft extend backend selection=%s backend=%s",
+                getattr(self, "draft_attn_backend", None),
+                type(backend).__name__,
+            )
+        return backend
 
     def _create_atom_dsv4_decode_backend(self):
         return ATOMDeepseekV4BackendForSgl(
@@ -164,6 +234,10 @@ def _patch_sglang_dsv4_draft_backends() -> None:
 
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
     DraftBackendFactory._create_dsv4_prefill_backend = _create_atom_dsv4_prefill_backend
+    DraftBackendFactory.create_decode_backend = _create_atom_decode_backend
+    DraftBackendFactory.create_draft_extend_backend = (
+        _create_atom_draft_extend_backend
+    )
     DraftBackendFactory._atom_dsv4_draft_backend_patched = True
     logger.info("Patched SGLang DSV4 speculative draft backends to ATOM")
 
@@ -186,6 +260,9 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             EAGLEDraftExtendCudaGraphRunner,
         )
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+        from atom.plugin.sglang.glm52_mtp.common import (
+            GLM52_GRAPH_SEQ_LEN_CAPACITY,
+        )
     except Exception as exc:
         logger.debug("Skip patching SGLang DSV4 spec cuda graph: %s", exc)
         return
@@ -203,6 +280,43 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             return any("DeepseekV4ForCausalLMNextN" in str(arch) for arch in arches)
         except Exception:
             return False
+
+    def _is_glm52_nextn_runner(runner) -> bool:
+        try:
+            arches = (
+                getattr(
+                    getattr(getattr(runner, "model_config", None), "hf_config", None),
+                    "architectures",
+                    None,
+                )
+                or []
+            )
+            return any(
+                "GlmMoeDsaForCausalLMNextN" in str(arch)
+                or "DeepseekV3ForCausalLMNextN" in str(arch)
+                for arch in arches
+            )
+        except Exception:
+            return False
+
+    def _is_glm52_runner(runner) -> bool:
+        try:
+            hf_config = getattr(
+                getattr(runner, "model_config", None), "hf_config", None
+            )
+            model_type = str(getattr(hf_config, "model_type", "")).lower()
+            arches = getattr(hf_config, "architectures", None) or []
+            return model_type == "glm_moe_dsa" or any(
+                "GlmMoeDsaForCausalLM" in str(arch) for arch in arches
+            )
+        except Exception:
+            return False
+
+    def _uses_glm52_generic_draft_frontend(runner) -> bool:
+        model = getattr(runner, "model", None)
+        return bool(
+            getattr(model, "_atom_glm52_uses_generic_draft_frontend", False)
+        )
 
     def _is_dsv4_runner(runner) -> bool:
         try:
@@ -348,6 +462,20 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     return False
                 if is_dsv4 and is_draft_extend:
                     return False
+                if _is_glm52_runner(model_runner) and is_target_verify:
+                    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                    if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+                        return False
+                    max_seq_len = int(max(seq_lens_cpu))
+                    max_graph_seq_len = GLM52_GRAPH_SEQ_LEN_CAPACITY
+                    if max_seq_len > max_graph_seq_len:
+                        logger.info(
+                            "[ATOM_GLM52_VERIFY_GRAPH] eager_fallback "
+                            "seq_len=%d graph_seq_limit=%d",
+                            max_seq_len,
+                            max_graph_seq_len,
+                        )
+                        return False
             except Exception:
                 pass
             return original_can_run(self, forward_batch)
@@ -357,6 +485,36 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
     if not getattr(EAGLEDraftCudaGraphRunner, "_atom_dsv4_replay_patched", False):
         original_draft_replay = EAGLEDraftCudaGraphRunner.replay
+        original_draft_replay_graph = EAGLEDraftCudaGraphRunner._replay
+
+        def _replay(self, forward_batch):
+            model_runner = getattr(self, "model_runner", None)
+            if _is_glm52_nextn_runner(model_runner) and not _uses_glm52_generic_draft_frontend(
+                model_runner
+            ):
+                from atom.plugin.sglang.runtime.forward_context import (
+                    stage_glm52_draft_decode_graph_metadata,
+                )
+
+                original_batch_size = forward_batch.batch_size
+                original_out_cache_loc = forward_batch.out_cache_loc
+                graph_bs = int(self.bs)
+                forward_batch.batch_size = graph_bs
+                forward_batch.out_cache_loc = self.buffers.out_cache_loc[
+                    : graph_bs * self.topk * self.speculative_num_steps
+                ]
+                try:
+                    stage_glm52_draft_decode_graph_metadata(
+                        forward_batch,
+                        speculative_num_steps=self.speculative_num_steps,
+                        topk=self.topk,
+                    )
+                finally:
+                    forward_batch.batch_size = original_batch_size
+                    forward_batch.out_cache_loc = original_out_cache_loc
+            return original_draft_replay_graph(self, forward_batch)
+
+        EAGLEDraftCudaGraphRunner._replay = _replay
 
         def replay(self, forward_batch):
             if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
@@ -413,14 +571,26 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 return False
 
         def can_run(self, forward_batch):
-            if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
+            model_runner = getattr(self, "model_runner", None)
+            if _is_glm52_nextn_runner(model_runner):
+                base_can_run = bool(original_extend_can_run(self, forward_batch))
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+                    return False
+                max_seq_len = int(max(seq_lens_cpu))
+                max_graph_seq_len = GLM52_GRAPH_SEQ_LEN_CAPACITY
+                return base_can_run and max_seq_len <= max_graph_seq_len
+            if not _is_dsv4_nextn_runner(model_runner):
                 return original_extend_can_run(self, forward_batch)
             if not original_extend_can_run(self, forward_batch):
                 return False
             return _dsv4_draft_extend_graph_layout_ok(self, forward_batch)
 
         def replay(self, forward_batch):
-            if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
+            model_runner = getattr(self, "model_runner", None)
+            if _is_glm52_nextn_runner(model_runner):
+                return original_extend_replay(self, forward_batch)
+            if not _is_dsv4_nextn_runner(model_runner):
                 return original_extend_replay(self, forward_batch)
             if not _draft_extend_graph_enabled(getattr(self, "model_runner", None)):
                 raise RuntimeError(
@@ -511,10 +681,14 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
         def _draft_extend_for_decode(self, batch, batch_result):
             try:
-                if (
-                    not _is_dsv4_nextn_runner(getattr(self, "draft_runner", None))
-                    or getattr(self, "cuda_graph_runner_for_draft_extend", None) is None
-                ):
+                is_glm52 = _is_glm52_nextn_runner(getattr(self, "draft_runner", None))
+                is_dsv4 = _is_dsv4_nextn_runner(getattr(self, "draft_runner", None))
+                draft_extend_graph_runner = getattr(
+                    self, "cuda_graph_runner_for_draft_extend", None
+                )
+                if not is_glm52 and not is_dsv4:
+                    return original_draft_extend_for_decode(self, batch, batch_result)
+                if is_dsv4 and draft_extend_graph_runner is None:
                     return original_draft_extend_for_decode(self, batch, batch_result)
 
                 import torch
@@ -529,26 +703,22 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if num_draft_tokens <= 0:
                     return original_draft_extend_for_decode(self, batch, batch_result)
 
-                if not _dsv4_draft_extend_graph_layout_ok(
-                    self.cuda_graph_runner_for_draft_extend
+                use_draft_extend_graph_runner = draft_extend_graph_runner
+                if (
+                    use_draft_extend_graph_runner is not None
+                    and not _dsv4_draft_extend_graph_layout_ok(
+                        use_draft_extend_graph_runner
+                    )
                 ):
-                    runner = self.cuda_graph_runner_for_draft_extend
-                    self.cuda_graph_runner_for_draft_extend = None
-                    try:
-                        return original_draft_extend_for_decode(
-                            self, batch, batch_result
-                        )
-                    finally:
-                        self.cuda_graph_runner_for_draft_extend = runner
+                    use_draft_extend_graph_runner = None
 
                 accept_lens = getattr(batch_result, "accept_lens", None)
                 if not torch.is_tensor(accept_lens):
                     return original_draft_extend_for_decode(self, batch, batch_result)
 
                 # DRAFT_EXTEND_V2 materializes exactly `num_draft_tokens` slots
-                # per sequence.  `accept_lens` includes the target bonus token,
-                # so the value can be `num_draft_tokens + 1`; using that directly
-                # in the fixed-layout index points one slot past the graph output.
+                # per sequence.  `accept_lens` includes the target bonus token, so
+                # clamp before converting it to a fixed-layout per-request row offset.
                 graph_accept_lens = accept_lens.clamp(min=1, max=num_draft_tokens)
 
                 draft_input = EagleDraftInput(
@@ -570,7 +740,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             batch_result.next_token_ids,
                             num_draft_tokens,
                             self.draft_runner,
-                            self.cuda_graph_runner_for_draft_extend,
+                            use_draft_extend_graph_runner,
                         )
                     )
 
@@ -579,19 +749,16 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         self.plan_stream
                     )
 
-                # The graph only fills draft slots.  Keep the scheduler-facing
-                # `batch_result.accept_lens` untouched, but make the graph's
-                # per-sequence counts match the fixed draft-token layout.
                 forward_batch.spec_info.num_correct_drafts = graph_accept_lens - 1
                 forward_batch.spec_info.num_accept_tokens = graph_accept_lens
 
                 can_cuda_graph = (
-                    self.cuda_graph_runner_for_draft_extend
-                    and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+                    use_draft_extend_graph_runner is not None
+                    and use_draft_extend_graph_runner.can_run(forward_batch)
                 )
                 if can_cuda_graph:
-                    draft_logits_output = (
-                        self.cuda_graph_runner_for_draft_extend.replay(forward_batch)
+                    draft_logits_output = use_draft_extend_graph_runner.replay(
+                        forward_batch
                     )
                 else:
                     draft_logits_output = self.draft_runner.forward(
@@ -612,7 +779,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     output_len = int(draft_logits_output.next_token_logits.shape[0])
                 if max_index >= output_len:
                     raise RuntimeError(
-                        "DSV4 DRAFT_EXTEND_V2 output/index layout mismatch: "
+                        "ATOM DRAFT_EXTEND_V2 output/index layout mismatch: "
                         f"max_index={max_index}, output_len={output_len}, "
                         f"batch={len(batch.seq_lens)}, "
                         f"num_draft_tokens={num_draft_tokens}, "
@@ -652,7 +819,29 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         original_init_cuda_graphs = EagleDraftWorker.init_cuda_graphs
 
         def init_cuda_graphs(self):
+            draft_runner = getattr(self, "draft_runner", None)
+            is_glm52 = _is_glm52_nextn_runner(draft_runner)
+            if is_glm52:
+                for backend in self.draft_attn_backend.attn_backends:
+                    backend.get_cuda_graph_seq_len_fill_value = (
+                        lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
+                    )
+                for backend in (
+                    getattr(self.draft_runner, "attn_backend", None),
+                    getattr(self, "draft_extend_attn_backend", None),
+                ):
+                    if backend is not None:
+                        backend.get_cuda_graph_seq_len_fill_value = (
+                            lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
+                        )
             ret = original_init_cuda_graphs(self)
+            if is_glm52:
+                logger.info(
+                    "GLM-5.2 CUDA graph initialization: draft_decode=%s "
+                    "draft_extend=%s",
+                    self.cuda_graph_runner is not None,
+                    self.cuda_graph_runner_for_draft_extend is not None,
+                )
             try:
                 if _env_flag(
                     "ATOM_SGLANG_V4_DISABLE_DRAFT_CG"
@@ -717,6 +906,168 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         EagleDraftWorker._atom_dsv4_init_cuda_graphs_patched = True
 
 
+def _patch_sglang_eagle_v2_draft_argmax() -> None:
+    """Use ATOM draft distributed argmax for SGLang EAGLE topk=1 drafting."""
+    if os.getenv("ATOM_SGLANG_DRAFT_ARGMAX", "1").lower() in ("0", "false", "no"):
+        return
+    try:
+        import torch
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+        from sglang.srt.speculative.spec_utils import (
+            maybe_detect_nan,
+            maybe_detect_oob,
+            select_top_k_tokens,
+        )
+    except Exception as exc:
+        logger.debug("Skip patching SGLang EAGLE draft argmax: %s", exc)
+        return
+
+    if getattr(EagleDraftWorker, "_atom_sglang_draft_argmax_patched", False):
+        return
+
+    def _is_glm52_nextn_runner(runner) -> bool:
+        try:
+            arches = (
+                getattr(
+                    getattr(getattr(runner, "model_config", None), "hf_config", None),
+                    "architectures",
+                    None,
+                )
+                or []
+            )
+            return any(
+                "GlmMoeDsaForCausalLMNextN" in str(arch)
+                or "DeepseekV3ForCausalLMNextN" in str(arch)
+                for arch in arches
+            )
+        except Exception:
+            return False
+
+    def draft_forward(self, forward_batch):
+        spec_info = forward_batch.spec_info
+        out_cache_loc = forward_batch.out_cache_loc
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+
+        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        out_cache_loc = out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
+
+        score_list = []
+        token_list = []
+        parents_list = []
+        scores = None
+        use_argmax = self.topk == 1
+
+        try:
+            from atom.plugin.sglang.glm52_dsa_bridge import (
+                clear_draft_decode_sub_step,
+                set_draft_decode_sub_step,
+            )
+        except Exception:
+            clear_draft_decode_sub_step = lambda *args, **kwargs: None  # type: ignore[assignment]
+            set_draft_decode_sub_step = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        clear_draft_decode_sub_step(forward_batch)
+
+        for i in range(self.speculative_num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+
+            if i == self.speculative_num_steps - 1:
+                break
+
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            forward_batch._atom_use_draft_argmax = use_argmax
+            spec_info.hidden_states = hidden_states
+            is_glm52_draft = _is_glm52_nextn_runner(
+                getattr(self, "draft_runner", None)
+            )
+            if is_glm52_draft:
+                set_draft_decode_sub_step(forward_batch, i)
+
+            logits_output = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+
+            draft_token_ids = None
+            customized_info = getattr(logits_output, "customized_info", None) or {}
+            if use_argmax:
+                draft_token_ids = customized_info.get("draft_token_ids")
+
+            if draft_token_ids is not None:
+                topk_index = draft_token_ids.reshape(-1, 1)
+                topk_p = torch.ones(
+                    (topk_index.shape[0], 1),
+                    dtype=torch.float32,
+                    device=topk_index.device,
+                )
+            else:
+                maybe_detect_nan(
+                    logits_output.next_token_logits, f"draft_forward step {i}"
+                )
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                from sglang.srt.utils.common import fast_topk
+
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                )
+
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+            forward_batch.positions.add_(1)
+
+        clear_draft_decode_sub_step(forward_batch)
+
+        score_list = torch.cat(score_list, dim=1).flatten(1)
+        ss_token_list = torch.cat(token_list, dim=1)
+        top_scores = torch.topk(
+            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        )
+        top_scores_index = torch.sort(top_scores.indices).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            ss_token_list.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
+        )
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            batch_size = parents_list[0].shape[0]
+            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+
+        return parent_list, top_scores_index, draft_tokens
+
+    EagleDraftWorker.draft_forward = draft_forward
+    EagleDraftWorker._atom_sglang_draft_argmax_patched = True
+    logger.info("Patched SGLang EAGLE draft_forward for ATOM distributed argmax")
+
+
 def register_ops_to_sglang(atom_config: Config) -> None:
     """
     Register custom ops to sglang, including attention
@@ -724,6 +1075,7 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     _register_custom_attention_to_sglang()
     _patch_sglang_dsv4_draft_backends()
     _patch_sglang_dsv4_spec_cuda_graph()
+    _patch_sglang_eagle_v2_draft_argmax()
 
 
 def set_attn_cls() -> None:
