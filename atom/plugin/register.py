@@ -736,12 +736,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 )
                 if not is_glm52 and not is_dsv4:
                     return original_draft_extend_for_decode(self, batch, batch_result)
-                if (
-                    is_glm52
-                    and os.environ.get("ATOM_GLM52_DRAFT_EXTEND_NATIVE", "0")
-                    in ("1", "true", "True")
-                ):
-                    return original_draft_extend_for_decode(self, batch, batch_result)
                 if is_dsv4 and draft_extend_graph_runner is None:
                     return original_draft_extend_for_decode(self, batch, batch_result)
 
