@@ -2201,6 +2201,9 @@ class ModelRunner:
             # multi-rank branch (`not enable_dp_attention` => True) and the
             # Context default — otherwise single-GPU/TP-only decode would
             # be forced into eager and lose the CUDAGraph decode path.
+            # No DP sync here: leave the EPLB prefill hint unset so the gate
+            # self-computes over the migration group (or uses the local flag).
+            self._eplb_any_rank_has_prefill = None
             return (
                 num_input_tokens,
                 None,
@@ -2223,6 +2226,9 @@ class ModelRunner:
             dspark_shape=dspark_shape,
         )
 
+        # Stash the DP-wide prefill OR for the EPLB prefill gate. Reused for free
+        # by on_forward_pass_end when the DP group == the migration (EP) group.
+        self._eplb_any_rank_has_prefill = sync.any_rank_has_prefill
         max_tokens = int(sync.num_tokens_across_dp.max())
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
