@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional, Type
+from typing import Any
 
 import torch
 
@@ -34,7 +35,7 @@ class GDNAttentionBackend:
         return "ROCM_GDN_ATTENTION"
 
     @staticmethod
-    def get_impl_cls() -> Type[GatedDeltaNet]:
+    def get_impl_cls() -> type[GatedDeltaNet]:
         return GatedDeltaNet
 
 
@@ -44,7 +45,7 @@ class SGLangGDNForwardContext:
 
     forward_batch: Any
     gdn_metadata: GDNAttentionMetadata
-    kv_cache_data: Dict[str, KVCacheTensor]
+    kv_cache_data: dict[str, KVCacheTensor]
     context: Context
     num_tokens: int
 
@@ -53,13 +54,61 @@ class SGLangGDNForwardContext:
         return getattr(attn_backend, "linear_attn_backend", attn_backend)
 
     @staticmethod
-    def _build_kv_cache_tensors(forward_batch: Any) -> Dict[str, KVCacheTensor]:
-        pool = forward_batch.req_to_token_pool
+    def _resolve_attn_backend(forward_batch: Any) -> Any:
+        backend = getattr(forward_batch, "attn_backend", None)
+        if backend is not None:
+            return backend
+
+        try:
+            from sglang.srt.model_executor.forward_context import (
+                get_attn_backend,
+                has_forward_context,
+            )
+
+            if has_forward_context():
+                return get_attn_backend()
+        except Exception:  # noqa: BLE001, S110 - forward context is optional
+            pass
+
+        return None
+
+    @staticmethod
+    def _patch_forward_batch_pools(forward_batch: Any, attn_backend: Any) -> None:
+        for attr in ("token_to_kv_pool", "req_to_token_pool"):
+            if getattr(forward_batch, attr, None) is None:
+                pool = getattr(attn_backend, attr, None)
+                if pool is not None:
+                    try:
+                        setattr(forward_batch, attr, pool)
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+
+    @staticmethod
+    def _build_kv_cache_tensors(
+        forward_batch: Any, attn_backend: Any
+    ) -> dict[str, KVCacheTensor]:
+        pool = getattr(forward_batch, "req_to_token_pool", None)
+        if pool is None:
+            pool = getattr(attn_backend, "req_to_token_pool", None)
+        if pool is None:
+            try:
+                from sglang.srt.model_executor.forward_context import (
+                    get_req_to_token_pool,
+                    has_forward_context,
+                )
+
+                if has_forward_context():
+                    pool = get_req_to_token_pool()
+            except Exception:  # noqa: BLE001 - forward context is optional
+                pool = None
+        if pool is None:
+            return {}
+
         mamba_map = getattr(pool, "mamba_map", None)
         if mamba_map is None:
             return {}
 
-        out: Dict[str, KVCacheTensor] = {}
+        out: dict[str, KVCacheTensor] = {}
         for layer_id in mamba_map:
             layer_cache = pool.mamba2_layer_cache(layer_id)
             layer_name = f"layer_{layer_id}"
@@ -92,7 +141,7 @@ class SGLangGDNForwardContext:
     @staticmethod
     def _build_gdn_metadata(
         forward_batch: Any, linear_backend: Any
-    ) -> Optional[GDNAttentionMetadata]:
+    ) -> GDNAttentionMetadata | None:
         fm = getattr(linear_backend, "forward_metadata", None)
         if fm is None:
             return None
@@ -107,18 +156,18 @@ class SGLangGDNForwardContext:
         device = fm.query_start_loc.device
         idx = fm.mamba_cache_indices.to(dtype=torch.int32, device=device)
         bs = forward_batch.batch_size
-        common_kwargs = dict(
-            num_spec_decodes=0,
-            num_spec_decode_tokens=0,
-            spec_query_start_loc=None,
-            non_spec_query_start_loc=fm.query_start_loc,
-            spec_state_indices_tensor=None,
-            non_spec_state_indices_tensor=idx,
-            spec_sequence_masks=None,
-            spec_token_indx=None,
-            non_spec_token_indx=None,
-            num_accepted_tokens=None,
-        )
+        common_kwargs = {
+            "num_spec_decodes": 0,
+            "num_spec_decode_tokens": 0,
+            "spec_query_start_loc": None,
+            "non_spec_query_start_loc": fm.query_start_loc,
+            "spec_state_indices_tensor": None,
+            "non_spec_state_indices_tensor": idx,
+            "spec_sequence_masks": None,
+            "spec_token_indx": None,
+            "non_spec_token_indx": None,
+            "num_accepted_tokens": None,
+        }
 
         if mode.is_decode_or_idle():
             return GDNAttentionMetadata(
@@ -161,9 +210,7 @@ class SGLangGDNForwardContext:
         return None
 
     @classmethod
-    def build(
-        cls, forward_batch_or_metadata: Any
-    ) -> Optional["SGLangGDNForwardContext"]:
+    def build(cls, forward_batch_or_metadata: Any) -> SGLangGDNForwardContext | None:
         from atom.plugin.sglang.runtime import (
             SGLangForwardBatchMetadata,
         )
@@ -173,12 +220,21 @@ class SGLangGDNForwardContext:
             return None
 
         forward_batch = metadata.forward_batch
-        linear_backend = cls._linear_attn_backend(forward_batch.attn_backend)
+        attn_backend = cls._resolve_attn_backend(forward_batch)
+        if attn_backend is None:
+            logger.warning(
+                "SGLang GDN forward context: no active SGLang attention backend; "
+                "GDN metadata skipped."
+            )
+            return None
+
+        cls._patch_forward_batch_pools(forward_batch, attn_backend)
+        linear_backend = cls._linear_attn_backend(attn_backend)
         gdn_metadata = cls._build_gdn_metadata(forward_batch, linear_backend)
         if gdn_metadata is None:
             return None
 
-        kv_cache_data = cls._build_kv_cache_tensors(forward_batch)
+        kv_cache_data = cls._build_kv_cache_tensors(forward_batch, attn_backend)
         if not kv_cache_data:
             return None
 

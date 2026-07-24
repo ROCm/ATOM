@@ -8,16 +8,16 @@
 # TODO: Rewrite this file once sglang's attention flow is unified into ATOM's
 # attention layer
 
+
 import torch
 from torch import nn
-from typing import Optional
 
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import BaseAttention
 from atom.model_ops.layernorm import GemmaRMSNorm, fused_qk_norm
 from atom.model_ops.utils import atom_parameter
-from atom.plugin.prepare import is_plugin_mode, is_sglang
 from atom.models.utils import maybe_prefix
+from atom.plugin.prepare import is_plugin_mode, is_sglang
 
 
 class RadixAttention(BaseAttention):
@@ -36,13 +36,13 @@ class RadixAttention(BaseAttention):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -183,6 +183,16 @@ class RadixAttention(BaseAttention):
                     forward_sparse_mla_for_sglang,
                 )
 
+                try:
+                    from sglang.srt.model_executor.forward_context import (
+                        get_attn_backend,
+                        has_forward_context,
+                    )
+
+                    attn_backend = get_attn_backend() if has_forward_context() else None
+                except Exception:  # noqa: BLE001 - forward context is optional
+                    attn_backend = None
+
                 return forward_sparse_mla_for_sglang(
                     query,
                     key,
@@ -191,9 +201,7 @@ class RadixAttention(BaseAttention):
                     forward_batch,
                     save_kv_cache=save_kv_cache,
                     topk_indices=topk_indices,
-                    input_dtype=getattr(
-                        forward_batch.attn_backend, "input_dtype", torch.bfloat16
-                    ),
+                    input_dtype=getattr(attn_backend, "input_dtype", torch.bfloat16),
                     q_scale=q_scale,
                 )
 
@@ -215,7 +223,7 @@ class RadixAttention(BaseAttention):
         key: torch.Tensor,
         value: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         **kwargs,
     ):
         if is_plugin_mode():

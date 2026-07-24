@@ -7,16 +7,15 @@ delegating the actual MTP block to ATOM's ``DeepseekV4MTP`` implementation.
 
 import copy
 import logging
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
 
 import torch
-from torch import nn
-
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
+from torch import nn
 
 from atom.config import QuantizationConfig as AtomQuantizationConfig
 from atom.config import SpeculativeConfig
@@ -26,6 +25,7 @@ from atom.plugin.config import generate_atom_config_for_plugin_mode
 from atom.plugin.sglang.runtime import (
     SGLangForwardBatchMetadata,
     SGLangPluginRuntime,
+    is_draft_extend_mode,
     plugin_runtime_scope,
 )
 
@@ -107,7 +107,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
     def __init__(
         self,
         config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         del prefix
@@ -245,12 +245,8 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                 elif (
                     torch.is_tensor(model_hidden_states)
                     and model_hidden_states.shape[0] != runtime.input_ids.shape[0]
-                    and bool(
-                        getattr(
-                            runtime.forward_batch.forward_mode,
-                            "is_draft_extend",
-                            lambda **kwargs: False,
-                        )(include_v2=True)
+                    and is_draft_extend_mode(
+                        runtime.forward_batch.forward_mode, include_v2=True
                     )
                 ):
                     tokens_per_req = int(
@@ -300,7 +296,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                 )
             return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         del weights
         from atom.model_loader.loader import load_model
 

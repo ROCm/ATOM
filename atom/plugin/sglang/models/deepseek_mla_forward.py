@@ -12,37 +12,41 @@ kv_b_proj post-load processing.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 from aiter import QuantType, dtypes, get_hip_quant
-from atom.model_ops.base_attention import Attention
+
 from atom.model_ops.attention_mla import (
     dynamic_per_batched_tensor_quant,
 )
+from atom.model_ops.base_attention import Attention
 from atom.models.deepseek_v2 import (
     _fuse_rmsnorm_quant,
     _mxfp4_activation_quant_layout,
 )
 from atom.models.utils import maybe_prefix
 
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+try:
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+except ImportError:
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
+    batched_gemm_a16wfp4,
+)
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
+    batched_gemm_afp4wfp4_pre_quant,
+)
 from sglang.srt.models.deepseek_common.utils import (
-    _use_aiter_gfx95,
-    _is_hip,
     _is_cpu,
     _is_cpu_amx_available,
     _is_cuda,
     _is_fp8_fnuz,
+    _is_hip,
     _is_npu,
+    _use_aiter_gfx95,
     awq_dequantize_func,
-)
-from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
-    batched_gemm_afp4wfp4_pre_quant,
-)
-from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
-from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
-    batched_gemm_a16wfp4,
 )
 
 try:
@@ -71,6 +75,20 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _get_sglang_token_to_kv_pool_from_backend(caller: str) -> Any:
+    """Resolve SGLang 0.5.15 token KV pool from the active attention backend."""
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    backend = get_attn_backend()
+    token_to_kv_pool = getattr(backend, "token_to_kv_pool", None)
+    if token_to_kv_pool is None:
+        raise RuntimeError(
+            f"{caller} requires SGLang token_to_kv_pool, but it could not be "
+            "resolved from the current attention backend."
+        )
+    return token_to_kv_pool
 
 
 # bmm_fp8 custom-op wrapper (adapted from sglang forward_mla.py)
@@ -125,7 +143,7 @@ def try_fused_mxfp4_kv_b_proj_fp8(
     num_heads: int,
     qk_nope_head_dim: int,
     v_head_dim: int,
-) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Return FP8 k/v from MXFP4 kv_b_proj when the fused split-cat path fits."""
     if fused_gemm_afp4wfp4_preshuffle_split_cat is None:
         return None
@@ -167,7 +185,7 @@ def try_fused_mxfp4_kv_b_proj_fp8(
     )
 
 
-def _linear_quant_type_value(linear: Any) -> Optional[int]:
+def _linear_quant_type_value(linear: Any) -> int | None:
     quant_type = getattr(linear, "quant_type", None)
     return None if quant_type is None else getattr(quant_type, "value", quant_type)
 
@@ -178,7 +196,7 @@ def _fuse_qk_rmsnorm_and_q_quant(
     k_nope: torch.Tensor,
     *,
     output_unquantized_q: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Fuse q/k RMSNorm and q quant using ATOM's DeepSeek-V2 path."""
 
     if getattr(attn, "quant_dtype", None) == dtypes.fp4x2:
@@ -209,7 +227,7 @@ def _fuse_qk_rmsnorm_and_q_quant(
 def _q_b_proj_with_optional_scale(
     attn: DeepseekV2MLAAttention,
     q: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
 ) -> torch.Tensor:
     if q_scale is None:
         return _unwrap_linear_output(attn.q_b_proj(q))
@@ -263,9 +281,12 @@ def init_sgl_attrs(
     kv_cache_dtype: str = "bf16",
 ) -> None:
     """Initialise sglang-only attributes on DeepseekV2MLAAttention."""
-    from sglang.srt.configs.model_config import is_deepseek_nsa
+    try:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+    except ImportError:
+        from sglang.srt.configs.model_config import is_deepseek_nsa as is_deepseek_dsa
 
-    attn.use_nsa = is_deepseek_nsa(config)
+    attn.use_nsa = is_deepseek_dsa(config)
     attn.use_deep_gemm_bmm = False
     attn.alt_stream = None
     attn.kv_cache_dtype = kv_cache_dtype
@@ -295,8 +316,8 @@ def mla_absorbed_bmm(
     attn: DeepseekV2MLAAttention,
     inp: torch.Tensor,
     weight: torch.Tensor,
-    weight_scale: Optional[torch.Tensor],
-    weight_scale_k: Optional[torch.Tensor],
+    weight_scale: torch.Tensor | None,
+    weight_scale_k: torch.Tensor | None,
     out_dim: int,
 ) -> torch.Tensor:
     """Batched matmul for MLA absorbed weights (w_kc / w_vc)."""
@@ -383,8 +404,8 @@ def mla_v_up_proj(
     attn: DeepseekV2MLAAttention,
     inp: torch.Tensor,
     weight: torch.Tensor,
-    weight_scale: Optional[torch.Tensor],
-    weight_scale_k: Optional[torch.Tensor],
+    weight_scale: torch.Tensor | None,
+    weight_scale_k: torch.Tensor | None,
     out_dim: int,
 ) -> torch.Tensor:
     """Project MLA decode output to a flat o_proj input."""
@@ -488,7 +509,10 @@ def _set_mla_kv_buffer_for_non_absorbed(
 ) -> None:
     attn_non_absorbed = _get_sglang_radix_attn(attn.attn_non_absorbed)
     cache_k = torch.cat([kv_a.unsqueeze(1), k_pe], dim=-1)
-    forward_batch.token_to_kv_pool.set_kv_buffer(
+    token_to_kv_pool = _get_sglang_token_to_kv_pool_from_backend(
+        "SGLang DeepSeek MLA non-absorbed cache path"
+    )
+    token_to_kv_pool.set_kv_buffer(
         attn_non_absorbed,
         forward_batch.out_cache_loc,
         cache_k,
@@ -533,9 +557,7 @@ def _can_run_non_absorbed_mla_now(
     del forward_batch
     if attn.use_nsa:
         return False
-    if attn.kv_b_proj.weight.dtype == torch.uint8 and not _is_mxfp4_kv_b_proj(attn):
-        return False
-    return True
+    return attn.kv_b_proj.weight.dtype != torch.uint8 or _is_mxfp4_kv_b_proj(attn)
 
 
 def _is_static_quark_mxfp4_linear(linear: Any) -> bool:
@@ -580,7 +602,7 @@ def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
     return w
 
 
-def _get_weight_block_size(attn: DeepseekV2MLAAttention) -> Optional[list[int]]:
+def _get_weight_block_size(attn: DeepseekV2MLAAttention) -> list[int] | None:
     """Derive weight_block_size from ATOM's quant_type system."""
     from aiter import QuantType as _AiterQuantType
 
@@ -595,21 +617,22 @@ def _get_weight_block_size(attn: DeepseekV2MLAAttention) -> Optional[list[int]]:
 def _process_fp8_weight(
     attn: DeepseekV2MLAAttention,
     w: torch.Tensor,
-    weight_block_size: Optional[list[int]],
-) -> tuple[torch.Tensor, bool, Optional[torch.Tensor]]:
+    weight_block_size: list[int] | None,
+) -> tuple[torch.Tensor, bool, torch.Tensor | None]:
     """Process FP8 weights for kv_b_proj."""
-    from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz
+    from sglang.srt.layers.deep_gemm_wrapper import (
+        DEEPGEMM_BLACKWELL,
+        ENABLE_JIT_DEEPGEMM,
+    )
     from sglang.srt.layers.quantization.fp8_utils import (
         block_quant_dequant,
         block_quant_to_tensor_quant,
         channel_quant_to_tensor_quant,
         inverse_transform_scale_ue8m0,
     )
-    from sglang.srt.layers.deep_gemm_wrapper import (
-        ENABLE_JIT_DEEPGEMM,
-        DEEPGEMM_BLACKWELL,
-    )
     from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+
+    from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz
 
     use_deep_gemm_bmm = False
     block_scale = None
@@ -673,7 +696,7 @@ def _process_fp8_weight(
 def _process_int8_weight(
     attn: DeepseekV2MLAAttention,
     w: torch.Tensor,
-    weight_block_size: Optional[list[int]],
+    weight_block_size: list[int] | None,
 ) -> torch.Tensor:
     """Process INT8 weights for kv_b_proj."""
     from sglang.srt.layers.quantization.int8_utils import (
@@ -719,8 +742,8 @@ def _split_and_assign_kc_vc(
     attn: DeepseekV2MLAAttention,
     w: torch.Tensor,
     use_deep_gemm_bmm: bool,
-    block_scale: Optional[torch.Tensor],
-    weight_block_size: Optional[list[int]],
+    block_scale: torch.Tensor | None,
+    weight_block_size: list[int] | None,
 ) -> None:
     """Split weight into kc/vc and assign to attn."""
     from atom.model_ops.utils import quark_post_load_weights

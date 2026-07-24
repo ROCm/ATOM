@@ -39,10 +39,13 @@ def setup_deepseek_for_sglang(model) -> None:
     kv_cache_dtype = model.atom_config.kv_cache_dtype
 
     # Initialise SGLang's MLA TP context before patching per-layer forwards.
-    from sglang.srt.configs.model_config import is_deepseek_nsa
+    try:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+    except ImportError:
+        from sglang.srt.configs.model_config import is_deepseek_nsa as is_deepseek_dsa
     from sglang.srt.layers.communicator import get_attn_tp_context
 
-    get_attn_tp_context().init_context(config.q_lora_rank, is_deepseek_nsa(config))
+    get_attn_tp_context().init_context(config.q_lora_rank, is_deepseek_dsa(config))
 
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
 
