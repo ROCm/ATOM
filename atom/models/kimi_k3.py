@@ -23,6 +23,7 @@ from einops import rearrange
 from torch import nn
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -41,6 +42,7 @@ from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.rotary_embedding import RotaryEmbedding
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -99,8 +101,7 @@ def _normalize_kimi_config(config) -> None:
     config.num_gdn_attn_state = len(config.kimi_kda_layers)
     config.num_full_attn = len(config.kimi_full_attn_layers)
 
-    # Kimi full-attention layers run MLA math but are stored in the standard
-    # paged-MHA cache by padding V to q_head_dim.
+    # Keep the logical Q/K head width available to shared model infrastructure.
     config.head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
     if getattr(config, "rope_parameters", None) is None:
         config.rope_parameters = {
@@ -129,6 +130,28 @@ def _extract_layer_idx(prefix: str) -> int:
         if part.isdigit():
             return int(part)
     return 0
+
+
+class _NoPositionalRotaryEmbedding(RotaryEmbedding):
+    def _compute_cos_sin_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+        cache_shape = (
+            self.max_position_embeddings,
+            1,
+            1,
+            self.rotary_dim // 2,
+        )
+        return (
+            torch.ones(cache_shape, dtype=torch.float32),
+            torch.zeros(cache_shape, dtype=torch.float32),
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return query, key
 
 
 class SituAndMul(nn.Module):
@@ -397,8 +420,6 @@ class KimiFullAttention(nn.Module):
         self.scaling = self.q_head_dim**-0.5
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_local_heads = self.num_heads // self.tp_size
-        self.local_q_size = self.num_local_heads * self.q_head_dim
-        self.local_v_size = self.num_local_heads * self.v_head_dim
 
         self.q_a_proj = ReplicatedLinear(
             self.hidden_size,
@@ -445,63 +466,54 @@ class KimiFullAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
+        rope_theta = rope_parameters.get("rope_theta") or 10000.0
+        self.rotary_emb = _NoPositionalRotaryEmbedding(
+            head_size=self.qk_rope_head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position_embeddings=int(
+                getattr(atom_config, "max_model_len", None) or 16384
+            ),
+            base=rope_theta,
+        )
+        mla_modules = MLAModules(
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            qk_head_dim=self.q_head_dim,
+            v_head_dim=self.v_head_dim,
+            rotary_emb=self.rotary_emb,
+            q_proj=self.q_b_proj,
+            kv_b_proj=self.kv_b_proj,
+            o_proj=nn.Identity(),
+            indexer=None,
+            is_sparse=False,
+            topk_tokens=None,
+        )
         self.layer_num = _extract_layer_idx(prefix)
         self.attn = Attention(
             self.num_local_heads,
-            self.q_head_dim,
+            self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
-            num_kv_heads=self.num_local_heads,
+            num_kv_heads=1,
             kv_cache_dtype=atom_config.kv_cache_dtype,
-            quant_config=quant_config,
-            use_mla=False,
             layer_num=self.layer_num,
-            config=atom_config,
+            use_mla=True,
+            mla_modules=mla_modules,
             prefix=prefix,
         )
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        # q already has the [nope | rope] head layout from q_b_proj; RoPE is
-        # applied inside self.attn, so there is no split/re-cat here (that would
-        # be an identity round-trip that just copies q).
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = q.view(-1, self.num_local_heads, self.q_head_dim)
-
+        q = self.q_a_layernorm(self.q_a_proj(hidden_states))
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_latent, k_rope = torch.split(
+        kv, k_rope = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
-        kv = self.kv_b_proj(self.kv_a_layernorm(k_latent))
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-
-        # Fused assembly (one kernel instead of split + cat + pad): builds
-        # k = [k_nope (from kv) | k_rope (MQA-shared)] and v_padded = [v | 0].
-        # Kimi MLA is stored in the standard paged-MHA cache, so V is padded to
-        # the query head dim to share a cache entry with K (sliced back after).
-        from atom.models.kimi_k3_fused import fuse_mla_kv
-
-        k, v_padded = fuse_mla_kv(
-            kv,
-            k_rope,
-            self.qk_nope_head_dim,
-            self.v_head_dim,
-            self.qk_rope_head_dim,
-        )
-
-        # MLA-as-MHA at head_dim=192. self.attn both writes the paged KV cache
-        # (4D FLASH layout, reshape_and_cache_flash) and runs aiter unified_attention
-        # for prefill (varlen) AND decode: the standard Triton kernel handles the
-        # non-power-of-two head dim via HEAD_SIZE_PADDED, so prefill needs no torch
-        # SDPA fallback. This routing also lets chunked prefill read the paged cache.
-        attn_out = self.attn(
-            q.reshape(-1, self.local_q_size),
-            k.reshape(-1, self.local_q_size),
-            v_padded.reshape(-1, self.local_q_size),
-        )
-        attn_out = attn_out.view(-1, self.num_local_heads, self.q_head_dim)[
-            :, :, : self.v_head_dim
-        ].reshape(-1, self.local_v_size)
+        kv = self.kv_a_layernorm(kv)
+        attn_out = self.attn(q, kv, k_rope, positions)
         attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))
         return self.o_proj(attn_out)
 
