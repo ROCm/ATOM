@@ -146,6 +146,25 @@ def build_entries(
             value=payload.get("mean_tpot_ms"),
             extra=extra,
         )
+        # Speculative-decoding metrics; None for non-spec runs (append_metric
+        # skips them), so only MTP/DSpark/Eagle variants get these series.
+        append_metric(
+            entries,
+            label_prefix=label_prefix,
+            metric_label="Accept Length (tok/fwd)",
+            unit="tok/fwd",
+            value=payload.get("accept_length"),
+            extra=extra,
+        )
+        accept_rate = payload.get("acceptance_rate")
+        append_metric(
+            entries,
+            label_prefix=label_prefix,
+            metric_label="Acceptance Rate (%)",
+            unit="%",
+            value=(accept_rate * 100 if accept_rate is not None else None),
+            extra=extra,
+        )
 
         if "tensor_parallel_size" in payload:
             tp = int(payload["tensor_parallel_size"])

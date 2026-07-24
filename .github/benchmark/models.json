@@ -57,6 +57,15 @@
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 1024
+        },
+        {
+          "label": "DPA DSpark",
+          "suffix": "-dpa-dspark",
+          "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode PIECEWISE --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
+          "bench_args": "--use-chat-template",
+          "conc_min": 64,
+          "conc_max": 512
         }
       ]
     },
