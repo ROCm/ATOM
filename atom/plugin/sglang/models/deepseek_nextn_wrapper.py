@@ -95,7 +95,7 @@ def _retag_mtp_runtime_layer_ids(model: nn.Module) -> None:
             if attn_obj is None:
                 continue
             _set_runtime_layer_id(attn_obj, local_layer_id)
-            for nested_name in ("attn", "native_attention"):
+            for nested_name in ("attn",):
                 nested_attn = getattr(attn_obj, nested_name, None)
                 if nested_attn is not None:
                     _set_runtime_layer_id(nested_attn, local_layer_id)
