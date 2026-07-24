@@ -10,15 +10,18 @@ several separate torch ops (each a kernel launch + full HBM round-trip):
 
 The activation and gated-rmsnorm kernels remain gated behind ``ATOM_K3_FUSED``
 in kimi_k3.py. ``apply_attn_res`` is the production path; correctness is checked
-against a local torch reference in my_script/optest_fused.py. ``dual_rmsnorm`` is
-ungated and always invokes the fused AITER q/k RMSNorm kernel.
+against a local torch reference in my_script/optest_fused.py. ``dual_rmsnorm`` has
+no environment gate or fallback and always launches the fused AITER q/k RMSNorm
+kernel.
 """
 
 from __future__ import annotations
 
 import torch
-from aiter import QuantType as _QuantType
-from aiter import fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.fused_qk_norm_rope_cache_quant import (
+    _fused_qk_rmsnorm_kernel as _aiter_fused_qk_rmsnorm_kernel,
+)
 
 try:
     import triton
@@ -840,6 +843,18 @@ def fuse_mla_kv(
     return k, v_padded
 
 
+def _dual_rmsnorm_fake(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_eps: float,
+    k: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return q.new_empty(q.shape), k.new_empty(k.shape)
+
+
+@torch_compile_guard(gen_fake=_dual_rmsnorm_fake, mutates_args=[])
 def dual_rmsnorm(
     q: torch.Tensor,
     q_weight: torch.Tensor,
@@ -852,15 +867,14 @@ def dual_rmsnorm(
     k = k.contiguous()
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
-    _aiter_fused_qk_rmsnorm(
-        q_out_quantized=q_out,
-        q=q,
-        q_weight=q_weight,
-        q_epsilon=q_eps,
-        k_out=k_out,
-        k=k,
-        k_weight=k_weight,
-        k_epsilon=k_eps,
-        quant_type=_QuantType.No,
+    _aiter_fused_qk_rmsnorm_kernel(
+        q,
+        q_weight,
+        q_eps,
+        k,
+        k_weight,
+        k_eps,
+        q_out,
+        k_out,
     )
     return q_out, k_out
