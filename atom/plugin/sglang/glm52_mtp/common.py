@@ -15,6 +15,7 @@ ATTENTION_PAGE_SIZE_ATTR = "_atom_glm52_attention_page_size"
 SHARED_SPARSE_INDICES_ATTR = "_atom_glm52_shared_sparse_kv_indices"
 DRAFT_SUB_STEP_ATTR = "_atom_glm52_draft_decode_sub_step"
 INDEXER_CONTEXT_LENS_ATTR = "_atom_glm52_indexer_context_lens"
+GLM52_GRAPH_SEQ_LEN_CAPACITY = 10240
 
 
 def is_glm52_dsa_arch(config) -> bool:

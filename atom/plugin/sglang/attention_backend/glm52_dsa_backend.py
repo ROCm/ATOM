@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
+from atom.plugin.sglang.glm52_mtp.common import GLM52_GRAPH_SEQ_LEN_CAPACITY
+
 logger = logging.getLogger("atom.plugin.sglang.attention_backend.glm52_dsa")
 
 
@@ -321,11 +323,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
         self._cuda_graph_seq_len_fill_value = (
             max(
                 tokens_per_req,
-                int(
-                    os.environ.get(
-                        "ATOM_GLM52_TARGET_VERIFY_CG_SEQ_LEN_FILL", "4096"
-                    )
-                ),
+                GLM52_GRAPH_SEQ_LEN_CAPACITY,
             )
             if is_target_verify_graph
             else 1
