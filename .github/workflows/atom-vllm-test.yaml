@@ -30,7 +30,7 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_OOT_IMAGE_TAG: rocm/atom-dev:vllm-latest
-  VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
+  VLLM_COMMIT: "752a3a504485790a2e8491cacbb35c137339ad34"
 
 jobs:
   # ---------- OOT CI path (pull_request only) ----------
@@ -175,8 +175,8 @@ jobs:
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
-      VLLM_COMMIT: 0b3ba88f165976e77ca5e6a7a3f5bba4562b80af
-      VLLM_VERSION: "0.22.0"
+      VLLM_COMMIT: 752a3a504485790a2e8491cacbb35c137339ad34
+      VLLM_VERSION: "0.25.1"
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
@@ -207,6 +207,21 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
+
+      - name: Detect ATOM base image changes
+        id: atom-base-changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+          if git diff --quiet "${BASE_SHA}" HEAD -- docker/atom_release.dockerfile; then
+            echo "rebuild_atom_base=false" >> "$GITHUB_OUTPUT"
+            echo "docker/atom_release.dockerfile is unchanged; reuse ${ATOM_BASE_NIGHTLY_IMAGE}."
+          else
+            echo "rebuild_atom_base=true" >> "$GITHUB_OUTPUT"
+            echo "docker/atom_release.dockerfile changed; rebuild the ATOM base image."
+          fi
 
       - name: Ensure Docker client config directory
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
@@ -292,8 +307,11 @@ jobs:
           EOF
       
       - name: Build OOT image locally
+        env:
+          REBUILD_ATOM_BASE: ${{ steps.atom-base-changes.outputs.rebuild_atom_base }}
         run: |
           set -euo pipefail
+          docker rmi "atom_release:ci" || true
           docker rmi "atom_oot_base:ci" || true
           docker rmi "atom_oot:ci" || true
 
@@ -307,7 +325,7 @@ jobs:
             LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_OOT_IMAGE_TAG}" 2>/dev/null || true)"
             echo "Expected vLLM commit label: ${VLLM_COMMIT}"
             echo "Resolved ${NIGHTLY_OOT_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
-            if [ -n "${LATEST_VLLM_COMMIT}" ] && [ "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" ]; then
+            if [ -n "${LATEST_VLLM_COMMIT}" ] && [ "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" ] && [ "${REBUILD_ATOM_BASE}" != "true" ]; then
               BUILD_MODE="fast"
               echo "Reusing ${NIGHTLY_OOT_IMAGE_TAG} locally for OOT CI."
             else
@@ -328,10 +346,30 @@ jobs:
             exit 0
           fi
 
-          DOCKER_BUILDKIT=1 docker build --pull --network=host \
+          ATOM_BASE_IMAGE_FOR_OOT="${ATOM_BASE_NIGHTLY_IMAGE}"
+          if [ "${REBUILD_ATOM_BASE}" = "true" ]; then
+            echo "Rebuilding ATOM base from docker/atom_release.dockerfile."
+            DOCKER_BUILDKIT=1 docker build --pull --network=host \
+              --no-cache \
+              -t atom_release:ci \
+              --build-arg GPU_ARCH="gfx950" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg ATOM_REPO="${GITHUB_REPO_URL}" \
+              --build-arg ATOM_COMMIT="${GITHUB_COMMIT_SHA}" \
+              -f docker/atom_release.dockerfile .
+            ATOM_BASE_IMAGE_FOR_OOT="atom_release:ci"
+          else
+            echo "ATOM base Dockerfile unchanged; pulling ${ATOM_BASE_IMAGE_FOR_OOT}."
+            docker pull "${ATOM_BASE_IMAGE_FOR_OOT}"
+          fi
+
+          # Do not use --pull here: ATOM_BASE_IMAGE_FOR_OOT can be the local
+          # atom_release:ci image built above. --pull would incorrectly resolve
+          # it as docker.io/library/atom_release:ci.
+          DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
             -t atom_oot_base:ci \
-            --build-arg OOT_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            --build-arg OOT_BASE_IMAGE="${ATOM_BASE_IMAGE_FOR_OOT}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -550,5 +588,6 @@ jobs:
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           rm -f Dockerfile.mod || true
+          docker rmi "atom_release:ci" || true
           docker rmi "atom_oot_base:ci" || true
           docker rmi "atom_oot:ci" || true

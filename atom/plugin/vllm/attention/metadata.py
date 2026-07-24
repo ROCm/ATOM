@@ -117,6 +117,7 @@ class AiterMhaMetadataForVllm:
     use_cascade: bool = False
     common_prefix_len: int = 0
     total_tokens: int = 0
+    draft_index: int = 0
 
 
 @dataclass
@@ -981,6 +982,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             use_cascade=False,
             common_prefix_len=0,
             total_tokens=self.total_tokens,
+            draft_index=draft_index,
         )
 
     # this method will be called by vllm, so it follows the vllm's interface convention

@@ -3,9 +3,10 @@ from typing import Optional
 
 import torch
 from transformers import AutoConfig, PretrainedConfig
+
 from atom.plugin.prepare import _set_framework_backbone
-from atom.utils import envs
 from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -181,8 +182,56 @@ def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
     def wrapped(self, act_dtype: "torch.dtype" = torch.bfloat16):
         return orig(self, act_dtype)
 
-    setattr(wrapped, "_atom_default_act_dtype_patched", True)
+    wrapped._atom_default_act_dtype_patched = True
     attention.process_weights_after_loading = wrapped
+
+
+def _patch_vllm_harmony_parser_manager() -> None:
+    """Restore vLLM's documented Harmony parser selection contract."""
+    try:
+        from vllm.parser import ParserManager
+        from vllm.parser.harmony import HarmonyParser
+    except ImportError:
+        return
+
+    original = ParserManager.get_parser.__func__
+    if getattr(original, "_atom_harmony_parser_patched", False):
+        return
+
+    # Do nothing after upstream fixes the early return for is_harmony=True.
+    try:
+        if original(ParserManager, is_harmony=True) is not None:
+            return
+    except TypeError:
+        return
+
+    def get_parser(
+        cls,
+        tool_parser_name=None,
+        reasoning_parser_name=None,
+        enable_auto_tools=False,
+        model_name=None,
+        is_harmony=False,
+    ):
+        parser_cls = original(
+            cls,
+            tool_parser_name=tool_parser_name,
+            reasoning_parser_name=reasoning_parser_name,
+            enable_auto_tools=enable_auto_tools,
+            model_name=model_name,
+            is_harmony=is_harmony,
+        )
+        if parser_cls is not None or not is_harmony:
+            return parser_cls
+
+        from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
+
+        HarmonyParser.reasoning_parser_cls = GptOssReasoningParser
+        HarmonyParser.tool_parser_cls = None
+        return HarmonyParser
+
+    get_parser._atom_harmony_parser_patched = True
+    ParserManager.get_parser = classmethod(get_parser)
 
 
 def register_model() -> None:
@@ -195,6 +244,7 @@ def register_model() -> None:
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
+    _patch_vllm_harmony_parser_manager()
 
     import vllm.model_executor.models.registry as vllm_model_registry
 

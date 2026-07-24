@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next MTP model."""
 
+import copy
+import re
+
 import torch
-import torch.nn as nn
-from atom.config import Config
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.moe import FusedMoE
 from aiter.dist.parallel_state import get_tp_group
-from atom.models.utils import IntermediateTensors
-from atom.models.qwen3_next import Qwen3NextDecoderLayer, Qwen3NextRMSNorm
-from atom.model_ops.linear import ColumnParallelLinear
+from torch import nn
+
+from atom.config import Config
 from atom.model_config.qwen3_next import Qwen3NextConfig
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.linear import ColumnParallelLinear
+from atom.model_ops.moe import FusedMoE
+from atom.models.qwen3_next import Qwen3NextDecoderLayer, Qwen3NextRMSNorm
+from atom.models.utils import IntermediateTensors
+
 from .utils import maybe_prefix
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
@@ -132,8 +137,34 @@ class Qwen3NextMTP(nn.Module):
         super().__init__()
         config = atom_config.hf_config
         self.config = config
+
+        # Checkpoint and quant config use draft-local indices
+        # (mtp.layers.0.*), while runtime layer prefixes use absolute indices
+        # (mtp.layers.<num_hidden_layers>.*) so vLLM allocates distinct draft KV
+        # layers. Keep quant excludes aligned with the runtime prefixes.
+        mtp_start = config.num_hidden_layers
+        num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1) or 1
+        mtp_atom_config = atom_config
+        if atom_config.quant_config is not None and mtp_start > 0:
+            pat = re.compile(r"^mtp\.layers\.(\d+)\.")
+            new_excludes = []
+            changed = False
+            for entry in atom_config.quant_config.exclude_layers:
+                m = pat.match(entry)
+                if m:
+                    old_idx = int(m.group(1))
+                    if old_idx < num_mtp_layers:
+                        changed = True
+                        entry = pat.sub(f"mtp.layers.{mtp_start + old_idx}.", entry)
+                new_excludes.append(entry)
+            if changed:
+                mtp_atom_config = copy.copy(atom_config)
+                mtp_qc = copy.copy(atom_config.quant_config)
+                mtp_qc.exclude_layers = list(dict.fromkeys(new_excludes))
+                mtp_atom_config.quant_config = mtp_qc
+
         self.model = Qwen3NextMultiTokenPredictor(
-            atom_config=atom_config, prefix=maybe_prefix(prefix, "mtp")
+            atom_config=mtp_atom_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
         self.lm_head = ParallelLMHead(
@@ -155,7 +186,12 @@ class Qwen3NextMTP(nn.Module):
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=kwargs.get("spec_step_idx", 0),
         )
         return hidden_states
 
