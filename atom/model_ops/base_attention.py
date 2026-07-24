@@ -324,6 +324,8 @@ def fake_(
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
     layer_name: str,
     use_mla: bool,
     qkv: torch.Tensor,
@@ -342,13 +344,19 @@ def fake_(
 # Dynamo will not try to inspect any of the internal operations for prefill or decode
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
-@mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=fake_,
+    mutates_args=["kv_cache", "kv_scale"],
+)
 def unified_attention_with_output_base(
     q: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
     layer_name: str,
     use_mla: bool,
     qkv: torch.Tensor,
@@ -368,9 +376,11 @@ def unified_attention_with_output_base(
             query=q,
             key=k,
             value=v,
-            position=positions,
+            positions=positions,
             q_scale=q_scale,
             qkv=qkv,
+            kv_cache=kv_cache,
+            kv_scale=kv_scale,
         )
 
 
@@ -379,6 +389,7 @@ def linear_attention_with_output_base_fake(
     b: torch.Tensor,
     a: torch.Tensor,
     core_attn_out: torch.Tensor,
+    kv_cache: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(core_attn_out)
@@ -387,19 +398,20 @@ def linear_attention_with_output_base_fake(
 @mark_spliting_op(
     is_custom=True,
     gen_fake=linear_attention_with_output_base_fake,
-    mutates_args=[],
+    mutates_args=["kv_cache"],
 )
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
     core_attn_out: torch.Tensor,
+    kv_cache: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     ret = torch.empty_like(core_attn_out)
-    ret = self.impl.forward(mixed_qkv, b, a, ret, layer_name)
+    ret = self.impl.forward(mixed_qkv, b, a, ret, kv_cache, layer_name)
     return ret
 
 
@@ -503,6 +515,7 @@ class LinearAttention(nn.Module):
         compilation_config = atom_config.compilation_config
         default_name = f"Linear_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name
+        self.kv_cache = torch.tensor([])
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer: {}".format(self.layer_name))
         compilation_config.static_forward_context[self.layer_name] = self
@@ -515,6 +528,6 @@ class LinearAttention(nn.Module):
         core_attn_out: torch.Tensor,
     ):
         output = torch.ops.aiter.linear_attention_with_output_base(
-            mixed_qkv, b, a, core_attn_out, self.layer_name
+            mixed_qkv, b, a, core_attn_out, self.kv_cache, self.layer_name
         )
         return output

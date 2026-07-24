@@ -118,7 +118,23 @@ class Attention(BaseAttention):
         qkv: torch.Tensor = None,
         **kwargs,
     ):
+        kv_cache = getattr(self.impl, "kv_cache", query.new_empty(0))
+        kv_scale_fn = getattr(self.impl, "_kv_scale_arg_for_forward", None)
+        kv_scale = (
+            kv_scale_fn(query, kv_cache)
+            if kv_scale_fn is not None
+            else query.new_empty(0)
+        )
         output = torch.ops.aiter.unified_attention_with_output_base(
-            query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
+            query,
+            q_scale,
+            key,
+            value,
+            positions,
+            kv_cache,
+            kv_scale,
+            self.layer_name,
+            self.use_mla,
+            qkv,
         )
         return output

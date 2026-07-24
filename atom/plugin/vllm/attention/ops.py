@@ -21,6 +21,7 @@ def atom_vllm_mha_attention_fake(
     key: Optional[torch.Tensor],
     value: Optional[torch.Tensor],
     kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
     layer_name: str,
     positions: Optional[torch.Tensor] = None,
     q_scale: Optional[torch.Tensor] = None,
@@ -32,13 +33,14 @@ def atom_vllm_mha_attention_fake(
 @mark_spliting_op(
     is_custom=True,
     gen_fake=atom_vllm_mha_attention_fake,
-    mutates_args=["kv_cache"],
+    mutates_args=["kv_cache", "kv_scale"],
 )
 def atom_vllm_mha_attention(
     query: torch.Tensor,
     key: Optional[torch.Tensor],
     value: Optional[torch.Tensor],
     kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
     layer_name: str,
     positions: Optional[torch.Tensor] = None,
     q_scale: Optional[torch.Tensor] = None,
@@ -50,6 +52,7 @@ def atom_vllm_mha_attention(
         key,
         value,
         kv_cache,
+        kv_scale,
         attn_metadata=attn_metadata,
         position=positions,
         q_scale=q_scale,
