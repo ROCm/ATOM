@@ -2,8 +2,8 @@ name: ATOM vLLM Nightly
 
 on:
   schedule:
-    # Nightly at 02:00 Beijing time (18:00 UTC on the previous day)
-    - cron: '0 18 * * *'
+    # Nightly at 00:00 Beijing time (16:00 UTC on the previous day)
+    - cron: '0 16 * * *'
   workflow_dispatch:
     # Manual runs use GitHub Actions' built-in branch dropdown ("Use workflow
     # from") as the ATOM branch selector, so users do not need to type branch
