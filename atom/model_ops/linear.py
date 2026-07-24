@@ -804,7 +804,19 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
-        if self.quant_type.value == QuantType.No.value:
+        # DEEP-ALIGN cause 1 (ported to mainline): AITER tgemm.mm is
+        # non-deterministic for small M (decode) -- same M=1 input yields
+        # different bytes per call/per TP rank. Replicated bf16 projections feed
+        # the sparse indexer, so per-rank divergence => each rank picks a
+        # different top-k KV set => sparse-MLA all-reduce mixes mismatched KV.
+        # cuBLAS F.linear is deterministic at these shapes. Use .value (int)
+        # comparison, not enum == (dynamo can't fold enum __eq__ -> graph break).
+        if (
+            self.quant_type.value == QuantType.No.value
+            and self.weight.dtype == torch.bfloat16
+        ):
+            y = torch.nn.functional.linear(x, self.weight, self.bias).to(otype)
+        elif self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
                 x,
                 self.weight,
