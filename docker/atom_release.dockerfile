@@ -244,8 +244,9 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
         cd /opt/aiperf && \
         git checkout "${SA_AIPERF_COMMIT}" && \
+        sed -i '/^[[:space:]]*"transformers @ git+/d' pyproject.toml && \
+        ! grep -q '^[[:space:]]*"transformers @ git+' pyproject.toml && \
         "${VENV_PYTHON}" -m pip install -e . && \
-        "${VENV_PYTHON}" -m pip install --no-cache-dir "transformers==5.2.0" && \
         "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
         "${VENV_PYTHON}" -m pip show aiperf || true && \
         command -v aiperf && aiperf --help >/dev/null; \

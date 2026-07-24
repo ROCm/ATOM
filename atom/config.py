@@ -579,6 +579,7 @@ _CONFIG_REGISTRY: dict[str, str] = {
     # through as extra config attrs and are read in DeepseekV4Args.from_hf_config.
     "glm_moe_dsa": "deepseek_v3",  # GLM 5.0 MoE, structure similar to DeepSeek v3.2
     "kimi_k2": "deepseek_v3",
+    "qwen3_next": "qwen3_next",
 }
 
 
