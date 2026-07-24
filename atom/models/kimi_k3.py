@@ -1288,6 +1288,7 @@ class KimiK3ForCausalLM(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         root_config = atom_config.hf_config
+        rebuilt_quant_config = False
         if (
             hasattr(root_config, "text_config")
             and root_config.text_config is not root_config
@@ -1302,6 +1303,7 @@ class KimiK3ForCausalLM(nn.Module):
                     root_config.text_config,
                     atom_config.online_quant_config,
                 )
+                rebuilt_quant_config = True
         else:
             _normalize_kimi_config(root_config)
         self.config = _text_config(root_config)
@@ -1309,6 +1311,12 @@ class KimiK3ForCausalLM(nn.Module):
         self.packed_modules_mapping = _kda_packed_modules_mapping(
             self.config.kimi_kda_layers
         )
+        if rebuilt_quant_config:
+            self.quant_config.remap_layer_name(
+                self.config,
+                packed_modules_mapping=self.packed_modules_mapping,
+                quant_exclude_name_mapping=self.quant_exclude_name_mapping,
+            )
         self.language_model = KimiLinearForCausalLM(
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "language_model"),
