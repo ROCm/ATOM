@@ -6,7 +6,9 @@ actual draft core to ATOM's `DeepSeekMTP`.
 """
 
 import copy
+import contextlib
 import logging
+import os
 import re
 from typing import Iterable, Optional, Tuple
 
@@ -93,9 +95,10 @@ def _retag_mtp_runtime_layer_ids(model: nn.Module) -> None:
             if attn_obj is None:
                 continue
             _set_runtime_layer_id(attn_obj, local_layer_id)
-            nested_attn = getattr(attn_obj, "attn", None)
-            if nested_attn is not None:
-                _set_runtime_layer_id(nested_attn, local_layer_id)
+            for nested_name in ("attn", "native_attention"):
+                nested_attn = getattr(attn_obj, nested_name, None)
+                if nested_attn is not None:
+                    _set_runtime_layer_id(nested_attn, local_layer_id)
 
 
 def _install_local_nextn_weight_remap(model: nn.Module) -> None:
@@ -147,6 +150,7 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
         self._is_glm_moe_dsa_nextn = (
             str(getattr(config, "model_type", "")).lower() == "glm_moe_dsa"
         )
+        self._atom_glm52_uses_generic_draft_frontend = self._is_glm_moe_dsa_nextn
         if self._is_glm_moe_dsa_nextn:
             self.draft_model_name = "GLM DSA MTP"
 
@@ -215,6 +219,12 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             self.model.atom_config = self.atom_config
             setup_deepseek_for_sglang(self.model)
             _retag_mtp_runtime_layer_ids(self.model)
+            first_attention = self._first_mtp_layer().mtp_block.self_attn
+            logger.info(
+                "GLM-5.2 draft model attention frontend mode=%s class=%s",
+                "generic",
+                type(first_attention.mla_attn).__name__,
+            )
 
         self.logits_processor = LogitsProcessor(config)
         self.lm_head = self._first_mtp_layer().shared_head.head
@@ -280,6 +290,7 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             raise ValueError(
                 f"{self.draft_model_name} draft forward requires speculative info"
             )
+        forward_batch._atom_glm52_generic_draft_frontend = True
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             with SGLangPluginRuntime(
@@ -330,6 +341,13 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
                         )
 
                 model_hidden_states = forward_batch.spec_info.hidden_states
+                # Save the incoming (target) hidden BEFORE any shape adjustment.
+                # GLM-5.2 MTP expects target hidden at every sub-step (native
+                # EagleProposer never updates hidden_states in its loop).
+                # SGLang EAGLE chains logits_output.hidden_states between steps,
+                # so we must restore the incoming target hidden as the chained
+                # state to avoid feeding draft output → hnorm (wrong space).
+                _incoming_hidden_for_chain = model_hidden_states
                 if runtime.forward_batch is not forward_batch:
                     model_hidden_states = _materialize_dummy_hidden_states(
                         model_hidden_states,
@@ -376,11 +394,27 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
 
             if self.pp_group.is_last_rank:
                 hidden_states = runtime.trim_output(hidden_states)
+                wrapper_mode = os.environ.get(
+                    "ATOM_GLM52_MTP_WRAPPER_MODE", "current"
+                ).strip().lower()
+                if wrapper_mode not in ("current", "pr1578"):
+                    raise ValueError(
+                        "ATOM_GLM52_MTP_WRAPPER_MODE must be 'current' or "
+                        f"'pr1578', got {wrapper_mode!r}"
+                    )
+                normed_hidden = self._first_mtp_layer().shared_head(hidden_states)
+                if wrapper_mode == "pr1578":
+                    logits_hidden = hidden_states
+                    hidden_states_before_norm = None
+                else:
+                    logits_hidden = normed_hidden
+                    hidden_states_before_norm = _incoming_hidden_for_chain
                 return self.logits_processor(
                     input_ids,
-                    hidden_states,
+                    logits_hidden,
                     self.lm_head,
                     forward_batch,
+                    hidden_states_before_norm=hidden_states_before_norm,
                 )
             return hidden_states
 

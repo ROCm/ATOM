@@ -747,6 +747,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+            init_sparse_mla_graph_state,
+        )
+
+        init_sparse_mla_graph_state(self, max_bs, max_num_tokens)
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int, device=self.device
         )

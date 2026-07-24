@@ -92,6 +92,34 @@ def _register_custom_attention_to_sglang() -> None:
     # the plugin backend.
     sglang_aiter_backend.AiterAttnBackend = ATOMAttnBackendForSgl
 
+    def create_glm52_backend(runner, registry_name: str):
+        is_draft_worker = bool(getattr(runner, "is_draft_worker", False))
+        draft_mode = os.environ.get(
+            "ATOM_GLM52_DRAFT_ATTN_MODE", "native"
+        ).strip().lower()
+        if draft_mode not in ("all_full", "full", "native"):
+            raise ValueError(
+                "ATOM_GLM52_DRAFT_ATTN_MODE must be 'all_full', 'full', or "
+                "'native', "
+                f"got {draft_mode!r}"
+            )
+
+        if draft_mode == "all_full" or (
+            is_draft_worker and draft_mode == "full"
+        ):
+            backend_cls = ATOMAttnBackendForSgl
+        else:
+            backend_cls = ATOMGLM52DSABackendForSgl
+
+        logger.info(
+            "GLM-5.2 attention route registry=%s role=%s draft_mode=%s backend=%s",
+            registry_name,
+            "draft" if is_draft_worker else "target",
+            draft_mode,
+            backend_cls.__name__,
+        )
+        return backend_cls(runner)
+
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
         hf_config = runner.model_config.hf_config
@@ -102,10 +130,7 @@ def _register_custom_attention_to_sglang() -> None:
             )
             return ATOMDeepseekV4BackendForSgl(runner)
         if is_glm52_dsa_config(hf_config):
-            logger.info(
-                "Use ATOMGLM52DSABackendForSgl for GLM-5.2 through SGLang aiter backend choice"
-            )
-            return ATOMGLM52DSABackendForSgl(runner)
+            return create_glm52_backend(runner, "aiter")
         return ATOMAttnBackendForSgl(runner)
 
     @register_attention_backend("dsv4")
@@ -119,22 +144,22 @@ def _register_custom_attention_to_sglang() -> None:
     def create_atom_nsa_backend(runner):
         hf_config = runner.model_config.hf_config
         if is_glm52_dsa_config(hf_config):
-            logger.info(
-                "Use ATOMGLM52DSABackendForSgl for GLM-5.2 through SGLang nsa backend choice"
-            )
-            return ATOMGLM52DSABackendForSgl(runner)
+            return create_glm52_backend(runner, "nsa")
         from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
         return NativeSparseAttnBackend(runner)
 
 
 def _patch_sglang_dsv4_draft_backends() -> None:
-    """Route SGLang's hard-coded DSV4 speculative factories to ATOM.
+    """Route hard-coded speculative factories to ATOM-owned backends.
 
     DraftBackendFactory constructs DeepSeek-V4 draft backends directly instead
     of going through the attention registry.  SGLang's native backend asserts a
     native DeepSeekV4TokenToKVPool, while ATOM plugin mode uses a proxy KV pool,
     so patch the factory methods to return the ATOM shim.
+
+    GLM-5.2 uses SGLang's AITER multi-step lifecycle with ATOM's general
+    attention backend.
     """
 
     try:
@@ -148,6 +173,51 @@ def _patch_sglang_dsv4_draft_backends() -> None:
 
     if getattr(DraftBackendFactory, "_atom_dsv4_draft_backend_patched", False):
         return
+
+    original_create_decode_backend = DraftBackendFactory.create_decode_backend
+    original_create_draft_extend_backend = (
+        DraftBackendFactory.create_draft_extend_backend
+    )
+
+    def _create_atom_decode_backend(self):
+        from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+        hf_config = getattr(
+            getattr(self.draft_model_runner, "model_config", None),
+            "hf_config",
+            None,
+        )
+        backend = original_create_decode_backend(self)
+        if is_glm52_dsa_config(hf_config):
+            per_step = [
+                type(item).__name__
+                for item in getattr(backend, "attn_backends", [])
+            ]
+            logger.info(
+                "GLM-5.2 draft decode backend selection=%s multi_step=%s "
+                "per_step=%s",
+                getattr(self, "draft_attn_backend", None),
+                type(backend).__name__,
+                per_step,
+            )
+        return backend
+
+    def _create_atom_draft_extend_backend(self):
+        from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+        backend = original_create_draft_extend_backend(self)
+        hf_config = getattr(
+            getattr(self.draft_model_runner, "model_config", None),
+            "hf_config",
+            None,
+        )
+        if is_glm52_dsa_config(hf_config):
+            logger.info(
+                "GLM-5.2 draft extend backend selection=%s backend=%s",
+                getattr(self, "draft_attn_backend", None),
+                type(backend).__name__,
+            )
+        return backend
 
     def _create_atom_dsv4_decode_backend(self):
         return ATOMDeepseekV4BackendForSgl(
@@ -164,6 +234,10 @@ def _patch_sglang_dsv4_draft_backends() -> None:
 
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
     DraftBackendFactory._create_dsv4_prefill_backend = _create_atom_dsv4_prefill_backend
+    DraftBackendFactory.create_decode_backend = _create_atom_decode_backend
+    DraftBackendFactory.create_draft_extend_backend = (
+        _create_atom_draft_extend_backend
+    )
     DraftBackendFactory._atom_dsv4_draft_backend_patched = True
     logger.info("Patched SGLang DSV4 speculative draft backends to ATOM")
 
@@ -179,6 +253,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
     try:
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+        from sglang.srt.model_executor.model_runner import ModelRunner
         from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
             EAGLEDraftCudaGraphRunner,
         )
@@ -221,6 +296,67 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             )
         except Exception:
             return False
+
+    def _is_glm52_runner(runner) -> bool:
+        try:
+            hf_config = getattr(
+                getattr(runner, "model_config", None), "hf_config", None
+            )
+            model_type = str(getattr(hf_config, "model_type", "")).lower()
+            arches = getattr(hf_config, "architectures", None) or []
+            return model_type == "glm_moe_dsa" or any(
+                "GlmMoeDsaForCausalLM" in str(arch) for arch in arches
+            )
+        except Exception:
+            return False
+
+    def _uses_glm52_generic_draft_frontend(runner) -> bool:
+        model = getattr(runner, "model", None)
+        return bool(
+            getattr(model, "_atom_glm52_uses_generic_draft_frontend", False)
+        )
+
+    def _glm52_cg_stage() -> int:
+        raw = os.environ.get("ATOM_GLM52_CG_STAGE", "0")
+        try:
+            stage = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"ATOM_GLM52_CG_STAGE must be an integer from 0 through 4, got {raw!r}"
+            ) from exc
+        if stage < 0 or stage > 4:
+            raise ValueError(
+                f"ATOM_GLM52_CG_STAGE must be an integer from 0 through 4, got {stage}"
+            )
+        return stage
+
+    if not getattr(ModelRunner, "_atom_glm52_init_device_graphs_patched", False):
+        original_init_device_graphs = ModelRunner.init_device_graphs
+
+        def init_device_graphs(self):
+            is_glm52_target = (
+                _is_glm52_runner(self)
+                and not bool(getattr(self, "is_draft_worker", False))
+                and bool(
+                    getattr(
+                        getattr(self, "spec_algorithm", None),
+                        "is_speculative",
+                        lambda: False,
+                    )()
+                )
+            )
+            if is_glm52_target and _glm52_cg_stage() < 2:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
+                logger.info(
+                    "GLM-5.2 CG stage %d: keep target verify eager",
+                    _glm52_cg_stage(),
+                )
+                return None
+            return original_init_device_graphs(self)
+
+        ModelRunner.init_device_graphs = init_device_graphs
+        ModelRunner._atom_glm52_init_device_graphs_patched = True
 
     def _is_dsv4_runner(runner) -> bool:
         try:
@@ -366,6 +502,24 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     return False
                 if is_dsv4 and is_draft_extend:
                     return False
+                if _is_glm52_runner(model_runner) and is_target_verify:
+                    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                    if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+                        return False
+                    max_seq_len = int(max(seq_lens_cpu))
+                    max_graph_seq_len = int(
+                        os.environ.get(
+                            "ATOM_GLM52_TARGET_VERIFY_CG_SEQ_LEN_FILL", "4096"
+                        )
+                    )
+                    if max_seq_len > max_graph_seq_len:
+                        logger.info(
+                            "[ATOM_GLM52_VERIFY_GRAPH] eager_fallback "
+                            "seq_len=%d graph_seq_limit=%d",
+                            max_seq_len,
+                            max_graph_seq_len,
+                        )
+                        return False
             except Exception:
                 pass
             return original_can_run(self, forward_batch)
@@ -375,6 +529,36 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
     if not getattr(EAGLEDraftCudaGraphRunner, "_atom_dsv4_replay_patched", False):
         original_draft_replay = EAGLEDraftCudaGraphRunner.replay
+        original_draft_replay_graph = EAGLEDraftCudaGraphRunner._replay
+
+        def _replay(self, forward_batch):
+            model_runner = getattr(self, "model_runner", None)
+            if _is_glm52_nextn_runner(model_runner) and not _uses_glm52_generic_draft_frontend(
+                model_runner
+            ):
+                from atom.plugin.sglang.runtime.forward_context import (
+                    stage_glm52_draft_decode_graph_metadata,
+                )
+
+                original_batch_size = forward_batch.batch_size
+                original_out_cache_loc = forward_batch.out_cache_loc
+                graph_bs = int(self.bs)
+                forward_batch.batch_size = graph_bs
+                forward_batch.out_cache_loc = self.buffers.out_cache_loc[
+                    : graph_bs * self.topk * self.speculative_num_steps
+                ]
+                try:
+                    stage_glm52_draft_decode_graph_metadata(
+                        forward_batch,
+                        speculative_num_steps=self.speculative_num_steps,
+                        topk=self.topk,
+                    )
+                finally:
+                    forward_batch.batch_size = original_batch_size
+                    forward_batch.out_cache_loc = original_out_cache_loc
+            return original_draft_replay_graph(self, forward_batch)
+
+        EAGLEDraftCudaGraphRunner._replay = _replay
 
         def replay(self, forward_batch):
             if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
@@ -431,14 +615,30 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 return False
 
         def can_run(self, forward_batch):
-            if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
+            model_runner = getattr(self, "model_runner", None)
+            if _is_glm52_nextn_runner(model_runner):
+                base_can_run = bool(original_extend_can_run(self, forward_batch))
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+                    return False
+                max_seq_len = int(max(seq_lens_cpu))
+                max_graph_seq_len = int(
+                    os.environ.get(
+                        "ATOM_GLM52_DRAFT_EXTEND_CG_SEQ_LEN_FILL", "4096"
+                    )
+                )
+                return base_can_run and max_seq_len <= max_graph_seq_len
+            if not _is_dsv4_nextn_runner(model_runner):
                 return original_extend_can_run(self, forward_batch)
             if not original_extend_can_run(self, forward_batch):
                 return False
             return _dsv4_draft_extend_graph_layout_ok(self, forward_batch)
 
         def replay(self, forward_batch):
-            if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
+            model_runner = getattr(self, "model_runner", None)
+            if _is_glm52_nextn_runner(model_runner):
+                return original_extend_replay(self, forward_batch)
+            if not _is_dsv4_nextn_runner(model_runner):
                 return original_extend_replay(self, forward_batch)
             if not _draft_extend_graph_enabled(getattr(self, "model_runner", None)):
                 raise RuntimeError(
@@ -580,26 +780,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     num_tokens_per_req=self.speculative_num_steps + 1,
                     num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
                 )
-                if is_glm52:
-                    try:
-                        hidden = batch_result.logits_output.hidden_states
-                        hidden_probe = None
-                        if torch.is_tensor(hidden):
-                            rows = hidden[
-                                : min(4, int(hidden.shape[0]))
-                            ].detach().float()
-                            hidden_probe = {
-                                "shape": tuple(hidden.shape),
-                                "norm": rows.norm(dim=-1).cpu().tolist(),
-                            }
-                        logger.info(
-                            "[GLM52_HIDDEN_HANDOFF] verify->draft_extend "
-                            "accept_lens=%s hidden=%s",
-                            accept_lens.detach().cpu().tolist(),
-                            hidden_probe,
-                        )
-                    except Exception:
-                        logger.exception("Failed GLM52 hidden handoff log")
                 select_index = (
                     torch.arange(len(batch.seq_lens), device=self.device)
                     * num_draft_tokens
@@ -622,31 +802,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     torch.get_device_module(self.device).current_stream().wait_stream(
                         self.plan_stream
                     )
-
-                if is_glm52:
-                    try:
-                        positions = getattr(forward_batch, "positions", None)
-                        logger.info(
-                            "[GLM52_DRAFT_EXTEND_DECODE] in accept_lens=%s "
-                            "graph_accept_lens=%s select_index=%s "
-                            "extend_num_tokens=%s positions_head=%s input_ids_head=%s",
-                            accept_lens.detach().cpu().tolist(),
-                            graph_accept_lens.detach().cpu().tolist(),
-                            select_index.detach().cpu().tolist(),
-                            getattr(forward_batch, "extend_num_tokens", None),
-                            (
-                                positions.detach().cpu().tolist()[:16]
-                                if torch.is_tensor(positions)
-                                else None
-                            ),
-                            (
-                                forward_batch.input_ids.detach().cpu().tolist()[:16]
-                                if torch.is_tensor(getattr(forward_batch, "input_ids", None))
-                                else None
-                            ),
-                        )
-                    except Exception:
-                        logger.exception("Failed GLM52 draft extend decode in log")
 
                 forward_batch.spec_info.num_correct_drafts = graph_accept_lens - 1
                 forward_batch.spec_info.num_accept_tokens = graph_accept_lens
@@ -697,25 +852,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 probs = torch.softmax(selected_logits, dim=-1)
                 ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
 
-                if is_glm52:
-                    try:
-                        logger.info(
-                            "[GLM52_DRAFT_EXTEND_DECODE] out ret_topk_head=%s "
-                            "ret_topk_p_head=%s logits_rows=%s hidden_shape=%s "
-                            "can_cuda_graph=%s",
-                            ret_topk_index.detach().cpu().reshape(-1).tolist()[:8],
-                            ret_topk_p.detach().cpu().reshape(-1).tolist()[:8],
-                            output_len,
-                            (
-                                tuple(selected_hidden_states.shape)
-                                if torch.is_tensor(selected_hidden_states)
-                                else None
-                            ),
-                            bool(can_cuda_graph),
-                        )
-                    except Exception:
-                        logger.exception("Failed GLM52 draft extend decode out log")
-
                 next_draft_input = batch_result.next_draft_input
                 (
                     next_draft_input.topk_p,
@@ -733,89 +869,57 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         EagleDraftWorker._draft_extend_for_decode = _draft_extend_for_decode
         EagleDraftWorker._atom_dsv4_draft_extend_accept_patched = True
 
-    if not getattr(EagleDraftWorker, "_atom_glm52_draft_prefill_dump_patched", False):
-
-        def _draft_extend_for_prefill(self, batch, *args, **kwargs):
-            original = EagleDraftWorker._atom_glm52_draft_prefill_dump_original
-            target_hidden = args[0] if args else kwargs.get("target_hidden_states")
-            next_token_ids = args[1] if len(args) > 1 else kwargs.get("next_token_ids")
-            if _is_glm52_nextn_runner(getattr(self, "draft_runner", None)):
-                try:
-                    import torch
-
-                    next_list = (
-                        next_token_ids.detach().cpu().reshape(-1).tolist()
-                        if torch.is_tensor(next_token_ids)
-                        else next_token_ids
-                    )
-                    logger.info(
-                        "[GLM52_DRAFT_PREFILL] in bs=%s seq_lens=%s extend_seq_lens=%s "
-                        "next_token_ids=%s target_hidden_shape=%s",
-                        int(getattr(batch, "batch_size", 0) or 0),
-                        getattr(batch, "seq_lens", None),
-                        getattr(batch, "extend_seq_lens", None),
-                        next_list,
-                        tuple(target_hidden.shape)
-                        if torch.is_tensor(target_hidden)
-                        else None,
-                    )
-                except Exception:
-                    logger.exception("Failed GLM52 draft prefill in log")
-
-            ret = original(self, batch, *args, **kwargs)
-
-            if _is_glm52_nextn_runner(getattr(self, "draft_runner", None)):
-                try:
-                    import torch
-
-                    topk = getattr(ret, "topk_index", None)
-                    topk_head = (
-                        topk.detach().cpu().reshape(-1).tolist()[:8]
-                        if torch.is_tensor(topk)
-                        else None
-                    )
-                    bonus = getattr(ret, "bonus_tokens", None)
-                    bonus_head = (
-                        bonus.detach().cpu().reshape(-1).tolist()[:8]
-                        if torch.is_tensor(bonus)
-                        else None
-                    )
-                    logger.info(
-                        "[GLM52_DRAFT_PREFILL] out ret_topk_head=%s ret_topk_p_head=%s "
-                        "bonus_tokens=%s new_seq_lens=%s hidden_shape=%s",
-                        topk_head,
-                        (
-                            getattr(ret, "topk_p", None)
-                            .detach()
-                            .cpu()
-                            .reshape(-1)
-                            .tolist()[:8]
-                            if torch.is_tensor(getattr(ret, "topk_p", None))
-                            else None
-                        ),
-                        bonus_head,
-                        getattr(ret, "new_seq_lens", None),
-                        (
-                            tuple(ret.hidden_states.shape)
-                            if torch.is_tensor(getattr(ret, "hidden_states", None))
-                            else None
-                        ),
-                    )
-                except Exception:
-                    logger.exception("Failed GLM52 draft prefill out log")
-            return ret
-
-        EagleDraftWorker._atom_glm52_draft_prefill_dump_original = (
-            EagleDraftWorker._draft_extend_for_prefill
-        )
-        EagleDraftWorker._draft_extend_for_prefill = _draft_extend_for_prefill
-        EagleDraftWorker._atom_glm52_draft_prefill_dump_patched = True
-
     if not getattr(EagleDraftWorker, "_atom_dsv4_init_cuda_graphs_patched", False):
         original_init_cuda_graphs = EagleDraftWorker.init_cuda_graphs
 
         def init_cuda_graphs(self):
-            ret = original_init_cuda_graphs(self)
+            draft_runner = getattr(self, "draft_runner", None)
+            is_glm52 = _is_glm52_nextn_runner(draft_runner)
+            glm52_stage = _glm52_cg_stage() if is_glm52 else 0
+            if is_glm52 and glm52_stage >= 1:
+                seq_len_fill = int(
+                    os.environ.get("ATOM_GLM52_DRAFT_CG_SEQ_LEN_FILL", "4096")
+                )
+                for backend in self.draft_attn_backend.attn_backends:
+                    backend.get_cuda_graph_seq_len_fill_value = (
+                        lambda value=seq_len_fill: value
+                    )
+                if glm52_stage >= 3:
+                    draft_extend_seq_len_fill = int(
+                        os.environ.get(
+                            "ATOM_GLM52_DRAFT_EXTEND_CG_SEQ_LEN_FILL", "4096"
+                        )
+                    )
+                    for backend in (
+                        getattr(self.draft_runner, "attn_backend", None),
+                        getattr(self, "draft_extend_attn_backend", None),
+                    ):
+                        if backend is not None:
+                            backend.get_cuda_graph_seq_len_fill_value = (
+                                lambda value=draft_extend_seq_len_fill: value
+                            )
+            saved_draft_extend_backend = None
+            if is_glm52 and glm52_stage < 3:
+                saved_draft_extend_backend = self.draft_extend_attn_backend
+                self.draft_extend_attn_backend = None
+            try:
+                ret = original_init_cuda_graphs(self)
+            finally:
+                if saved_draft_extend_backend is not None:
+                    self.draft_extend_attn_backend = saved_draft_extend_backend
+            if is_glm52:
+                if glm52_stage < 1:
+                    self.cuda_graph_runner = None
+                if glm52_stage < 3:
+                    self.cuda_graph_runner_for_draft_extend = None
+                logger.info(
+                    "GLM-5.2 CG stage %d: draft_decode=%s target_verify=%s "
+                    "draft_extend=%s",
+                    glm52_stage,
+                    self.cuda_graph_runner is not None,
+                    glm52_stage >= 2,
+                    self.cuda_graph_runner_for_draft_extend is not None,
+                )
             try:
                 if _env_flag(
                     "ATOM_SGLANG_V4_DISABLE_DRAFT_CG"
@@ -878,83 +982,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
         EagleDraftWorker.init_cuda_graphs = init_cuda_graphs
         EagleDraftWorker._atom_dsv4_init_cuda_graphs_patched = True
-
-
-def _patch_sglang_glm52_target_verify_log() -> None:
-    """Log GLM-5.2 eager target_verify in/out for staged MTP gates."""
-    try:
-        from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
-    except Exception as exc:
-        logger.debug("Skip GLM52 target verify log patch: %s", exc)
-        return
-
-    if getattr(EAGLEWorkerV2, "_atom_glm52_target_verify_log_patched", False):
-        return
-
-    def _is_glm52_runner(runner) -> bool:
-        try:
-            from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
-
-            hf_config = getattr(
-                getattr(runner, "model_config", None), "hf_config", None
-            )
-            return is_glm52_dsa_config(hf_config)
-        except Exception:
-            return False
-
-    original_verify = EAGLEWorkerV2.verify
-
-    def verify(self, batch):
-        target_runner = getattr(
-            getattr(self, "target_worker", None), "model_runner", None
-        )
-        is_glm52 = _is_glm52_runner(target_runner)
-        if is_glm52:
-            try:
-                import torch
-
-                verify_input = getattr(batch, "spec_info", None)
-                draft_token = getattr(verify_input, "draft_token", None)
-                candidates = (
-                    draft_token.detach().cpu().reshape(-1).tolist()[:16]
-                    if torch.is_tensor(draft_token)
-                    else None
-                )
-                positions = getattr(verify_input, "positions", None)
-                logger.info(
-                    "[GLM52_TARGET_VERIFY] in candidates_head=%s draft_token_num=%s "
-                    "seq_lens=%s positions_head=%s",
-                    candidates,
-                    getattr(verify_input, "draft_token_num", None),
-                    getattr(batch, "seq_lens", None),
-                    (
-                        positions.detach().cpu().tolist()[:16]
-                        if torch.is_tensor(positions)
-                        else None
-                    ),
-                )
-            except Exception:
-                logger.exception("Failed GLM52 target verify in log")
-
-        out = original_verify(self, batch)
-
-        if is_glm52:
-            try:
-                import torch
-
-                accept = getattr(out, "accept_lens", None)
-                new_seq = getattr(out, "new_seq_lens", None)
-                logger.info(
-                    "[GLM52_TARGET_VERIFY] out accept_lens=%s new_seq_lens=%s",
-                    accept.detach().cpu().tolist() if torch.is_tensor(accept) else None,
-                    new_seq.detach().cpu().tolist() if torch.is_tensor(new_seq) else None,
-                )
-            except Exception:
-                logger.exception("Failed GLM52 target verify out log")
-        return out
-
-    EAGLEWorkerV2.verify = verify
-    EAGLEWorkerV2._atom_glm52_target_verify_log_patched = True
 
 
 def _patch_sglang_eagle_v2_draft_argmax() -> None:
@@ -1048,7 +1075,10 @@ def _patch_sglang_eagle_v2_draft_argmax() -> None:
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             forward_batch._atom_use_draft_argmax = use_argmax
             spec_info.hidden_states = hidden_states
-            if _is_glm52_nextn_runner(getattr(self, "draft_runner", None)):
+            is_glm52_draft = _is_glm52_nextn_runner(
+                getattr(self, "draft_runner", None)
+            )
+            if is_glm52_draft:
                 set_draft_decode_sub_step(forward_batch, i)
 
             logits_output = self.draft_runner.forward(
@@ -1087,6 +1117,8 @@ def _patch_sglang_eagle_v2_draft_argmax() -> None:
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
 
+        clear_draft_decode_sub_step(forward_batch)
+
         score_list = torch.cat(score_list, dim=1).flatten(1)
         ss_token_list = torch.cat(token_list, dim=1)
         top_scores = torch.topk(
@@ -1121,7 +1153,6 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     _register_custom_attention_to_sglang()
     _patch_sglang_dsv4_draft_backends()
     _patch_sglang_dsv4_spec_cuda_graph()
-    _patch_sglang_glm52_target_verify_log()
     _patch_sglang_eagle_v2_draft_argmax()
 
 
