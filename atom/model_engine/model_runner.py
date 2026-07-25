@@ -605,19 +605,7 @@ class tokenIDProcessor:
             f"ragged total {total} > num_deferred_tokens {num_deferred_tokens} "
             f"(graph bucket capacity); ragged must fit within bs*q_eff"
         )
-        anchors = self.prev_token_ids.detach().to("cpu").numpy()  # [bs]
-        drafts = (
-            self.draft_token_ids.detach().to("cpu").numpy()
-            if self.draft_token_ids is not None
-            else None
-        )  # [bs, mtp_k]
-        flat = self.input_ids.np
-        for i in range(bs):
-            s = int(cu[i])
-            flat[s] = anchors[i]
-            d = int(lens[i]) - 1
-            if d > 0 and drafts is not None:
-                flat[s + 1 : s + 1 + d] = drafts[i, :d]
+
         # FLAT graph tail-padding. Under CUDAGraph the captured grid processes
         # C = effective_bs * q_eff tokens (effective_bs = the graph bs bucket
         # >= bs), but this ragged step has only Σ = total real tokens (Σ ≤ C).
@@ -632,9 +620,28 @@ class tokenIDProcessor:
             gbs = next((g for g in reversed(self.runner.graph_bs) if g >= bs), None)
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * q_eff)
+
+        # Per flat pos p in [0, total): seq_of_pos[p] = owning seq i,
+        # local_of_pos[p] = p - cu[i] (0 = anchor, >=1 = draft column local-1).
+        gpu = self.input_ids.gpu
+        if total > 0:
+            seq_of_pos = np.repeat(np.arange(bs, dtype=np.int64), lens)  # [total]
+            local_of_pos = np.arange(total, dtype=np.int64) - cu[seq_of_pos]
+            dev = self.prev_token_ids.device
+            seq_t = torch.as_tensor(seq_of_pos, device=dev)
+            local_t = torch.as_tensor(local_of_pos, device=dev)
+            anchor_vals = self.prev_token_ids[seq_t]  # [total]
+            if self.draft_token_ids is not None:
+                # draft column = local-1; clamp anchor rows (local==0) to 0 then
+                # mask them back to the anchor value.
+                draft_col = (local_t - 1).clamp_(min=0)
+                draft_vals = self.draft_token_ids[seq_t, draft_col]
+                out = torch.where(local_t == 0, anchor_vals, draft_vals)
+            else:
+                out = anchor_vals
+            gpu[:total] = out
         if fill_to > total:
-            flat[total:fill_to] = 0
-        self.input_ids.copy_to_gpu(fill_to)
+            gpu[total:fill_to].zero_()
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
