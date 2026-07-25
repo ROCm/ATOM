@@ -23,6 +23,8 @@ Currently registered:
   - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
 """
 
+from typing import Optional
+
 import torch
 
 from atom.config import get_current_atom_config
@@ -97,7 +99,9 @@ direct_register_custom_op(
 # ---------------------------------------------------------------------------
 #
 # Caller contract (the Indexer module looked up by `layer_name`):
-#   - `indexer_score_topk(q_fp8, weights, topk) -> Tensor`   — real impl,
+#   - `indexer_score_topk(q_quant, weights, q_scale, topk) -> Tensor`  — real impl,
+#     (q_quant is FP8, or packed FP4 uint8 when the FP4 indexer is on; q_scale is
+#     the paired e8m0 Q scale on the FP4 path, None for FP8)
 #     must return `[total_tokens, topk] int32` indices
 #
 # `topk` is on the op signature (not derived from the module) so the fake
@@ -115,27 +119,29 @@ direct_register_custom_op(
 
 
 def indexer_score_topk(
-    q_fp8: torch.Tensor,
+    q_quant: torch.Tensor,
     weights: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
     layer_name: str,
     topk: int,
 ) -> torch.Tensor:
     indexer = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return indexer.indexer_score_topk(q_fp8, weights, topk)
+    return indexer.indexer_score_topk(q_quant, weights, q_scale, topk)
 
 
 def _indexer_score_topk_fake(
-    q_fp8: torch.Tensor,
+    q_quant: torch.Tensor,
     weights: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
     layer_name: str,
     topk: int,
 ) -> torch.Tensor:
     return torch.empty(
-        (q_fp8.shape[0], topk),
+        (q_quant.shape[0], topk),
         dtype=torch.int32,
-        device=q_fp8.device,
+        device=q_quant.device,
     )
 
 

@@ -196,8 +196,9 @@ def _v4_core_attention_fake(
     qr: torch.Tensor,
     qr_scale: torch.Tensor,
     positions: torch.Tensor,
-    idx_q_fp8: Optional[torch.Tensor],
+    idx_q_quant: Optional[torch.Tensor],
     idx_weights: Optional[torch.Tensor],
+    idx_q_scale: Optional[torch.Tensor],
     layer_name: str,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
@@ -213,13 +214,16 @@ def v4_core_attention(
     qr: torch.Tensor,
     qr_scale: torch.Tensor,
     positions: torch.Tensor,
-    idx_q_fp8: Optional[torch.Tensor],
+    idx_q_quant: Optional[torch.Tensor],
     idx_weights: Optional[torch.Tensor],
+    idx_q_scale: Optional[torch.Tensor],
     layer_name: str,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    out = self._attn_core(x, q, kv_pre, qr, qr_scale, positions, idx_q_fp8, idx_weights)
+    out = self._attn_core(
+        x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
+    )
 
     from atom.config import CUDAGraphMode
     from atom.utils.forward_context import get_forward_context
@@ -1247,6 +1251,19 @@ class Indexer(nn.Module):
         # one indexer slot per `compress_ratio` source tokens.
         self._max_model_len_idx = args.max_seq_len // compress_ratio
 
+        # FP4-indexer flag, self-computed at construction so it is correct BEFORE
+        # the graphed `_attn_pre`/`forward_pre` piece is traced — the graph bakes
+        # this branch, and the builder's re-assert in `build_kv_cache_tensor` does
+        # NOT reliably precede that trace (verified: defaulting False here bakes
+        # the FP8 branch → q_scale None → the eager FP4 `indexer_score_topk`
+        # disagrees). Mirror the builder's decision (index_cache_dtype fp4 +
+        # gfx950); the builder still re-asserts the authoritative value (with the
+        # non-gfx950 warn+fallback) onto this module when it binds the cache.
+        self._indexer_fp4 = (
+            get_current_atom_config().index_cache_dtype == "fp4"
+            and get_gfx() == "gfx950"
+        )
+
         self.compressor = Compressor(
             args,
             compress_ratio,
@@ -1290,7 +1307,7 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         """Q proj + RoPE + FP8-quant + weights compute (have module state),
         then dispatch to `torch.ops.aiter.indexer_score_topk`, which calls
-        back into `self.indexer_score_topk(q_fp8, weights, self.index_topk)`.
+        back into `self.indexer_score_topk(q_quant, weights, q_scale, index_topk)`.
 
         Caller must invoke `self.compressor` once batched BEFORE this so all
         seqs' Indexer kv_cache is already populated.
@@ -1304,8 +1321,10 @@ class Indexer(nn.Module):
             Consumer (`csa_translate_pack`) skips negative entries via its
             `topk >= 0` write mask.
         """
-        q_fp8, weights = self.forward_pre(x_full, qr_full, positions, qr_full_scale)
-        return self.score_topk_from(q_fp8, weights)
+        q_quant, weights, q_scale = self.forward_pre(
+            x_full, qr_full, positions, qr_full_scale
+        )
+        return self.score_topk_from(q_quant, weights, q_scale)
 
     def topk(
         self,
@@ -1314,18 +1333,20 @@ class Indexer(nn.Module):
         positions: torch.Tensor,
         qr_full_scale: Optional[torch.Tensor] = None,
         *,
-        pre_q_fp8: Optional[torch.Tensor] = None,
+        pre_q_quant: Optional[torch.Tensor] = None,
         pre_weights: Optional[torch.Tensor] = None,
+        pre_q_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute the top-k, reusing precomputed projections when available.
 
         PIECEWISE narrow split projects Q/weights in `_attn_pre` (graphed piece)
-        and passes them as ``pre_q_fp8``/``pre_weights`` so only the eager paged
-        ``score_topk_from`` runs here. Otherwise (FULL/legacy) project inline via
-        ``forward_batched``. Same result either way — only the split site differs.
+        and passes them as ``pre_q_quant``/``pre_weights``/``pre_q_scale`` so only
+        the eager paged ``score_topk_from`` runs here. Otherwise (FULL/legacy)
+        project inline via ``forward_batched``. Same result either way — only the
+        split site differs.
         """
-        if pre_q_fp8 is not None:
-            return self.score_topk_from(pre_q_fp8, pre_weights)
+        if pre_q_quant is not None:
+            return self.score_topk_from(pre_q_quant, pre_weights, pre_q_scale)
         return self.forward_batched(x_full, qr_full, positions, qr_full_scale)
 
     def forward_pre(
@@ -1339,7 +1360,9 @@ class Indexer(nn.Module):
 
         No paged / KV-cache access, so this runs in the compiled dense piece.
         Only `score_topk_from` (paged gather + score) must stay eager.
-        Returns (q_fp8, weights).
+        Returns (q_quant, weights, q_scale): q_quant is FP8 by default or packed
+        FP4 (uint8) when the FP4 indexer is on; q_scale is the paired e8m0 Q scale
+        on the FP4 path (None for FP8), threaded to the scorer via the op boundary.
         """
         assert self.rotary_emb is not None
         rd = self.rope_head_dim
@@ -1357,7 +1380,11 @@ class Indexer(nn.Module):
         # the per-(token, head) fp8 block scale (head_dim == group => one/row).
         # `_weights_scale` precomputed in __init__.
         # self.rotary_emb(positions, q[..., -rd:]); q = rotate_activation(q)
-        if self.kv_cache is not None and self.kv_cache.dtype == torch.uint8:
+        # Branch on the STABLE `_indexer_fp4` flag (set at __init__), NOT
+        # `kv_cache.dtype`: this runs inside the graphed `_attn_pre` piece, where
+        # a kv_cache-derived branch can be baked wrong (kv_cache is bound after
+        # tracing) and then disagree with the eager `indexer_score_topk`.
+        if self._indexer_fp4:
             # ── FP4 indexer path ──────────────────────────────────────────
             # Q is FP4-quantized (E2M1 + per-group(32) e8m0) in the
             # `pa_mqa_logits_fp4` preshuffle layout. The MQA-logits kernel
@@ -1394,14 +1421,9 @@ class Indexer(nn.Module):
             # q_scale premultiply (kernel dequants Q via e8m0), no pre-scale
             # launch.
             weights = self.weights_proj(x_full)
-            # Stash q_scale for the opaque dispatch op (read synchronously by
-            # `indexer_score_topk` on this same module); q_fp4 rides the q arg.
-            self._q_scale_fp4 = q_scale
-            # Return (q, weights) like the FP8 path below; the paged dispatch
-            # (`score_topk_from` -> `torch.ops.aiter.indexer_score_topk`) routes
-            # to the FP4 kernels via its uint8 kv_cache check and reads the
-            # stashed `_q_scale_fp4`. q_fp4 (uint8) rides the q_fp8 arg.
-            return q_fp4, weights
+            # Return q_scale (don't stash on self — see __init__): it's threaded
+            # through the v4_core_attention op and stashed eagerly in _attn_core.
+            return q_fp4, weights, q_scale
 
         q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
         q_scale = torch.empty(
@@ -1433,20 +1455,24 @@ class Indexer(nn.Module):
             self._weights_scale,
             prefix=f"{self.prefix}.scale_indexer_weights",
         )
-        return q_fp8, weights
+        return q_fp8, weights, None
 
     def score_topk_from(
-        self, q_fp8: torch.Tensor, weights: torch.Tensor
+        self,
+        q_quant: torch.Tensor,
+        weights: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Eager paged gather + score + top-k (reads compressor KV cache)."""
         return torch.ops.aiter.indexer_score_topk(
-            q_fp8, weights, self.prefix, self.index_topk
+            q_quant, weights, q_scale, self.prefix, self.index_topk
         )  # [total_tokens, index_topk] int32
 
     def indexer_score_topk(
         self,
-        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8, or packed FP4 (uint8) when the FP4 indexer is on
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        q_scale: Optional[torch.Tensor],  # FP4 e8m0 Q scale (None on the FP8 path)
         topk: int,
     ) -> torch.Tensor:
         """Module-side entry invoked by `torch.ops.aiter.indexer_score_topk`.
@@ -1466,18 +1492,19 @@ class Indexer(nn.Module):
         indexer_meta = fc.attn_metadata.indexer_meta
         block_tables = fc.attn_metadata.block_tables  # [bs, max_blocks_per_seq] int32
 
-        # FP4 indexer cache (uint8) → FP4 paged MQA-logits kernels. The FP8
-        # cache (torch.float8) stays on the existing cp_gather/deepgemm paths.
-        # q here is actually q_fp4; the paired q_scale was stashed on `self`
-        # by `forward_batched` (read synchronously, same fwd).
-        if self.kv_cache is not None and self.kv_cache.dtype == torch.uint8:
-            q_scale = self._q_scale_fp4
+        # FP4 indexer → FP4 paged MQA-logits kernels; FP8 stays on the
+        # cp_gather/deepgemm paths. Branch on the STABLE `_indexer_fp4` flag (not
+        # `kv_cache.dtype`) so this eager dispatch always agrees with the branch
+        # `forward_pre` baked into the graphed projection piece. `q_quant` is the
+        # packed q_fp4 and `q_scale` its paired e8m0 scale — both value-passed from
+        # `forward_pre` (q_scale rides its own op arg; no per-module state).
+        if self._indexer_fp4:
             if fc.context.is_prefill:
                 return self._score_topk_prefill_fp4(
-                    q_fp8, q_scale, block_tables, weights, indexer_meta, topk
+                    q_quant, q_scale, block_tables, weights, indexer_meta, topk
                 )
             return self._score_topk_decode_fp4(
-                q_fp8, q_scale, block_tables, weights, indexer_meta, topk
+                q_quant, q_scale, block_tables, weights, indexer_meta, topk
             )
 
         # No host-side `if total_committed == 0: return torch.full(-1)`
@@ -1488,10 +1515,10 @@ class Indexer(nn.Module):
         # `csa_translate_pack` skips them via its `topk >= 0` mask.
         if fc.context.is_prefill:
             return self._score_topk_prefill(
-                q_fp8, weights, block_tables, indexer_meta, topk
+                q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
         return self._score_topk_decode(
-            q_fp8, weights, block_tables, indexer_meta, topk
+            q_quant, weights, block_tables, indexer_meta, topk
         )  # [total_tokens, topk] int32
 
     def _prefill_chunked_topk(
@@ -1904,23 +1931,20 @@ class Indexer(nn.Module):
         fc = get_forward_context()
         total_tokens = q_fp4.size(0)
         n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
-        # DSpark RAGGED decode (per-request variable query lengths) is handled for
-        # the FP8 path by `_score_topk_decode_ragged`. This FP4 path is
-        # rectangular-only — it does `q_fp4.view(bs, next_n, ...)` and its
-        # precomputed cta_info schedule assumes a uniform next_n — so a ragged
-        # batch (total_tokens != bs*next_n) would fail with a confusing view()
-        # shape error. Fail loudly instead. Ragged is eager-only (CUDAGraph
-        # rectangularizes it upstream), so this only triggers under
-        # --enforce-eager + MTP per-request verify.
+        # DSpark RAGGED decode (per-request variable query lengths): route to the
+        # varqlen FP4 path (aiter `flydsl_pa_mqa_logits_fp4_varqlen` via the
+        # ragged-prefill kernel). The rectangular path below does
+        # `q_fp4.view(bs, next_n, ...)` + a uniform-next_n cta_info schedule, so a
+        # ragged batch (total_tokens != bs*next_n) can't take it. Ragged is
+        # eager-only (CUDAGraph rectangularizes it upstream — see
+        # `deepseek_v4_attn.py` TRUE-FLAT graph), so this only triggers under
+        # --enforce-eager + MTP per-request verify, mirroring the FP8
+        # `_score_topk_decode_ragged` scope.
         attn_md = fc.attn_metadata
-        if (
-            getattr(attn_md, "dspark_ragged_lens_gpu", None) is not None
-            and getattr(attn_md, "dspark_full_q", 0) > 0
-        ):
-            raise NotImplementedError(
-                "FP4 indexer does not support eager DSpark ragged decode "
-                "(per-request variable query lengths) yet. Use CUDAGraph "
-                "(rectangular decode) or the FP8 indexer (--index_cache_dtype fp8)."
+        ragged_lens = getattr(attn_md, "dspark_ragged_lens_gpu", None)
+        if ragged_lens is not None and getattr(attn_md, "dspark_full_q", 0) > 0:
+            return self._score_topk_decode_ragged_fp4(
+                q_fp4, q_scale, block_tables, weights, indexer_meta, topk
             )
         next_n = max(1, int(attn_md.max_seqlen_q))
         bs = total_tokens // next_n
@@ -1989,6 +2013,131 @@ class Indexer(nn.Module):
             k=topk,
         )
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
+
+    def _score_topk_decode_ragged_fp4(
+        self,
+        q_fp4: torch.Tensor,  # [padded_tokens, n_heads, head_dim//2] uint8
+        q_scale: torch.Tensor,  # [padded_tokens, K_TILES, 4, 16, QS_PAD] uint8
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+        weights: torch.Tensor,  # [padded_tokens, n_heads] fp32
+        indexer_meta: dict,  # carries the varlen windows built by the attn builder
+        topk: int,
+    ) -> torch.Tensor:
+        """RAGGED decode FP4 via the varqlen (ragged-prefill) MQA-logits kernel.
+
+        DSpark per-request variable query lengths (paper §5.2): seq b forwards
+        its own `qlen_b` query tokens, so `total_tokens = Σ qlen_b != bs*next_n`
+        and the rectangular `_score_topk_decode_fp4` view()/uniform-next_n
+        schedule can't apply. Instead of the FP8 path's pad-to-rectangle+gather
+        (`_score_topk_decode_ragged`), this uses aiter's native varqlen path: the
+        decode tokens are already laid out per-seq ascending (the natural DSpark
+        ragged order, `batch_id_per_token = repeat(arange(bs), qlen)`), which is
+        exactly what the ragged-prefill kernel + `compute_varqlen_windows`
+        consume — no scatter needed.
+
+        Per-row MTP tail-causal window: row n of seq b scores compressed KV
+        `[0, n_committed_b - qlen_b + n + 1)`, identical to the rectangular decode
+        kernel's `rowEnds - next_n + r + 1` bound but with per-seq `qlen_b` in
+        place of a uniform `next_n`. Windows are precomputed once/fwd by the attn
+        builder over ALL padded rows (pad tail forced to empty), so the full
+        padded q_fp4 is scored single-shot and the seq-local top-k is returned
+        directly (pad rows → -1, ignored downstream).
+
+        The scorer itself is CG-safe: windows + persistent-grid schedule are
+        precomputed once/fwd into fixed-address buffers by the attn builder and the
+        logits width is the static `_max_model_len_idx`, so it captures/replays at a
+        static shape from stable pointers (like the rectangular decode path). It is
+        exercised eagerly under PIECEWISE (the paged core is an eager splitting op).
+
+        `--cudagraph-mode FULL` (whole-forward capture) is NOT supported yet: the
+        scorer captures, but the broader FULL ragged-decode replay pipeline is
+        experimental (DSpark SPS calibration is disabled under a ragged graph) and
+        faults mid-run — so the guard below fails loudly at capture. Use PIECEWISE.
+        """
+        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+            flydsl_pa_mqa_logits_fp4_prefill,
+        )
+
+        # FULL whole-forward capture of DSpark ragged decode is not supported yet
+        # (see docstring) — fail loudly at warmup capture instead of faulting mid
+        # replay. Never fires under PIECEWISE (the paged core runs eager, so no
+        # stream capture is active here). Sync-free: inspects capture state only.
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "FP4 DSpark ragged decode does not support --cudagraph-mode FULL "
+                "(whole-forward capture) yet; the FULL ragged replay pipeline is "
+                "experimental and faults mid-run. Use --cudagraph-mode PIECEWISE "
+                "(attention runs eager), or the FP8 indexer (--index_cache_dtype "
+                "fp8)."
+            )
+
+        device = q_fp4.device
+        padded_tokens = q_fp4.size(0)
+        # Windows + persistent-grid schedule precomputed once/fwd by the attn
+        # builder into FIXED-address buffers (`_build_v4_indexer_meta`). Windows
+        # span ALL padded rows with the pad tail forced empty (local_ends == 0),
+        # so the full padded q_fp4 is scored single-shot: pad rows are skipped by
+        # the kernel (empty window → 0 CTAs → no paged KV read) and their top-k is
+        # -1 (ignored downstream by csa_translate_pack). No strip / pad-back.
+        row_to_batch = indexer_meta["fp4_ragged_row_to_batch"]
+        local_starts = indexer_meta["fp4_ragged_local_starts"]
+        local_ends = indexer_meta["fp4_ragged_local_ends"]
+        cta_info = indexer_meta["fp4_ragged_cta_info"]
+        n_ctas = indexer_meta["fp4_ragged_n_ctas"]
+        # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
+        # the rectangular decode path.
+        max_seq_len = self._max_model_len_idx
+        kv_block_size = self.kv_cache.size(3)  # k1_csa = 64
+        # Same N_PHYS==1 packed-dword-scale contract as the other FP4 paths
+        # (see `_score_topk_decode_fp4`): fail loudly on an unsupported block size.
+        assert kv_block_size == 64, (
+            f"FP4 indexer requires kv_block_size (k1_csa) == 64 for the packed "
+            f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
+            f"block_size=256 (k1_csa=block_size//4)."
+        )
+
+        # Write-once, NOT -inf-filled: passing the precomputed `cta_info`/`n_ctas`
+        # makes the kernel skip its internal schedule build AND its out.fill_(-inf);
+        # the captured grid (n_ctas) is constant. The kernel writes every column in
+        # [rs, re) per row; top_k scans only that range.
+        logits = torch.empty(
+            padded_tokens, max_seq_len, dtype=torch.float32, device=device
+        )
+        flydsl_pa_mqa_logits_fp4_prefill(
+            q_fp4,
+            q_scale,
+            self.kv_cache,
+            self.kv_scale,
+            block_tables,
+            weights,
+            row_to_batch,
+            local_starts,
+            local_ends,
+            max_seq_len,
+            weight_scale=self._weights_scale,
+            block_k=_V4_FP4_DECODE_BLOCK_K,
+            kv_block_size=kv_block_size,
+            out=logits,
+            cta_info=cta_info,
+            n_ctas=n_ctas,
+        )  # [padded_tokens, max_seq_len] fp32, seq-local
+        # Seq-local output → indices returned directly. top_k writes every row
+        # (real + empty pad rows → -1), so a bare torch.empty output is fine.
+        topk_out = torch.empty(
+            (padded_tokens, topk), dtype=torch.int32, device=device
+        )
+        top_k_per_row_prefill(
+            logits,
+            local_starts,
+            local_ends,
+            topk_out,
+            None,  # values not needed, only indices
+            padded_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
+        )
+        return topk_out  # [padded_tokens, topk] int32, raw seq-local
 
     def _score_topk_decode_ragged(
         self,
@@ -2412,9 +2561,16 @@ class DeepseekV4Attention(nn.Module):
         #  for torch compile.
         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
-            q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights = self._attn_pre(
-                x, positions
-            )
+            (
+                q,
+                kv_pre,
+                qr,
+                qr_scale,
+                x,
+                idx_q_quant,
+                idx_weights,
+                idx_q_scale,
+            ) = self._attn_pre(x, positions)
             o = torch.ops.aiter.v4_core_attention(
                 x,
                 q,
@@ -2422,8 +2578,9 @@ class DeepseekV4Attention(nn.Module):
                 qr,
                 qr_scale,
                 positions,
-                idx_q_fp8,
+                idx_q_quant,
                 idx_weights,
+                idx_q_scale,
                 self.layer_name,
             )
             return self._attn_post(o)
@@ -2445,8 +2602,9 @@ class DeepseekV4Attention(nn.Module):
             keeps the indexer's `forward_batched` inline in the core (unchanged
             ordering), so no indexer projection happens here.
 
-        Returns (q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights); the last two
-        are None when run_indexer_proj is False or the layer has no indexer.
+        Returns (q, kv_pre, qr, qr_scale, x, idx_q_quant, idx_weights, idx_q_scale);
+        the last three are None when run_indexer_proj is False or the layer has no
+        indexer (idx_q_scale is also None on the FP8 indexer path).
         """
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
@@ -2462,12 +2620,12 @@ class DeepseekV4Attention(nn.Module):
         qr, qr_scale = self.q_norm(q_lora)
         q = self.wq_b(qr, x_scale=qr_scale)
         # Indexer Q/weights projection (no paged access) -> graphed piece.
-        idx_q_fp8 = idx_weights = None
+        idx_q_quant = idx_weights = idx_q_scale = None
         if run_indexer_proj and self.indexer is not None and not self.skip_topk:
-            idx_q_fp8, idx_weights = self.indexer.forward_pre(
+            idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
                 x, qr, positions, qr_scale
             )
-        return q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights
+        return q, kv_pre, qr, qr_scale, x, idx_q_quant, idx_weights, idx_q_scale
 
     @mark_trace
     def _wo_a_grouped_lora(self, o: torch.Tensor, prefix: str = "") -> torch.Tensor:
@@ -2537,7 +2695,7 @@ class DeepseekV4Attention(nn.Module):
         # above, so _attn_pre must NOT re-quantise -> its guard is a no-op here
         # because we pass the already-processed x (the flag re-clones, harmless
         # on the dead path, but we rely on the assert keeping this off anyway).
-        q, kv_pre, qr, qr_scale, x, _idx_q, _idx_w = self._attn_pre(
+        q, kv_pre, qr, qr_scale, x, _idx_q, _idx_w, _idx_qs = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
         # Paged attention core (compressor already launched above).
@@ -2548,7 +2706,7 @@ class DeepseekV4Attention(nn.Module):
             qr,
             qr_scale,
             positions,
-            idx_q_fp8=None,
+            idx_q_quant=None,
             idx_weights=None,
             compressor_already_launched=True,
         )
@@ -2563,8 +2721,9 @@ class DeepseekV4Attention(nn.Module):
         qr: torch.Tensor,  # [num_tokens, q_lora_rank] FP8  q RMSNorm out (for indexer)
         qr_scale: torch.Tensor,  # qr FP8 scale
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
-        idx_q_fp8: Optional[torch.Tensor] = None,  # indexer q_fp8 (from _attn_pre)
+        idx_q_quant: Optional[torch.Tensor] = None,  # indexer quantized q — FP8 or packed FP4 (from _attn_pre)
         idx_weights: Optional[torch.Tensor] = None,  # indexer weights (from _attn_pre)
+        idx_q_scale: Optional[torch.Tensor] = None,  # indexer FP4 e8m0 q-scale (from _attn_pre; None for FP8)
         compressor_already_launched: bool = False,
     ) -> torch.Tensor:  # [num_tokens, n_local_heads*head_dim]  flat attn output
         """Paged/dynamic attention core — SINGLE source of the paged attention
@@ -2577,7 +2736,7 @@ class DeepseekV4Attention(nn.Module):
           legacy ordering) and passes True so we don't relaunch. PIECEWISE passes
           False and launches here (its projections are in a separate captured
           piece, and side-stream alloc can't happen during capture anyway).
-        - `idx_q_fp8`/`idx_weights`: if provided (PIECEWISE, projected in
+        - `idx_q_quant`/`idx_weights`: if provided (PIECEWISE, projected in
           `_attn_pre`), the indexer runs only its paged score/top-k via
           `score_topk_from`; if None (FULL), the indexer's `forward_batched`
           projects + scores inline here (unchanged legacy path).
@@ -2727,8 +2886,9 @@ class DeepseekV4Attention(nn.Module):
                 qr,
                 positions,
                 qr_scale,
-                pre_q_fp8=idx_q_fp8,
+                pre_q_quant=idx_q_quant,
                 pre_weights=idx_weights,
+                pre_q_scale=idx_q_scale,
             )
             self._fill_csa_paged_compress(
                 attn_md, indexer_topk_batched, positions, num_tokens

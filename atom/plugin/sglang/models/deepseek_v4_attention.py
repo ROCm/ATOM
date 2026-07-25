@@ -54,7 +54,10 @@ def _install_draft_extend_fused_swa_patch() -> None:
             return None
         return original_swa_write(*args, **kwargs)
 
-    def indexer_score_topk(self, q_fp8, weights, topk):
+    def indexer_score_topk(self, q_quant, weights, q_scale, topk):
+        # q_quant: FP8, or packed FP4 (uint8) when the FP4 indexer is on; q_scale
+        # is the paired FP4 e8m0 scale (None for FP8, this verify-graph path).
+        # Delegated to base for the FP4 branch.
         fc = dsv4.get_forward_context()
         if bool(
             getattr(fc.attn_metadata, "use_decode_indexer_for_verify_graph", False)
@@ -62,9 +65,9 @@ def _install_draft_extend_fused_swa_patch() -> None:
             indexer_meta = fc.attn_metadata.indexer_meta
             block_tables = fc.attn_metadata.block_tables
             return self._score_topk_decode(
-                q_fp8, weights, block_tables, indexer_meta, topk
+                q_quant, weights, block_tables, indexer_meta, topk
             )
-        return original_indexer_score_topk(self, q_fp8, weights, topk)
+        return original_indexer_score_topk(self, q_quant, weights, q_scale, topk)
 
     def _score_topk_decode(self, q_fp8, weights, block_tables, indexer_meta, topk):
         fc = dsv4.get_forward_context()
