@@ -614,17 +614,6 @@ def _get_or_create_sparse_mla_indexer_graph_buffers(
         ),
     )
     store[key] = buffers
-    logger.info(
-        "[ATOM_SPARSE_MLA_INDEXER_GRAPH] allocate mode=DRAFT_EXTEND_V2 "
-        "bs=%d tokens_per_req=%d tokens=%d context_capacity=%d "
-        "block_table_ptr=%d k_fp8_ptr=%d",
-        batch_size,
-        tokens_per_req,
-        num_tokens,
-        context_capacity,
-        buffers.block_table.data_ptr(),
-        buffers.k_fp8.data_ptr(),
-    )
     return buffers
 
 
@@ -817,22 +806,6 @@ def _get_or_create_sparse_mla_graph_buffers(
             output_dim=output_dim,
         )
         store[key] = buffers
-        forward_mode = getattr(forward_batch, "forward_mode", None)
-        logger.info(
-            "[ATOM_SPARSE_MLA_GRAPH] allocate mode=%s bs=%d tokens_per_req=%d "
-            "tokens=%d topk=%d page_size=%d q_ptr=%d output_ptr=%d "
-            "kv_indices_ptr=%d backend=%s",
-            getattr(forward_mode, "name", str(forward_mode)),
-            batch_size,
-            tokens_per_req,
-            num_tokens,
-            topk_tokens,
-            allocator_page_size,
-            buffers.q.data_ptr(),
-            buffers.output.data_ptr(),
-            buffers.kv_indices.data_ptr(),
-            type(backend).__name__,
-        )
     return buffers
 
 

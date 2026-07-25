@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-import os
-
 import numpy as np
 import torch
 
@@ -23,10 +20,6 @@ from atom.plugin.sglang.glm52_mtp.common import (
     metadata_dtype,
     validate_page_size,
 )
-
-
-logger = logging.getLogger("atom")
-
 
 def build_mtp_multi_token_decode_metadata(
     forward_batch,
@@ -157,46 +150,4 @@ def build_mtp_multi_token_decode_metadata(
     for key, value in sparse_mtp_work.items():
         setattr(md, key, value)
 
-    if draft_extend and os.environ.get("ATOM_GLM52_MTP_DUMP", "0") in (
-        "1",
-        "true",
-        "True",
-    ):
-        forward_batch._atom_glm52_draft_extend_dump_metadata = md
-
-    if draft_extend and os.environ.get("ATOM_GLM52_MTP_DEBUG", "0") in (
-        "1",
-        "true",
-        "True",
-    ):
-        req_pool_indices = forward_batch.req_pool_indices[:bs]
-        raw = req_to_token_pool.req_to_token[req_pool_indices]
-        row = 0
-        prefix = int(prefix_lens_np[row])
-        context = int(context_lens_np[row])
-        token_suffix = token_table[row, prefix:context]
-        raw_suffix = raw[row, prefix:context]
-        slots = slot_mapping[:draft_token_num]
-        sparse_lens = per_token_kv_lens[:draft_token_num]
-        expected_sparse_lens = prefix + np.arange(
-            1, draft_token_num + 1, dtype=np.int32
-        )
-        logger.info(
-            "[GLM52_DRAFT_EXTEND_METADATA] req_idx=%s pool_ids=(kv=%s,req=%s) "
-            "prefix=%s context=%s raw_suffix=%s table_suffix=%s slots=%s "
-            "table_matches_raw=%s table_matches_slots=%s sparse_lens=%s "
-            "sparse_matches_causal=%s",
-            int(req_pool_indices[row].item()),
-            id(token_to_kv_pool),
-            id(req_to_token_pool),
-            prefix,
-            context,
-            raw_suffix.detach().cpu().tolist(),
-            token_suffix.detach().cpu().tolist(),
-            slots.detach().cpu().tolist(),
-            bool(torch.equal(token_suffix, raw_suffix)),
-            bool(torch.equal(token_suffix, slots)),
-            sparse_lens.tolist(),
-            bool(np.array_equal(sparse_lens, expected_sparse_lens)),
-        )
     return md
