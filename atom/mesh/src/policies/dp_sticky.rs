@@ -2,10 +2,13 @@
 //!
 //! Requests carrying `X-Session-ID` are pinned to the first healthy worker
 //! selected for that session. New sessions and requests without a session ID
-//! use minimum-load balancing. A stale mapping is removed and
-//! reassigned when its worker is no longer healthy.
+//! use minimum-load balancing. A stale mapping is removed and reassigned when
+//! its worker is no longer healthy or the session has been idle for too long.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
@@ -13,10 +16,18 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{core::Worker, routers::comm::header_utils::extract_sticky_routing_key};
 
+const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug)]
+struct StickyAssignment {
+    worker_url: String,
+    last_access: Instant,
+}
+
 #[derive(Debug)]
 pub struct DpStickyPolicy {
     /// Session ID -> worker URL. URLs remain valid when a worker slice is reordered.
-    assignments: DashMap<String, String>,
+    assignments: DashMap<String, StickyAssignment>,
 }
 
 impl DpStickyPolicy {
@@ -52,10 +63,17 @@ impl DpStickyPolicy {
         let Some(session_id) = session_id else {
             return Self::select_low_load_worker(workers);
         };
+        let now = Instant::now();
 
-        if let Some(assignment) = self.assignments.get(session_id) {
-            if let Some(index) = Self::healthy_worker_for_url(workers, assignment.value()) {
-                return Some(index);
+        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
+            let is_expired = now.saturating_duration_since(assignment.last_access)
+                > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
+            assignment.last_access = now;
+
+            if !is_expired {
+                if let Some(index) = Self::healthy_worker_for_url(workers, &assignment.worker_url) {
+                    return Some(index);
+                }
             }
         }
 
@@ -66,16 +84,28 @@ impl DpStickyPolicy {
         let selected_url = workers[selected_index].url().to_string();
 
         match self.assignments.entry(session_id.to_string()) {
-            Entry::Occupied(mut assignment) => {
-                if let Some(index) = Self::healthy_worker_for_url(workers, assignment.get()) {
+            Entry::Occupied(mut entry) => {
+                let existing_index = {
+                    let assignment = entry.get_mut();
+                    assignment.last_access = now;
+                    Self::healthy_worker_for_url(workers, &assignment.worker_url)
+                };
+
+                if let Some(index) = existing_index {
                     Some(index)
                 } else {
-                    assignment.insert(selected_url);
+                    entry.insert(StickyAssignment {
+                        worker_url: selected_url,
+                        last_access: now,
+                    });
                     Some(selected_index)
                 }
             }
             Entry::Vacant(slot) => {
-                slot.insert(selected_url);
+                slot.insert(StickyAssignment {
+                    worker_url: selected_url,
+                    last_access: now,
+                });
                 Some(selected_index)
             }
         }
@@ -166,6 +196,25 @@ mod tests {
             policy.select_worker(&workers, &info).await,
             Some(replacement)
         );
+    }
+
+    #[tokio::test]
+    async fn expired_session_assignment_is_rebalanced_to_lowest_load_worker() {
+        let policy = DpStickyPolicy::new();
+        let workers = workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        workers[0].increment_load();
+        workers[0].increment_load();
+        policy.assignments.get_mut("session-1").unwrap().last_access =
+            Instant::now() - SESSION_REASSIGNMENT_IDLE_TIMEOUT - Duration::from_secs(1);
+
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
     }
 
     #[tokio::test]
