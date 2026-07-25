@@ -219,12 +219,6 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             self.model.atom_config = self.atom_config
             setup_deepseek_for_sglang(self.model)
             _retag_mtp_runtime_layer_ids(self.model)
-            first_attention = self._first_mtp_layer().mtp_block.self_attn
-            logger.info(
-                "GLM-5.2 draft model attention frontend mode=%s class=%s",
-                "generic",
-                type(first_attention.mla_attn).__name__,
-            )
 
         self.logits_processor = LogitsProcessor(config)
         self.lm_head = self._first_mtp_layer().shared_head.head

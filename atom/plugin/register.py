@@ -92,31 +92,12 @@ def _register_custom_attention_to_sglang() -> None:
     # the plugin backend.
     sglang_aiter_backend.AiterAttnBackend = ATOMAttnBackendForSgl
 
-    def create_glm52_backend(runner, registry_name: str):
+    def create_glm52_backend(runner):
         is_draft_worker = bool(getattr(runner, "is_draft_worker", False))
-        draft_mode = os.environ.get(
-            "ATOM_GLM52_DRAFT_ATTN_MODE", "native"
-        ).strip().lower()
-        if draft_mode not in ("all_full", "full", "native"):
-            raise ValueError(
-                "ATOM_GLM52_DRAFT_ATTN_MODE must be 'all_full', 'full', or "
-                "'native', "
-                f"got {draft_mode!r}"
-            )
-
-        if draft_mode == "all_full" or (
-            is_draft_worker and draft_mode == "full"
-        ):
-            backend_cls = ATOMAttnBackendForSgl
-        else:
-            backend_cls = ATOMGLM52DSABackendForSgl
-
-        logger.info(
-            "GLM-5.2 attention route registry=%s role=%s draft_mode=%s backend=%s",
-            registry_name,
-            "draft" if is_draft_worker else "target",
-            draft_mode,
-            backend_cls.__name__,
+        backend_cls = (
+            ATOMAttnBackendForSgl
+            if is_draft_worker
+            else ATOMGLM52DSABackendForSgl
         )
         return backend_cls(runner)
 
@@ -130,7 +111,7 @@ def _register_custom_attention_to_sglang() -> None:
             )
             return ATOMDeepseekV4BackendForSgl(runner)
         if is_glm52_dsa_config(hf_config):
-            return create_glm52_backend(runner, "aiter")
+            return create_glm52_backend(runner)
         return ATOMAttnBackendForSgl(runner)
 
     @register_attention_backend("dsv4")
@@ -144,7 +125,7 @@ def _register_custom_attention_to_sglang() -> None:
     def create_atom_nsa_backend(runner):
         hf_config = runner.model_config.hf_config
         if is_glm52_dsa_config(hf_config):
-            return create_glm52_backend(runner, "nsa")
+            return create_glm52_backend(runner)
         from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
         return NativeSparseAttnBackend(runner)
@@ -174,51 +155,6 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     if getattr(DraftBackendFactory, "_atom_dsv4_draft_backend_patched", False):
         return
 
-    original_create_decode_backend = DraftBackendFactory.create_decode_backend
-    original_create_draft_extend_backend = (
-        DraftBackendFactory.create_draft_extend_backend
-    )
-
-    def _create_atom_decode_backend(self):
-        from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
-
-        hf_config = getattr(
-            getattr(self.draft_model_runner, "model_config", None),
-            "hf_config",
-            None,
-        )
-        backend = original_create_decode_backend(self)
-        if is_glm52_dsa_config(hf_config):
-            per_step = [
-                type(item).__name__
-                for item in getattr(backend, "attn_backends", [])
-            ]
-            logger.info(
-                "GLM-5.2 draft decode backend selection=%s multi_step=%s "
-                "per_step=%s",
-                getattr(self, "draft_attn_backend", None),
-                type(backend).__name__,
-                per_step,
-            )
-        return backend
-
-    def _create_atom_draft_extend_backend(self):
-        from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
-
-        backend = original_create_draft_extend_backend(self)
-        hf_config = getattr(
-            getattr(self.draft_model_runner, "model_config", None),
-            "hf_config",
-            None,
-        )
-        if is_glm52_dsa_config(hf_config):
-            logger.info(
-                "GLM-5.2 draft extend backend selection=%s backend=%s",
-                getattr(self, "draft_attn_backend", None),
-                type(backend).__name__,
-            )
-        return backend
-
     def _create_atom_dsv4_decode_backend(self):
         return ATOMDeepseekV4BackendForSgl(
             self.draft_model_runner,
@@ -234,10 +170,6 @@ def _patch_sglang_dsv4_draft_backends() -> None:
 
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
     DraftBackendFactory._create_dsv4_prefill_backend = _create_atom_dsv4_prefill_backend
-    DraftBackendFactory.create_decode_backend = _create_atom_decode_backend
-    DraftBackendFactory.create_draft_extend_backend = (
-        _create_atom_draft_extend_backend
-    )
     DraftBackendFactory._atom_dsv4_draft_backend_patched = True
     logger.info("Patched SGLang DSV4 speculative draft backends to ATOM")
 
@@ -478,12 +410,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     max_seq_len = int(max(seq_lens_cpu))
                     max_graph_seq_len = GLM52_GRAPH_SEQ_LEN_CAPACITY
                     if max_seq_len > max_graph_seq_len:
-                        logger.info(
-                            "[ATOM_GLM52_VERIFY_GRAPH] eager_fallback "
-                            "seq_len=%d graph_seq_limit=%d",
-                            max_seq_len,
-                            max_graph_seq_len,
-                        )
                         return False
             except Exception:
                 pass
@@ -868,13 +794,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
             ret = original_init_cuda_graphs(self)
-            if is_glm52:
-                logger.info(
-                    "GLM-5.2 CUDA graph initialization: draft_decode=%s "
-                    "draft_extend=%s",
-                    self.cuda_graph_runner is not None,
-                    self.cuda_graph_runner_for_draft_extend is not None,
-                )
             try:
                 if _env_flag(
                     "ATOM_SGLANG_V4_DISABLE_DRAFT_CG"
