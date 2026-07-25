@@ -97,14 +97,9 @@ python3 -m atom.entrypoints.openai_server \
   --server-port 8010 \
   --trust-remote-code \
   --tensor-parallel-size 8 \
-  --gpu-memory-utilization 0.85 \
   --kv_cache_dtype fp8 \
   --block-size 16 \
-  --max-model-len 1048576 \
   --max-num-seqs 512 \
-  --max-num-batched-tokens 131072 \
-  --attn-prefill-chunk-size 131072 \
-  --long-prefill-token-threshold 131072 \
   --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
   --kv-transfer-config '{"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}' \
   2>&1 | tee "${LOG_PATH}"
@@ -112,8 +107,11 @@ python3 -m atom.entrypoints.openai_server \
 
 Notes:
 
-- The 131072-token prefill budget and chunk size are intended for the 1M-context
-  Weka workload.
+- The service leaves maximum model length unspecified, so GLM-5.2's model
+  configuration supplies its native 1M context limit.
+- The service uses ATOM's defaults for GPU memory utilization (`0.9`), maximum
+  batched tokens (`16384`), attention prefill chunk size (`16384`), and long
+  prefill token threshold (`0`).
 - Native HBM prefix caching remains enabled. LMCache acts as the lower CPU
   offload tier when reusable blocks are evicted from HBM.
 - `LMCACHE_CHUNK_SIZE=256` is an integer multiple of `--block-size 16`.
@@ -136,12 +134,9 @@ python3 -m atom.entrypoints.openai_server \
   --server-port 8020 \
   --trust-remote-code \
   --tensor-parallel-size 8 \
-  --gpu-memory-utilization 0.85 \
   --kv_cache_dtype fp8 \
   --block-size 16 \
-  --max-model-len 1048576 \
-  --max-num-seqs 64 \
-  --max-num-batched-tokens 262144 \
+  --max-num-seqs 512 \
   --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
   --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
   2>&1 | tee "${LOG_PATH}"
@@ -235,7 +230,7 @@ python3 -m venv "${AIPERF_VENV}"
 ## Step 7: Run the Agentic Dataset Benchmark
 
 The defaults below reproduce the 1-hour InferenceX-aligned GLM-5.2 workload.
-Set `CONCURRENCY` to one of the nightly points: `1`, `2`, `4`, `16`, or `32`.
+Set `CONCURRENCY` to one of the nightly points: `1`, `2`, `4`, or `8`.
 
 ```bash
 export AIPERF_VENV=${AIPERF_VENV:-/workspace/venvs/aiperf-sa}
@@ -311,13 +306,19 @@ appropriate for short smoke tests below the scenario's minimum valid duration.
 The nightly performance suite measures these points independently:
 
 ```text
-1, 2, 4, 16, 32
+1, 2, 4, 8
 ```
+
+The CI runs each concurrency with three service layouts:
+
+- Prefill TP4 + decode TP4 on separate nodes.
+- Prefill TP4 + decode TP8 on separate nodes.
+- Prefill TP8 + decode TP8 on separate nodes.
 
 Run Step 7 once for each value. Restart the prefill server, decode server, and
 router before every point so each measurement begins with fresh HBM and LMCache
-state. The repository's nightly configuration models these as five separate
-jobs for the same reason.
+state. The repository's nightly configuration models every layout/concurrency
+combination as an independent job for the same reason.
 
 For a short functional smoke test, use:
 
