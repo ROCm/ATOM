@@ -476,8 +476,12 @@ class DSparkLayer(Block):  # type: ignore[misc]
     def _compute_main_kv(
         self, main_x: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        """Project one target hidden state per request into a rolling-window KV
-        row (post kv_norm + RoPE + QAT). main_x: [B, dim] -> [B, head_dim].
+        """Project target hidden states into rolling-window KV rows (post
+        kv_norm + RoPE + QAT). main_x: [T, dim] -> [T, head_dim].
+
+        ``positions`` is the caller's full forward positions buffer, which is
+        padded and therefore may be LONGER than ``main_x``; only its first T
+        entries are consumed (row r of main_x is the token at positions[r]).
 
         The NoPE lanes are fake-quantized through fp8 E4M3 (DSpark QAT numerics)
         then stored bf16 — matching the QAT-trained draft's expected KV values."""
@@ -494,7 +498,9 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # rope_dim == 0 doesn't turn `[..., -rope_dim:]` into the whole head
         # (-0 == 0).
         if rope_dim:
-            a.rotary_emb.forward(positions.reshape(-1), kv[..., -rope_dim:])
+            a.rotary_emb.forward(
+                positions.reshape(-1)[: kv.shape[0]], kv[..., -rope_dim:]
+            )
         _apply_dspark_kv_qat_(kv, rope_dim)
         return kv.view(-1, a.head_dim)
 
@@ -503,21 +509,24 @@ class DSparkLayer(Block):  # type: ignore[misc]
         main_x: torch.Tensor,  # [T, dim]  target hidden(s)
         positions: torch.Tensor,  # [T]
         cu_seqlens_q: torch.Tensor,  # [B+1] int32 per-req spans into main_x
-        write_per_batch: int = 1,
+        write_per_batch: int,
     ) -> None:
-        """Write target-KV row(s) into each request's rolling window (pos % window).
+        """Write target-KV rows into each request's rolling window.
 
-        Two modes:
-          * decode: main_x is [B, dim], one anchor token per request, so
-            ``cu_seqlens_q`` is the identity ramp [0..B] (the caller passes the
-            drafter's preallocated ``arrange_bs`` slice) and ``write_per_batch=1``.
-          * prefill warmup: main_x is the flat [T, dim] ragged batch of all
-            scheduled tokens; ``cu_seqlens_q`` ([B+1]) delimits per-request
-            spans and ``write_per_batch = min(max_seqlen, window)`` so the last
-            ``min(seq_len, window)`` tokens of every request seed the window.
-            Without this, a request's first draft (right after prefill) sees an
-            almost-empty window and rejects early; warming it lifts first-block
-            acceptance to the steady-state level.
+        ``main_x`` is the flat [T, dim] ragged batch of every scheduled token and
+        ``cu_seqlens_q`` ([B+1]) delimits the per-request spans; the last
+        ``min(seq_len, write_per_batch)`` rows of each span are written. Callers
+        pass ``write_per_batch = window_size``, which covers a prefill tail and a
+        decode verify span alike.
+
+        Every scheduled row is written on every step, prefill and decode. The
+        window must hold a target-KV row for EVERY position it spans: a
+        spec-decode step advances the anchor by 1 + (accepted drafts), so writing
+        only the anchor row would leave most slots at their zero-init value while
+        the read side still gathers them (validity is derived from absolute
+        position, not from whether a slot was ever written). Rows past the anchor
+        belong to rejected drafts on future positions — never read this step, and
+        overwritten from a valid hidden by the step that accepts them.
 
         PAGED-SWA: the draft window KV now lives in the shared paged pool
         (``self.attn.swa_kv``, this draft layer's slice of ``unified_kv``),
@@ -822,14 +831,15 @@ class DeepseekV4DSpark(nn.Module):
         main_hidden,
         positions,
         cu_seqlens_q,
-        write_per_batch: int = 1,
+        write_per_batch: int,
     ) -> None:
         """Populate every stage's rolling target-KV window from target hidden.
 
-        Decode: one anchor row per request, so ``cu_seqlens_q`` is the identity
-        ramp [0..B]. Prefill warmup: pass the flat ragged batch with the real
-        ``cu_seqlens_q`` + ``write_per_batch`` so the last ``min(seq_len, window)``
-        tokens of each request seed the window.
+        Pass the flat ragged batch of all scheduled tokens with the real
+        ``cu_seqlens_q`` and ``write_per_batch = window_size``, so the last
+        ``min(seq_len, window)`` rows of every request are written — on decode
+        steps as well as prefill. See :meth:`DSparkLayer.precompute_context_kv`
+        for why every scheduled row must be written, not just the anchor.
         """
         self.model.precompute_context_kv(
             main_hidden, positions, cu_seqlens_q, write_per_batch
@@ -905,7 +915,7 @@ class _DSparkInner(nn.Module):
         main_hidden,
         positions,
         cu_seqlens_q,
-        write_per_batch: int = 1,
+        write_per_batch: int,
     ) -> None:
         # Stage 0 owns main_proj/main_norm; project once, reuse the rolling-KV
         # write per stage (each stage has its own kv cache + attn linears).
