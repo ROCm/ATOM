@@ -108,15 +108,12 @@ class DSparkConfidenceHead(nn.Module):
     ``W1[x_{k-1}]`` (rank), so the projection weight has shape
     ``[1, hidden + rank]`` (checkpoint: confidence_head.proj.weight [1, 7680]).
 
-    ``h_k`` is the PRE-norm mHC head reduction, NOT the post-norm tensor the LM
-    head consumes — the reference never rebinds ``x`` through ``self.norm``
-    (model.py:862/873). Feeding the normed tensor here silently miscalibrates
-    every confidence score.
+    ``h_k`` is the PRE-norm mHC head reduction, not the post-norm tensor the LM
+    head consumes; feeding the normed one miscalibrates every score.
 
-    Unlike the reference, which returns the raw projection and leaves ``sigma``
-    to its caller, the sigmoid is applied here: ATOM's VerifyScheduler consumes
-    ``c_k`` as an absolute probability (cumulative-product survival + STS), so
-    the (0, 1) range is part of this module's contract.
+    The sigmoid lives here rather than in the caller (as in the reference):
+    VerifyScheduler consumes ``c_k`` as an absolute probability, so the (0, 1)
+    range is part of this module's contract.
     """
 
     def __init__(self, hidden_size: int, rank: int):
@@ -217,13 +214,8 @@ def _dspark_block_topk_idxs(
       * EVERY draft-block slot           -> global index ``W + j`` (j = 0..T-1)
     Invalid window slots are ``-1`` (the fused sparse_attn kernel skips them).
 
-    Attention inside the draft block is BIDIRECTIONAL, not causal: the block is
-    a fixed ``[anchor, noise, noise, ...]`` input decoded in parallel, and the
-    reference builds ONE column list and broadcasts it over every query row
-    (HF ``inference/model.py`` ``get_dspark_topk_idxs``:
-    ``cat([...]).view(1, 1, -1).expand(bsz, block_size, -1)``). Masking the
-    block causally gives each position a different, shorter context than the
-    one it was trained on and costs acceptance.
+    Attention inside the draft block is BIDIRECTIONAL: the block is decoded in
+    one parallel pass, so position is carried by RoPE, not by a causal mask.
 
     Returns: topk_idxs [B, T, W+T] int32, suitable for ``sparse_attn``.
     """
@@ -490,9 +482,8 @@ class DSparkLayer(Block):  # type: ignore[misc]
         """Project target hidden states into rolling-window KV rows (post
         kv_norm + RoPE + QAT). main_x: [T, dim] -> [T, head_dim].
 
-        ``positions`` is the caller's full forward positions buffer, which is
-        padded and therefore may be LONGER than ``main_x``; only its first T
-        entries are consumed (row r of main_x is the token at positions[r]).
+        ``positions`` is the caller's padded forward buffer and may be longer
+        than ``main_x``; only its first T entries are used.
 
         The NoPE lanes are fake-quantized through fp8 E4M3 (DSpark QAT numerics)
         then stored bf16 — matching the QAT-trained draft's expected KV values."""
@@ -530,14 +521,10 @@ class DSparkLayer(Block):  # type: ignore[misc]
         pass ``write_per_batch = window_size``, which covers a prefill tail and a
         decode verify span alike.
 
-        Every scheduled row is written on every step, prefill and decode. The
-        window must hold a target-KV row for EVERY position it spans: a
-        spec-decode step advances the anchor by 1 + (accepted drafts), so writing
-        only the anchor row would leave most slots at their zero-init value while
-        the read side still gathers them (validity is derived from absolute
-        position, not from whether a slot was ever written). Rows past the anchor
-        belong to rejected drafts on future positions — never read this step, and
-        overwritten from a valid hidden by the step that accepts them.
+        Every scheduled row is written on every step: the window must hold a row
+        for every position it spans, and the read side gathers slots by absolute
+        position regardless of whether they were ever written. See
+        :meth:`DSparkProposer.propose` for why writing rejected rows is safe.
 
         PAGED-SWA: the draft window KV now lives in the shared paged pool
         (``self.attn.swa_kv``, this draft layer's slice of ``unified_kv``),
@@ -847,10 +834,8 @@ class DeepseekV4DSpark(nn.Module):
         """Populate every stage's rolling target-KV window from target hidden.
 
         Pass the flat ragged batch of all scheduled tokens with the real
-        ``cu_seqlens_q`` and ``write_per_batch = window_size``, so the last
-        ``min(seq_len, window)`` rows of every request are written — on decode
-        steps as well as prefill. See :meth:`DSparkLayer.precompute_context_kv`
-        for why every scheduled row must be written, not just the anchor.
+        ``cu_seqlens_q`` and ``write_per_batch = window_size``. See
+        :meth:`DSparkLayer.precompute_context_kv`.
         """
         self.model.precompute_context_kv(
             main_hidden, positions, cu_seqlens_q, write_per_batch
@@ -981,11 +966,8 @@ class _DSparkInner(nn.Module):
             hc_state.x_prev, residual, hc_state.post_mix, hc_state.comb_mix
         )  # [B*T, hc, dim]
         # Sigmoid-gated mHC head reduction to [B*T, dim] (reuse target head math).
-        # The LM head and the confidence head take DIFFERENT tensors: the
-        # reference applies `norm` inline for the logits only and never rebinds
-        # `x`, so the confidence head sees the PRE-norm reduction (model.py:862
-        # `x = self.hc_head(...)`, :863 `logits = self.head(self.norm(x), ...)`,
-        # :873 `confidence = self.confidence_head(x, markov_embed)`).
+        # `norm` applies to the LM head input only: the confidence head takes the
+        # PRE-norm reduction (matching the reference).
         hc_hidden = self.head.hc_head(
             reduced, last.hc_head_fn, last.hc_head_scale, last.hc_head_base
         )  # [B*T, dim]
@@ -1002,9 +984,8 @@ class _DSparkInner(nn.Module):
         paper Eq.5:  logits_k <- U_k + B(x_{k-1}, .) ;  x_k <- sample(logits_k)
         Confidence:  c_k = sigma(proj([h_k ; W1[x_{k-1}]]))
 
-        ``hc_hidden`` is the PRE-norm mHC head reduction [B, T, dim] — the
-        confidence head's ``h_k``. The base logits were built from the POST-norm
-        tensor; the two heads deliberately consume different inputs.
+        ``hc_hidden`` is the PRE-norm mHC reduction [B, T, dim] (the confidence
+        head's ``h_k``); ``base_logits`` came from the post-norm tensor.
         """
         B, T, _ = base_logits.shape
         last = self.mtp[-1]

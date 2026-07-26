@@ -158,11 +158,8 @@ def test_speculative_config_mtp_not_misrouted_to_dspark():
 
 
 def test_block_sparse_attention_is_bidirectional_within_block():
-    # DSpark decodes the whole draft block in parallel, so EVERY draft query
-    # position sees EVERY draft KV column — including ones after itself. The HF
-    # reference builds one column list and broadcasts it over all query rows
-    # (get_dspark_topk_idxs: `.view(1, 1, -1).expand(bsz, block_size, -1)`).
-    # A causal mask here would silently cost acceptance, so pin the direction.
+    # The block is decoded in one parallel pass, so every draft query position
+    # sees every draft KV column, including ones after itself.
     B, T, H, D, W = 1, 4, 2, 8, 3
     torch.manual_seed(0)
     q = torch.randn(B, T, H, D)
@@ -187,10 +184,9 @@ def test_block_sparse_attention_is_bidirectional_within_block():
 
 
 def test_block_topk_idxs_encode_the_same_mask_as_the_torch_path():
-    # The torch fallback re-derives the mask from `valid_target` and IGNORES
-    # topk_idxs, while production dispatches to the fused kernel and honours
-    # ONLY topk_idxs. Nothing else pins the two encodings together, so assert
-    # the gather indices directly: any drift here is invisible on CPU.
+    # The torch fallback ignores topk_idxs and production honours only
+    # topk_idxs, so nothing else pins the two encodings together. Assert the
+    # gather indices directly — drift is invisible on CPU otherwise.
     B, T, W = 2, 4, 5
     valid_target = torch.ones(B, W, dtype=torch.bool)
     valid_target[0, :2] = False  # request 0 has two unpopulated window slots

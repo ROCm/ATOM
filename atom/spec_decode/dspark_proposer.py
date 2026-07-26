@@ -133,38 +133,22 @@ class DSparkProposer(Drafter):
         anchor_ids = next_token_ids
         anchor_positions = torch.index_select(target_positions, 0, last_token_indices)
 
-        # Populate the rolling target-KV window before drafting: write EVERY
-        # scheduled row of the batch, on prefill and decode steps alike.
+        # Populate the rolling target-KV window: write EVERY scheduled row, on
+        # prefill and decode alike. A spec-decode step advances the anchor by
+        # 1 + accepted drafts, so writing only the anchor would leave most slots
+        # at their zero-init value — and the read side gathers them regardless,
+        # since validity comes from absolute position, not from what was written.
+        # Rejected rows are harmless: swa_write is content-addressed by position
+        # and the draft only reads [anchor-window+1, anchor], so they land on
+        # future positions, unread until the step that accepts them rewrites them.
         #
-        # Writing only the anchor row on decode steps leaves holes. A spec-decode
-        # step advances the anchor by 1 + (accepted drafts) — ~3.4 positions at
-        # the measured acceptance rate — so one row per step populates only
-        # ~1/3.4 of the 128-slot window. The read side derives slot validity
-        # purely from absolute position (``_build_block_plan``), so never-written
-        # slots are gathered anyway; the pool is zero-init, and a zero KV row
-        # scores 0, contributing exp(0)=1 to the softmax denominator and nothing
-        # to the numerator. ~91 such rows act as one giant attention sink.
-        # The reference writes a target-KV row for EVERY decoded position.
+        # write_per_batch is only the grid's y extent (the kernel clamps to
+        # min(tok_n, WRITE_PER_BATCH) per sequence), so pass the window size
+        # instead of paying a `seqlens.max().item()` sync.
         #
-        # Writing the whole span needs no accepted/rejected mask: ``swa_write``
-        # is content-addressed by ``positions``, and the draft only ever reads
-        # ``[anchor-window+1, anchor]``. Rows past the anchor are rejected drafts
-        # landing on FUTURE positions — unread this step, and rewritten from a
-        # valid hidden by the step that eventually accepts them (a position
-        # becomes the anchor only on a step whose span covered it at or before
-        # ``last_token_indices``, and every row up to that index was produced
-        # from correctly-conditioned target hidden states).
-        #
-        # write_per_batch is only the grid's y extent: `swa_write`'s kernel
-        # clamps it per sequence itself (`write_n = min(tok_n, WRITE_PER_BATCH)`,
-        # rows beyond that return immediately). So pass the window size directly
-        # — it covers a prefill tail and a verify span alike, and deriving the
-        # true max would cost a blocking `seqlens.max().item()` device sync on
-        # every step to save only a few no-op grid rows.
-        #
-        # NOTE: GSM8K does NOT catch regressions here — spec decode stays
-        # lossless, so accuracy moves only through batch-shape numerics while
-        # acceptance can halve. Verify changes against acceptance rate.
+        # NOTE: GSM8K cannot catch regressions here — spec decode is lossless,
+        # so accuracy only moves through batch-shape numerics while acceptance
+        # can halve. Verify against acceptance rate.
         with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
             self.model.precompute_context_kv(
                 main_hidden_all,
