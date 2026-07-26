@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 from torch.profiler import record_function
 
@@ -143,18 +144,31 @@ class DSparkProposer(Drafter):
         # future positions, unread until the step that accepts them rewrites them.
         #
         # write_per_batch is only the grid's y extent (the kernel clamps to
-        # min(tok_n, WRITE_PER_BATCH) per sequence), so pass the window size
-        # instead of paying a `seqlens.max().item()` sync.
+        # min(tok_n, WRITE_PER_BATCH) per sequence), so it costs nothing to
+        # over-provision and never needs a `seqlens.max().item()` sync. It must
+        # cover window + mtp_k, not just window: swa_write keeps the LAST
+        # write_per_batch rows of a span, while the anchor sits up to mtp_k rows
+        # BEFORE the span end, so a narrower bound drops the anchor's own row
+        # once mtp_k approaches the window. That is the same win_with_spec the
+        # prefix-cache gate uses (swa_pool.py). Under ATOM_SWA_FULL_RETAIN the
+        # target publishes every chunk block to the content-addressed cache, so
+        # the draft must fill them too — otherwise a cross-request prefix hit
+        # lands on draft blocks that were never written.
         #
         # NOTE: GSM8K cannot catch regressions here — spec decode is lossless,
         # so accuracy only moves through batch-shape numerics while acceptance
         # can halve. Verify against acceptance rate.
+        write_per_batch = (
+            int(attn_metadata.max_seqlen_q)
+            if envs.ATOM_SWA_FULL_RETAIN
+            else int(self.model.window_size) + int(self.mtp_k)
+        )
         with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
             self.model.precompute_context_kv(
                 main_hidden_all,
                 target_positions,
                 attn_metadata.cu_seqlens_q[: bs + 1],
-                write_per_batch=int(self.model.window_size),
+                write_per_batch=write_per_batch,
             )
         # Draft width = the verify horizon mtp_k (num_speculative_tokens). This
         # may exceed dspark_block_size (the training default); DSpark weights are

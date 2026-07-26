@@ -223,6 +223,10 @@ class DeepseekV4MTP(nn.Module):
         self.args = DeepseekV4Args.from_hf_config(self.hf_config)
         self.args.quant_config = make_v4_quant_config(
             self.hf_config,
+            # Target parity (deepseek_v4.py): without model_path the
+            # wo_a-is-BF16-on-disk probe returns False, and a ckpt shipping BF16
+            # wo_a would give the draft FP8+scale params and garbage attention.
+            model_path=getattr(config, "model", None),
             online_quant_config=getattr(config, "online_quant_config", None),
         )
         self.atom_config.quant_config = self.args.quant_config
