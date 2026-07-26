@@ -1,9 +1,6 @@
 # Default base image
-ARG BASE_IMAGE="rocm/pytorch:latest"
+ARG BASE_IMAGE="rocm/vllm:rocm7.14.0_cdna_ubuntu24.04_py3.14_pytorch_2.11.0_vllm_0.23.0"
 ARG GPU_ARCH="gfx942;gfx950"
-ARG TORCH_ROCM_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0%2Brocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl"
-ARG TORCHVISION_ROCM_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchvision-0.26.0%2Brocm7.2.2.git336d36e8-cp312-cp312-linux_x86_64.whl"
-ARG TORCHAUDIO_ROCM_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchaudio-2.10.0%2Brocm7.2.2.git5047768f-cp312-cp312-linux_x86_64.whl"
 
 # ====================================================================
 # ATOM image: multi-stage parallel build
@@ -12,7 +9,7 @@ ARG TORCHAUDIO_ROCM_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7
 #   base ──┬── build_rccl  ──┐
 #          └── build_aiter ──┴── atom_image (merge builders + install MORI/ATOM)
 #
-# Triton is NOT built from source: the ROCm PyTorch base image already ships a
+# Triton is NOT built from source: the ROCm vLLM base image already ships a
 # matching Triton (installed as a torch dependency), and aiter handles its own
 # Triton needs at install time. The previous build_triton stage that compiled
 # ROCm/triton release/internal/3.5.x has been removed.
@@ -24,17 +21,10 @@ ARG TORCHAUDIO_ROCM_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7
 FROM ${BASE_IMAGE} AS base
 
 ARG GPU_ARCH
-ARG TORCH_ROCM_WHEEL_URL
-ARG TORCHVISION_ROCM_WHEEL_URL
-ARG TORCHAUDIO_ROCM_WHEEL_URL
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 
 RUN pip install --upgrade pip && \
-    pip install --no-deps --force-reinstall \
-        "${TORCH_ROCM_WHEEL_URL}" \
-        "${TORCHVISION_ROCM_WHEEL_URL}" \
-        "${TORCHAUDIO_ROCM_WHEEL_URL}" && \
     python -c "import torch, torchvision, torchaudio; print(f'torch={torch.__version__}'); print(f'hip={torch.version.hip}'); print(f'torchvision={torchvision.__version__}'); print(f'torchaudio={torchaudio.__version__}'); assert torch.version.hip is not None" && \
     apt-get update && \
     apt --fix-broken install -y && \
@@ -184,7 +174,7 @@ COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
 RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
     rm -rf /tmp/rccl
 
-# Triton ships with the ROCm PyTorch base image (installed as a torch dependency);
+# Triton ships with the ROCm vLLM base image (installed as a torch dependency);
 # no separate build/copy step is needed here.
 
 # Aiter: copy compiled source tree + re-register editable install
