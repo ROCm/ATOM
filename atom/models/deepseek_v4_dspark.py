@@ -104,13 +104,19 @@ class DSparkConfidenceHead(nn.Module):
 
         c_k = sigma( w^T [ h_k ; W1[x_{k-1}] ] )
 
-    Input is the concatenation of the backbone hidden state ``h_k`` (dim) and the
-    Markov embedding ``W1[x_{k-1}]`` (rank), so the projection weight has shape
+    Input is the concatenation of ``h_k`` (dim) and the Markov embedding
+    ``W1[x_{k-1}]`` (rank), so the projection weight has shape
     ``[1, hidden + rank]`` (checkpoint: confidence_head.proj.weight [1, 7680]).
 
-    The raw sigmoid output is the per-position conditional acceptance estimate.
-    Phase 2 applies Sequential Temperature Scaling (STS) on the cumulative
-    product before feeding the hardware-aware scheduler.
+    ``h_k`` is the PRE-norm mHC head reduction, NOT the post-norm tensor the LM
+    head consumes — the reference never rebinds ``x`` through ``self.norm``
+    (model.py:862/873). Feeding the normed tensor here silently miscalibrates
+    every confidence score.
+
+    Unlike the reference, which returns the raw projection and leaves ``sigma``
+    to its caller, the sigmoid is applied here: ATOM's VerifyScheduler consumes
+    ``c_k`` as an absolute probability (cumulative-product survival + STS), so
+    the (0, 1) range is part of this module's contract.
     """
 
     def __init__(self, hidden_size: int, rank: int):
@@ -121,7 +127,7 @@ class DSparkConfidenceHead(nn.Module):
         self, hidden_states: torch.Tensor, markov_embeds: torch.Tensor
     ) -> torch.Tensor:
         """Args:
-            hidden_states: [*, hidden]  backbone hidden h_k.
+            hidden_states: [*, hidden]  PRE-norm mHC head reduction h_k.
             markov_embeds: [*, rank]    W1[x_{k-1}].
         Returns:
             confidence: [*]  sigmoid survival probability in (0, 1).
@@ -975,22 +981,30 @@ class _DSparkInner(nn.Module):
             hc_state.x_prev, residual, hc_state.post_mix, hc_state.comb_mix
         )  # [B*T, hc, dim]
         # Sigmoid-gated mHC head reduction to [B*T, dim] (reuse target head math).
-        hidden = self.head.hc_head(
+        # The LM head and the confidence head take DIFFERENT tensors: the
+        # reference applies `norm` inline for the logits only and never rebinds
+        # `x`, so the confidence head sees the PRE-norm reduction (model.py:862
+        # `x = self.hc_head(...)`, :863 `logits = self.head(self.norm(x), ...)`,
+        # :873 `confidence = self.confidence_head(x, markov_embed)`).
+        hc_hidden = self.head.hc_head(
             reduced, last.hc_head_fn, last.hc_head_scale, last.hc_head_base
-        )
-        hidden = last.norm(hidden).view(B, T, -1)  # [B, T, dim]
-        base_logits = self.head.get_logits(hidden.reshape(B * T, -1)).view(
+        )  # [B*T, dim]
+        base_logits = self.head.get_logits(last.norm(hc_hidden)).view(
             B, T, -1
         )  # [B, T, vocab]
 
         # ----- Sequential Markov head: sample the block left-to-right ---------
-        return self.forward_head(base_logits, hidden, input_ids)
+        return self.forward_head(base_logits, hc_hidden.view(B, T, -1), input_ids)
 
-    def forward_head(self, base_logits, hidden, anchor_ids):
+    def forward_head(self, base_logits, hc_hidden, anchor_ids):
         """Apply the Markov transition bias position-by-position and sample.
 
         paper Eq.5:  logits_k <- U_k + B(x_{k-1}, .) ;  x_k <- sample(logits_k)
         Confidence:  c_k = sigma(proj([h_k ; W1[x_{k-1}]]))
+
+        ``hc_hidden`` is the PRE-norm mHC head reduction [B, T, dim] — the
+        confidence head's ``h_k``. The base logits were built from the POST-norm
+        tensor; the two heads deliberately consume different inputs.
         """
         B, T, _ = base_logits.shape
         last = self.mtp[-1]
@@ -1005,6 +1019,6 @@ class _DSparkInner(nn.Module):
             )  # greedy (temp handled upstream)
             markov_embeds.append(m_embed)
         confidence = last.confidence_head(
-            hidden, torch.stack(markov_embeds, dim=1)
+            hc_hidden, torch.stack(markov_embeds, dim=1)
         )  # [B, T]
         return out_ids[:, 1:], confidence
