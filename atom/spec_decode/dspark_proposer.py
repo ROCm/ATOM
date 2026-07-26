@@ -5,6 +5,7 @@ import torch.nn as nn
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils.forward_context import get_forward_context
+from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
 
@@ -131,37 +132,48 @@ class DSparkProposer(Drafter):
         # at last_token_indices in the flat batch.
         anchor_ids = next_token_ids
         anchor_positions = torch.index_select(target_positions, 0, last_token_indices)
-        main_hidden = torch.index_select(main_hidden_all, 0, last_token_indices)
-        state_slot = getattr(attn_metadata, "state_slot_mapping", None)
-        if state_slot is not None:
-            cache_indices = state_slot[:bs].to(torch.long)
-        else:
-            cache_indices = torch.arange(bs, device=anchor_ids.device, dtype=torch.long)
 
-        # Prefill warmup: seed each request's rolling window with the last
-        # min(seq_len, window) target tokens BEFORE drafting. Right after
-        # prefill the window is otherwise empty (only the anchor would be
-        # written), so the first draft block sees almost no target context and
-        # rejects early. Writing the prefill tail lifts first-block acceptance
-        # to the steady-state level. Decode steps skip this (the ring buffer is
-        # already populated from prior steps).
+        # Populate the rolling target-KV window before drafting. The two branches
+        # are mutually exclusive: the prefill warmup seeds each request's window
+        # tail, and the anchor IS that tail's last row, so writing it again right
+        # after would recompute the same slot from the same hidden state.
         if context.is_prefill:
-            cu_seqlens_q = getattr(attn_metadata, "cu_seqlens_q", None)
-            if cu_seqlens_q is not None:
-                window = int(self.model.window_size)
-                seqlens = cu_seqlens_q[1 : bs + 1] - cu_seqlens_q[:bs]
-                write_per_batch = int(min(int(seqlens.max().item()), window))
+            # Seed each request's window with its last min(seq_len, window)
+            # target tokens. Straight after prefill the window is otherwise
+            # empty, so the first draft block would see almost no target context
+            # and reject early; warming it lifts first-block acceptance to the
+            # steady-state level.
+            # write_per_batch is only the grid's y extent: `swa_write`'s kernel
+            # clamps it per sequence itself (`write_n = min(tok_n, WRITE_PER_BATCH)`,
+            # rows beyond that return immediately). So pass the window size
+            # directly — deriving the true max would cost a blocking
+            # `seqlens.max().item()` device sync on every prefill step, to save
+            # only a few no-op grid rows.
+            with record_function(
+                f"dspark_warmup_kv[bs={bs} tok={main_hidden_all.shape[0]}]"
+            ):
                 self.model.precompute_context_kv(
                     main_hidden_all,
                     target_positions,
-                    cache_indices,
-                    cu_seqlens_q=cu_seqlens_q[: bs + 1],
-                    write_per_batch=write_per_batch,
+                    attn_metadata.cu_seqlens_q[: bs + 1],
+                    write_per_batch=int(self.model.window_size),
                 )
-
-        # Refresh the rolling target-KV window with the new anchor row, then
-        # draft the block in a single backbone pass.
-        self.model.precompute_context_kv(main_hidden, anchor_positions, cache_indices)
+        else:
+            # Decode: append only the newly verified anchor row. The rest of the
+            # window is already populated from prior steps.
+            #
+            # NOTE: GSM8K does NOT catch regressions here — spec decode stays
+            # lossless, so accuracy moves only through batch-shape numerics while
+            # acceptance can halve. Verify changes against acceptance rate.
+            with record_function(f"dspark_ctx_kv[bs={bs}]"):
+                self.model.precompute_context_kv(
+                    torch.index_select(main_hidden_all, 0, last_token_indices),
+                    anchor_positions,
+                    # One anchor row per request -> the identity ramp [0..bs].
+                    # Slice the drafter's preallocated buffer instead of building
+                    # a fresh arange (it would be rebuilt once per DSpark stage).
+                    self.arrange_bs[: bs + 1],
+                )
         # Draft width = the verify horizon mtp_k (num_speculative_tokens). This
         # may exceed dspark_block_size (the training default); DSpark weights are
         # draft-width-agnostic so the wider block is drafted in one pass, with
@@ -170,13 +182,12 @@ class DSparkProposer(Drafter):
         window = int(self.model.window_size)
         num_draft = min(self.mtp_k, window)
         self._refresh_dp_metadata(forward_context, bs * num_draft)
-        draft_token_ids, confidence = self.model.forward_spec(
-            anchor_ids,
-            main_hidden,
-            anchor_positions,
-            cache_indices,
-            num_draft=num_draft,
-        )
+        with record_function(f"dspark[bs={bs} T={num_draft}]"):
+            draft_token_ids, confidence = self.model.forward_spec(
+                anchor_ids,
+                anchor_positions,
+                num_draft=num_draft,
+            )
         draft_token_ids = draft_token_ids[:, : self.mtp_k]
         # Confidence-scheduled verification. The hardware-aware prefix scheduler
         # consumes the confidence head to pick a per-request verify length
@@ -185,9 +196,10 @@ class DSparkProposer(Drafter):
         # request's scheduled spec tokens to ell_r, which frees batch capacity
         # instead of the no-op in-block masking of Level A.
         if self.verify_scheduler is not None and confidence is not None:
-            self.verify_scheduler.set_last_ell(
-                self.verify_scheduler.compute_ell(confidence[:, : self.mtp_k])
-            )
+            with record_function(f"dspark_sched[bs={bs}]"):
+                self.verify_scheduler.set_last_ell(
+                    self.verify_scheduler.compute_ell(confidence[:, : self.mtp_k])
+                )
         elif self.verify_scheduler is not None:
             self.verify_scheduler.set_last_ell(None)
         return draft_token_ids
