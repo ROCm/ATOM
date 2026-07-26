@@ -333,6 +333,15 @@ class UBatchWrapper(nn.Module):
                 # Concatenate results (this op is captured too)
                 sorted_results = [v for _, v in sorted(results)]
                 output = self._concat_ubatch_outputs(sorted_results)
+                # capture_tbo_graph bypasses nn.Module.__call__, so registered
+                # forward hooks don't fire. Run them here (inside the graph) so
+                # drafter aux capture (EAGLE3 tuple-strip) writes its buffers as
+                # captured ops; a hook returning a value replaces the output,
+                # mirroring __call__ semantics.
+                for hook in self._forward_hooks.values():
+                    hooked = hook(self, (input_ids, positions), output)
+                    if hooked is not None:
+                        output = hooked
                 # Copy into caller's buffer so replay writes to the right place
                 if output_buffer is not None:
                     output_buffer.copy_(self._primary_output(output))

@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ctypes
-import bisect
 import gc
 import inspect
 import logging
@@ -10,7 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -25,6 +24,12 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.distributed.pcp_utils import (
+    PcpBalGroup,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+    pcp_round_robin_split,
+)
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -36,7 +41,8 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
-from atom.spec_decode.eagle import EagleProposer
+from atom.spec_decode.drafter import Drafter
+from atom.spec_decode.factory import build_drafter
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -62,12 +68,6 @@ from atom.utils.tbo import (
     local_tbo_precompute,
     maybe_create_ubatch_slices,
     sync_dp_metadata,
-)
-from atom.distributed.pcp_utils import (
-    PcpBalGroup,
-    pcp_allgather_rerange,
-    pcp_pad_len,
-    pcp_round_robin_split,
 )
 from torch.profiler import record_function
 
@@ -236,9 +236,6 @@ class tokenIDProcessor:
         self.pending_mtp_status_copies: list[
             tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
         ] = []
-        self.mapped_bonus_list: Optional[list[int]] = (
-            None  # Mapped to current batch order
-        )
         self.num_rejected: Optional[np.ndarray] = None
         self.num_bonus: Optional[np.ndarray] = None
 
@@ -447,7 +444,8 @@ class tokenIDProcessor:
         self.num_rejected = batch.num_rejected
         self.num_bonus = batch.num_bonus
         if num_deferred_seqs > 0 and self.prev_rejected_num is not None:
-            # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
+            # Remap prev step's rejected/bonus counts onto the current batch order
+            # (prev_idx → curr_idx) for the deferred (carried-over) sequences.
             self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
                 deferred_prev_indices
             ]
@@ -727,14 +725,7 @@ class ModelRunner:
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
-        self.eagle3_mode = (
-            self.config.speculative_config is not None
-            and self.config.speculative_config.method == "eagle3"
-        )
 
-        self.use_aux_hidden_state_outputs = False
-        self.use_dspark_aux_capture = False
-        self._aux_hidden_states = None
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
@@ -781,35 +772,14 @@ class ModelRunner:
 
             torch.set_default_device(self.device)
             with set_model_tag("drafter"):
-                self.drafter = EagleProposer(self.config, self.device, self)
+                self.drafter = build_drafter(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler()
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
-
-        if self.eagle3_mode and self.config.speculative_config.use_aux_hidden_state:
-            aux_ids = self.config.speculative_config.eagle3_aux_layer_ids
-            if not aux_ids and hasattr(
-                self.model, "get_eagle3_aux_hidden_state_layers"
-            ):
-                aux_ids = list(self.model.get_eagle3_aux_hidden_state_layers())
-            if aux_ids:
-                self.model.set_aux_hidden_state_layers(tuple(aux_ids))
-                self.use_aux_hidden_state_outputs = True
-                logger.info(f"Eagle3 aux hidden state layers: {aux_ids}")
-
-        # DSpark draft consumes target hidden states from configured target
-        # layers (dspark_target_layer_ids, e.g. [58,59,60]). The reference
-        # captures the per-layer mHC residual reduced over the hc axis
-        # (mean over dim=1: [N, hc, dim] -> [N, dim]) and concatenates the
-        # selected layers. V4ForCausalLM is @support_torch_compile (must not be
-        # edited), so we capture via forward hooks on the target decoder layers.
-        if (
-            self.config.speculative_config
-            and get_pp_group().is_last_rank
-            and getattr(self.config.speculative_config, "use_dspark", lambda: False)()
-        ):
-            self._install_dspark_aux_hooks()
+            # NOTE: aux-hidden-state capture is armed AFTER the optional TBO wrap
+            # below, so the drafter's capture hook lands on the object whose
+            # forward returns the final (concatenated) output. See arm_aux_capture.
 
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
@@ -847,6 +817,12 @@ class ModelRunner:
                 dp_gather_scatter=dp_gather_scatter,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
+        # Arm drafter-owned aux capture now that self.model is final (TBO-wrapped
+        # or not): the capture hook must sit on the object whose forward returns
+        # the concatenated output. Fully drafter-owned — ModelRunner stays
+        # aux-unaware (no tuple unpack, no aux buffers, no graph_aux state).
+        if getattr(self, "drafter", None) is not None:
+            self.drafter.arm_aux_capture(self.model)
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
@@ -997,16 +973,6 @@ class ModelRunner:
             decode_context_parallel_size=getattr(
                 config, "decode_context_parallel_size", 1
             ),
-        )
-
-    def _make_buffer(
-        self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
-    ) -> CpuGpuBuffer:
-        # Bfloat16 torch tensors cannot be directly cast to a numpy array, so
-        # if a bfloat16 buffer is needed without a corresponding numpy array,
-        # don't bother instantiating the numpy array.
-        return CpuGpuBuffer(
-            *size, dtype=dtype, device=self.device, pin_memory=True, with_numpy=numpy
         )
 
     def _get_cumsum_and_arange(
@@ -1168,88 +1134,6 @@ class ModelRunner:
         if self.rank == 0:
             logger.info(*args)
 
-    def _install_dspark_aux_hooks(self) -> None:
-        """Capture DSpark target hidden states via forward hooks.
-
-        DSpark's draft reads, for each configured target layer L, the layer's
-        output mHC residual reduced over the hc axis (mean(dim=1):
-        [N, hc, dim] -> [N, dim]), and concatenates the selected layers into
-        [N, len(target_layers)*dim].
-
-        The captured per-layer [N, dim] tensors are stashed on the runner and
-        read out in run_model as ``self._aux_hidden_states`` (list, target order).
-        """
-        spec_cfg = self.config.speculative_config
-        draft_cfg = spec_cfg.draft_model_hf_config
-        target_layer_ids = tuple(
-            int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
-        )
-        if not target_layer_ids:
-            raise ValueError(
-                "DSpark requires dspark_target_layer_ids on the draft config."
-            )
-
-        base = getattr(self.model, "language_model", self.model)
-        inner = base.model  # DeepseekV4Model
-        layers = inner.layers
-        hidden_size = self.config.hf_config.hidden_size
-        max_tokens = self.config.max_num_batched_tokens
-
-        self._dspark_target_layer_ids = target_layer_ids
-        self._dspark_aux_buffers = [
-            torch.zeros(
-                max_tokens,
-                hidden_size,
-                device=self.device,
-                dtype=self.config.torch_dtype,
-            )
-            for _ in target_layer_ids
-        ]
-        # Map layer id -> buffer index (closed over by each hook; read-only).
-        layer_to_buf = {lid: i for i, lid in enumerate(target_layer_ids)}
-
-        def _make_hook(buf_idx: int, block):
-            buffer = self._dspark_aux_buffers[buf_idx]
-
-            def _hook(_module, _inputs, output):
-                # output is the HCState returned by Block.forward.
-                residual = getattr(output, "residual", None)
-                x_prev = getattr(output, "x_prev", None)
-                post = getattr(output, "post_mix", None)
-                comb = getattr(output, "comb_mix", None)
-                if residual is None:
-                    return
-                if x_prev is not None and post is not None and comb is not None:
-                    # Synthesize the post-layer residual [N, hc, dim].
-                    out_res = block.hc_post(x_prev, residual, post, comb)
-                else:
-                    out_res = residual
-                # Reduce over the hc axis to [N, dim] and write in-place into the
-                # fixed buffer (cudagraph-safe; no host-side dict mutation).
-                reduced = out_res.mean(dim=1)
-                buffer[: reduced.shape[0]].copy_(reduced)
-
-            return _hook
-
-        n_layers = len(layers)
-        for lid in target_layer_ids:
-            if lid < 0 or lid >= n_layers:
-                raise ValueError(
-                    f"dspark_target_layer_id {lid} out of range [0,{n_layers})."
-                )
-            layers[lid].register_forward_hook(
-                _make_hook(layer_to_buf[lid], layers[lid])
-            )
-
-        self.use_dspark_aux_capture = True
-        logger.info(f"DSpark aux capture hooks on target layers: {target_layer_ids}")
-
-    def _collect_dspark_aux(self, num_tokens: int) -> None:
-        """Assemble captured per-layer aux tensors (sliced to num_tokens)."""
-        if not getattr(self, "use_dspark_aux_capture", False):
-            return
-        self._aux_hidden_states = [buf[:num_tokens] for buf in self._dspark_aux_buffers]
-
     def _run_dummy_drafter(self, hidden_states, draft_bs=None):
         """Run drafter forward for DP synchronization (no real proposal)."""
         if not hasattr(self, "drafter"):
@@ -1281,7 +1165,6 @@ class ModelRunner:
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
-        # num_tokens_original = 1
         has_drafter = hasattr(self, "drafter")
         mtp_k = self.drafter.mtp_k if has_drafter else 0
         mtp_factor = mtp_k + 1
@@ -1309,49 +1192,6 @@ class ModelRunner:
         logger.debug(
             f"{self.label}: dummy batch executed with {dummy_batch.total_tokens_num} tokens"
         )
-        return True
-
-    def dummy_prefill_execution(self, num_tokens: int, num_reqs: int = 1):
-        """Execute dummy prefill batch for DP synchronization."""
-        if num_reqs < 1:
-            num_reqs = 1
-        if num_tokens < num_reqs:
-            num_tokens = num_reqs
-        # Distribute tokens evenly across requests
-        base = num_tokens // num_reqs
-        remainder = num_tokens % num_reqs
-        tokens_per_seq = [base + (1 if i < remainder else 0) for i in range(num_reqs)]
-
-        seqs = {}
-        for t in tokens_per_seq:
-            seq = Sequence([0] * t, block_size=self.block_size)
-            seqs[seq.id] = seq
-
-        dummy_batch = ScheduledBatch(
-            seqs=seqs,
-            num_scheduled_tokens=np.array(tokens_per_seq, dtype=np.int32),
-            total_tokens_num=num_tokens,
-            total_tokens_num_prefill=num_tokens,
-            total_seqs_num=num_reqs,
-            total_seqs_num_prefill=num_reqs,
-            is_dummy_run=True,
-        )
-
-        bs = self.prepare_inputs(dummy_batch)
-        self.forward_vars["input_ids"].gpu[:bs].zero_()
-        input_ids = self.forward_vars["input_ids"].gpu[:bs]
-
-        with torch.no_grad():
-            logits, hidden_states = self.run_model(input_ids)
-            self._run_dummy_drafter(hidden_states, draft_bs=1)
-
-        torch.cuda.synchronize()
-        reset_forward_context()
-
-        logger.info(
-            f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens, {num_reqs} reqs"
-        )
-        # TODO: initialize KV connector during warmup
         return True
 
     def warmup_model(self):
@@ -1529,7 +1369,7 @@ class ModelRunner:
                 full_q = self.drafter.mtp_k + 1
                 q_buckets = self._dspark_capture_q_buckets(full_q)
                 if (
-                    getattr(self.drafter, "dspark_confidence_schedule", False)
+                    self.drafter.uses_confidence_schedule
                     and os.environ.get("ATOM_PIECEWISE_FINE_TOKENS", "0") == "1"
                 ):
                     q_buckets = sorted(set(q_buckets) | set(range(1, full_q + 1)))
@@ -1571,9 +1411,7 @@ class ModelRunner:
         # number of captured buckets (the pool grows ~linearly with bucket
         # count, each bucket ~one graph set). This stays a safe upper bound:
         # measured per-bucket pool (~1.4GB) << 0.2*act.
-        if hasattr(self, "drafter") and getattr(
-            self.drafter, "dspark_confidence_schedule", False
-        ):
+        if hasattr(self, "drafter") and self.drafter.uses_confidence_schedule:
             # Match the capture loop's bucket source so we count the graphs
             # actually captured; the pool grows ~linearly with bucket count.
             buckets = self._dspark_capture_q_buckets(self.drafter.mtp_k + 1)
@@ -2270,10 +2108,7 @@ class ModelRunner:
         # it again — only the first application must shrink the batch.
         if getattr(batch, "_dspark_q_applied", False):
             return
-        if not (
-            hasattr(self, "drafter")
-            and getattr(self.drafter, "dspark_confidence_schedule", False)
-        ):
+        if not (hasattr(self, "drafter") and self.drafter.uses_confidence_schedule):
             return
         if batch.total_tokens_num_prefill > 0:
             return  # mixed/prefill step: keep full length
@@ -2471,34 +2306,6 @@ class ModelRunner:
         # from prev_token_ids (anchor) + draft_token_ids, which never consults
         # scheduled_spec_decode_tokens.)
 
-    def _dspark_sync_graph_shape_dp(self, batch: ScheduledBatch) -> None:
-        """DP-attention: force the decode graph shape (bs, q) IDENTICAL on every
-        DP rank via an all-reduce MAX of (q, decode_bs, total_tokens).
-
-        DSpark scheduling picks q/bs per rank from the local batch, so they
-        diverge; the decode graph's MoE all_gather pads to ``graph_bs *
-        max_seqlen_q``, so divergent shapes -> mismatched collective rows ->
-        RCCL deadlock. Adopting the DP-max only enlarges graph capacity (real
-        tokens stay flat-packed, extra slots are skipped padding) -> lossless;
-        per-request ``num_scheduled_tokens`` is untouched so attention stays
-        ragged. Called on every rank each step (real + dummy) so the collective
-        never deadlocks; no-op for single-DP or non-spec.
-
-        The real hot-path collective is folded into ``sync_dp_metadata`` (see
-        ``_dspark_local_shape`` / ``_apply_dspark_shape_max``); this standalone
-        method is only the non-merged call path.
-        """
-        shape = self._dspark_local_shape(batch)
-        if shape is None:
-            return
-        import torch.distributed as dist
-
-        shape_t = torch.tensor(list(shape), device="cpu", dtype=torch.int64)
-        dist.all_reduce(shape_t, op=dist.ReduceOp.MAX, group=get_dp_group().cpu_group)
-        self._apply_dspark_shape_max(
-            batch, (int(shape_t[0]), int(shape_t[1]), int(shape_t[2]))
-        )
-
     def _dspark_local_shape(
         self, batch: ScheduledBatch
     ) -> Optional[tuple[int, int, int]]:
@@ -2512,7 +2319,7 @@ class ModelRunner:
         if self.config.parallel_config.data_parallel_size <= 1:
             return None
         drafter = getattr(self, "drafter", None)
-        if drafter is None or not getattr(drafter, "use_dspark", False):
+        if drafter is None or not drafter.is_block_drafter:
             return None
         local_q = int(getattr(batch, "num_spec_query_tokens", 1))
         local_bs = int(getattr(batch, "total_seqs_num_decode", 0))
@@ -2527,9 +2334,13 @@ class ModelRunner:
     def _apply_dspark_shape_max(
         self, batch: ScheduledBatch, shape_max: Optional[tuple[int, int, int]]
     ) -> None:
-        """Adopt the DP-MAX (q, decode_bs, total_tokens). Raising q/bs/total only
-        enlarges graph capacity (real tokens stay flat-packed in [0:total]), so
-        it is always lossless; see _dspark_sync_graph_shape_dp docstring."""
+        """Adopt the DP-MAX (q, decode_bs, total_tokens) across DP ranks so every
+        rank captures/replays an identical decode graph shape (else the MoE
+        all_gather pads to divergent rows -> RCCL deadlock). Raising q/bs/total
+        only enlarges graph capacity (real tokens stay flat-packed in [0:total])
+        and leaves per-request num_scheduled_tokens untouched, so it is always
+        lossless. The DP-max is computed via ``_dspark_local_shape`` and the
+        collective is folded into ``sync_dp_metadata``'s packed all_gather."""
         if shape_max is None:
             return
         batch.num_spec_query_tokens = int(shape_max[0])
@@ -2638,7 +2449,7 @@ class ModelRunner:
         # but MoE pad needs the DP-unified padded_scheduled_bs.
         graph_bs = num_input_tokens if is_prefill else forward_mode.moe_pad_bs
         drafter = getattr(self, "drafter", None)
-        if not is_prefill and getattr(drafter, "use_dspark", False):
+        if not is_prefill and drafter is not None and drafter.is_block_drafter:
             graph_bs = self._dspark_ragged_moe_graph_bs(batch, graph_bs)
         context = Context(
             positions=positions,
@@ -2946,21 +2757,6 @@ class ModelRunner:
             # the label shows bs=<real>/<graph> when they differ.
             graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
             batch=batch,
-        )
-
-        # Profiler label. Kind (prefix) distinguishes real/dummy and
-        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
-        # `build_run_label`.
-        label = build_run_label(
-            is_prefill=is_prefill,
-            use_cudagraph=forward_mode.use_cudagraph,
-            is_dummy=context.is_dummy_run,
-            tbo_on=forward_context.ubatch_slices is not None,
-            bs=bs,
-            # The CUDAGraph replays a padded batch (context.graph_bs); pass it so
-            # the label shows bs=<real>/<graph> when they differ.
-            graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
-            batch=batch,
             detailed_suffix=self._detailed_label_suffix(batch),
         )
 
@@ -3024,26 +2820,13 @@ class ModelRunner:
                 # the full global sequence. Per-group (not single global) because
                 # each group was striped independently.
                 if _pcp_tbo_balanced:
-                    if self.use_aux_hidden_state_outputs:
-                        _h, _aux = model_output
-                        model_output = (
-                            self._restore_pcp_balanced_output(
-                                _h, _pcp_bal_groups, _pcp_size
-                            ),
-                            _aux,
-                        )
-                    else:
-                        model_output = self._restore_pcp_balanced_output(
-                            model_output, _pcp_bal_groups, _pcp_size
-                        )
-                if self.use_aux_hidden_state_outputs:
-                    hidden_states, self._aux_hidden_states = model_output
-                else:
-                    hidden_states = model_output
-                    self._aux_hidden_states = None
-                # DSpark captures aux hidden states via forward hooks (the model
-                # itself returns only hidden_states); assemble them in order.
-                self._collect_dspark_aux(hidden_states.shape[0])
+                    model_output = self._restore_pcp_balanced_output(
+                        model_output, _pcp_bal_groups, _pcp_size
+                    )
+                # model_output is always a plain Tensor: any drafter aux capture
+                # (EAGLE3 tuple-strip hook / DSpark layer hooks) already ran inside
+                # the forward and wrote the drafter's own buffers.
+                hidden_states = model_output
                 logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
@@ -3085,20 +2868,15 @@ class ModelRunner:
                     )
                     forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
                     forward_context.batch_descriptor = None
-                    if self.use_aux_hidden_state_outputs:
-                        hidden_states, self._aux_hidden_states = model_output
-                    else:
-                        hidden_states = model_output
-                        self._aux_hidden_states = None
-                    # DSpark: forward hooks wrote per-layer aux hidden during the
-                    # forward; assemble them. Spec keeps the padded [0:Σ] layout
-                    # (postprocess/draft re-gather to bs via next_token_locs);
-                    # non-spec slices to the real num_tokens so pad rows never leak
-                    # into sampled_token_ids -> prev_token_ids -> next-step shape
-                    # mismatch.
+                    # model_output is always a plain Tensor; drafter aux capture
+                    # (if any) already wrote its own buffers inside the forward.
+                    # Spec keeps the padded [0:Σ] layout (postprocess/draft
+                    # re-gather to bs via next_token_locs); non-spec slices to the
+                    # real num_tokens so pad rows never leak into sampled_token_ids
+                    # -> prev_token_ids -> next-step shape mismatch.
+                    hidden_states = model_output
                     _is_spec = hasattr(self, "drafter")
                     _slice_len = num_tokens_pad if _is_spec else num_tokens
-                    self._collect_dspark_aux(_slice_len)
                     hidden_states = hidden_states[:_slice_len]
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
@@ -3106,15 +2884,8 @@ class ModelRunner:
                 graph_key = (graph_bs, max_q_len)
                 self.graphs[graph_key].replay()
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
-                if graph_key in self.graph_aux_hidden:
-                    self._aux_hidden_states = [
-                        aux[:num_tokens] for aux in self.graph_aux_hidden[graph_key]
-                    ]
-                else:
-                    self._aux_hidden_states = None
-                # DSpark: hooks write aux hidden into fixed preallocated buffers
-                # in-place (cudagraph-safe); slice to this step's token count.
-                self._collect_dspark_aux(num_tokens)
+                # Drafter aux buffers (if any) refresh on replay: their in-place
+                # copy ops were captured into the graph.
                 if self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:num_tokens]
                 else:
@@ -3216,8 +2987,6 @@ class ModelRunner:
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
-                # self.debug(f"{sampled_tokens=}")
-                # self.debug(f"{next_token_locs=}")
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
@@ -3354,7 +3123,7 @@ class ModelRunner:
             last_token_offset = lens_t - num_bonus
         elif (
             hasattr(self, "drafter")
-            and getattr(self.drafter, "dspark_confidence_schedule", False)
+            and self.drafter.uses_confidence_schedule
             and batch.total_tokens_num_prefill == 0
         ):
             full_q = self.drafter.mtp_k + 1
@@ -3362,7 +3131,7 @@ class ModelRunner:
             if 1 <= q_actual < full_q:
                 last_token_offset = last_token_offset - (full_q - q_actual)
 
-        assert isinstance(self.drafter, EagleProposer)
+        assert isinstance(self.drafter, Drafter)
 
         last_token_indices = self.drafter.prepare_inputs(
             batch.total_seqs_num, last_token_offset
@@ -3375,7 +3144,6 @@ class ModelRunner:
             num_reject_tokens=num_reject_tokens,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
-            aux_hidden_states=self._aux_hidden_states,
         )
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
@@ -3571,10 +3339,7 @@ class ModelRunner:
         q-bucket path use independent size sets. Defaults to ``[full_q]`` (the
         Phase-1 single-graph behavior) when confidence scheduling is off.
         """
-        if not (
-            hasattr(self, "drafter")
-            and getattr(self.drafter, "dspark_confidence_schedule", False)
-        ):
+        if not (hasattr(self, "drafter") and self.drafter.uses_confidence_schedule):
             return [full_q]
         from atom.spec_decode.dspark_scheduler import resolve_q_buckets
 
@@ -3673,7 +3438,6 @@ class ModelRunner:
             )
             self._force_aiter_unreg_capture_for_piecewise()
         start_time = time.time()
-        # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.config.compilation_config.cudagraph_capture_sizes
         else:
@@ -3720,7 +3484,6 @@ class ModelRunner:
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
-        self.graph_aux_hidden: dict[tuple[int, int], list[torch.Tensor]] = dict()
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
@@ -3831,10 +3594,7 @@ class ModelRunner:
                         else positions[:num_tokens]
                     )
                     model_output = self.model(input_ids[:num_tokens], model_positions)
-                    if self.use_aux_hidden_state_outputs:
-                        outputs[:num_tokens] = model_output[0]
-                    else:
-                        outputs[:num_tokens] = model_output
+                    outputs[:num_tokens] = model_output
                     if self.logits_in_graph:
                         self.model.compute_logits(outputs[:num_tokens])
                     if prof is not None:
@@ -3860,20 +3620,20 @@ class ModelRunner:
                     ):
                         if ubatch_slices is not None:
                             # TBO capture: threads + multi-stream captured in graph.
-                            graph, graph_output = self.model.capture_tbo_graph(
+                            # Drafter aux (if any) is written inside the graph by
+                            # capture_tbo_graph replaying the model's forward hooks.
+                            graph, _ = self.model.capture_tbo_graph(
                                 input_ids[:num_tokens],
                                 positions[:num_tokens],
                                 self.graph_pool,
                                 capture_ctx.stream,
                                 output_buffer=outputs[:num_tokens],
                             )
-                            graph_aux = (
-                                graph_output[1]
-                                if self.use_aux_hidden_state_outputs
-                                else None
-                            )
                         else:
-                            # Standard single-stream capture
+                            # Standard single-stream capture. The drafter's aux
+                            # capture hook runs inside the forward and writes its
+                            # own buffers (captured in-graph); model_output is a
+                            # plain Tensor.
                             graph = torch.cuda.CUDAGraph()
                             with torch.cuda.graph(
                                 graph, self.graph_pool, stream=capture_ctx.stream
@@ -3881,12 +3641,7 @@ class ModelRunner:
                                 model_output = self.model(
                                     input_ids[:num_tokens], model_positions
                                 )
-                                if self.use_aux_hidden_state_outputs:
-                                    outputs[:num_tokens] = model_output[0]
-                                    graph_aux = model_output[1]
-                                else:
-                                    outputs[:num_tokens] = model_output
-                                    graph_aux = None
+                                outputs[:num_tokens] = model_output
                                 if self.logits_in_graph:
                                     graph_logits = self.model.compute_logits(
                                         outputs[:num_tokens]
@@ -3898,8 +3653,6 @@ class ModelRunner:
                         self.graph_logits[(bs, max_q_len)] = graph_logits
                     if prof is not None:
                         prof.step()
-                    if graph_aux is not None:
-                        self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
                     torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
 
@@ -3966,7 +3719,7 @@ class ModelRunner:
         drafter with confidence scheduling enabled is present.
         """
         drafter = getattr(self, "drafter", None)
-        if drafter is None or not getattr(drafter, "use_dspark", False):
+        if drafter is None or not drafter.is_block_drafter:
             return
         verify_scheduler = getattr(drafter, "verify_scheduler", None)
         if verify_scheduler is None:
@@ -4242,9 +3995,10 @@ class RapidServeModelRunner(ModelRunner):
         TP-aware: each rank reads its own handles file (index=self.rank) and
         deletes it after import.  Returns True as sentinel for wait_out=True.
         """
-        from atom.model_engine.ipc_utils import import_model_weights
         import gc
         import pickle
+
+        from atom.model_engine.ipc_utils import import_model_weights
 
         path = paths[self.rank]
         logger.info(f"ModelRunner rank {self.rank}: reading weight handles from {path}")
@@ -4298,8 +4052,9 @@ class RapidServeModelRunner(ModelRunner):
         deletes it after import.  Also imports kv_scale when present (fp8).
         Returns True as sentinel for wait_out=True.
         """
-        from atom.model_engine.ipc_utils import import_kv_cache
         import pickle
+
+        from atom.model_engine.ipc_utils import import_kv_cache
 
         self.num_physical_kvcache_blocks = (
             num_kvcache_blocks * self.attn_metadata_builder.block_ratio

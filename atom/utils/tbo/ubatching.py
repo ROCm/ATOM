@@ -238,8 +238,8 @@ def sync_dp_metadata(
 
     Gate: ``active = OR(meets_min_tokens) AND AND(can_split) AND uniform``.
 
-    ``dspark_shape`` folds DSpark's per-step graph-shape sync (formerly a
-    standalone all_reduce in ``_dspark_sync_graph_shape_dp``) into this same
+    ``dspark_shape`` folds DSpark's per-step graph-shape sync (the DP-MAX of
+    (q, decode_bs, total_tokens) from ``_dspark_local_shape``) into this same
     packed all_gather. It is global-config gated (DSpark on + DP), so every
     rank appends the same 3 fields and the payload stays symmetric.
     """

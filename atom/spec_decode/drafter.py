@@ -1,0 +1,432 @@
+import abc
+import logging
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+from aiter.dist.parallel_state import get_pp_group
+from atom.config import Config
+from atom.model_loader.loader import load_model
+from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
+from atom.utils.forward_context import (
+    DPMetadata,
+    SpecDecodeMetadata,
+    get_forward_context,
+)
+
+logger = logging.getLogger("atom")
+
+
+@dataclass(frozen=True)
+class AuxCaptureSpec:
+    """Declarative spec for drafter-owned target aux-hidden-state capture.
+
+    A drafter declares WHICH target decoder layers to tap and HOW to turn each
+    tapped layer's forward output into the ``[N, hidden_size]`` aux tensor it
+    consumes; the base ``Drafter`` owns the generic forward-hook + buffer
+    machinery. This keeps the target model agnostic — a different drafter can be
+    run against the same target with zero model-side changes.
+    """
+
+    layer_ids: tuple[int, ...]
+    hidden_size: int
+    # (layer_output, layer_module) -> [N, hidden_size], or None to skip this call.
+    extract: Callable[[Any, nn.Module], Optional[torch.Tensor]]
+
+
+def _resolve_decoder_layers(target_model: nn.Module) -> nn.Module:
+    """Unwrap the target's decoder-layer stack (handles the multimodal wrapper)."""
+    base = getattr(target_model, "language_model", target_model)
+    return base.model.layers
+
+
+# Draft-model architecture registry: maps a draft checkpoint's architecture
+# string to the ATOM wrapper class. Covers all drafter flavors (serial MTP,
+# EAGLE3, DSpark), so it lives on the shared base rather than a per-flavor file.
+support_draft_model_arch_dict = {
+    "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
+    "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
+    "DeepseekV4DSparkModel": "atom.models.deepseek_v4_dspark.DeepseekV4DSpark",
+    "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
+    "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
+    "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
+    "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
+    "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
+    "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
+}
+
+
+class Drafter(abc.ABC):
+    """Abstract speculative-decode drafter.
+
+    ModelRunner depends on this contract, not on the concrete flavor
+    (serial-MTP / EAGLE3 via ``EagleProposer``, or block-parallel via
+    ``DSparkProposer``). The base holds the flavor-neutral scaffolding both
+    concretes share — buffer setup, DP-metadata refresh, weight loading /
+    sharing, anchor-index preparation, and spec-decode metadata — while the
+    flavor hooks (``_resolve_mtp_k``, ``_build_draft_model``) and the hot
+    ``propose`` are subclass-supplied.
+
+    The capability properties (``is_block_drafter`` / ``uses_confidence_schedule``
+    / ``verify_scheduler``) are the typed replacements for the historical
+    ``getattr(drafter, "dspark_*")`` and ``method == "eagle3"`` flavor probes
+    ModelRunner used to scatter through its code.
+    """
+
+    def __init__(self, atom_config: Config, device: torch.device, runner):
+        self.config = atom_config
+        self.speculative_config = self.config.speculative_config
+        self.runner = runner
+        self.device = device
+        self.dtype = self.config.torch_dtype
+        self.max_num_tokens = self.config.max_num_batched_tokens
+
+        # Flavor-specific verify horizon. MUST be resolved before the buffers
+        # below are sized: target_logits_indices is (max_bs * mtp_k) wide.
+        self.mtp_k: int = self._resolve_mtp_k()
+
+        # Flavor-specific draft-model construction (plain MTP / eagle3 / DSpark).
+        draft_hf = self.speculative_config.draft_model_hf_config
+        model_class = resolve_obj_by_qualname(
+            support_draft_model_arch_dict[draft_hf.architectures[0]]
+        )
+        self.model = self._build_draft_model(model_class)
+        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
+
+        # Drafter-owned aux capture state (armed by arm_aux_capture).
+        self._captures_aux = False
+        self._aux_buffers: list[torch.Tensor] = []
+
+        i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        i64_kwargs = {"dtype": torch.int64, "device": self.device}
+        max_bs = self.config.max_num_seqs
+        self.arrange_bs = torch.arange(max_bs + 1, **i32_kwargs)
+        self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
+        self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
+        self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
+
+    # ---- flavor hooks ----
+    @abc.abstractmethod
+    def _resolve_mtp_k(self) -> int:
+        """Return the per-request verify horizon (drafted tokens per step).
+
+        Called before buffer allocation in ``__init__``; a subclass may also
+        stash flavor-specific config (e.g. DSpark's block size) as a side
+        effect here so the value is available when buffers are sized.
+        """
+
+    def _build_draft_model(self, model_class) -> nn.Module:
+        """Construct the draft ``nn.Module``. Default builds a plain draft from
+        the target config; ``EagleProposer`` overrides for the eagle3 arch."""
+        return model_class(self.config)
+
+    def _aux_capture_spec(self, target_model: nn.Module) -> Optional[AuxCaptureSpec]:
+        """Declare which target layers to tap for aux hidden states and how to
+        extract them. Default: no capture. Hook-based drafters (DSpark) override
+        this; the base ``arm_aux_capture`` turns the spec into forward hooks."""
+        return None
+
+    @abc.abstractmethod
+    def propose(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        num_reject_tokens: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draft this step's speculative tokens for every request in the batch.
+
+        Aux hidden states (EAGLE3/DSpark) are drafter-owned: a concrete reads
+        them from its own buffers via ``aux_for`` — ModelRunner passes none.
+        """
+
+    # ---- capability surface (typed replacements for flavor probes) ----
+    @property
+    def is_block_drafter(self) -> bool:
+        """True for block-parallel drafters (DSpark); False for serial MTP/EAGLE3."""
+        return False
+
+    @property
+    def uses_confidence_schedule(self) -> bool:
+        """True when the drafter drives variable-length (confidence) verification."""
+        return False
+
+    @property
+    def verify_scheduler(self):
+        """Confidence-schedule verify planner (DSpark Level B), or None when the
+        drafter uses fixed-length verification."""
+        return None
+
+    # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
+    def arm_aux_capture(self, target_model: nn.Module) -> None:
+        """Install drafter-owned forward hooks on the target's decoder layers per
+        this drafter's ``_aux_capture_spec``, writing each tapped layer's aux
+        tensor into a preallocated buffer in-place (cudagraph-safe). Called once
+        after ``load_model``. No-op when the drafter declares no spec."""
+        spec = self._aux_capture_spec(target_model)
+        if spec is None:
+            return
+        self._aux_buffers = [
+            torch.zeros(
+                self.max_num_tokens,
+                spec.hidden_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            for _ in spec.layer_ids
+        ]
+        layers = _resolve_decoder_layers(target_model)
+        n_layers = len(layers)
+        for buf_idx, lid in enumerate(spec.layer_ids):
+            if not (0 <= lid < n_layers):
+                raise ValueError(
+                    f"aux capture layer id {lid} out of range [0,{n_layers})."
+                )
+            layers[lid].register_forward_hook(
+                self._make_aux_hook(buf_idx, spec.extract)
+            )
+        self._captures_aux = True
+        logger.info(
+            f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
+        )
+
+    def _make_aux_hook(self, buf_idx: int, extract):
+        buffer = self._aux_buffers[buf_idx]
+
+        def _hook(module, _inputs, output):
+            tensor = extract(output, module)
+            if tensor is None:
+                return
+            # In-place write into the fixed buffer (cudagraph-safe; no host-side
+            # dict mutation).
+            buffer[: tensor.shape[0]].copy_(tensor)
+
+        return _hook
+
+    def aux_for(
+        self, target_hidden_states: torch.Tensor
+    ) -> Optional[list[torch.Tensor]]:
+        """The target aux hidden states captured during the last forward,
+        row-aligned to ``target_hidden_states`` (the tensor they accompany), or
+        None if this drafter captures no aux. The fixed capture buffers are
+        sliced to ``target_hidden_states``' row count — the caller never juggles
+        token counts."""
+        if not self._captures_aux:
+            return None
+        n = target_hidden_states.shape[0]
+        return [buf[:n] for buf in self._aux_buffers]
+
+    # ---- shared machinery ----
+    @staticmethod
+    def _share_if_not_loaded(
+        owner: nn.Module,
+        attr: str,
+        source: nn.Module,
+        loaded: set[str],
+        param_key: str,
+        label: str,
+    ):
+        """Replace *owner.attr* with *source* if the weight was not loaded."""
+        if param_key not in loaded and getattr(owner, attr, None) is not None:
+            logger.info(
+                f"MTP {label} not loaded from checkpoint, "
+                "sharing from the target model."
+            )
+            delattr(owner, attr)
+            setattr(owner, attr, source)
+
+    def load_model(self, target_model: nn.Module) -> None:
+        if self.speculative_config.method == "eagle3":
+            load_model(
+                self.model,
+                self.speculative_config.model,
+                self.speculative_config.draft_model_hf_config,
+                self.config.load_dummy,
+                False,
+            )
+            logger.info(
+                "Eagle3 draft model loaded from %s (independent embed/lm_head)",
+                self.speculative_config.model,
+            )
+            return
+
+        # MTP: load from the target model checkpoint and share embeddings/lm_head.
+        loaded = load_model(
+            self.model,
+            self.config.model,
+            self.speculative_config.draft_model_hf_config,
+            self.config.load_dummy,
+            True,
+        )
+
+        # Resolve the base model (unwrap multimodal wrapper if present)
+        target_base = getattr(target_model, "language_model", target_model)
+
+        # Model-specific share hook escape valve. Models whose embed/lm_head
+        # naming doesn't match the standard `model.embed_tokens` /
+        # `lm_head` convention (e.g. DeepSeek-V4 uses `model.embed` /
+        # `model.head`) implement `share_with_target(target_base)` to do
+        # their own setattr-rebinding and short-circuit the default path.
+        if hasattr(self.model, "share_with_target"):
+            self.model.share_with_target(target_base, loaded)
+            if self.is_block_drafter and hasattr(self.model, "reset_kv_cache"):
+                # Allocate DSpark's private rolling target-KV window now that the
+                # device/dtype and max concurrency are known.
+                self.model.reset_kv_cache(
+                    self.config.max_num_seqs, self.device, self.dtype
+                )
+            return
+
+        # Share embed_tokens with the target model. Match on the *logical* vocab
+        # (num_embeddings) and hidden dim rather than the stored weight shape, so a
+        # replicated target embed ([vocab, hidden], ATOM_REPLICATE_VOCAB_EMBED) is
+        # still shared onto a TP-sharded draft embed ([vocab/tp, hidden]) — the
+        # draft then reuses the target's replicated table (no post-embed
+        # all-reduce). When both are sharded this is identical to the old check.
+        draft_embed = self.model.model.embed_tokens
+        target_embed = target_base.model.embed_tokens
+        draft_vocab = getattr(draft_embed, "num_embeddings", None)
+        target_vocab = getattr(target_embed, "num_embeddings", None)
+        if (
+            get_pp_group().world_size == 1
+            and draft_vocab is not None
+            and draft_vocab == target_vocab
+            and draft_embed.weight.shape[1] == target_embed.weight.shape[1]
+        ):
+            logger.info(
+                "Assuming the EAGLE head shares the same vocab embedding"
+                " with the target model."
+            )
+            del self.model.model.embed_tokens
+            self.model.model.embed_tokens = target_base.model.embed_tokens
+
+        # Share lm_head from target if not loaded from checkpoint.
+        # Case 1: per-layer shared_head.head (DeepSeek MTP)
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            layers = self.model.model.layers
+            # ModuleDict uses string keys (actual layer indices like "61"),
+            # ModuleList uses integer indices.
+            layer_items = (
+                layers.items() if hasattr(layers, "items") else enumerate(layers)
+            )
+            for key, layer in layer_items:
+                if hasattr(layer, "shared_head"):
+                    self._share_if_not_loaded(
+                        layer.shared_head,
+                        "head",
+                        target_base.lm_head,
+                        loaded,
+                        f"model.layers.{key}.shared_head.head.weight",
+                        "shared_head.head",
+                    )
+        # Case 2: top-level lm_head (Qwen3.5 / Qwen3-Next MTP)
+        self._share_if_not_loaded(
+            self.model,
+            "lm_head",
+            target_base.lm_head,
+            loaded,
+            "lm_head.weight",
+            "lm_head",
+        )
+
+    def _refresh_dp_metadata(self, forward_context, num_local_tokens: int) -> None:
+        parallel_config = self.config.parallel_config
+        if parallel_config.data_parallel_size <= 1:
+            return
+        forward_context.context.dp_uniform_decode = False
+        forward_context.dp_metadata = DPMetadata.make(
+            parallel_config,
+            num_local_tokens,
+        )
+
+    def prepare_inputs(
+        self,
+        scheduled_bs: int,
+        # [batch_size]
+        last_token_offset: int | torch.Tensor,
+    ) -> torch.Tensor:
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+
+        cu_seqlens_q = attn_metadata.cu_seqlens_q
+        # Only use decode sequences' cu_seqlens_q (num_rejected_tokens length
+        # matches decode sequences). cu_seqlens_q has length scheduled_bs + 1.
+        cu_seqlens_q = cu_seqlens_q[: scheduled_bs + 1]
+
+        token_indices = cu_seqlens_q[1:] - last_token_offset
+
+        # Defensive clamp to the valid flat-token range [0, total_tokens-1].
+        # Under DSpark flat-ragged CUDA graph, the drain-phase corner (tiny /
+        # mixed batches) can drive an anchor index just out of range; the anchor
+        # only seeds the DRAFT (a wrong anchor lowers acceptance but never
+        # corrupts the verified/target output — losslessness is preserved), so
+        # clamping is safe and avoids an index_select GPU fault. No-op on the
+        # normal path where indices are already in range.
+        if self.is_block_drafter:
+            upper = (cu_seqlens_q[-1] - 1).clamp_(min=0)
+            token_indices = token_indices.clamp_(min=0)
+            torch.minimum(token_indices, upper, out=token_indices)
+
+        return token_indices
+
+    def calc_spec_decode_metadata(
+        self,
+        num_sampled_tokens: np.ndarray,
+        cu_num_sampled_tokens: np.ndarray,
+        input_ids: torch.Tensor,
+    ) -> SpecDecodeMetadata:
+        scheduled_bs = len(num_sampled_tokens)
+
+        # num_draft = num_sampled - 1 per request. num_sampled_tokens is the
+        # per-seq token count for THIS forward (anchor + drafts). In Phase 1 that
+        # is mtp_k+1 (full). With DSpark plan Y the q-bucket already shrank it to
+        # q (uniform), so deriving num_draft from num_sampled keeps draft / target
+        # / bonus indices consistent with the actual forward layout — no separate
+        # mtp_k constant that could desync (the A-bug: 98%->52%).
+        num_draft_tokens = np.asarray(num_sampled_tokens, dtype=np.int32) - 1
+        np.clip(num_draft_tokens, 0, self.mtp_k, out=num_draft_tokens)
+        sum_drafted_tokens = int(num_draft_tokens.sum())
+
+        # Compute the bonus logits indices.
+        bonus_logits_indices = cu_num_sampled_tokens - 1
+
+        # Compute the draft logits indices.
+        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
+        # arange: [0, 1, 2, 0, 1, 0]
+        cu_num_draft_tokens, arange = self.runner._get_cumsum_and_arange(
+            num_draft_tokens, cumsum_dtype=np.int32
+        )
+        # [0, 0, 0, 5, 5, 9]
+        target_logits_indices = np.repeat(
+            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+        )
+        # [0, 1, 2, 5, 6, 9]
+        target_logits_indices += arange
+
+        # Do the CPU -> GPU copy.
+        self.target_logits_indices.np[:sum_drafted_tokens] = target_logits_indices
+        self.cu_num_draft_tokens.np[:scheduled_bs] = cu_num_draft_tokens
+        self.bonus_logits_indices.np[:scheduled_bs] = bonus_logits_indices
+        target_logits_indices = self.target_logits_indices.copy_to_gpu(
+            sum_drafted_tokens
+        )
+        cu_num_draft_tokens = self.cu_num_draft_tokens.copy_to_gpu(scheduled_bs)
+        bonus_logits_indices = self.bonus_logits_indices.copy_to_gpu(scheduled_bs)
+
+        # Compute the draft token ids.
+        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        draft_token_ids = torch.index_select(input_ids[1:], 0, target_logits_indices)
+
+        metadata = SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_spec_steps=self.mtp_k,
+            num_draft_tokens_np=num_draft_tokens,
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+        )
+        return metadata
