@@ -696,6 +696,9 @@ class DeepseekV4DSpark(nn.Module):
         self.atom_config.quant_config = self.args.quant_config
 
         self.block_size = int(getattr(self.hf_config, "dspark_block_size"))
+        # Rolling target-KV window width. Exposed on the wrapper (top level) so the
+        # proposer never reaches through `self.model.model.mtp[0]` to read it.
+        self.window_size = int(self.args.window_size)
         self.markov_rank = int(getattr(self.hf_config, "dspark_markov_rank"))
         self.noise_token_id = int(getattr(self.hf_config, "dspark_noise_token_id"))
         self.target_layer_ids = tuple(

@@ -148,7 +148,7 @@ class DSparkProposer(Drafter):
         if context.is_prefill:
             cu_seqlens_q = getattr(attn_metadata, "cu_seqlens_q", None)
             if cu_seqlens_q is not None:
-                window = int(self.model.model.mtp[0].window_size)
+                window = int(self.model.window_size)
                 seqlens = cu_seqlens_q[1 : bs + 1] - cu_seqlens_q[:bs]
                 write_per_batch = int(min(int(seqlens.max().item()), window))
                 self.model.precompute_context_kv(
@@ -167,7 +167,7 @@ class DSparkProposer(Drafter):
         # draft-width-agnostic so the wider block is drafted in one pass, with
         # positions past block_size RoPE-extrapolated. Capped at the rolling
         # window so [window ++ draft] KV stays bounded.
-        window = int(self.model.model.mtp[0].window_size)
+        window = int(self.model.window_size)
         num_draft = min(self.mtp_k, window)
         self._refresh_dp_metadata(forward_context, bs * num_draft)
         draft_token_ids, confidence = self.model.forward_spec(
