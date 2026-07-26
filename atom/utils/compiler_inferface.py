@@ -19,6 +19,18 @@ from atom.utils import compilation_counter, is_torch_equal_or_newer
 logger = logging.getLogger("atom")
 
 
+def _extend_metadata_with_cluster_dims(md):
+    """Return ``md`` with a no-op ``cluster_dims=(1, 1, 1)`` appended if it's a
+    namedtuple missing that field (AMD has no thread-block clusters); else ``md``
+    unchanged."""
+    if md is not None and hasattr(md, "_fields") and not hasattr(md, "cluster_dims"):
+        from collections import namedtuple
+
+        extended = namedtuple("KernelMetadata", list(md._fields) + ["cluster_dims"])
+        return extended(*md, (1, 1, 1))
+    return md
+
+
 def _patch_triton_cluster_dims_for_rocm() -> None:
     """Make compile-time Triton autotuning work on ROCm.
 
@@ -31,32 +43,69 @@ def _patch_triton_cluster_dims_for_rocm() -> None:
     patching ``triton.autotune_at_compile_time=True`` -- crashes on AMD with
     ``AttributeError: 'KernelMetadata' object has no attribute 'cluster_dims'``.
 
-    Inject a no-op ``cluster_dims=(1, 1, 1)`` (single cluster == AMD's only mode)
-    when the field is absent, so the launcher's ``cta_args`` computation succeeds.
-    No-op on CUDA, where the field already exists. Idempotent.
+    Two entry paths create the metadata, and BOTH must be patched:
+
+    1. **Same-process compile** (``compile_threads==1``): the kernel is built by
+       ``CompiledKernel.__init__`` in this process -- patch ``__init__`` to inject
+       the field.
+    2. **Subprocess compile** (default ``compile_threads>1``): the kernel is
+       compiled in an ``async_compile`` worker (which never imports atom, so the
+       ``__init__`` patch is absent there), pickled back, and rebuilt in this
+       process by ``TritonCompileResult.__setstate__`` via
+       ``CompiledKernel.__new__`` (bypassing ``__init__`` entirely) +
+       ``_deserialize_metadata`` (which reconstructs the namedtuple from the
+       worker's field dict, still without ``cluster_dims``). Patch
+       ``__setstate__`` to inject the field into the rebuilt ``.metadata``.
+
+    Injecting a no-op ``cluster_dims=(1, 1, 1)`` (single cluster == AMD's only
+    mode) lets the launcher's ``cta_args`` computation succeed. No-op on CUDA,
+    where the field already exists. Idempotent.
     """
     if getattr(torch.version, "hip", None) is None:
         return
+
+    # Path 1: same-process CompiledKernel.__init__.
     try:
         import triton.compiler.compiler as _tcc
     except Exception:
-        return
-    if getattr(_tcc.CompiledKernel, "_atom_cluster_dims_patched", False):
-        return
+        _tcc = None
+    if _tcc is not None and not getattr(
+        _tcc.CompiledKernel, "_atom_cluster_dims_patched", False
+    ):
+        _orig_init = _tcc.CompiledKernel.__init__
 
-    _orig_init = _tcc.CompiledKernel.__init__
+        def _init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            self.metadata = _extend_metadata_with_cluster_dims(
+                getattr(self, "metadata", None)
+            )
 
-    def _init(self, *args, **kwargs):
-        _orig_init(self, *args, **kwargs)
-        md = getattr(self, "metadata", None)
-        if md is not None and not hasattr(md, "cluster_dims"):
-            from collections import namedtuple
+        _tcc.CompiledKernel.__init__ = _init
+        _tcc.CompiledKernel._atom_cluster_dims_patched = True
 
-            extended = namedtuple("KernelMetadata", list(md._fields) + ["cluster_dims"])
-            self.metadata = extended(*md, (1, 1, 1))
+    # Path 2: subprocess-compiled kernels rebuilt via pickle (the default,
+    # compile_threads>1 path -- this is what --cudagraph-mode PIECEWISE without
+    # --level 0 hits during Inductor autotune).
+    try:
+        from torch._inductor.runtime.triton_heuristics import TritonCompileResult
+    except Exception:
+        TritonCompileResult = None
+    if TritonCompileResult is not None and not getattr(
+        TritonCompileResult, "_atom_cluster_dims_patched", False
+    ):
+        _orig_setstate = TritonCompileResult.__setstate__
 
-    _tcc.CompiledKernel.__init__ = _init
-    _tcc.CompiledKernel._atom_cluster_dims_patched = True
+        def _setstate(self, state):
+            _orig_setstate(self, state)
+            # Only fix .metadata (read by make_launcher's cta_args); leave
+            # packed_metadata untouched -- triton's C launch expects its exact
+            # packed layout, so appending a field there would corrupt it.
+            self.kernel.metadata = _extend_metadata_with_cluster_dims(
+                getattr(self.kernel, "metadata", None)
+            )
+
+        TritonCompileResult.__setstate__ = _setstate
+        TritonCompileResult._atom_cluster_dims_patched = True
 
 
 _patch_triton_cluster_dims_for_rocm()
