@@ -42,6 +42,31 @@ def _resolve_decoder_layers(target_model: nn.Module) -> nn.Module:
     return base.model.layers
 
 
+def _resolve_embedding(target_model: nn.Module) -> nn.Module:
+    """Unwrap the target's token-embedding module (for the ``-1`` aux tap).
+
+    The reference convention (deepspec ``extract_context_feature``) uses layer id
+    ``-1`` to mean the embedding output (``hidden_states[0]``). Model wrappers name
+    it either ``embed_tokens`` (standard) or ``embed`` (DeepSeek-V4)."""
+    base = getattr(target_model, "language_model", target_model)
+    model = base.model
+    for name in ("embed_tokens", "embed"):
+        embed = getattr(model, name, None)
+        if embed is not None:
+            return embed
+    raise ValueError(
+        "could not resolve the target embedding module for aux capture of "
+        "layer id -1 (expected model.embed_tokens or model.embed)."
+    )
+
+
+def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
+    """Aux extractor for the ``-1`` (embedding) tap: the embedding output is
+    already ``[N, hidden]``, so take it verbatim (unwrapping a (tensor, scale)
+    tuple if a quantized embedding returns one)."""
+    return output[0] if isinstance(output, tuple) else output
+
+
 # Draft-model architecture registry: maps a draft checkpoint's architecture
 # string to the ATOM wrapper class. Covers all drafter flavors (serial MTP,
 # EAGLE3, DSpark), so it lives on the shared base rather than a per-flavor file.
@@ -181,14 +206,30 @@ class Drafter(abc.ABC):
         ]
         layers = _resolve_decoder_layers(target_model)
         n_layers = len(layers)
+        # Reference convention (deepspec validate_target_layer_ids): ids must be
+        # strictly increasing and each in {-1} U [0, n_layers). Each id resolves to
+        # a (module, extract) tap funneled through the SAME hook: -1 taps the
+        # embedding output (hidden_states[0], taken verbatim); k taps decoder
+        # layer k's output through the drafter's mHC extract.
+        prev = None
         for buf_idx, lid in enumerate(spec.layer_ids):
-            if not (0 <= lid < n_layers):
+            if not (lid == -1 or 0 <= lid < n_layers):
                 raise ValueError(
-                    f"aux capture layer id {lid} out of range [0,{n_layers})."
+                    f"aux capture layer id {lid} out of range "
+                    f"{{-1}} U [0,{n_layers})."
                 )
-            layers[lid].register_forward_hook(
-                self._make_aux_hook(buf_idx, spec.extract)
+            if prev is not None and lid <= prev:
+                raise ValueError(
+                    "aux capture layer ids must be strictly increasing, got "
+                    f"{spec.layer_ids}."
+                )
+            prev = lid
+            module, extract = (
+                (_resolve_embedding(target_model), _identity_extract)
+                if lid == -1
+                else (layers[lid], spec.extract)
             )
+            module.register_forward_hook(self._make_aux_hook(buf_idx, extract))
         self._captures_aux = True
         logger.info(
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
