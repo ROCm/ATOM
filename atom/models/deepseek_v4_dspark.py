@@ -191,7 +191,7 @@ def _fake_fp8_e4m3_inplace(x: torch.Tensor, block_size: int = 64) -> None:
             "DSpark fake-FP8 block size must divide the last dim: "
             f"{x.shape[-1]} % {block_size} != 0."
         )
-    view = x.reshape(-1, x.shape[-1] // block_size, block_size)
+    view = x.view(-1, x.shape[-1] // block_size, block_size)
     amax = view.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-4)
     scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
     quant = torch.clamp(view / scale, -448.0, 448.0).to(torch.float8_e4m3fn)
@@ -500,9 +500,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # rope_dim == 0 doesn't turn `[..., -rope_dim:]` into the whole head
         # (-0 == 0).
         if rope_dim:
-            a.rotary_emb.forward(
-                positions.reshape(-1)[: kv.shape[0]], kv[..., -rope_dim:]
-            )
+            a.rotary_emb.forward(positions.view(-1)[: kv.shape[0]], kv[..., -rope_dim:])
         _apply_dspark_kv_qat_(kv, rope_dim)
         return kv.view(-1, a.head_dim)
 
@@ -576,7 +574,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         """Block attention over (rolling target window ++ draft block KV)."""
         a = self.attn
         B, T, _ = x.shape
-        flat = x.reshape(B * T, -1)
+        flat = x.view(B * T, -1)
         qr_kv = _linear_out(a.wqkv_a(flat))
         qr, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
         # q_norm runs in fused_quant mode: it returns (qr_fp8, qr_scale) so the
@@ -604,7 +602,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             a.kv_norm.weight,
             a.rotary_emb.cos_cache,
             a.rotary_emb.sin_cache,
-            draft_pos.reshape(-1),
+            draft_pos.view(-1),
             a.n_local_heads,
             a.head_dim,
             rope_dim,
@@ -657,10 +655,10 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # stage exactly (deepseek_v4.py:1922-1930): inverse-RoPE on the rope
         # lanes, grouped output-LoRA einsum with the BF16 wo_a weight, then wo_b.
         # GPU-VERIFY: numerics validated against the V4 reference output stage.
-        o = out.reshape(B * T, a.n_local_heads, a.head_dim)
+        o = out.view(B * T, a.n_local_heads, a.head_dim)
         rope_dim = a.rope_head_dim
         # Remove the absolute-position contribution carried in via value-side RoPE.
-        a.rotary_emb.inverse(draft_pos.reshape(-1), o[..., -rope_dim:])
+        a.rotary_emb.inverse(draft_pos.view(-1), o[..., -rope_dim:])
         o = o.view(B * T, a.n_local_groups, -1)
         wo_a = a.wo_a.weight.view(a.n_local_groups, a.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
@@ -683,7 +681,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         T = x.shape[1]
         # ----- Attention sub-layer with mHC mixing -----
         if hc_state is None:
-            residual = x.reshape(B * T, self.hc_mult, x.shape[-1])
+            residual = x.view(B * T, self.hc_mult, x.shape[-1])
             hc_state = HCState(
                 residual=residual, post_mix=None, comb_mix=None, x_prev=None
             )
@@ -697,7 +695,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         )
         attn_in = hc_state.x_prev.view(B, T, -1)
         attn_out = self.dspark_attention(attn_in, positions, plan)
-        hc_state.x_prev = attn_out.reshape(B * T, -1)
+        hc_state.x_prev = attn_out.view(B * T, -1)
         # ----- FFN sub-layer with mHC mixing -----
         hc_state = self.fuse_hc(
             hc_state,
@@ -937,7 +935,7 @@ class _DSparkInner(nn.Module):
         # Build the draft block input ids: [anchor, noise, noise, ...].
         draft_ids = input_ids.new_full((B, T), self.noise_token_id)
         draft_ids[:, 0] = input_ids
-        x = self.embed(draft_ids.reshape(-1)).view(B, T, -1)  # [B, T, dim]
+        x = self.embed(draft_ids.view(-1)).view(B, T, -1)  # [B, T, dim]
         x = x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [B, T, hc, dim]
 
         # Per-block invariants (draft positions, window validity, gather indices)
