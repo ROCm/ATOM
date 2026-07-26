@@ -203,13 +203,21 @@ def _apply_dspark_kv_qat_(kv: torch.Tensor, rope_dim: int) -> None:
 def _dspark_block_topk_idxs(
     B: int, T: int, W: int, valid_target: torch.Tensor, device
 ) -> torch.Tensor:
-    """Encode the (window-validity + block-causal) attention mask as gather
-    indices into the combined ``[window ++ draft]`` KV (length ``W+T``).
+    """Encode the window-validity attention mask as gather indices into the
+    combined ``[window ++ draft]`` KV (length ``W+T``).
 
     For draft query position ``m`` (0..T-1) the attended columns are:
       * every VALID rolling-window slot  -> global index ``w`` (0..W-1)
-      * draft-block slots ``0..m``       -> global index ``W + j``  (block-causal)
-    All other entries are ``-1`` (the fused sparse_attn kernel skips them).
+      * EVERY draft-block slot           -> global index ``W + j`` (j = 0..T-1)
+    Invalid window slots are ``-1`` (the fused sparse_attn kernel skips them).
+
+    Attention inside the draft block is BIDIRECTIONAL, not causal: the block is
+    a fixed ``[anchor, noise, noise, ...]`` input decoded in parallel, and the
+    reference builds ONE column list and broadcasts it over every query row
+    (HF ``inference/model.py`` ``get_dspark_topk_idxs``:
+    ``cat([...]).view(1, 1, -1).expand(bsz, block_size, -1)``). Masking the
+    block causally gives each position a different, shorter context than the
+    one it was trained on and costs acceptance.
 
     Returns: topk_idxs [B, T, W+T] int32, suitable for ``sparse_attn``.
     """
@@ -222,11 +230,9 @@ def _dspark_block_topk_idxs(
     win_idx = torch.arange(W, device=device, dtype=torch.int32)
     win_cols = torch.where(valid_target, win_idx.view(1, W), win_idx.new_full((1,), -1))
     win_cols = win_cols.view(B, 1, W).expand(B, T, W)  # [B, T, W]
-    # Draft columns: block-causal. position m attends draft j<=m -> index W+j.
+    # Draft columns: every query row attends the WHOLE block -> index W+j.
     j = torch.arange(T, device=device, dtype=torch.int32)
-    causal = j.view(1, T) <= j.view(T, 1)  # [T(m), T(j)]
-    draft_cols = torch.where(causal, (W + j).view(1, T), j.new_full((1,), -1))
-    draft_cols = draft_cols.view(1, T, T).expand(B, T, T)  # [B, T, T]
+    draft_cols = (W + j).view(1, 1, T).expand(B, T, T)  # [B, T, T]
     return torch.cat([win_cols, draft_cols], dim=-1)  # [B, T, W+T] int32
 
 
@@ -291,11 +297,9 @@ def _dspark_block_sparse_attention_torch(
     neg_inf = torch.finfo(scores.dtype).min
     # Window slots: valid_target [B, W] -> [B, 1, 1, W].
     win_mask = valid_target.view(B, 1, 1, W)
-    # Draft-block slots: block-causal, position t attends to draft cols <= t.
-    # block_causal[t, s] = (s <= t).
-    draft_cols = torch.arange(T, device=q.device)
-    block_causal = draft_cols.view(1, T) <= draft_cols.view(T, 1)  # [T, T]
-    block_mask = block_causal.view(1, 1, T, T).expand(B, 1, T, T)
+    # Draft-block slots: bidirectional — every draft position attends the whole
+    # block (see _dspark_block_topk_idxs; the block is decoded in parallel).
+    block_mask = q.new_ones(1, 1, T, T, dtype=torch.bool).expand(B, 1, T, T)
     full_mask = torch.cat([win_mask.expand(B, 1, T, W), block_mask], dim=-1)
     scores = scores.masked_fill(~full_mask, neg_inf)
     # Attention sink: one extra always-on column per head with zero value.
@@ -319,10 +323,10 @@ def _dspark_block_sparse_attention(
 
     DSpark is MQA: a single shared KV head broadcast to all H query heads. Each
     draft query position t attends to all valid target-window slots plus the
-    draft-block KV up to and including its own position (block-causal), with a
-    per-head attention sink contributing to the softmax denominator only.
+    ENTIRE draft-block KV (bidirectional within the block), with a per-head
+    attention sink contributing to the softmax denominator only.
 
-    The (window-validity + block-causal) mask is encoded as gather indices
+    The window-validity mask is encoded as gather indices
     (``topk_idxs``, built once per block by :func:`_build_block_plan`) and
     dispatched to ATOM's fused flash ``sparse_attn`` (Triton + torch fallback,
     both sink+MQA aware and tuned for head_dim>=256). This avoids materializing
@@ -355,8 +359,9 @@ def _dspark_block_sparse_attention(
 #
 # These reuse the DeepSeek-V4 decoder layer machinery (attention linears, MoE,
 # mHC) but run a DSpark-specific attention path: a private rolling target-KV
-# window (size = sliding_window) plus the draft-block KV, dense block-causal
-# attention with an attention sink, and a BF16 inverse-RoPE output projection.
+# window (size = sliding_window) plus the draft-block KV, dense attention that
+# is bidirectional within the draft block, with an attention sink, and a BF16
+# inverse-RoPE output projection.
 #
 # GPU-VERIFY: every method below that touches aiter / V4 attention submodules
 # must be validated on an MI3xx device against the reference DSpark outputs.

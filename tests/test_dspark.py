@@ -157,8 +157,12 @@ def test_speculative_config_mtp_not_misrouted_to_dspark():
     assert hf.architectures == ["DeepseekV4MTPModel"]
 
 
-def test_block_sparse_attention_is_block_causal():
-    # A draft query at position t must not attend to draft positions > t.
+def test_block_sparse_attention_is_bidirectional_within_block():
+    # DSpark decodes the whole draft block in parallel, so EVERY draft query
+    # position sees EVERY draft KV column — including ones after itself. The HF
+    # reference builds one column list and broadcasts it over all query rows
+    # (get_dspark_topk_idxs: `.view(1, 1, -1).expand(bsz, block_size, -1)`).
+    # A causal mask here would silently cost acceptance, so pin the direction.
     B, T, H, D, W = 1, 4, 2, 8, 3
     torch.manual_seed(0)
     q = torch.randn(B, T, H, D)
@@ -166,13 +170,47 @@ def test_block_sparse_attention_is_block_causal():
     sink = torch.zeros(H)
     valid_target = torch.ones(B, W, dtype=torch.bool)
     out_full = _block_attn(q, kv, sink, valid_target, D**-0.5)
-    # Zero out the last draft KV row; position 0..T-2 outputs must be unchanged
-    # (block-causal: they never see the last draft column), position T-1 changes.
+    # Perturb the LAST draft KV row: every position, not just the last, must move.
     kv2 = kv.clone()
     kv2[:, -1] = 0.0
     out2 = _block_attn(q, kv2, sink, valid_target, D**-0.5)
-    torch.testing.assert_close(out_full[:, :-1], out2[:, :-1], rtol=1e-4, atol=1e-4)
-    assert not torch.allclose(out_full[:, -1], out2[:, -1])
+    for t in range(T):
+        assert not torch.allclose(
+            out_full[:, t], out2[:, t]
+        ), f"draft position {t} did not see the last draft column (causal leak)"
+    # Symmetrically, perturbing the FIRST draft column must move every position.
+    kv3 = kv.clone()
+    kv3[:, W] = 0.0
+    out3 = _block_attn(q, kv3, sink, valid_target, D**-0.5)
+    for t in range(T):
+        assert not torch.allclose(out_full[:, t], out3[:, t])
+
+
+def test_block_topk_idxs_encode_the_same_mask_as_the_torch_path():
+    # The torch fallback re-derives the mask from `valid_target` and IGNORES
+    # topk_idxs, while production dispatches to the fused kernel and honours
+    # ONLY topk_idxs. Nothing else pins the two encodings together, so assert
+    # the gather indices directly: any drift here is invisible on CPU.
+    B, T, W = 2, 4, 5
+    valid_target = torch.ones(B, W, dtype=torch.bool)
+    valid_target[0, :2] = False  # request 0 has two unpopulated window slots
+    idxs = _dspark_block_topk_idxs(B, T, W, valid_target, torch.device("cpu"))
+    assert idxs.shape == (B, T, W + T)
+    assert idxs.dtype == torch.int32
+    win, draft = idxs[..., :W], idxs[..., W:]
+    for b in range(B):
+        for m in range(T):
+            # Window half: the slot's own index where valid, -1 where not.
+            expected_win = torch.where(
+                valid_target[b],
+                torch.arange(W, dtype=torch.int32),
+                torch.full((W,), -1, dtype=torch.int32),
+            )
+            torch.testing.assert_close(win[b, m], expected_win)
+            # Draft half: the WHOLE block, every query row, never masked.
+            torch.testing.assert_close(
+                draft[b, m], W + torch.arange(T, dtype=torch.int32)
+            )
 
 
 def test_block_sparse_attention_respects_window_validity():
