@@ -335,7 +335,6 @@ class ScheduledBatch:
             for seq in seqs.values()
             if getattr(seq, "mrope_positions", None) is not None
         }
-        self.has_mrope = bool(self.mrope_positions_by_req)
 
         # num_cached_tokens for chunked prefill support
         self.num_cached_tokens = (
@@ -2176,7 +2175,6 @@ class PrefillScheduler:
                 name=disagg_cu_shm_name, create=False
             )
             logger.info("initialized shared memory")
-        self.num_seq_done = 0
         self._pending_lock = threading.Lock()
 
     def is_finished(self) -> bool:
