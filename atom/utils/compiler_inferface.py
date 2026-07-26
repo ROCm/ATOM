@@ -67,7 +67,7 @@ def _patch_triton_cluster_dims_for_rocm() -> None:
     # Path 1: same-process CompiledKernel.__init__.
     try:
         import triton.compiler.compiler as _tcc
-    except Exception:
+    except ImportError:
         _tcc = None
     if _tcc is not None and not getattr(
         _tcc.CompiledKernel, "_atom_cluster_dims_patched", False
@@ -88,7 +88,7 @@ def _patch_triton_cluster_dims_for_rocm() -> None:
     # --level 0 hits during Inductor autotune).
     try:
         from torch._inductor.runtime.triton_heuristics import TritonCompileResult
-    except Exception:
+    except ImportError:
         TritonCompileResult = None
     if TritonCompileResult is not None and not getattr(
         TritonCompileResult, "_atom_cluster_dims_patched", False

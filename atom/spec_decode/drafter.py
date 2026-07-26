@@ -1,12 +1,14 @@
 import abc
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 from aiter.dist.parallel_state import get_pp_group
+from torch import nn
+
 from atom.config import Config
 from atom.model_loader.loader import load_model
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
@@ -33,7 +35,7 @@ class AuxCaptureSpec:
     layer_ids: tuple[int, ...]
     hidden_size: int
     # (layer_output, layer_module) -> [N, hidden_size], or None to skip this call.
-    extract: Callable[[Any, nn.Module], Optional[torch.Tensor]]
+    extract: Callable[[Any, nn.Module], torch.Tensor | None]
 
 
 def _resolve_decoder_layers(target_model: nn.Module) -> nn.Module:
@@ -147,7 +149,7 @@ class Drafter(abc.ABC):
         the target config; ``EagleProposer`` overrides for the eagle3 arch."""
         return model_class(self.config)
 
-    def _aux_capture_spec(self, target_model: nn.Module) -> Optional[AuxCaptureSpec]:
+    def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec | None:
         """Declare which target layers to tap for aux hidden states and how to
         extract them. Default: no capture. Hook-based drafters (DSpark) override
         this; the base ``arm_aux_capture`` turns the spec into forward hooks."""
@@ -248,9 +250,7 @@ class Drafter(abc.ABC):
 
         return _hook
 
-    def aux_for(
-        self, target_hidden_states: torch.Tensor
-    ) -> Optional[list[torch.Tensor]]:
+    def aux_for(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor] | None:
         """The target aux hidden states captured during the last forward,
         row-aligned to ``target_hidden_states`` (the tensor they accompany), or
         None if this drafter captures no aux. The fixed capture buffers are

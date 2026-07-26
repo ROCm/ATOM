@@ -1,12 +1,13 @@
 import logging
 
 import torch
-import torch.nn as nn
+from torch import nn
+from torch.profiler import record_function
+
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
-from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
 
@@ -34,7 +35,7 @@ class DSparkProposer(Drafter):
 
     def _resolve_mtp_k(self) -> int:
         draft_cfg = self.speculative_config.draft_model_hf_config
-        self.dspark_block_size = int(getattr(draft_cfg, "dspark_block_size"))
+        self.dspark_block_size = int(draft_cfg.dspark_block_size)
         # num_speculative_tokens may be unset for DSpark; default to the full
         # block (a static verify length == block size).
         return self.speculative_config.num_speculative_tokens or self.dspark_block_size

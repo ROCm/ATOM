@@ -23,6 +23,8 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
+from torch.profiler import record_function
+
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -69,7 +71,6 @@ from atom.utils.tbo import (
     maybe_create_ubatch_slices,
     sync_dp_metadata,
 )
-from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
 
@@ -236,8 +237,8 @@ class tokenIDProcessor:
         self.pending_mtp_status_copies: list[
             tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
         ] = []
-        self.num_rejected: Optional[np.ndarray] = None
-        self.num_bonus: Optional[np.ndarray] = None
+        self.num_rejected: np.ndarray | None = None
+        self.num_bonus: np.ndarray | None = None
 
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
@@ -2306,9 +2307,7 @@ class ModelRunner:
         # from prev_token_ids (anchor) + draft_token_ids, which never consults
         # scheduled_spec_decode_tokens.)
 
-    def _dspark_local_shape(
-        self, batch: ScheduledBatch
-    ) -> Optional[tuple[int, int, int]]:
+    def _dspark_local_shape(self, batch: ScheduledBatch) -> tuple[int, int, int] | None:
         """Local (q, decode_bs, total_tokens) for the DSpark DP graph-shape sync,
         or None when the sync does not apply (single-DP or non-DSpark).
 
@@ -2332,7 +2331,7 @@ class ModelRunner:
         return local_q, local_bs, local_total_tokens
 
     def _apply_dspark_shape_max(
-        self, batch: ScheduledBatch, shape_max: Optional[tuple[int, int, int]]
+        self, batch: ScheduledBatch, shape_max: tuple[int, int, int] | None
     ) -> None:
         """Adopt the DP-MAX (q, decode_bs, total_tokens) across DP ranks so every
         rank captures/replays an identical decode graph shape (else the MoE
@@ -3482,8 +3481,8 @@ class ModelRunner:
         if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
-        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
-        self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.graph_logits: dict[tuple[int, int], torch.Tensor] = {}
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.

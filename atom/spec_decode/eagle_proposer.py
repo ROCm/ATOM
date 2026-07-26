@@ -2,7 +2,9 @@ import copy
 import logging
 
 import torch
-import torch.nn as nn
+from torch import nn
+from torch.profiler import record_function
+
 from atom.config import CompilationLevel
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -15,7 +17,6 @@ from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
-from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
 
