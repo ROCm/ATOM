@@ -3,19 +3,11 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from collections.abc import Iterable
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import torch
-from torch import nn
-
-from atom.plugin.sglang.runtime import (
-    SGLangForwardBatchMetadata,
-    SGLangPluginRuntime,
-    plugin_runtime_scope,
-)
-
 from aiter.dist.parallel_state import get_pp_group as _aiter_pp_group
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig as SGLangQuantizationConfig,
@@ -26,8 +18,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration as _SglQwen35VL,
+)
+from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration as _SglQwen35MoeVL,
 )
+from torch import nn
 
 from atom.model_loader.loader import WeightsMapper
 from atom.models.qwen3_5 import (
@@ -45,6 +40,8 @@ from atom.plugin.sglang.attention_backend.attention_gdn import (
 )
 from atom.plugin.sglang.runtime import (
     SGLangForwardBatchMetadata,
+    SGLangPluginRuntime,
+    plugin_runtime_scope,
 )
 
 _PACKED_MODULES_MAPPING = {
@@ -289,43 +286,47 @@ def _get_qwen35_language_model_stack_cls(
                 inputs_embeds = kwargs.pop("inputs_embeds", None)
             del kwargs
 
-            with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
-                with SGLangPluginRuntime(
+            with (
+                plugin_runtime_scope(framework="sglang", atom_config=self.atom_config),
+                SGLangPluginRuntime(
                     atom_config=self.atom_config,
                     forward_batch=forward_batch,
                     positions=positions,
                     input_ids=input_ids,
                     input_embeds=inputs_embeds,
                     set_forward_context=True,
-                ) as runtime:
-                    metadata = SGLangForwardBatchMetadata.build(
-                        runtime.forward_batch,
-                        pp_proxy_tensors=pp_proxy_tensors,
-                        save_kv_cache=save_kv_cache,
+                ) as runtime,
+            ):
+                metadata = SGLangForwardBatchMetadata.build(
+                    runtime.forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    save_kv_cache=save_kv_cache,
+                )
+
+                if intermediate_tensors is None:
+                    intermediate_tensors = (
+                        SGLangForwardBatchMetadata.to_intermediate_tensors(
+                            pp_proxy_tensors,
+                            metadata,
+                        )
                     )
 
-                    if intermediate_tensors is None:
-                        intermediate_tensors = (
-                            SGLangForwardBatchMetadata.to_intermediate_tensors(
-                                pp_proxy_tensors,
-                                metadata,
-                            )
-                        )
-
-                    with SGLangForwardBatchMetadata.bind(metadata):
-                        with SGLangGDNForwardContext.bind(metadata):
-                            out = _forward_qwen35_decoder_stack(
-                                self.model,
-                                runtime.input_ids,
-                                runtime.positions,
-                                intermediate_tensors=intermediate_tensors,
-                                inputs_embeds=runtime.input_embeds,
-                                input_deepstack_embeds=input_deepstack_embeds,
-                            )
-                    out = runtime.trim_output(out)
-                    if isinstance(out, IntermediateTensors):
-                        return PPProxyTensors(dict(out.tensors))
-                    return out
+                with (
+                    SGLangForwardBatchMetadata.bind(metadata),
+                    SGLangGDNForwardContext.bind(metadata),
+                ):
+                    out = _forward_qwen35_decoder_stack(
+                        self.model,
+                        runtime.input_ids,
+                        runtime.positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=runtime.input_embeds,
+                        input_deepstack_embeds=input_deepstack_embeds,
+                    )
+                out = runtime.trim_output(out)
+                if isinstance(out, IntermediateTensors):
+                    return PPProxyTensors(dict(out.tensors))
+                return out
 
     _QWEN35_SGLANG_LANGUAGE_MODEL_STACKS[atom_model_cls] = (
         _AtomQwen35LanguageModelAdapter
