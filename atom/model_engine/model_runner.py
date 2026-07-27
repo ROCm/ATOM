@@ -606,19 +606,7 @@ class tokenIDProcessor:
             f"ragged total {total} > num_deferred_tokens {num_deferred_tokens} "
             f"(graph bucket capacity); ragged must fit within bs*q_eff"
         )
-        anchors = self.prev_token_ids.detach().to("cpu").numpy()  # [bs]
-        drafts = (
-            self.draft_token_ids.detach().to("cpu").numpy()
-            if self.draft_token_ids is not None
-            else None
-        )  # [bs, mtp_k]
-        flat = self.input_ids.np
-        for i in range(bs):
-            s = int(cu[i])
-            flat[s] = anchors[i]
-            d = int(lens[i]) - 1
-            if d > 0 and drafts is not None:
-                flat[s + 1 : s + 1 + d] = drafts[i, :d]
+
         # FLAT graph tail-padding. Under CUDAGraph the captured grid processes
         # C = effective_bs * q_eff tokens (effective_bs = the graph bs bucket
         # >= bs), but this ragged step has only Σ = total real tokens (Σ ≤ C).
@@ -633,9 +621,28 @@ class tokenIDProcessor:
             gbs = next((g for g in reversed(self.runner.graph_bs) if g >= bs), None)
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * q_eff)
+
+        # Per flat pos p in [0, total): seq_of_pos[p] = owning seq i,
+        # local_of_pos[p] = p - cu[i] (0 = anchor, >=1 = draft column local-1).
+        gpu = self.input_ids.gpu
+        if total > 0:
+            seq_of_pos = np.repeat(np.arange(bs, dtype=np.int64), lens)  # [total]
+            local_of_pos = np.arange(total, dtype=np.int64) - cu[seq_of_pos]
+            dev = self.prev_token_ids.device
+            seq_t = torch.as_tensor(seq_of_pos, device=dev)
+            local_t = torch.as_tensor(local_of_pos, device=dev)
+            anchor_vals = self.prev_token_ids[seq_t]  # [total]
+            if self.draft_token_ids is not None:
+                # draft column = local-1; clamp anchor rows (local==0) to 0 then
+                # mask them back to the anchor value.
+                draft_col = (local_t - 1).clamp_(min=0)
+                draft_vals = self.draft_token_ids[seq_t, draft_col]
+                out = torch.where(local_t == 0, anchor_vals, draft_vals)
+            else:
+                out = anchor_vals
+            gpu[:total] = out
         if fill_to > total:
-            flat[total:fill_to] = 0
-        self.input_ids.copy_to_gpu(fill_to)
+            gpu[total:fill_to].zero_()
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
@@ -2199,6 +2206,7 @@ class ModelRunner:
             # multi-rank branch (`not enable_dp_attention` => True) and the
             # Context default — otherwise single-GPU/TP-only decode would
             # be forced into eager and lose the CUDAGraph decode path.
+            self._dspark_decode_replay = True
             return (
                 num_input_tokens,
                 None,
@@ -2219,6 +2227,7 @@ class ModelRunner:
             local_can_split=local_can_split,
             local_ub_tokens=(local_ub0, local_ub1),
             dspark_shape=dspark_shape,
+            local_is_dummy=bool(getattr(batch, "is_dummy_run", False)),
         )
 
         max_tokens = int(sync.num_tokens_across_dp.max())
@@ -2229,6 +2238,8 @@ class ModelRunner:
             # CUDAGraph path: all ranks pad to the same max for fixed-size all_gather.
             num_input_tokens = max_tokens
         # else: variable-length path — each rank keeps its own token count.
+
+        self._dspark_decode_replay = dp_uniform_decode and not sync.any_dummy
 
         return (
             num_input_tokens,
@@ -2554,6 +2565,8 @@ class ModelRunner:
             ub_max_tokens_across_dp,
             _dspark_shape_max,
         ) = preprocessed
+        # NOTE: self._dspark_decode_replay is set inside _preprocess (it needs
+        # sync.any_dummy), so it's already current here for build()/run_model.
 
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
@@ -3504,10 +3517,13 @@ class ModelRunner:
                 else int(batch.total_tokens_num_decode)
             )
             buckets = self._piecewise_sorted_tokens
-            idx = bisect.bisect_left(buckets, real_tokens)
-            if idx < len(buckets):
-                return buckets[idx], real_tokens, True
-            # total tokens exceeds the largest captured bucket -> eager.
+            q = int(max_q_len)
+            # Pick the q-divisible bucket N; replay only when all-real (see
+            # _dspark_decode_replay -- any dummy this step -> everyone eager).
+            _replay = bool(getattr(self, "_dspark_decode_replay", False))
+            for b in buckets:
+                if b >= real_tokens and q > 0 and b % q == 0:
+                    return b, real_tokens, _replay
             return max(real_tokens, graph_bs * max_q_len), real_tokens, False
 
         num_tokens_pad = graph_bs * max_q_len
@@ -3535,9 +3551,14 @@ class ModelRunner:
             return default_graph_bs
         q = int(batch.num_spec_query_tokens)
         buckets = self._piecewise_sorted_tokens
-        idx = bisect.bisect_left(buckets, int(dp_total_tokens))
-        if idx < len(buckets) and q > 0 and buckets[idx] % q == 0:
-            return buckets[idx] // q
+        # Select the SAME q-divisible bucket N that _piecewise_replay_shape picks
+        # (smallest captured bucket >= dp_total_tokens with q | N), and return
+        # graph_bs = N // q. Then graph_bs*max_seqlen_q == N on EVERY rank, so the
+        # eager (dummy) MoE all_gather size equals the size baked into the real
+        # ranks' replayed piecewise graph -> no cross-rank collective mismatch.
+        for b in buckets:
+            if b >= int(dp_total_tokens) and q > 0 and b % q == 0:
+                return int(b) // q
         return default_graph_bs
 
     def _dspark_capture_q_buckets(self, full_q: int) -> list[int]:
