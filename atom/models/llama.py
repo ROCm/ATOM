@@ -511,7 +511,7 @@ class LlamaForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 

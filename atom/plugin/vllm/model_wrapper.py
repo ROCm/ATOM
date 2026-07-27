@@ -596,7 +596,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if not hasattr(self, "lm_head"):
             holder = first_holder("lm_head")
             if holder is not None:
-                put(self, "lm_head", getattr(holder, "lm_head"))
+                put(self, "lm_head", holder.lm_head)
 
         # (2) Draft only: propagate vLLM's later writes on the outer model down
         #     to the inner module the forward path reads from. Create the one-off
