@@ -385,9 +385,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   "overlap" (default): move the AR onto the comm stream so it overlaps the
     #             partner ubatch's compute. Per-ubatch pynccl comms keep the
     #             cross-rank enqueue order consistent (hang-free).
-    #   "inline": run the AR on the current stream, no overlap. Kill switch —
-    #             the Plan-A baseline; fall back here if an overlap-path hang
-    #             ever resurfaces on some shape/topology.
+    #   "inline": run the AR on the current stream, no overlap. Plan-A baseline.
     "ATOM_TBO_TP_AR_MODE": lambda: os.getenv("ATOM_TBO_TP_AR_MODE", "overlap"),
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores

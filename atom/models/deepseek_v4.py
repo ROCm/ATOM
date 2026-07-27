@@ -35,7 +35,7 @@ from aiter import (
     rope_rotate_activation,
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
-from aiter.dist.communication_op import (
+from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from aiter.dist.parallel_state import (
@@ -3033,15 +3033,12 @@ class MoE(nn.Module):
                 shared = shared * (1.0 / get_pcp_world_size())
             routed = routed + shared
         if self.tp_size > 1:
-            if self.tbo_aware:
-                # Pure TP+TBO: TBO-aware AR (custom op) overlaps this ubatch's TP
-                # all_reduce with the partner ubatch's compute. The custom op is a
-                # Dynamo barrier so no tbo_active() branch lands in the (possibly
-                # compiled) call site — see module_dispatch_ops.tbo_all_reduce.
-                routed = torch.ops.aiter.tbo_all_reduce(routed)
-            else:
-                # Non-TBO / TBO+DP: original plain TP all_reduce, untouched.
-                routed = tensor_model_parallel_all_reduce(routed)
+            # ATOM AR layer routes through the TBO-aware custom op when
+            # self.tbo_aware (pure TP+TBO); plain all_reduce otherwise
+            # (non-TBO / TBO+DP), untouched.
+            routed = tensor_model_parallel_all_reduce(
+                routed, tbo_aware=self.tbo_aware
+            )
         return routed
 
     def single_stream_moe_forward(

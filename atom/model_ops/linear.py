@@ -23,6 +23,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from atom.config import QuantizationConfig, get_current_atom_config
+from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_ops.utils import (
     atom_parameter,
@@ -924,10 +925,9 @@ class LinearBase(nn.Module):
                 if self.bias is not None:
                     y += self.bias
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
-            if getattr(self, "tbo_aware", False):
-                y = torch.ops.aiter.tbo_all_reduce(y)
-            else:
-                y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
+            y = tensor_model_parallel_all_reduce(
+                y, tbo_aware=getattr(self, "tbo_aware", False)
+            )
         return y
 
 
