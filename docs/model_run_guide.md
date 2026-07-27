@@ -1,8 +1,8 @@
-# Model Run Guide
+# Model run guide
 
 Ready-to-use commands for serving models on ATOM with AMD Instinct MI355X / MI300X GPUs. Each model recipe below is validated in nightly CI.
 
-## Quick Start
+## Quick start
 
 ```bash
 # Pull the latest ATOM container
@@ -17,23 +17,23 @@ docker run -it --device=/dev/kfd --device=/dev/dri \
   rocm/atom:latest
 ```
 
-## Supported Models
+## Supported models
 
 | Model | Type | Precision | TP | Recipe |
 |-------|------|-----------|-----|--------|
-| DeepSeek-R1-0528 | MoE + MLA | FP8 / MXFP4 | 8 | [recipes/DeepSeek-R1.md](../recipes/DeepSeek-R1.md) |
-| GLM-5 | MoE + MLA | FP8 | 8 | [recipes/GLM-5.md](../recipes/GLM-5.md) |
-| GPT-OSS-120B | MoE | FP8 | 1 | [recipes/GPT-OSS.md](../recipes/GPT-OSS.md) |
-| Kimi-K2.5/K2.7 | MoE | MXFP4 | 4 | [recipes/Kimi-K2.md](../recipes/Kimi-K2.md) |
-| Kimi-K2-Thinking | MoE | FP8 | 8 | [recipes/Kimi-K2-Thinking.md](../recipes/Kimi-K2-Thinking.md) |
-| Qwen3-235B | MoE | FP8 | 8 | [recipes/Qwen3-235b.md](../recipes/Qwen3-235b.md) |
-| Qwen3-Next | MoE | FP8 | 8 | [recipes/Qwen3-Next.md](../recipes/Qwen3-Next.md) |
+| DeepSeek-R1-0528 | MoE + MLA | FP8 / MXFP4 | 8 | [recipes/DeepSeek-R1.md](https://github.com/ROCm/ATOM/blob/main/recipes/DeepSeek-R1.md) |
+| GLM-5 | MoE + MLA | FP8 | 8 | [recipes/GLM-5.md](https://github.com/ROCm/ATOM/blob/main/recipes/GLM-5.md) |
+| GPT-OSS-120B | MoE | FP8 | 1 | [recipes/GPT-OSS.md](https://github.com/ROCm/ATOM/blob/main/recipes/GPT-OSS.md) |
+| Kimi-K2.5/K2.7 | MoE | MXFP4 | 4 | [recipes/Kimi-K2.md](https://github.com/ROCm/ATOM/blob/main/recipes/Kimi-K2.md) |
+| Kimi-K2-Thinking | MoE | FP8 | 8 | [recipes/Kimi-K2-Thinking.md](https://github.com/ROCm/ATOM/blob/main/recipes/Kimi-K2-Thinking.md) |
+| Qwen3-235B | MoE | FP8 | 8 | [recipes/Qwen3-235b.md](https://github.com/ROCm/ATOM/blob/main/recipes/Qwen3-235b.md) |
+| Qwen3-Next | MoE | FP8 | 8 | [recipes/Qwen3-Next.md](https://github.com/ROCm/ATOM/blob/main/recipes/Qwen3-Next.md) |
 
-### vLLM Plugin Backend
+### vLLM plugin backend
 
-ATOM also runs as a vLLM plugin backend. See recipes under [recipes/atom_vllm/](../recipes/atom_vllm/) for vLLM-integrated serving.
+ATOM also runs as a vLLM plugin backend. See recipes under [recipes/atom_vllm/](https://github.com/ROCm/ATOM/tree/main/recipes/atom_vllm/) for vLLM-integrated serving.
 
-## Nightly CI Benchmark Configurations
+## Nightly CI benchmark configurations
 
 The nightly CI sweeps these configurations for every model:
 
@@ -61,7 +61,7 @@ Key parameters:
 - `--request-rate inf` — closed-loop benchmarking (no inter-request delay)
 - `--ignore-eos` — forces full output length generation
 
-## Live Dashboard
+## Live dashboard
 
 Nightly benchmark results are published to the [ATOM Benchmark Dashboard](https://rocm.github.io/ATOM/benchmark-dashboard/).
 

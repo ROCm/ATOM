@@ -33,7 +33,7 @@ class _VetoDelayer:
     """Stub cross-DP delayer that always refuses prefill this tick, forcing the
     decode loop to run while a partial prefill is still sitting in `running`."""
 
-    def should_allow_prefill(self, local_prefillable, token_usage):
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
         return False
 
 

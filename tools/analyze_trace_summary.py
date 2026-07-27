@@ -63,7 +63,7 @@ def extract_labeled_events(events: list[dict]) -> list[StepEvent]:
 
 
 def parse_label(name: str) -> dict[str, str]:
-    """Parse label like 'decode[bs=4 tok=16 d=4 spec=3]' into dict."""
+    """Parse label like 'decode[bs=4 tok=16 p=0 d=4 spec=3]' into dict."""
     m = re.match(r"(\w+)\[(.+)\]", name)
     if not m:
         return {"type": name}
@@ -102,7 +102,12 @@ def generate_report(events: list[StepEvent], filepath: str) -> str:
     lines.append("# Trace Performance Summary")
     lines.append(f"\n**File:** `{Path(filepath).name}`\n")
 
-    # Separate by phase
+    # Separate by phase. The exact "prefill[" / "decode[" prefixes exclude
+    # DP-sync dummy steps ("dummy_decode[" / "dummy_prefill[") and forced-eager
+    # decodes ("eager_decode[") — see atom/model_engine/run_labels.py.
+    # NOTE: pre-taxonomy traces labeled dummies as plain "decode[", so counts
+    # here differ vs an old trace of the same workload; re-baseline, don't read
+    # the delta as a perf change.
     prefills = [
         e
         for e in events

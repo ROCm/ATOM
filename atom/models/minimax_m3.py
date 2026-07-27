@@ -331,6 +331,7 @@ class MiniMaxM3Attention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         cache_config: str = "bf16",
+        index_cache_config: str = "auto",
     ) -> None:
         super().__init__()
         self.layer_num = layer_id
@@ -409,6 +410,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         cache_config: str = "bf16",
+        index_cache_config: str = "auto",
     ) -> None:
         super().__init__()
         self.is_indexed_sparse_attention = True
@@ -522,6 +524,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             local_blocks=self.local_blocks,
             skip_index_topk=self.skip_index_topk,
             sparse_layer_ordinal=self.sparse_layer_ordinal,
+            index_cache_dtype=index_cache_config,
         )
 
     def forward(
@@ -553,6 +556,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         config: PretrainedConfig,
         prefix: str,
         cache_config: str = "bf16",
+        index_cache_config: str = "auto",
         quant_config: Optional[QuantizationConfig] = None,
         params_dtype: Optional[torch.dtype] = None,
         layer_num: int = 0,
@@ -569,6 +573,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             cache_config=cache_config,
+            index_cache_config=index_cache_config,
         )
 
         self.is_moe_layer = _is_moe_layer(config, layer_num)
@@ -667,6 +672,7 @@ class MiniMaxM3Model(nn.Module):
         config = _get_text_config(atom_config.hf_config)
         self.config = config
         cache_config = atom_config.kv_cache_dtype
+        index_cache_config = atom_config.index_cache_dtype
         quant_config = atom_config.quant_config
 
         if get_pp_group().is_first_rank:
@@ -683,6 +689,7 @@ class MiniMaxM3Model(nn.Module):
                 config,
                 prefix,
                 cache_config=cache_config,
+                index_cache_config=index_cache_config,
                 quant_config=quant_config,
                 layer_num=layer_num,
                 params_dtype=atom_config.torch_dtype,

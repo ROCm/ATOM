@@ -157,7 +157,7 @@ jobs:
           EXTRA_LAUNCH_ARGS: ${{ inputs.extra_args }}
         run: |
           set -euo pipefail
-          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
+          if [ -n "${MODEL_HOST_ROOT:-}" ]; then model_path="/models/${{ env.MODEL_PATH }}"
           else model_path="${{ env.MODEL_PATH }}"; fi
 
           # Launch via stdin so the container's bash parses the shell quoting in

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -19,6 +20,68 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME = "model.layers.0.atom_deepseek_v4_proxy"
 ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX = "atom_deepseek_v4_draft_proxy"
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+
+logger = logging.getLogger(__name__)
+
+# aiter's V4 native 2buff fp8 prefill (op4) / decode (op5) kernels exist only on
+# gfx950 / gfx1250. Mirror native's guard (deepseek_v4_attn.py): a request for an
+# fp8 KV cache on any other arch degrades to a bf16 cache instead of hard-failing.
+_V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
+_V4_FP8_DOWNGRADE_WARNED = False
+
+
+def _v4_kv_fp8(vllm_config) -> bool:
+    """Whether the V4 KV cache runs the native 2buff fp8 layout.
+
+    True iff vLLM's ``--kv-cache-dtype`` is an fp8 spelling AND the arch is one
+    aiter op4/op5 support. Any ``fp8*`` spelling (``fp8`` / ``fp8_e4m3`` / ...)
+    maps to ATOM's single ``"fp8"`` 2buff path. This is the single authority for
+    the fp8 decision -- the proxy KV-cache sizing (``_proxy_page_bytes`` /
+    ``get_kv_cache_spec``), the view slicing, and the per-module bind all key off
+    it, so pool geometry and the runtime dispatch never disagree.
+    """
+    global _V4_FP8_DOWNGRADE_WARNED
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", None) if cache_config else None
+    if not (isinstance(cache_dtype, str) and cache_dtype.startswith("fp8")):
+        return False
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        gfx = get_gfx()
+    except Exception:
+        gfx = None
+    if gfx not in _V4_FP8_SUPPORTED_GFX:
+        if not _V4_FP8_DOWNGRADE_WARNED:
+            logger.warning(
+                "DeepSeek-V4 --kv-cache-dtype %r (2buff fp8) is only supported on "
+                "%s (aiter op4/op5); got gfx=%r. Falling back to a bf16 KV cache.",
+                cache_dtype,
+                "/".join(_V4_FP8_SUPPORTED_GFX),
+                gfx,
+            )
+            _V4_FP8_DOWNGRADE_WARNED = True
+        return False
+    return True
+
+
+def _v4_rope_head_dim(hf_config) -> int:
+    return int(getattr(hf_config, "qk_rope_head_dim", 64))
+
+
+def _v4_entry_bytes(head_dim: int, rope_head_dim: int, kv_fp8: bool) -> int:
+    """Per-KV-entry byte size of the (NoPE + RoPE) payload for one V4 slot.
+
+    bf16: a single ``[head_dim]`` bf16 row (NoPE 448 + RoPE 64 concatenated) =
+    ``head_dim * 2``.
+
+    fp8 2buff: a NoPE fp8 pool row ``[head_dim]`` (1 B/elem -- 448 NoPE + 14 e8m0
+    scales + 50 pad = 512 B) PLUS a parallel bf16 RoPE pool row ``[rope_head_dim]``
+    (2 B/elem). RoPE is never quantized, so it lives in its own bf16 buffer.
+    """
+    if kv_fp8:
+        return head_dim * 1 + rope_head_dim * 2
+    return head_dim * 2
 
 
 def deepseek_v4_draft_proxy_layer_name(hf_config) -> str:
@@ -42,14 +105,19 @@ def _layer_counts(hf_config) -> tuple[list[int], int, int, int]:
     return ratios, dense, csa, hca
 
 
-def _classical_block_bytes(hf_config) -> int:
+def _classical_block_bytes(hf_config, kv_fp8: bool = False) -> int:
     ratios, _dense, csa_layers, hca_layers = _layer_counts(hf_config)
     head_dim = int(getattr(hf_config, "head_dim", 512))
+    rope_head_dim = _v4_rope_head_dim(hf_config)
     index_head_dim = int(getattr(hf_config, "index_head_dim", 128))
     index_dim = _aligned_index_dim(index_head_dim)
-    csa_main = (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4) * head_dim * 2
+    # NoPE(+RoPE) payload bytes per classical entry; fp8 splits into a fp8 NoPE
+    # pool + a bf16 RoPE pool (see _v4_entry_bytes). Indexer is always fp8 and
+    # unchanged by the 2buff layout.
+    entry = _v4_entry_bytes(head_dim, rope_head_dim, kv_fp8)
+    csa_main = (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4) * entry
     csa_index = (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4) * index_dim
-    hca_main = (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128) * head_dim * 2
+    hca_main = (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128) * entry
     return csa_layers * (csa_main + csa_index) + hca_layers * hca_main
 
 
@@ -69,6 +137,8 @@ def _proxy_page_bytes(vllm_config) -> int:
     hf = vllm_config.model_config.hf_config
     ratios, _dense, _csa, _hca = _layer_counts(hf)
     head_dim = int(getattr(hf, "head_dim", 512))
+    rope_head_dim = _v4_rope_head_dim(hf)
+    kv_fp8 = _v4_kv_fp8(vllm_config)
     win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
     max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
     max_model_len = int(vllm_config.model_config.max_model_len)
@@ -77,10 +147,19 @@ def _proxy_page_bytes(vllm_config) -> int:
         (max_model_len + ATOM_DEEPSEEK_V4_BLOCK_SIZE - 1)
         // ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     )
-    swa_bytes = len(ratios) * max_num_seqs * win * head_dim * 2
+    # SWA prefix bytes per layer scale with the same (NoPE+RoPE) entry size as the
+    # classical pool so bf16 and fp8 2buff geometry stay in lockstep.
+    swa_bytes = (
+        len(ratios)
+        * max_num_seqs
+        * win
+        * _v4_entry_bytes(head_dim, rope_head_dim, kv_fp8)
+    )
     # Amortize fixed SWA state into every vLLM page so total proxy storage can
     # hold both SWA prefix and classical paged KV while remaining a vLLM KV cache.
-    return _classical_block_bytes(hf) + ((swa_bytes + min_blocks - 1) // min_blocks)
+    return _classical_block_bytes(hf, kv_fp8) + (
+        (swa_bytes + min_blocks - 1) // min_blocks
+    )
 
 
 def slice_deepseek_v4_proxy_cache_views(
@@ -93,13 +172,27 @@ def slice_deepseek_v4_proxy_cache_views(
     window_size: int = 128,
     head_dim: int = 512,
     index_head_dim: int = 128,
+    kv_fp8: bool = False,
+    rope_head_dim: int = 64,
 ) -> dict[str, list[torch.Tensor]]:
     """Carve ATOM V4 KV views from vLLM-managed proxy KV storage.
 
-    Storage layout is linear over the raw proxy bytes:
-      per layer: SWA prefix [num_slots*window, D] BF16, then optional classical
-      tail [num_blocks*k, D] BF16 for CSA/HCA; CSA indexer blocks are stored
-      after each CSA main tail as FP8 bytes.
+    Two layouts, selected by ``kv_fp8`` and kept byte-consistent with
+    ``_proxy_page_bytes`` / ``_classical_block_bytes``:
+
+    - bf16 (``kv_fp8=False``): per layer a single NoPE+RoPE pool -- SWA prefix
+      ``[num_slots*window, head_dim]`` bf16 then an optional classical tail
+      ``[num_blocks*k, head_dim]`` bf16 (CSA/HCA); CSA indexer blocks follow the
+      CSA main tail as fp8 bytes. All ``*_rope`` views are ``None``.
+
+    - fp8 2buff (``kv_fp8=True``): the NoPE payload becomes an fp8 pool
+      ``[.., head_dim]`` (1 B/elem, packed 448 NoPE + 14 e8m0 scales + 50 pad)
+      plus a PARALLEL bf16 RoPE pool ``[.., rope_head_dim]`` carved right after
+      the indexer. NoPE and RoPE share identical (block, slot) paged addressing.
+      Per-layer linear order is: swa_nope, main_nope, [indexer], swa_rope,
+      main_rope -- so ``unified`` / ``unified_rope`` are each contiguous swa+main
+      spans, and every bf16 (RoPE) region starts at an even byte offset (all
+      preceding fp8/indexer region sizes are even).
     """
     if compress_ratios is None:
         assert csa_layer_count is not None and hca_layer_count is not None
@@ -117,6 +210,15 @@ def slice_deepseek_v4_proxy_cache_views(
     csa_main: list[torch.Tensor] = []
     csa_indexer: list[torch.Tensor] = []
     hca_main: list[torch.Tensor] = []
+    # Parallel bf16 RoPE pools (fp8 2buff only). In bf16 these carry ``None`` so
+    # callers can index them uniformly by layer_id / csa_i / hca_i.
+    unified_rope: list[torch.Tensor | None] = []
+    swa_rope: list[torch.Tensor | None] = []
+    csa_main_rope: list[torch.Tensor | None] = []
+    hca_main_rope: list[torch.Tensor | None] = []
+
+    nope_dtype = dtypes.fp8 if kv_fp8 else torch.bfloat16
+    nope_elt = 1 if kv_fp8 else 2  # bytes per NoPE-pool element
 
     def take_bytes(n: int) -> torch.Tensor:
         nonlocal offset
@@ -129,30 +231,41 @@ def slice_deepseek_v4_proxy_cache_views(
         return out
 
     for ratio in ratios:
-        swa_bytes = num_slots * window_size * head_dim * 2
-        layer_start = offset
-        swa_view = (
-            take_bytes(swa_bytes)
-            .view(torch.bfloat16)
-            .view(num_slots, window_size, head_dim)
-        )
-        swa.append(swa_view)
         if ratio == 4:
             k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
-            main_bytes = num_blocks * k * head_dim * 2
-            main = (
-                take_bytes(main_bytes)
-                .view(torch.bfloat16)
+        elif ratio == 128:
+            k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128
+        else:
+            k = 0
+
+        # ---- NoPE pool: SWA prefix + optional classical tail (contiguous) ----
+        nope_start = offset
+        swa_nope = (
+            take_bytes(num_slots * window_size * head_dim * nope_elt)
+            .view(nope_dtype)
+            .view(num_slots, window_size, head_dim)
+        )
+        swa.append(swa_nope)
+        if k:
+            main_nope = (
+                take_bytes(num_blocks * k * head_dim * nope_elt)
+                .view(nope_dtype)
                 .as_strided(
-                    size=(num_blocks, k, head_dim), stride=(k * head_dim, head_dim, 1)
+                    size=(num_blocks, k, head_dim),
+                    stride=(k * head_dim, head_dim, 1),
                 )
             )
-            unified_bytes = raw[layer_start:offset]
             unified.append(
-                unified_bytes.view(torch.bfloat16).view(
-                    num_slots * window_size + num_blocks * k, head_dim
-                )
+                raw[nope_start:offset]
+                .view(nope_dtype)
+                .view(num_slots * window_size + num_blocks * k, head_dim)
             )
+        else:
+            main_nope = None
+            unified.append(swa_nope.view(num_slots * window_size, head_dim))
+
+        # ---- CSA indexer (always fp8, unchanged by the 2buff layout) ----
+        if ratio == 4:
             idx = (
                 take_bytes(num_blocks * k * index_dim)
                 .view(dtypes.fp8)
@@ -161,27 +274,46 @@ def slice_deepseek_v4_proxy_cache_views(
                     stride=(k * index_dim, index_dim, 1),
                 )
             )
-            csa_main.append(main)
             csa_indexer.append(idx)
-        elif ratio == 128:
-            k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128
-            main_bytes = num_blocks * k * head_dim * 2
-            main = (
-                take_bytes(main_bytes)
+
+        # ---- Parallel bf16 RoPE pool (fp8 2buff only) ----
+        if kv_fp8:
+            rope_start = offset
+            swa_r = (
+                take_bytes(num_slots * window_size * rope_head_dim * 2)
                 .view(torch.bfloat16)
-                .as_strided(
-                    size=(num_blocks, k, head_dim), stride=(k * head_dim, head_dim, 1)
-                )
+                .view(num_slots, window_size, rope_head_dim)
             )
-            unified_bytes = raw[layer_start:offset]
-            unified.append(
-                unified_bytes.view(torch.bfloat16).view(
-                    num_slots * window_size + num_blocks * k, head_dim
+            swa_rope.append(swa_r)
+            if k:
+                main_r = (
+                    take_bytes(num_blocks * k * rope_head_dim * 2)
+                    .view(torch.bfloat16)
+                    .as_strided(
+                        size=(num_blocks, k, rope_head_dim),
+                        stride=(k * rope_head_dim, rope_head_dim, 1),
+                    )
                 )
-            )
-            hca_main.append(main)
+                unified_rope.append(
+                    raw[rope_start:offset]
+                    .view(torch.bfloat16)
+                    .view(num_slots * window_size + num_blocks * k, rope_head_dim)
+                )
+            else:
+                main_r = None
+                unified_rope.append(swa_r.view(num_slots * window_size, rope_head_dim))
         else:
-            unified.append(swa_view.view(num_slots * window_size, head_dim))
+            main_r = None
+            swa_rope.append(None)
+            unified_rope.append(None)
+
+        # ---- Bucket the classical main (+ its RoPE) by ratio ----
+        if ratio == 4:
+            csa_main.append(main_nope)
+            csa_main_rope.append(main_r)
+        elif ratio == 128:
+            hca_main.append(main_nope)
+            hca_main_rope.append(main_r)
 
     return {
         "unified": unified,
@@ -189,6 +321,10 @@ def slice_deepseek_v4_proxy_cache_views(
         "csa_main": csa_main,
         "csa_indexer": csa_indexer,
         "hca_main": hca_main,
+        "unified_rope": unified_rope,
+        "swa_rope": swa_rope,
+        "csa_main_rope": csa_main_rope,
+        "hca_main_rope": hca_main_rope,
     }
 
 
@@ -416,6 +552,8 @@ def _bind_compressor_state(
     head_dim: int,
     *,
     is_indexer: bool = False,
+    write_mode: str = "bf16",
+    kv_cache_rope: torch.Tensor | None = None,
 ) -> None:
     compressor.kv_state = torch.zeros(
         (num_slots, *compressor.kv_state.shape[1:]),
@@ -444,6 +582,12 @@ def _bind_compressor_state(
         )
     else:
         compressor.cache_scale = None
+    # #1600 contract: Compressor.forward selects its scatter path from
+    # `write_mode` (was: sniff kv_cache.dtype). The indexer-inner cache is always
+    # fp8 -> "indexer_fp8"; CSA/HCA Main is "bf16" or, under the fp8 2buff layout,
+    # "main_2buff_fp8" with a parallel bf16 RoPE pool bound via `kv_cache_rope`.
+    compressor.kv_cache_rope = kv_cache_rope
+    compressor.write_mode = write_mode
 
 
 def _v4_max_spec_steps(vllm_config) -> int:
@@ -507,6 +651,28 @@ def _v4_round_to_cudagraph_bucket(n: int, sizes) -> int:
     return n
 
 
+def _build_swa_ring_block_tables(
+    state_slot_gpu: torch.Tensor, max_blocks: int, out_gpu=None
+) -> torch.Tensor:
+    """Ring-emulating SWA block table for the paged SWA ABI (project 024).
+
+    ATOM #1423 made the shared V4 SWA path content-addressed via
+    ``swa_block_tables``:
+    ``swa_kv[swa_block_tables[bid, pos // block_size] * block_size + pos % block_size]``.
+    The vllm plugin keeps the per-request ring pool (correct without prefix
+    reuse). Mapping every logical block of a request to its ring slot and passing
+    ``block_size = cs`` collapses the paged offset to the ring
+    ``slot * cs + pos % cs`` — no shared-kernel change needed. ``out_gpu`` (a
+    persistent buffer) is filled in place for CUDA-graph capture safety.
+    """
+    bs = int(state_slot_gpu.shape[0])
+    src = state_slot_gpu.view(bs, 1).expand(bs, max_blocks)
+    if out_gpu is not None:
+        out_gpu[:bs, :max_blocks].copy_(src)
+        return out_gpu[:bs, :max_blocks]
+    return src.contiguous()
+
+
 class _V4DecodeMetaBuffers:
     """Persistent, fixed-address scratch for the V4 *decode* attention metadata.
 
@@ -531,6 +697,7 @@ class _V4DecodeMetaBuffers:
         max_committed_hca: int,
         ratios_overlap,
         device: torch.device,
+        max_blocks: int = 1,
     ):
         from atom.utils import CpuGpuBuffer
 
@@ -543,12 +710,17 @@ class _V4DecodeMetaBuffers:
         hca = int(max_committed_hca)
         self.num_slots = S
         self.max_decode_tokens = T
+        self.max_blocks = max(1, int(max_blocks))
 
         def i32(*shape):
             return CpuGpuBuffer(*shape, dtype=torch.int32, device=device)
 
         # Per-seq scalars (sized to padded request count == num_slots).
         self.state_slot = i32(S)
+        # Ring-emulating SWA block table (project 024): [S, max_blocks], every
+        # column = the request's ring slot; paged block_size = cs. Persistent so
+        # its address is stable across CUDA-graph replay.
+        self.swa_block_tables = i32(S, self.max_blocks)
         self.n_csa = i32(S)
         self.n_hca = i32(S)
         # Per-token mapping (sized to padded token count). int32: accepted by
@@ -563,6 +735,19 @@ class _V4DecodeMetaBuffers:
         self.idx_swa = i32(T * max(1, win))
         self.idx_csa = i32(T * max(1, win + topk))
         self.idx_hca = i32(T * max(1, win + hca))
+        # Per-token paged-decode index tensors for the fp8 asm decode kernel
+        # (aiter op5 `mla_decode_fwd_v4_nm`, page_size=1). Mirrors native
+        # deepseek_v4_attn.py: values depend ONLY on the (padded) decode token
+        # count, never the batch content -- qo_indptr == arange(N+1) (with the
+        # CG-padded tail repeating the real token count so padded slots are
+        # 0-length queries the asm kernel skips), kv_last_page_lens == ones(N).
+        # Re-staged into these persistent buffers every fwd (H2D into a stable
+        # address) => CUDAGraph-safe. Allocated unconditionally (tiny); only
+        # populated on the fp8 path. bf16 leaves md.qo_indptr / kv_last_page_lens
+        # None (the native Triton decode path ignores them).
+        self.qo_indptr = i32(T + 1)
+        self.kv_last_page_lens = i32(T)
+        self._qo_indptr_np = np.arange(T + 1, dtype=np.int32)
         # Native compress-plan buffers (one pair per compress ratio present).
         # Decode worst case: each seq contributes ceil((1 + spec) / ratio)
         # compression boundaries. The write plan is a subset of the per-fwd
@@ -578,18 +763,20 @@ class _V4DecodeMetaBuffers:
             make_compress_plans as _mcp,
         )
 
+        # Decode CG plan slicing is `graph_bs * per_seq_bound` (computed inside
+        # make_compress_plans from these two scalars). graph_bs == num_slots
+        # (padded decode batch); max_q_len == 1 + max_spec_steps.
+        self.decode_graph_bs = S
+        self.decode_q_len = max(1, T // S)
         self.plan_buffers: dict[int, dict] = {}
-        self.decode_compress_cap: dict[int, int] = {}
-        spec_plus_one = max(1, T // S)
         for ratio, is_overlap in ratios_overlap:
             ratio = int(ratio)
-            per_seq = (spec_plus_one + ratio - 1) // ratio
+            per_seq = (self.decode_q_len + ratio - 1) // ratio
             cap = max(1, S * per_seq)
             self.plan_buffers[ratio] = {
                 "compress": i32(cap, 4),
                 "write": i32(max(1, T), 4),
             }
-            self.decode_compress_cap[ratio] = cap
 
     def stage(self, buf, arr_np):
         """Copy ``arr_np`` into the head of CpuGpuBuffer ``buf`` and return the
@@ -628,6 +815,12 @@ def bind_deepseek_v4_proxy_cache_views(
         model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
     window_size = int(model.args.window_size)
     win_with_spec = _v4_win_with_spec(vllm_config, window_size)
+    # Single fp8 authority for the whole bind (must agree with the _proxy_page_bytes
+    # sizing vLLM already used to allocate proxy.kv_cache). Threaded onto
+    # meta_params so the metadata builder stages the fp8 op5 per-token decode
+    # index tensors (qo_indptr / kv_last_page_lens) only under fp8.
+    kv_fp8 = _v4_kv_fp8(vllm_config)
+    rope_head_dim = _v4_rope_head_dim(vllm_config.model_config.hf_config)
     model._atom_v4_meta_params = SimpleNamespace(
         num_slots=num_slots,
         window_size=window_size,
@@ -635,7 +828,11 @@ def bind_deepseek_v4_proxy_cache_views(
         # steps so MTP>1 writes do not alias the target decode window.
         cs=win_with_spec,
         index_topk=int(getattr(model.args, "index_topk", 1024)),
+        kv_fp8=kv_fp8,
     )
+    # CSA/HCA Main scatter mode: fp8 2buff -> "main_2buff_fp8" (nope fp8 + parallel
+    # bf16 rope), else the plain bf16 scatter. The indexer is always "indexer_fp8".
+    main_write_mode = "main_2buff_fp8" if kv_fp8 else "bf16"
     views = slice_deepseek_v4_proxy_cache_views(
         proxy.kv_cache,
         compress_ratios=ratios,
@@ -643,13 +840,36 @@ def bind_deepseek_v4_proxy_cache_views(
         window_size=win_with_spec,
         head_dim=int(model.args.head_dim),
         index_head_dim=int(model.args.index_head_dim),
+        kv_fp8=kv_fp8,
+        rope_head_dim=rope_head_dim,
     )
     for fallback_layer_id, block in enumerate(_deepseek_v4_blocks(model)):
         attn = block.attn
         layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
         ratio = int(attn.compress_ratio)
         attn.unified_kv = views["unified"][layer_id]
-        attn.swa_kv = views["swa"][layer_id]
+        # paged SWA ABI (#1423): shared _attn_core / swa_write treat swa_kv as a
+        # flat [pages, head_dim] region addressed by swa_block_tables. Plugin keeps
+        # the ring pool but exposes it flat with block_size = cs, so a ring-slot
+        # block table reduces the paged offset to `slot*cs + pos%cs` (project 024).
+        swa_view = views["swa"][layer_id]
+        attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
+        attn.swa_block_size = int(win_with_spec)
+        # #1600 contract: DeepseekV4Attention.forward reads unified_kv_rope /
+        # swa_kv_rope unconditionally (the parallel bf16 rope pool of the fp8
+        # 2buff layout). bf16 -> both None (RoPE stays inline in unified_kv,
+        # matching the native builder's bf16 branch). fp8 2buff -> the parallel
+        # bf16 RoPE pool, paged identically to unified_kv / swa_kv. kv_fp8 is
+        # (re)asserted here as the bind-time authority so the module geometry
+        # agrees with the proxy pool (incl. the gfx950/1250 -> bf16 fallback).
+        attn.kv_fp8 = kv_fp8
+        if kv_fp8:
+            attn.unified_kv_rope = views["unified_rope"][layer_id]
+            swa_rope_view = views["swa_rope"][layer_id]
+            attn.swa_kv_rope = swa_rope_view.reshape(-1, swa_rope_view.shape[-1])
+        else:
+            attn.unified_kv_rope = None
+            attn.swa_kv_rope = None
         if ratio == 4:
             csa_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
@@ -657,6 +877,8 @@ def bind_deepseek_v4_proxy_cache_views(
                 views["csa_main"][csa_i],
                 num_slots,
                 int(model.args.head_dim),
+                write_mode=main_write_mode,
+                kv_cache_rope=views["csa_main_rope"][csa_i],
             )
             attn.indexer.kv_cache = views["csa_indexer"][csa_i]
             attn.indexer._max_model_len_idx = max(
@@ -668,6 +890,7 @@ def bind_deepseek_v4_proxy_cache_views(
                 num_slots,
                 int(model.args.index_head_dim),
                 is_indexer=True,
+                write_mode="indexer_fp8",
             )
         elif ratio == 128:
             hca_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
@@ -676,6 +899,8 @@ def bind_deepseek_v4_proxy_cache_views(
                 views["hca_main"][hca_i],
                 num_slots,
                 int(model.args.head_dim),
+                write_mode=main_write_mode,
+                kv_cache_rope=views["hca_main_rope"][hca_i],
             )
     # Persistent decode-metadata buffers for the FULL decode CUDA/HIP graph.
     # Allocated once (sized to the worst-case decode shape) so build() can
@@ -697,6 +922,7 @@ def bind_deepseek_v4_proxy_cache_views(
             max_committed_hca=max_committed_hca,
             ratios_overlap=ratios_overlap,
             device=proxy.kv_cache.device,
+            max_blocks=max_committed_hca,
         )
     model._atom_vllm_v4_proxy_cache_ptr = ptr
     return True
@@ -849,12 +1075,11 @@ def _make_compress_plans(
         context_lens_cpu,
         ratios,
         plan_buffers=plan_buffers,
-        decode_capacity_per_ratio=None,
     )
-    # Preserve the bridge eager path's old variable-grid behavior. Native
-    # make_compress_plans returns a sentinel-padded write buffer, while the
-    # previous bridge helper launched update_compressor_states with exactly
-    # num_write rows. Graph decode uses _make_decode_compress_plans instead.
+    # Eager path (graph_bs unset): make_compress_plans returns a full-buffer
+    # write slice (sentinel-padded). The eager bridge launches
+    # update_compressor_states with exactly num_write rows, so re-slice down.
+    # Graph decode uses _make_decode_compress_plans (fixed graph_bs slice).
     for plan in plans.values():
         plan.write_plan_gpu = plan.write_plan_gpu[: plan.num_write]
     return plans
@@ -1034,6 +1259,18 @@ def build_atom_v4_attention_metadata(
         block_tables=common_attn_metadata.block_table_tensor,
         state=state,
     )
+    # #1600 decode contract: DeepseekV4Attention._attn_core unconditionally reads
+    # `attn_md.qo_indptr` / `attn_md.kv_last_page_lens` for the paged decode call.
+    # The base AttentionMetaData declares `kv_last_page_lens` (default None) but
+    # NOT `qo_indptr`, so the attribute must be set explicitly or decode raises
+    # AttributeError (even in bf16). Default both to None -> the native bf16
+    # Triton decode path ignores them; the fp8 op5 asm path gets real per-token
+    # tensors staged below.
+    md.qo_indptr = None
+    md.kv_last_page_lens = None
+    # fp8 2buff KV cache => stage the op5 per-token decode index tensors. False
+    # for bf16 and for standalone/no-meta_params builds (safe: stays None).
+    kv_fp8 = bool(getattr(meta_params, "kv_fp8", False)) if meta_params else False
     if meta_params is not None:
         md.swa_num_slots = int(meta_params.num_slots)
         md.swa_window = int(meta_params.window_size)
@@ -1119,6 +1356,11 @@ def build_atom_v4_attention_metadata(
         bufs = decode_bufs
         md.state_slot_mapping_cpu = slot_arr
         md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr)
+        # Ring-emulating SWA block table for the paged write in _attn_core
+        # (capture-safe persistent buffer). block_size = cs at bind time.
+        md.swa_block_tables = _build_swa_ring_block_tables(
+            md.state_slot_mapping, bufs.max_blocks, out_gpu=bufs.swa_block_tables.gpu
+        )
         # Per-token seq map padded to T_pad with the -1 sentinel tail.
         if total:
             bufs.batch_id.np[:total] = batch_np
@@ -1171,11 +1413,28 @@ def build_atom_v4_attention_metadata(
             "cu_starts_gpu": None,
             "cu_ends_gpu": None,
         }
+        # fp8 op5 asm decode per-token index tensors (page_size=1), staged into
+        # persistent buffers so the captured decode graph replays a stable
+        # address. Real region [0..total] == arange; the CG-padded tail
+        # [total+1..T_pad] repeats `total` (0-length queries the asm kernel skips
+        # -- same trick as the kv_indptr pad tail). kv_last_page_lens == ones.
+        # Matches native deepseek_v4_attn.py `_build_paged_decode_meta`.
+        if kv_fp8:
+            qob = bufs.qo_indptr.np
+            qob[: total + 1] = bufs._qo_indptr_np[: total + 1]
+            if T_pad > total:
+                qob[total + 1 : T_pad + 1] = total
+            md.qo_indptr = bufs.qo_indptr.copy_to_gpu(T_pad + 1)
+            bufs.kv_last_page_lens.np[:T_pad] = 1
+            md.kv_last_page_lens = bufs.kv_last_page_lens.copy_to_gpu(T_pad)
         return md
 
     # ---- eager path: prefill, or decode without persistent buffers ----
     md.state_slot_mapping = torch.from_numpy(slot_arr).to(device)
     md.state_slot_mapping_cpu = slot_arr
+    md.swa_block_tables = _build_swa_ring_block_tables(
+        md.state_slot_mapping, int(common_attn_metadata.block_table_tensor.shape[1])
+    )
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
     md.n_committed_hca_per_seq = torch.from_numpy(n_hca_cpu).to(device)
@@ -1188,6 +1447,13 @@ def build_atom_v4_attention_metadata(
     pos_np = positions[:total].detach().cpu().numpy().astype(np.int32)
     if is_decode:
         _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
+        # Eager fp8 decode (no persistent buffers -- standalone/tests, or a
+        # batch that skips CG capture): fresh per-token op5 index tensors. Not
+        # CUDAGraph-captured here, so plain arange/ones over the real token count
+        # is correct (no pad tail). Production decode uses the persistent path.
+        if kv_fp8:
+            md.qo_indptr = torch.arange(total + 1, dtype=torch.int32, device=device)
+            md.kv_last_page_lens = torch.ones(total, dtype=torch.int32, device=device)
     else:
         _populate_prefill(md, common_attn_metadata, batch_np, pos_np, q_np, positions)
     # Decode/prefill split for the indexer. vLLM reorders rows with
@@ -1259,7 +1525,8 @@ def _make_decode_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         ratios_overlap,
         plan_buffers=bufs.plan_buffers,
-        decode_capacity_per_ratio=bufs.decode_compress_cap,
+        graph_bs=bufs.decode_graph_bs,
+        max_q_len=bufs.decode_q_len,
     )
 
 
@@ -1523,6 +1790,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         state_slot_per_seq=md.state_slot_mapping[:num_reqs],
         n_committed_hca_per_seq=n_hca_seq_g,
         block_tables=common.block_table_tensor[:num_reqs],
+        swa_block_tables=md.swa_block_tables[:num_reqs],
         extend_indptr=ext_indptr,
         prefix_swa_indptr=swa_indptr,
         prefix_csa_indptr=csa_indptr,
@@ -1533,7 +1801,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        cs=cs,
+        block_size=cs,
         swa_pages=swa_pages,
     )
     md.kv_indices_extend = ext_indices[:ext_total]
@@ -1588,7 +1856,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
     hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
     write_v4_paged_decode_indices(
-        state_slot_per_seq=md.state_slot_mapping,
+        block_tables=md.swa_block_tables,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
@@ -1599,7 +1867,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         hca_indices=hca_indices,
         T=T,
         win=win,
-        cs=cs,
+        block_size=cs,
     )
     write_v4_decode_hca_compress_tail(
         batch_id_per_token=md.batch_id_per_token,

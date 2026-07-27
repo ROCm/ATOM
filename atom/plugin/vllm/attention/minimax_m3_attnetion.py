@@ -236,7 +236,9 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         self.index_cache_layer = MiniMaxM3SparseIndexerCache(
             layer_name=f"{self.layer_name}.index_cache",
             head_dim=index_head_dim,
-            kv_cache_dtype="auto",
+            kv_cache_dtype=(
+                cache_dtype if str(cache_dtype).startswith("fp8") else "auto"
+            ),
         )
         _register_vllm_static_forward_context(self)
 
