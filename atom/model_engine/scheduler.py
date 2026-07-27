@@ -1440,6 +1440,23 @@ class Scheduler:
                 del seq.token_ids[-strip:]
                 del seq.output_tokens[-strip:]
                 seq.num_tokens -= strip
+        elif self.is_deferred_out:
+            # MTP off, but deferred-output mode still appends exactly one
+            # placeholder per step (postprocess: num_placeholder = mtp_k + 1 when
+            # is_deferred_out, i.e. 1 here). The `mtp_k > 0` guard above skipped
+            # it, so on preemption the stale eos placeholder — and the +1 it
+            # added to seq.num_tokens — survived requeue. After recompute the
+            # bookkeeping was off by one and the next deferred-output write
+            # (seq.output_tokens[pos] = el in postprocess) indexed out of range,
+            # raising IndexError and killing the engine core. Strip that lone
+            # placeholder here too so requeue starts from a clean token count.
+            # num_rejected is 0 without speculation; the min() clamp is
+            # defensive against a seq preempted before it ever got a placeholder.
+            strip = min(1 + seq.num_rejected, len(seq.output_tokens))
+            if strip > 0:
+                del seq.token_ids[-strip:]
+                del seq.output_tokens[-strip:]
+                seq.num_tokens -= strip
         seq.num_rejected = 0
         seq.num_bonus_tokens = 0
         seq.spec_token_ids = np.array([], dtype=np.int32)
@@ -1508,6 +1525,13 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
+        # Cache the engine's actual deferred-output state. It is set per step by
+        # the ModelRunner's tokenID_processor (which lives in the worker process
+        # and is invisible to the Scheduler at construction time, so the
+        # constructor default is a stale False). preempt() reads this to learn
+        # that a trailing deferred-output placeholder was appended even when MTP
+        # is off (mtp_k == 0). See preempt() for the crash this prevents.
+        self.is_deferred_out = is_deferred_out
         token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
         # update token_ids with the actual sampled token ids
 
