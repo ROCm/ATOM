@@ -44,6 +44,28 @@ class EagleProposer(Drafter):
     flavor is its sibling ``DSparkProposer``; both share the ``Drafter`` base.
     """
 
+    def __init__(self, atom_config, device: torch.device, runner):
+        super().__init__(atom_config, device, runner)
+        # GLM-5.2 draft index sharing: step 0 runs the MTP indexer, steps 1+
+        # reuse sparse_kv_indices_buffer via skip_topk + compact_topk_indices.
+        # Gated on method=mtp, DSA index_topk and the config flag, so other
+        # draft backends are unchanged. (DSpark is DSparkProposer, not this
+        # class, so it cannot reach here.)
+        draft_hf = self.speculative_config.draft_model_hf_config
+        mtp_inner = getattr(self.model, "model", None)
+        self._share_mtp_indices = (
+            self.speculative_config.method == "mtp"
+            and getattr(draft_hf, "index_share_for_mtp_iteration", False)
+            and hasattr(draft_hf, "index_topk")
+            and mtp_inner is not None
+            and hasattr(mtp_inner, "set_skip_topk")
+        )
+        if self._share_mtp_indices:
+            logger.info(
+                "MTP draft index_share_for_mtp_iteration enabled: "
+                "step 0 computes indexer top-k, steps 1+ reuse the buffer."
+            )
+
     def _resolve_mtp_k(self) -> int:
         return self.speculative_config.num_speculative_tokens or 0
 
@@ -242,6 +264,10 @@ class EagleProposer(Drafter):
                         positions,
                         hidden_states,
                     )
+                # index_share_for_mtp_iteration: step 0 runs the MTP indexer;
+                # steps 1+ skip it and read the compacted sparse_kv buffer.
+                if self._share_mtp_indices and i == 0:
+                    self.model.model.set_skip_topk(False)
                 ret_hidden_states = self.model(
                     input_ids=d_input_ids,
                     positions=d_positions,
@@ -251,6 +277,9 @@ class EagleProposer(Drafter):
                     ret_hidden_states = pcp_allgather_rerange(
                         ret_hidden_states, pcp_ws
                     )[:n_global_draft]
+                if self._share_mtp_indices and i == 0:
+                    self.model.model.set_skip_topk(True)
+                    self.model.model.compact_topk_indices(last_token_indices)
 
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
