@@ -11,7 +11,9 @@ derived from device data via `.item()`.
 
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
+    make_capture_boundary_plan,
     make_compress_plans,
+    make_restore_boundary_plan,
 )
 from atom.model_ops.v4_kernels.csa_translate_pack import (
     csa_translate_pack,
@@ -46,6 +48,10 @@ from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
     qk_norm_rope_maybe_quant_fp8_2buff,
 )
 from atom.model_ops.v4_kernels.state_writes import (
+    capture_compressor_boundary,
+    capture_compressor_boundary_reference,
+    restore_compressor_boundary,
+    restore_compressor_boundary_reference,
     update_compressor_states,
     swa_write,
     swa_write_2buff_prepacked,
@@ -55,6 +61,10 @@ __all__ = [
     "update_compressor_states",
     "swa_write",
     "swa_write_2buff_prepacked",
+    "capture_compressor_boundary",
+    "capture_compressor_boundary_reference",
+    "restore_compressor_boundary",
+    "restore_compressor_boundary_reference",
     "fused_compress_attn",
     "fused_compress_attn_reference",
     "sparse_attn_v4_paged_decode",
@@ -65,6 +75,8 @@ __all__ = [
     "csa_translate_pack_reference",
     "CompressPlan",
     "make_compress_plans",
+    "make_capture_boundary_plan",
+    "make_restore_boundary_plan",
     "inverse_rope_inplace",
     "scale_indexer_weights",
     "write_v4_paged_decode_indices",

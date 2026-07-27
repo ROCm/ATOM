@@ -50,7 +50,9 @@ def _v4_paged_decode_indices_kernel(
     swa_indices_ptr,  # [swa_total] int32, output
     csa_indices_ptr,  # [csa_total] int32, output (writes SWA-prefix segment only)
     hca_indices_ptr,  # [hca_total] int32, output (writes SWA-prefix segment only)
-    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
+    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128) — token modulus
+    swa_row_stride,  # physical rows per SWA block (== chunk_rows; 224 for a fused
+    #                  c4 chunk, else == block_size). Decoupled from block_size.
     win: tl.constexpr,  # window_size — max SWA prefix slots
     BLOCK_N: tl.constexpr,  # next_pow2(win)
 ):
@@ -100,7 +102,7 @@ def _v4_paged_decode_indices_kernel(
     phys = tl.load(
         block_tables_ptr + bid * block_tables_stride + blk, mask=mask, other=0
     )
-    paged = phys * block_size + abs_pos % block_size
+    paged = phys * swa_row_stride + abs_pos % block_size
 
     tl.store(swa_indices_ptr + swa_end - n + i, paged, mask=mask)
     tl.store(csa_indices_ptr + csa_end - n + i, paged, mask=mask)
@@ -122,6 +124,7 @@ def write_v4_paged_decode_indices(
     T: int,
     win: int,
     block_size: int,
+    swa_row_stride: int | None = None,
     prefix: str = "",
 ) -> None:
     """In-place fill SWA / CSA / HCA window-prefix offsets via a single
@@ -175,6 +178,8 @@ def write_v4_paged_decode_indices(
     assert csa_indices.dim() == 1
     assert hca_indices.dim() == 1
 
+    if swa_row_stride is None:
+        swa_row_stride = block_size
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_decode_indices_kernel[(T,)](
         block_tables,
@@ -188,6 +193,7 @@ def write_v4_paged_decode_indices(
         csa_indices,
         hca_indices,
         block_size,
+        swa_row_stride,
         win=win,
         BLOCK_N=BLOCK_N,
     )
@@ -207,6 +213,7 @@ def write_v4_paged_decode_indices_reference(
     T: int,
     win: int,
     block_size: int,
+    swa_row_stride: int | None = None,
 ) -> None:
     """Pure-PyTorch reference equivalent of `write_v4_paged_decode_indices`
     (paged-SWA). For unit tests and bisect verification. Mirrors the kernel:
@@ -214,6 +221,8 @@ def write_v4_paged_decode_indices_reference(
     """
     if T == 0:
         return
+    if swa_row_stride is None:
+        swa_row_stride = block_size
     bid = batch_id_per_token[:T].long()
     pos_t = positions[:T].long()
     valid = bid >= 0
@@ -229,7 +238,7 @@ def write_v4_paged_decode_indices_reference(
         i_arr = torch.arange(n, device=positions.device, dtype=torch.long)
         abs_pos = p - n + 1 + i_arr  # [n]
         phys = block_tables[b, abs_pos // block_size].long()
-        paged = (phys * block_size + abs_pos % block_size).to(torch.int32)
+        paged = (phys * swa_row_stride + abs_pos % block_size).to(torch.int32)
         # SWA prefix segment at the slice TAIL (compress section fills the head).
         swa_end = int(swa_indptr[t + 1].item())
         csa_end = int(csa_indptr[t + 1].item())

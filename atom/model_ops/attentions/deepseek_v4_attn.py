@@ -63,7 +63,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -191,6 +191,17 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """[bs, max_blocks] int32 GPU — paged-SWA logical→physical block table
     for the independent SWA pool (parallel to `block_tables`, which addresses
     the compressed pool). -1 entries are window-freed blocks (never indexed)."""
+    # Unified-KV arena: per-group PHYSICAL block/swa tables (group -> [bs,mb] GPU
+    # int32). When set (flag on), the index build runs once per group and takes
+    # each group's mapped prefix buffer (c4->csa, c128->hca, dense->swa) so the
+    # existing per-ratio buffer selection in the forward is unchanged.
+    arena_block_tables_gpu: dict = None  # type: ignore[assignment]
+    arena_swa_block_tables_gpu: dict = None  # type: ignore[assignment]
+    # CPU (numpy) mirrors of the same per-group physical tables, sliced to
+    # scheduled_bs. Consumed by the eager decode index build (HCA compress head
+    # is written CPU-side) — the GPU dicts above feed the captured model forward.
+    arena_block_tables_np: dict = None  # type: ignore[assignment]
+    arena_swa_block_tables_np: dict = None  # type: ignore[assignment]
 
     # ----- Native 2buff fp8 per-token paged-decode index tensors -----
     # Feed the aiter asm decode kernel `mla_decode_fwd_v4_nm` (op5), which treats
@@ -433,6 +444,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.csa_main_state_shape = (2 * 4 + ring_extra, 2 * self.head_dim)
         self.csa_idx_state_shape = (2 * 4 + ring_extra, 2 * self.index_head_dim)
         self.hca_main_state_shape = (128 + ring_extra, self.head_dim)
+        # CSA native prefix-cache boundary snapshot (feature-gated). Stores the
+        # terminal block's last TAIL=4 FULL compressor ring rows (abs positions
+        # B-4..B-1) per physical compressed block; a prefix hit copies them into
+        # a fresh request ring (no token replay). Row dim matches the live ring
+        # row (2*head_dim / 2*index_head_dim) so restore is a byte-for-byte copy.
+        # Only CSA layers; HCA is clean at an aligned boundary.
+        # See enable_v4_csa_prefix_state_cache.
+        self.enable_csa_prefix_state_cache = bool(
+            getattr(
+                self.model_runner.config,
+                "enable_v4_csa_prefix_state_cache",
+                False,
+            )
+        )
+        self.csa_boundary_tail = 4  # abs positions B-4..B-1
+        self.csa_main_boundary_shape = (self.csa_boundary_tail, 2 * self.head_dim)
+        self.csa_idx_boundary_shape = (self.csa_boundary_tail, 2 * self.index_head_dim)
         self.max_decode_tokens = self.max_bs * (1 + self.max_spec_steps)
         # SWA ring-buffer slots per req. Distinct from `window_size`:
         #   * `window_size`  = SWA attention window = topk count per token
@@ -501,6 +529,120 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # 2buff: parallel bf16 rope pool [block_size, rope_head_dim].
             b += self.block_size * self.rope_head_dim * self._rope_dtype.itemsize
         return b
+
+    def compute_arena_group_specs(self, available_for_pool: int) -> list[dict]:
+        """Unified-KV BYTE chunk arena (ATOM_V4_UNIFIED_KV_ARENA) sizing.
+
+        UNVALIDATED on GPU — needs GSM8K + rocm-smi tuning before trust. Splits
+        the paged-pool budget into per-group BYTE chunks shared elastically
+        between SWA and compressed KV. ``num_chunks`` is UNIFORM across groups (a
+        swa_id must back a chunk in every group), but per-chunk bytes differ:
+        c4 chunks fuse the CSA boundary-state snapshot after the SWA nope KV (one
+        [SWA 128 rows | CSA state | pad] block), so a c4 chunk is fatter than
+        c128/dense. CSA is therefore NOT a separate arena owner — it rides the
+        SWA block's alloc/free/pin (its retention == SWA's pin).
+
+        Returns one dict per ratio group present::
+
+            {"name", "num_chunks", "bytes_per_chunk", "chunk_rows",
+             "owners": {owner_name: page_bytes}[, "csa_state_off"]}
+
+        Owners: ``swa`` (chunk-atomic, every group) and ``compress`` (c4/c128).
+        ``csa_state_off`` (c4 only, when the CSA cache is on) is the byte offset
+        within a chunk where the fused CSA state segment begins. Empty when there
+        are no compress layers (arena not applicable).
+        """
+        if self.swa_block_bytes_per_layer() <= 0 or self.num_layers <= 0:
+            return []
+
+        # The arena chunk is measured in NOPE bytes: SWA/compress store nope KV in
+        # `unified_kv` (dtype) and rope in a PARALLEL `unified_kv_rope` pool with
+        # the SAME row count / stride (compress tiles the whole chunk in BOTH
+        # pools, so rope must mirror nope row-for-row). CSA boundary state (fp32)
+        # is FUSED into the c4 SWA chunk: it reinterprets a fixed tail byte
+        # segment of the SAME nope chunk, so it is NOT a separate arena owner — it
+        # rides the SWA block's alloc/free/pin. A c4 chunk is thus one fused
+        # [SWA nope 128 rows | CSA state | pad] block, or (when borrowed by
+        # compress) N compressed pages.
+        classical_elem = self._classical_dtype.itemsize  # fp8=1 / bf16=2
+        nope_row = self.head_dim * classical_elem  # bytes per SWA/compress row
+        nope_chunk = self.block_size * nope_row  # 1 SWA block nope (64KB fp8)
+        rope_row = self.rope_head_dim * self._rope_dtype.itemsize if self._kv_fp8 else 0
+
+        def _cmp_pb(stride: int) -> int:
+            # compressed nope page bytes for a ratio group; divides a chunk that
+            # is a multiple of nope_row * stride by construction.
+            return stride * nope_row
+
+        csa_on = self.enable_csa_prefix_state_cache and bool(self.csa_layers)
+
+        # Per-group NOPE chunk bytes. c4 fuses CSA state after the SWA nope KV,
+        # padded up to a multiple of its compress page so compressed borrowers
+        # still tile the chunk exactly (104KB -> 112KB = 7 x 16KB fp8). Single
+        # source of truth for the fused geometry so boundary views / tensor
+        # sizing / kernels can't drift from the spec.
+        c4_cmp_pb = _cmp_pb(self.k1_csa)
+        c4_chunk = self._c4_chunk_bytes(csa_on)
+
+        def _rows(chunk_bytes: int) -> int:
+            return chunk_bytes // nope_row
+
+        # num_chunks is UNIFORM across groups (one swa_id must back a chunk in
+        # every group), but per-chunk bytes differ (c4 is fatter). Budget the
+        # uniform num_chunks against the SUM of every layer's full (nope+rope)
+        # per-chunk cost = chunk_rows * (nope_row + rope_row).
+        n_csa = len(self.csa_layers)
+        n_hca = len(self.hca_layers)
+        n_dense = self.num_layers - n_csa - n_hca
+
+        def _full(chunk_bytes: int) -> int:
+            return _rows(chunk_bytes) * (nope_row + rope_row)
+
+        per_unit = (
+            n_csa * _full(c4_chunk)
+            + n_hca * _full(nope_chunk)
+            + n_dense * _full(nope_chunk)
+        )
+        if per_unit <= 0:
+            return []
+        num_chunks = int(available_for_pool // per_unit)
+        if num_chunks <= 0:
+            return []
+
+        def _grp(name: str, chunk_bytes: int, owners: dict, csa: bool = False) -> dict:
+            spec = {
+                "name": name,
+                "num_chunks": num_chunks,
+                "bytes_per_chunk": chunk_bytes,
+                "chunk_rows": _rows(chunk_bytes),
+                "owners": owners,
+            }
+            if csa:
+                # Byte offset (within a chunk) where the fused CSA state segment
+                # begins, right after the SWA nope KV region.
+                spec["csa_state_off"] = nope_chunk
+            return spec
+
+        specs: list[dict] = []
+        if self.csa_layers:
+            # swa owner is chunk-atomic (page == whole chunk): a c4 SWA block owns
+            # its fused [nope | CSA | pad] chunk. compress borrows 16KB pages.
+            owners = {"swa": c4_chunk, "compress": c4_cmp_pb}
+            specs.append(_grp("c4", c4_chunk, owners, csa=csa_on))
+        if self.hca_layers:
+            specs.append(
+                _grp(
+                    "c128",
+                    nope_chunk,
+                    {"swa": nope_chunk, "compress": _cmp_pb(self.k2_hca)},
+                )
+            )
+        # Dense layers (ratio 0) have SWA but no compressed cache; SWA is global
+        # across every layer, so a dense/SWA-only group is needed for their SWA
+        # pages to have arena backing too.
+        if n_dense > 0:
+            specs.append(_grp("dense", nope_chunk, {"swa": nope_chunk}))
+        return specs
 
     def swa_pool_block_bytes(self) -> int:
         """paged-SWA: bytes of ONE SWA physical block across all layers
@@ -590,6 +732,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             csa_main_per_block += self.k1_csa * self.rope_head_dim * elem_rope
             hca_main_per_block += self.k2_hca * self.rope_head_dim * elem_rope
             swa_per_block += self.block_size * self.rope_head_dim * elem_rope
+        # CSA boundary snapshot: no per-block charge here — it is FUSED into the
+        # c4 SWA chunk (feat/csa-swa-fusion) and accounted by the fatter c4 chunk
+        # in compute_arena_group_specs (the arena is required for the feature).
         return (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
             + len(self.hca_layers) * hca_main_per_block
@@ -666,42 +811,84 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         head_dim = self.head_dim
         dtype = self._swa_dtype
 
-        # Per-layer unified_kv: SWA prefix + (CSA/HCA) compress tail.
+        # Unified-KV chunk arena: one flat [num_chunks * chunk_rows, head_dim]
+        # pool per layer. Chunks interleave SWA / compressed pages, addressed by
+        # per-group physical pages (swa_pages semantics collapse to 0). num_chunks
+        # is uniform across groups but chunk_rows differs: c4 chunks are FATTER
+        # (they fuse the CSA state after the SWA nope KV — see
+        # compute_arena_group_specs), so a c4 layer's pool is taller than a
+        # c128/dense layer's.
+        #
+        # Size from the AUTHORITATIVE num_physical_kvcache_blocks, NOT the per-rank
+        # spec num_chunks: under TP each rank computes its own num_chunks from its
+        # free memory, but num_physical_kvcache_blocks is reconciled across ranks —
+        # so a rank's spec num_chunks can be SMALLER than the reconciled count. The
+        # arena hands out physical pages up to the reconciled count, so the tensor
+        # must cover that. num_blocks == num_chunks_reconciled * c4_pages_per_chunk
+        # (c4 is the tightest compress group), so num_chunks_auth = num_blocks //
+        # c4_pages_per_chunk and c4 rows = num_chunks_auth * 224 == num_blocks *
+        # k1_csa (the original authoritative c4 formula); c128/dense = ...* 128.
+        arena_specs = getattr(self.model_runner.config, "v4_arena_group_specs", None)
+        self._arena_on = bool(arena_specs)
+        arena_group_rows: dict[str, int] = {}
+        if self._arena_on:
+            csa_on = self.enable_csa_prefix_state_cache and bool(self.csa_layers)
+            nope_row = head_dim * self._classical_dtype.itemsize
+            c4_chunk_bytes = self._c4_chunk_bytes(csa_on)
+            c4_chunk_rows = c4_chunk_bytes // nope_row
+            c4_pages_per_chunk = c4_chunk_bytes // (self.k1_csa * nope_row)
+            num_chunks_auth = num_blocks // c4_pages_per_chunk
+            arena_group_rows = {
+                "c4": num_chunks_auth * c4_chunk_rows,
+                "c128": num_chunks_auth * self.block_size,
+                "dense": num_chunks_auth * self.block_size,
+            }
+
+        def _arena_rows_for(ratio: int) -> int:
+            name = "c4" if ratio == 4 else ("c128" if ratio == 128 else "dense")
+            return arena_group_rows.get(name, 0)
+
+        # Per-layer unified_kv: SWA prefix + (CSA/HCA) compress tail (fixed), or
+        # one flat per-group arena pool (elastic).
         unified_kv: list[torch.Tensor] = []
         ratios = self.compress_ratios
         for layer_id in range(self.num_layers):
             ratio = ratios[layer_id]
-            if ratio == 4:
-                compress_pages = num_blocks * self.k1_csa
-            elif ratio == 128:
-                compress_pages = num_blocks * self.k2_hca
+            if self._arena_on:
+                rows = _arena_rows_for(ratio)
             else:
-                compress_pages = 0  # Dense
-            unified_kv.append(
-                torch.zeros(
-                    (swa_pages + compress_pages, head_dim),
-                    dtype=dtype,
-                    device=device,
-                )
-            )
-
-        # ---- 2buff fp8: parallel per-layer rope pool (bf16) ------------------
-        # Same [swa_pages + compress_pages] page count as unified_kv, but width
-        # = rope_head_dim (64) and dtype bf16 (rope is never quantized). bf16
-        # path: list of None (no rope pool; rope stays inline in unified_kv).
-        unified_kv_rope: list[Optional[torch.Tensor]] = []
-        if self._kv_fp8:
-            for layer_id in range(self.num_layers):
-                ratio = ratios[layer_id]
                 if ratio == 4:
                     compress_pages = num_blocks * self.k1_csa
                 elif ratio == 128:
                     compress_pages = num_blocks * self.k2_hca
                 else:
                     compress_pages = 0  # Dense
+                rows = swa_pages + compress_pages
+            unified_kv.append(torch.zeros((rows, head_dim), dtype=dtype, device=device))
+
+        # ---- 2buff fp8: parallel per-layer rope pool (bf16) ------------------
+        # Same row count / stride as unified_kv (compress tiles the whole chunk
+        # in BOTH pools, so rope mirrors nope row-for-row; the c4 CSA tail rows
+        # carry no rope but are counted so nope/rope addressing match), but width
+        # = rope_head_dim (64) and dtype bf16 (rope is never quantized). bf16
+        # path: list of None (no rope pool; rope stays inline in unified_kv).
+        unified_kv_rope: list[Optional[torch.Tensor]] = []
+        if self._kv_fp8:
+            for layer_id in range(self.num_layers):
+                ratio = ratios[layer_id]
+                if self._arena_on:
+                    rows = _arena_rows_for(ratio)
+                else:
+                    if ratio == 4:
+                        compress_pages = num_blocks * self.k1_csa
+                    elif ratio == 128:
+                        compress_pages = num_blocks * self.k2_hca
+                    else:
+                        compress_pages = 0  # Dense
+                    rows = swa_pages + compress_pages
                 unified_kv_rope.append(
                     torch.zeros(
-                        (swa_pages + compress_pages, self.rope_head_dim),
+                        (rows, self.rope_head_dim),
                         dtype=self._rope_dtype,
                         device=device,
                     )
@@ -728,6 +915,60 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         hca_main_score = self._neg_inf_state(
             (n_hca, num_slots, *self.hca_main_state_shape), device
         )
+
+        # ---- CSA boundary-state snapshot (feature-gated) ---------------------
+        # Fused into the SWA chunk (feat/csa-swa-fusion): the boundary is an fp32
+        # as_strided VIEW over each c4 layer's `unified_kv` tail bytes, indexed by
+        # the block's PHYSICAL c4 SWA page (1 chunk == 1 SWA block). No separate
+        # pool — SWA/compress/CSA share the same bytes elastically. REQUIRES the
+        # arena; without it the feature is disabled (empty tensors) since the
+        # associative CsaStatePool that backed the non-arena path is gone.
+        if self.enable_csa_prefix_state_cache and not self._arena_on:
+            logger.warning(
+                "DSV4 CSA prefix-state snapshot requires ATOM_V4_UNIFIED_KV_ARENA "
+                "(fused into the SWA chunk); disabling it for this run."
+            )
+        if self.enable_csa_prefix_state_cache and self._arena_on:
+            # Kernels are stride-driven; the views are dim-contiguous (see
+            # state_writes assert). View math is GPU-verified.
+            csa_main_boundary_kv = []
+            csa_main_boundary_score = []
+            csa_idx_boundary_kv = []
+            csa_idx_boundary_score = []
+            for pos in range(n_csa):
+                layer_id = self.csa_layers[pos]
+                mk, ms, ik, isc = self._csa_boundary_arena_views(unified_kv[layer_id])
+                csa_main_boundary_kv.append(mk)
+                csa_main_boundary_score.append(ms)
+                csa_idx_boundary_kv.append(ik)
+                csa_idx_boundary_score.append(isc)
+            if n_csa:
+                logger.info(
+                    "DSV4 CSA prefix-state snapshot: arena byte-view (option-b), "
+                    "%d CSA layers, main pages/layer=%d idx pages/layer=%d, "
+                    "0 GiB separate pool (shares unified_kv bytes)",
+                    n_csa,
+                    csa_main_boundary_kv[0].shape[0],
+                    csa_idx_boundary_kv[0].shape[0],
+                )
+        else:
+            _empty = lambda: torch.empty(  # noqa: E731
+                (n_csa, 0, *self.csa_main_boundary_shape),
+                dtype=self._state_dtype,
+                device=device,
+            )
+            csa_main_boundary_kv = _empty()
+            csa_main_boundary_score = _empty()
+            csa_idx_boundary_kv = torch.empty(
+                (n_csa, 0, *self.csa_idx_boundary_shape),
+                dtype=self._state_dtype,
+                device=device,
+            )
+            csa_idx_boundary_score = torch.empty(
+                (n_csa, 0, *self.csa_idx_boundary_shape),
+                dtype=self._state_dtype,
+                device=device,
+            )
 
         # ---- RDMA staging pool, only allocated in PD disaggregation mode --
         is_pd = bool(getattr(self.model_runner.config, "kv_transfer_config", None))
@@ -760,6 +1001,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "v4_csa_idx_score_state": csa_idx_score,
             "v4_hca_main_kv_state": hca_main_kv,
             "v4_hca_main_score_state": hca_main_score,
+            "v4_csa_main_boundary_kv": csa_main_boundary_kv,
+            "v4_csa_main_boundary_score": csa_main_boundary_score,
+            "v4_csa_idx_boundary_kv": csa_idx_boundary_kv,
+            "v4_csa_idx_boundary_score": csa_idx_boundary_score,
             "v4_state_pool": state_pool,
             "v4_state_pool_size": pool_size,
             "v4_state_slot_stride": state_slot_stride,
@@ -788,6 +1033,34 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # paged-SWA: SWA region is the separate num_swa_blocks pool,
         # content-addressed by swa_block_tables.
         swa_pages = self.model_runner.num_swa_blocks * self.block_size
+        # Unified-KV arena: SWA/compress interleave in one flat pool, addressed
+        # by per-group physical pages -> swa_pages collapses to 0 (no front/back
+        # split) and both views bind the WHOLE tensor. `_arena_num_chunks` is the
+        # per-group chunk count (uniform across groups).
+        arena_on = getattr(self, "_arena_on", False)
+        _rows_by_group: dict[str, int] = {}
+        if arena_on:
+            specs = self.model_runner.config.v4_arena_group_specs
+            arena_num_chunks = int(specs[0]["num_chunks"])
+            swa_pages = 0
+            _rows_by_group = {s["name"]: int(s["chunk_rows"]) for s in specs}
+            # Persist for the per-group SWA index builds / swa_write (decode +
+            # prefill): a group's SWA block spans chunk_rows physical rows
+            # (c4=224 fused, c128/dense=128). Off the arena there is no map and
+            # callers fall back to block_size.
+            self._arena_group_rows = dict(_rows_by_group)
+
+        def _swa_stride(layer_id: int) -> int:
+            # Physical ROW stride of one SWA block in unified_kv (== chunk_rows).
+            # c4 chunks fuse CSA state so they are FATTER (224 rows fp8) than the
+            # 128-row SWA KV they hold; c128/dense stay 128. Distinct from
+            # `swa_block_size` (== block_size, the token windowing modulus). Off
+            # the arena the chunk IS one 128-row block, so stride == block_size.
+            if not arena_on:
+                return self.block_size
+            r = self.compress_ratios[layer_id]
+            g = "c4" if r == 4 else ("c128" if r == 128 else "dense")
+            return _rows_by_group.get(g, self.block_size)
 
         if isinstance(module, _V4Attention):
             # DSpark draft layer: fp8 target KV cache. DSpark's block attention runs bf16.
@@ -798,6 +1071,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     device=self.model_runner.device,
                 )
                 module.swa_block_size = self.block_size
+                module.swa_row_stride = self.block_size
                 module.kv_fp8 = False
                 module.unified_kv = None
                 module.unified_kv_rope = None
@@ -811,8 +1085,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             #     hits reuse SWA via content-addressed swa_block_tables (#1417).
             unified = runner.v4_unified_kv[module.layer_id]
             module.unified_kv = unified
-            module.swa_kv = unified[:swa_pages]
+            # Arena: SWA reads/writes the whole interleaved pool via physical
+            # swa pages; fixed layout: the front [0, swa_pages) SWA region.
+            module.swa_kv = unified if arena_on else unified[:swa_pages]
             module.swa_block_size = self.block_size
+            module.swa_row_stride = _swa_stride(module.layer_id)
             module.kv_fp8 = self._kv_fp8
             if self._kv_fp8:
                 # 2buff: parallel bf16 rope pool, same paged layout. swa_kv_rope
@@ -820,7 +1097,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # the full pool (asm decode op5 reads it).
                 rope = runner.v4_unified_kv_rope[module.layer_id]
                 module.unified_kv_rope = rope
-                module.swa_kv_rope = rope[:swa_pages]
+                module.swa_kv_rope = rope if arena_on else rope[:swa_pages]
             else:
                 module.unified_kv_rope = None
                 module.swa_kv_rope = None
@@ -851,11 +1128,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             is_indexer_inner = "indexer" in parts
             ratio = module.compress_ratio
 
+            csa_snapshot = self.enable_csa_prefix_state_cache
             if is_indexer_inner:
                 assert ratio == 4, "Indexer-inner Compressor only on CSA layers"
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_idx_kv_state[pos]
                 module.score_state = runner.v4_csa_idx_score_state[pos]
+                # CSA boundary snapshot (indexer ring): per-layer slice of the
+                # runner pool, or None when the feature is off.
+                if csa_snapshot:
+                    module.boundary_kv = runner.v4_csa_idx_boundary_kv[pos]
+                    module.boundary_score = runner.v4_csa_idx_boundary_score[pos]
+                    # Stage-4 routing: idx-inner reads the arena's csa_IDX
+                    # physical page table / restore source (distinct owner from
+                    # main). Identity to logical when the arena is off.
+                    module._csa_owner = "idx"
                 # Inner compressor writes target the SAME storage as the
                 # outer Indexer.kv_cache (csa_idx_kv). Same [NB, k1_csa,
                 # aligned_dim] FP8 shape — `Compressor.forward` resolves
@@ -897,6 +1184,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_main_kv_state[pos]
                 module.score_state = runner.v4_csa_main_score_state[pos]
+                if csa_snapshot:
+                    module.boundary_kv = runner.v4_csa_main_boundary_kv[pos]
+                    module.boundary_score = runner.v4_csa_main_boundary_score[pos]
+                    # Stage-4 routing: main compressor reads the arena's csa_MAIN
+                    # physical page table / restore source. Identity to logical
+                    # when the arena is off.
+                    module._csa_owner = "main"
                 # CSA Main compressed pool now lives in the tail of the
                 # owning layer's `unified_kv`. Compressor.forward writes via
                 # `kv_cache[block_id, slot_in_block, :] = entry`, so we hand
@@ -921,13 +1215,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.score_state = runner.v4_hca_main_score_state[pos]
                 num_blocks = runner.num_physical_kvcache_blocks
                 unified = runner.v4_unified_kv[layer_id_from_prefix]
+                # Arena: the C128 compress pool spans the layer's WHOLE flat
+                # tensor (SWA/compress interleave, addressed by physical page).
+                # Its row count is the c128 group's num_chunks*chunk_rows (128) —
+                # which, unlike c4, is NOT num_blocks*k1_csa once c4 fuses CSA and
+                # gets a fatter chunk. Derive the page count from the actual
+                # tensor rows (// k2 rows-per-page) so it tracks the group size.
+                # Off the arena: fixed num_blocks pages after the swa_pages front.
+                if arena_on:
+                    hca_p = unified[swa_pages:].shape[0] // self.k2_hca
+                else:
+                    hca_p = num_blocks
                 module.kv_cache = unified[swa_pages:].view(
-                    num_blocks, self.k2_hca, self.head_dim
+                    hca_p, self.k2_hca, self.head_dim
                 )
                 if self._kv_fp8:
                     rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
                     module.kv_cache_rope = rope[swa_pages:].view(
-                        num_blocks, self.k2_hca, self.rope_head_dim
+                        hca_p, self.k2_hca, self.rope_head_dim
                     )
                     module.write_mode = "main_2buff_fp8"
                 else:
@@ -1470,6 +1775,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_mapping_cpu = state_slot_np
         attn_metadata.compress_plans = compress_plans
         attn_metadata.swa_block_tables = swa_bt_gpu
+        # Unified-KV arena: stage per-group physical tables (decode path). Must
+        # precede _attach_v4_per_fwd_meta so the decode index build sees the
+        # numpy mirrors; feeds the captured forward via the GPU views.
+        self._stage_arena_group_tables(batch, scheduled_bs, attn_metadata)
         # DSpark RAGGED: pass per-seq verify lengths + full_q to the (rectangular-
         # only) decode indexer so it can pad Q back to [bs, full_q].
         _drafter = getattr(self.model_runner, "drafter", None)
@@ -1721,6 +2030,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.swa_block_tables = self._populate_swa_block_tables(
                 batch, scheduled_bs
             )
+        # Unified-KV arena: stage per-group physical tables for the per-group
+        # prefill index build below (no-op when the arena is off).
+        self._stage_arena_group_tables(batch, scheduled_bs, attn_metadata)
         state_slot_gpu, state_slot_np = self._populate_state_slot_mapping(
             batch, scheduled_bs, return_cpu=True
         )
@@ -1754,6 +2066,87 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.compress_plans = self._build_compress_plans(
             extend_lens_np, context_lens_np
         )
+        # CSA native prefix-cache snapshot: bit-exact reseed of a fresh
+        # compressor ring on a hit (no token replay).
+        # Capture runs every prefill fwd (producing snapshots for future hits);
+        # restore runs only for seqs carrying a one-shot boundary source. Both
+        # attach to the ratio-4 CompressPlan so Compressor.forward can reach
+        # them. Prefill is eager → fresh tensors, no CG buffers.
+        if (
+            self.enable_csa_prefix_state_cache
+            and getattr(self, "_arena_on", False)
+            and 4 in attn_metadata.compress_plans
+        ):
+            from atom.model_ops.v4_kernels import (
+                make_capture_boundary_plan,
+                make_restore_boundary_plan,
+            )
+
+            cp4 = attn_metadata.compress_plans[4]
+            cap_gpu, n_cap = make_capture_boundary_plan(
+                extend_lens_np,
+                context_lens_np,
+                block_size=self.block_size,
+                device=positions.device,
+                tail=self.csa_boundary_tail,
+            )
+            cp4.capture_boundary_plan_gpu = cap_gpu
+            cp4.num_capture_boundary = n_cap
+            # Fused CSA (feat/csa-swa-fusion): the capture destination is the
+            # block's c4 PHYSICAL SWA page. main and idx index the SAME chunk (the
+            # boundary views encode the byte offset), so both use the one c4 SWA
+            # table the scheduler shipped (csa_main_page_tables == csa_idx_page_
+            # tables). The scheduler already did the logical->physical translation
+            # (with -1 for unbacked blocks so the capture kernel skips them).
+            cp4.csa_page_tables_gpu = self._populate_csa_page_tables(
+                batch,
+                scheduled_bs,
+                tables_attr="csa_main_page_tables",
+                buffer_name="csa_page_tables",
+            )
+            cp4.csa_idx_page_tables_gpu = self._populate_csa_page_tables(
+                batch,
+                scheduled_bs,
+                tables_attr="csa_idx_page_tables",
+                buffer_name="csa_idx_page_tables",
+            )
+            slots_np = np.asarray(
+                attn_metadata.state_slot_mapping_cpu[:scheduled_bs], dtype=np.int32
+            )
+            boundary_b_np = (context_lens_np - extend_lens_np).astype(np.int32)
+            # Restore source: the terminal cached block's c4 physical SWA page
+            # (main == idx, same chunk). Scheduler set both; -1 = no restore.
+            src_main_np = np.asarray(
+                getattr(
+                    batch,
+                    "v4_csa_boundary_source_main",
+                    getattr(batch, "v4_csa_boundary_source_ids", [-1] * scheduled_bs),
+                ),
+                dtype=np.int32,
+            )
+            assert src_main_np.shape == (scheduled_bs,)
+            res_gpu, n_res = make_restore_boundary_plan(
+                src_main_np, slots_np, boundary_b_np, device=positions.device
+            )
+            cp4.restore_boundary_plan_gpu = res_gpu
+            cp4.num_restore_boundary = n_res
+            src_idx_np = np.asarray(
+                getattr(batch, "v4_csa_boundary_source_idx", src_main_np),
+                dtype=np.int32,
+            )
+            res_idx_gpu, n_res_idx = make_restore_boundary_plan(
+                src_idx_np, slots_np, boundary_b_np, device=positions.device
+            )
+            cp4.restore_boundary_plan_idx_gpu = res_idx_gpu
+            cp4.num_restore_boundary_idx = n_res_idx
+            if n_res > 0:
+                logger.info(
+                    "DSV4 CSA snapshot: restoring %d seq(s) from boundary "
+                    "sources %s (capture rows this fwd: %d)",
+                    n_res,
+                    src_main_np[src_main_np >= 0].tolist(),
+                    n_cap,
+                )
         # Prefill goes through eager (no CG): defaults make padded_total_tokens
         # collapse to total_tokens — no padding logic kicks in. Must still run
         # BEFORE `_attach_v4_indexer_meta` so the indexer-side meta builder can
@@ -2425,7 +2818,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         win = self.window_size  # per-token max SWA prefix slots
         # paged-SWA: SWA region = num_swa_blocks*block_size rows (separate
         # pool); this boundary offsets the HCA compress section in unified_kv.
-        swa_pages = self.model_runner.num_swa_blocks * self.block_size
+        # Arena: SWA/compress interleave (no front/back split) -> 0, so the HCA
+        # compress index is block_id*k2 (== physical row) with no OOB offset.
+        swa_pages = (
+            0
+            if getattr(self, "_arena_on", False)
+            else self.model_runner.num_swa_blocks * self.block_size
+        )
 
         T = total_tokens
 
@@ -2514,7 +2913,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `_attach_v4_per_fwd_meta`.
 
         # ----- HCA compress paged offsets (CPU numpy, vectorized) -----
-        block_tables_np_full = var[f"{buf_prefix_ubatch}block_tables"].np[:scheduled_bs]
+        # Under the arena, HCA compress rows come from the c128-group PHYSICAL
+        # table (each logical compressed block → a per-group physical page);
+        # swa_pages is 0 so the value below IS the physical row (HCA stride == 1).
+        arena_bt_np = getattr(attn_metadata, "arena_block_tables_np", None)
+        if arena_bt_np:
+            block_tables_np_full = arena_bt_np["c128"]
+        else:
+            block_tables_np_full = var[f"{buf_prefix_ubatch}block_tables"].np[
+                :scheduled_bs
+            ]
         hca_total_indices = int(hca_indptr_np[T])
         hca_indices_np = np.full(hca_total_indices, -1, dtype=np.int32)
         # n_committed_hca_per_seq is int32; gather stays int32.
@@ -2550,30 +2958,74 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # also fixes that, see skill `debug-agent-locate-kernel`).
         swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"].gpu
         csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"].gpu
-        write_v4_paged_decode_indices(
-            # paged-SWA: SWA block table must come from the SAME buffer set as
-            # batch_id_per_token. In a TBO ubatch, batch_id_per_token holds
-            # LOCAL req indices [0, ub_real_reqs), so the SWA table must be the
-            # ubatch-sliced var[f"{p}swa_block_tables"] whose row i == local req
-            # i — not the global var["swa_block_tables"] (row i == global req i).
-            # Using the global table here makes ubatch1 (req_start>0) read other
-            # requests' SWA blocks → cross-request KV contamination, wrong output
-            # without a crash. block_tables_np_full above (HCA) already uses the
-            # prefixed buffer; this line must match. For the non-ubatch path the
-            # prefix is "" so this resolves to var["swa_block_tables"] as before.
-            block_tables=var[f"{buf_prefix_ubatch}swa_block_tables"].gpu[:scheduled_bs],
-            batch_id_per_token=batch_id_per_token_gpu,
-            positions=var[f"{buf_prefix_ubatch}positions"].gpu,
-            swa_indptr=swa_indptr_gpu,
-            csa_indptr=csa_indptr_gpu,
-            hca_indptr=hca_indptr_gpu,
-            swa_indices=swa_indices_gpu,
-            csa_indices=csa_indices_gpu,
-            hca_indices=hca_indices_gpu,
-            T=T,
-            win=win,
-            block_size=self.block_size,
-        )
+
+        def _decode_build(swa_bt, swa_o, csa_o, hca_o, swa_row_stride=None):
+            write_v4_paged_decode_indices(
+                # paged-SWA: SWA block table must come from the SAME buffer set as
+                # batch_id_per_token. In a TBO ubatch, batch_id_per_token holds
+                # LOCAL req indices [0, ub_real_reqs), so the SWA table must be the
+                # ubatch-sliced var[f"{p}swa_block_tables"] whose row i == local
+                # req i — not the global var["swa_block_tables"] (row i == global
+                # req i). Using the global table here makes ubatch1 (req_start>0)
+                # read other requests' SWA blocks → cross-request KV contamination,
+                # wrong output without a crash. block_tables_np_full above (HCA)
+                # already uses the prefixed buffer; this must match. Non-ubatch:
+                # prefix is "" so this resolves to var["swa_block_tables"].
+                block_tables=swa_bt,
+                batch_id_per_token=batch_id_per_token_gpu,
+                positions=var[f"{buf_prefix_ubatch}positions"].gpu,
+                swa_indptr=swa_indptr_gpu,
+                csa_indptr=csa_indptr_gpu,
+                hca_indptr=hca_indptr_gpu,
+                swa_indices=swa_o,
+                csa_indices=csa_o,
+                hca_indices=hca_o,
+                T=T,
+                win=win,
+                block_size=self.block_size,
+                swa_row_stride=swa_row_stride,
+            )
+
+        arena_swa_gpu = getattr(attn_metadata, "arena_swa_block_tables_gpu", None)
+        if arena_swa_gpu:
+            _grp_rows = getattr(self, "_arena_group_rows", {})
+            # Per-group SWA-prefix build: each decode index buffer is read only by
+            # its group's layers (c4→csa, c128→hca, dense→swa), so write each
+            # buffer's SWA prefix from that group's PHYSICAL SWA table and route
+            # the other two outputs to scratch. The c128 call targets the real hca
+            # buffer, whose HCA compress HEAD (written CPU-side above) is preserved
+            # because the kernel writes the SWA prefix at the slice TAIL.
+            scr_s = torch.empty_like(swa_indices_gpu)
+            scr_c = torch.empty_like(csa_indices_gpu)
+            scr_h = torch.empty_like(hca_indices_gpu)
+            _decode_build(
+                arena_swa_gpu["dense"],
+                swa_indices_gpu,
+                scr_c,
+                scr_h,
+                swa_row_stride=_grp_rows.get("dense"),
+            )
+            _decode_build(
+                arena_swa_gpu["c4"],
+                scr_s,
+                csa_indices_gpu,
+                scr_h,
+                swa_row_stride=_grp_rows.get("c4"),
+            )
+            _decode_build(
+                arena_swa_gpu["c128"],
+                scr_s,
+                scr_c,
+                hca_indices_gpu,
+                swa_row_stride=_grp_rows.get("c128"),
+            )
+        else:
+            _decode_build(
+                var[f"{buf_prefix_ubatch}swa_block_tables"].gpu[:scheduled_bs],
+                swa_indices_gpu,
+                csa_indices_gpu,
+                hca_indices_gpu,
+            )
 
         # `skip_prefix_len_csa` is no longer materialized on the decode path —
         # `csa_translate_pack` is invoked with `window_size = self.window_size`
@@ -2684,8 +3136,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if num_slots == 0:
             return
         # paged-SWA: SWA region = num_swa_blocks*block_size (separate pool),
-        # boundary into the HCA compress section of unified_kv.
-        swa_pages = self.model_runner.num_swa_blocks * self.block_size
+        # boundary into the HCA compress section of unified_kv. Arena: 0
+        # (interleaved; the per-group prefill build already passes swa_pages=0).
+        swa_pages = (
+            0
+            if getattr(self, "_arena_on", False)
+            else self.model_runner.num_swa_blocks * self.block_size
+        )
         var = self.model_runner.forward_vars
 
         # ----- CPU numpy: per-token counts + indptrs -----
@@ -2805,29 +3262,89 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if pcp_is_enabled():
             csa_indices.fill_(-1)
 
-        # ----- Single Triton kernel: scatter SWA-prefix / extend / HCA-compress -----
-        write_v4_paged_prefill_indices(
-            positions=positions_gpu,
-            bid_per_token=bid_per_token_gpu,
-            chunk_start_per_seq=chunk_start_per_seq_gpu,
-            cu_seqlens_q_per_seq=cu_q_per_seq_gpu,
-            state_slot_per_seq=state_slot_per_seq_gpu,
-            n_committed_hca_per_seq=n_committed_hca_per_seq_gpu,
-            block_tables=block_tables_gpu,
-            swa_block_tables=swa_block_tables_gpu,
-            extend_indptr=ext_indptr,
-            prefix_swa_indptr=swa_indptr,
-            prefix_csa_indptr=csa_indptr,
-            prefix_hca_indptr=hca_indptr,
-            extend_indices=ext_indices,
-            prefix_swa_indices=swa_indices,
-            prefix_csa_indices=csa_indices,
-            prefix_hca_indices=hca_indices,
-            T=T,
-            win=win,
-            block_size=self.block_size,
-            swa_pages=swa_pages,
-        )
+        # ----- Triton kernel: scatter SWA-prefix / extend / HCA-compress -----
+        arena_bt = getattr(attn_metadata, "arena_block_tables_gpu", None)
+
+        def _prefill_build(bt, swa_bt, sp, ext_o, swa_o, csa_o, hca_o, swa_rs=None):
+            write_v4_paged_prefill_indices(
+                positions=positions_gpu,
+                bid_per_token=bid_per_token_gpu,
+                chunk_start_per_seq=chunk_start_per_seq_gpu,
+                cu_seqlens_q_per_seq=cu_q_per_seq_gpu,
+                state_slot_per_seq=state_slot_per_seq_gpu,
+                n_committed_hca_per_seq=n_committed_hca_per_seq_gpu,
+                block_tables=bt,
+                swa_block_tables=swa_bt,
+                extend_indptr=ext_indptr,
+                prefix_swa_indptr=swa_indptr,
+                prefix_csa_indptr=csa_indptr,
+                prefix_hca_indptr=hca_indptr,
+                extend_indices=ext_o,
+                prefix_swa_indices=swa_o,
+                prefix_csa_indices=csa_o,
+                prefix_hca_indices=hca_o,
+                T=T,
+                win=win,
+                block_size=self.block_size,
+                swa_pages=sp,
+                swa_row_stride=swa_rs,
+            )
+
+        if arena_bt:
+            # Per-group build: run once per group with that group's PHYSICAL
+            # tables + swa_pages=0, keeping only the buffer the per-ratio forward
+            # reads for that group (c4->csa, c128->hca, dense->swa). The other
+            # buffers each call writes go to scratch and are discarded.
+            aswa = attn_metadata.arena_swa_block_tables_gpu
+            _grp_rows = getattr(self, "_arena_group_rows", {})
+            scr_e = torch.empty_like(ext_indices)
+            scr_s = torch.empty_like(swa_indices)
+            scr_c = torch.empty_like(csa_indices)
+            scr_h = torch.empty_like(hca_indices)
+            # dense -> swa_indices (also gives ext_indices, group-independent)
+            gd = "dense" if "dense" in arena_bt else next(iter(arena_bt))
+            _prefill_build(
+                arena_bt[gd],
+                aswa[gd],
+                0,
+                ext_indices,
+                swa_indices,
+                scr_c,
+                scr_h,
+                swa_rs=_grp_rows.get(gd),
+            )
+            if "c4" in arena_bt:
+                _prefill_build(
+                    arena_bt["c4"],
+                    aswa["c4"],
+                    0,
+                    scr_e,
+                    scr_s,
+                    csa_indices,
+                    scr_h,
+                    swa_rs=_grp_rows.get("c4"),
+                )
+            if "c128" in arena_bt:
+                _prefill_build(
+                    arena_bt["c128"],
+                    aswa["c128"],
+                    0,
+                    scr_e,
+                    scr_s,
+                    scr_c,
+                    hca_indices,
+                    swa_rs=_grp_rows.get("c128"),
+                )
+        else:
+            _prefill_build(
+                block_tables_gpu,
+                swa_block_tables_gpu,
+                swa_pages,
+                ext_indices,
+                swa_indices,
+                csa_indices,
+                hca_indices,
+            )
 
         # ----- skip_prefix_len_csa: per-token SWA prefix length -----
         # csa_translate_pack consumes this to derive the CSA topk length
@@ -2944,6 +3461,103 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     # indexed; a raw -1 phys → negative paged offset → OOB).
                     swa_np[i, : len(bt)] = [max(0, b) for b in bt]
         return var["swa_block_tables"].copy_to_gpu(scheduled_bs)
+
+    def _stage_arena_group_tables(self, batch, scheduled_bs, attn_metadata):
+        """Unified-KV arena: stage per-group PHYSICAL block/swa tables (from the
+        scheduler-translated ``batch.arena_*_block_tables``) into the persistent
+        ``v4_arena_{bt,swabt}_{group}`` forward_vars buffers and expose GPU +
+        numpy views on attn_metadata. Persistent (stable-address) buffers are
+        required for CUDAGraph replay — the captured model forward reads the GPU
+        views (compressor scatter / csa_translate_pack / indexer gather / SWA
+        write). The numpy mirrors feed the eager decode index build. No-op when
+        the arena is off (dicts stay None)."""
+        abt = getattr(batch, "arena_block_tables", None)
+        if not abt:
+            return
+        var = self.model_runner.forward_vars
+        mb = var["block_tables"].np.shape[1]
+
+        def _fill(name, tables):
+            buf = var[name]
+            buf.np[:scheduled_bs] = 0
+            for i, bt in enumerate(tables[:scheduled_bs]):
+                if len(bt):
+                    buf.np[i, : min(len(bt), mb)] = bt[:mb]
+            return buf.copy_to_gpu(scheduled_bs), buf.np[:scheduled_bs]
+
+        gpu_bt, np_bt = {}, {}
+        for g, v in abt.items():
+            gpu_bt[g], np_bt[g] = _fill(f"v4_arena_bt_{g}", v)
+        attn_metadata.arena_block_tables_gpu = gpu_bt
+        attn_metadata.arena_block_tables_np = np_bt
+
+        aswa = getattr(batch, "arena_swa_block_tables", {}) or {}
+        gpu_swa, np_swa = {}, {}
+        for g, v in aswa.items():
+            gpu_swa[g], np_swa[g] = _fill(f"v4_arena_swabt_{g}", v)
+        attn_metadata.arena_swa_block_tables_gpu = gpu_swa
+        attn_metadata.arena_swa_block_tables_np = np_swa
+
+        if (
+            os.environ.get("ATOM_ARENA_DEBUG") == "1"
+            and getattr(self, "_arena_dbg_n", 0) < 6
+        ):
+            import numpy as _np
+
+            log_bt = np.zeros((scheduled_bs, mb), dtype=np.int32)
+            for i, bt in enumerate(batch.block_tables[:scheduled_bs]):
+                if len(bt):
+                    log_bt[i, : min(len(bt), mb)] = bt[:mb]
+            log_swa = np.zeros((scheduled_bs, mb), dtype=np.int32)
+            _swa = getattr(batch, "swa_block_tables", None) or []
+            for i in range(min(scheduled_bs, len(_swa))):
+                bt = _swa[i]
+                if len(bt):
+                    log_swa[i, : min(len(bt), mb)] = [max(0, b) for b in bt[:mb]]
+            c4d = int(_np.abs(np_bt.get("c4", log_bt) - log_bt).max())
+            c128d = int(_np.abs(np_bt.get("c128", log_bt) - log_bt).max())
+            swd = int(_np.abs(np_swa.get("dense", log_swa) - log_swa).max())
+            swc4 = int(_np.abs(np_swa.get("c4", log_swa) - log_swa).max())
+            # Only log NON-IDENTITY batches (the interesting case): they prove the
+            # eviction/borrow path made physical != logical and is being exercised.
+            if max(c4d, c128d, swd, swc4) > 0:
+                self._arena_dbg_n = getattr(self, "_arena_dbg_n", 0) + 1
+                print(
+                    f"[ARENA_DBG] NON-IDENTITY groups={list(abt.keys())} "
+                    f"bs={scheduled_bs} c4.maxdiff={c4d} c128.maxdiff={c128d} "
+                    f"swa(dense).maxdiff={swd} swa(c4).maxdiff={swc4} "
+                    f"state={attn_metadata.state}",
+                    flush=True,
+                )
+
+    def _populate_csa_page_tables(
+        self,
+        batch: ScheduledBatch,
+        scheduled_bs: int,
+        tables_attr: str = "csa_page_tables",
+        buffer_name: str = "csa_page_tables",
+    ):
+        """DSV4 CSA: fill `forward_vars[buffer_name]` from `batch.<tables_attr>`
+        (block -> boundary page id) and return the GPU view sliced to
+        scheduled_bs. Cached/uncaptured blocks carry -1; the capture kernel skips
+        page < 0, and finalized blocks (the only ones in the capture plan) always
+        have a claimed page >= 0. Returns None when the buffer is unregistered.
+
+        With the byte arena on, the page id is the arena PHYSICAL csa page
+        (main or idx, per `tables_attr` / `buffer_name`), translated by the
+        scheduler; off, it is the logical CsaStatePool page id (main == idx)."""
+        var = self.model_runner.forward_vars
+        if buffer_name not in var:
+            return None
+        page_np = var[buffer_name].np
+        page_np[:scheduled_bs] = -1  # default: no page (skipped by the kernel)
+        tables = getattr(batch, tables_attr, None) or []
+        for i in range(scheduled_bs):
+            if i < len(tables):
+                pt = tables[i]
+                if len(pt):
+                    page_np[i, : len(pt)] = pt
+        return var[buffer_name].copy_to_gpu(scheduled_bs)
 
     def _populate_state_slot_mapping(
         self, batch: ScheduledBatch, scheduled_bs: int, return_cpu: bool = False
@@ -3068,6 +3682,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_mapping = state_slot_gpu
         attn_metadata.state_slot_mapping_cpu = state_slot_np
         attn_metadata.swa_block_tables = swa_bt_gpu
+
+        # Unified-KV arena: capture the per-group physical tables against the same
+        # persistent v4_arena_* buffers that replay-time prepare_decode refills,
+        # so the captured forward's arena reads/writes hit stable addresses.
+        # Placeholder (block 0) data — replay overwrites with real physical pages.
+        if envs.ATOM_V4_UNIFIED_KV_ARENA:
+            gpu_bt, np_bt, gpu_swa, np_swa = {}, {}, {}, {}
+            for g in ("c4", "c128", "dense"):
+                b = var[f"v4_arena_bt_{g}"]
+                b.np[:bs] = block_tables_np
+                gpu_bt[g], np_bt[g] = b.copy_to_gpu(bs), b.np[:bs]
+                s = var[f"v4_arena_swabt_{g}"]
+                s.np[:bs] = block_tables_np
+                gpu_swa[g], np_swa[g] = s.copy_to_gpu(bs), s.np[:bs]
+            attn_metadata.arena_block_tables_gpu = gpu_bt
+            attn_metadata.arena_block_tables_np = np_bt
+            attn_metadata.arena_swa_block_tables_gpu = gpu_swa
+            attn_metadata.arena_swa_block_tables_np = np_swa
 
         # DSpark TRUE-FLAT graph: capture must take the same ragged indexer branch
         # and rect shape [bs, full_q] as replay, else the graph mismatches. Synthetic
@@ -3283,6 +3915,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         _bt_cols = self.model_runner.forward_vars["block_tables"].np.shape[1]
         bufs["swa_block_tables"] = CpuGpuBuffer(bs, _bt_cols, **i32)
 
+        # Unified-KV arena: persistent per-group PHYSICAL block/swa tables. These
+        # feed the CAPTURED model forward (compressor scatter, csa_translate_pack,
+        # indexer gather, SWA write), so they must live in stable-address buffers
+        # (like swa_block_tables) for CUDAGraph replay — NOT fresh allocations.
+        # One per ratio group: c4/c128 carry compressed physical, all three carry
+        # SWA physical (SWA is backed in every group). Only when the flag is on.
+        if envs.ATOM_V4_UNIFIED_KV_ARENA:
+            for g in ("c4", "c128", "dense"):
+                bufs[f"v4_arena_bt_{g}"] = CpuGpuBuffer(bs, _bt_cols, **i32)
+                bufs[f"v4_arena_swabt_{g}"] = CpuGpuBuffer(bs, _bt_cols, **i32)
+        # DSV4 CSA associative store: parallel boundary-page table (same shape as
+        # block_tables), logical block -> CsaStatePool page id (-1 = cached /
+        # uncaptured). Staged per prefill fwd; the capture kernel writes
+        # boundary[csa_page_table[batch, pos//128]]. Only when the feature is on.
+        if self.enable_csa_prefix_state_cache:
+            bufs["csa_page_tables"] = CpuGpuBuffer(bs, _bt_cols, **i32)
+            # Byte arena (option-b): csa_idx is a SEPARATE owner with its own
+            # physical page space, so it needs its own staged table (main uses
+            # "csa_page_tables"). Only when the arena is on; off, idx == main and
+            # the idx compressor reuses the main table.
+            if envs.ATOM_V4_UNIFIED_KV_ARENA:
+                bufs["csa_idx_page_tables"] = CpuGpuBuffer(bs, _bt_cols, **i32)
+
         self.model_runner.forward_vars.update(bufs)
 
     def _alloc_v4_ubatch_decode_buffers(self, bufs: dict, i32: dict, i64: dict) -> None:
@@ -3429,3 +4084,74 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     def _neg_inf_state(self, shape: tuple, device) -> torch.Tensor:
         return torch.full(shape, float("-inf"), dtype=self._state_dtype, device=device)
+
+    def _c4_chunk_bytes(self, csa_on: bool) -> int:
+        """NOPE bytes of one c4 arena chunk. When the CSA cache is on, the chunk
+        fuses [SWA nope KV | CSA state | pad] and is padded up to a multiple of
+        the c4 compress page (so compressed borrowers still tile it exactly);
+        otherwise it is just the SWA nope block. Single source of truth shared by
+        `compute_arena_group_specs`, tensor sizing, and `_csa_boundary_arena_views`.
+        """
+        classical_elem = self._classical_dtype.itemsize
+        nope_row = self.head_dim * classical_elem
+        nope_chunk = self.block_size * nope_row
+        if not csa_on:
+            return nope_chunk
+        st_elem = self._state_dtype.itemsize  # fp32
+        csa_main = 2 * self.csa_boundary_tail * (2 * self.head_dim) * st_elem
+        csa_idx = 2 * self.csa_boundary_tail * (2 * self.index_head_dim) * st_elem
+        cmp_pb = self.k1_csa * nope_row
+        raw = nope_chunk + csa_main + csa_idx
+        return ((raw + cmp_pb - 1) // cmp_pb) * cmp_pb
+
+    def _csa_boundary_arena_views(self, unified: torch.Tensor):
+        """Fused option-A: build the 4 CSA boundary-state fp32 views over one c4
+        layer's chunked `unified_kv` byte buffer.
+
+        CSA state is a fixed byte SEGMENT inside each c4 SWA chunk (right after
+        the SWA nope KV region), indexed by the chunk's physical page == its SWA
+        physical page (swa owner is chunk-atomic, so 1 chunk == 1 SWA block).
+        Layout per chunk (fp8, tail=4, head_dim=512, index=128):
+          bytes [0 : 64KB)      SWA nope KV (128 rows)        -- not CSA
+          bytes [64KB : 96KB)   main: kv [4,1024] | score [4,1024] fp32
+          bytes [96KB : 104KB)  idx:  kv [4,256]  | score [4,256]  fp32
+          bytes [104KB : 112KB) pad
+        A restore/capture that names SWA physical page P lands its CSA state at
+        chunk P's segment — exactly co-located with that SWA block's KV.
+
+        Returns (main_kv, main_score, idx_kv, idx_score), each fp32
+        [n_chunks, TAIL, 2*dim], strided by the chunk (dim-contiguous rows).
+        """
+        tail = self.csa_boundary_tail
+        csa_off = self._c4_chunk_bytes(csa_on=False)  # == nope_chunk (segment start)
+        chunk_bytes = self._c4_chunk_bytes(csa_on=True)
+        # Flatten to a 1-D fp32 view over the raw bytes (dtype-agnostic:
+        # unified is bf16/fp8; reinterpret its bytes as fp32).
+        f32 = unified.reshape(-1).view(torch.float32)
+        total_f32 = f32.numel()
+        base = f32.storage_offset()
+        chunk_f32 = chunk_bytes // 4
+        assert total_f32 % chunk_f32 == 0, (
+            f"c4 chunk {chunk_f32} fp32 must divide buffer {total_f32} "
+            "(unified_kv sized off a different chunk geometry)"
+        )
+        n_chunks = total_f32 // chunk_f32
+        seg0 = base + csa_off // 4  # fp32 offset of the CSA segment in chunk 0
+        main_w = 2 * self.head_dim
+        idx_w = 2 * self.index_head_dim
+        main_payload = tail * main_w  # kv elems (== score elems)
+        idx_payload = tail * idx_w
+
+        def _view(off: int, width: int) -> torch.Tensor:
+            return f32.as_strided(
+                size=(n_chunks, tail, width),
+                stride=(chunk_f32, width, 1),
+                storage_offset=off,
+            )
+
+        main_kv = _view(seg0, main_w)
+        main_score = _view(seg0 + main_payload, main_w)
+        idx0 = seg0 + 2 * main_payload
+        idx_kv = _view(idx0, idx_w)
+        idx_score = _view(idx0 + idx_payload, idx_w)
+        return main_kv, main_score, idx_kv, idx_score

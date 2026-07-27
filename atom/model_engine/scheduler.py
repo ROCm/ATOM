@@ -286,6 +286,8 @@ class ScheduledBatch:
         remote_kv_block_ids: list[int] | None = None,
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
+        arena=None,
+        v4_csa_boundary_source_ids: list[int] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -343,6 +345,19 @@ class ScheduledBatch:
             if num_cached_tokens is not None
             else [seq.num_cached_tokens for seq in seqs.values()]
         )
+        # Per-seq one-shot CSA boundary-state snapshot source (physical block id
+        # of the terminal hit block, or -1). Consumed by the DSV4 builder to
+        # build the restore plan on a hit's first suffix chunk. -1 everywhere
+        # unless enable_v4_csa_prefix_state_cache is on and the seq hit.
+        if v4_csa_boundary_source_ids is None:
+            v4_csa_boundary_source_ids = [-1] * len(self.req_ids)
+        if len(v4_csa_boundary_source_ids) != len(self.req_ids):
+            raise ValueError(
+                "v4_csa_boundary_source_ids must have one entry per sequence"
+            )
+        self.v4_csa_boundary_source_ids = np.asarray(
+            v4_csa_boundary_source_ids, dtype=np.int32
+        )
 
         # context_lens: for prefill seqs, use num_cached_tokens + num_scheduled_tokens
         self.context_lens = np.asarray(
@@ -382,6 +397,61 @@ class ScheduledBatch:
         self.swa_block_tables = [
             seq.swa_block_table for seq in seqs.values() if seq.block_table
         ]
+        # Unified-KV arena: per-group PHYSICAL block/swa tables, translated here
+        # (scheduler process owns the arena) for shipping to the worker. Empty
+        # dicts when the arena is off — worker falls back to the logical tables.
+        self.arena_block_tables: dict[str, list[list[int]]] = {}
+        self.arena_swa_block_tables: dict[str, list[list[int]]] = {}
+        if arena is not None and getattr(arena, "enabled", False):
+            for g in arena.group_names():
+                self.arena_block_tables[g] = [
+                    arena.physical_compress_table(g, bt) for bt in self.block_tables
+                ]
+                self.arena_swa_block_tables[g] = [
+                    arena.physical_swa_table(g, st) for st in self.swa_block_tables
+                ]
+        # DSV4 CSA fused into the SWA block (feat/csa-swa-fusion): the boundary
+        # snapshot lives in the c4 SWA chunk's fp32 tail segment, indexed by the
+        # block's c4 PHYSICAL swa page (swa owner is chunk-atomic, so 1 chunk ==
+        # 1 SWA block). So the capture-destination page table IS the c4 physical
+        # SWA block table, and the restore source IS the terminal cached block's
+        # c4 physical swa page. main and idx index the SAME chunk (the boundary
+        # views encode the byte-offset difference), so they share one table.
+        # v4_csa_boundary_source_ids holds the terminal cached block's LOGICAL c4
+        # swa id (BlockManager sets it on a hit; -1 otherwise). Requires the arena
+        # (fused CSA has no separate pool); empty/passthrough when off.
+        self.csa_main_page_tables: list[list[int]] = []
+        self.csa_idx_page_tables: list[list[int]] = []
+        self.v4_csa_boundary_source_main = self.v4_csa_boundary_source_ids
+        self.v4_csa_boundary_source_idx = self.v4_csa_boundary_source_ids
+        if (
+            arena is not None
+            and getattr(arena, "enabled", False)
+            and "c4" in self.arena_swa_block_tables
+        ):
+
+            def _phys_src(s):
+                s = int(s)
+                return (
+                    arena.swa_page("c4", s) if s >= 0 and arena.is_swa_backed(s) else -1
+                )
+
+            # Capture-destination table: the c4 physical SWA page per block, but
+            # UNBACKED blocks (window-freed / cached-prefix placeholders, logical
+            # -1) MUST map to -1, NOT physical_swa_table's 0 fallback — the capture
+            # kernel skips phys < 0, whereas a 0 would write CSA state over chunk
+            # 0's LIVE compressed KV (fused: the boundary shares unified_kv, unlike
+            # the old dedicated boundary pool where page 0 was a harmless slot).
+            # main and idx index the same chunk (views encode the byte offset).
+            csa_cap = [[_phys_src(b) for b in st] for st in self.swa_block_tables]
+            self.csa_main_page_tables = csa_cap
+            self.csa_idx_page_tables = csa_cap
+
+            src = np.asarray(
+                [_phys_src(s) for s in self.v4_csa_boundary_source_ids], dtype=np.int32
+            )
+            self.v4_csa_boundary_source_main = src
+            self.v4_csa_boundary_source_idx = src
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
@@ -1125,8 +1195,19 @@ class Scheduler:
                     self.block_manager.swa.ensure_for_tokens(
                         seq, seq.num_cached_tokens, chunk
                     )
+            # DSV4 CSA (feat/csa-swa-fusion): no separate boundary-page claim —
+            # the boundary is captured into each block's SWA chunk, whose pages
+            # ensure_swa_for_tokens above already materialized.
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
+            ]
+            # DSV4 CSA snapshot: one-shot restore source per seq (terminal hit
+            # block id or -1). Non-negative only on a hit's first suffix chunk;
+            # postprocess clears it once the ring is seeded. -1 unless
+            # enable_v4_csa_prefix_state_cache set it in BlockManager.allocate.
+            v4_csa_boundary_source_ids = [
+                int(getattr(seq, "csa_boundary_state_block_id", -1))
+                for seq in scheduled_seqs.values()
             ]
             cached_per_req = [s.num_cached_tokens for s in scheduled_seqs.values()]
             logger.info(
@@ -1144,6 +1225,7 @@ class Scheduler:
             return (
                 ScheduledBatch(
                     seqs=scheduled_seqs,
+                    arena=self.block_manager.arena,
                     num_scheduled_tokens=num_scheduled_tokens,
                     total_tokens_num=total_tokens_num_prefill,
                     total_tokens_num_prefill=total_tokens_num_prefill,
@@ -1151,6 +1233,7 @@ class Scheduler:
                     total_seqs_num_prefill=num_seqs_prefill,
                     connector_meta_output=connector_meta_output,
                     num_cached_tokens=num_cached_tokens_list,
+                    v4_csa_boundary_source_ids=v4_csa_boundary_source_ids,
                 ),
                 scheduled_seqs,
             )
@@ -1241,6 +1324,7 @@ class Scheduler:
 
         decode_batch = ScheduledBatch(
             seqs=scheduled_seqs,
+            arena=self.block_manager.arena,
             num_scheduled_tokens=num_scheduled_tokens,
             total_tokens_num=total_tokens_num_decode,
             total_tokens_num_decode=total_tokens_num_decode,
@@ -1489,6 +1573,12 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
+                # One-shot: the CSA boundary snapshot (if any) was restored into
+                # the fresh ring by this first suffix forward; later chunks
+                # continue the live ring, so clear the source. Fused CSA
+                # (feat/csa-swa-fusion) needs no source pin — the SWA reuse claim
+                # + retention pin already protect the source chunk.
+                seq.csa_boundary_state_block_id = -1
                 # chunked-prefill: reclaim SWA blocks that just fell out of
                 # the window, using the computed-so-far length
                 # (num_cached_tokens). Bounds peak SWA to ~window during prefill

@@ -63,6 +63,33 @@ class CompressPlan:
     # `indexer_k_quant_and_cache`. None for empty fwds.
     compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
 
+    # --- CSA native prefix-cache boundary-state snapshot (ratio-4 only) ---
+    # Populated by the DSV4 builder when enable_v4_csa_prefix_state_cache is on;
+    # None otherwise (and always None for non-CSA ratios). Prefill-only (eager),
+    # so these are fresh tensors, not fixed-capacity CG buffers.
+    #   capture_boundary_plan_gpu: [num_capture, 4] int32
+    #       (ragged_id, batch_id, position, -1) for the last TAIL positions of
+    #       each block; consumed by capture_compressor_boundary.
+    #   restore_boundary_plan_gpu: [num_restore, 4] int32
+    #       (source_phys_block, state_slot, boundary_B, -1) per hit sequence;
+    #       consumed by restore_compressor_boundary before the first read.
+    capture_boundary_plan_gpu: torch.Tensor | None = None
+    num_capture_boundary: int = 0
+    restore_boundary_plan_gpu: torch.Tensor | None = None
+    num_restore_boundary: int = 0
+
+    # Unified-KV byte arena (option-b): csa_main and csa_idx are SEPARATE arena
+    # owners, so one logical CsaStatePool page maps to two DIFFERENT physical
+    # pages. The `*_gpu` fields above carry the MAIN-owner physical view (or the
+    # plain logical ids when the arena is off, used by both owners); these carry
+    # the IDX-owner physical view. `Compressor.forward` picks by `_csa_owner`,
+    # falling back to the main field when None (arena off / csa-only).
+    #   csa_main_page_tables_gpu  == csa_page_tables (name kept for the capture
+    #       block_tables arg); this is the MAIN page table.
+    csa_idx_page_tables_gpu: torch.Tensor | None = None
+    restore_boundary_plan_idx_gpu: torch.Tensor | None = None
+    num_restore_boundary_idx: int = 0
+
 
 def make_compress_plans(
     extend_lens_cpu: np.ndarray,
@@ -285,3 +312,89 @@ def make_compress_plans(
             compress_plan_cpu=compress_plan if n_compress > 0 else None,
         )
     return out
+
+
+def make_capture_boundary_plan(
+    extend_lens_cpu: np.ndarray,
+    context_lens_cpu: np.ndarray,
+    *,
+    block_size: int,
+    device,
+    tail: int = 4,
+) -> Tuple[torch.Tensor, int]:
+    """Build the CSA boundary-capture plan for one prefill fwd.
+
+    Selects every extend token whose absolute position is in the last ``tail``
+    slots of its KV block (``position % block_size >= block_size - tail``) — the
+    B-4..B-1 rows the terminal-block snapshot needs. Row layout matches the
+    capture kernel: ``(ragged_id, batch_id, position, -1)``.
+
+    Args mirror ``make_compress_plans`` (per-seq extend/context lengths); the
+    per-token position/batch/ragged arrays are reconstructed the same way.
+
+    Returns ``(plan_gpu [num_capture, 4] int32, num_capture)``. Empty fwds give a
+    ``[0, 4]`` tensor.
+    """
+    extend_lens_cpu = np.ascontiguousarray(extend_lens_cpu, dtype=np.int32)
+    context_lens_cpu = np.ascontiguousarray(context_lens_cpu, dtype=np.int32)
+    bs = len(extend_lens_cpu)
+    total = int(extend_lens_cpu.sum())
+    if total == 0 or bs == 0:
+        return torch.zeros((0, 4), dtype=torch.int32, device=device), 0
+    batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_cpu)
+    ragged_ids = np.arange(total, dtype=np.int32)
+    cu_extend = np.empty(bs + 1, dtype=np.int32)
+    cu_extend[0] = 0
+    np.cumsum(extend_lens_cpu, out=cu_extend[1:])
+    prefix_lens = context_lens_cpu - extend_lens_cpu
+    positions = prefix_lens[batch_ids] + (ragged_ids - cu_extend[batch_ids])
+    mask = (positions % block_size) >= (block_size - tail)
+    n = int(mask.sum())
+    if n == 0:
+        return torch.zeros((0, 4), dtype=torch.int32, device=device), 0
+    rows = np.stack(
+        [
+            ragged_ids[mask],
+            batch_ids[mask],
+            positions[mask],
+            np.full(n, -1, dtype=np.int32),
+        ],
+        axis=1,
+    ).astype(np.int32)
+    return torch.from_numpy(rows).to(device, non_blocking=True), n
+
+
+def make_restore_boundary_plan(
+    source_block_ids: np.ndarray,
+    state_slots: np.ndarray,
+    boundary_lens: np.ndarray,
+    *,
+    device,
+) -> Tuple[torch.Tensor, int]:
+    """Build the CSA boundary-restore plan for one prefill fwd.
+
+    One row per sequence with a live snapshot source (``source_block_id >= 0``):
+    ``(source_phys_block, state_slot, boundary_B, -1)``. ``boundary_B`` is the
+    128-aligned hit boundary (= that seq's cached-token count / prefix length).
+    Sequences without a source are dropped (not sentinel-padded — prefill is
+    eager, so a tight grid is fine).
+
+    Returns ``(plan_gpu [num_restore, 4] int32, num_restore)``.
+    """
+    source_block_ids = np.ascontiguousarray(source_block_ids, dtype=np.int32)
+    state_slots = np.ascontiguousarray(state_slots, dtype=np.int32)
+    boundary_lens = np.ascontiguousarray(boundary_lens, dtype=np.int32)
+    keep = source_block_ids >= 0
+    n = int(keep.sum())
+    if n == 0:
+        return torch.zeros((0, 4), dtype=torch.int32, device=device), 0
+    rows = np.stack(
+        [
+            source_block_ids[keep],
+            state_slots[keep],
+            boundary_lens[keep],
+            np.full(n, -1, dtype=np.int32),
+        ],
+        axis=1,
+    ).astype(np.int32)
+    return torch.from_numpy(rows).to(device, non_blocking=True), n

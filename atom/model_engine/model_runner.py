@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ctypes
-import bisect
 import gc
 import inspect
 import logging
@@ -1756,6 +1755,41 @@ class ModelRunner:
             self.num_swa_blocks = 0
             num_kvcache_blocks = available_for_pool // block_bytes
 
+        # Unified-KV chunk arena (ATOM_V4_UNIFIED_KV_ARENA) — UNVALIDATED on GPU.
+        # Replaces the fixed SWA/compressed split with equal-size chunks shared
+        # elastically. Sets per-group specs for BlockManager; compressed capacity
+        # is elastic up to num_chunks * pages_per_chunk(C4=4), so the idx/boundary
+        # caches (indexed by compressed block_id) must be sized to that max ->
+        # num_kvcache_blocks. Requires steps 2-3 (arena tensor + per-group index
+        # translation) to be runnable; GSM8K flag on/off must match before trust.
+        config.v4_arena_group_specs = None
+        if (
+            envs.ATOM_V4_UNIFIED_KV_ARENA
+            and swa_block_bytes > 0
+            and hasattr(b, "compute_arena_group_specs")
+        ):
+            specs = b.compute_arena_group_specs(available_for_pool)
+            if specs:
+                config.v4_arena_group_specs = specs
+                num_chunks = specs[0]["num_chunks"]
+                # max elastic compressed = tightest compress group's
+                # num_chunks * (bytes_per_chunk // compress_page_bytes) (c4 -> 4).
+                cmp_caps = [
+                    s["num_chunks"] * (s["bytes_per_chunk"] // s["owners"]["compress"])
+                    for s in specs
+                    if "compress" in s["owners"]
+                ]
+                num_kvcache_blocks = min(cmp_caps) if cmp_caps else num_chunks
+                config.num_swa_blocks = num_chunks
+                self.num_swa_blocks = num_chunks
+                logger.warning(
+                    "unified-KV arena (UNVALIDATED): specs=%s num_chunks=%d "
+                    "num_kvcache_blocks(max compressed)=%d",
+                    specs,
+                    num_chunks,
+                    num_kvcache_blocks,
+                )
+
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB, "
@@ -1836,6 +1870,14 @@ class ModelRunner:
             # attn builder's SWA pool.
             "num_swa_blocks": int(getattr(config, "num_swa_blocks", 0)),
             "swa_window_size": int(getattr(config, "swa_window_size", 0)),
+            # Unified-KV arena: get_num_blocks runs in the RUNNER subprocess and
+            # is where the per-group arena specs are computed. BlockManager (built
+            # in the engine/scheduler process) needs them to construct the arena
+            # and ship per-group physical tables. Propagate via block_info like the
+            # SWA fields above (else scheduler-side arena=None → tables not shipped
+            # → worker uses logical block ids as physical → KV corruption once the
+            # mapping is non-identity under eviction).
+            "v4_arena_group_specs": getattr(config, "v4_arena_group_specs", None),
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):

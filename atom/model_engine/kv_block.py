@@ -4,8 +4,8 @@
 
 class Block:
     """One physical KV cache block. Shared by the compressed pool (BlockManager)
-    and the sliding-window pool (SlidingWindowPool). Lives in its own module so
-    both can import it without a circular dependency."""
+    and its sliding-window component (SlidingWindowPool). Lives in its own module
+    so both can import it without a circular dependency."""
 
     def __init__(self, block_id):
         self.block_id = block_id
