@@ -51,32 +51,26 @@ def _materialize_atom_dummy_forward(
     ForwardBatch,
 ]:
     """Convert an empty SGLang IDLE batch into ATOM-style dummy inputs."""
-    # if positions is None and input_ids is None and input_embeds is None:
-    #     raise RuntimeError("SGLang dummy forward materialization requires positions,input ids, input embeds")
-    # if positions is None:
-    #     raise RuntimeError("SGLang dummy forward materialization requires positions")
-    # if input_ids is None:
-    # raise RuntimeError("SGLang dummy forward materialization requires input_ids")
     if positions is not None:
-        reference = positions
+        device = positions.device
     elif input_ids is not None:
-        reference = input_ids
+        device = input_ids.device
     elif input_embeds is not None:
-        reference = input_embeds
+        device = input_embeds.device
     else:
         raise RuntimeError(
-            "SGLang dummy forward materialization requires positions,input ids, input embeds"
+            "SGLang dummy forward materialization requires positions, input ids, input embeds"
         )
 
     dummy_positions = (
         positions.new_zeros((1,))
         if positions is not None
-        else torch.zeros((1,), dtype=torch.long, device=reference.device)
+        else torch.zeros((1,), dtype=torch.long, device=device)
     )
     dummy_input_ids = (
         input_ids.new_zeros((1,))
         if input_ids is not None
-        else torch.zeros((1,), dtype=torch.long, device=reference.device)
+        else torch.zeros((1,), dtype=torch.long, device=device)
     )
     dummy_input_embeds = _pad_dummy_like(input_embeds, length=1, fill_value=0)
 
