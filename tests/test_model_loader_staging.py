@@ -27,6 +27,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 
+from atom.model_loader.expert_staging import ExpertStagingPool
 from atom.model_loader.loading_core import load_weights_into_model
 from atom.model_ops.fused_moe.expert_layout import (
     count_local_base_experts,
@@ -494,6 +495,32 @@ class EPLBRedundantSlotTest(unittest.TestCase):
                 f"redundant slot {slot} was overwritten by the shared expert; "
                 "fill_redundant populates these after loading",
             )
+
+
+class StagingBufferAllocationTest(unittest.TestCase):
+    """Packed dtypes have to fall back to a raw-byte staging buffer."""
+
+    # `zero_` on a packed fp4x2 tensor only dispatches to `fill_cpu` -- which
+    # has no kernel for that dtype -- once the tensor is big enough for the
+    # parallel path (torch's GRAIN_SIZE, 32768 elements). Anything smaller
+    # takes a memset fast path and succeeds, so a small tensor would not
+    # reproduce this at all.
+    NUMEL = 1 << 15
+
+    @unittest.skipUnless(hasattr(torch, "float4_e2m1fn_x2"), "torch has no fp4x2 dtype")
+    def test_packed_dtype_falls_back_to_raw_bytes(self):
+        param = nn.Parameter(
+            torch.empty((4, self.NUMEL // 4), dtype=torch.float4_e2m1fn_x2),
+            requires_grad=False,
+        )
+        with self.assertRaises(NotImplementedError):
+            param.data.zero_()
+
+        staging = ExpertStagingPool._allocate_staging(param)
+
+        self.assertEqual(staging.dtype, torch.uint8)
+        self.assertEqual(staging.shape, param.data.shape)
+        self.assertEqual(int(staging.sum()), 0, "staging buffer must be zeroed")
 
 
 if __name__ == "__main__":

@@ -247,16 +247,20 @@ class ExpertStagingPool:
                     device="cpu",
                     pin_memory=pinned,
                 )
+                # Must stay inside the try: for packed dtypes (fp4x2) the
+                # allocation succeeds and it is `zero_` that has no CPU kernel.
+                t.zero_()
             except NotImplementedError:
-                # Packed dtypes (fp4x2) have no CPU implementation; stage the
-                # raw bytes instead and let the flush re-view the parameter.
+                # Stage the raw bytes instead and let the flush re-view the
+                # parameter as uint8.
                 t = torch.empty(
                     param.data.shape,
                     dtype=torch.uint8,
                     device="cpu",
                     pin_memory=pinned,
                 )
-            return t.zero_()
+                t.zero_()
+            return t
 
         try:
             return _alloc(torch.cuda.is_available())
