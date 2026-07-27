@@ -8,17 +8,19 @@ from atom.model_engine.sequence import Sequence
 
 
 class SlidingWindowPool:
-    """Physical content-addressed SWA component for ``StatePool``.
+    """Physical content-addressed SWA component owned by ``BlockManager``.
 
     Owns an independent free-list + content-hash map so out-of-window SWA blocks
     can be freed while the compressed blocks persist. Mirrors vLLM's
-    `SlidingWindowManager`; ``StatePool`` owns one instance and delegates all
-    SWA lifecycle here, driving it in lockstep with the compressed pool.
+    `SlidingWindowManager`; ``BlockManager`` holds one instance as ``self.swa``
+    and drives its SWA lifecycle in lockstep with the compressed pool. Under the
+    CSA-into-SWA fusion the CSA boundary snapshot rides this pool's blocks (no
+    separate page pool), so this is the sole prefix-cache sidecar owner.
     `seq.swa_block_table` lives on `Sequence` (shared with attention / PD); this
     component only reads/writes it.
 
     Self-guarding: when `num_blocks == 0` (non-V4 models) the pool is DISABLED —
-    every method is an identity/no-op, so ``StatePool`` can call it
+    every method is an identity/no-op, so ``BlockManager`` can call it
     unconditionally (no `if swa_enabled` scattered at the call sites). `has_free`
     returns True and `bounded_hit` returns the input length, so admission and
     hit-length are byte-identical to a no-SWA build.

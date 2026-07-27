@@ -18,7 +18,7 @@ from atom.distributed.kv_events import (
 from atom.model_engine.chunk_arena import ArenaEmpty
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.state_pool import StatePool
+from atom.model_engine.swa_pool import SlidingWindowPool
 from atom.model_engine.unified_kv_arena import UnifiedKvArena
 from atom.utils import envs
 
@@ -116,42 +116,39 @@ class BlockManager:
             range(num_per_req_cache_groups)
         )
 
-        # Prefix-cache sidecar-state control plane.  Today it materializes the
-        # independently allocated SWA component; it also owns the lifecycle
-        # contract for future immutable CSA boundary-state sidecars.  It is a
-        # no-op for non-SWA models, so the compressed path stays byte-identical.
-        # See atom/model_engine/state_pool.py.
+        # SWA component: content-addressed sliding-window pool, the sole prefix-
+        # cache sidecar owner now that the CSA boundary snapshot is fused into the
+        # SWA chunk (feat/csa-swa-fusion) — no separate page pool. It is a no-op
+        # for non-SWA models (num_swa_blocks == 0), so the compressed path stays
+        # byte-identical. Under the unified-KV arena, size the SWA logical id
+        # space to the arena's max SWA capacity so SWA can grow into borrowed
+        # compressed chunks; else the fixed num_swa pool. full_retain/retention/
+        # checkpoint carry the SWA sparse-checkpoint policy (and the arena
+        # elastic-borrow lives inside SlidingWindowPool).
         _spec = getattr(config, "speculative_config", None)
         _mtp_k = int(getattr(_spec, "num_speculative_tokens", 0) or 0) if _spec else 0
-        # Prefix-cache sidecar-state control plane (StatePool) owns BOTH the SWA
-        # component and the CSA boundary-state page pool. Under the unified-KV
-        # arena, size the SWA logical id space to the arena's max SWA capacity so
-        # SWA can grow into borrowed compressed chunks; else the fixed num_swa
-        # pool. full_retain/retention/checkpoint carry the SWA sparse-checkpoint
-        # policy (and the arena elastic-borrow lives inside SlidingWindowPool).
         _num_swa = getattr(config, "num_swa_blocks", 0)
         if self.arena is not None and self.arena.enabled:
             _num_swa = max(_num_swa, self.arena.max_swa_blocks())
-        self.state_pool = StatePool(
-            num_swa_blocks=_num_swa,
-            swa_window=getattr(config, "swa_window_size", 0),
+        self.swa = SlidingWindowPool(
+            num_blocks=_num_swa,
+            window=getattr(config, "swa_window_size", 0),
             block_size=block_size,
             max_num_batched_tokens=getattr(config, "max_num_batched_tokens", 0),
             mtp_k=_mtp_k,
             full_retain=envs.ATOM_SWA_FULL_RETAIN,
             retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
             checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
-            # CSA boundary snapshot is fused into the SWA chunk (feat/csa-swa-
-            # fusion): it has no separate page pool — capture writes into the
-            # block's SWA chunk and retention rides the SWA pin. This flag only
-            # gates whether the capture/restore plans are built.
-            require_csa_boundary_state=bool(
-                getattr(config, "enable_v4_csa_prefix_state_cache", False)
-            ),
         )
-        # `self.swa` remains the SWA component (same SlidingWindowPool instance)
-        # so the arena wiring + all existing self.swa.* call sites are unchanged.
-        self.swa = self.state_pool.swa
+        # CSA boundary snapshot is fused into the SWA chunk (feat/csa-swa-fusion):
+        # it has no separate page pool — capture writes into the block's SWA chunk
+        # and retention rides the SWA pin. This flag only gates whether the
+        # capture/restore plans are built; exposed via the
+        # requires_csa_boundary_state property (a seam for a future non-SWA
+        # sidecar that would not ride the SWA pin).
+        self._require_csa_boundary_state = bool(
+            getattr(config, "enable_v4_csa_prefix_state_cache", False)
+        )
         # Wire the arena into SWA so SWA + compress borrow chunks from the shared
         # arena and reclaim from a sibling under pressure (pool-driven lending via
         # _evict_cold_for_borrow). CSA rides the SWA chunk, so no separate wiring.
@@ -248,7 +245,16 @@ class BlockManager:
     @property
     def swa_enabled(self) -> bool:
         """Compatibility capability for callers that only need SWA status."""
-        return self.state_pool.swa_enabled
+        return self.swa.enabled
+
+    @property
+    def requires_csa_boundary_state(self) -> bool:
+        """Whether CSA boundary-state capture/restore plans should be built.
+
+        Kept as a property (not a bare read) as a seam: a future non-SWA sidecar
+        that does not ride the SWA pin would gate its own lifecycle here.
+        """
+        return self._require_csa_boundary_state
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -340,9 +346,7 @@ class BlockManager:
             # SWA admission: only the per-request windowed peak (filled
             # incrementally + window-freed), not the whole prompt. No-op / True
             # when SWA disabled.
-            if not self.state_pool.has_free_swa(
-                self.state_pool.swa_admission_blocks(seq)
-            ):
+            if not self.swa.has_free(self.swa.admission_blocks(seq)):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
@@ -368,13 +372,16 @@ class BlockManager:
         # → num_cached_blocks so we never reuse a block whose in-window SWA is
         # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
         # the hit.
-        # StatePool.bound_hit runs the SWA trailing-window gate AND (when CSA
-        # boundary-state is on) shrinks the hit to a terminal block whose CSA
-        # boundary page is published — one consistent gate.
-        state_hit = self.state_pool.bound_hit(
-            seq, compressed_hit, block_hashes, compressed_block_ids
-        )
-        num_cached_blocks = state_hit.num_cached_blocks
+        # SWA trailing-window gate: shrink the compressed hit to the largest
+        # boundary whose trailing window is SWA-present. Under CSA-into-SWA fusion
+        # the CSA boundary rides that same SWA block, so this one gate covers CSA
+        # too — a boundary whose SWA window is present has its fused CSA state
+        # present. The assert guards the caller's compressed-prefix invariant
+        # (every counted hit block must have a materialized physical id).
+        assert (
+            len(compressed_block_ids) >= compressed_hit
+        ), "missing physical ids for compressed prefix hit"
+        num_cached_blocks = self.swa.bounded_hit(seq, compressed_hit, block_hashes)
         # Instrumentation: record the pre-gate compressed hit so CacheStats can
         # separate reuse lost to the SWA tail gate (compressed_hit -
         # num_cached_blocks) from reuse lost to compressed eviction.
@@ -390,9 +397,7 @@ class BlockManager:
         # SWA new-block demand is bounded by the windowed peak (filled
         # incrementally + window-freed), not the full new-block count. No-op /
         # True when SWA disabled.
-        if not self.state_pool.has_free_swa(
-            min(num_new_blocks, self.state_pool.swa_admission_blocks(seq))
-        ):
+        if not self.swa.has_free(min(num_new_blocks, self.swa.admission_blocks(seq))):
             return -1
         return num_cached_blocks
 
@@ -409,7 +414,7 @@ class BlockManager:
         assert not seq.block_table
         # SWA tail-gate: only the trailing window before the hit boundary is
         # SWA-reused; earlier blocks are out of window (never read by the resumed
-        # forward) → mark -1 (matches state_pool.bound_hit; keeps swa_block_table
+        # forward) → mark -1 (matches self.swa.bounded_hit; keeps swa_block_table
         # aligned with block_table). swa_hit_start == boundary - swa_tail_blocks
         # on a full-window hit, and 0 on a short/partial hit (whole prefix in
         # one window → all present, all claimed).
@@ -417,7 +422,7 @@ class BlockManager:
         # SWA-reused; earlier (out-of-window) blocks get -1. A tail size of zero
         # when disabled makes swa_hit_start == num_cached_blocks → every SWA call
         # below is a no-op (swa_block_table stays empty for non-SWA models).
-        swa_hit_start = max(0, num_cached_blocks - self.state_pool.swa_tail_blocks)
+        swa_hit_start = max(0, num_cached_blocks - self.swa.tail_blocks)
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -440,13 +445,9 @@ class BlockManager:
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
             if i < swa_hit_start:
-                self.state_pool.append_swa_placeholder(
-                    seq
-                )  # out of window: never read → -1
+                self.swa.alloc_placeholder(seq)  # out of window: never read → -1
             else:
-                self.state_pool.claim_swa_cached(
-                    seq, h, token_ids
-                )  # trailing window: reuse
+                self.swa.claim_cached(seq, h, token_ids)  # trailing window: reuse
         # Fused CSA (feat/csa-swa-fusion): the restore source is the terminal
         # cached block's LOGICAL c4 swa id — its physical SWA chunk (content-
         # addressed, retention-pinned) holds the captured boundary in its fused
@@ -456,7 +457,7 @@ class BlockManager:
         # needed (the SWA reuse claim + retention pin already protect the chunk).
         seq.csa_boundary_state_block_id = -1
         if (
-            self.state_pool.requires_csa_boundary_state
+            self.requires_csa_boundary_state
             and num_cached_blocks
             and len(seq.swa_block_table) >= num_cached_blocks
         ):
@@ -473,7 +474,7 @@ class BlockManager:
             # length as block_table; ensure_for_tokens fills the current chunk's
             # window slots before each forward, free_after_prefill_chunk releases
             # out-of-window ones.
-            self.state_pool.append_swa_placeholder(seq)
+            self.swa.alloc_placeholder(seq)
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
         # Per-request cache: claim one slot index from the pre-allocated
@@ -523,7 +524,7 @@ class BlockManager:
             # boundary into this block's SWA chunk during the forward, so a later
             # prefix hit that reuses the content-addressed SWA block restores the
             # boundary for free — no separate CSA publish needed.
-            self.state_pool.publish_swa_block(seq, i, h, token_ids)
+            self.swa.publish_hash(seq, i, h, token_ids)
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
@@ -543,7 +544,7 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        self.state_pool.release(
+        self.swa.release(
             seq
         )  # release SWA blocks + clear swa_block_table (no-op if disabled)
         seq.num_cached_tokens = 0
@@ -561,9 +562,7 @@ class BlockManager:
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         if not self._has_free_compressed(new_blocks_needed):
             return False
-        if not self.state_pool.has_free_swa(
-            new_blocks_needed
-        ):  # True when SWA disabled
+        if not self.swa.has_free(new_blocks_needed):  # True when SWA disabled
             return False
         return True
 
@@ -586,11 +585,9 @@ class BlockManager:
                 block_id = self._pop_free_block()
                 self._allocate_block(block_id)
                 block_table.append(block_id)
-                self.state_pool.append_new_swa_block(
-                    seq
-                )  # lockstep SWA block (no-op if disabled)
+                self.swa.append_new(seq)  # lockstep SWA block (no-op if disabled)
         # Reclaim SWA blocks that just fell out of the window (no-op if disabled).
-        self.state_pool.free_swa_out_of_window(seq, len(seq))
+        self.swa.free_out_of_window(seq, len(seq))
 
     # ---------------- KV event API ---------------- #
 
