@@ -156,7 +156,15 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 
 ## Weight loading
 
-`load_model()` in `atom/model_loader/loader.py` handles weight loading.
+`load_model()` in `atom/model_loader/loader.py` handles weight loading. It binds the pieces that need AITER — the TP group, the quant-config-driven shared-expert fusion decision, the safetensors iterator — and owns post-load weight processing; everything else lives in modules that import nothing but torch, so they are unit-testable on a runner with no GPU build:
+
+| Module | Responsibility |
+|--------|----------------|
+| `atom/model_loader/loading_core.py` | `load_weights_into_model`: the loading loop, thread pool and post-load coverage report |
+| `atom/model_loader/weight_names.py` | `WeightsMapper` and `CheckpointNameRewriter`: on-disk name → parameter name |
+| `atom/model_loader/weight_dispatch.py` | `WeightDispatcher`: which of the five write paths a tensor takes |
+| `atom/model_loader/expert_staging.py` | `ExpertStagingPool`: batched MoE expert staging (see below) |
+| `atom/model_ops/fused_moe/expert_layout.py` | expert slot layout shared by the loader and `FusedMoE` |
 
 ### Function signature
 
@@ -190,7 +198,7 @@ def load_model(
    ```
    Each packed parameter has a `weight_loader` attribute that knows how to shard and place the weight into the correct slice.
 
-4. **Expert parameter loading:** If the model has a `get_expert_mapping()` method, expert weights are loaded using `FusedMoE.make_expert_params_mapping()`, which generates (param_name, weight_name, expert_id, shard_id) tuples. This handles per-expert sharding across TP ranks. Each expert shard is then placed either through the per-expert `FusedMoE.weight_loader` or, when the parallel loader is enabled, the batched staging path (see [Batched Expert Staging](#batched-expert-staging)).
+4. **Expert parameter loading:** If the model has a `get_expert_mapping()` method, expert weights are loaded using `FusedMoE.make_expert_params_mapping()`, which generates (param_name, weight_name, expert_id, shard_id) tuples. This handles per-expert sharding across TP ranks. Each expert shard is then placed either through the per-expert `FusedMoE.weight_loader` or, when the parallel loader is enabled, the batched staging path (see [Batched Expert Staging](#batched-expert-staging)). Checkpoints that stack all routed experts of a layer into one tensor instead go through the model's own `load_fused_expert_weights`, which writes them directly.
 
 5. **TP sharding:** Parallel linear layers (`ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`) have custom `weight_loader` methods that automatically select the correct shard for the current TP rank during loading. The default fallback `default_weight_loader` handles simple cases where weights need to be sliced by TP rank.
 
@@ -200,10 +208,17 @@ def load_model(
 
 ### Batched expert staging
 
-On large MoE checkpoints each expert's weight arrives as a separate tensor, so the per-expert `weight_loader` issues one small H2D copy per (expert, shard). When the parallel loader is enabled (`ATOM_LOADER_NUM_THREADS > 1`), these are collapsed into one large copy per fused parameter:
+On large MoE checkpoints each expert's weight arrives as a separate tensor, so the per-expert `weight_loader` issues one small H2D copy per (expert, shard). When the parallel loader is enabled (`ATOM_LOADER_NUM_THREADS > 1`), `ExpertStagingPool` collects them in a CPU buffer shaped like the fused parameter and writes the result back in one copy.
 
-- Once a buffer has received all `expected_batched_arrivals` shards, it is flushed to the GPU parameter with a single H2D copy.
-- If a staged group never reaches its expected count (some expert slots left unstaged), loading raises a `RuntimeError` rather than flushing a partially-zeroed parameter; set `ATOM_LOADER_NUM_THREADS=1` to fall back to the per-expert loader.
+**Ownership rule:** the pool writes back only the (expert slot, shard) regions it actually staged. Other loader paths may write the same parameter as long as they touch different regions — a checkpoint that stores routed experts as one stacked tensor loads them directly while the shared expert comes through the per-expert path. Before writing such a parameter, those paths call `ExpertStagingPool.decline`, which hands the parameter over after writing back whatever had already been staged.
+
+What the pool does and does not own:
+
+- **Routed base experts only.** `expected_batched_arrivals` counts them and nothing else. A fused shared expert is three tensors per layer and skips staging entirely (`is_batched_expert_slot`); EPLB redundant replicas are populated by `fill_redundant` after loading.
+- **One large copy when the batch is complete.** `flush_staged` copies slots `[0, n_base)` in one go when every routed base slot arrived, and falls back to per-region copies otherwise. It also zeroes the redundant slots, which `process_weights_after_loading` reads before `fill_redundant` fills them.
+- **Region granularity, not byte.** `_load_w13` / `_load_w2` narrow further to the checkpoint shard's width when a parameter is padded (MXFP4 alignment); the padding tail is zero on both sides, since staging buffers are zero-initialised and MXFP4 parameters are zeroed in `create_weights`.
+
+If a parameter never receives every routed base expert, loading raises a `RuntimeError` naming the parameter and how many (slot, shard) regions arrived. Set `ATOM_LOADER_STRICT_COVERAGE=false` to downgrade that to a warning and load anyway, leaving those slots at their init values.
 
 ### Layers beyond `num_hidden_layers`
 
