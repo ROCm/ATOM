@@ -203,6 +203,35 @@ def load_weights_into_model(
         if executor is not None:
             executor.shutdown(wait=True)
 
+    _report_coverage(
+        loaded_weights_record=loaded_weights_record,
+        params_dict=params_dict,
+        dropped_ckpt_keys=dropped_ckpt_keys,
+        prefix=prefix,
+        is_rank0=is_rank0,
+    )
+
+    # Avoid holding stale Parameter refs that prevent storage release.
+    del params_dict
+
+    return loaded_weights_record
+
+
+def _report_coverage(
+    *,
+    loaded_weights_record: set[str],
+    params_dict: dict,
+    dropped_ckpt_keys: list[tuple[str, str]],
+    prefix: str,
+    is_rank0: Callable[[], bool],
+) -> None:
+    """Warn about parameters nothing wrote, and checkpoint tensors nothing took.
+
+    Both directions point at the same bug class -- a name-rewrite rule that
+    produces a name the model does not have -- and both are silent otherwise:
+    the destination keeps its init value (all-ones for RMSNorm, whatever
+    `torch.empty` left elsewhere) and the forward pass is quietly wrong.
+    """
     # Verify every model parameter actually got loaded from the checkpoint.
     # Without this check, weights_mapping bugs (e.g. a substring rule
     # accidentally rewriting `attn_norm.weight` → `attn_model.norm.weight`)
@@ -268,8 +297,3 @@ def load_weights_into_model(
                 len(sample),
                 sample,
             )
-
-    # Avoid holding stale Parameter refs that prevent storage release.
-    del params_dict
-
-    return loaded_weights_record
