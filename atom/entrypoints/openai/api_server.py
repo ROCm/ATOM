@@ -1916,6 +1916,7 @@ async def responses_endpoint(raw_request: Request):
                         return _flush_pending()
                     return []
 
+                aborted = True  # abort the seq on disconnect; False on normal end
                 try:
                     for s in emitter.created():
                         yield s
@@ -1944,9 +1945,10 @@ async def responses_endpoint(raw_request: Request):
                             for s in emitter.finish(input_tokens, output_tokens):
                                 yield s
                             yield "data: [DONE]\n\n"
+                            aborted = False
                             break
                 finally:
-                    cleanup_streaming_request(request_id, seq_id)
+                    cleanup_streaming_request(request_id, seq_id, aborted=aborted)
 
             return StreamingResponse(
                 generate_responses_stream(),
