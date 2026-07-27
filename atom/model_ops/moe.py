@@ -44,6 +44,7 @@ from atom.model_ops.fused_moe.config import (
 from atom.model_ops.fused_moe.expert_layout import (
     count_local_base_experts,
     determine_expert_map,
+    expert_region,
     expert_shard_dim,
     expert_shard_view,
     physical_expert_id,
@@ -3353,27 +3354,79 @@ class FusedMoE(torch.nn.Module):
         ):
             w13_batchable.append(getattr(self, "w13_weight_scale", None))
             w2_batchable.append(getattr(self, "w2_weight_scale", None))
-        # Only local BASE (non-redundant) expert slots receive a checkpoint
-        # weight during loading; EPLB redundant physical slots are filled later
-        # by fill_redundant, so they never arrive here. Counting all local
-        # physical slots (local_num_experts) would over-estimate `expected` on
-        # ranks that own redundant slots -> the batched staging entry never
-        # reaches the flush threshold, so it is never flushed/freed (staging
-        # leaks for every layer -> OOM, and load never completes -> the rank
-        # misses the post-load all2all init collective -> hang). Count only the
-        # local slots inside the logical range (the base experts the checkpoint
-        # actually delivers).
-        n_local_base = count_local_base_experts(
-            expert_map=self.expert_map,
-            global_num_experts=self.global_num_experts,
-            num_redundant_experts=self.num_redundant_experts,
-            local_num_experts=self.local_num_experts,
-        )
+        # Counted over routed BASE slots only. EPLB redundant replicas are
+        # filled by fill_redundant after loading, and fused shared experts are
+        # delivered by the checkpoint separately and never staged
+        # (`is_batched_expert_slot`). Counting either would leave the entry
+        # short of its threshold forever: it is never flushed or freed, so
+        # staging leaks for every layer and the rank never finishes loading.
+        n_local_base = self.num_local_base_experts
         if any(param is p for p in w13_batchable if p is not None):
             return n_local_base * 2
         if any(param is p for p in w2_batchable if p is not None):
             return n_local_base
         return None
+
+    @property
+    def num_local_base_experts(self) -> int:
+        """Local slots holding a routed base expert, i.e. slots `[0, n)`."""
+        return count_local_base_experts(
+            expert_map=self.expert_map,
+            global_num_experts=self.global_num_experts,
+            num_redundant_experts=self.num_redundant_experts,
+            local_num_experts=self.local_num_experts,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+        )
+
+    def is_batched_expert_slot(self, local_expert_id: int) -> bool:
+        """Whether arrivals for this local slot should go through staging.
+
+        Only routed base experts benefit: they arrive one tensor per (expert,
+        shard) and coalescing them is the entire point. A fused shared expert
+        is three tensors per layer, and in checkpoints that store routed
+        experts as one stacked tensor it is the *only* thing that would be
+        staged -- leaving a parameter-sized buffer alive for a handful of rows.
+        """
+        return local_expert_id < self.num_local_base_experts
+
+    def flush_staged(
+        self,
+        param: torch.nn.Parameter,
+        staging: torch.Tensor,
+        filled: set[tuple[int, str]],
+    ) -> None:
+        """Write staged (slot, shard) regions of `staging` back into `param`.
+
+        Only the regions in `filled` are written. Other loader paths may own
+        the remaining slots of the same parameter -- a checkpoint that stores
+        routed experts as one stacked tensor loads them directly while the
+        shared expert comes through the per-expert path -- and a whole-buffer
+        copy would overwrite their work with zeros.
+        """
+        dst = (
+            param.data.view(torch.uint8)
+            if staging.dtype != param.data.dtype
+            else param.data
+        )
+        n_base = self.num_local_base_experts
+        if len(filled) == self.expected_batched_arrivals(param):
+            # Every base slot arrived: one large copy, which is the reason the
+            # staging path exists at all.
+            dst[:n_base].copy_(staging[:n_base])
+        else:
+            is_transposed = getattr(param, "is_transposed", False)
+            for local_expert_id, shard_id in sorted(filled):
+                expert_region(dst, local_expert_id, shard_id, is_transposed).copy_(
+                    expert_region(staging, local_expert_id, shard_id, is_transposed)
+                )
+        # EPLB redundant replicas belong to fill_redundant, which runs after
+        # process_weights_after_loading has already read every local slot.
+        # create_weights hands them out as torch.empty, so zero them here --
+        # the whole-buffer flush this replaced used to do it as a side effect.
+        for slot in range(
+            n_base, self.local_num_experts - self.num_fused_shared_experts
+        ):
+            dst[slot].zero_()
 
     def weight_loader(
         self,

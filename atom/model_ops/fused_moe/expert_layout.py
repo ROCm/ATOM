@@ -71,21 +71,22 @@ def count_local_base_experts(
     global_num_experts: int,
     num_redundant_experts: int,
     local_num_experts: int,
+    num_fused_shared_experts: int = 0,
 ) -> int:
-    """Number of local slots that receive a routed expert from the checkpoint.
+    """Number of local slots holding a routed base expert.
 
-    Excludes EPLB redundant replicas, which `fill_redundant` populates after
-    loading.  Fused shared experts are *not* excluded here — they sit after the
-    routed slots and callers that care subtract `num_fused_shared_experts`
-    themselves.
+    Excludes both EPLB redundant replicas — `fill_redundant` populates those
+    after loading — and fused shared experts, which the checkpoint delivers
+    separately from the routed ones and which therefore must not be counted
+    when deciding whether a batch is complete.
 
     `determine_expert_map` assigns a rank a contiguous run of global ids
-    starting at local index 0, and redundant replicas extend the global range
-    past `global_num_experts - num_redundant_experts`, so the returned count is
-    also the length of the local slot *prefix* holding routed base experts.
+    starting at local index 0, and both the redundant replicas and the shared
+    experts are appended after them, so the returned count is also the length
+    of the local slot *prefix* holding routed base experts.
     """
     if expert_map is None:
-        return local_num_experts
+        return local_num_experts - num_fused_shared_experts
     num_logical = global_num_experts - num_redundant_experts
     return int((expert_map[:num_logical] != -1).sum().item())
 

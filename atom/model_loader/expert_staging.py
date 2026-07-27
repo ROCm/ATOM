@@ -9,14 +9,23 @@ the per-expert `weight_loader` issues one small host-to-device copy per
 bandwidth-bound. The pool coalesces every arrival for one fused parameter into
 a CPU staging buffer and writes the result back with a single large copy.
 
+Ownership rule: the pool writes back only the (expert slot, shard) regions it
+actually staged. Any other loader path may write the same parameter as long as
+it touches different regions, which is what lets a checkpoint that stores
+routed experts one way and shared experts another -- Qwen3.5 BF16 stacks the
+routed experts into a single tensor -- load correctly. Before writing such a
+parameter, that other path calls `decline` so the two never race for a region.
+
 Deliberately free of AITER and of `atom.config`: the pool talks to a MoE module
-only through the small protocol below, so it can be unit-tested on a plain CPU
+only through the protocol below, so it can be unit-tested on a plain CPU
 runner.
 
     stage_expert_weight(param, staging, loaded_weight, local_expert_id,
                         shard_id, weight_name) -> bool
     expected_batched_arrivals(param) -> int | None
     _map_global_expert_id_to_local_expert_id(global_expert_id) -> int
+    is_batched_expert_slot(local_expert_id) -> bool
+    flush_staged(param, staging, filled) -> None
 """
 
 import logging
@@ -32,14 +41,35 @@ logger = logging.getLogger("atom")
 
 @dataclass
 class StagingEntry:
-    """One in-flight fused parameter's staging buffer and arrival count."""
+    """One in-flight fused parameter's staging buffer and its filled regions."""
 
     param: torch.nn.Parameter
     staging: torch.Tensor
     moe: Any
     expected: int
-    arrived: int = 0
+    name: str
+    filled: set[tuple[int, str]] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @property
+    def complete(self) -> bool:
+        return len(self.filled) >= self.expected
+
+    def missing_description(self) -> str:
+        got = len(self.filled)
+        slots = sorted({slot for slot, _ in self.filled})
+        span = f"{slots[0]}..{slots[-1]}" if slots else "none"
+        return (
+            f"{self.name}: {got}/{self.expected} (expert slot, shard) regions "
+            f"staged, slots {span}"
+        )
+
+
+@dataclass
+class StagingReport:
+    """What the pool still held when loading finished."""
+
+    incomplete: list[str] = field(default_factory=list)
 
 
 class ExpertStagingPool:
@@ -104,8 +134,17 @@ class ExpertStagingPool:
         if local_eid == -1:
             return
 
+        # This slot is somebody else's (a fused shared expert), but the
+        # parameter as a whole is still batchable -- do not poison it the way
+        # an unstageable shard below does.
+        if not moe.is_batched_expert_slot(local_eid):
+            self._direct_load(
+                param, full_param_name, shard_id, global_expert_id, loaded_weight
+            )
+            return
+
         if entry is None:
-            entry = self._get_or_create_entry(param, moe)
+            entry = self._get_or_create_entry(param, moe, full_param_name)
             if entry is None:  # declined while we were allocating
                 self._direct_load(
                     param, full_param_name, shard_id, global_expert_id, loaded_weight
@@ -121,33 +160,61 @@ class ExpertStagingPool:
             weight_name=full_param_name,
         )
         if not staged:
-            with self._lock:
-                self._declined.add(pid)
-                self._entries.pop(pid, None)
+            # The shard shape or dtype is not one the batched path handles, and
+            # that verdict holds for every arrival of this parameter, so hand
+            # the whole thing over -- writing back what already landed first.
+            self.decline(param)
             self._direct_load(
                 param, full_param_name, shard_id, global_expert_id, loaded_weight
             )
             return
 
         with entry.lock:
-            entry.arrived += 1
-            complete = entry.arrived >= entry.expected
+            entry.filled.add((local_eid, shard_id))
+            complete = entry.complete
         if complete:
-            self._flush(entry)
             with self._lock:
-                if self._entries.get(pid) is entry:
-                    del self._entries[pid]
+                claimed = self._entries.pop(pid, None) is entry
+            if claimed:
+                with entry.lock:
+                    moe.flush_staged(param, entry.staging, entry.filled)
 
-    def take_pending(self) -> list[StagingEntry]:
-        """Drain and return entries that never reached their arrival count."""
+    def decline(self, param: torch.nn.Parameter) -> None:
+        """Hand this parameter over to another loader path.
+
+        Called before any write that does not go through the pool. Whatever has
+        already been staged is written back first: the other path is about to
+        write different regions of the same parameter, and dropping the buffer
+        would silently lose the arrivals that did land.
+        """
+        pid = id(param)
+        with self._lock:
+            self._declined.add(pid)
+            entry = self._entries.pop(pid, None)
+        if entry is not None:
+            with entry.lock:
+                entry.moe.flush_staged(param, entry.staging, entry.filled)
+
+    def flush_pending(self) -> StagingReport:
+        """Write back and drop every entry still held, after the drain.
+
+        An entry that is still here never reached its arrival count. Its staged
+        regions are written back regardless -- partial data beats none, and the
+        report tells the caller exactly what is missing.
+        """
         with self._lock:
             pending = list(self._entries.values())
             self._entries.clear()
-        return pending
+        report = StagingReport()
+        for entry in pending:
+            with entry.lock:
+                entry.moe.flush_staged(entry.param, entry.staging, entry.filled)
+                report.incomplete.append(entry.missing_description())
+        return report
 
     # ── internals ─────────────────────────────────────────────────────────
 
-    def _get_or_create_entry(self, param, moe) -> StagingEntry | None:
+    def _get_or_create_entry(self, param, moe, name: str) -> StagingEntry | None:
         pid = id(param)
         # Allocate outside the lock: the buffer is parameter-sized and pinning
         # it is slow enough that holding the lock would serialize every layer.
@@ -156,6 +223,7 @@ class ExpertStagingPool:
             staging=self._allocate_staging(param),
             moe=moe,
             expected=moe.expected_batched_arrivals(param),
+            name=name,
         )
         with self._lock:
             if pid in self._declined:
@@ -203,11 +271,3 @@ class ExpertStagingPool:
         param.weight_loader(
             param, loaded_weight, full_param_name, shard_id, global_expert_id
         )
-
-    @staticmethod
-    def _flush(entry: StagingEntry) -> None:
-        param, staging = entry.param, entry.staging
-        if staging.dtype != param.data.dtype:
-            param.data.view(torch.uint8).copy_(staging)
-        else:
-            param.data.copy_(staging)

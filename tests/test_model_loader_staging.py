@@ -24,7 +24,6 @@ import os
 import unittest
 from typing import ClassVar
 
-import pytest
 import torch
 from torch import nn
 
@@ -94,6 +93,8 @@ class FakeFusedMoE(nn.Module):
         self.w2_weight.weight_loader = self.weight_loader
         self.stage_calls = 0
         self.direct_calls = 0
+        self.flush_calls = 0
+        self.fast_path_flushes = 0
 
     # ── protocol the loader depends on ────────────────────────────────────
 
@@ -111,13 +112,37 @@ class FakeFusedMoE(nn.Module):
             ]
         )
 
-    def expected_batched_arrivals(self, param: nn.Parameter) -> int | None:
-        n_local_base = count_local_base_experts(
+    @property
+    def num_local_base_experts(self) -> int:
+        return count_local_base_experts(
             expert_map=self.expert_map,
             global_num_experts=self.global_num_experts,
             num_redundant_experts=self.num_redundant_experts,
             local_num_experts=self.local_num_experts,
+            num_fused_shared_experts=self.num_fused_shared_experts,
         )
+
+    def is_batched_expert_slot(self, local_expert_id: int) -> bool:
+        return local_expert_id < self.num_local_base_experts
+
+    def flush_staged(self, param, staging, filled) -> None:
+        self.flush_calls += 1
+        n_base = self.num_local_base_experts
+        if len(filled) == self.expected_batched_arrivals(param):
+            self.fast_path_flushes += 1
+            param.data[:n_base].copy_(staging[:n_base])
+        else:
+            for local_expert_id, shard_id in sorted(filled):
+                expert_region(param.data, local_expert_id, shard_id).copy_(
+                    expert_region(staging, local_expert_id, shard_id)
+                )
+        for slot in range(
+            n_base, self.local_num_experts - self.num_fused_shared_experts
+        ):
+            param.data[slot].zero_()
+
+    def expected_batched_arrivals(self, param: nn.Parameter) -> int | None:
+        n_local_base = self.num_local_base_experts
         if param is self.w13_weight:
             return n_local_base * 2
         if param is self.w2_weight:
@@ -371,17 +396,19 @@ class ExpertLoadingDifferentialTest(unittest.TestCase):
         (serial, batched), (_, batched_model) = self.run_pair(FakeMoEModel, shards)
         self.assert_same(serial, batched)
         self.assert_every_slot_written(batched)
-        # The batched run must actually have used staging, otherwise the
-        # differential assertion above is comparing two identical code paths.
-        self.assertGreater(sum(m.stage_calls for m in batched_model.moes()), 0)
+        # With threads=1 the staging path is dead code, so the comparison above
+        # only means something if the batched run really did batch -- and did so
+        # through the single-large-copy path staging exists for.
+        moes = batched_model.moes()
+        self.assertGreater(sum(m.stage_calls for m in moes), 0)
+        self.assertEqual(
+            sum(m.fast_path_flushes for m in moes),
+            2 * len(moes),
+            "every w13/w2 pair should have flushed via the complete-batch path",
+        )
 
     # ── (a) the reported bug ──────────────────────────────────────────────
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="routed experts bypass staging, so the staging entry for the "
-        "shared expert never reaches its arrival count",
-    )
     def test_fused_routed_checkpoint_with_separate_shared_expert(self):
         shards = fused_shards(self.NUM_LAYERS, self.NUM_ROUTED)
         (serial, batched), _ = self.run_pair(FusedCkptMoEModel, shards, fused=True)
@@ -390,10 +417,6 @@ class ExpertLoadingDifferentialTest(unittest.TestCase):
 
     # ── (g) shard read order must not matter ──────────────────────────────
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="same as the in-order case; read order is not what makes it fail",
-    )
     def test_shared_expert_shard_read_before_routed_shards(self):
         shards = fused_shards(self.NUM_LAYERS, self.NUM_ROUTED)
         (serial, batched), _ = self.run_pair(
@@ -404,11 +427,6 @@ class ExpertLoadingDifferentialTest(unittest.TestCase):
 
     # ── (c) expert parallelism ────────────────────────────────────────────
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="expected_batched_arrivals excludes the shared slot under EP but "
-        "the shared arrival is still staged, so the count overflows",
-    )
     def test_expert_parallel_with_fused_shared_expert(self):
         shards = per_expert_shards(self.NUM_LAYERS, self.NUM_ROUTED)
         (serial, batched), _ = self.run_pair(FakeMoEModel, shards, ep_size=2, ep_rank=0)
@@ -428,7 +446,9 @@ class ExpertLoadingDifferentialTest(unittest.TestCase):
             models.append(model)
         self.assert_same(*results)
         self.assert_every_slot_written(results[1])
-        self.assertGreater(sum(m.stage_calls for m in models[1].moes()), 0)
+        moes = models[1].moes()
+        self.assertGreater(sum(m.stage_calls for m in moes), 0)
+        self.assertEqual(sum(m.fast_path_flushes for m in moes), 2 * len(moes))
 
 
 class EPLBRedundantSlotTest(unittest.TestCase):

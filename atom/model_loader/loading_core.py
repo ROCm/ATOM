@@ -281,6 +281,11 @@ def load_weights_into_model(
                             if name_mapped not in params_dict:
                                 continue
 
+                            # Writes the routed experts straight into the fused
+                            # parameter, so the staging pool must not also own
+                            # it -- see ExpertStagingPool's ownership rule.
+                            staging_pool.decline(params_dict[name_mapped])
+
                             # Generic call - model provides implementation details
                             num_experts = getattr(
                                 hf_config, "n_routed_experts", 0
@@ -358,6 +363,9 @@ def load_weights_into_model(
                             except AttributeError:
                                 dropped_ckpt_keys.append((_orig_ckpt_name, fused_name))
                                 continue
+                            # Merged loader writes expert slots directly; same
+                            # ownership rule as the fused path above.
+                            staging_pool.decline(param)
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
@@ -399,11 +407,18 @@ def load_weights_into_model(
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        pending = staging_pool.take_pending()
-        if pending:
+        # Whatever the pool still holds is written back here; anything short of
+        # its expected region count means the checkpoint never delivered some
+        # routed base experts. The per-parameter check further down is too
+        # coarse to see this -- it only knows whether a parameter was touched
+        # at all -- so report it while the (slot, shard) detail is still around.
+        staging_report = staging_pool.flush_pending()
+        if staging_report.incomplete:
+            detail = "\n  ".join(staging_report.incomplete)
             raise RuntimeError(
-                f"Batched loader: {len(pending)} MoE param group(s) under-filled "
-                f"Set ATOM_LOADER_NUM_THREADS=1 to use the per-expert loader."
+                f"Batched loader: {len(staging_report.incomplete)} MoE "
+                f"parameter(s) did not receive every routed expert from the "
+                f"checkpoint:\n  {detail}"
             )
     finally:
         if executor is not None:
