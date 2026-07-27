@@ -10,7 +10,8 @@ means the rules can be unit-tested directly instead of only through a full
 `load_model` run.
 """
 
-from collections.abc import Iterable, Mapping
+import re
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -120,6 +121,101 @@ def shared_expert_prefixes(name: str, matching_name: str) -> tuple[str, str]:
         layer_prefix + matching_name.rstrip("."),
         layer_prefix + f"{module_prefix}experts",
     )
+
+
+@dataclass
+class CheckpointNameRewriter:
+    """Turns an on-disk tensor name into the parameter name it belongs to.
+
+    Nine model-declared rules applied in a fixed order; `rewrite` returns None
+    for a tensor this model does not want. Order matters and is not obvious --
+    the MTP filter has to run before `mtp_remap`, because a drafter checkpoint
+    remaps `mtp.*` onto names that no longer contain "mtp" -- so it lives in
+    one place rather than being spread through the loading loop.
+
+    `fuse_shared_expert(shared_prefix, routed_prefix) -> bool` is injected: the
+    real decision reads the quantization config, which would drag AITER into
+    this module and out of reach of the unit test gate.
+    """
+
+    weights_mapper: WeightsMapper | None = None
+    weights_mapping: Mapping[str, str] = field(default_factory=dict)
+    skip_weight_prefixes: Sequence[str] = ()
+    mtp_remap: Callable[[str], str | None] | None = None
+    spec_decode: bool = False
+    num_hidden_layers: int = 0
+    n_routed_experts: int | None = None
+    fuse_shared_expert: Callable[[str, str], bool] = lambda *_: False
+    disable_fused_shared_loading: bool = False
+
+    def rewrite(self, name: str) -> str | None:
+        name = self._apply_mapper(name)
+        if name is None:
+            return None
+        # Draft models remap ckpt-side `mtp.*` entries into params whose names
+        # do not themselves contain `mtp` (Qwen3.5 MTP rewrites `mtp.*` ->
+        # `model.*`), so gate only on `spec_decode`: dropping every `mtp` name
+        # first would discard the whole drafter checkpoint before the
+        # model-specific remap ever runs.
+        if "mtp" in name and not self.spec_decode:
+            return None
+        if name.endswith("kv_scale") or "inv_freq" in name:
+            return None
+        # Model-declared prefixes to ignore, e.g. the vision encoder of a
+        # multimodal checkpoint being served text-only.
+        if any(name.startswith(p) for p in self.skip_weight_prefixes):
+            return None
+        if self.spec_decode and self.mtp_remap is not None:
+            name = self.mtp_remap(name)
+            if name is None:
+                return None
+        for part, replacement in self.weights_mapping.items():
+            if part in name:
+                name = name.replace(part, replacement)
+        if "weight_scale_inv" in name:
+            name = name.replace("weight_scale_inv", "weight_scale")
+        if self._is_past_last_layer(name):
+            return None
+        return self._maybe_fuse_shared_expert(name)
+
+    # ── steps ─────────────────────────────────────────────────────────────
+
+    def _apply_mapper(self, name: str) -> str | None:
+        if self.weights_mapper is None:
+            return name
+        return self.weights_mapper._map_name(name)
+
+    def _is_past_last_layer(self, name: str) -> bool:
+        if not self.num_hidden_layers or self.spec_decode:
+            return False
+        match = re.search(r"model\.layers\.(\d+)\.", name)
+        return match is not None and int(match.group(1)) >= self.num_hidden_layers
+
+    def _maybe_fuse_shared_expert(self, name: str) -> str:
+        matching_name = have_shared_expert(name)
+        if matching_name is None:
+            return name
+        # Some models keep shared experts unfused (V4-Pro with FP4 routed vs
+        # FP8 shared, or DP + mori all2all); their shared weights must land on
+        # the standalone Expert module instead of the fused slot.
+        if self.disable_fused_shared_loading:
+            return name
+        if not self.fuse_shared_expert(*shared_expert_prefixes(name, matching_name)):
+            return name
+        if self.n_routed_experts is None:
+            raise AttributeError(
+                "Cannot remap shared expert weights without n_routed_experts, "
+                "num_local_experts, or num_experts on the model config."
+            )
+        # Keep the module-naming prefix (mlp. / ffn.) so the rewritten name
+        # matches this model's routed-expert parameter naming. The id follows
+        # the *logical* routed experts, matching
+        # `FusedMoE.make_expert_params_mapping`; FusedMoE translates it to a
+        # physical slot, which under EPLB also has to clear the replicas.
+        module_prefix = matching_name.split("shared_expert", 1)[0]
+        return name.replace(
+            matching_name, f"{module_prefix}experts.{self.n_routed_experts}."
+        )
 
 
 def extract_expert_target_and_id(name: str) -> tuple[str, int] | None:

@@ -12,7 +12,6 @@ AITER build, and `loader.py` imports AITER at module level.
 
 import concurrent.futures
 import logging
-import re
 from collections.abc import Callable, Iterable
 
 import torch
@@ -21,10 +20,9 @@ from transformers import AutoConfig
 
 from atom.model_loader.expert_staging import ExpertStagingPool
 from atom.model_loader.weight_names import (
+    CheckpointNameRewriter,
     WeightsMapper,
     extract_expert_target_and_id,
-    have_shared_expert,
-    shared_expert_prefixes,
 )
 from atom.utils import envs
 
@@ -57,8 +55,12 @@ def load_weights_into_model(
     - ``weights_iterator``       ``(path, disable_mmap) -> (name, tensor)``
     """
 
-    def should_fuse_shared_expert_weight(name: str, matching_name: str) -> bool:
-        return fuse_shared_expert(*shared_expert_prefixes(name, matching_name))
+    def _n_routed_experts() -> int | None:
+        return (
+            getattr(hf_config, "n_routed_experts", None)
+            or getattr(hf_config, "num_local_experts", None)
+            or getattr(hf_config, "num_experts", None)
+        )
 
     # need to record the loaded weight name for vllm load check
     # it is only used in plugin mode for vllm
@@ -82,6 +84,21 @@ def load_weights_into_model(
     # composed: weights_mapper applies first, then the legacy substring map.
     if weights_mapper is None:
         weights_mapper = getattr(model, "weights_mapper", None)
+    rewriter = CheckpointNameRewriter(
+        weights_mapper=weights_mapper,
+        weights_mapping=weights_mapping,
+        skip_weight_prefixes=skip_weight_prefixes,
+        mtp_remap=mtp_remap,
+        spec_decode=spec_decode,
+        num_hidden_layers=hf_config.num_hidden_layers,
+        n_routed_experts=_n_routed_experts(),
+        fuse_shared_expert=fuse_shared_expert,
+        # Stays False for models without the attribute (GLM4 etc.), so their
+        # fused-shared path is unchanged.
+        disable_fused_shared_loading=getattr(
+            model, "disable_fused_shared_loading", False
+        ),
+    )
     params_dict = dict(model.named_parameters())
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
     # Original code does O(N) scan of expert_mapping (768 entries) per tensor,
@@ -139,82 +156,12 @@ def load_weights_into_model(
     try:
         disable_mmap = envs.ATOM_DISABLE_MMAP
         for name, weight_tensor in weights_iterator(model_name_or_path, disable_mmap):
-            _orig_ckpt_name = name  # preserve for ckpt-side coverage report
-            if weights_mapper is not None:
-                mapped_name = weights_mapper._map_name(name)
-                if mapped_name is None:
-                    continue
-                name = mapped_name
             if load_dummy:
                 continue
-            # Draft models may remap ckpt-side `mtp.*` entries into params
-            # whose names do not themselves contain `mtp` (e.g. Qwen3.5 MTP
-            # rewrites `mtp.*` -> `model.*`). Gate only on `spec_decode`,
-            # otherwise we can drop the entire drafter checkpoint before the
-            # model-specific remap logic has a chance to run.
-            if "mtp" in name and not spec_decode:
+            _orig_ckpt_name = name  # preserve for ckpt-side coverage report
+            name = rewriter.rewrite(name)
+            if name is None:
                 continue
-            if name.endswith("kv_scale") or "inv_freq" in name:
-                continue
-            # Skip weights matching model-defined prefixes (e.g. vision encoder
-            # weights in multimodal checkpoints that are not needed for text-only
-            # inference).
-            if skip_weight_prefixes and any(
-                name.startswith(p) for p in skip_weight_prefixes
-            ):
-                continue
-            if spec_decode and mtp_remap is not None:
-                remapped = mtp_remap(name)
-                if remapped is None:
-                    continue
-                name = remapped
-            for mapping_part in weights_mapping:
-                if mapping_part in name:
-                    name = name.replace(mapping_part, weights_mapping[mapping_part])
-            if "weight_scale_inv" in name:
-                name = name.replace("weight_scale_inv", "weight_scale")
-
-            layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
-            layerId = int(layerId_.group(1)) if layerId_ else 0
-            if (
-                hf_config.num_hidden_layers
-                and layerId >= hf_config.num_hidden_layers
-                and not spec_decode
-            ):
-                continue
-            maybe_matching_name = have_shared_expert(name)
-            if (
-                maybe_matching_name is not None
-                # When the model keeps shared experts unfused (e.g. V4-Pro with
-                # FP4 routed vs FP8 shared, or DP + mori all2all), do NOT rewrite
-                # the shared weights into the fused slot — they must load into the
-                # standalone Expert module. Stays True for models without this
-                # attr (GLM4 etc.) so their fused-shared path is unchanged.
-                and not getattr(model, "disable_fused_shared_loading", False)
-                and should_fuse_shared_expert_weight(name, maybe_matching_name)
-            ):
-                # Preserve the module-naming prefix (mlp. / ffn.) so the rewritten
-                # name matches this model's routed-expert param naming.
-                module_prefix = maybe_matching_name.split("shared_expert", 1)[0]
-                # Numbered right after the *logical* routed experts, matching
-                # `FusedMoE.make_expert_params_mapping`. `FusedMoE` translates
-                # this to a physical slot, which under EPLB also has to clear
-                # the redundant replicas.
-                n_routed_experts = (
-                    getattr(hf_config, "n_routed_experts", None)
-                    or getattr(hf_config, "num_local_experts", None)
-                    or getattr(hf_config, "num_experts", None)
-                )
-                if n_routed_experts is None:
-                    raise AttributeError(
-                        "Cannot remap shared expert weights without "
-                        "n_routed_experts, num_local_experts, or num_experts "
-                        "on the model config."
-                    )
-                name = name.replace(
-                    maybe_matching_name,
-                    f"{module_prefix}experts.{n_routed_experts}.",
-                )
             for k in packed_modules_mapping:
                 # We handle the experts below in expert_params_mapping
                 if (
