@@ -19,10 +19,10 @@ from torch import nn
 from transformers import AutoConfig
 
 from atom.model_loader.expert_staging import ExpertStagingPool
+from atom.model_loader.weight_dispatch import WeightDispatcher
 from atom.model_loader.weight_names import (
     CheckpointNameRewriter,
     WeightsMapper,
-    extract_expert_target_and_id,
 )
 from atom.utils import envs
 
@@ -64,7 +64,6 @@ def load_weights_into_model(
 
     # need to record the loaded weight name for vllm load check
     # it is only used in plugin mode for vllm
-    loaded_weights_record: set[str] = set()
 
     # Auto-detect weight mapper from model if not provided explicitly
     if weights_mapper is None:
@@ -118,16 +117,6 @@ def load_weights_into_model(
         expert_weight_prefixes = sorted(expert_index.keys(), key=len, reverse=True)
 
     # Get fused expert mapping from model if it provides one
-    is_fused_expert = False
-    fused_expert_params_mapping = []
-    detect_fused_expert_fn = getattr(model, "detect_fused_expert_format", None)
-    get_fused_expert_mapping_fn = getattr(model, "get_fused_expert_mapping", None)
-
-    # Track ckpt names that were silently dropped at `get_parameter`
-    # AttributeError sites — these indicate weights_mapping bugs where the
-    # rewritten name doesn't correspond to any model param. (orig, mapped) pairs.
-    dropped_ckpt_keys: list[tuple[str, str]] = []
-
     moe_module_cache: dict = {}
 
     def _lookup_moe_module(full_param_name: str):
@@ -153,6 +142,25 @@ def load_weights_into_model(
         else:
             fn(*args)
 
+    dispatcher = WeightDispatcher(
+        model=model,
+        params_dict=params_dict,
+        hf_config=hf_config,
+        prefix=prefix,
+        spec_decode=spec_decode,
+        submit=_submit,
+        staging_pool=staging_pool,
+        batching_enabled=executor is not None,
+        default_weight_loader=default_weight_loader,
+        packed_modules_mapping=packed_modules_mapping,
+        expert_index=expert_index,
+        expert_weight_prefixes=expert_weight_prefixes,
+        has_expert_mapping=has_expert_mapping,
+        detect_fused_expert_fn=getattr(model, "detect_fused_expert_format", None),
+        get_fused_expert_mapping_fn=getattr(model, "get_fused_expert_mapping", None),
+        load_fused_expert_weights_fn=load_fused_expert_weights_fn,
+    )
+
     try:
         disable_mmap = envs.ATOM_DISABLE_MMAP
         for name, weight_tensor in weights_iterator(model_name_or_path, disable_mmap):
@@ -162,197 +170,15 @@ def load_weights_into_model(
             name = rewriter.rewrite(name)
             if name is None:
                 continue
-            for k in packed_modules_mapping:
-                # We handle the experts below in expert_params_mapping
-                if (
-                    "mlp.experts." in name
-                    or "ffn.experts." in name
-                    or "block_sparse_moe.experts." in name
-                ) and name not in params_dict:
-                    continue
-                if k in name:
-                    packed_value = packed_modules_mapping[k]
-                    # Handle both tuple (fuse parameter) and list (shard parameter)
-                    if isinstance(packed_value, list):
-                        # Checkpoint has fused weight, split into separate params
-                        for shard_idx, target_name in enumerate(packed_value):
-                            param_name = name.replace(k, target_name)
-                            if "output_scale" not in param_name:
-                                try:
-                                    param = model.get_parameter(param_name)
-                                except AttributeError:
-                                    dropped_ckpt_keys.append(
-                                        (_orig_ckpt_name, param_name)
-                                    )
-                                    continue
-                                weight_loader = param.weight_loader
-                                _submit(weight_loader, param, weight_tensor, shard_idx)
-                                loaded_weights_record.add(prefix + param_name)
-                    else:
-                        # Checkpoint has separate weights, load into fused param
-                        v, shard_id = packed_value
-                        param_name = name.replace(k, v)
-                        # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
-                        if "output_scale" not in param_name:
-                            try:
-                                param = model.get_parameter(param_name)
-                            except AttributeError:
-                                dropped_ckpt_keys.append((_orig_ckpt_name, param_name))
-                                break
-                            weight_loader = param.weight_loader
-                            _submit(weight_loader, param, weight_tensor, shard_id)
-                            loaded_weights_record.add(prefix + param_name)
-                    break
-            else:
-                # Detect fused expert format if model provides detection function
-                if detect_fused_expert_fn is not None and not is_fused_expert:
-                    is_fused_expert = detect_fused_expert_fn(name)
-                    if is_fused_expert and get_fused_expert_mapping_fn is not None:
-                        fused_expert_params_mapping = get_fused_expert_mapping_fn()
-
-                # Check if model has expert mapping before processing
-                if has_expert_mapping:
-                    # Handle fused expert format
-                    # Model-specific detection and handling via callback functions
-                    if (
-                        is_fused_expert
-                        and load_fused_expert_weights_fn is not None
-                        and fused_expert_params_mapping
-                    ):
-                        matched = False
-                        for mapping_entry in fused_expert_params_mapping:
-                            param_name, weight_name, shard_id = mapping_entry[:3]
-                            if weight_name not in name:
-                                continue
-                            name_mapped = name.replace(weight_name, param_name)
-                            if name_mapped not in params_dict:
-                                continue
-
-                            # Writes the routed experts straight into the fused
-                            # parameter, so the staging pool must not also own
-                            # it -- see ExpertStagingPool's ownership rule.
-                            staging_pool.decline(params_dict[name_mapped])
-
-                            # Generic call - model provides implementation details
-                            num_experts = getattr(
-                                hf_config, "n_routed_experts", 0
-                            ) or getattr(hf_config, "num_experts", 0)
-                            matched = load_fused_expert_weights_fn(
-                                name,  # Original checkpoint name
-                                name_mapped,  # Mapped parameter name
-                                params_dict,
-                                weight_tensor,
-                                shard_id,
-                                num_experts,
-                            )
-
-                            if matched:
-                                loaded_weights_record.add(prefix + name)
-                                break
-
-                        if matched:
-                            continue
-
-                    matched = False
-                    for wm_name in expert_weight_prefixes:
-                        if wm_name not in name:
-                            continue
-                        pm_name, expert_id, shard_id = expert_index[wm_name]
-                        name = name.replace(wm_name, pm_name)
-                        if (
-                            name.endswith((".bias", "_bias"))
-                            and name not in params_dict
-                        ):
-                            matched = True
-                            break
-                        if "mtp" in name and not spec_decode:
-                            matched = True
-                            break
-                        param = params_dict.get(name)
-                        if param is None:
-                            # Parameter absent from model (e.g. weight scales for
-                            # an unquantized drafter MTP block); skip silently.
-                            matched = True
-                            break
-                        if executor is not None and staging_pool.is_batchable(
-                            param, name
-                        ):
-                            _submit(
-                                staging_pool.stage,
-                                param,
-                                name,
-                                shard_id,
-                                expert_id,
-                                weight_tensor,
-                            )
-                            loaded_weights_record.add(prefix + name)
-                            matched = True
-                            break
-                        weight_loader = param.weight_loader
-                        _submit(
-                            weight_loader,
-                            param,
-                            weight_tensor,
-                            name,
-                            shard_id,
-                            expert_id,
-                        )
-                        loaded_weights_record.add(prefix + name)
-                        matched = True
-                        break
-                    if not matched:
-                        if "mtp" in name and not spec_decode:
-                            continue
-                        if merged_target := extract_expert_target_and_id(name):
-                            fused_name, expert_id = merged_target
-                            try:
-                                param = model.get_parameter(fused_name)
-                            except AttributeError:
-                                dropped_ckpt_keys.append((_orig_ckpt_name, fused_name))
-                                continue
-                            # Merged loader writes expert slots directly; same
-                            # ownership rule as the fused path above.
-                            staging_pool.decline(param)
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            _submit(
-                                weight_loader,
-                                param,
-                                weight_tensor,
-                                "",  # use merged moe loader
-                                "",
-                                expert_id,
-                            )
-                            loaded_weights_record.add(prefix + fused_name)
-                            continue
-                        try:
-                            param = model.get_parameter(name)
-                        except AttributeError:
-                            dropped_ckpt_keys.append((_orig_ckpt_name, name))
-                            continue
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        _submit(weight_loader, param, weight_tensor)
-                        loaded_weights_record.add(prefix + name)
-                else:
-                    # Model doesn't have expert mapping, use generic loading
-                    try:
-                        param = model.get_parameter(name)
-                    except AttributeError:
-                        dropped_ckpt_keys.append((_orig_ckpt_name, name))
-                        continue
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    _submit(weight_loader, param, weight_tensor)
-                    loaded_weights_record.add(prefix + name)
+            dispatcher.dispatch(_orig_ckpt_name, name, weight_tensor)
 
         if executor is not None:
             # Drain all tasks (surfacing errors) before the safety flush.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+
+        loaded_weights_record = dispatcher.loaded_weights_record
+        dropped_ckpt_keys = dispatcher.dropped_ckpt_keys
 
         # Whatever the pool still holds is written back here; anything short of
         # its expected region count means the checkpoint never delivered some
