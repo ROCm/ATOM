@@ -13,6 +13,11 @@ LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
+# Temporary backport: SGLang v0.5.15.post1, the latest release at the time of
+# this change, does not include the upstream Cohere2MoeConfig dataclass fix.
+# Remove this patch once SGLANG_REF includes:
+# https://github.com/sgl-project/sglang/commit/6a4ffcc34aae336e712792b1bbcbd142ba7114eb
+# Tracking issue: https://github.com/sgl-project/sglang/issues/28233
 COPY docker/patches/sglang/cohere2-moe-drop-invalid-hf-strict.patch /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
