@@ -338,12 +338,58 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         if self.speculative_config.method == "eagle3":
-            load_model(
+            loaded = load_model(
                 self.model,
                 self.speculative_config.model,
                 self.speculative_config.draft_model_hf_config,
                 self.config.load_dummy,
                 False,
+            )
+            # Eagle3 checkpoints may omit the embedding matrix (e.g. NVIDIA's
+            # LlamaForCausalLMEagle3 speculators share the target tokenizer).
+            # Share embed_tokens/lm_head from the target when the draft didn't
+            # load them, so the draft can run without needing extra weights.
+            target_base = getattr(target_model, "language_model", target_model)
+            target_embed = getattr(
+                getattr(target_base, "model", None), "embed_tokens", None
+            )
+            # Only share the target embed_tokens when the target actually owns a
+            # real embedding on this rank. With pipeline parallelism, ranks other
+            # than the first may hold a PPMissingLayer placeholder instead of the
+            # actual embedding, and using that would break the draft.
+            if (
+                get_pp_group().world_size == 1
+                and target_embed is not None
+                and hasattr(target_embed, "weight")
+                and getattr(self.model, "embed_tokens", None) is not None
+                and hasattr(self.model.embed_tokens, "weight")
+                and self.model.embed_tokens.weight.shape == target_embed.weight.shape
+            ):
+                self._share_if_not_loaded(
+                    self.model,
+                    "embed_tokens",
+                    target_embed,
+                    loaded,
+                    "embed_tokens.weight",
+                    "Eagle3 embed_tokens",
+                )
+            if (
+                "embed_tokens.weight" not in loaded
+                and getattr(self.model, "embed_tokens", None) is not target_embed
+            ):
+                raise RuntimeError(
+                    "Eagle3 draft checkpoint is missing embed_tokens.weight, but "
+                    "ATOM could not share the target embedding on this rank "
+                    "(requires PP=1 and matching embed_tokens shapes; for TP>1 you "
+                    "may need ATOM_EAGLE_REPLICATE_EMBED=0)."
+                )
+            self._share_if_not_loaded(
+                self.model,
+                "lm_head",
+                target_base.lm_head,
+                loaded,
+                "lm_head.weight",
+                "Eagle3 lm_head",
             )
             logger.info(
                 "Eagle3 draft model loaded from %s (independent embed/lm_head)",

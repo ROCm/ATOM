@@ -114,6 +114,9 @@ class Eagle3LlamaAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             is_neox_style=True,
+            dtype=getattr(config, "dtype", None) or torch.bfloat16,
+            rope_scaling=getattr(config, "rope_parameters", None)
+            or getattr(config, "rope_scaling", None),
         )
 
         sliding_window = -1
@@ -334,6 +337,7 @@ class Eagle3LlamaModel(nn.Module):
         self.target_hidden_size = target_hidden_size
         self.num_aux_hidden_states = num_aux
         self.norm_output = getattr(config, "norm_output", False)
+        self.norm_before_fc = getattr(config, "norm_before_fc", False)
 
         # Independent embedding (vocab matches target model). The draft embed is
         # NOT shared with the (still TP-sharded) lm_head, so it can be replicated
@@ -366,6 +370,13 @@ class Eagle3LlamaModel(nn.Module):
             )
         else:
             self.fc_norm = None
+
+        if self.norm_before_fc:
+            self.input_norm = RMSNorm(
+                target_hidden_size * num_aux, eps=config.rms_norm_eps
+            )
+        else:
+            self.input_norm = None
 
         # Draft attention layer_num must start from the target model's layer
         # count so kv_cache_data["layer_N"] maps to the correct cache entry.
@@ -412,6 +423,8 @@ class Eagle3LlamaModel(nn.Module):
                 )
             else:
                 fc_in = aux_hidden_states
+            if self.input_norm is not None:
+                fc_in = self.input_norm(fc_in)
             return self.fc(fc_in)
 
         # fc_norm path: per-group RMSNorm, then fc. Use the single-launch fused
@@ -419,6 +432,8 @@ class Eagle3LlamaModel(nn.Module):
         # + concat; fall back to the torch path only when the fused kernel's
         # preconditions don't hold (non-CUDA / non-contiguous / shape mismatch).
         x = torch.cat(aux_hidden_states, dim=-1) if is_list else aux_hidden_states
+        if self.input_norm is not None:
+            x = self.input_norm(x)
         if (
             x.is_cuda
             and x.is_contiguous()
@@ -431,11 +446,7 @@ class Eagle3LlamaModel(nn.Module):
                 self.num_aux_hidden_states,
             )
         else:
-            chunks = (
-                aux_hidden_states
-                if is_list
-                else x.chunk(self.num_aux_hidden_states, dim=-1)
-            )
+            chunks = x.chunk(self.num_aux_hidden_states, dim=-1)
             fc_in = torch.cat(
                 [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
                 dim=-1,

@@ -41,6 +41,28 @@ Tips on server configuration:
 - DP attention + EP mode does not require `--trust-remote-code` since ATOM has built-in `GptOssForCausalLM`.
 - Sliding window attention is applied on even-indexed layers automatically.
 
+### Eagle3 Speculative Decoding
+
+GPT-OSS-120B can use NVIDIA's Eagle3 draft models for lossless throughput gains:
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model openai/gpt-oss-120b \
+  --kv_cache_dtype fp8 \
+  --gpu-memory-utilization 0.5 \
+  --method eagle3 \
+  --num-speculative-tokens 1 \
+  --draft-model nvidia/gpt-oss-120b-Eagle3-throughput
+```
+
+Example draft models:
+- `nvidia/gpt-oss-120b-Eagle3-throughput` — throughput-optimized Eagle3 draft
+- `nvidia/gpt-oss-120b-Eagle3-short-context` — short-context Eagle3 draft
+
+When the draft checkpoint omits these weights, ATOM shares the target `lm_head`, and can
+share `embed_tokens` when running without pipeline parallelism and with compatible sharding
+(e.g. TP=1 or `ATOM_EAGLE_REPLICATE_EMBED=0`).
+
 ## Performance baseline
 
 The following script can be used to benchmark the performance:
