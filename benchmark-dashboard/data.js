@@ -1,42 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785139502576,
+  "lastUpdate": 1785142614731,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Lingpeng Jin",
-            "username": "valarLip",
-            "email": "103567126+valarLip@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "b966bedcad09ef3a426a5cc39751cf0ef75cd88f",
-          "message": "feat: set process titles for engine/worker processes (#1482)\n\nAdopt vLLM's set_process_title approach so GPU-holding processes are\ndistinguishable in ps/top/rocm-smi instead of all showing as \"python\".\n\n- Add set_process_title(name, suffix, prefix) util in atom/utils (soft\n  dependency on setproctitle; no-op if not installed)\n- Add ATOM_PROCESS_NAME_PREFIX env (default \"ATOM\")\n- EngineCore process -> ATOM::EngineCore (ATOM::EngineCore_DP{n} when DP>1)\n- Each GPU worker -> ATOM::TP{rank} (ATOM::DP{d}TP{rank} when DP>1)\n- Add setproctitle to dependencies",
-          "timestamp": "2026-07-06T14:08:33Z",
-          "url": "https://github.com/ROCm/ATOM/commit/b966bedcad09ef3a426a5cc39751cf0ef75cd88f"
-        },
-        "date": 1783347583191,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8332,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28782864301 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.12-nightly_20260705 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8211 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8863,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28782864301 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.12-nightly_20260705 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8666 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -353784,6 +353750,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8817,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30243488264 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202607241525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.4139 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "haoyangli0109",
+            "username": "haoyangli0109",
+            "email": "lihaoyang0109@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "e5fa9973368a201540f6a09eb2685be8fdabc221",
+          "message": "[Doc] Add explanations for online quantization and offline quantization (#1692)\n\n* wip\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n* update\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n---------\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>",
+          "timestamp": "2026-07-27T06:40:09Z",
+          "url": "https://github.com/ROCm/ATOM/commit/e5fa9973368a201540f6a09eb2685be8fdabc221"
+        },
+        "date": 1785142589412,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3-32B-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.8802,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30210184655 | Threshold: 0.8 | BaselineModel: Qwen/Qwen3-32B-FP8 | BaselineNote: Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output. | Docker: rocm/atom-dev:sglang-v0.5.12-nightly_20260723 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8992 | fewshot: 3 | Model: /models/Qwen/Qwen3-32B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 accuracy (GSM8K)",
+            "value": 0.8506,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30210184655 | Threshold: 0.76 | BaselineModel: amd/Qwen3.5-35B-A3B-PTPC-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.12-nightly_20260723 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.837 | fewshot: 3 | Model: /models/amd/Qwen3.5-35B-A3B-PTPC-FP8"
           }
         ]
       }
