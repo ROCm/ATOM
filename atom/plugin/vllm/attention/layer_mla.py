@@ -73,7 +73,7 @@ if use_triton_gemm():
 # reorg_kvcache lives in atom.model_ops.dcp_ops so both the plugin and the
 # server-mode MLA path share one implementation (server must not import from
 # the plugin/vLLM tree). Re-exported here to keep the original call sites.
-from atom.model_ops.dcp_ops import reorg_kvcache  # noqa: E402,F401
+from atom.model_ops.dcp_ops import reorg_kvcache
 
 
 @triton.jit

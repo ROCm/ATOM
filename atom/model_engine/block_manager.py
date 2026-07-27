@@ -61,7 +61,7 @@ class BlockManager:
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
+        self.hash_to_block_id: dict[int, int] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.free_block_ids_set: set[int] = set(range(num_blocks))
         self.used_block_ids: set[int] = set()

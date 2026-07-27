@@ -9,13 +9,13 @@ from typing import List, Optional, Type
 import numpy as np
 import torch
 import triton
-from atom.utils import envs
 from aiter import (
     decode_update_mla_metadata_v1,
     dtypes,
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -26,7 +26,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
@@ -86,8 +86,8 @@ class MLAChunkContextMetadata:
     v_workspace: torch.Tensor
     # Block-granular CSR per chunk for the shuffled-KV gather (block_size=64
     # blocks instead of token slots). None for the plain token-slot layout.
-    shuffle_kv_block_indptr: Optional[List[torch.Tensor]] = None
-    shuffle_kv_block_indices: Optional[List[torch.Tensor]] = None
+    shuffle_kv_block_indptr: list[torch.Tensor] | None = None
+    shuffle_kv_block_indices: list[torch.Tensor] | None = None
     # --- DCP (Decode Context Parallel) prefill fields ---
     # Present only when dcp_world_size > 1. The cached context KV is sharded
     # (interleaved) across DCP ranks, so per chunk each rank gathers its local
@@ -98,17 +98,17 @@ class MLAChunkContextMetadata:
     # Per chunk: absolute slot ids of this rank's local cached tokens, laid out
     # per-seq contiguous and padded to `padded_local_chunk_seq_lens` (so every
     # rank's AllGather block has identical `seq_tot` tokens).
-    local_slot_ids: Optional[List[torch.Tensor]] = None
+    local_slot_ids: list[torch.Tensor] | None = None
     # Per chunk: per-seq padded local chunk length (list[list[int]]).
-    padded_local_chunk_seq_lens: Optional[List[List[int]]] = None
+    padded_local_chunk_seq_lens: list[list[int]] | None = None
     # Per seq: real local context length on each rank (list[list[int]]), shared
     # across chunks; used by reorg to drop padding.
-    local_context_lens_allranks: Optional[List[List[int]]] = None
+    local_context_lens_allranks: list[list[int]] | None = None
     # Per chunk: number of local tokens per rank in the AllGather block (== sum
     # of that chunk's padded_local_chunk_seq_lens).
-    seq_tot: Optional[List[int]] = None
+    seq_tot: list[int] | None = None
     # Local padded max context chunk size (local tokens per seq per chunk).
-    chunk_size: Optional[int] = None
+    chunk_size: int | None = None
 
 
 def cdiv(a, b):
@@ -1151,7 +1151,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def _build_mla_chunk_meta_dcp(
         self, batch: ScheduledBatch, bs: int
-    ) -> Optional[MLAChunkContextMetadata]:
+    ) -> MLAChunkContextMetadata | None:
         """DCP variant of `_build_mla_chunk_meta` (compressed-KV AllGather).
 
         The cached context is interleaved across DCP ranks: global token `g`
@@ -1209,11 +1209,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         block_tables = batch.block_tables
 
-        local_slot_ids_list: List[torch.Tensor] = []
-        cu_seqlens_k_list: List[torch.Tensor] = []
-        padded_local_chunk_seq_lens_list: List[List[int]] = []
-        seq_tot_list: List[int] = []
-        max_seqlen_k_list: List[int] = []
+        local_slot_ids_list: list[torch.Tensor] = []
+        cu_seqlens_k_list: list[torch.Tensor] = []
+        padded_local_chunk_seq_lens_list: list[list[int]] = []
+        seq_tot_list: list[int] = []
+        max_seqlen_k_list: list[int] = []
 
         for c in range(num_chunks):
             c_lo = c * chunk_size
@@ -1240,7 +1240,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             seq_tot_list.append(int(plc.sum()))
 
             # This rank's local slot ids for the chunk, per-seq padded to plc[i].
-            slot_segments: List[np.ndarray] = []
+            slot_segments: list[np.ndarray] = []
             for i in range(bs):
                 n = int(plc[i])
                 if n == 0:

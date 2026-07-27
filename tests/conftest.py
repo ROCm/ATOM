@@ -169,25 +169,25 @@ class MockConfig:
     """
 
     def __init__(self, **overrides):
-        defaults = dict(
-            kv_cache_block_size=4,
-            num_kvcache_blocks=10,
-            enable_prefix_caching=False,
-            enable_chunked_prefill=True,
-            max_num_seqs=4,
-            max_num_batched_tokens=64,
-            long_prefill_token_threshold=0,
-            decode_context_parallel_size=1,
-            max_model_len=64,
-            bos_token_id=1,
-            eos_token_id=2,
-            stop_token_ids=[],
-            scheduler_delay_factor=0.0,
-            speculative_config=None,
+        defaults = {
+            "kv_cache_block_size": 4,
+            "num_kvcache_blocks": 10,
+            "enable_prefix_caching": False,
+            "enable_chunked_prefill": True,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 64,
+            "long_prefill_token_threshold": 0,
+            "decode_context_parallel_size": 1,
+            "max_model_len": 64,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "stop_token_ids": [],
+            "scheduler_delay_factor": 0.0,
+            "speculative_config": None,
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
-            hf_config=_MockHFConfig(),
-        )
+            "hf_config": _MockHFConfig(),
+        }
         defaults.update(overrides)
         for k, v in defaults.items():
             setattr(self, k, v)

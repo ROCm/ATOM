@@ -11,18 +11,19 @@ if TYPE_CHECKING:
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
+from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.tbo.ubatch_splitting import (
     UBatchSlice,
     attach_tbo_cpu_lens,
     split_attn_metadata,
 )
 from atom.utils.tbo.ubatching import tbo_enabled
-from atom.utils.forward_context import AttentionMetaData, AttnState
-from torch import nn
 
 logger = logging.getLogger("atom")
 T = TypeVar("T", bound="BroadcastableModelInput")

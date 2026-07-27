@@ -34,11 +34,13 @@ from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
 )
-from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
 )
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
+from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
+from torch import nn
+
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import (
     get_dcp_group,
@@ -59,9 +61,8 @@ from atom.utils.forward_context import (
     ForwardContext,
     get_forward_context,
 )
-from torch import nn
 
-from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
+from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 
@@ -160,6 +161,7 @@ def _maybe_view_mxfp4_weight_for_gather(
 if is_rocm_aiter_fp4bmm_enabled():
     # from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import  batched_gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+
     from atom.model_ops.utils import quark_post_load_weights
 
 
@@ -669,8 +671,8 @@ class MLAAttention(nn.Module):
         )
 
         # Step 2: chunked cached-prefix attention.
-        chunked_out: Optional[torch.Tensor] = None
-        chunked_lse: Optional[torch.Tensor] = None
+        chunked_out: torch.Tensor | None = None
+        chunked_lse: torch.Tensor | None = None
         if getattr(chunk_meta, "is_dcp", False):
             # DCP: the cached context KV is sharded (interleaved) across ranks,
             # so the per-chunk gather becomes gather-local -> AllGather ->
@@ -774,8 +776,8 @@ class MLAAttention(nn.Module):
 
         is_fp8_kv = self.kv_cache_dtype.startswith("fp8")
 
-        chunked_out: Optional[torch.Tensor] = None
-        chunked_lse: Optional[torch.Tensor] = None
+        chunked_out: torch.Tensor | None = None
+        chunked_lse: torch.Tensor | None = None
         for c in range(chunk_meta.num_chunks):
             toks = chunk_meta.seq_tot[c]
             if toks == 0:
