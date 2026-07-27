@@ -1,4 +1,4 @@
-# Online Quantization Guide
+# Online quantization guide
 
 ATOM can quantize or re-quantize model weights while loading them by passing
 `--online_quant_config` to the engine. The source checkpoint stays on disk
@@ -8,11 +8,9 @@ right after the loader finishes copying tensors.
 This guide covers when to use online quantization, the full configuration
 syntax, ready-to-run recipes for the most common model families, how to verify
 the result, and troubleshooting tips. For the dataclass-level field reference,
-see [`configuration_guide.md` § 3.7](./configuration_guide.md#37-online-quantization-at-load-time).
+see [`configuration_guide.md` § Online quantization at load time](./configuration_guide.md#online-quantization-at-load-time).
 
----
-
-## 1. When to use online quantization
+## When to use online quantization
 
 Use online quantization when one of the following holds:
 
@@ -40,9 +38,7 @@ is one of:
 | `fp8` (block FP8, `QuantType.per_1x128`) | FP8 block weights are dequantized to BF16 first, then re-quantized. |
 | `mxfp4` | **Not re-quantized.** Source MXFP4 weights are currently passed through unchanged — there is no dequant path for `per_1x32`, so the requested target format does not take effect on these layers. |
 
----
-
-## 2. Configuration syntax
+## Configuration syntax
 
 The flag accepts a single JSON object with three optional fields:
 
@@ -67,7 +63,7 @@ Resolution order for a given layer name:
 3. Otherwise, fall back to `global_quant_config`.
 4. If `global_quant_config` is also empty, the layer keeps its source format.
 
-### 2.1 Target formats
+### Target formats
 
 The target formats below are currently supported. Any other string (for example
 `ptpc_i8`, `mxi4`, `mxfp8`) will be rejected by the JSON parser or trigger an
@@ -85,7 +81,7 @@ scale of shape `(N//128, K//128)` and the activation uses a 1×128 (along K)
 scale, consumed by the block-scale GEMM. `per_block_fp8` and `per_block128_fp8`
 are equivalent (128 is the default block size).
 
-### 2.2 Picking the right pattern
+### Picking the right pattern
 
 ATOM's resolver runs against the **fully-qualified layer name** as reported by
 `model.named_modules()`. Useful patterns:
@@ -97,9 +93,7 @@ ATOM's resolver runs against the **fully-qualified layer name** as reported by
 | `"lm_head"` | Output projection | Always exclude — kept at source precision avoids logit-distribution shift. |
 | `"*shared_expert*"` | Shared experts in DeepSeek / Qwen3 MoE | Keep at higher precision if you see accuracy regressions. |
 
----
-
-## 3. Recipes
+## Recipes
 
 The four recipes below are the configurations validated in
 [ROCm/ATOM#653](https://github.com/ROCm/ATOM/pull/653). Each has been A/B
@@ -109,7 +103,7 @@ ISL=1024 / OSL=1024 / concurrency=128 throughput.
 All commands assume you are inside the standard ATOM container
 (`docker pull rocm/atom:latest`).
 
-### 3.1 Qwen3-30B-A3B-Thinking-2507 — full per-token FP8
+### Qwen3-30B-A3B-Thinking-2507 — full per-token FP8
 
 BF16 source → every Linear and the fused expert module quantized to
 `ptpc_fp8`. The matching offline checkpoint is
@@ -125,7 +119,7 @@ python -m atom.entrypoints.openai_server \
   }'
 ```
 
-### 3.2 Qwen3-235B-A22B-Instruct-2507 — full MXFP4
+### Qwen3-235B-A22B-Instruct-2507 — full MXFP4
 
 BF16 source → every Linear (including experts) quantized to `mxfp4`, served
 with expert parallel.
@@ -140,7 +134,7 @@ python -m atom.entrypoints.openai_server \
   }'
 ```
 
-### 3.3 DeepSeek-R1-0528 — FP8 attention + MXFP4 experts
+### DeepSeek-R1-0528 — FP8 attention + MXFP4 experts
 
 FP8 source → non-expert Linear stays at `ptpc_fp8`, fused MoE experts are
 downgraded to `mxfp4`. The matching offline checkpoint layout is
@@ -161,7 +155,7 @@ python -m atom.entrypoints.openai_server \
 reproduction. Drop it to get full CUDA-graph throughput; it does not affect
 the online quantization output.
 
-### 3.4 DeepSeek-R1-0528 + MTP-3 — FP8 attention + MXFP4 experts
+### DeepSeek-R1-0528 + MTP-3 — FP8 attention + MXFP4 experts
 
 Same online quantization recipe as § 3.3, layered with MTP-3 speculative
 decoding for ~2.5× lower TPOT.
@@ -182,7 +176,7 @@ python -m atom.entrypoints.openai_server \
 quantization — it can be added to any of the recipes above without changing
 the `--online_quant_config` JSON.
 
-### 3.5 Qwen3-30B-A3B-Thinking-2507 — full per-block FP8
+### Qwen3-30B-A3B-Thinking-2507 — full per-block FP8
 
 BF16 source → every Linear and the fused expert module quantized to
 `per_block_fp8` (DeepSeek-style 128×128 block scale).
@@ -201,7 +195,8 @@ python -m atom.entrypoints.openai_server \
 it is a good drop-in when you want FP8 accuracy closer to the block-scaled
 checkpoint than per-token `ptpc_fp8`.
 
-### 3.6 Plugin mode (`vllm serve`)
+(plugin-mode-vllm-serve)=
+### Plugin mode (`vllm serve`)
 
 In the [vLLM out-of-tree plugin backend](vllm_plugin_backend_guide.md) you launch
 with `vllm serve`, whose CLI does not understand ATOM's `--online_quant_config`
@@ -209,7 +204,8 @@ flag. Instead, pass the **same JSON object** through vLLM's official plugin
 escape hatch `--additional-config`, under the `online_quant_config` key. ATOM
 reads it during the vLLM→ATOM config translation and routes it through the
 identical load-time quantization path (`process_weights_after_loading`),
-including the `online_quant_info_*.json` dump described in § 4.
+including the `online_quant_info_*.json` dump described in
+[Verifying the result](#verifying-the-result).
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-R1-0528 \
@@ -229,9 +225,7 @@ leaves weights at their source precision. As with the standalone flag, online
 quantization only activates when the source checkpoint's `quant_method` is
 unquantized or per-block FP8 (see § 1).
 
----
-
-## 4. Verifying the result
+## Verifying the result
 
 When online quantization runs, rank 0 writes
 `online_quant_info_<timestamp>_<ns>.json` to:
@@ -286,21 +280,19 @@ Things to check:
 
 The runtime also logs a one-line summary in the server log:
 
-```
+```text
 Weight post-processing done: 2.34 seconds, 144 layers online-quantized
 Online quantization info saved to /root/online_quant_info_20260525_033839_112444436.json
 ```
 
----
+## Notes and gotchas
 
-## 5. Notes and gotchas
-
-### 5.1 When online quantization activates
+### When online quantization activates
 
 `--online_quant_config` is only applied when the source checkpoint's
 `quant_method` is unquantized or per-block FP8 (see § 1).
 
-### 5.2 Tensor-parallel behavior
+### Tensor-parallel behavior
 
 Tensor-parallel weights are gathered onto a single rank before quantization
 **only** when local quantization would produce different scales than quantizing
@@ -316,14 +308,14 @@ the full unpartitioned weight. Concretely:
 If load time grows linearly with TP size, your recipe is hitting the gather
 path.
 
-### 5.3 Only Linear and fused MoE modules are quantized
+### Only Linear and fused MoE modules are quantized
 
 Modules whose weights are not loaded through ATOM's `LinearMethodBase` or
 `FusedMoEMethodBase` paths are skipped silently. In practice this means
 embeddings, layernorms, attention bias, and any custom op kept in BF16 will not
 appear in `online_quant_info_*.json` — that is expected.
 
-### 5.4 Compile cache
+### Compile cache
 
 The compile cache (`/root/.cache/atom/*`) is keyed on the full quantization
 config hash. Switching `--online_quant_config` between runs will trigger a
@@ -333,11 +325,9 @@ recompile on first startup. If you are iterating rapidly:
 rm -rf /root/.cache/atom/*
 ```
 
-### 5.5 Always exclude the MoE gate
+### Always exclude the MoE gate
 
 The MoE router (`*.gate.*`) is a tiny Linear that produces top-k routing
 logits. Quantizing it consistently produces large accuracy drops on every MoE
 model we have measured. Keep it in the exclude list unless you have a specific
 reason not to.
-
----

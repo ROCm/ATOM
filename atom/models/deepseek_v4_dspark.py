@@ -173,164 +173,6 @@ def _count_dspark_stages(model_path, default: int = 0) -> int:
     return (max(stages) + 1) if stages else default
 
 
-def _apply_dspark_rope_hf_torch(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    rope_dim: int,
-) -> torch.Tensor:
-    """Plain-torch reference for DSpark HF-style (GPT-J interleaved) RoPE.
-
-    Kept as a kernel-free, inspectable reference. The production path
-    (``_apply_dspark_rope_hf``) dispatches to a fused Triton kernel on GPU.
-    """
-    if rope_dim <= 0:
-        return x
-    out = x.clone()
-    rope = x[..., -rope_dim:].float()
-    cos_sin = cos_sin_cache.index_select(0, positions.reshape(-1)).float()
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    # Broadcast cos/sin over an optional head axis.
-    if rope.dim() == 3:
-        cos = cos[:, None, :]
-        sin = sin[:, None, :]
-    rope_pairs = rope.view(*rope.shape[:-1], -1, 2)
-    even = rope_pairs[..., 0]
-    odd = rope_pairs[..., 1]
-    rotated = torch.stack(
-        (even * cos - odd * sin, odd * cos + even * sin), dim=-1
-    ).flatten(-2)
-    out[..., -rope_dim:] = rotated.to(out.dtype)
-    return out
-
-
-_FORWARD_ROPE_KERNEL = None
-
-
-def _forward_rope_gptj_kernel_impl():
-    """Lazily build (and cache) the forward GPT-J RoPE Triton kernel.
-
-    Mirrors ``atom/model_ops/v4_kernels/inverse_rope.py`` but applies the FORWARD
-    rotation. Same ``reuse_freqs_front_part`` cache layout: cos/sin hold rd//2
-    entries, each shared by an adjacent pair (index = d // 2). fp32 math for
-    parity with the torch reference; result cast back to the input dtype.
-    """
-    global _FORWARD_ROPE_KERNEL
-    if _FORWARD_ROPE_KERNEL is not None:
-        return _FORWARD_ROPE_KERNEL
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def _kernel(
-        x_ptr,
-        cos_ptr,
-        sin_ptr,
-        pos_ptr,
-        stride_x_s,
-        stride_x_h,
-        stride_x_d,
-        stride_cos_s,
-        stride_cos_d,
-        S,
-        BLOCK_S: tl.constexpr,
-        BLOCK_RD: tl.constexpr,
-        BLOCK_RD_HALF: tl.constexpr,
-    ):
-        pid_h = tl.program_id(0)
-        pid_s = tl.program_id(1)
-        s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
-        d_offs = tl.arange(0, BLOCK_RD)
-        s_mask = s_offs < S
-        pos = tl.load(pos_ptr + s_offs, mask=s_mask)
-        # GPT-J reuse_freqs_front_part: cos/sin index = d // 2 (pair-shared).
-        d_cos_offs = d_offs // 2
-        cos_offs = pos[:, None] * stride_cos_s + d_cos_offs[None, :] * stride_cos_d
-        cos_mask = s_mask[:, None] & (d_cos_offs < BLOCK_RD_HALF)[None, :]
-        cos = tl.load(cos_ptr + cos_offs, mask=cos_mask).to(tl.float32)
-        sin = tl.load(sin_ptr + cos_offs, mask=cos_mask).to(tl.float32)
-        x_offs = (
-            s_offs[:, None] * stride_x_s
-            + pid_h * stride_x_h
-            + d_offs[None, :] * stride_x_d
-        )
-        x_mask = s_mask[:, None] & (d_offs < BLOCK_RD)[None, :]
-        x = tl.load(x_ptr + x_offs, mask=x_mask).to(tl.float32)
-        # Forward GPT-J: out[2i]   =  x[2i]*cos - x[2i+1]*sin
-        #                out[2i+1] =  x[2i]*sin + x[2i+1]*cos
-        # Negate ODDs of (x*sin), then flip pairs (inverse kernel negates evens).
-        x_sin = x * sin
-        odd_mask = (d_offs % 2 == 1)[None, :]
-        x_negated = tl.where(odd_mask, -x_sin, x_sin)
-        x_negated = tl.reshape(x_negated, (BLOCK_S, BLOCK_RD_HALF, 2))
-        x_negated = tl.flip(x_negated, 2)
-        x_rotated = tl.reshape(x_negated, (BLOCK_S, BLOCK_RD))
-        out = x * cos + x_rotated
-        out = out.to(x_ptr.dtype.element_ty)
-        tl.store(x_ptr + x_offs, out, mask=x_mask)
-
-    _FORWARD_ROPE_KERNEL = _kernel
-    return _kernel
-
-
-def _apply_dspark_rope_hf(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    rope_dim: int,
-) -> torch.Tensor:
-    """Apply DSpark HF-style (GPT-J interleaved) RoPE to the trailing rope lanes.
-
-    Args:
-        x: [N, H, head_dim] or [N, head_dim]; rope acts on last ``rope_dim`` dims.
-        positions: [N] int absolute positions.
-        cos_sin_cache: [max_pos, rope_dim] concatenated cos||sin.
-        rope_dim: number of trailing rope dimensions.
-
-    Dispatches to a fused Triton kernel on GPU (forward analog of the existing
-    ``inverse_rope`` kernel). Set ``ATOM_DSPARK_ROPE_TORCH=1`` to force the
-    plain-torch reference above.
-    """
-    if rope_dim <= 0:
-        return x
-    import os
-
-    if os.environ.get("ATOM_DSPARK_ROPE_TORCH", "0") == "1" or not x.is_cuda:
-        return _apply_dspark_rope_hf_torch(x, positions, cos_sin_cache, rope_dim)
-    import triton
-
-    kernel = _forward_rope_gptj_kernel_impl()
-    out = x.clone()
-    # Normalize to [S, H, rd] over the rope slice (add a head axis if absent).
-    squeeze_head = out.dim() == 2
-    rope_view = (out.unsqueeze(1) if squeeze_head else out)[..., -rope_dim:]
-    S, H, rd = rope_view.shape
-    # cos_sin_cache is [max_pos, rope_dim] = concat(cos[rd//2] || sin[rd//2]).
-    cos = cos_sin_cache[:, : rope_dim // 2].contiguous()
-    sin = cos_sin_cache[:, rope_dim // 2 :].contiguous()
-    pos = positions.reshape(-1).to(torch.int32)
-    BLOCK_RD = triton.next_power_of_2(rd)
-    BLOCK_S = 32
-    grid = (H, triton.cdiv(S, BLOCK_S))
-    kernel[grid](
-        rope_view,
-        cos,
-        sin,
-        pos,
-        rope_view.stride(0),
-        rope_view.stride(1),
-        rope_view.stride(2),
-        cos.stride(0),
-        cos.stride(1),
-        S,
-        BLOCK_S=BLOCK_S,
-        BLOCK_RD=BLOCK_RD,
-        BLOCK_RD_HALF=BLOCK_RD // 2,
-        num_warps=4,
-    )
-    return out
-
-
 def _fake_fp8_e4m3_inplace(x: torch.Tensor, block_size: int = 64) -> None:
     """In-place FP8 E4M3 fake-quant with power-of-two block scales (DSpark QAT).
 
@@ -488,6 +330,9 @@ try:
         dspark_paged_window_gather,
         swa_write,
     )
+    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (  # noqa: E402
+        qk_norm_rope_maybe_quant,
+    )
 
     _ATOM_V4_AVAILABLE = True
 except Exception:  # pragma: no cover - exercised only in the stubbed test sandbox
@@ -592,16 +437,17 @@ class DSparkLayer(Block):  # type: ignore[misc]
         qr_kv = _linear_out(a.wqkv_a(main_x))
         _, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
         kv = a.kv_norm(kv).view(-1, 1, a.head_dim)
-        kv = _apply_dspark_rope_hf(
-            kv,
-            positions.reshape(-1),
-            torch.cat(
-                [a.rotary_emb.cos_cache.squeeze(), a.rotary_emb.sin_cache.squeeze()],
-                dim=-1,
-            ),
-            a.rope_head_dim,
-        )
-        _apply_dspark_kv_qat_(kv, a.rope_head_dim)
+        rope_dim = a.rope_head_dim
+        # RoPE via the shared aiter fused kernel (rope_cached_positions, GPT-J
+        # interleaved = the same rotate_style=1 layout the draft used to apply via
+        # its own triton kernel). In-place on the rope-slice only (aiter handles
+        # the non-contiguous [..., -rope_dim:] slice via strides); `kv` is a fresh
+        # local tensor so the in-place write is safe. Guard rope_dim > 0 so
+        # rope_dim == 0 doesn't turn `[..., -rope_dim:]` into the whole head
+        # (-0 == 0).
+        if rope_dim:
+            a.rotary_emb.forward(positions.reshape(-1), kv[..., -rope_dim:])
+        _apply_dspark_kv_qat_(kv, rope_dim)
         return kv.view(-1, a.head_dim)
 
     def precompute_context_kv(
@@ -683,24 +529,37 @@ class DSparkLayer(Block):  # type: ignore[misc]
             q = _linear_out(a.wq_b(qr_q, x_scale=qr_scale))
         else:
             q = _linear_out(a.wq_b(qr_normed))
-        q = q.view(B * T, a.n_local_heads, a.head_dim)
-        # Per-head Q RMSNorm (weightless), matching the V4 reference.
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + a.eps).to(
-            q.dtype
-        )
-        kv = a.kv_norm(kv).view(B * T, 1, a.head_dim)
+        # q stays 2-D [B*T, H*D], kv 2-D [B*T, D] — the fused kernel wants 2-D.
 
         # Draft positions: anchor+1 .. anchor+T.
         draft_pos = positions.view(B, 1) + torch.arange(
             1, T + 1, device=x.device, dtype=positions.dtype
         ).view(1, T)
-        cos_sin = torch.cat(
-            [a.rotary_emb.cos_cache.squeeze(), a.rotary_emb.sin_cache.squeeze()], dim=-1
+        rope_dim = a.rope_head_dim
+        # Per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE in ONE
+        # fused kernel — the same `qk_norm_rope_maybe_quant` the V4 target runs
+        # every layer (bf16 path: quant off, no SWA fusion — DSpark scatters its
+        # window separately). Replaces the draft's hand-written weightless Q-norm
+        # + kv_norm + the `rotary_emb.forward` (_V4RoPE) RoPE launch. `kv` is
+        # passed PRE-norm; the kernel applies kv_norm.weight internally.
+        qkn = qk_norm_rope_maybe_quant(
+            q,
+            kv,
+            a.kv_norm.weight,
+            a.rotary_emb.cos_cache,
+            a.rotary_emb.sin_cache,
+            draft_pos.reshape(-1),
+            a.n_local_heads,
+            a.head_dim,
+            rope_dim,
+            a.eps,
+            quant_q=False,
+            quant_k=False,
+            prefix=f"{a.layer_name}.dspark_qk_norm_rope",
         )
-        q = _apply_dspark_rope_hf(q, draft_pos.reshape(-1), cos_sin, a.rope_head_dim)
-        kv = _apply_dspark_rope_hf(kv, draft_pos.reshape(-1), cos_sin, a.rope_head_dim)
-        _apply_dspark_kv_qat_(kv, a.rope_head_dim)
-        q = q.view(B, T, a.n_local_heads, a.head_dim)
+        q = qkn.q_sa.view(B, T, a.n_local_heads, a.head_dim)
+        kv = qkn.kv.view(B * T, 1, a.head_dim)
+        _apply_dspark_kv_qat_(kv, rope_dim)
         kv = kv.view(B, T, a.head_dim)
 
         # Assemble [window ++ draft block] KV and the window-validity mask.
@@ -742,9 +601,9 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # lanes, grouped output-LoRA einsum with the BF16 wo_a weight, then wo_b.
         # GPU-VERIFY: numerics validated against the V4 reference output stage.
         o = out.reshape(B * T, a.n_local_heads, a.head_dim).contiguous()
-        rd = a.rope_head_dim
+        rope_dim = a.rope_head_dim
         # Remove the absolute-position contribution carried in via value-side RoPE.
-        a.rotary_emb.inverse(draft_pos.reshape(-1), o[..., -rd:])
+        a.rotary_emb.inverse(draft_pos.reshape(-1), o[..., -rope_dim:])
         o = o.view(B * T, a.n_local_groups, -1)
         wo_a = a.wo_a.weight.view(a.n_local_groups, a.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)

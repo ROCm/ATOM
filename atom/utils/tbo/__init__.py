@@ -8,6 +8,7 @@ from .prefill_token_split import (
 )
 from .ubatch_splitting import (
     UBatchSlice,
+    attach_tbo_cpu_lens,
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "TokenSplitPrefillState",
     "UBatchSlice",
     "UBatchWrapper",
+    "attach_tbo_cpu_lens",
     "compute_straddle_split_info",
     "local_tbo_precompute",
     "sync_dp_metadata",

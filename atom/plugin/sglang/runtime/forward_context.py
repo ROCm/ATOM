@@ -284,6 +284,38 @@ def _build_glm52_dsa_metadata(
     return attn_metadata
 
 
+def _build_minimax_m3_metadata(
+    atom_config: Any,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+):
+    hf_config = getattr(atom_config, "hf_config", None)
+    if _is_dummy_forward(forward_batch) or hf_config is None:
+        return None
+
+    from atom.plugin.sglang.minimax_m3_bridge import (
+        build_atom_minimax_m3_attention_metadata_from_sglang,
+        is_minimax_m3_config,
+        maybe_get_minimax_m3_pools_from_sglang_batch,
+    )
+
+    if not is_minimax_m3_config(hf_config):
+        return None
+
+    token_to_kv_pool, req_to_token_pool = maybe_get_minimax_m3_pools_from_sglang_batch(
+        forward_batch
+    )
+    if token_to_kv_pool is None or req_to_token_pool is None:
+        return None
+
+    return build_atom_minimax_m3_attention_metadata_from_sglang(
+        forward_batch,
+        positions,
+        token_to_kv_pool=token_to_kv_pool,
+        req_to_token_pool=req_to_token_pool,
+    )
+
+
 def _build_deepseek_v4_metadata(forward_batch: ForwardBatch, positions: torch.Tensor):
     backend = None
     attn_metadata = getattr(forward_batch, "atom_v4_graph_metadata", None)
@@ -355,15 +387,27 @@ def _set_atom_forward_context(
     max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
     attn_metadata = None
     try:
-        attn_metadata = _build_glm52_dsa_metadata(
+        attn_metadata = _build_minimax_m3_metadata(
             atom_config,
             forward_batch,
             positions,
         )
     except Exception as exc:
         raise RuntimeError(
-            "Failed to build ATOM GLM-5.2 DSA metadata for SGLang"
+            "Failed to build ATOM MiniMax-M3 sparse metadata for SGLang"
         ) from exc
+
+    if attn_metadata is None:
+        try:
+            attn_metadata = _build_glm52_dsa_metadata(
+                atom_config,
+                forward_batch,
+                positions,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to build ATOM GLM-5.2 DSA metadata for SGLang"
+            ) from exc
 
     if attn_metadata is None:
         try:

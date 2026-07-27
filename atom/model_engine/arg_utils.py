@@ -13,6 +13,7 @@ from atom.config import (
     CUDAGraphMode,
     DSparkConfig,
     SpeculativeConfig,
+    EPLBConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
@@ -36,6 +37,7 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    decode_context_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
@@ -67,6 +69,9 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: Optional[str] = None
     mark_trace: bool = False
+    enable_rapidserve: bool = False
+    disagg_prefill_max_num_seqs: Optional[int] = None
+    disagg_constrained: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
     dspark_config: Optional[dict] = None
@@ -74,6 +79,9 @@ class EngineArgs:
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+
+    eplb_enable: bool = False
+    eplb_config: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -110,6 +118,13 @@ class EngineArgs:
             help="Data parallel size.",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            "-dcp",
+            type=int,
+            default=1,
+            help="Decode context parallel size. Must divide tensor_parallel_size.",
+        )
+        parser.add_argument(
             "--enforce-eager",
             action="store_true",
             help="Enforce eager mode execution.",
@@ -128,9 +143,7 @@ class EngineArgs:
             help="Engine internal port",
         )
         parser.add_argument(
-            "--kv-cache-dtype",
             "--kv_cache_dtype",
-            dest="kv_cache_dtype",
             choices=["bf16", "fp8"],
             type=str,
             default="bf16",
@@ -320,6 +333,28 @@ class EngineArgs:
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
         )
         parser.add_argument(
+            "--enable-rapidserve",
+            action="store_true",
+            help="Enable intra-GPU prefill/decode disaggregation. "
+            "Defaults to unconstrained mode (plain separate streams, "
+            "no CU masking). Pass --disagg-constrained to enable "
+            "CU-masked streams + shm coordination.",
+        )
+        parser.add_argument(
+            "--disagg-prefill-max-num-seqs",
+            type=int,
+            default=None,
+            help="Max sequences per prefill batch in disagg mode. "
+            "Defaults to --max-num-seqs when not set.",
+        )
+        parser.add_argument(
+            "--disagg-constrained",
+            action="store_true",
+            help="With --enable-rapidserve, enable CU-masked streams and "
+            "shm-based prefill/decode coordination. Default (off) "
+            "uses plain separate streams with no CU masking.",
+        )
+        parser.add_argument(
             "--online_quant_config",
             type=json.loads,
             default=None,
@@ -371,6 +406,43 @@ class EngineArgs:
                 "Example:\n"
                 """  '{"confidence_schedule": true, "ragged": true, """
                 """"ragged_graph_sizes": "8"}'"""
+            ),
+        )
+        eplb_group = parser.add_argument_group("EPLB options")
+        eplb_group.add_argument(
+            "--eplb-enable",
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB runtime load monitoring and expert rebalance.",
+        )
+        eplb_group.add_argument(
+            "--eplb-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "EPLB config as a JSON dict, parsed straight into an EPLBConfig "
+                "object (no per-field flags). --eplb-enable turns EPLB on; "
+                "--eplb-config only tunes it. Supported keys:\n"
+                '  - "load_window_size": int, non-dummy forwards accumulated '
+                "for EPLB load stats.\n"
+                '  - "rebalance_interval": int, forward-pass interval for '
+                "EPLB rebalance gating.\n"
+                '  - "rebalance_layers_per_chunk": int, MoE layers migrated '
+                "per EPLB rebalance chunk.\n"
+                '  - "num_redundant_experts": int, extra physical expert '
+                "slots per MoE layer for EPLB replicas.\n"
+                '  - "rebalance_min_balancedness": float, skip EPLB '
+                "rebalance when balancedness is at least this value.\n"
+                '  - "rebalance_balancedness_agg": "min"|"mean", layer '
+                "aggregation used by the EPLB balancedness gate.\n"
+                '  - "p2p_batch_chunk_size": int, P2P batch chunk size used '
+                "while migrating expert weights.\n"
+                '  - "placement_policy": "naive"|"biased", how to spend the '
+                "redundant budget: 'naive' (spread) or 'biased' (fully "
+                "replicate top-K hottest experts to all GPUs).\n"
+                "Example:\n"
+                """  '{"num_redundant_experts": 8, "placement_policy": """
+                """"biased"}'"""
             ),
         )
 
@@ -439,6 +511,9 @@ class EngineArgs:
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
         kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
+        # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
+        # is the master switch, --eplb-config only tunes it).
+        kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))
 
         logger.info(f"Engine kwargs: {kwargs}")
 

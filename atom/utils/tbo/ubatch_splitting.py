@@ -238,6 +238,48 @@ def _split_prefill_token_midpoint(
     return slices
 
 
+def attach_tbo_cpu_lens(
+    attn_metadata: AttentionMetaData, field_name: str, np_array
+) -> None:
+    """Publish a ready-made CPU (numpy) copy of a per-request length array.
+
+    Called from a backend's prefill ``prepare_prefill`` AFTER all metadata is
+    finalized, where the source numpy already exists (e.g.
+    ``forward_vars["context_lens"].np``). ``split_attn_metadata`` then reads it
+    via ``_get_tbo_cpu_lens`` (host math, zero device sync) instead of copying
+    the freshly-sliced device tensors back to the host.
+
+    NOTE: ``forward_vars[...].np`` is a *reused* pinned buffer that the next
+    forward will overwrite, so callers MUST pass a ``.copy()`` (or a freshly
+    allocated array) to keep it valid for this batch's lifetime.
+    """
+    setattr(attn_metadata, "_tbo_cpu_lens_" + field_name, np_array)
+
+
+def _get_tbo_cpu_lens(attn_metadata: AttentionMetaData, field_name: str):
+    """Fetch a CPU (numpy) copy of a per-request length array.
+
+    Fast path: one was already published by ``attach_tbo_cpu_lens`` from the
+    backend's prepare path (numpy was free there) — zero device sync.
+
+    Fallback path: if none was published (a backend whose prepare_prefill
+    doesn't attach one), lazily copy the device tensor to host once and cache it
+    under ``_tbo_cpu_lens_<field>``; subsequent ubatch slices in the same
+    forward reuse it. This is TBO-only: reached only through
+    ``split_attn_metadata`` and never touched when TBO is disabled, so non-TBO
+    runs pay zero extra cost.
+    """
+    cache_attr = "_tbo_cpu_lens_" + field_name
+    if not hasattr(attn_metadata, cache_attr):
+        t = getattr(attn_metadata, field_name, None)
+        setattr(
+            attn_metadata,
+            cache_attr,
+            None if t is None else t.detach().cpu().numpy(),
+        )
+    return getattr(attn_metadata, cache_attr)
+
+
 def split_attn_metadata(
     attn_metadata: AttentionMetaData,
     ub_slice: UBatchSlice,
@@ -270,8 +312,6 @@ def split_attn_metadata(
         ub_slot_mapping = attn_metadata.slot_mapping[ts]
         # Pad with -1 for padded positions
         tok_count = ts.stop - ts.start
-        # max_q_len = attn_metadata.max_seqlen_q
-        # padded_tok_count = padded_bs * max_q_len
         padded_tok_count = padded_bs
         if padded_tok_count > tok_count:
             pad = torch.full(
@@ -373,11 +413,6 @@ def split_attn_metadata(
             padding = last_val.expand(pad_size)
             ub_sparse_kv_indptr = torch.cat([ub_sparse_kv_indptr, padding])
 
-    # max_seqlen_k: recompute from the sliced context_lens
-    ub_max_seqlen_k = attn_metadata.max_seqlen_k
-    if ub_context_lens is not None and ub_num_reqs > 0:
-        ub_max_seqlen_k = int(ub_context_lens[:ub_num_reqs].max().item())
-
     # cu_seqlens_k: re-base like cu_seqlens_q (needed for prefill attention)
     ub_cu_seqlens_k = None
     if attn_metadata.cu_seqlens_k is not None:
@@ -394,12 +429,28 @@ def split_attn_metadata(
             padding = last_val.expand(pad_size)
             ub_cu_seqlens_k = torch.cat([ub_cu_seqlens_k, padding])
 
-    # max_seqlen_q: recompute from cu_seqlens_q for this ubatch
+    # Scalars (max_seqlen_q/k, total_kv) are derived from per-request lengths
+    # that originate as numpy on the CPU (see the attention builders). Instead of
+    # syncing the freshly-sliced device tensors back to the host, slice the CPU
+    # length copies and compute these with numpy — no GPU sync, no kernel
+    # launches. The copies are published by attach_tbo_cpu_lens (or created
+    # lazily on first use as a fallback) and are TBO-only.
+    ub_max_seqlen_k = attn_metadata.max_seqlen_k
     ub_max_seqlen_q = attn_metadata.max_seqlen_q
-    if ub_cu_seqlens_q is not None and ub_num_reqs > 0:
-        # Per-request q lengths are the diffs of consecutive cu_seqlens entries
-        per_req_q = ub_cu_seqlens_q[1 : ub_num_reqs + 1] - ub_cu_seqlens_q[:ub_num_reqs]
-        ub_max_seqlen_q = int(per_req_q.max().item())
+
+    if ub_num_reqs > 0:
+        # max_seqlen_k: max over this ubatch's context lengths.
+        ctx_cpu = _get_tbo_cpu_lens(attn_metadata, "context_lens")
+        if ctx_cpu is not None:
+            ub_ctx_cpu = ctx_cpu[req_start:req_end]
+            ub_max_seqlen_k = int(ub_ctx_cpu.max())
+
+        # max_seqlen_q: max per-request q length, matching the clamp/re-base that
+        # produced ub_cu_seqlens_q above (clamp to the token window, then diff).
+        cuq_cpu = _get_tbo_cpu_lens(attn_metadata, "cu_seqlens_q")
+        if cuq_cpu is not None:
+            seg = np.clip(cuq_cpu[req_start : req_end + 1], ts.start, ts.stop)
+            ub_max_seqlen_q = int(np.diff(seg).max())
 
     ub_total_kv = None
     if attn_metadata.has_cached:

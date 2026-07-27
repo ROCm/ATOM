@@ -10,7 +10,6 @@ import torch
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
-    _apply_dspark_rope_hf,
     _dspark_block_sparse_attention,
 )
 
@@ -192,22 +191,11 @@ def test_block_sparse_attention_sink_absorbs_probability():
     assert o_big_sink.abs().sum() < o_no_sink.abs().sum()
 
 
-def test_dspark_rope_is_norm_preserving_on_rope_lanes():
-    # RoPE is a rotation: it must preserve the L2 norm of the rope sub-vector.
-    N, H, D, rope = 3, 2, 8, 4
-    torch.manual_seed(3)
-    x = torch.randn(N, H, D)
-    # Build a valid cos||sin cache: cos^2 + sin^2 == 1 so the map is a rotation.
-    angles = torch.randn(16, rope // 2)
-    cache = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)  # [16, rope]
-    pos = torch.tensor([0, 5, 10])
-    y = _apply_dspark_rope_hf(x, pos, cache, rope)
-    # Non-rope lanes untouched.
-    torch.testing.assert_close(y[..., :-rope], x[..., :-rope])
-    # Rope-lane norm preserved per (token, head).
-    n_in = x[..., -rope:].float().norm(dim=-1)
-    n_out = y[..., -rope:].float().norm(dim=-1)
-    torch.testing.assert_close(n_in, n_out, rtol=1e-4, atol=1e-4)
+# NOTE: the draft RoPE norm-preservation test was removed with the hand-written
+# `_apply_dspark_rope_hf` helper. The draft now applies RoPE via the shared aiter
+# fused kernel (`attn.rotary_emb.forward`, GPT-J interleaved) — the same op the V4
+# target uses and covers — so there is no DSpark-specific RoPE path left to unit
+# test here (it needs a GPU + a real _V4RoPE, out of scope for these CPU tests).
 
 
 # ---- Phase 2: confidence-scheduled verification (Hardware-Aware Scheduler) ----

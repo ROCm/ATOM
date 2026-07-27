@@ -579,6 +579,7 @@ _CONFIG_REGISTRY: dict[str, str] = {
     # through as extra config attrs and are read in DeepseekV4Args.from_hf_config.
     "glm_moe_dsa": "deepseek_v3",  # GLM 5.0 MoE, structure similar to DeepSeek v3.2
     "kimi_k2": "deepseek_v3",
+    "qwen3_next": "qwen3_next",
 }
 
 
@@ -756,6 +757,9 @@ class ParallelConfig:
     data_parallel_rank_local: Optional[int] = None
     """Local rank of the data parallel group,
     set only in SPMD mode."""
+    decode_context_parallel_size: int = 1
+    """DCP group size. tp_size must be divisible by dcp_size.
+    DCP does not increase world_size; it reuses TP GPUs."""
     world_size: int = field(init=False)
     """world_size is TPxPP, it affects the number of workers we create."""
     data_parallel_master_port: int = 29500
@@ -1101,6 +1105,72 @@ class DSparkConfig:
 
 
 @dataclass
+class EPLBConfig:
+    """EPLB sub-config (vLLM-style: enable + config object)."""
+
+    load_window_size: int = 1000
+    rebalance_interval: int = 3000
+    rebalance_layers_per_chunk: int = 64
+    num_redundant_experts: int = 0
+    rebalance_min_balancedness: float = 2.0
+    rebalance_balancedness_agg: str = "min"
+    p2p_batch_chunk_size: int = 32
+    # Placement policy for spending the redundant-expert budget:
+    #   "naive"  -> greedy replicate + balanced_packing (spread thinly)
+    #   "biased" -> fully replicate top-K hottest experts to all GPUs
+    #               (K = num_redundant // num_gpus, per-node in multi-node)
+    placement_policy: str = "naive"
+
+    def __post_init__(self):
+        self.load_window_size = int(self.load_window_size)
+        assert self.load_window_size > 0, "eplb.load_window_size must be > 0"
+        self.rebalance_interval = int(self.rebalance_interval)
+        assert self.rebalance_interval > 0, "eplb.rebalance_interval must be > 0"
+        assert (
+            self.rebalance_interval >= self.load_window_size
+        ), "eplb.rebalance_interval must be >= eplb.load_window_size"
+        self.rebalance_layers_per_chunk = int(self.rebalance_layers_per_chunk)
+        assert (
+            self.rebalance_layers_per_chunk > 0
+        ), "eplb.rebalance_layers_per_chunk must be > 0"
+        self.num_redundant_experts = int(self.num_redundant_experts)
+        assert (
+            self.num_redundant_experts >= 0
+        ), "eplb.num_redundant_experts must be >= 0"
+        self.rebalance_min_balancedness = float(self.rebalance_min_balancedness)
+        self.rebalance_balancedness_agg = (
+            str(self.rebalance_balancedness_agg).lower().strip()
+        )
+        assert self.rebalance_balancedness_agg in {
+            "min",
+            "mean",
+        }, "eplb.rebalance_balancedness_agg must be one of {'min','mean'}"
+        self.p2p_batch_chunk_size = int(self.p2p_batch_chunk_size)
+        assert self.p2p_batch_chunk_size > 0, "eplb.p2p_batch_chunk_size must be > 0"
+        self.placement_policy = str(self.placement_policy).lower().strip()
+        assert self.placement_policy in {
+            "naive",
+            "biased",
+        }, "eplb.placement_policy must be one of {'naive','biased'}"
+
+    @classmethod
+    def from_dict(cls, cfg: Optional[dict]) -> "EPLBConfig":
+        """Build from the ``--eplb-config`` JSON dict.
+
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --eplb-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
@@ -1112,6 +1182,7 @@ class Config:
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    decode_context_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
@@ -1166,12 +1237,40 @@ class Config:
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # EPLB master switch + sub-config (vLLM style).
+    eplb_enable: bool = False
+    eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
     # only for quark_online_quantization
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict[str, Any]] = None
+
+    # Intra-GPU prefill/decode disaggregation
+    enable_rapidserve: bool = False
+    # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages)
+    disagg_d2p_addr: str = ""
+    # ZMQ IPC address: prefill PUSH → decode PULL (PrefillDone messages)
+    disagg_p2d_addr: str = ""
+    # Bootstrap round 1: prefill PUSH → decode PULL (weight IPC handles)
+    disagg_weight_ipc_addr: str = ""
+    # Bootstrap round 1 ACK: decode PUSH → prefill PULL (signals weights freed)
+    disagg_weight_ack_addr: str = ""
+    # Bootstrap round 2: prefill PUSH → decode PULL (kvcache_args + num_blocks)
+    disagg_kvcache_ipc_addr: str = ""
+    # True for the decode process in disagg mode: skip GPU weight/kvcache allocation.
+    disagg_is_decode: bool = False
+    # Name of the shared-memory region used for dynamic CU partitioning.
+    # Both prefill and decode processes open this to exchange batch sizes.
+    disagg_cu_shm_name: str = ""
+    # Override max_num_seqs for the prefill process in disagg mode.
+    # When None, prefill inherits the base max_num_seqs.
+    disagg_prefill_max_num_seqs: Optional[int] = None
+    # When True (and enable_rapidserve=True), use CU-masked streams + shm
+    # coordination between prefill and decode. When False (default),
+    # use plain separate streams with no CU masking.
+    disagg_constrained: bool = False
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -1191,9 +1290,44 @@ class Config:
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
+        if isinstance(self.eplb_config, dict):
+            self.eplb_config = EPLBConfig(**self.eplb_config)
+        elif isinstance(self.eplb_config, EPLBConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.eplb_config = EPLBConfig(**self.eplb_config.__dict__)
+        else:
+            raise TypeError("eplb_config must be EPLBConfig or dict")
         # assert os.path.isdir(self.model)
 
+        # RapidServe (intra-GPU prefill/decode disagg) needs a specialized
+        # runner in both the prefill and decode processes. Select it unless the
+        # user explicitly overrode runner_qualname.
+        if (
+            self.enable_rapidserve
+            and self.runner_qualname == "atom.model_engine.model_runner.ModelRunner"
+        ):
+            self.runner_qualname = (
+                "atom.model_engine.model_runner.RapidServeModelRunner"
+            )
+
         assert 1 <= self.tensor_parallel_size <= 8
+        if self.decode_context_parallel_size > 1:
+            assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
+                f"tp_size ({self.tensor_parallel_size}) must be divisible by "
+                f"dcp_size ({self.decode_context_parallel_size})"
+            )
+            if self.enable_prefix_caching:
+                logger.warning(
+                    "DCP does not support prefix caching yet; "
+                    "disabling enable_prefix_caching."
+                )
+                self.enable_prefix_caching = False
+            if self.enable_chunked_prefill:
+                logger.warning(
+                    "DCP does not support chunked prefill yet; "
+                    "disabling enable_chunked_prefill."
+                )
+                self.enable_chunked_prefill = False
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )

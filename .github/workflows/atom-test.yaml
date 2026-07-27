@@ -172,6 +172,9 @@ jobs:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
     if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+      contents: read
 
     env:
       CONTAINER_NAME: atom_test_${{ strategy.job-index }}
@@ -277,10 +280,13 @@ jobs:
           EOF
 
       - name: Download aiter wheel
-        uses: actions/download-artifact@v8
-        with:
-          name: aiter-whl
-          path: /tmp/aiter-whl
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_NAME: aiter-whl
+          AITER_WHEEL_OUTPUT_DIR: /tmp/aiter-whl
+        run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Set HF token for predownload runner
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'

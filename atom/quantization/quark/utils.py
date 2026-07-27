@@ -9,6 +9,13 @@ import triton.language as tl
 import torch
 from aiter import QuantType
 
+_FP8_SOURCE_DTYPES = frozenset(
+    {
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    }
+)
+
 
 def deep_compare(dict1: Any, dict2: Any) -> bool:
     if type(dict1) is not type(dict2):
@@ -82,11 +89,12 @@ def _weight_dequant_kernel(  # type: ignore[no-untyped-def]
     tl.store(y_ptr + offs, y, mask=mask)
 
 
-def weight_dequant_fp8(
+def dequant_per_block_fp8(
     x: torch.Tensor, s: torch.Tensor, block_size: int = 128
 ) -> torch.Tensor:
     """
-    Dequantize FP8 weight tensor using inverse scale with Triton kernel.
+    Dequantize a per-block (128x128) FP8 weight using inverse scale with a
+    Triton kernel.
     """
     assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
     assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
@@ -118,10 +126,14 @@ def _mx_block_scale_dtype():
     return dtypes.fp8_e8m0
 
 
-def weight_dequant_mxfp8(
+def dequant_mxfp8(
     x: torch.Tensor, s: torch.Tensor, block_size: int = 32
 ) -> torch.Tensor:
-    """Dequantize an MXFP8 weight to the default float dtype."""
+    """Dequantize an MXFP8 weight to the default float dtype.
+
+    MXFP8 is a standard microscaling dtype (its 1x32 block scale is part of the
+    format), so the name carries no explicit granularity suffix.
+    """
     assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
     M, K = x.shape
     assert K % block_size == 0, f"K={K} not divisible by block_size={block_size}"
@@ -139,6 +151,118 @@ def weight_dequant_mxfp8(
     y = x.to(torch.float32).reshape(M, n_blocks, block_size)
     y = y * scale.unsqueeze(-1)
     return y.reshape(M, K).to(out_dtype)
+
+
+def dequant_per_channel_fp8(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """Dequantize a per-output-channel (per_Token / PTPC) FP8 weight to the
+    default float dtype.
+
+    :param x: quantized weight ``[N, K]`` (last dim is the contracted dim).
+    :param s: per-output-channel scale, ``[N]`` or ``[N, 1]``.
+    """
+    assert x.dim() == 2, f"expected 2D weight, got shape={tuple(x.shape)}"
+    out_dtype = torch.get_default_dtype()
+    scale = s.reshape(-1).to(torch.float32).view(-1, 1)
+    return (x.to(torch.float32) * scale).to(out_dtype)
+
+
+def dequant_per_tensor_fp8(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    output_partition_sizes: list[int] | None = None,
+) -> torch.Tensor:
+    """Dequantize a per-tensor  FP8 weight to the atom config float dtype.
+
+    Merged layers (qkv / gate_up) carry one scalar scale per output partition,
+    so each output row-range is scaled by its own scale. A single scale
+    (``numel <= 1``) scales the whole tensor.
+
+    :param x: quantized weight ``[N, K]``.
+    :param s: per-partition scalar scale(s).
+    :param output_partition_sizes: row counts of each merged output partition,
+        required when there is more than one scale.
+    """
+    out_dtype = torch.get_default_dtype()
+
+    w = x.to(torch.float32)
+    scale = s.reshape(-1)
+    if scale.numel() <= 1:
+        return (w * scale.reshape(())).to(out_dtype)
+    assert output_partition_sizes is not None, (
+        "per_Tensor merged layer needs output_partition_sizes to map each "
+        "scale to its output rows."
+    )
+    off = 0
+    for i, sz in enumerate(output_partition_sizes):
+        w[off : off + sz] = w[off : off + sz] * scale[i]
+        off += sz
+    return w.to(out_dtype)
+
+
+def dequant_weight_online(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    source_quant_type: QuantType,
+    source_quant_dtype: torch.dtype | None = None,
+    output_partition_sizes: list[int] | None = None,
+) -> torch.Tensor:
+    """Dequantize an online-quant SOURCE weight back to the default float dtype.
+
+    Single entry point shared by the Linear and MoE online-quant paths and the
+    inverse counterpart of :func:`quant_weight_online`: it turns an
+    already-quantized weight back into float so it can be re-quantized to a
+    different target format.
+
+    A source is identified by BOTH its ``quant_type`` (the block layout) and its
+    element ``quant_dtype``. The layout alone is not enough: e.g. ``per_1x32``
+    can carry either MXFP8 (8-bit) or MXFP4 (4-bit) elements. We only support
+    dequantizing 8-bit FP8 sources; any 4-bit (e.g. MXFP4) source is rejected,
+    since MXFP4 is only ever an online-quant target, never a weight we
+    dequantize. Supported sources:
+
+    - ``No``: unquantized, returned unchanged.
+    - ``per_Tensor``: per-tensor FP8, one scalar scale per output partition.
+    - ``per_Token`` (ptpc_fp8): per-output-channel FP8, scale ``(N, 1)``.
+    - ``per_1x128``: DeepSeek-style 128x128 block FP8.
+    - ``per_1x32``: MXFP8 (1x32 E8M0 shared scale).
+
+    :param weight: The quantized (or float, for ``No``) weight tensor.
+    :param weight_scale: The source weight scale (``None`` for ``No``).
+    :param source_quant_type: The source quantization scheme (block layout).
+    :param source_quant_dtype: The source element dtype. Used together with
+        ``source_quant_type`` to reject non-8-bit (e.g. MXFP4) sources. When
+        ``None`` the dtype check is skipped (caller vouches for an 8-bit source).
+    :param output_partition_sizes: row counts of each merged output partition,
+        only used (and required) by ``per_Tensor`` merged layers.
+    :return: The dequantized weight in the default float dtype.
+    """
+    if source_quant_type == QuantType.No:
+        return weight
+
+    # Reject any non-8-bit source up front. The element dtype -- not just the
+    # block layout -- decides whether we can dequantize: MXFP4 (fp4x2) shares
+    # the per_1x32 layout with MXFP8 but is a target-only format.
+    if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
+        raise ValueError(
+            f"Unsupported online dequant source dtype={source_quant_dtype} "
+            f"(quant_type={source_quant_type}); only 8-bit FP8 sources are "
+            f"supported (MXFP4 and other 4-bit formats are target-only)."
+        )
+
+    if source_quant_type == QuantType.per_Tensor:
+        return dequant_per_tensor_fp8(weight, weight_scale, output_partition_sizes)
+    if source_quant_type == QuantType.per_Token:
+        return dequant_per_channel_fp8(weight, weight_scale)
+    if source_quant_type == QuantType.per_1x128:
+        return dequant_per_block_fp8(weight, weight_scale)
+    if source_quant_type == QuantType.per_1x32:
+        # per_1x32 is only the block layout; the (8-bit) dtype check above has
+        # already ruled out MXFP4, so a valid source here is always MXFP8.
+        return dequant_mxfp8(weight, weight_scale)
+    raise ValueError(
+        f"Unsupported source quant_type for online dequant: {source_quant_type}. "
+        f"Supported sources: No, per_Tensor, per_Token, per_1x128, per_1x32."
+    )
 
 
 def quant_mxfp4_online_even(

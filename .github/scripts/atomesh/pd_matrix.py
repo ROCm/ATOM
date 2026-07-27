@@ -165,8 +165,11 @@ def format_display_topology(
     ]
     prefill_tp = prefill_cfg.get("tp")
     decode_tp = decode_cfg.get("tp")
-    if prefill_tp == decode_tp and prefill_tp is not None:
-        parts.append(f"TP{prefill_tp}")
+    if prefill_tp is not None and decode_tp is not None:
+        if prefill_tp == decode_tp:
+            parts.append(f"TP{prefill_tp}")
+        else:
+            parts.append(f"TP{prefill_tp}-TP{decode_tp}")
 
     return "-".join(parts)
 

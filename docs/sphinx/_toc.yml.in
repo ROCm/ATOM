@@ -1,0 +1,56 @@
+defaults:
+  numbered: False
+
+root: index
+
+subtrees:
+  - caption: Getting started
+    entries:
+      - file: installation
+        title: Install ATOM
+      - file: quickstart
+        title: Quick start
+      - file: model_run_guide
+        title: Run a model
+
+  - caption: Reference
+    entries:
+      - file: architecture_guide
+        title: Architecture
+      - file: configuration_guide
+        title: Configuration
+      - file: environment_variables
+        title: Environment variables
+      - file: model_support_guide
+        title: Model support
+      - file: model_ops_guide
+        title: Model operations
+      - file: online_quantization_guide
+        title: Online quantization
+      - file: eagle3_speculative_decoding
+        title: EAGLE 3 / 3.1 speculative decoding
+      - file: scheduling_kv_cache_guide
+        title: Scheduling and KV cache
+      - file: distributed_guide
+        title: Distributed inference
+      - file: context_parallel_guide
+        title: Context parallelism
+      - file: compilation_cudagraph_guide
+        title: Compilation and CUDA graphs
+      - file: serving_benchmarking_guide
+        title: Serving and benchmarking
+
+  - caption: Framework integrations
+    entries:
+      - file: vllm_plugin_backend_guide
+        title: vLLM-ATOM backend
+
+  - caption: Ecosystem integrations
+    entries:
+      - file: hermes_agent_guide
+        title: Hermes Agent with ATOM
+
+  - caption: API reference
+    entries:
+      - file: api/serving
+      - file: api/models
