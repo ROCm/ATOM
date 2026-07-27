@@ -125,7 +125,8 @@ jobs:
           - display_name: "DeepSeek-V4-Flash TP4"
             model_name: "DeepSeek-V4-Flash"
             model_path: "deepseek-ai/DeepSeek-V4-Flash"
-            extra_args: "--tensor-parallel-size 4 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4"
+            client_command: "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/completions,num_concurrent=8,max_retries=1,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
+            extra_args: "--tensor-parallel-size 4 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4 --no-async-scheduling"
             env_vars: |
               AITER_BF16_FP8_MOE_BOUND=0
               ATOM_MOE_GU_ITLV=1
@@ -212,15 +213,26 @@ jobs:
         id: atom-base-changes
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
-          if git diff --quiet "${BASE_SHA}" HEAD -- docker/atom_release.dockerfile; then
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+          echo "Checking ATOM base changes: base=${BASE_SHA}, PR head=${HEAD_SHA}"
+
+          set +e
+          git diff --quiet "${BASE_SHA}" "${HEAD_SHA}" -- docker/atom_release.dockerfile
+          diff_rc=$?
+          set -e
+
+          if [ "${diff_rc}" -eq 0 ]; then
             echo "rebuild_atom_base=false" >> "$GITHUB_OUTPUT"
             echo "docker/atom_release.dockerfile is unchanged; reuse ${ATOM_BASE_NIGHTLY_IMAGE}."
-          else
+          elif [ "${diff_rc}" -eq 1 ]; then
             echo "rebuild_atom_base=true" >> "$GITHUB_OUTPUT"
             echo "docker/atom_release.dockerfile changed; rebuild the ATOM base image."
+          else
+            echo "Failed to compare docker/atom_release.dockerfile (git diff exit ${diff_rc})." >&2
+            exit "${diff_rc}"
           fi
 
       - name: Ensure Docker client config directory
