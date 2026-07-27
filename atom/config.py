@@ -662,8 +662,6 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         config_class = AutoConfig.for_model(_CONFIG_REGISTRY[model_type])
         hf_config = config_class.from_pretrained(
             model,
-            # revision=revision,
-            # code_revision=code_revision,
             token=_get_hf_token(),
             trust_remote_code=trust_remote_code,
         )
@@ -813,8 +811,6 @@ class ParallelConfig:
         # dp rank 1: has_unfinished_seqs=False
         # aggregated: has_unfinished_seqs=True
         # so this is an OR operation, i.e. MAX in integers
-        # torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
-        # from aiter.dist.parallel_state import get_dp_group
         torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
         aggregated_has_unfinished = bool(tensor.item())
         return aggregated_has_unfinished
@@ -844,8 +840,6 @@ class ParallelConfig:
             self.data_parallel_rank = envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
-        # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
-        # self.data_parallel_master_port = get_open_port()
 
 
 def _normalize_moe_config_fields(

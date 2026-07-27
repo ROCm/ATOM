@@ -251,17 +251,24 @@ def naive_multicast(
 
 
 def pad_for_all_gather(x: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """Zero-pad ``x`` along dim 0 up to the uniform all-gather batch size.
+    """Pad ``x`` along dim 0 up to the uniform all-gather batch size.
 
     Every DP rank must contribute the same number of rows to the uniform
     all-gather, so a short batch is padded up to ``graph_bs`` (scaled by the
     per-sequence query length when decoding with MTP > 1).
 
-    The padding MUST be zeros, never uninitialized memory: padded rows are
-    all-gathered across DP ranks and fed straight into the aiter fused-MoE
-    expert GEMM, where garbage values leak into real tokens' outputs.
-    Bisection traced a ~0.7pp GSM8K drop at large batch to a bare
-    ``torch.empty`` pad here; explicitly zeroing the pad rows fixes it.
+    Pad rows are left UNINITIALIZED. The expert GEMM is per-token and
+    ``reduce_scatter_with_unpadding`` drops the pad region, so garbage there
+    cannot reach a real token's output. It DOES reach the EPLB counter:
+    ``get_moe_input`` gathers ``router_logits`` with the same padding, so
+    ``record_eplb_expert_load`` counts pad rows into the expert-load histogram.
+    Fix that by excluding pad rows from the counter, not by zeroing here —
+    all-zero logits route deterministically and skew it just as much.
+
+    (An earlier revision claimed the pad MUST be zeroed, citing a ~0.7pp GSM8K
+    drop. It was written while ``zero_()`` was already commented out, and
+    restoring the zeroing measures no difference on V4-Flash-DSpark tp8 + DPA —
+    though that is not the V4-Pro TBO config the original was bisected on.)
 
     Returns the (possibly padded) tensor and the original row count so the
     caller can unpad after reduce-scatter.
@@ -280,7 +287,7 @@ def pad_for_all_gather(x: torch.Tensor) -> tuple[torch.Tensor, int]:
     padding_shape[0] = max_batch_size
     padded_x = torch.empty(padding_shape, device=x.device, dtype=x.dtype)
     padded_x[:original_batch_size, :].copy_(x)
-    # padded_x[original_batch_size:, :].zero_()
+    # padded_x[original_batch_size:, :].zero_() # keep for debug
     return padded_x, original_batch_size
 
 
@@ -304,7 +311,8 @@ def reduce_scatter_with_unpadding(
     dp_group = get_dp_group()
     scattered_output = dp_group.reduce_scatter_tensor(x)
 
-    # Drop the rows that pad_for_all_gather zero-padded (padding is on dim 0).
+    # Drop the rows pad_for_all_gather appended (padding is on dim 0). Their
+    # contents were never initialized, so they must not survive past here.
     if scattered_output.shape[0] > original_batch_size:
         scattered_output = scattered_output[:original_batch_size]
 
