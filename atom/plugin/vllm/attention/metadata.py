@@ -438,7 +438,7 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     # (query_len == num_spec + 1): the decode index-topk and sparse-attn kernels
     # thread MAX_Q with per-token causality (causal_len = seq_len - MAX_Q + tok +
     # 1) and their grids depend only on shape constants, so a captured (batch,
-    # query_len) shape is fixed. Prefill/mixed batches still use build(), where 
+    # query_len) shape is fixed. Prefill/mixed batches still use build(), where
     # variable query lengths and CPU-side max reduction are allowed.
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
