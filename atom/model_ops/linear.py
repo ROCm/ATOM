@@ -11,9 +11,9 @@ from aiter import (
     dtypes,
     gemm_a4w4,
     gemm_a8w8,
+    gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
-    gemm_a8w8_blockscale,
     get_hip_quant,
 )
 
@@ -22,22 +22,23 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
+from torch import nn
+
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
-from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
     requantize_with_max_scale,
     shuffle_weights,
 )
-from atom.utils import envs
-from atom.utils.decorators import mark_trace
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.quantization.quark.utils import (
     dequant_weight_online,
     quant_weight_online,
 )
-from torch import nn
+from atom.utils import envs
+from atom.utils.decorators import mark_trace
 
 logger = logging.getLogger("atom")
 
@@ -1819,7 +1820,7 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         tbo_aware: bool = False,
         source_quant_dtype: torch.dtype = None,

@@ -35,13 +35,26 @@ from aiter import (
     rope_rotate_activation,
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
-from atom.model_ops.communication_op import (
-    tensor_model_parallel_all_reduce,
-)
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
+from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+    fused_clamp_act_mul,
+)
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
+from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from torch import nn
+
+from atom.config import (
+    Config,
+    LayerQuantConfig,
+    QuantizationConfig,
+    QuantType,
+    get_current_atom_config,
+)
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_all_reduce,
@@ -51,21 +64,6 @@ from atom.distributed.pcp_utils import (
     pcp_reduce_scatter,
     pcp_round_robin_split,
 )
-from atom.utils.custom_register import direct_register_custom_op
-from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
-from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-from aiter.ops.triton.fusions.fused_clamp_act_mul import (
-    fused_clamp_act_mul,
-)
-from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
-from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-from atom.config import (
-    Config,
-    LayerQuantConfig,
-    QuantizationConfig,
-    QuantType,
-    get_current_atom_config,
-)
 from atom.model_loader.loader import WeightsMapper
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
@@ -74,6 +72,9 @@ from atom.model_loader.loader import WeightsMapper
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import (
@@ -107,9 +108,9 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
+from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
-from torch import nn
 
 logger = logging.getLogger(__name__)
 
