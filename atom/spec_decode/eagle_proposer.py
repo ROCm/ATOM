@@ -137,7 +137,10 @@ class EagleProposer(Drafter):
         if not (isinstance(output, tuple) and len(output) == 2):
             return output
         hidden, aux_list = output
-        for buf, aux in zip(self._aux_buffers, aux_list):
+        # strict: buffers are sized from the CONFIGURED aux ids, aux_list is what
+        # the target actually installed. A lenient zip would leave a trailing
+        # buffer at its zeros init and silently lose acceptance.
+        for buf, aux in zip(self._aux_buffers, aux_list, strict=True):
             buf[: aux.shape[0]].copy_(aux)
         return hidden
 
