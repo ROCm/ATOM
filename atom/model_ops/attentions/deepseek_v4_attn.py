@@ -1471,9 +1471,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.compress_plans = compress_plans
         attn_metadata.swa_block_tables = swa_bt_gpu
         # DSpark RAGGED: pass per-seq verify lengths + full_q to the (rectangular-
-        # only) decode indexer so it can pad Q back to [bs, full_q]. Eager-only;
-        # None on the regular rectangular path.
-        if ragged_lens is not None:
+        # only) decode indexer so it can pad Q back to [bs, full_q].
+        _drafter = getattr(self.model_runner, "drafter", None)
+        _dspark_ragged_graph = (
+            self.model_runner.config.dspark.ragged
+            and _drafter is not None
+            and getattr(_drafter, "dspark_confidence_schedule", False)
+        )
+        if ragged_lens is not None or _dspark_ragged_graph:
             attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
                 extend_lens_np, device=positions.device
             )

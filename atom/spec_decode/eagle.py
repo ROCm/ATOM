@@ -805,9 +805,9 @@ class EagleProposer:
         # normal path where indices are already in range.
 
         if self.use_dspark:
-            total_tokens = int(cu_seqlens_q[-1])
-            if total_tokens > 0:
-                token_indices = token_indices.clamp_(0, total_tokens - 1)
+            upper = (cu_seqlens_q[-1] - 1).clamp_(min=0)
+            token_indices = token_indices.clamp_(min=0)
+            torch.minimum(token_indices, upper, out=token_indices)
 
         return token_indices
 

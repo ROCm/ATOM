@@ -1170,7 +1170,10 @@ jobs:
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/it-share/models" ]; then
+          if [ -d "/shared_nfs/huggingface_models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
+            MODEL_CACHE_DESC="/shared_nfs/huggingface_models (shared host path)"
+          elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
           elif [ -d "/models" ]; then
@@ -1236,6 +1239,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -1271,6 +1276,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then

@@ -1,10 +1,10 @@
 import copy
 import json
-from typing import Any, Optional
+import logging
 from dataclasses import dataclass
+from typing import Any
 
 import torch
-import logging
 
 from atom.utils import envs
 
@@ -38,7 +38,7 @@ class PluginConfig:
     sglang_disable_cuda_graph: bool = False
     sglang_enable_dp_attention: bool = False
     sglang_aiter_rank_id: int = 0
-    sglang_dist_init_addr: Optional[str] = None
+    sglang_dist_init_addr: str | None = None
     sglang_port_args: Any = None
     sglang_enable_nsa_prefill_cp: bool = False
     sglang_nsa_prefill_cp_mode: str = "round-robin-split"
@@ -46,6 +46,32 @@ class PluginConfig:
     # rtp-llm specific
     rtpllm_model_config: Any = None
     rtpllm_parallelism_config: Any = None
+
+
+def _get_sglang_prefill_cp_config(server_args) -> tuple[bool, str]:
+    """Read prefill CP settings across SGLang ServerArgs versions."""
+    if hasattr(server_args, "enable_prefill_cp"):
+        enable_prefill_cp = server_args.enable_prefill_cp
+        cp_strategy = server_args.cp_strategy
+        if not enable_prefill_cp:
+            return False, "round-robin-split"
+
+        strategy_to_legacy_mode = {
+            "interleave": "round-robin-split",
+            "zigzag": "in-seq-split",
+        }
+        if cp_strategy not in strategy_to_legacy_mode:
+            raise ValueError(
+                "SGLang+ATOM PCP requires a supported --cp-strategy, got "
+                f"{cp_strategy!r}"
+            )
+        return True, strategy_to_legacy_mode[cp_strategy]
+
+    # Compatibility with SGLang versions before the unified prefill CP flags.
+    return (
+        getattr(server_args, "enable_nsa_prefill_context_parallel", False),
+        getattr(server_args, "nsa_prefill_cp_mode", "round-robin-split"),
+    )
 
 
 def _normalize_sglang_parallel_config(
@@ -227,7 +253,7 @@ def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
 
 
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
-    from atom.config import Config, CompilationConfig
+    from atom.config import CompilationConfig, Config
 
     vllm_model_config = config.model_config
     vllm_scheduler_config = config.scheduler_config
@@ -324,6 +350,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
 
 def _generate_atom_config_from_sglang_config(config: Any):
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
+    from sglang.srt.configs.modelopt_config import ModelOptConfig
     from sglang.srt.distributed import get_tensor_model_parallel_rank
     from sglang.srt.layers.dp_attention import (
         get_attention_cp_rank,
@@ -332,14 +361,12 @@ def _generate_atom_config_from_sglang_config(config: Any):
         get_attention_tp_size,
     )
     from sglang.srt.server_args import (
-        get_global_server_args,
-        PortArgs,
         ZMQ_TCP_PORT_DELTA,
+        PortArgs,
+        get_global_server_args,
     )
-    from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
-    from sglang.srt.configs.modelopt_config import ModelOptConfig
-    from sglang.srt.configs.load_config import LoadConfig
-    from atom.config import Config, ParallelConfig, CompilationConfig
+
+    from atom.config import CompilationConfig, Config, ParallelConfig
 
     # sglang's ModelRunner already parsed and stored ServerArgs globally
     # before OOT model loading, so we can retrieve it directly.
@@ -399,6 +426,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     attn_cp_rank = get_attention_cp_rank()
     attn_tp_size = get_attention_tp_size()
     attn_tp_rank = get_attention_tp_rank()
+    enable_prefill_cp, prefill_cp_mode = _get_sglang_prefill_cp_config(server_args)
     (
         atom_tensor_parallel_size,
         atom_prefill_context_parallel_size,
@@ -410,8 +438,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
         dp_size=server_args.dp_size,
         tp_rank=tp_rank,
         enable_dp_attention=server_args.enable_dp_attention,
-        enable_nsa_prefill_context_parallel=server_args.enable_nsa_prefill_context_parallel,
-        nsa_prefill_cp_mode=server_args.nsa_prefill_cp_mode,
+        enable_nsa_prefill_context_parallel=enable_prefill_cp,
+        nsa_prefill_cp_mode=prefill_cp_mode,
         attn_cp_size=attn_cp_size,
         attn_cp_rank=attn_cp_rank,
         attn_tp_size=attn_tp_size,
@@ -481,14 +509,14 @@ def _generate_atom_config_from_sglang_config(config: Any):
         sglang_enable_torch_compile=server_args.enable_torch_compile,
         sglang_disable_cuda_graph=server_args.disable_cuda_graph,
         sglang_enable_dp_attention=server_args.enable_dp_attention,
-        sglang_enable_nsa_prefill_cp=server_args.enable_nsa_prefill_context_parallel,
-        sglang_nsa_prefill_cp_mode=server_args.nsa_prefill_cp_mode,
+        sglang_enable_nsa_prefill_cp=enable_prefill_cp,
+        sglang_nsa_prefill_cp_mode=prefill_cp_mode,
         sglang_aiter_rank_id=sglang_aiter_rank_id,
         sglang_dist_init_addr=sglang_dist_init_addr,
         sglang_port_args=sglang_port_args,
     )
 
-    # SGLang sets enable_dp_attention=True when enabling NSA prefill context
+    # SGLang sets enable_dp_attention=True when enabling prefill context
     # parallelism because its attention TP/CP groups are built through the
     # DP-attention layout code.  In ATOM plugin mode we remap that same SGLang
     # layout to aiter PCP groups above, so propagating enable_dp_attention into
@@ -497,10 +525,10 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # (it asserts dp_size == 1), so this keeps the plugin semantics aligned:
     # true DP-attention + PCP remains unsupported; dp_size > 1 is rejected in
     # _normalize_sglang_parallel_config().
-    if server_args.enable_nsa_prefill_context_parallel:
+    if enable_prefill_cp:
         if server_args.enable_dp_attention:
             logger.warning(
-                "SGLang enabled DP attention as part of NSA prefill context "
+                "SGLang enabled DP attention as part of prefill context "
                 "parallel setup. ATOM plugin maps this layout to aiter PCP "
                 "groups, so ATOM-side enable_dp_attention is disabled. "
                 "True DP attention combined with PCP is not supported."
@@ -551,7 +579,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
 
 
 def _generate_atom_config_from_rtpllm_config(config: Any):
-    from atom.config import Config, ParallelConfig, CompilationConfig
+    from atom.config import CompilationConfig, Config, ParallelConfig
 
     rtpllm_model_config = getattr(config, "model_config", None)
     rtpllm_parallelism_config = getattr(config, "parallelism_config", None)
@@ -635,8 +663,8 @@ def generate_atom_config_for_plugin_mode(config: Any = None):
 
     logger.info("Generate atom config for plugin mode from passed config")
     atom_config = None
-    from atom.plugin import is_vllm, is_sglang, is_rtpllm
     from atom.config import set_current_atom_config
+    from atom.plugin import is_rtpllm, is_sglang, is_vllm
 
     if is_vllm():
         atom_config = _generate_atom_config_from_vllm_config(config)

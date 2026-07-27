@@ -19,7 +19,8 @@ documented at the bottom of this file but NOT managed here.
 """
 
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # --- Data Parallelism ---
@@ -37,7 +38,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
-    # Override the PCP size that SGLang+ATOM maps into aiter. 0 means unset.
+    # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
+    # attention TP size to 1.
+    # ATOM remaps the SGLang world into internal TP x PCP groups.
+    # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",

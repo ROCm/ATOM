@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
+from atom.plugin.sglang.runtime.context import is_draft_extend_mode
+
 if TYPE_CHECKING:
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
 
@@ -24,7 +26,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
 
     def __init__(
         self,
-        owner_attn: "DeepseekV2MLAAttention",
+        owner_attn: DeepseekV2MLAAttention,
         base_attn: nn.Module,
     ) -> None:
         super().__init__()
@@ -184,14 +186,22 @@ class SGLangDeepseekMLAAttention(nn.Module):
     ) -> torch.Tensor:
         attn = self.owner_attn
         from aiter import dtypes
+
         from atom.model_ops.attention_mla import fused_qk_rope_concat_and_cache_mla
+        from atom.models.deepseek_v2 import _pcp_active
         from atom.plugin.sglang.models.deepseek_mla_forward import (
             _get_sglang_radix_attn,
+            _get_sglang_token_to_kv_pool_from_backend,
             mla_absorbed_bmm,
             mla_v_up_proj,
         )
-        from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
-        from atom.models.deepseek_v2 import _pcp_active
+
+        try:
+            from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+        except ImportError:
+            from sglang.srt.layers.attention.nsa.utils import (
+                nsa_use_prefill_cp as dsa_use_prefill_cp,
+            )
 
         q = self._project_q(q_input, q_scale)
         k_nope = kv_c_normed.unsqueeze(1)
@@ -217,7 +227,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
             pcp_ws = get_pcp_world_size()
             k_nope = pcp_allgather_rerange(k_nope.squeeze(1), pcp_ws).unsqueeze(1)
             k_pe = pcp_allgather_rerange(k_pe.squeeze(1), pcp_ws).unsqueeze(1)
-        elif nsa_use_prefill_cp(forward_batch):
+        elif dsa_use_prefill_cp(forward_batch):
             latent_cache = torch.cat([k_nope.squeeze(1), k_pe.squeeze(1)], dim=-1)
             k_nope, k_pe = attn.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -228,7 +238,10 @@ class SGLangDeepseekMLAAttention(nn.Module):
         q_descale = None
         if attn.use_fused_qk_rope_concat_and_cache_mla and not atom_pcp_on:
             mla_attn = _get_sglang_radix_attn(self.base_attn)
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(mla_attn.layer_id)
+            token_to_kv_pool = _get_sglang_token_to_kv_pool_from_backend(
+                "SGLang DeepSeek MLA fused cache path"
+            )
+            kv_cache = token_to_kv_pool.get_key_buffer(mla_attn.layer_id)
             q_cache_scale = getattr(mla_attn, "q_scale", None)
             if q_cache_scale is None:
                 q_cache_scale = mla_attn.k_scale
@@ -368,10 +381,11 @@ class SGLangDeepseekMLAAttention(nn.Module):
         attn = self.owner_attn
         forward_batch = self._get_forward_batch(kwargs)
 
+        from sglang.srt.layers.communicator import get_attn_tp_context
+
         from atom.plugin.sglang.models.deepseek_mla_forward import (
             _can_run_non_absorbed_mla_now,
         )
-        from sglang.srt.layers.communicator import get_attn_tp_context
 
         attn_tp_context = get_attn_tp_context()
         with attn_tp_context.maybe_input_scattered(forward_batch):
@@ -395,7 +409,9 @@ class SGLangDeepseekMLAAttention(nn.Module):
             use_non_absorbed = (
                 forward_batch.forward_mode.is_extend_without_speculative()
             )
-            if not use_non_absorbed and forward_batch.forward_mode.is_draft_extend():
+            if not use_non_absorbed and is_draft_extend_mode(
+                forward_batch.forward_mode, include_v2=True
+            ):
                 extend_prefix_lens_cpu = getattr(
                     forward_batch, "extend_prefix_lens_cpu", None
                 )

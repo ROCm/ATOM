@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
@@ -22,8 +23,6 @@ from aiter import (
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-import triton
-import triton.language as tl
 
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -177,7 +176,7 @@ def _maybe_apply_pcp_query_split(
         )
 
         pcp_size = get_pcp_world_size()
-    except Exception:
+    except Exception:  # noqa: BLE001
         pcp_size = 1
 
     if pcp_size <= 1:
@@ -213,7 +212,7 @@ def _maybe_apply_pcp_dense_query_split(
         )
 
         pcp_size = get_pcp_world_size()
-    except Exception:
+    except Exception:  # noqa: BLE001
         pcp_size = 1
 
     if pcp_size <= 1:
@@ -282,7 +281,7 @@ def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
 def _build_sparse_req_id_per_token_for_sglang(
     forward_batch,
     device: torch.device,
-    num_tokens: Optional[int] = None,
+    num_tokens: int | None = None,
 ) -> torch.Tensor:
     bs = int(forward_batch.batch_size)
     req_ids = torch.arange(bs, dtype=torch.int32, device=device)
@@ -327,8 +326,8 @@ def forward_sparse_mla_for_sglang(
     forward_batch,
     topk_indices: torch.Tensor,
     save_kv_cache: bool = True,
-    input_dtype: Optional[torch.dtype] = None,
-    q_scale: Optional[torch.Tensor] = None,
+    input_dtype: torch.dtype | None = None,
+    q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ATOM sparse MLA path for SGLang DeepSeek-V3.2."""
     if save_kv_cache and k is not None:
@@ -490,7 +489,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -658,7 +657,7 @@ def sparse_attn_indexer_sglang_fake(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,

@@ -50,7 +50,26 @@ from aiter.ops.triton.fused_mxfp4_quant import (
 )
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_all_reduce,
+    pcp_allgather_rankmajor,
+    pcp_allgather_rerange,
+    pcp_is_enabled,
+    pcp_pad_dense,
+    pcp_pad_len,
+    pcp_reduce_scatter,
+    pcp_round_robin_split,
+)
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
+# shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
+# `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
@@ -85,33 +104,15 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.plugin.vllm.attention.layer_sparse_mla import (
+    DeepseekV32IndexerCacheDecoratorForPluginMode,
+    IndexerDecoratorForPluginMode,
+)
 from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-
-# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
-# shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
-# `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.distributed.pcp_utils import (
-    pcp_all_reduce,
-    pcp_allgather_rankmajor,
-    get_pcp_world_size,
-    pcp_allgather_rerange,
-    pcp_is_enabled,
-    pcp_pad_dense,
-    pcp_pad_len,
-    pcp_reduce_scatter,
-    pcp_round_robin_split,
-)
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.plugin.vllm.attention.layer_sparse_mla import (
-    IndexerDecoratorForPluginMode,
-    DeepseekV32IndexerCacheDecoratorForPluginMode,
-)
-from torch import nn
-from transformers import PretrainedConfig
 
 # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
@@ -1221,9 +1222,7 @@ class DeepseekV2MoE(nn.Module):
             return False
         ctx = get_forward_context()
         context = getattr(ctx, "context", None)
-        if context is None or bool(getattr(context, "is_dummy_run", False)):
-            return False
-        return True
+        return not (context is None or bool(getattr(context, "is_dummy_run", False)))
 
     def _pcp_moe_merge_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_forward_context()
