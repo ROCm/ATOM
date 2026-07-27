@@ -1,8 +1,7 @@
-from typing import Type
-
 import torch
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+
 from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
 
@@ -96,7 +95,7 @@ class AiterMhaBackendForVllm:
         return False
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import AiterMhaMetadataBuilderForVllm
 
         return AiterMhaMetadataBuilderForVllm
@@ -168,7 +167,7 @@ class AiterMlaBackendForVllm:
         return (1, 0, 2, 3) if include_num_layers_dimension else (0, 1, 2)
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import AiterMlaMetadataBuilderForVllm
 
         return AiterMlaMetadataBuilderForVllm
@@ -259,7 +258,7 @@ class AiterSparseMlaBackendForVllm(AiterMlaBackendForVllm):
         return 64
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import AiterMlaSparseMetadataBuilder
 
         return AiterMlaSparseMetadataBuilder
@@ -292,7 +291,7 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
         return 64
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import (
             AiterMlaSparseIndexerMetadataBuilder,
         )
@@ -357,7 +356,7 @@ class MiniMaxM3SparseAttentionBackend:
         return SPARSE_BLOCK_SIZE
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import (
             MinimaxM3SparseAttentionMetadataBuilder,
         )
@@ -437,7 +436,7 @@ class SparseMHAIndexerBackend(AiterMlaBackendForVllm):
         return SPARSE_BLOCK_SIZE
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import (
             MinimaxM3SparseAttentionMetadataBuilder,
         )
@@ -473,7 +472,7 @@ class GDNAttentionBackend:
         return "ROCM_GDN_ATTENTION"
 
     @staticmethod
-    def get_impl_cls() -> Type:
+    def get_impl_cls() -> type:
         from atom.plugin.vllm.attention.layer_gdn import GatedDeltaNet
 
         return GatedDeltaNet
