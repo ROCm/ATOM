@@ -148,7 +148,7 @@ def responses_tools_to_openai(tools: Any) -> List[Dict[str, Any]]:
         if not isinstance(tl, dict):
             continue
         if tl.get("type") == "function":
-            fn = tl.get("function", tl)
+            fn = tl.get("function") or tl
             ct.append(
                 {
                     "type": "function",
@@ -314,8 +314,11 @@ def _claude_tool_to_shell(
             return None
         off, lim = a.get("offset"), a.get("limit")
         if off or lim:
-            start = int(off or 0) + 1
-            end = start + int(lim or 200) - 1
+            try:
+                start = int(off or 0) + 1
+                end = start + int(lim or 200) - 1
+            except (ValueError, TypeError):
+                start, end = 1, 400
         else:
             start, end = 1, 400
         return _read_cmd(str(fp), cwd, start, end)
