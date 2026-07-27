@@ -415,11 +415,17 @@ def load_weights_into_model(
         staging_report = staging_pool.flush_pending()
         if staging_report.incomplete:
             detail = "\n  ".join(staging_report.incomplete)
-            raise RuntimeError(
+            message = (
                 f"Batched loader: {len(staging_report.incomplete)} MoE "
                 f"parameter(s) did not receive every routed expert from the "
                 f"checkpoint:\n  {detail}"
             )
+            if envs.ATOM_LOADER_STRICT_COVERAGE:
+                raise RuntimeError(
+                    f"{message}\nSet ATOM_LOADER_STRICT_COVERAGE=false to load "
+                    "anyway, leaving those expert slots at their init values."
+                )
+            logger.warning("%s\nLoading anyway (strict coverage disabled).", message)
     finally:
         if executor is not None:
             executor.shutdown(wait=True)

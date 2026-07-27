@@ -19,7 +19,8 @@ documented at the bottom of this file but NOT managed here.
 """
 
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # --- Data Parallelism ---
@@ -194,6 +195,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Fail loading when the checkpoint does not deliver every routed expert of
+    # a fused MoE parameter. On by default: the alternative is a model that
+    # loads happily with some expert slots left at their init values, which
+    # only shows up much later as an accuracy drop. Set to false to downgrade
+    # to a warning when bringing up a checkpoint that is known to be partial.
+    "ATOM_LOADER_STRICT_COVERAGE": lambda: (
+        os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
