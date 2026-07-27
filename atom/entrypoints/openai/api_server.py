@@ -18,6 +18,7 @@ import binascii
 import io
 import json
 import logging
+import os
 import time
 import urllib.request
 import uuid
@@ -1755,6 +1756,16 @@ def main():
         help="Server port (note: --port is used for internal engine communication)",
     )
     parser.add_argument(
+        "--chat-template",
+        type=str,
+        default=None,
+        help=(
+            "Override the tokenizer's chat template. "
+            "Accepts a file path to a Jinja template or an inline Jinja string. "
+            "Useful for base models that have no built-in chat_template."
+        ),
+    )
+    parser.add_argument(
         "--default-chat-template-kwargs",
         type=str,
         default=None,
@@ -1787,6 +1798,15 @@ def main():
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
+    if args.chat_template:
+        if os.path.isfile(args.chat_template):
+            with open(args.chat_template, "r", encoding="utf-8") as f:
+                tokenizer.chat_template = f.read()
+            logger.info(f"Loaded chat template from file: {args.chat_template}")
+        else:
+            tokenizer.chat_template = args.chat_template
+            logger.info("Using inline chat template from --chat-template argument")
+
     model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
