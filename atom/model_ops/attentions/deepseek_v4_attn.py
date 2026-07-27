@@ -1291,16 +1291,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 getattr(attn_metadata, "dspark_ragged_lens_gpu", None) is not None
                 and getattr(attn_metadata, "dspark_full_q", 0) > 0
             )
-            # When `dspark.ragged` is on, `build_for_cudagraph_capture` captures
-            # EVERY decode graph through the ragged branch (uniform `max_q_len`),
-            # so even a rectangular step replays the ragged kernels and its
-            # windows must be refreshed too — see the rect branch below.
-            _drafter = getattr(self.model_runner, "drafter", None)
-            _graphs_are_ragged = (
-                self.model_runner.config.dspark.ragged
-                and _drafter is not None
-                and getattr(_drafter, "dspark_confidence_schedule", False)
-            )
+            # NOTE: with `dspark.ragged` + `confidence_schedule` on, `prepare_decode`
+            # sets `dspark_ragged_lens_gpu` on EVERY decode (uniform lengths when
+            # nothing shrank), so `_ragged` is always True there and the rectangular
+            # branch below only runs with those options off. The windows are
+            # therefore rebuilt once per fwd; steps whose lengths did not actually
+            # shrink pay for a rebuild they do not need.
             if self._indexer_fp4 and _ragged:
                 self._refresh_fp4_ragged_windows(
                     attn_metadata,
@@ -1341,22 +1337,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
                 meta["fp4_cta_info"] = self._v4_fp4_cta_info
                 meta["fp4_total_ctas"] = self._fp4_parallel_unit_num
-                if _graphs_are_ragged:
-                    # The captured graph replays the ragged kernels even on this
-                    # rectangular step, so refresh their windows from stale data.
-                    # A rectangle is the uniform case: feed `next_n` per real seq
-                    # (same shape `build_for_cudagraph_capture` synthesizes).
-                    self._refresh_fp4_ragged_windows(
-                        attn_metadata,
-                        torch.full(
-                            (bs,),
-                            next_n,
-                            dtype=torch.int32,
-                            device=positions_gpu.device,
-                        ),
-                        positions_gpu,
-                        meta,
-                    )
             return meta
 
         ratio = 4  # CSA — also referenced by `visible_end_gpu` below
