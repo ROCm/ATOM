@@ -91,6 +91,13 @@ class EngineArgs:
             "--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path."
         )
         parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=None,
+            help="Override the model name returned by the API. "
+            "If not specified, defaults to the --model value.",
+        )
+        parser.add_argument(
             "--trust-remote-code",
             action="store_true",
             help="Trust remote code when loading model.",

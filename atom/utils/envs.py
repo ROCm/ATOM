@@ -19,7 +19,8 @@ documented at the bottom of this file but NOT managed here.
 """
 
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # --- Data Parallelism ---
@@ -37,6 +38,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
+    # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
+    # attention TP size to 1.
+    # ATOM remaps the SGLang world into internal TP x PCP groups.
+    # 0 means unset.
+    "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -194,6 +200,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Fail loading when the checkpoint does not deliver every routed expert of
+    # a fused MoE parameter. On by default: the alternative is a model that
+    # loads happily with some expert slots left at their init values, which
+    # only shows up much later as an accuracy drop. Set to false to downgrade
+    # to a warning when bringing up a checkpoint that is known to be partial.
+    "ATOM_LOADER_STRICT_COVERAGE": lambda: (
+        os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

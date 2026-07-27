@@ -39,6 +39,7 @@ on:
           - DeepSeek-R1-FP4 TP8 MTP3
           - DeepSeek-R1-FP4 TP8 MTP1
           - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 TP4 PCP2
           - GLM-5.2-MXFP4 TP4
       model_mi308:
         description: "Manual MI308 accuracy model selection"
@@ -367,6 +368,17 @@ jobs:
                   "lm_eval_num_concurrent": 65,
                   "accuracy_test_threshold": 0.92,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_USE_AITER=1\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
+                  "runner": "atom-plugin-acc-validation-runner-sgl",
+              },
+              {
+                  "toggle_env": "RUN_GLM52_FP8_TP4_PCP2",
+                  "model_name": "GLM-5.2-FP8 TP4 PCP2",
+                  "model_path": "zai-org/GLM-5.2-FP8",
+                  "extra_args": "--trust-remote-code --tp-size 4 --enable-nsa-prefill-context-parallel --attn-cp-size 2 --nsa-prefill-cp-mode round-robin-split --max-prefill-tokens 30720 --chunked-prefill-size 30720 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"},\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
+                  "lm_eval_num_fewshot": 5,
+                  "lm_eval_num_concurrent": 65,
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_SGLANG_PCP_SIZE=2\nATOM_PCP_MOE_MERGE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
                   "runner": "atom-plugin-acc-validation-runner-sgl",
               },
               {

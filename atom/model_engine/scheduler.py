@@ -335,7 +335,6 @@ class ScheduledBatch:
             for seq in seqs.values()
             if getattr(seq, "mrope_positions", None) is not None
         }
-        self.has_mrope = bool(self.mrope_positions_by_req)
 
         # num_cached_tokens for chunked prefill support
         self.num_cached_tokens = (
@@ -412,6 +411,9 @@ class ScheduledBatch:
         # cudagraph shape. None outside DSpark-under-DP steps.
         self.dspark_dp_bs = None
         self.dspark_dp_total_tokens = None
+        # Flat PIECEWISE replay token count for this decode step (set in
+        # prepare_inputs). None when N/A -> consumers use bs*max_seqlen_q.
+        self.dynamic_num_tokens_pad = None
 
         # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
@@ -2176,7 +2178,6 @@ class PrefillScheduler:
                 name=disagg_cu_shm_name, create=False
             )
             logger.info("initialized shared memory")
-        self.num_seq_done = 0
         self._pending_lock = threading.Lock()
 
     def is_finished(self) -> bool:
