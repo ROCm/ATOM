@@ -3036,9 +3036,7 @@ class MoE(nn.Module):
             # ATOM AR layer routes through the TBO-aware custom op when
             # self.tbo_aware (pure TP+TBO); plain all_reduce otherwise
             # (non-TBO / TBO+DP), untouched.
-            routed = tensor_model_parallel_all_reduce(
-                routed, tbo_aware=self.tbo_aware
-            )
+            routed = tensor_model_parallel_all_reduce(routed, tbo_aware=self.tbo_aware)
         return routed
 
     def single_stream_moe_forward(
