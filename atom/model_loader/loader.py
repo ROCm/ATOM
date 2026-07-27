@@ -5,14 +5,11 @@ import json
 import logging
 import os
 import time
-from collections.abc import Generator
-from glob import glob
 
 import safetensors
 import safetensors.torch
 import torch
 from torch import nn
-from tqdm import tqdm
 from transformers import AutoConfig
 
 # safetensors<=0.7.0 ships a Python `_TYPES` dict missing the `F8_E8M0`
@@ -25,17 +22,15 @@ if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"
     safetensors.torch._TYPES["F8_E8M0"] = torch.float8_e8m0fnu
 
 from aiter.dist.parallel_state import get_tp_group
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from atom.model_loader.loading_core import load_weights_into_model
+from atom.model_loader.weight_iterator import (
+    safetensors_weights_iterator,
+)
 
 # Re-exported so the many `from atom.model_loader.loader import WeightsMapper`
 # call sites (models, vLLM/SGLang/RTP-LLM plugins) keep working.
 from atom.model_loader.weight_names import WeightsMapper, WeightsMapping  # noqa: F401
-from atom.model_loader.weight_utils import (
-    download_weights_from_hf,
-    filter_duplicate_safetensors_files,
-)
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.moe import FusedMoEMethodBase
 from atom.model_ops.topK import (
@@ -73,58 +68,6 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
             f"default_weight_loader: shape mismatch — param={tuple(param.shape)} "
             f"loaded={tuple(loaded_weight.shape)}. Cannot copy."
         )
-
-
-def safetensors_weights_iterator(
-    model_name_or_path: str,
-    disable_mmap: bool = False,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
-    logger.info(f"disable_mmap: {disable_mmap}")
-    path = (
-        model_name_or_path
-        if os.path.isdir(model_name_or_path)
-        else download_weights_from_hf(
-            model_name_or_path, None, ["*.safetensors"], ignore_patterns=["original/*"]
-        )
-    )
-    hf_weights_files = filter_duplicate_safetensors_files(
-        glob(os.path.join(path, "*.safetensors")), path, SAFE_WEIGHTS_INDEX_NAME
-    )
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
-
-    iters = tqdm(
-        hf_weights_files,
-        desc=f"Loading safetensors shards[{model_name_or_path}]",
-        disable=not enable_tqdm,
-    )
-    for st_file in iters:
-        # Advise kernel for sequential read-ahead (mmap optimization)
-        if not disable_mmap and hasattr(os, "posix_fadvise"):
-            try:
-                fd = os.open(st_file, os.O_RDONLY)
-                file_size = os.fstat(fd).st_size
-                os.posix_fadvise(
-                    fd,
-                    0,
-                    file_size,
-                    os.POSIX_FADV_SEQUENTIAL | os.POSIX_FADV_WILLNEED,
-                )
-                os.close(fd)
-            except OSError:
-                pass
-
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-                for name, param in result.items():
-                    yield name, param
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in f.keys():
-                    yield name, f.get_tensor(name)
 
 
 # when plugin mode, model loader method is bind to model implementation

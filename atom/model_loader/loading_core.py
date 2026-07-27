@@ -42,7 +42,7 @@ def load_weights_into_model(
     default_weight_loader: Callable,
     fuse_shared_expert: Callable[[str, str], bool],
     is_rank0: Callable[[], bool],
-    weights_iterator: Callable[[str, bool], Iterable[tuple[str, torch.Tensor]]],
+    weights_iterator: Callable[..., Iterable[tuple[str, torch.Tensor]]],
 ) -> set[str]:
     """Copy every checkpoint tensor into the model parameter it belongs to.
 
@@ -52,7 +52,7 @@ def load_weights_into_model(
     - ``default_weight_loader``  fallback copy for params without their own
     - ``fuse_shared_expert``     ``(shared_prefix, routed_prefix) -> fuse?``
     - ``is_rank0``               suppress duplicate diagnostics off rank 0
-    - ``weights_iterator``       ``(path, disable_mmap) -> (name, tensor)``
+    - ``weights_iterator``       ``(path, disable_mmap, wants) -> (name, tensor)``
     """
 
     def _n_routed_experts() -> int | None:
@@ -161,13 +161,35 @@ def load_weights_into_model(
         load_fused_expert_weights_fn=load_fused_expert_weights_fn,
     )
 
+    # Rewriting a name is the same question as "is this tensor wanted", and the
+    # iterator asks it before materializing anything -- so answer it once and
+    # keep the answer. On a target-model load nearly every tensor is wanted, and
+    # rewriting is a dozen substring scans plus a regex per tensor.
+    rewritten: dict[str, str | None] = {}
+
+    def _wanted(ckpt_name: str) -> bool:
+        if ckpt_name not in rewritten:
+            rewritten[ckpt_name] = rewriter.rewrite(ckpt_name)
+        return rewritten[ckpt_name] is not None
+
     try:
         disable_mmap = envs.ATOM_DISABLE_MMAP
-        for name, weight_tensor in weights_iterator(model_name_or_path, disable_mmap):
+        # Reject by name before the tensor is materialized. A drafter load reads
+        # the whole target checkpoint to pick out the MTP block, so most shards
+        # can be skipped without being read at all. Under `--load_dummy` nothing
+        # is loaded, so nothing is wanted -- and the rewriter, which is allowed
+        # to raise on a checkpoint it cannot map, is never consulted.
+        for name, weight_tensor in weights_iterator(
+            model_name_or_path,
+            disable_mmap,
+            (lambda _: False) if load_dummy else _wanted,
+        ):
             if load_dummy:
                 continue
             _orig_ckpt_name = name  # preserve for ckpt-side coverage report
-            name = rewriter.rewrite(name)
+            # Normally a cache hit: the iterator just asked. Recomputed only if
+            # a caller supplied an iterator that ignores the predicate.
+            name = rewritten[name] if name in rewritten else rewriter.rewrite(name)
             if name is None:
                 continue
             dispatcher.dispatch(_orig_ckpt_name, name, weight_tensor)

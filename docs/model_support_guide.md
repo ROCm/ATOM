@@ -182,7 +182,11 @@ def load_model(
 
 1. **SafeTensors iteration:** `safetensors_weights_iterator()` discovers and iterates over all `*.safetensors` files in the model directory (or downloads them from HuggingFace Hub via `download_weights_from_hf()`). Duplicate files are filtered using the `model.safetensors.index.json` weight map. ATOM uses memory-mapped loading by default; set `ATOM_DISABLE_MMAP=true` to disable.
 
-2. **Weight name rewriting:** Each weight name goes through several transformations:
+   The iterator takes a `wants(name)` predicate so a tensor can be rejected before it is materialized — step 2 below is what answers it. A shard holding nothing wanted is skipped without being read, decided from the safetensors header alone. This matters for a drafter load, which reads the *target's* checkpoint to pick out the MTP block and discards the rest: for DeepSeek-V4-Flash that is 1 shard out of 46. Without mmap (`ATOM_DISABLE_MMAP=true`, which CI sets) each shard is otherwise read and deserialized whole, so the discarded work is real — that pass drops from 26s to 1s.
+
+   Within a shard that *is* read, the non-mmap path still deserializes every tensor in it, because `safetensors.torch.load` has no partial API; the predicate only suppresses the yield.
+
+2. **Weight name rewriting:** `CheckpointNameRewriter` turns an on-disk name into the parameter name it belongs to, returning `None` for a tensor this model does not want — which is also what decides whether a shard gets read at all (step 1). Each weight name goes through several transformations:
    - `weight_scale_inv` is renamed to `weight_scale`.
    - Model-specific `weights_mapping` (e.g., GPT-OSS maps `gate_up_proj_blocks` to `w13_weight`).
    - For speculative decoding (`spec_decode=True`), MTP layer weights are rewritten via `rewrite_spec_layer_name()`.
@@ -391,5 +395,6 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 | `atom/models/qwen3_next_mtp.py` | Qwen3-Next MTP draft model |
 | `atom/models/qwen3_5_mtp.py` | Qwen3.5 MTP draft model: `Qwen3_5MTP`, `Qwen3_5MultiTokenPredictor` |
 | `atom/models/utils.py` | Model utilities: `IntermediateTensors`, `PPMissingLayer`, `make_layers`, `maybe_prefix`, `extract_layer_index` |
-| `atom/model_loader/loader.py` | Weight loading: `load_model`, `safetensors_weights_iterator`, `default_weight_loader` |
+| `atom/model_loader/loader.py` | Public API: `load_model`, `default_weight_loader`; binds the AITER-dependent pieces and runs post-load processing |
+| `atom/model_loader/weight_iterator.py` | `safetensors_weights_iterator`: reads shards, skipping what the caller does not want |
 | `atom/model_loader/weight_utils.py` | Weight utilities: `download_weights_from_hf`, `set_weight_attrs`, `filter_duplicate_safetensors_files` |

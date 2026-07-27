@@ -20,15 +20,23 @@ no AITER, and the fake MoE module below calls the *real* layout functions so
 the tests keep their teeth.
 """
 
+import builtins
 import os
+import tempfile
 import unittest
+import unittest.mock
 from typing import ClassVar
 
+import safetensors.torch
 import torch
 from torch import nn
 
 from atom.model_loader.expert_staging import ExpertStagingPool
 from atom.model_loader.loading_core import load_weights_into_model
+from atom.model_loader.weight_iterator import (
+    _shard_tensor_names,
+    safetensors_weights_iterator,
+)
 from atom.model_ops.fused_moe.expert_layout import (
     count_local_base_experts,
     determine_expert_map,
@@ -305,16 +313,23 @@ def fused_shards(num_layers, num_routed):
     return [routed, shared]
 
 
-def shards_to_iterator(shards):
+def shards_to_iterator(shards, materialized=None):
     """Turn an ordered list of shards into a `weights_iterator` callable.
 
     Replaces the `glob` + `safe_open` pair, whose order is filesystem- and
     lexicographic-dependent; here the read order is exactly the list order.
+    `materialized`, when given, records every name the loader actually asked
+    for -- i.e. everything the `wants` predicate did not reject.
     """
 
-    def _iterator(path, disable_mmap):
+    def _iterator(path, disable_mmap, wants=None):
         for shard in shards:
-            yield from shard.items()
+            for name, tensor in shard.items():
+                if wants is not None and not wants(name):
+                    continue
+                if materialized is not None:
+                    materialized.append(name)
+                yield name, tensor
 
     return _iterator
 
@@ -521,6 +536,125 @@ class StagingBufferAllocationTest(unittest.TestCase):
         self.assertEqual(staging.dtype, torch.uint8)
         self.assertEqual(staging.shape, param.data.shape)
         self.assertEqual(int(staging.sum()), 0, "staging buffer must be zeroed")
+
+
+class DrafterSkipsUnwantedTensorsTest(unittest.TestCase):
+    """A drafter load must not materialize the target model's weights.
+
+    The drafter reads the *target's* checkpoint to pick out the MTP block. With
+    `ATOM_DISABLE_MMAP=true` -- which CI sets -- a shard is read whole and
+    deserialized whole, so the win comes from not reading shards that hold
+    nothing wanted at all (see RealSafetensorsIteratorTest). This test pins the
+    loader's half of that contract: it must reject by name, up front.
+    """
+
+    NUM_LAYERS = 1
+    NUM_ROUTED = 8
+
+    def test_target_weights_are_never_materialized(self):
+        # Note: this drives the injected iterator, so it pins the loader's half
+        # of the contract (it asks before consuming). The production iterator's
+        # half -- header-only shard inspection and the skip -- is covered by
+        # RealSafetensorsIteratorTest below.
+        target = per_expert_shards(self.NUM_LAYERS, self.NUM_ROUTED, prefix="model")
+        drafter = per_expert_shards(self.NUM_LAYERS, self.NUM_ROUTED, prefix="mtp")
+        shards = target + drafter
+
+        materialized: list[str] = []
+        model = build_model(MTPDrafterModel, self.NUM_LAYERS, self.NUM_ROUTED)
+        load_weights_into_model(
+            model=model,
+            model_name_or_path="<synthetic>",
+            hf_config=HFConfig(self.NUM_LAYERS, self.NUM_ROUTED),
+            spec_decode=True,
+            default_weight_loader=default_weight_loader,
+            fuse_shared_expert=lambda *_args, **_kw: True,
+            is_rank0=lambda: True,
+            weights_iterator=shards_to_iterator(shards, materialized),
+        )
+
+        self.assertTrue(materialized, "drafter loaded nothing at all")
+        self.assertFalse(
+            [n for n in materialized if not n.startswith("mtp.")],
+            "target-model tensors were materialized during a drafter load",
+        )
+        # And the drafter still got everything it needed.
+        for moe in model.moes():
+            self.assertTrue(bool(moe.w13_weight.abs().sum() > 0))
+
+
+class RealSafetensorsIteratorTest(unittest.TestCase):
+    """Exercises the production iterator against real files on disk."""
+
+    def _write_shards(self, root: str) -> None:
+        safetensors.torch.save_file(
+            {
+                f"model.layers.0.mlp.experts.{i}.gate_proj.weight": torch.zeros(2)
+                for i in range(4)
+            },
+            os.path.join(root, "model-00001-of-00002.safetensors"),
+        )
+        safetensors.torch.save_file(
+            {"mtp.layers.0.mlp.gate.weight": torch.ones(2)},
+            os.path.join(root, "model-00002-of-00002.safetensors"),
+        )
+
+    def test_shard_with_nothing_wanted_is_never_opened(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_shards(root)
+            wanted = os.path.join(root, "model-00002-of-00002.safetensors")
+            skipped = os.path.join(root, "model-00001-of-00002.safetensors")
+
+            opened: list[str] = []
+            real_open = builtins.open
+
+            def _tracking_open(file, *args, **kwargs):
+                # The header probe opens the file too; only count reads that go
+                # past it, which is what `safetensors.torch.load` does.
+                if isinstance(file, str) and file.endswith(".safetensors"):
+                    opened.append(file)
+                return real_open(file, *args, **kwargs)
+
+            for disable_mmap in (True, False):
+                opened.clear()
+                with unittest.mock.patch.object(builtins, "open", _tracking_open):
+                    names = [
+                        name
+                        for name, _ in safetensors_weights_iterator(
+                            root, disable_mmap, wants=lambda n: n.startswith("mtp.")
+                        )
+                    ]
+                self.assertEqual(names, ["mtp.layers.0.mlp.gate.weight"])
+                # The skipped shard is opened at most once (the header probe),
+                # never a second time to read its tensors.
+                self.assertLessEqual(
+                    opened.count(skipped), 1, f"disable_mmap={disable_mmap}"
+                )
+                self.assertGreaterEqual(opened.count(wanted), 1)
+
+    def test_no_predicate_yields_everything(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_shards(root)
+            for disable_mmap in (True, False):
+                names = {
+                    name for name, _ in safetensors_weights_iterator(root, disable_mmap)
+                }
+                self.assertEqual(len(names), 5)
+
+    def test_unreadable_header_falls_back_to_loading_the_shard(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_shards(root)
+            self.assertIsNotNone(
+                _shard_tensor_names(
+                    os.path.join(root, "model-00002-of-00002.safetensors")
+                )
+            )
+            truncated = os.path.join(root, "truncated.safetensors")
+            with open(truncated, "wb") as f:
+                f.write(b"\x00\x01")
+            # None means "cannot tell" -- the caller must not skip the shard on
+            # the strength of a failed probe.
+            self.assertIsNone(_shard_tensor_names(truncated))
 
 
 if __name__ == "__main__":
