@@ -340,8 +340,8 @@ class Eagle3LlamaModel(nn.Module):
         # full on every rank — a local lookup with no post-embedding all-reduce.
         # Bit-identical to the sharded path; on by default (trades memory for one
         # fewer collective per draft step). Falls back to the sharded embedding
-        # when ATOM_EAGLE_REPLICATE_EMBED=0.
-        if envs.ATOM_EAGLE_REPLICATE_EMBED:
+        # when ATOM_REPLICATE_VOCAB_EMBED=0.
+        if envs.ATOM_REPLICATE_VOCAB_EMBED:
             self.embed_tokens = ReplicatedEmbedding(
                 config.vocab_size, config.hidden_size
             )

@@ -47,6 +47,24 @@ class TestAggregateBasic:
         result = agg.aggregate(outputs)
         assert result.finished_recving == {"r1"}
 
+    def test_all_workers_report_same_loading(self):
+        agg = KVOutputAggregator(world_size=2)
+        outputs = [KVConnectorOutput(finished_loading={"r1"}) for _ in range(2)]
+        result = agg.aggregate(outputs)
+        assert result.finished_loading == {"r1"}
+        assert result.finished_recving == set()
+
+    def test_loading_failure_wins_after_all_workers_report(self):
+        agg = KVOutputAggregator(world_size=2)
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(finished_loading={"r1"}),
+                KVConnectorOutput(failed_loading={"r1"}),
+            ]
+        )
+        assert result.finished_loading == set()
+        assert result.failed_loading == {"r1"}
+
     def test_partial_workers_not_emitted(self):
         agg = KVOutputAggregator(world_size=3)
         outputs = [
@@ -143,12 +161,14 @@ class TestKVConnectorOutput:
         out = KVConnectorOutput()
         assert out.finished_sending == set()
         assert out.finished_recving == set()
+        assert out.finished_loading == set()
         assert out.expected_finished_count == 0
 
     def test_is_empty(self):
         assert KVConnectorOutput().is_empty()
         assert not KVConnectorOutput(finished_sending={"x"}).is_empty()
         assert not KVConnectorOutput(finished_recving={"x"}).is_empty()
+        assert not KVConnectorOutput(finished_loading={"x"}).is_empty()
 
     def test_repr(self):
         out = KVConnectorOutput(finished_sending={"a"}, finished_recving={"b"})

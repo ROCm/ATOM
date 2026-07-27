@@ -355,8 +355,10 @@ def forward_sparse_mla_for_sglang(
             max_seqlen_qo=max_seqlen_qo,
             uni_seqlen_qo=uni_seqlen_qo,
             fast_mode=True,
-            dtype_q=q.dtype,
-            dtype_kv=k_buffer.dtype,
+            dtype_q_nope=q.dtype,
+            dtype_q_rope=q.dtype,
+            dtype_kv_nope=k_buffer.dtype,
+            dtype_kv_rope=k_buffer.dtype,
         )
 
     mla_decode_fwd(

@@ -21,6 +21,22 @@ ENV MAX_JOBS=${MAX_JOBS}
 ENV VLLM_TARGET_DEVICE=rocm
 ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 
+# Preserve the base image's custom RCCL before any OOT apt runs.
+# The native base builds RCCL from the pinned RCCL_BRANCH (build_rccl stage) and
+# installs it to /usr/local/lib with an /etc/ld.so.conf.d/rccl.conf entry, so
+# ldconfig resolves the custom build. The custom `dpkg -i --force-all` leaves
+# rocm-hip's rccl version dep "broken" on purpose; the OOT `apt --fix-broken
+# install` below satisfies it by reinstalling the STOCK ROCm rccl into
+# /opt/rocm, which then shadows the custom build via ldconfig. That regresses
+# GLM-5.2 decode perf (memory-bound kernels run ~40% slower under the stock rccl
+# even though its collective kernels are never called in decode). Back it up here
+# and restore after all OOT installs (mirrors the Triton backup/restore below).
+RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
+    mkdir -p /tmp/rccl-base-backup && \
+    (cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true) && \
+    (cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true) && \
+    ls -l /tmp/rccl-base-backup/ || true
+
 RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     apt-get update && \
     apt --fix-broken install -y && \
@@ -119,6 +135,29 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton || true
 
+# Restore the base image's custom RCCL over any stock rccl that OOT apt pulled
+# into /opt/rocm, so the OOT image runs the SAME custom RCCL as the native image.
+# Must run after ALL OOT apt/pip installs. Removes the stock /opt/rocm librccl so
+# ldconfig unambiguously resolves the custom build in /usr/local/lib (leaving the
+# stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied — only the .so
+# is swapped, exactly the runtime state the native image ships).
+RUN echo "========== [OOT] Restore base-image custom RCCL ==========" && \
+    if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
+      echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
+      rm -f /opt/rocm*/lib/librccl.so* && \
+      cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
+      if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
+        cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
+      else \
+        echo "/usr/local/lib" > /etc/ld.so.conf.d/rccl.conf ; \
+      fi && \
+      ldconfig && \
+      echo "librccl now resolves to:" && ldconfig -p | grep -i librccl ; \
+    else \
+      echo "WARNING: no base-image custom RCCL backup found; leaving rccl unchanged" ; \
+    fi && \
+    rm -rf /tmp/rccl-base-backup
+
 
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
@@ -132,11 +171,18 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.12"
+ARG SGLANG_REF="v0.5.15.post1"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
+
+# Temporary backport: SGLang v0.5.15.post1, the latest release at the time of
+# this change, does not include the upstream Cohere2MoeConfig dataclass fix.
+# Remove this patch once SGLANG_REF includes:
+# https://github.com/sgl-project/sglang/commit/6a4ffcc34aae336e712792b1bbcbd142ba7114eb
+# Tracking issue: https://github.com/sgl-project/sglang/issues/28233
+COPY docker/patches/sglang/cohere2-moe-drop-invalid-hf-strict.patch /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
@@ -157,6 +203,7 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     git clone "${SGLANG_REPO}" /app/sglang && \
     cd /app/sglang && \
     git checkout "${SGLANG_REF}" && \
+    git apply /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch && \
     git submodule update --init --recursive && \
     echo "sglang ref:" && \
     git rev-parse HEAD
@@ -183,7 +230,7 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
-    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'transformers==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
+    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       -r /tmp/sglang-runtime-common.txt \
       airportsdata \
@@ -475,5 +522,23 @@ from lmcache.v1.metadata import LMCacheMetadata; \
 assert 'rocm' in torch.__version__, torch.__version__; \
 assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
 print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
+
+# ========== SemiAnalysis aiperf agentic benchmark tool ==========
+# Install the SemiAnalysis fork pinned to the commit that supports the SA
+# agentic datasets (semianalysis_cc_traces_weka_062126*).
+ARG INSTALL_SA_AIPERF=1
+ARG SA_AIPERF_COMMIT="0d2aa0572ac685943d38c580675c4a61023581d3"
+RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
+        rm -rf /opt/aiperf && \
+        git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
+        cd /opt/aiperf && \
+        git checkout "${SA_AIPERF_COMMIT}" && \
+        "${VENV_PYTHON}" -m pip install -e . && \
+        "${VENV_PYTHON}" -m pip show aiperf || true && \
+        command -v aiperf && aiperf --help >/dev/null; \
+    else \
+        echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
 
 CMD ["/bin/bash"]

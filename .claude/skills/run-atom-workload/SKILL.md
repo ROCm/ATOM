@@ -1,9 +1,9 @@
 ---
 name: run-atom-workload
-description: Run any ATOM workload — accuracy eval (GSM8K via lm_eval), performance benchmark, concurrency sweep, offline simple_inference, or fault repro under rocm-debug-agent. Use when the user asks to "test accuracy", "测精度", "跑 GSM8K", "跑 benchmark", "test performance", "run sweep", "repro the fault", "测一下 MTP1 精度", "跑 simple_inference" — anything that drives an ATOM workload. Encodes the canonical flow (stop → start → workload-in-shell-bg → wait_infer_drain → stop) and the model-family env vars. Same pattern works for both server-based workloads (lm_eval / benchmark client) and offline simple_inference. Do NOT use for profiling traces (use capture-trace).
-version: 1.6.0
+description: Run any ATOM workload — accuracy eval (GSM8K via lm_eval), performance benchmark, concurrency sweep, offline simple_inference, or fault repro under rocm-debug-agent. Use when the user asks to "test accuracy", "测精度", "跑 GSM8K", "跑 benchmark", "test performance", "run sweep", "repro the fault", "测一下 MTP1 精度", "跑 simple_inference" — anything that drives an ATOM workload. Encodes the canonical flow (stop → start → workload-in-bg → wait_infer_drain → stop) and the model-family env vars. Same pattern works for both server-based workloads (lm_eval / benchmark client) and offline simple_inference. Do NOT use for profiling traces (use capture-trace).
+version: 1.7.0
 scope: ATOM on AMD ROCm; `scripts/` orchestration scripts under repo root
-last_updated: 2026-05-21
+last_updated: 2026-07-18
 ---
 
 ## Path convention
@@ -24,38 +24,44 @@ Past failure modes this skill prevents (collected from many sessions):
 
 1. **Writing wrapper scripts in `/app/logs_claude/`** — `start_atom_server.sh` etc. ARE the orchestration layer. Wrapping them is pure noise. The dozens of `run_*.sh` / `start_*_safe.sh` files in `/app/logs_claude/` are session debris — **do not mimic them**.
 2. **Chaining all steps with `&&` into one long command** — the user has explicitly forbidden this. Each step gets its own Bash tool call so logs are separate, errors abort cleanly, and the user can interrupt at any boundary.
-3. **Foregrounding `start_atom_server.sh`** — its inline ready-poll caps at **120 iterations × `sleep 1` = 120s** with no failure exit, so any model that takes >2min to cold-start (V4-Pro takes 5–10min) lets the script return success while the server is still loading. Step 3 then launches against a not-yet-ready server. Fix: background it with `&`, use step 2.5 as the real foreground ready gate.
+3. **Foregrounding `start_atom_server.sh`** — its inline ready-poll caps at **120 iterations × `sleep 1` = 120s** with no failure exit, so any model that takes >2min to cold-start (V4-Pro takes 5–10min) lets the script return success while the server is still loading. Step 3 then launches against a not-yet-ready server. Fix: launch it with the Bash tool's **`run_in_background: true`**, use step 2.5 as the real foreground ready gate.
 4. **Skipping `wait_infer_drain.sh`** — without it, GPU faults take the whole timeout to surface, and hangs go undetected. `wait_infer_drain.sh` exits in ~10s on fault and ~1min on hang, with tail-log attached.
 5. **Using `curl /health` for liveness** — under heavy load it can false-negative. The flow uses `/v1/models` (start script) and `pgrep` + Engine Core marker (drain script).
 6. **Forgetting model-family env vars** — V4-Pro silently regresses on accuracy without `AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1`. Pinned in the table below.
 7. **Skipping drain for offline simple_inference** — `wait_infer_drain.sh` supports offline mode (process-exit detection + fault scan). Without it you lose early fault visibility.
 8. **Passing the wrong LOG_FILE to drain** — `wait_infer_drain.sh` auto-discovers the server log via `/proc/<pid>/fd/1`; the user-supplied LOG_FILE is a **secondary** signal (fault scan + mtime progress for clients with tqdm output). Pass any log you want extra coverage on, or pass nothing — drain still works.
-9. **Trusting `start_atom_server.sh` exit alone** — same root cause as failure 3. Background step 2 with `&` and use **step 2.5 `wait_server_ready.sh` as the mandatory foreground ready gate** with a real (15min) timeout. If 2.5 fails, abort to step 5 — do **not** launch workload.
+9. **Trusting `start_atom_server.sh` exit alone** — same root cause as failure 3. Launch step 2 with `run_in_background: true` and use **step 2.5 `wait_server_ready.sh` as the mandatory foreground ready gate** with a real (15min) timeout. If 2.5 fails, abort to step 5 — do **not** launch workload.
 10. **Writing a custom monitor loop to "catch the hang at the right moment"** for rocgdb / py-spy attach — `wait_infer_drain.sh` exit=1 IS that moment: workers are still alive in livelock state, GPU queues still loaded, the next call is your attach. Self-written `for i in ...; sleep 10; grep -c "output send" ...` loops always misjudge the heuristic (drain's STUCK_POLLS check is tuned across hundreds of runs; yours isn't), waste a turn re-deriving it, and leak past the user-forbidden "no ad-hoc orchestration" rule. Use drain → on exit=1 attach rocgdb (see step 4.5) → step 5.
 
-## Backgrounding mechanism — shell `&`, NOT claude task
+## Backgrounding mechanism — Bash tool `run_in_background: true`, NOT shell `&`
 
-In step 3 the workload must run concurrent with step 4's drain monitor. Use **shell-level `&`** (append to the bash command), NOT the Bash tool's `run_in_background: true`:
+Steps 2 and 3 launch long-running processes (server / workload) that must run
+concurrent with the next foreground gate (step 2.5 ready-poll, step 4 drain).
+Background them with the **Bash tool's `run_in_background: true` parameter** —
+**never** append a shell `&`.
 
-- Shell `&`: bash starts workload, returns immediately, workload runs as orphan; drain finds it via `pgrep` — no claude task tracking dependency
-- `run_in_background: true`: workload becomes a claude task accessed via TaskOutput — adds complexity, doesn't help drain since drain uses pgrep anyway
+Why `run_in_background` over shell `&`:
+- **Tracked, not orphaned.** `&` detaches the process as an untracked orphan; if a later step kills the parent, the orphan can linger for a long time holding GPU (a real past incident: a `&`-orphaned server ran 58 min after its launcher was killed). `run_in_background` registers a task you can `TaskStop`, and the harness reports its exit.
+- **Output captured.** The task's stdout/stderr go to a file the harness hands you; you're notified on completion and can read it.
+- **Drain still works.** `wait_infer_drain.sh` / `wait_server_ready.sh` find the server + workload via **`pgrep`**, independent of how they were backgrounded — so nothing about the drain/ready gates changes.
 
-Pattern (literal):
+Pattern (each step = one Bash tool call):
 ```
-# Step 3 — single Bash tool call, command ends with `&`
-bash scripts/run_gsm8k_eval.sh /data/MODEL 30000 3 &
+# Step 3 — Bash tool call with run_in_background: true (NO trailing &)
+bash scripts/run_gsm8k_eval.sh /data/MODEL 30000 3
 
-# Step 4 — single Bash tool call, blocks
+# Step 4 — Bash tool call, foreground, blocks on drain (finds workload via pgrep)
 bash scripts/wait_infer_drain.sh 30000 30 10
 ```
 
-The Bash invocation for step 3 returns the instant `&` is processed (`bash -c 'cmd &'` exits as soon as cmd is backgrounded). Step 4 then runs as the next Bash call and blocks on drain.
+The step-3 call returns immediately with a task id (the workload keeps running as
+a tracked task). Step 4 then runs as the next Bash call and blocks on drain.
 
 ## Canonical 5-step flow
 
 Run each step as a **separate Bash tool call**. Never chain with `&&`.
 
-Step order: **1 stop → 2 start → 2.5 verify-ready → 3 workload `&` → 4 drain → 4.5 (optional) hang inspection → 5 stop**.
+Step order: **1 stop → 2 start (bg) → 2.5 verify-ready → 3 workload (bg) → 4 drain → 4.5 (optional) hang inspection → 5 stop**. Steps 2 and 3 use the Bash tool's `run_in_background: true`; all others are foreground.
 
 ### Step 1 — clean GPU (always)
 
@@ -67,13 +73,14 @@ Idempotent. SIGTERM → SIGKILL → force-kill GPU PIDs, waits ≤60s for VRAM=0
 
 ### Step 2 — start workload host (blocks until ready / completion)
 
-**Server-based workloads** (GSM8K / benchmark / sweep / fault repro): **background with shell `&`**, then use step 2.5 as the real ready gate.
+**Server-based workloads** (GSM8K / benchmark / sweep / fault repro): launch with the Bash tool's **`run_in_background: true`**, then use step 2.5 as the real ready gate.
 
 ```bash
-<MODEL_ENV_VARS> bash scripts/start_atom_server.sh <MODEL_PATH> <TP> <PORT> <EXTRA_ARGS...> &
+<MODEL_ENV_VARS> bash scripts/start_atom_server.sh <MODEL_PATH> <TP> <PORT> <EXTRA_ARGS...>
 ```
+(Bash tool call, `run_in_background: true`, **no** trailing `&`.)
 
-- **MUST end with `&`** so the Bash tool returns immediately and step 2.5 can do the real foreground wait
+- **MUST use `run_in_background: true`** so the Bash tool returns immediately and step 2.5 can do the real foreground wait
 - The script forks python in background and runs a best-effort inline poll, but that poll caps at 120s and falls through to exit-0 without raising — for any model that takes >2min to load, the inline poll's outcome is meaningless
 - Step 2.5 is the source of truth for ready/fail
 - Log: hard-coded `/app/logs_claude/atom_server.log` (`LOG_FILE` env is NOT respected by this script). Drain auto-discovers it via `/proc/<pid>/fd/1` regardless of path
@@ -104,27 +111,30 @@ Typical: `bash scripts/wait_server_ready.sh 30000 15 5 /app/logs_claude/atom_ser
 - `MAX_MIN`: V4-Pro cold start ~5–10min; use 15 to be safe. Smaller models: 5–8
 - Set Bash tool timeout to ≥ `MAX_MIN × 60 × 1000` ms (e.g. `900000` for 15min) so the tool doesn't kill the poll prematurely
 
-Why mandatory: step 2 was backgrounded with `&`, so its exit code is meaningless to us — we deliberately ignored it. Step 2.5 is the **one and only** clean gate — its exit code, blocking behavior, and tail-on-fail are all visible to the operator. Without it, step 3 may launch against a dead or not-yet-ready server (lm_eval just sits in its own retry loop and hides the failure).
+Why mandatory: step 2 ran in the background (`run_in_background: true`), so its exit code is meaningless to us — we deliberately ignored it. Step 2.5 is the **one and only** clean gate — its exit code, blocking behavior, and tail-on-fail are all visible to the operator. Without it, step 3 may launch against a dead or not-yet-ready server (lm_eval just sits in its own retry loop and hides the failure).
 
 Skip step 2.5 for: offline simple_inference (no server), debug-agent fault repro (the fault IS the goal).
 
-### Step 3 — launch workload in shell background (`&`)
+### Step 3 — launch workload in the background (`run_in_background: true`)
 
-The workload script must end with shell `&` so the Bash tool returns immediately and step 4 can start monitoring in parallel.
+Launch the workload as a Bash tool call with **`run_in_background: true`** (no trailing `&`) so the tool returns immediately and step 4 can start monitoring in parallel. Drain finds the workload via `pgrep`.
 
 **Server-based workloads** (PORT is needed):
 
-| Workload | Command (note trailing `&`) | Optional client log for drain |
+| Workload | Command (run with `run_in_background: true`) | Optional client log for drain |
 |---|---|---|
-| GSM8K accuracy | `bash scripts/run_gsm8k_eval.sh MODEL PORT NUM_FEWSHOT &` | `/app/logs_claude/gsm8k_eval.log` (lm_eval is silent during requests; drain's auto-discovered server log carries the engine markers — passing this log only helps fault grep coverage) |
-| Single benchmark | `bash scripts/run_benchmark.sh MODEL PORT ISL OSL CONC [PROMPT_MULT] [PROFILE] &` | `/app/logs_claude/benchmark.log` (has tqdm progress, useful mtime signal) |
-| Concurrency sweep | `bash scripts/run_benchmark_sweep.sh MODEL PORT ISL OSL "CONC1 CONC2 ..." &` | `/app/logs_claude/benchmark.log` (overwritten per step) |
+| GSM8K accuracy | `bash scripts/run_gsm8k_eval.sh MODEL PORT NUM_FEWSHOT` | `/app/logs_claude/gsm8k_eval.log` (lm_eval is silent during requests; drain's auto-discovered server log carries the engine markers — passing this log only helps fault grep coverage) |
+| Single benchmark | `bash scripts/run_benchmark.sh MODEL PORT ISL OSL CONC [PROMPT_MULT] [PROFILE]` | `/app/logs_claude/benchmark.log` (has tqdm progress, useful mtime signal) |
+| Concurrency sweep | `bash scripts/run_benchmark_sweep.sh MODEL PORT ISL OSL "CONC1 CONC2 ..."` | `/app/logs_claude/benchmark.log` (overwritten per step) |
+
+**No foreground exception.** Even a single perf benchmark runs with `run_in_background: true` — never foreground (it would block the tool for minutes and leave the run untracked). Read the metrics from the task output file after step 4's drain returns.
 
 **Offline simple_inference** (no PORT; step 2 is skipped since this script IS the workload host):
 
 ```bash
-<MODEL_ENV_VARS> bash scripts/start_simple_inference.sh MODEL TP <EXTRA_ARGS...> &
+<MODEL_ENV_VARS> bash scripts/start_simple_inference.sh MODEL TP <EXTRA_ARGS...>
 ```
+(Bash tool call, `run_in_background: true`, **no** trailing `&`.)
 
 Optional client log for drain: `/app/logs_claude/simple_inference.log` (drain auto-discovers via /proc anyway; this only helps fault grep redundancy).
 
@@ -223,12 +233,12 @@ Per-model accuracy baselines and thresholds live in `.github/benchmark/models_ac
 
 1. **One Bash tool call per script.** No `&&` chains. User has explicitly forbidden chaining.
 2. **No wrapper scripts in `/app/logs_claude/`.** Call `scripts/*` directly.
-3. **Shell `&`, not `run_in_background: true`** for step 3 (drain finds workload via pgrep, no task tracking needed).
+3. **Bash tool `run_in_background: true`, NOT shell `&`** for steps 2 and 3. `&` orphans the process untracked (past incident: 58-min lingering server); `run_in_background` gives a tracked, stoppable task with captured output. Drain finds the workload via pgrep either way.
 4. **Drain auto-discovers server log via `/proc/<pid>/fd/1`** — you no longer need to know or pass the canonical server log path. Pass a client log only as supplementary signal.
 5. **Always step 5 (`stop_atom_server.sh`)**, even after a fault, even for offline workloads.
 6. **Never use `curl /health`** to verify ready — only `/v1/models` (already inlined in start script).
 7. **No `LOG_FILE=` env on `start_atom_server.sh`** — log path is hard-coded.
-8. **Step 2 (`start_atom_server.sh`) MUST end with shell `&`.** Foregrounding it is a trap: its inline ready-poll caps at 120s and falls through to exit-0 without raising — for V4-Pro and other slow-starting models the script silently returns success while the server is still loading. See failure mode 3.
+8. **Step 2 (`start_atom_server.sh`) MUST run with `run_in_background: true`.** Foregrounding it is a trap: its inline ready-poll caps at 120s and falls through to exit-0 without raising — for V4-Pro and other slow-starting models the script silently returns success while the server is still loading. See failure mode 3.
 9. **Step 2.5 (`wait_server_ready.sh`) is MANDATORY for server-based workloads.** Run it as a separate foreground Bash tool call after step 2. If it exits non-zero, abort to step 5; do not launch step 3.
 10. **Step 4 (`wait_infer_drain.sh`) is the ONLY hang detector.** Never replace it with a custom `for/sleep/grep` monitor loop, even if your goal is to attach rocgdb / py-spy at hang time — drain's exit=1 IS the attach moment (workers still alive, GPU queues still loaded). Step 4.5 covers the inspection workflow. See failure mode 10.
 
@@ -237,11 +247,11 @@ Per-model accuracy baselines and thresholds live in `.github/benchmark/models_ac
 | Script | What it does | Step | Blocks? |
 |---|---|---|---|
 | `stop_atom_server.sh` | Kill all atom + multiproc children, wait for VRAM=0 | 1, 5 | Yes ≤60s |
-| `start_atom_server.sh MODEL TP PORT [ARGS...]` | Clean GPU, fork python in bg, best-effort 120s ready poll (must wrap with `&` — step 2.5 is the real gate) | 2 (server) | Self-blocks ≤120s but unreliable as gate |
-| `start_simple_inference.sh MODEL TP [ARGS...]` | Offline inference (no server, runs prompts) — wrap with `&` for drain | 3 (offline) | Blocks unless `&` |
-| `run_gsm8k_eval.sh MODEL PORT FEWSHOT` | lm_eval local-completions GSM8K — wrap with `&` for drain | 3 (server) | Blocks unless `&` |
-| `run_benchmark.sh MODEL PORT ISL OSL CONC [PMULT] [PROF]` | Single perf point — wrap with `&` for drain | 3 (server) | Blocks unless `&` |
-| `run_benchmark_sweep.sh MODEL PORT ISL OSL "CONCs"` | Loop run_benchmark — wrap with `&` for drain | 3 (server) | Blocks unless `&` |
+| `start_atom_server.sh MODEL TP PORT [ARGS...]` | Clean GPU, fork python in bg, best-effort 120s ready poll (run with `run_in_background: true` — step 2.5 is the real gate) | 2 (server) | Self-blocks ≤120s but unreliable as gate |
+| `start_simple_inference.sh MODEL TP [ARGS...]` | Offline inference (no server, runs prompts) — run with `run_in_background: true` for drain | 3 (offline) | Blocks until done |
+| `run_gsm8k_eval.sh MODEL PORT FEWSHOT` | lm_eval local-completions GSM8K — run with `run_in_background: true` for drain | 3 (server) | Blocks until done |
+| `run_benchmark.sh MODEL PORT ISL OSL CONC [PMULT] [PROF]` | Single perf point — `run_in_background: true` for drain, or foreground to just read metrics | 3 (server) | Blocks until done |
+| `run_benchmark_sweep.sh MODEL PORT ISL OSL "CONCs"` | Loop run_benchmark — run with `run_in_background: true` for drain | 3 (server) | Blocks until done |
 | `wait_infer_drain.sh PORT MAX_MIN POLL [LOG] [STUCK]` | Monitor workload for drain / hang / fault (auto-discovers server log) | 4 | Yes, until exit code |
 | `wait_server_ready.sh PORT MAX_MIN POLL LOG` | Mandatory ready-gate after start; polls `/v1/models` + greps log for startup errors | 2.5 (server) | Yes, until ready or fail |
 | `run_debug_agent.sh [--simple] MODEL TP [PORT] [ARGS...]` | Server (or simple_inference) under rocm-debug-agent — fault repro | 2 (replaces start) | Yes, until ready or fault |
@@ -252,17 +262,17 @@ Per-model accuracy baselines and thresholds live in `.github/benchmark/models_ac
 # Step 1
 bash scripts/stop_atom_server.sh
 
-# Step 2 — note trailing `&` (REQUIRED — see Hard rule 8)
+# Step 2 — Bash tool run_in_background: true (REQUIRED — see Hard rule 8), NO trailing &
 AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
   bash scripts/start_atom_server.sh /data/DeepSeek-V4-Pro 8 30000 \
-  --kv_cache_dtype fp8 --method mtp --num-speculative-tokens 3 --level 0 &
+  --kv_cache_dtype fp8 --method mtp --num-speculative-tokens 3 --level 0
 
 # Step 2.5 — MANDATORY foreground ready gate. Bash tool timeout ≥ 900000ms.
 # Abort to step 5 on non-zero exit.
 bash scripts/wait_server_ready.sh 30000 15 5 /app/logs_claude/atom_server.log
 
-# Step 3 — note trailing `&`
-bash scripts/run_gsm8k_eval.sh /data/DeepSeek-V4-Pro 30000 3 &
+# Step 3 — Bash tool run_in_background: true, NO trailing &
+bash scripts/run_gsm8k_eval.sh /data/DeepSeek-V4-Pro 30000 3
 
 # Step 4 — drain auto-discovers server log; no LOG_FILE needed
 bash scripts/wait_infer_drain.sh 30000 30 10
@@ -280,10 +290,11 @@ grep -E "flexible-extract|strict-match" /app/logs_claude/gsm8k_eval.log | head -
 # Step 1
 bash scripts/stop_atom_server.sh
 
-# Step 2+3 fused (simple_inference IS the workload host) — note trailing `&`
+# Step 2+3 fused (simple_inference IS the workload host)
+# Bash tool run_in_background: true, NO trailing &
 AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
   bash scripts/start_simple_inference.sh /data/DeepSeek-V4-Pro 8 \
-  --kv_cache_dtype fp8 --level 0 &
+  --kv_cache_dtype fp8 --level 0
 
 # Step 4 — drain auto-discovers via /proc; PORT unused
 bash scripts/wait_infer_drain.sh 0 15 10

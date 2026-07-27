@@ -196,7 +196,8 @@ def maybe_dump_weights_and_exit(model: torch.nn.Module) -> None:
         import torch.distributed as dist
 
         if dist.is_initialized():
-            dist.barrier()
+            if dist.get_world_size() > 1:
+                dist.barrier()
             dist.destroy_process_group()
         sys.exit(0)
 

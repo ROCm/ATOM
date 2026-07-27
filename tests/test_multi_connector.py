@@ -268,6 +268,21 @@ def test_get_finished_unions_and_normalizes_tuple():
     assert out.failed_recving == {"f1"}
 
 
+def test_producer_offload_load_completion_uses_loading_state():
+    moriio = FakeWorkerSub(is_producer=True, finished=(set(), set()))
+    off = FakeWorkerSub(
+        finished=KVConnectorOutput(finished_loading={"l1"}, failed_loading={"f1"})
+    )
+    w = _worker([moriio, off])
+
+    out = w.get_finished()
+
+    assert out.finished_recving == set()
+    assert out.failed_recving == set()
+    assert out.finished_loading == {"l1"}
+    assert out.failed_loading == {"f1"}
+
+
 def test_recv_blocks_concat():
     w = _worker([FakeWorkerSub(recv_blocks=[1, 2]), FakeWorkerSub(recv_blocks=[3])])
     assert w.get_finished_recv_blocks() == [1, 2, 3]

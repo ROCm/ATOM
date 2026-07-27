@@ -6,8 +6,12 @@ import torch
 import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
+from atom.model_ops.layernorm import RMSNorm, fused_dual_rmsnorm_cat
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import IntermediateTensors
@@ -15,7 +19,11 @@ from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
-from .deepseek_v2 import DeepseekV2DecoderLayer, _can_fuse_indexer_wk_weights_proj
+from .deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    _can_fuse_indexer_wk_weights_proj,
+    use_replicated_vocab_embed,
+)
 from .utils import ckpt_has_tensor_suffix, maybe_prefix
 
 
@@ -87,13 +95,17 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        masked_inputs_embeds = inputs_embeds
-        inputs_embeds = self.enorm(masked_inputs_embeds)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
-
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        # Fused enorm(inputs_embeds) ++ hnorm(previous_hidden_states) in a single
+        # Triton launch (folds the two RMSNorms + the torch.cat; enorm and hnorm
+        # share eps=rms_norm_eps). bf16-identical to the separate path.
+        eh_input = fused_dual_rmsnorm_cat(
+            inputs_embeds,
+            self.enorm.weight,
+            previous_hidden_states,
+            self.hnorm.weight,
+            self.enorm.eps,
         )
+        hidden_states = self.eh_proj(eh_input)
 
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
@@ -136,10 +148,18 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 )
             }
         )
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+        if use_replicated_vocab_embed(config):
+            # GLM-5.2 MTP: full table per rank, no post-embedding all-reduce.
+            # (Shared with the target's replicated embed by EagleProposer at load.)
+            self.embed_tokens = ReplicatedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
 
     def forward(
         self,
@@ -169,6 +189,59 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         logits = mtp_layer.shared_head.head(mtp_layer.shared_head(hidden_states))
         return logits
+
+    def compute_draft_token(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token via distributed argmax over the TP-sharded vocab —
+        avoids all-gathering the full [N, vocab] logits every draft step.
+
+        Mirrors compute_logits() (same norm + shared head), but reduces each
+        rank's logit shard to (max_val, global_idx) and all-gathers only [N, 2]
+        instead of the O(vocab) logits. Token-identical to
+        compute_logits(...).argmax(-1).
+        """
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        normed = mtp_layer.shared_head(hidden_states)
+        return mtp_layer.shared_head.head.compute_argmax_token(normed)
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """Toggle ``skip_topk`` on MTP sparse-attention layers.
+
+        Used by ``EagleProposer`` for ``index_share_for_mtp_iteration``: draft
+        step 0 sets ``skip=False`` (compute indexer top-k), steps 1+ set
+        ``skip=True`` (reuse step 0's ``sparse_kv_indices_buffer``).
+        Matches vLLM ``DeepSeekMultiTokenPredictor.set_skip_topk``.
+        """
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is None:
+                continue
+            self_attn = getattr(mtp_block, "self_attn", None)
+            if self_attn is None or not hasattr(self_attn, "skip_topk"):
+                continue
+            if getattr(self_attn, "indexer", None) is not None:
+                self_attn.skip_topk = skip
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        """Gather sparse top-k rows at ``slot_ids`` to the front of each buffer."""
+        num_slots = slot_ids.numel()
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is None:
+                continue
+            self_attn = getattr(mtp_block, "self_attn", None)
+            if self_attn is None:
+                continue
+            mla_attn = getattr(self_attn, "mla_attn", None)
+            if mla_attn is None:
+                continue
+            sparse_buf = getattr(mla_attn, "sparse_kv_indices_buffer", None)
+            if sparse_buf is not None and sparse_buf.numel() > 0:
+                sparse_buf[:num_slots] = sparse_buf[slot_ids]
 
 
 @support_torch_compile
@@ -258,6 +331,26 @@ class DeepSeekMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def compute_draft_token(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
+
+        EagleProposer picks this over compute_logits().argmax(-1) when present
+        (``_draft_argmax_fused``), so the draft never all-gathers the full
+        [N, vocab] logits — it all-gathers only the packed [N, 2] per-rank
+        reductions. See DeepSeekMultiTokenPredictor.compute_draft_token.
+        """
+        return self.model.compute_draft_token(hidden_states, spec_step_idx)
+
+    def set_skip_topk(self, skip: bool) -> None:
+        self.model.set_skip_topk(skip)
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        self.model.compact_topk_indices(slot_ids)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

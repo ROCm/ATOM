@@ -2,8 +2,8 @@ name: ATOM vLLM Nightly
 
 on:
   schedule:
-    # Nightly at 02:00 Beijing time (18:00 UTC on the previous day)
-    - cron: '0 18 * * *'
+    # Nightly at 00:00 Beijing time (16:00 UTC on the previous day)
+    - cron: '0 16 * * *'
   workflow_dispatch:
     # Manual runs use GitHub Actions' built-in branch dropdown ("Use workflow
     # from") as the ATOM branch selector, so users do not need to type branch
@@ -53,7 +53,10 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 MTP TP4
           - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4 MTP TP4
       model_slot_2:
         description: "Manual selection slot 2: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -98,7 +101,10 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 MTP TP4
           - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4 MTP TP4
       model_slot_3:
         description: "Manual selection slot 3: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -143,7 +149,10 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 MTP TP4
           - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4 MTP TP4
       model_slot_4:
         description: "Manual selection slot 4: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -188,7 +197,10 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 MTP TP4
           - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4 MTP TP4
       model_slot_5:
         description: "Manual selection slot 5: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -233,7 +245,10 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 MTP TP4
           - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4 MTP TP4
       model_slot_6:
         description: "Manual selection slot 6: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -278,7 +293,10 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 MTP TP4
           - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4 MTP TP4
       model_slot_7:
         description: "Manual selection slot 7: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -323,7 +341,10 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 MTP TP4
           - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4 MTP TP4
       model_slot_8:
         description: "Manual selection slot 8: choose an accuracy model case from .github/benchmark/oot_models_accuracy.json."
         type: choice
@@ -368,7 +389,10 @@ on:
           - GLM-4.7-FP8 MTP TP4
           - GLM-4.7-FP8 MTP TP8
           - GLM-5.1-FP8 TP8
+          - GLM-5.2-FP8 TP4
+          - GLM-5.2-FP8 MTP TP4
           - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4 MTP TP4
       oot_image:
         description: "Optional atom-vLLM image override. Leave empty to keep the existing nightly/manual build behavior."
         required: false
@@ -667,7 +691,7 @@ jobs:
           REBUILD_FROM_DOCKERFILE="${REBUILD_ATOM_BASE_FROM_DOCKERFILE:-false}"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
-              echo "Manual run selected full ATOM base rebuild from docker/Dockerfile"
+              echo "Manual run selected full ATOM base rebuild from docker/atom_release.dockerfile"
             else
               echo "Manual run selected fast overlay rebuild from ${ATOM_BASE_NIGHTLY_IMAGE}"
             fi
@@ -732,25 +756,23 @@ jobs:
 
             DOCKER_BUILDKIT=1 docker build --pull --network=host --no-cache \
               -t "${REBUILT_ATOM_BASE_IMAGE_TAG}" \
-              --target atom_image \
               --build-arg GPU_ARCH="${GPU_ARCH}" \
               --build-arg AITER_REPO="${AITER_REPO}" \
               --build-arg AITER_COMMIT="${AITER_COMMIT}" \
               --build-arg MAX_JOBS=64 \
               --build-arg ATOM_REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
               --build-arg ATOM_COMMIT="${GITHUB_SHA}" \
-              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              -f "${BUILD_CONTEXT}/docker/atom_release.dockerfile" \
               "${BUILD_CONTEXT}"
 
             DOCKER_BUILDKIT=1 docker build --network=host --no-cache \
               -t "${OOT_IMAGE_TAG}" \
-              --target atom_oot \
               --build-arg OOT_BASE_IMAGE="${REBUILT_ATOM_BASE_IMAGE_TAG}" \
               --build-arg MAX_JOBS=64 \
               --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
               --build-arg INSTALL_LM_EVAL=1 \
               --build-arg INSTALL_FASTSAFETENSORS=1 \
-              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              -f "${BUILD_CONTEXT}/docker/vllm_release.dockerfile" \
               "${BUILD_CONTEXT}"
 
             docker push "${OOT_IMAGE_TAG}"
@@ -799,13 +821,12 @@ jobs:
 
           docker build --network=host --no-cache \
             -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
             --build-arg OOT_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+            -f "${BUILD_CONTEXT}/docker/vllm_release.dockerfile" \
             "${BUILD_CONTEXT}"
 
           docker push "${OOT_IMAGE_TAG}"
@@ -939,27 +960,34 @@ jobs:
       - name: Prepare model cache mount
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
+          MODEL_CACHE_ROOT=""
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/shared/data/WRH/models" ]; then
-            MODEL_CACHE_MOUNT="-v /shared/data/WRH/models:/models"
-            MODEL_CACHE_DESC="/shared/data/WRH/models (shared host path)"
+          MODEL_MOUNT_PATH="/models"
+          if [ -d "/mnt/dcgpuval" ]; then
+            MODEL_CACHE_ROOT="/mnt/dcgpuval"
+          elif [ -d "/shared/data/WRH/models" ]; then
+            MODEL_CACHE_ROOT="/shared/data/WRH/models"
           elif [ -d "/it-share/models" ]; then
-            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
-            MODEL_CACHE_DESC="/it-share/models (shared host path)"
+            MODEL_CACHE_ROOT="/it-share/models"
           elif [ -d "/models" ]; then
-            MODEL_CACHE_MOUNT="-v /models:/models"
-            MODEL_CACHE_DESC="/models (shared host path)"
+            MODEL_CACHE_ROOT="/models"
           elif [ -d "/data/models" ]; then
-            MODEL_CACHE_MOUNT="-v /data/models:/models"
-            MODEL_CACHE_DESC="/data/models (shared host path)"
+            MODEL_CACHE_ROOT="/data/models"
+          fi
+
+          if [ -n "${MODEL_CACHE_ROOT}" ]; then
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (shared host path)"
           else
-            echo "No shared host model cache found; using container-local /models."
+            echo "No shared host model cache found; using container-local ${MODEL_MOUNT_PATH}."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+          echo "MODEL_MOUNT_PATH=${MODEL_MOUNT_PATH}" >> "$GITHUB_ENV"
 
       - name: Clean up old containers
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
@@ -978,6 +1006,11 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
+          if [ "${CONTAINER_ENGINE}" = "podman" ]; then
+            GROUP_ADD_FLAG="--group-add keep-groups"
+          else
+            GROUP_ADD_FLAG="--group-add video"
+          fi
 
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -994,7 +1027,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add keep-groups \
+            --ipc=host $GROUP_ADD_FLAG \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -1110,6 +1143,11 @@ jobs:
                   "/models/GLM/GLM-5.1-FP8",
                   "/models/GLM-5.1-FP8",
               ],
+              "zai-org/GLM-5.2-FP8": [
+                  "/models/zai-org/GLM-5.2-FP8",
+                  "/models/GLM/GLM-5.2-FP8",
+                  "/models/GLM-5.2-FP8",
+              ],
               "amd/GLM-5.2-MXFP4": [
                   "/models/amd/GLM-5.2-MXFP4",
                   "/models/GLM/GLM-5.2-MXFP4",
@@ -1160,7 +1198,7 @@ jobs:
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           set -euo pipefail
-          model_dir="/models/${{ matrix.model_path }}"
+          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           if [ "${OOT_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
             echo "Using local model path ${OOT_RESOLVED_MODEL_PATH}; skip download."
             exit 0
@@ -1222,7 +1260,7 @@ jobs:
               exit 1
             fi
           else
-            echo "/models directory not mounted; skipping model download"
+            echo "${MODEL_MOUNT_PATH} directory not mounted; skipping model download"
           fi
 
       - name: Resolve OOT model path
@@ -1233,8 +1271,8 @@ jobs:
             exit 0
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
-            echo "Using mounted model path: /models/${{ matrix.model_path }}"
+            echo "OOT_RESOLVED_MODEL_PATH=${MODEL_MOUNT_PATH}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: ${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           else
             echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"

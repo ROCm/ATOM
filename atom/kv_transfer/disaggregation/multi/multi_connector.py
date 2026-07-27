@@ -226,16 +226,25 @@ class MultiConnector(KVConnectorBase):
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
         failed: set = set()
+        loaded: set = set()
+        load_failed: set = set()
         send_now: list = []
         save_now: list = []
         for c in self._connectors:
             o = _normalize_finished(c.get_finished())
             recv |= o.finished_recving
             failed |= o.failed_recving
+            loaded |= o.finished_loading
+            load_failed |= o.failed_loading
             send_now.extend(o.finished_sending)
             save_now.extend(o.finished_saving)
 
-        out = KVConnectorOutput(finished_recving=recv, failed_recving=failed)
+        out = KVConnectorOutput(
+            finished_recving=recv,
+            failed_recving=failed,
+            finished_loading=loaded,
+            failed_loading=load_failed,
+        )
 
         if not self.is_producer:
             # No moriio send to pair with: offload save / recv pass straight
