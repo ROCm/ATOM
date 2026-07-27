@@ -1017,13 +1017,12 @@ jobs:
           docker build --network=host \
             --no-cache \
             -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
             --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f docker/vllm_release.dockerfile .
           echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom OOT image
@@ -1171,7 +1170,10 @@ jobs:
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/it-share/models" ]; then
+          if [ -d "/shared_nfs/huggingface_models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
+            MODEL_CACHE_DESC="/shared_nfs/huggingface_models (shared host path)"
+          elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
           elif [ -d "/models" ]; then
@@ -1237,6 +1239,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -1272,6 +1276,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then

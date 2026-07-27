@@ -503,7 +503,7 @@ jobs:
             if [ -n "${USER_PROVIDED_SGLANG_IMAGE}" ]; then
               echo "Manual run will use user-provided SGLANG image: ${USER_PROVIDED_SGLANG_IMAGE}"
             elif [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
-              echo "Manual run selected full ATOM base rebuild from docker/Dockerfile"
+              echo "Manual run selected full ATOM base rebuild from docker/atom_release.dockerfile"
             elif [ "${GITHUB_REF_NAME}" = "main" ]; then
               echo "Manual run on main reuses published SGLANG image"
             else
@@ -575,25 +575,23 @@ jobs:
 
             DOCKER_BUILDKIT=1 docker build --pull --network=host --no-cache \
               -t "${REBUILT_ATOM_BASE_IMAGE_TAG}" \
-              --target atom_image \
               --build-arg GPU_ARCH="${GPU_ARCH}" \
               --build-arg AITER_REPO="${AITER_REPO}" \
               --build-arg AITER_COMMIT="${AITER_COMMIT}" \
               --build-arg MAX_JOBS=64 \
               --build-arg ATOM_REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
               --build-arg ATOM_COMMIT="${GITHUB_SHA}" \
-              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              -f "${BUILD_CONTEXT}/docker/atom_release.dockerfile" \
               "${BUILD_CONTEXT}"
 
             DOCKER_BUILDKIT=1 docker build --network=host --no-cache \
               -t "${SGLANG_IMAGE_TAG}" \
-              --target atom_sglang \
               --build-arg SGLANG_BASE_IMAGE="${REBUILT_ATOM_BASE_IMAGE_TAG}" \
               --build-arg MAX_JOBS=64 \
               --build-arg SGLANG_REF="${SGLANG_REF}" \
               --build-arg INSTALL_LM_EVAL=1 \
               --build-arg INSTALL_FASTSAFETENSORS=1 \
-              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              -f "${BUILD_CONTEXT}/docker/sglang_release.dockerfile" \
               "${BUILD_CONTEXT}"
 
             docker push "${SGLANG_IMAGE_TAG}"
@@ -642,13 +640,12 @@ jobs:
 
           docker build --network=host --no-cache \
             -t "${SGLANG_IMAGE_TAG}" \
-            --target atom_sglang \
             --build-arg SGLANG_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
             --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+            -f "${BUILD_CONTEXT}/docker/sglang_release.dockerfile" \
             "${BUILD_CONTEXT}"
 
           docker push "${SGLANG_IMAGE_TAG}"

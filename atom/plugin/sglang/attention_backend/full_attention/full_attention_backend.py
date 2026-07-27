@@ -10,13 +10,11 @@ from __future__ import annotations
 # attention layer — KV cache management and attention kernel dispatch will then
 # be handled by ATOM's native backend, making sglang-specific overrides
 # unnecessary.
-
 import math
-from typing import TYPE_CHECKING, Optional
-
-import torch
+from typing import TYPE_CHECKING
 
 import sglang.srt.layers.attention.aiter_backend as _sglang_aiter
+import torch
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
@@ -32,22 +30,28 @@ from atom.plugin.sglang.attention_backend.full_attention.kv_cache import (
 from atom.plugin.sglang.attention_backend.full_attention.metadata import ForwardMetadata
 from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     allocate_pa_metadata_buffers as _allocate_pa_metadata_buffers,
+)
+from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     build_pa_metadata_for_decode as _build_pa_metadata_for_decode,
+)
+from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     build_pa_metadata_for_prefill as _build_pa_metadata_for_prefill,
 )
+from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
+
 try:
     from aiter import (
         QuantType,
-        flash_attn_varlen_func,
         dtypes,
-        get_pa_metadata_info_v1,
+        flash_attn_varlen_func,
         get_hip_quant,
+        get_pa_metadata_info_v1,
         mha_batch_prefill_func,
         pa_fwd_asm,
         pa_persistent_fwd,
@@ -75,8 +79,7 @@ try:
 except ImportError:
     pass
 try:
-    from aiter.mla import mla_prefill_fwd
-    from aiter.mla import mla_decode_fwd
+    from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     pass
 try:
@@ -100,10 +103,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
-        kv_indptr_buf: Optional[torch.Tensor] = None,
+        kv_indptr_buf: torch.Tensor | None = None,
         topk: int = 1,
     ):
         super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
+        self._atom_token_to_kv_pool = model_runner.token_to_kv_pool
+        self._atom_req_to_token_pool = model_runner.req_to_token_pool
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
@@ -174,6 +179,36 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         else:
             self.prefill_ps_num_kv_splits = None
 
+    def _patch_forward_batch_pools(self, forward_batch: ForwardBatch):
+        attr_to_pool = {
+            "token_to_kv_pool": self._atom_token_to_kv_pool,
+            "req_to_token_pool": self._atom_req_to_token_pool,
+        }
+        for attr, saved_pool in attr_to_pool.items():
+            if getattr(forward_batch, attr, None) is not None:
+                continue
+            pool = saved_pool or getattr(self, attr, None)
+            if pool is None:
+                try:
+                    from sglang.srt.model_executor.forward_context import (
+                        get_attn_backend,
+                        has_forward_context,
+                    )
+
+                    if has_forward_context():
+                        backend = get_attn_backend()
+                        pool = getattr(backend, attr, None)
+                        if pool is None:
+                            full_backend = getattr(backend, "full_attn_backend", None)
+                            pool = getattr(full_backend, attr, None)
+                except Exception:  # noqa: BLE001 - forward context is optional
+                    pool = None
+            if pool is not None:
+                try:
+                    setattr(forward_batch, attr, pool)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
         max_seqlen_qo = 1
@@ -185,17 +220,52 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
+        self._patch_forward_batch_pools(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_forward_metadata_decode(forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_draft_extend_v2():
             self._init_draft_extend_v2_mla(forward_batch.batch_size, forward_batch)
-        elif self.use_mla and forward_batch.forward_mode.is_draft_extend():
+        elif self.use_mla and is_draft_extend_mode(forward_batch.forward_mode):
             self._init_draft_extend_mla(forward_batch.batch_size, forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_target_verify():
             self._init_target_verify_mla(forward_batch.batch_size, forward_batch)
         else:
             self._init_forward_metadata_extend(forward_batch)
         self._fixup_page_table(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """Build ATOM metadata for SGLang's split CUDA graph init protocol."""
+        self._patch_forward_batch_pools(forward_batch)
+        if in_capture:
+            self.init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.seq_lens_sum,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
+        else:
+            self.init_forward_metadata_replay_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                forward_batch.encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+                forward_batch.seq_lens_cpu,
+                forward_batch.out_cache_loc,
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """ATOM's full-attention metadata is prepared outside the captured graph."""
+        return
 
     def _init_forward_metadata_decode(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -745,7 +815,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         self,
         max_bs: int,
         max_num_tokens: int,
-        kv_indices_buf: Optional[torch.Tensor] = None,
+        kv_indices_buf: torch.Tensor | None = None,
     ):
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int, device=self.device
@@ -878,9 +948,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
+        encoder_lens: torch.Tensor | None,
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        spec_info: SpecInput | None,
     ):
         num_kv_splits = None
         work_metadata = None
@@ -1112,7 +1182,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     mask_indptr=None,
                     max_extend_len=num_tokens_per_bs,
                 )
-        elif forward_mode.is_draft_extend():
+        elif is_draft_extend_mode(forward_mode):
             num_tokens_per_bs = self.speculative_num_steps + 1
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -1210,11 +1280,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
+        encoder_lens: torch.Tensor | None,
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: Optional[torch.Tensor] = None,
+        spec_info: SpecInput | None,
+        seq_lens_cpu: torch.Tensor | None,
+        out_cache_loc: torch.Tensor | None = None,
     ):
         num_kv_splits = None
         work_metadata = None
@@ -1451,7 +1521,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     mask_indptr=None,
                     max_extend_len=num_tokens_per_bs,
                 )
-        elif forward_mode.is_draft_extend():
+        elif is_draft_extend_mode(forward_mode):
             num_tokens_per_bs = self.speculative_num_steps + 1
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
@@ -1551,7 +1621,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor] = None,
+        seq_lens_cpu: torch.Tensor | None = None,
         static_columns: bool = False,
     ):
         page_table_persistent = self.page_table
@@ -1846,7 +1916,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 qo_indptr,
                 forward_batch,
             )
-        if forward_batch.forward_mode.is_draft_extend(include_v2=True) and (
+        if is_draft_extend_mode(forward_batch.forward_mode, include_v2=True) and (
             k is None or v is None or layer.qk_head_dim == K_Buffer.shape[-1]
         ):
             return self._forward_extend_mla_speculative(
@@ -1856,9 +1926,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 qo_indptr,
                 forward_batch,
             )
-        if (
-            not forward_batch.forward_mode.is_extend()
-            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        if not forward_batch.forward_mode.is_extend() and not is_draft_extend_mode(
+            forward_batch.forward_mode, include_v2=True
         ):
             raise ValueError(
                 f"Invalid forward mode for MLA extend: {forward_batch.forward_mode=}"
@@ -2306,7 +2375,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             self._call_mla_decode_fwd(q, K_Buffer, o, layer)
             return o
 
-        if forward_batch.forward_mode.is_draft_extend(include_v2=True):
+        if is_draft_extend_mode(forward_batch.forward_mode, include_v2=True):
             if md.run_graph is not True:
                 bs, q_pad, _ = pad_sequence_with_mask(
                     q.view(q.shape[0], -1),
@@ -2348,6 +2417,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        self._patch_forward_batch_pools(forward_batch)
         topk_indices = kwargs.get("topk_indices")
         if self.use_mla and topk_indices is not None:
             return self._forward_sparse_mla(
@@ -2454,10 +2524,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
         else:
             q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-            if self.forward_metadata.page_table.dtype != torch.int32:
+            page_table = getattr(self.forward_metadata, "page_table", None)
+            if page_table is None:
+                page_table = getattr(self.forward_metadata, "swa_page_table", None)
+            if page_table is None:
+                raise AttributeError(
+                    "ForwardMetadata has neither page_table nor swa_page_table"
+                )
+            if page_table.dtype != torch.int32:
                 raise TypeError(
                     "pa_fwd_asm block_tables must be torch.int32, got "
-                    f"{self.forward_metadata.page_table.dtype}"
+                    f"{page_table.dtype}"
                 )
             if self.forward_metadata.kv_lens.dtype != torch.int32:
                 raise TypeError(
@@ -2474,9 +2551,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 Q=q_3d,
                 K=new_key_cache,
                 V=new_value_cache,
-                block_tables=self.forward_metadata.page_table,
+                block_tables=page_table,
                 context_lens=self.forward_metadata.kv_lens,
-                block_tables_stride0=self.forward_metadata.page_table.stride(0),
+                block_tables_stride0=page_table.stride(0),
                 K_QScale=k_qscale,
                 V_QScale=v_qscale,
                 out_=o,

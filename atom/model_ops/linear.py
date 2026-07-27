@@ -33,9 +33,8 @@ from atom.model_ops.utils import (
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.quantization.quark.utils import (
+    dequant_weight_online,
     quant_weight_online,
-    weight_dequant_fp8,
-    weight_dequant_mxfp8,
 )
 from torch import nn
 
@@ -587,14 +586,22 @@ class LinearBase(nn.Module):
             f"Unsupported online quant: "
             f"dtype={online_quant_dtype}, type={online_quant_type}"
         )
+        # Quark models arrive in several source formats. We can re-quantize any
+        # source we know how to dequantize back to float first: unquantized
+        # (No), per-tensor FP8 (per_Tensor), per-output-channel FP8 (per_Token /
+        # ptpc_fp8), 128x128 block FP8 (per_1x128) and MXFP8 (per_1x32). Any
+        # other source is rejected up front rather than silently producing
+        # garbage.
         assert self.quant_type in [
             QuantType.No,
             QuantType.per_Tensor,
+            QuantType.per_Token,
             QuantType.per_1x128,
             QuantType.per_1x32,
         ], (
             f"Unsupported source quant_type for online quantization: "
-            f"{self.quant_type} (layer={self.prefix})"
+            f"{self.quant_type} (layer={self.prefix}). Supported sources: "
+            f"No, per_Tensor, per_Token, per_1x128, per_1x32."
         )
         weight = self.weight.data
         weight_scale = getattr(self, "weight_scale", None)
@@ -624,28 +631,26 @@ class LinearBase(nn.Module):
                 need_gather = self.tp_dim == 1 and self.input_size % 32 != 0
         if need_gather:
             weight = self._gather_full_weight(weight)
-            if weight_scale is not None:
+            # Per-token scales are shaped (N, 1). In row-parallel layers
+            # (tp_dim=1), that size-1 dim is replicated rather than sharded, so
+            # gathering it would duplicate the scale columns. Block scales still
+            # follow the weight sharding and are gathered here.
+            if weight_scale is not None and not (
+                self.quant_type == QuantType.per_Token and self.tp_dim == 1
+            ):
                 weight_scale = self._gather_full_weight(weight_scale)
 
-        if self.quant_type == QuantType.per_1x128:
-            # dequant per block fp8
-            weight = weight_dequant_fp8(weight, weight_scale)
-        elif self.quant_type == QuantType.per_1x32:
-            # dequant MXFP8 (FP8 elements + 1x32 E8M0 shared scale)
-            weight = weight_dequant_mxfp8(weight, weight_scale)
-        elif self.quant_type == QuantType.per_Tensor:
-            # dequant per-tensor fp8: weight (N, K) * per-partition scalar scale.
-            # Merged layers (qkv/gate_up) carry one scale per output partition.
-            w = weight.to(torch.float32)
-            ws = weight_scale.reshape(-1)
-            if ws.numel() <= 1:
-                w = w * ws.reshape(())
-            else:
-                off = 0
-                for i, sz in enumerate(self.output_partition_sizes):
-                    w[off : off + sz] = w[off : off + sz] * ws[i]
-                    off += sz
-            weight = w.to(get_current_atom_config().torch_dtype)
+        # Dequantize the source weight back to float so it can be re-quantized
+        # to the online target format (no-op for an unquantized source).
+        # output_partition_sizes lets per_Tensor merged layers (qkv/gate_up)
+        # apply the right per-partition scale to each output row-range.
+        weight = dequant_weight_online(
+            weight,
+            weight_scale,
+            self.quant_type,
+            self.params_dtype,
+            self.output_partition_sizes,
+        )
 
         q_weight, weight_scale = quant_weight_online(
             weight, online_quant_type, online_quant_dtype

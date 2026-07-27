@@ -1691,7 +1691,6 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         super().process_weights_after_loading()
 
 
-@IndexerDecoratorForPluginMode
 def _indexer_with_output_fake(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
@@ -1771,6 +1770,7 @@ direct_register_custom_op(
 )
 
 
+@IndexerDecoratorForPluginMode
 class Indexer(nn.Module):
     def __init__(
         self,

@@ -70,6 +70,10 @@ def _prepare_minimax_m3_config(atom_config: Any, model_arch: str) -> None:
         MiniMaxM3SparseForConditionalGeneration,
     )
 
+    # MiniMax-M3 native sparse attention is block-sparse at 128-token granularity.
+    # The SGLang recipe must use --page-size 128; keep ATOM's config aligned so
+    # sparse metadata and SHUFFLE cache views speak the same page ABI.
+    atom_config.kv_cache_block_size = 128
     quant_config = getattr(atom_config, "quant_config", None)
     if quant_config is None:
         return
@@ -188,6 +192,30 @@ def _install_minimax_m3_adapters(model: Any) -> None:
     setup_minimax_m3_for_sglang(model)
 
 
+def _minimax_m3_construction_context():
+    from atom.plugin.sglang.models.minimax_m3 import (
+        minimax_m3_native_sparse_attention_construction,
+    )
+
+    return minimax_m3_native_sparse_attention_construction()
+
+
+def _bind_minimax_m3_cache_views(model: Any, runtime: Any) -> None:
+    if getattr(runtime.forward_batch.forward_mode, "is_idle", lambda: False)():
+        return
+
+    from atom.plugin.sglang.minimax_m3_bridge import (
+        bind_minimax_m3_sparse_cache_views,
+        maybe_get_minimax_m3_pools_from_sglang_batch,
+    )
+
+    token_to_kv_pool, _ = maybe_get_minimax_m3_pools_from_sglang_batch(
+        runtime.forward_batch
+    )
+    if not bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool):
+        raise RuntimeError("MiniMax-M3 SGLang sparse KV pool is not initialized")
+
+
 MODEL_ADAPTER_SPECS = {
     "DeepseekV3ForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_mla_adapters,
@@ -230,12 +258,16 @@ MODEL_ADAPTER_SPECS = {
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_config=_prepare_minimax_m3_config,
+        construction_context=_minimax_m3_construction_context,
         install_adapters=_install_minimax_m3_adapters,
+        bind_cache_views=_bind_minimax_m3_cache_views,
     ),
     "MiniMaxM3SparseForConditionalGeneration": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_config=_prepare_minimax_m3_config,
+        construction_context=_minimax_m3_construction_context,
         install_adapters=_install_minimax_m3_adapters,
+        bind_cache_views=_bind_minimax_m3_cache_views,
     ),
 }
 
