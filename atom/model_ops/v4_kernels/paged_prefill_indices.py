@@ -76,7 +76,9 @@ def _v4_paged_prefill_indices_kernel(
     prefix_hca_indices_ptr,
     # Constants.
     win: tl.constexpr,
-    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
+    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128) — token modulus
+    swa_row_stride,  # physical rows per SWA block (== chunk_rows; 224 for a fused
+    #                  c4 chunk, else == block_size). Decoupled from block_size.
     swa_pages,  # num_blocks * block_size — boundary into HCA compress section
     HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
@@ -143,7 +145,7 @@ def _v4_paged_prefill_indices_kernel(
         mask=swa_mask,
         other=0,
     )
-    paged = swa_phys * block_size + (global_pos - swa_blk * block_size)
+    paged = swa_phys * swa_row_stride + (global_pos - swa_blk * block_size)
     tl.store(prefix_swa_indices_ptr + swa_base_swa + i, paged, mask=swa_mask)
     # CSA buffer: the SWA prefix goes at the slice TAIL. `csa_translate_pack`
     # writes the CSA topk section at the slice HEAD
@@ -197,6 +199,7 @@ def write_v4_paged_prefill_indices(
     win: int,
     block_size: int,
     swa_pages: int,
+    swa_row_stride: int | None = None,
     hca_ratio: int = 128,
     prefix: str = "",
 ) -> None:
@@ -269,6 +272,8 @@ def write_v4_paged_prefill_indices(
     ):
         assert idx.dim() == 1
 
+    if swa_row_stride is None:
+        swa_row_stride = block_size
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_prefill_indices_kernel[(T,)](
         positions,
@@ -291,6 +296,7 @@ def write_v4_paged_prefill_indices(
         prefix_hca_indices,
         win=win,
         block_size=block_size,
+        swa_row_stride=swa_row_stride,
         swa_pages=swa_pages,
         HCA_RATIO=hca_ratio,
         BLOCK_N=BLOCK_N,
@@ -319,6 +325,7 @@ def write_v4_paged_prefill_indices_reference(
     win: int,
     block_size: int,
     swa_pages: int,
+    swa_row_stride: int | None = None,
     hca_ratio: int = 128,
 ) -> None:
     """Pure-Python equivalent of ``write_v4_paged_prefill_indices``.
@@ -331,6 +338,8 @@ def write_v4_paged_prefill_indices_reference(
     """
     if T == 0:
         return
+    if swa_row_stride is None:
+        swa_row_stride = block_size
     bid_cpu = bid_per_token[:T].cpu().tolist()
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
@@ -383,7 +392,7 @@ def write_v4_paged_prefill_indices_reference(
             phys = swa_block_tables_cpu[bid, blk.cpu()].to(
                 device=device, dtype=prefix_swa_indices.dtype
             )
-            paged = phys * block_size + (
+            paged = phys * swa_row_stride + (
                 global_pos - blk.to(global_pos.dtype) * block_size
             )
             prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = paged

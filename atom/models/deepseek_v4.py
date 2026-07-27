@@ -96,10 +96,12 @@ from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
     CompressPlan,
+    capture_compressor_boundary,
     csa_translate_pack,
     fused_compress_attn,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
+    restore_compressor_boundary,
     scale_indexer_weights,
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
@@ -142,6 +144,27 @@ _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 _V4_SWA_FULL_RETAIN = envs.ATOM_SWA_FULL_RETAIN
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+
+
+def _arena_layer_tables(attn_md, ratio: int):
+    """Unified-KV arena: resolve a layer's (compressed, SWA) block tables to its
+    ratio group's PHYSICAL tables (c4 / c128 / dense), or return the logical
+    tables when the arena is off.
+
+    Every per-layer consumer of ``attn_md.block_tables`` / ``swa_block_tables``
+    (compressor scatter WRITE, SWA WRITE, indexer topk gather, csa_translate_pack)
+    must go through here so writes and reads for a group share one physical
+    mapping. Group choice mirrors ``UnifiedKvArena.compress_group_of_ratio``:
+    ratio 4 → c4, ratio 128 → c128, else dense (dense has no compressor, so its
+    compressed table is unused). swa_pages collapses to 0 under the arena, so the
+    kernel row formula ``page * stride`` lands on the physical row.
+    """
+    abt = getattr(attn_md, "arena_block_tables_gpu", None)
+    if not abt:
+        return attn_md.block_tables, attn_md.swa_block_tables
+    g = "c4" if ratio == 4 else ("c128" if ratio == 128 else "dense")
+    aswa = attn_md.arena_swa_block_tables_gpu
+    return abt.get(g, attn_md.block_tables), aswa.get(g, attn_md.swa_block_tables)
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -970,6 +993,11 @@ class Compressor(nn.Module):
         # "indexer_fp8" keep the existing behavior.
         self.kv_cache_rope: Optional[torch.Tensor] = None
         self.write_mode: str = "bf16"
+        # CSA native prefix-cache boundary snapshot (per-layer slices, bound by
+        # the V4 builder only when enable_v4_csa_prefix_state_cache is on and
+        # only for CSA compressors). None → capture/restore are skipped.
+        self.boundary_kv: Optional[torch.Tensor] = None
+        self.boundary_score: Optional[torch.Tensor] = None
 
         # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
         # window" portion). Indexed as a single ring buffer of size
@@ -1140,6 +1168,34 @@ class Compressor(nn.Module):
             scatter_kv_cache = self.kv_cache
             scatter_block_tables = block_tables
             scatter_kv_cache_rope = self.kv_cache_rope if main_2buff_fp8 else None
+        # CSA native prefix-cache restore: on a hit's first suffix chunk, reseed
+        # the fresh per-request ring with the producer's exact B-4..B-1 rows
+        # BEFORE the fused kernel reads state-cache-as-of-previous-fwd. One-shot;
+        # the scheduler clears the source after this chunk. No-op when the
+        # feature is off (boundary_kv unbound) or no seq carries a source.
+        # Byte arena (option-b): csa_main / csa_idx are separate arena owners, so
+        # this compressor's restore source is its OWNER's physical page. Route by
+        # `_csa_owner` (set at bind); the idx fields fall back to main when the
+        # arena is off (idx == main logical page).
+        _is_idx = getattr(self, "_csa_owner", "main") == "idx"
+        if _is_idx:
+            restore_plan = getattr(plan, "restore_boundary_plan_idx_gpu", None)
+            num_restore = getattr(plan, "num_restore_boundary_idx", 0)
+        else:
+            restore_plan = getattr(plan, "restore_boundary_plan_gpu", None)
+            num_restore = plan.num_restore_boundary
+        if (
+            self.boundary_kv is not None
+            and restore_plan is not None
+            and num_restore > 0
+        ):
+            restore_compressor_boundary(
+                self.boundary_kv,
+                self.boundary_score,
+                self.kv_state,
+                self.score_state,
+                restore_plan=restore_plan,
+            )
         fused_compress_attn(
             kv_in=kv,
             score_in=score,
@@ -1180,6 +1236,38 @@ class Compressor(nn.Module):
             overlap=overlap,
             prefix=f"{self.prefix}.update_compressor_states",
         )
+        # CSA native prefix-cache capture: snapshot this fwd's terminal-block
+        # B-4..B-1 rows (same kv/score just committed to the ring) into the
+        # per-block immutable pool, so a future prefix hit can restore them.
+        # Runs every prefill fwd; requires block_tables (skipped during warmup).
+        capture_plan = getattr(plan, "capture_boundary_plan_gpu", None)
+        # Associative store: the destination is the per-seq boundary-page table
+        # (logical block -> CsaStatePool page id), staged onto the plan. The
+        # kernel writes boundary[page_table[batch, pos//128]] directly (no
+        # phys % NUM_PAGES). None during warmup → skip. Byte arena: the idx-inner
+        # compressor writes its OWNER's physical page table (csa_idx); off, this
+        # is the same GPU tensor as main (logical page).
+        if _is_idx:
+            csa_page_tables = getattr(plan, "csa_idx_page_tables_gpu", None)
+        else:
+            csa_page_tables = getattr(plan, "csa_page_tables_gpu", None)
+        if (
+            self.boundary_kv is not None
+            and capture_plan is not None
+            and plan.num_capture_boundary > 0
+            and csa_page_tables is not None
+        ):
+            capture_compressor_boundary(
+                kv,
+                score,
+                self.ape,
+                self.boundary_kv,
+                self.boundary_score,
+                capture_plan=capture_plan,
+                block_tables=csa_page_tables,
+                block_size=_V4_BLOCK_SIZE,
+                ratio=ratio,
+            )
 
 
 class Indexer(nn.Module):
@@ -1406,7 +1494,11 @@ class Indexer(nn.Module):
         """
         fc = get_forward_context()
         indexer_meta = fc.attn_metadata.indexer_meta
-        block_tables = fc.attn_metadata.block_tables  # [bs, max_blocks_per_seq] int32
+        # Unified-KV arena: the indexer's compressed-K gather must read this
+        # (CSA/ratio-4) layer's c4-group PHYSICAL pages (no-op when off).
+        block_tables, _ = _arena_layer_tables(
+            fc.attn_metadata, self.compress_ratio
+        )  # [bs, max_blocks_per_seq] int32
 
         # No host-side `if total_committed == 0: return torch.full(-1)`
         # short-circuit — that would freeze a Python branch into the
@@ -2179,11 +2271,14 @@ class DeepseekV4Attention(nn.Module):
         ratio = self.compress_ratio
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
+        # Unified-KV arena: compressor scatter WRITE via this layer's group
+        # PHYSICAL compressed table (no-op when off).
+        arena_block_tables_gpu, _ = _arena_layer_tables(attn_md, ratio)
         self.maybe_compressors_async(
             x,
             plan_for_layer,
             attn_md.state_slot_mapping,
-            attn_md.block_tables,
+            arena_block_tables_gpu,
         )
 
         # Q/KV projections (indexer projection deferred to the core's inline
@@ -2264,10 +2359,9 @@ class DeepseekV4Attention(nn.Module):
         # compress_plans, ...) is well-typed for pyright.
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
-        block_tables_gpu = attn_md.block_tables
-        # paged-SWA: swa_write targets the separate SWA pool via
-        # swa_block_tables (always populated for V4).
-        swa_block_tables_gpu = attn_md.swa_block_tables
+        # Unified-KV arena: this layer's compress scatter + SWA write must address
+        # its ratio group's PHYSICAL pages (no-op when the arena is off).
+        block_tables_gpu, swa_block_tables_gpu = _arena_layer_tables(attn_md, ratio)
         state_slot_mapping = attn_md.state_slot_mapping
         plan_for_layer = compress_plans[ratio] if ratio else None
 
@@ -2333,6 +2427,16 @@ class DeepseekV4Attention(nn.Module):
         # / qkn.k_packed / qkn.k_rope populated (the 2buff layout nope-fp8 [.,512] +
         # rope-bf16 [.,64] that op4 (prefill) / op5 (decode) consume with no
         # requant). The inactive path's fields stay None.
+        # Decode SWA write is normally FUSED into this launch. The aiter fused
+        # write (flydsl / group-quant) expresses only ONE swa_block_size, used as
+        # both physical row stride AND token modulus — so it can serve a fused c4
+        # chunk only if its row stride (chunk_rows) equals the modulus. It does
+        # NOT (c4 = 224 rows vs 128 modulus), so those layers un-fuse: pass the
+        # SWA fusion args only when stride == modulus (c128/dense/non-arena), and
+        # scatter the c4 decode K with a standalone swa_write below (chunk_rows
+        # stride, before paged_decode reads the ring).
+        swa_row_stride = getattr(self, "swa_row_stride", swa_block_size)
+        fuse_swa = is_decode and swa_row_stride == swa_block_size
         qkn = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
@@ -2347,20 +2451,38 @@ class DeepseekV4Attention(nn.Module):
             quant_q=False,
             quant_k=False,
             fp8_2buff=self.kv_fp8,
-            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
-            swa_block_tables=swa_block_tables_gpu if is_decode else None,
-            swa_block_size=swa_block_size if is_decode else None,
+            batch_id_per_token=attn_md.batch_id_per_token if fuse_swa else None,
+            swa_block_tables=swa_block_tables_gpu if fuse_swa else None,
+            swa_block_size=swa_block_size if fuse_swa else None,
             # bf16 SWA fusion (flydsl kernel / Triton fallback):
-            swa_kv=self.swa_kv if (is_decode and not self.kv_fp8) else None,
-            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
-            swa_write_per_batch=attn_md.max_seqlen_q if is_decode else None,
+            swa_kv=self.swa_kv if (fuse_swa and not self.kv_fp8) else None,
+            swa_cu_seqlens_q=attn_md.cu_seqlens_q if fuse_swa else None,
+            swa_write_per_batch=attn_md.max_seqlen_q if fuse_swa else None,
             # fp8 2buff SWA fusion (aiter group-quant launch):
-            swa_nope_scale_buff=self.swa_kv if (is_decode and self.kv_fp8) else None,
-            swa_rope_buff=self.swa_kv_rope if (is_decode and self.kv_fp8) else None,
+            swa_nope_scale_buff=self.swa_kv if (fuse_swa and self.kv_fp8) else None,
+            swa_rope_buff=self.swa_kv_rope if (fuse_swa and self.kv_fp8) else None,
             prefix=f"{self.layer_name}.qk_norm_rope_maybe_quant",
         )
         if _V4_USE_REF_QUANT and not self.kv_fp8:
             act_quant_inplace(qkn.kv[..., :-rd], 64, self.scale_fmt)
+        # Un-fused c4 decode SWA write (chunk_rows stride). Must land before the
+        # paged_decode dispatch reads the window (line below), matching the fused
+        # path's ordering. No-op for c128/dense/non-arena (they fused above).
+        if is_decode and not fuse_swa:
+            swa_write(
+                qkn.kv,
+                positions,
+                attn_md.cu_seqlens_q,
+                swa_block_tables_gpu,
+                self.swa_kv,
+                swa_block_size,
+                attn_md.max_seqlen_q,
+                row_stride=swa_row_stride,
+                k_packed=qkn.k_packed if self.kv_fp8 else None,
+                k_rope=qkn.k_rope if self.kv_fp8 else None,
+                swa_region_rope=self.swa_kv_rope if self.kv_fp8 else None,
+                prefix=f"{self.layer_name}.swa_write_decode",
+            )
 
         # HCA
         if use_async_compress:
@@ -2568,6 +2690,10 @@ class DeepseekV4Attention(nn.Module):
                 k_packed=k_packed_full,
                 k_rope=k_rope_full,
                 swa_region_rope=self.swa_kv_rope,
+                # Physical rows per SWA block (== chunk_rows). A fused c4 chunk is
+                # 224 rows (SWA KV 128 + CSA state + pad) so the SWA KV lands in
+                # rows [0:128) of the fat chunk; c128/dense/non-arena == block_size.
+                row_stride=getattr(self, "swa_row_stride", swa_block_size),
                 prefix=f"{self.layer_name}.swa_write",
             )
 
@@ -2645,9 +2771,12 @@ class DeepseekV4Attention(nn.Module):
             skip_buf = attn_md.skip_prefix_len_csa
             window_size = 0
 
+        # Unified-KV arena: CSA topk → physical must use the c4-group PHYSICAL
+        # table (this method only fires for CSA/ratio-4 layers); swa_pages is 0.
+        csa_bt, _ = _arena_layer_tables(attn_md, self.compress_ratio)
         csa_translate_pack(
             topk_local_raw,
-            attn_md.block_tables,
+            csa_bt,
             positions,
             kv_indptr,
             attn_md.batch_id_per_token,

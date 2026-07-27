@@ -98,6 +98,10 @@ class EngineCore:
             # the runner's attn builder (else swa_enabled=False vs the SWA pool).
             config.num_swa_blocks = block_info.get("num_swa_blocks", 0)
             config.swa_window_size = block_info.get("swa_window_size", 0)
+            # Unified-KV arena: propagate the runner-computed per-group specs so
+            # BlockManager (built in Scheduler below) constructs the arena and
+            # ships per-group physical tables to the worker.
+            config.v4_arena_group_specs = block_info.get("v4_arena_group_specs")
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )

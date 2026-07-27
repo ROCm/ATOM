@@ -8,17 +8,17 @@ from atom.model_engine.sequence import Sequence
 
 
 class SlidingWindowPool:
-    """Content-addressed sliding-window KV block pool (DeepSeek-V4 SWA).
+    """Physical content-addressed SWA component for ``StatePool``.
 
     Owns an independent free-list + content-hash map so out-of-window SWA blocks
     can be freed while the compressed blocks persist. Mirrors vLLM's
-    `SlidingWindowManager`; `BlockManager` holds one instance (`self.swa`) and
-    delegates all SWA lifecycle here, driving it in lockstep with the compressed
-    pool. `seq.swa_block_table` lives on `Sequence` (shared with attention / PD);
-    this pool only reads/writes it.
+    `SlidingWindowManager`; ``StatePool`` owns one instance and delegates all
+    SWA lifecycle here, driving it in lockstep with the compressed pool.
+    `seq.swa_block_table` lives on `Sequence` (shared with attention / PD); this
+    component only reads/writes it.
 
     Self-guarding: when `num_blocks == 0` (non-V4 models) the pool is DISABLED —
-    every method is an identity/no-op, so `BlockManager` can call it
+    every method is an identity/no-op, so ``StatePool`` can call it
     unconditionally (no `if swa_enabled` scattered at the call sites). `has_free`
     returns True and `bounded_hit` returns the input length, so admission and
     hit-length are byte-identical to a no-SWA build.
@@ -82,16 +82,97 @@ class SlidingWindowPool:
         )
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
+        # free_block_ids = BACKED-free (hold an arena page); _unbacked_free_ids =
+        # ref-0 ids whose page was lent to the compressed pool (reuse re-borrows).
+        # Arena is attached later; without it every id is a fixed slot ("backed")
+        # and _unbacked stays empty — byte-identical to the pre-arena path.
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.free_block_ids_set: set[int] = set(range(num_blocks))
+        self._unbacked_free_ids: deque[int] = deque()
+        self._unbacked_free_set: set[int] = set()
         self.used_block_ids: set[int] = set()
+        # Unified-KV chunk arena (ATOM_V4_UNIFIED_KV_ARENA). When attached, an
+        # SWA block's physical page is borrowed from the shared arena instead of
+        # being its fixed slot id, so idle SWA capacity can be lent to the
+        # compressed pool. ``_evict_sibling`` evicts a cold compressed block to
+        # return a chunk when the arena is starved (pool-driven lending).
+        self.arena = None
+        self._evict_sibling = None
+
+    def attach_arena(self, arena, evict_sibling) -> None:
+        """Wire the shared arena + a callback that evicts one cold compressed
+        block (returning a chunk) so SWA can borrow it under pressure."""
+        self.arena = arena
+        self._evict_sibling = evict_sibling
+        # With the arena on, an SWA id has NO physical page until first _alloc, so
+        # every currently-free id starts UNbacked.
+        if arena is not None and getattr(arena, "enabled", False):
+            self._unbacked_free_ids = self.free_block_ids
+            self._unbacked_free_set = self.free_block_ids_set
+            self.free_block_ids = deque()
+            self.free_block_ids_set = set()
+
+    def _arena_alloc_swa(self, block_id: int) -> None:
+        """Back an SWA block with an arena page, evicting a cold compressed block
+        on starvation and retrying (pool-driven cross-pool lending)."""
+        from atom.model_engine.chunk_arena import ArenaEmpty
+
+        if self.arena is None or self.arena.is_swa_backed(block_id):
+            return
+        while True:
+            try:
+                self.arena.alloc_swa(block_id)
+                return
+            except ArenaEmpty:
+                if self._evict_sibling is None or not self._evict_sibling():
+                    raise
+
+    def evict_cold_for_arena(self) -> bool:
+        """Truly evict the coldest ref-0 SWA block (drop its hash + return its
+        arena pages) so the compressed pool can borrow the freed chunk. Returns
+        False when no ref-0 block is available."""
+        if self.arena is None:
+            return False
+        # free_block_ids holds only BACKED-free ids → all evictable candidates.
+        # Drop the coldest ref-0 block's hash, return its arena page (a whole
+        # chunk, since an SWA page == a chunk), and move the id to the UNBACKED
+        # free pool so it stays reusable instead of leaking.
+        while self.free_block_ids:
+            block_id = self.free_block_ids.popleft()
+            if block_id not in self.free_block_ids_set:
+                continue  # stale duplicate
+            block = self.blocks[block_id]
+            if block.ref_count != 0:
+                self.free_block_ids_set.discard(block_id)  # self-heal
+                continue
+            self.free_block_ids_set.discard(block_id)
+            if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+                del self.hash_to_block_id[block.hash]
+            block.reset()
+            self.arena.free_swa(block_id)
+            self._unbacked_free_ids.append(block_id)
+            self._unbacked_free_set.add(block_id)
+            return True
+        return False
+
+    def num_evictable(self) -> int:
+        """Count of ref-0 BACKED SWA blocks the compressed pool could reclaim
+        (each holds a full chunk that lending returns to the arena)."""
+        return len(self.free_block_ids_set) if self.arena is not None else 0
 
     # ----------------------------- primitives ------------------------------ #
     def _pop(self) -> int:
+        # Prefer BACKED-free (reuse held page) before UNBACKED-free (re-borrow a
+        # page on _alloc). Arena off: _unbacked_free_ids is empty (unchanged).
         while self.free_block_ids:
             block_id = self.free_block_ids.popleft()
             if block_id in self.free_block_ids_set:
                 self.free_block_ids_set.discard(block_id)
+                return block_id
+        while self._unbacked_free_ids:
+            block_id = self._unbacked_free_ids.popleft()
+            if block_id in self._unbacked_free_set:
+                self._unbacked_free_set.discard(block_id)
                 return block_id
         raise AssertionError("No free SWA blocks available")
 
@@ -102,7 +183,11 @@ class SlidingWindowPool:
             del self.hash_to_block_id[block.hash]
         block.reset()
         self.free_block_ids_set.discard(block_id)
+        self._unbacked_free_set.discard(block_id)  # now becomes used+backed
         self.used_block_ids.add(block_id)
+        # Ensure this SWA block has an arena page (no-op when the arena is off or
+        # the block is already backed). Borrows from compressed under pressure.
+        self._arena_alloc_swa(block_id)
         return block
 
     def _dealloc(self, block_id: int):
@@ -149,10 +234,22 @@ class SlidingWindowPool:
     # --------------------------- admission / hit --------------------------- #
     def has_free(self, n: int) -> bool:
         """Whether the pool has at least `n` free blocks. Disabled → True (never
-        blocks admission)."""
+        blocks admission). Arena on: also require `n` arena pages backable from
+        SWA's own capacity — conservative (does not count chunks reclaimable from
+        the compressed pool, which alloc can still borrow), so it never
+        over-admits."""
         if not self.enabled:
             return True
-        return len(self.free_block_ids_set) >= n
+        if self.arena is None:
+            return len(self.free_block_ids_set) >= n
+        # Reusing a BACKED-free id costs no new page; only the shortfall must be
+        # backed from SWA's own arena capacity (conservative — ignores chunks
+        # reclaimable from the compressed pool, so it never over-admits).
+        backed_free = len(self.free_block_ids_set)
+        total_free = backed_free + len(self._unbacked_free_set)
+        if total_free < n:
+            return False
+        return backed_free + self.arena.swa_available() >= n
 
     def admission_blocks(self, seq: Sequence) -> int:
         """Peak concurrent SWA blocks one request holds during (chunked) prefill.
@@ -223,7 +320,10 @@ class SlidingWindowPool:
         else:
             assert block.ref_count == 0
             block.ref_count = 1
+            # Cache hits land only on BACKED blocks (KV resident); discard from
+            # both free sets so the id leaves the free pool cleanly.
             self.free_block_ids_set.discard(swa_id)
+            self._unbacked_free_set.discard(swa_id)
             self.used_block_ids.add(swa_id)
         # Cross-request reuse of a pinned checkpoint → refresh its LRU recency.
         if swa_id in self.checkpoint_lru:

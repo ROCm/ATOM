@@ -1193,10 +1193,21 @@ class Config:
     stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
+    # DSV4 unified-KV chunk arena (ATOM_V4_UNIFIED_KV_ARENA). Per-ratio group
+    # specs `[(name, compress_stride, num_chunks), ...]` set by ModelRunner
+    # sizing; None/empty disables the arena (BlockManager keeps the two
+    # fixed-size pools). See atom/model_engine/unified_kv_arena.py.
+    v4_arena_group_specs: list | None = None
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
+    # DeepSeek-V4: use the immutable CSA boundary-state snapshot on a native
+    # prefix-cache hit (bit-exact) instead of the 4-token recompute/replay.
+    # Off keeps the legacy replay path. See envs.ATOM_V4_CSA_PREFIX_STATE_CACHE.
+    enable_v4_csa_prefix_state_cache: bool = field(
+        default_factory=lambda: envs.ATOM_V4_CSA_PREFIX_STATE_CACHE
+    )
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR

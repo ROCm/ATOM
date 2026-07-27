@@ -67,6 +67,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # DeepSeek-V4 native HBM prefix-cache CSA boundary-state snapshot. When on,
+    # the producer captures the terminal block's B-4..B-1 first-half compressor
+    # projection rows into an immutable per-block snapshot; a prefix hit restores
+    # them into the fresh per-request ring (bit-exact) instead of replaying the
+    # 4 warmup tokens (the recompute path). Off → legacy recompute/replay.
+    "ATOM_V4_CSA_PREFIX_STATE_CACHE": lambda: (
+        os.getenv("ATOM_V4_CSA_PREFIX_STATE_CACHE", "0") == "1"
+    ),
+    # NOTE (feat/csa-swa-fusion): the DSV4 CSA boundary snapshot is now FUSED
+    # into the SWA chunk, so it has no store of its own — its capacity and
+    # retention ride the SWA pool (ATOM_SWA_*). The old ATOM_V4_CSA_BOUNDARY_SLOTS
+    # / ATOM_V4_CSA_FULL_RETAIN / _RETENTION_INTERVAL / _CHECKPOINT_FRAC knobs are
+    # removed; use ATOM_SWA_FULL_RETAIN / ATOM_SWA_RETENTION_INTERVAL instead.
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
@@ -120,6 +133,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when sparse retention is on; the rest stays free for live-window churn.
     "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(
         os.getenv("ATOM_SWA_CHECKPOINT_FRAC", "0.5")
+    ),
+    # DeepSeek-V4 unified-KV chunk arena. When ON, the SWA pool and the
+    # compressed pool stop being two fixed-size regions and instead borrow
+    # equal-size physical chunks from one shared arena on demand (each pool
+    # sub-divides a chunk at its own page size). Removes the fixed
+    # ATOM_SWA_TAIL_BUDGET_FRAC split: whichever pool is under-used lends its
+    # chunks to the other. Default 0 (current two-fixed-pool behaviour,
+    # byte-identical). See atom/model_engine/chunk_arena.py.
+    "ATOM_V4_UNIFIED_KV_ARENA": lambda: (
+        os.getenv("ATOM_V4_UNIFIED_KV_ARENA", "0") == "1"
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];

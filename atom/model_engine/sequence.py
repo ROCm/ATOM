@@ -100,6 +100,14 @@ class Sequence:
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).
         self.per_req_cache_group = -1
+        # One-shot CSA boundary-state restore source for a local DSV4 prefix hit
+        # (feat/csa-swa-fusion). This is the terminal cached block's LOGICAL c4
+        # swa id — the scheduler translates it to that block's physical SWA chunk,
+        # whose fused tail segment holds the captured boundary; -1 means no
+        # restore is needed. BlockManager sets it only when the CSA state cache is
+        # enabled and the terminal hit block's SWA window is present. Consumed once
+        # by the restore kernel via batch metadata, then cleared in postprocess.
+        self.csa_boundary_state_block_id = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
