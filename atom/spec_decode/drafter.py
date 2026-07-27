@@ -38,10 +38,42 @@ class AuxCaptureSpec:
     extract: Callable[[Any, nn.Module], torch.Tensor | None]
 
 
+# Descent bound for the `.model` wrapper chain below — big enough for every
+# nesting we ship (UBatchWrapper -> ForCausalLM -> Model), small enough that a
+# self-referential `.model` cannot spin.
+_MAX_WRAPPER_DEPTH = 8
+
+
+def _descend_wrappers(target_model: nn.Module, pick):
+    """Walk the ``.model`` wrapper chain until ``pick(module)`` returns non-None.
+
+    A fixed two-level walk is not enough: aux capture is armed AFTER the optional
+    TBO wrap, so ``target_model`` may be a ``UBatchWrapper`` and the attribute
+    sits one level deeper. Same unwrap ``EagleProposer.arm_aux_capture`` does.
+    """
+    module = getattr(target_model, "language_model", target_model)
+    for _ in range(_MAX_WRAPPER_DEPTH):
+        found = pick(module)
+        if found is not None:
+            return found
+        inner = getattr(module, "model", None)
+        if inner is None or inner is module:
+            break
+        module = inner
+    return None
+
+
 def _resolve_decoder_layers(target_model: nn.Module) -> nn.Module:
-    """Unwrap the target's decoder-layer stack (handles the multimodal wrapper)."""
-    base = getattr(target_model, "language_model", target_model)
-    return base.model.layers
+    """Unwrap the target's decoder-layer stack (handles the multimodal wrapper
+    and any number of ``.model`` wrappers, e.g. the TBO ``UBatchWrapper``)."""
+    layers = _descend_wrappers(target_model, lambda m: getattr(m, "layers", None))
+    if layers is None:
+        raise ValueError(
+            "could not resolve the target decoder layers for aux capture "
+            f"(no `.layers` within {_MAX_WRAPPER_DEPTH} `.model` levels of "
+            f"{type(target_model).__name__})."
+        )
+    return layers
 
 
 def _resolve_embedding(target_model: nn.Module) -> nn.Module:
@@ -50,16 +82,21 @@ def _resolve_embedding(target_model: nn.Module) -> nn.Module:
     The reference convention (deepspec ``extract_context_feature``) uses layer id
     ``-1`` to mean the embedding output (``hidden_states[0]``). Model wrappers name
     it either ``embed_tokens`` (standard) or ``embed`` (DeepSeek-V4)."""
-    base = getattr(target_model, "language_model", target_model)
-    model = base.model
-    for name in ("embed_tokens", "embed"):
-        embed = getattr(model, name, None)
-        if embed is not None:
-            return embed
-    raise ValueError(
-        "could not resolve the target embedding module for aux capture of "
-        "layer id -1 (expected model.embed_tokens or model.embed)."
-    )
+
+    def _pick(module):
+        for name in ("embed_tokens", "embed"):
+            embed = getattr(module, name, None)
+            if embed is not None:
+                return embed
+        return None
+
+    embed = _descend_wrappers(target_model, _pick)
+    if embed is None:
+        raise ValueError(
+            "could not resolve the target embedding module for aux capture of "
+            "layer id -1 (expected model.embed_tokens or model.embed)."
+        )
+    return embed
 
 
 def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
@@ -241,12 +278,21 @@ class Drafter(abc.ABC):
         buffer = self._aux_buffers[buf_idx]
 
         def _hook(module, _inputs, output):
+            ctx = get_forward_context().context
+            # Target forwards only. The `-1` tap sits on the embedding, which the
+            # draft model shares — its forward_spec would otherwise clobber these
+            # rows with noise-token embeddings.
+            if ctx.is_draft:
+                return
             tensor = extract(output, module)
             if tensor is None:
                 return
-            # In-place write into the fixed buffer (cudagraph-safe; no host-side
-            # dict mutation).
-            buffer[: tensor.shape[0]].copy_(tensor)
+            # In-place write into the fixed buffer (cudagraph-safe). Offset is 0
+            # except under TBO, where this hook fires once per micro-batch on a
+            # disjoint token slice — writing at row 0 unconditionally would make
+            # the ubatches overwrite each other.
+            off = ctx.ubatch_token_offset
+            buffer[off : off + tensor.shape[0]].copy_(tensor)
 
         return _hook
 

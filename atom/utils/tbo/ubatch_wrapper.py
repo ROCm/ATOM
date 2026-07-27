@@ -5,16 +5,16 @@ import logging
 import threading
 import traceback
 from dataclasses import dataclass
-from typing import Optional, TypeAlias
+from typing import TypeAlias
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from atom.utils.forward_context import (
     Context,
     ForwardContext,
-    get_forward_context,
     _forward_context_local,
+    get_forward_context,
 )
 
 from .ubatch_splitting import UBatchSlice
@@ -31,7 +31,7 @@ class TBOGraphData:
 
     graph: torch.cuda.CUDAGraph
     tbo_ctxs: list  # keep torch.Event objects alive for replay
-    output: Optional[UBatchModelOutput] = None  # output reference from capture
+    output: UBatchModelOutput | None = None  # output reference from capture
 
 
 class UBatchWrapper(nn.Module):
@@ -47,7 +47,7 @@ class UBatchWrapper(nn.Module):
         self.model = model
         self.attn_metadata_builder = attn_metadata_builder
         self.dp_gather_scatter = dp_gather_scatter
-        self.comm_stream: Optional[torch.cuda.Stream] = None
+        self.comm_stream: torch.cuda.Stream | None = None
         # Barrier: ubatch threads + main thread
         self.ready_barrier = threading.Barrier(3)  # 2 ubatch threads + 1 main
         # TBO CUDAGraph storage: keyed by (graph_bs, max_q_len)
@@ -57,10 +57,10 @@ class UBatchWrapper(nn.Module):
         # 2 threads.
         self._num_workers = 2
         self._workers: list[threading.Thread] = []
-        self._worker_jobs: list[Optional[callable]] = [None] * self._num_workers
+        self._worker_jobs: list[callable | None] = [None] * self._num_workers
         self._worker_job_ready = [threading.Event() for _ in range(self._num_workers)]
         self._worker_job_done = [threading.Event() for _ in range(self._num_workers)]
-        self._workers_device: Optional[torch.device] = None
+        self._workers_device: torch.device | None = None
 
     def _worker_loop(self, idx: int):
         # Bind this long-lived thread to the device ONCE — the HIP per-thread
@@ -172,7 +172,7 @@ class UBatchWrapper(nn.Module):
         )
 
         results: list[tuple[int, UBatchModelOutput]] = []
-        errors: list[Optional[Exception]] = [None] * N
+        errors: list[Exception | None] = [None] * N
 
         device = input_ids.device
         assert (
@@ -234,7 +234,7 @@ class UBatchWrapper(nn.Module):
         positions: torch.Tensor,
         graph_pool,
         capture_stream: torch.cuda.Stream,
-        output_buffer: Optional[torch.Tensor] = None,
+        output_buffer: torch.Tensor | None = None,
     ) -> tuple[torch.cuda.CUDAGraph, UBatchModelOutput]:
         """Capture a CUDAGraph for TBO ubatch execution.
 
@@ -287,7 +287,7 @@ class UBatchWrapper(nn.Module):
         )
 
         results: list[tuple[int, UBatchModelOutput]] = []
-        errors: list[Optional[Exception]] = [None] * N
+        errors: list[Exception | None] = [None] * N
         device = input_ids.device
 
         @torch.inference_mode()
@@ -560,6 +560,9 @@ class UBatchWrapper(nn.Module):
                 if ctx.context.input_ids is not None
                 else None
             ),
+            # Where this ubatch's rows start on the full forward's token axis;
+            # drafter aux capture writes at this offset.
+            ubatch_token_offset=ub_slice.token_slice.start,
         )
 
         return ForwardContext(
