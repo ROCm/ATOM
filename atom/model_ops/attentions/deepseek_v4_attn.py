@@ -1391,10 +1391,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ) + np.repeat(context_lens_np - full_q, max_seqlen_q)
         sum_scheduled_tokens = batch.total_tokens_num_decode
 
-        # DSpark FLAT graph tail-padding: the graph replays a fixed C=bs*max_seqlen_q
-        # token grid but ragged has only Σ≤C real tokens, so pad positions[Σ:C]=0
-        # (valid; masked out via batch_id==-1). Eager (Σ==C) is a no-op.
-        graph_cap_tokens = int(bs) * int(max_seqlen_q)
+        # Pad positions up to the graph's replayed token count. Prefer the real
+        # flat bucket run_model actually replays (dynamic_num_tokens_pad); else
+        # bs*max_seqlen_q (non-ragged / non-piecewise).
+        dynamic_num_tokens_pad = getattr(batch, "dynamic_num_tokens_pad", None)
+        graph_cap_tokens = (
+            int(dynamic_num_tokens_pad)
+            if dynamic_num_tokens_pad is not None
+            else int(bs) * int(max_seqlen_q)
+        )
         if graph_cap_tokens > sum_scheduled_tokens:
             _pad_positions = np.zeros(graph_cap_tokens, dtype=positions_np.dtype)
             _pad_positions[:sum_scheduled_tokens] = positions_np
@@ -1448,9 +1453,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens_np,
             graph_bs=bs,
             max_q_len=max_seqlen_q,
-            # per-seq upper bound (full_q); ragged flat-pack can place a seq
-            # longer than the q_eff bucket -> size compressor by full_q.
-            compress_cap_q_len=1 + self.max_spec_steps,
         )
 
         # ---- sync, build attn_metadata, per-fwd meta ----
@@ -1642,7 +1644,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 ctx_for_plan,
                 graph_bs=padded_bs,
                 max_q_len=max_seqlen_q,
-                compress_cap_q_len=1 + self.max_spec_steps,
                 buf_prefix_ubatch=p,
             )
 
@@ -2862,7 +2863,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         *,
         graph_bs: int | None = None,
         max_q_len: int | None = None,
-        compress_cap_q_len: int | None = None,
         buf_prefix_ubatch: str = "",
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
@@ -2913,7 +2913,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             plan_buffers=plan_buffers,
             graph_bs=graph_bs,
             max_q_len=max_q_len,
-            compress_cap_q_len=compress_cap_q_len,
         )
 
     def _populate_block_tables(
@@ -3098,10 +3097,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens_np,
             graph_bs=bs,
             max_q_len=max_q_len,
-            # capture the full_q-based compressor capacity for EVERY q bucket so a
-            # ragged replay at a small bucket (seq longer than q_eff) never
-            # overflows the baked compress grid.
-            compress_cap_q_len=1 + self.max_spec_steps,
         )
         # Capture: padded_bs == scheduled_bs == bs (synthetic batch is full).
         # Must run BEFORE `_attach_v4_indexer_meta` so the indexer-side meta

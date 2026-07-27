@@ -2285,20 +2285,29 @@ class ModelRunner:
         # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
         # [0:Σ] with the per-seq ragged new_len.
         #   * dynamic_spec_query_tokens_per_req : the true ragged per-seq lengths.
-        #   * num_spec_query_tokens (scalar) : graph CAPACITY selector q_eff, so
-        #     C = bs*q_eff >= Σ (q_eff = ceil(Σ/bs) quantized up to a captured
-        #     bucket). Graph replays a fixed C grid; tail [Σ:C] is -1-batch_id
-        #     padding (kernels skip it). C tracks the SUM, not bs*max_len, so a
-        #     long tail seq no longer inflates the whole batch (win over q-bucket).
+        #   * num_spec_query_tokens (scalar) q_eff : the PER-SEQ length bound
+        #     (>= max(new_len), quantized up to a captured bucket). Per-seq
+        #     structures (compressor grid, rectangular indexer) size by it, so no
+        #     seq can overflow them. It is NOT the total compute size -- that is
+        #     the flat num_tokens bucket (dynamic_num_tokens_pad), sized to the
+        #     real sum, so a long-tail seq no longer inflates the batch row count.
         buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
         if self.enforce_eager:
             # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
             # real len (positions/attn bound); layout is pure flat Σ.
             q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
         else:
-            # Graph: pick the smallest bucket q_eff with bs*q_eff >= Σ.
-            q_ceil = (total_new + scheduled_bs - 1) // max(scheduled_bs, 1)
-            q_eff = quantize_to_bucket(q_ceil, buckets)
+            # Graph: q_eff = smallest bucket >= the real MAX per-seq len, so no
+            # seq ever exceeds q_eff. Per-seq structures (compressor grid,
+            # rectangular indexer) size by q_eff and can't overflow -- no separate
+            # full_q cap needed. The TOTAL compute size is chosen apart from this
+            # by the flat num_tokens bucket (dynamic_num_tokens_pad, sized to the
+            # real sum), so q_eff no longer needs to track the sum/avg.
+            q_eff = (
+                quantize_to_bucket(int(new_len.max()), buckets)
+                if scheduled_bs > 0
+                else full_q
+            )
         batch.num_spec_query_tokens = int(q_eff)
         batch.dynamic_spec_query_tokens_per_req = new_len
 
@@ -2379,6 +2388,10 @@ class ModelRunner:
         ) = preprocessed
         # NOTE: self._dspark_decode_replay is set inside _preprocess (it needs
         # sync.any_dummy), so it's already current here for build()/run_model.
+
+        # Precompute the flat replay token count once here (before attn build +
+        # run_model) so the attn builder's positions padding matches it.
+        batch.dynamic_num_tokens_pad = self._dynamic_num_tokens_pad(batch)
 
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
@@ -3256,6 +3269,34 @@ class ModelRunner:
                     "capture path for cudagraph-safe DP collectives.",
                     getter,
                 )
+
+    def _dynamic_num_tokens_pad(self, batch) -> int | None:
+        """Flat PIECEWISE replay token count for a ragged decode step, or None so
+        callers fall back to ``bs * max_seqlen_q``.
+
+        Mirrors the ragged branch of ``_piecewise_replay_shape``: the smallest
+        captured q-divisible num_tokens bucket >= the (DP-max) real token total.
+        None for non-ragged / non-piecewise / dummy / prefill / no-match."""
+        if (
+            batch is None
+            or batch.is_dummy_run
+            or batch.total_tokens_num_prefill > 0
+            or not self._piecewise_cg_active()
+            or not self._piecewise_sorted_tokens
+            or not hasattr(self, "drafter")
+        ):
+            return None
+        dp_total = batch.dspark_dp_total_tokens
+        real_tokens = (
+            int(dp_total)
+            if dp_total is not None
+            else int(batch.total_tokens_num_decode)
+        )
+        q = int(batch.num_spec_query_tokens)
+        for b in self._piecewise_sorted_tokens:
+            if b >= real_tokens and q > 0 and b % q == 0:
+                return int(b)
+        return None
 
     def _piecewise_replay_shape(self, batch, graph_bs, max_q_len):
         """Pick the PIECEWISE replay token count for one decode step.
