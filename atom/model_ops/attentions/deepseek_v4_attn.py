@@ -1448,6 +1448,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens_np,
             graph_bs=bs,
             max_q_len=max_seqlen_q,
+            # per-seq upper bound (full_q); ragged flat-pack can place a seq
+            # longer than the q_eff bucket -> size compressor by full_q.
+            compress_cap_q_len=1 + self.max_spec_steps,
         )
 
         # ---- sync, build attn_metadata, per-fwd meta ----
@@ -1639,6 +1642,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 ctx_for_plan,
                 graph_bs=padded_bs,
                 max_q_len=max_seqlen_q,
+                compress_cap_q_len=1 + self.max_spec_steps,
                 buf_prefix_ubatch=p,
             )
 
@@ -2858,6 +2862,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         *,
         graph_bs: int | None = None,
         max_q_len: int | None = None,
+        compress_cap_q_len: int | None = None,
         buf_prefix_ubatch: str = "",
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
@@ -2908,6 +2913,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             plan_buffers=plan_buffers,
             graph_bs=graph_bs,
             max_q_len=max_q_len,
+            compress_cap_q_len=compress_cap_q_len,
         )
 
     def _populate_block_tables(
@@ -3088,7 +3094,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # helpers used at runtime — guarantees addresses match.
         extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
         attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np, context_lens_np, graph_bs=bs, max_q_len=max_q_len
+            extend_lens_np,
+            context_lens_np,
+            graph_bs=bs,
+            max_q_len=max_q_len,
+            # capture the full_q-based compressor capacity for EVERY q bucket so a
+            # ragged replay at a small bucket (seq longer than q_eff) never
+            # overflows the baked compress grid.
+            compress_cap_q_len=1 + self.max_spec_steps,
         )
         # Capture: padded_bs == scheduled_bs == bs (synthetic batch is full).
         # Must run BEFORE `_attach_v4_indexer_meta` so the indexer-side meta

@@ -72,6 +72,7 @@ def make_compress_plans(
     plan_buffers: dict,
     graph_bs: int | None = None,
     max_q_len: int | None = None,
+    compress_cap_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
@@ -162,9 +163,17 @@ def make_compress_plans(
         """
         if graph_bs is not None:
             k_pool = (2 if is_overlap else 1) * ratio
+            # Capacity must bound the LONGEST possible single seq, not the (avg-
+            # based) q_eff bucket: DSpark ragged flat-packs per-seq lengths up to
+            # full_q into a bs*q_eff grid, so one seq can exceed q_eff (only the
+            # SUM is bounded) and compress ceil(len/ratio) > ceil(q_eff/ratio)
+            # times -> n_compress overflow. Size compress/write by
+            # compress_cap_q_len (== full_q, the per-seq upper bound) when given;
+            # else fall back to max_q_len (uniform/non-ragged path, unchanged).
+            cap_q = compress_cap_q_len if compress_cap_q_len is not None else max_q_len
             return (
-                graph_bs * ((max_q_len + ratio - 1) // ratio),  # ceil(qlen/ratio)
-                graph_bs * min(max_q_len, k_pool),
+                graph_bs * ((cap_q + ratio - 1) // ratio),  # ceil(cap_q/ratio)
+                graph_bs * min(cap_q, k_pool),
             )
         if decode_capacity_per_ratio is not None:
             return decode_capacity_per_ratio[ratio], full_wcap
