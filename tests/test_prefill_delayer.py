@@ -38,17 +38,17 @@ def _add_rank(slots):
 
 
 def make_delayer(**kw):
-    defaults = dict(
-        dp_size=1,
-        cpu_group=None,
-        max_num_batched_tokens=MAX_BATCHED,
-        target_fill=0.7,
-        ttft_max_ticks=30,
-        partial_max_ticks=8,
-        stall_ticks=3,
-        kv_high_watermark=0.9,
-        token_usage_low_watermark=None,
-    )
+    defaults = {
+        "dp_size": 1,
+        "cpu_group": None,
+        "max_num_batched_tokens": MAX_BATCHED,
+        "target_fill": 0.7,
+        "ttft_max_ticks": 30,
+        "partial_max_ticks": 8,
+        "stall_ticks": 3,
+        "kv_high_watermark": 0.9,
+        "token_usage_low_watermark": None,
+    }
     defaults.update(kw)
     # The cross-DP all_reduce only runs when cpu_group is not None (dp=1/TP-only
     # skips it — there is no sibling to align with). Multi-rank tests mock
