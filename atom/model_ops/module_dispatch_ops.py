@@ -121,7 +121,7 @@ direct_register_custom_op(
 def indexer_score_topk(
     q_quant: torch.Tensor,
     weights: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
     layer_name: str,
     topk: int,
 ) -> torch.Tensor:
@@ -134,7 +134,7 @@ def indexer_score_topk(
 def _indexer_score_topk_fake(
     q_quant: torch.Tensor,
     weights: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
     layer_name: str,
     topk: int,
 ) -> torch.Tensor:

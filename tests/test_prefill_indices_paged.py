@@ -156,13 +156,28 @@ def _run2(fn):
     c = torch.full((max(int(csa_i2[-1]), 1),), -9, dtype=torch.int32, device=dev)
     h = torch.full((int(hca_i2[-1]),), -9, dtype=torch.int32, device=dev)
     fn(
-        positions=pos2, bid_per_token=bidt2, chunk_start_per_seq=cstart2,
-        cu_seqlens_q_per_seq=cuq2, state_slot_per_seq=sslot2,
-        n_committed_hca_per_seq=nhca2, block_tables=bt2, swa_block_tables=sbt2,
-        extend_indptr=ext_i2, prefix_swa_indptr=swa_i2, prefix_csa_indptr=csa_i2,
-        prefix_hca_indptr=hca_i2, extend_indices=e, prefix_swa_indices=s,
-        prefix_csa_indices=c, prefix_hca_indices=h, T=T2, win=win,
-        block_size=bs2, swa_pages=sp2, hca_ratio=hr2, k2_hca=k2,
+        positions=pos2,
+        bid_per_token=bidt2,
+        chunk_start_per_seq=cstart2,
+        cu_seqlens_q_per_seq=cuq2,
+        state_slot_per_seq=sslot2,
+        n_committed_hca_per_seq=nhca2,
+        block_tables=bt2,
+        swa_block_tables=sbt2,
+        extend_indptr=ext_i2,
+        prefix_swa_indptr=swa_i2,
+        prefix_csa_indptr=csa_i2,
+        prefix_hca_indptr=hca_i2,
+        extend_indices=e,
+        prefix_swa_indices=s,
+        prefix_csa_indices=c,
+        prefix_hca_indices=h,
+        T=T2,
+        win=win,
+        block_size=bs2,
+        swa_pages=sp2,
+        hca_ratio=hr2,
+        k2_hca=k2,
     )
     return h
 
@@ -175,7 +190,8 @@ btn = bt2.cpu().numpy()[0]
 # independent oracle = where the compressor writes entry e (phys*k2 + slot)
 oracle2 = torch.tensor(
     [sp2 + int(btn[e // k2]) * k2 + e % k2 for e in range(4)],
-    dtype=torch.int32, device=dev,
+    dtype=torch.int32,
+    device=dev,
 )
 assert torch.equal(h_ker2, oracle2), (
     f"k2={k2} HCA compress offset wrong (the HCA paged-gather bug)\n"

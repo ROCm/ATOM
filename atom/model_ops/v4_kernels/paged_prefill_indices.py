@@ -413,4 +413,6 @@ def write_v4_paged_prefill_indices_reference(
             slot = (ks % k2_hca).to(prefix_hca_indices.dtype)
             bt = block_tables_cpu[bid, blk].to(device).to(prefix_hca_indices.dtype)
             hca_dst = sb_hca + prefix_swa_count
-            prefix_hca_indices[hca_dst : hca_dst + n_hca] = swa_pages + bt * k2_hca + slot
+            prefix_hca_indices[hca_dst : hca_dst + n_hca] = (
+                swa_pages + bt * k2_hca + slot
+            )

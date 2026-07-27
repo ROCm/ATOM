@@ -1179,7 +1179,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata: AttentionMetaData_DSV4,
         ragged_lens,
         positions_gpu,
-        meta: Dict[str, Any],
+        meta: dict[str, Any],
     ) -> None:
         """Rebuild the FP4 ragged-decode varlen windows + persistent-grid schedule.
 
@@ -2818,7 +2818,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # cache view [num_blocks, k2_hca, head_dim]); shared with the prefill
             # kernel + regression test via hca_compress_paged_offsets.
             hca_indices_np[write_pos] = hca_compress_paged_offsets(
-                entry_offsets, bid_expanded, block_tables_np_full, swa_pages, self.k2_hca
+                entry_offsets,
+                bid_expanded,
+                block_tables_np_full,
+                swa_pages,
+                self.k2_hca,
             )
         # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
         hca_indices_gpu = self._stage(

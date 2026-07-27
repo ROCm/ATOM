@@ -24,19 +24,19 @@ from atom.model_ops.v4_kernels.fused_compress import (
 from atom.model_ops.v4_kernels.indexer_weights import (
     scale_indexer_weights,
 )
+from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
 from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_decode_reference,
 )
-from atom.model_ops.v4_kernels.paged_prefill import (
-    sparse_attn_v4_paged_prefill,
-    sparse_attn_v4_paged_prefill_reference,
-)
-from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
 from atom.model_ops.v4_kernels.paged_decode_indices import (
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_decode_indices_reference,
+)
+from atom.model_ops.v4_kernels.paged_prefill import (
+    sparse_attn_v4_paged_prefill,
+    sparse_attn_v4_paged_prefill_reference,
 )
 from atom.model_ops.v4_kernels.paged_prefill_indices import (
     write_v4_paged_prefill_indices,
@@ -45,42 +45,42 @@ from atom.model_ops.v4_kernels.paged_prefill_indices import (
 from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
     QKNormRopeOut,
     qk_norm_rope_maybe_quant,
-    qk_norm_rope_maybe_quant_reference,
     qk_norm_rope_maybe_quant_fp8_2buff,
+    qk_norm_rope_maybe_quant_reference,
 )
 from atom.model_ops.v4_kernels.state_writes import (
-    update_compressor_states,
     swa_write,
     swa_write_2buff_prepacked,
+    update_compressor_states,
 )
 
 __all__ = [
-    "update_compressor_states",
-    "swa_write",
-    "swa_write_2buff_prepacked",
+    "FP4_MQA_BLOCK_K",
+    "FP4_MQA_PARALLEL_UNIT_NUM",
+    "CompressPlan",
+    "QKNormRopeOut",
+    "csa_translate_pack",
+    "csa_translate_pack_reference",
     "fused_compress_attn",
     "fused_compress_attn_reference",
+    "hca_compress_paged_offsets",
+    "inverse_rope_inplace",
+    "make_compress_plans",
+    "qk_norm_rope_maybe_quant",
+    "qk_norm_rope_maybe_quant_fp8_2buff",
+    "qk_norm_rope_maybe_quant_reference",
+    "scale_indexer_weights",
     "sparse_attn_v4_paged_decode",
     "sparse_attn_v4_paged_decode_reference",
     "sparse_attn_v4_paged_prefill",
     "sparse_attn_v4_paged_prefill_reference",
-    "csa_translate_pack",
-    "csa_translate_pack_reference",
-    "CompressPlan",
-    "make_compress_plans",
-    "inverse_rope_inplace",
-    "scale_indexer_weights",
-    "hca_compress_paged_offsets",
+    "swa_write",
+    "swa_write_2buff_prepacked",
+    "update_compressor_states",
     "write_v4_paged_decode_indices",
     "write_v4_paged_decode_indices_reference",
     "write_v4_paged_prefill_indices",
     "write_v4_paged_prefill_indices_reference",
-    "QKNormRopeOut",
-    "qk_norm_rope_maybe_quant",
-    "qk_norm_rope_maybe_quant_reference",
-    "qk_norm_rope_maybe_quant_fp8_2buff",
-    "FP4_MQA_PARALLEL_UNIT_NUM",
-    "FP4_MQA_BLOCK_K",
 ]
 
 # FP4 indexer persistent-grid schedule params, shared by the decode

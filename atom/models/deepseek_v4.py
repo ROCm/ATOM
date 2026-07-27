@@ -42,6 +42,22 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
+from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+    fused_clamp_act_mul,
+)
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
+from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from torch import nn
+
+from atom.config import (
+    Config,
+    LayerQuantConfig,
+    QuantizationConfig,
+    QuantType,
+    get_current_atom_config,
+)
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_all_reduce,
@@ -50,21 +66,6 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_reduce_scatter,
     pcp_round_robin_split,
-)
-from atom.utils.custom_register import direct_register_custom_op
-from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
-from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-from aiter.ops.triton.fusions.fused_clamp_act_mul import (
-    fused_clamp_act_mul,
-)
-from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
-from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-from atom.config import (
-    Config,
-    LayerQuantConfig,
-    QuantizationConfig,
-    QuantType,
-    get_current_atom_config,
 )
 from atom.model_loader.loader import WeightsMapper
 
@@ -109,9 +110,9 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
+from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
-from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -194,9 +195,9 @@ def _v4_core_attention_fake(
     qr: torch.Tensor,
     qr_scale: torch.Tensor,
     positions: torch.Tensor,
-    idx_q_quant: Optional[torch.Tensor],
-    idx_weights: Optional[torch.Tensor],
-    idx_q_scale: Optional[torch.Tensor],
+    idx_q_quant: torch.Tensor | None,
+    idx_weights: torch.Tensor | None,
+    idx_q_scale: torch.Tensor | None,
     layer_name: str,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
@@ -212,9 +213,9 @@ def v4_core_attention(
     qr: torch.Tensor,
     qr_scale: torch.Tensor,
     positions: torch.Tensor,
-    idx_q_quant: Optional[torch.Tensor],
-    idx_weights: Optional[torch.Tensor],
-    idx_q_scale: Optional[torch.Tensor],
+    idx_q_quant: torch.Tensor | None,
+    idx_weights: torch.Tensor | None,
+    idx_q_scale: torch.Tensor | None,
     layer_name: str,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
@@ -279,7 +280,7 @@ class DeepseekV4Args:
     index_topk: int = 1024
     use_index_cache: bool = False
     index_topk_freq: int = 1
-    index_topk_pattern: Optional[Any] = None
+    index_topk_pattern: Any | None = None
 
     # MoE
     moe_inter_dim: int = 3072  # moe_intermediate_size
@@ -305,12 +306,12 @@ class DeepseekV4Args:
 
     # Quantization (PR1 ignores; PR2+ uses)
     dtype: Literal["bf16", "fp8"] = "bf16"
-    expert_dtype: Optional[Literal["fp4", "fp8"]] = None
-    scale_fmt: Optional[Literal["ue8m0"]] = None
+    expert_dtype: Literal["fp4", "fp8"] | None = None
+    scale_fmt: Literal["ue8m0"] | None = None
 
     # V4QuantizationConfig — Linear layers auto-build the right (FP8 / FP4
     # / BF16) weight + scale params. Set by DeepseekV4ForCausalLM at init.
-    quant_config: Optional[Any] = None
+    quant_config: Any | None = None
 
     @classmethod
     def from_hf_config(cls, hf_config: Any) -> "DeepseekV4Args":
@@ -853,7 +854,7 @@ class _V4RoPE(nn.Module):
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
+        key: torch.Tensor | None = None,
     ) -> None:
         """In-place RoPE on `query` (and `key` if given). All inputs are the
         rope-slice only (`head_size == rotary_dim`)."""
@@ -965,12 +966,12 @@ class Compressor(nn.Module):
         self._combined_cg_buf: dict = {}
 
         # External tensors — assigned by the owning Attention / Indexer at first forward.
-        self.kv_cache: Optional[torch.Tensor] = None
-        self.rotary_emb: Optional[_V4RoPE] = None
+        self.kv_cache: torch.Tensor | None = None
+        self.rotary_emb: _V4RoPE | None = None
         # FP8 quant path only: strided fp32 view of the per-block scale region
         # of `self.kv_cache`. Bound by the V4 builder when `kv_cache.dtype` is
         # FP8 (Indexer-inner Compressor); None for BF16 cache (Main path).
-        self.cache_scale: Optional[torch.Tensor] = None
+        self.cache_scale: torch.Tensor | None = None
         # Compress-scatter quant mode, bound by DeepseekV4AttentionMetadataBuilder.
         # Unified with the kernel's `quant_mode` — one of:
         #   "none"        → plain BF16 Main scatter (kv_cache_rope unused)
@@ -978,7 +979,7 @@ class Compressor(nn.Module):
         #                   kv_cache, bf16 rope into the parallel kv_cache_rope pool)
         #   "per_row_fp8" → Indexer-inner per-row fp8 + preshuffle
         #   "fp4"         → Indexer-inner FP4 (E2M1 + e8m0)
-        self.kv_cache_rope: Optional[torch.Tensor] = None
+        self.kv_cache_rope: torch.Tensor | None = None
         self.quant_mode: str = "none"
 
         # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
@@ -1025,7 +1026,7 @@ class Compressor(nn.Module):
         x: torch.Tensor,  # [num_tokens, dim]
         plan: "CompressPlan",
         state_slot_mapping: torch.Tensor,  # [bs] int32
-        block_tables: Optional[torch.Tensor] = None,  # [bs, max_blocks_per_seq] int32
+        block_tables: torch.Tensor | None = None,  # [bs, max_blocks_per_seq] int32
     ) -> None:
         """Batched plan-style compress: one fused kernel call for the whole
         fwd's batch (across all seqs).
@@ -1092,8 +1093,10 @@ class Compressor(nn.Module):
         if _pcp_active():
             from atom.utils.tbo.ubatching import (
                 tbo_active as _tbo_active,
-                tbo_yield_and_switch_from_compute_to_comm,
+            )
+            from atom.utils.tbo.ubatching import (
                 tbo_switch_to_compute_sync,
+                tbo_yield_and_switch_from_compute_to_comm,
             )
 
             _tbo = _tbo_active()
@@ -1295,7 +1298,7 @@ class Indexer(nn.Module):
             ),
             persistent=False,
         )
-        self.rotary_emb: Optional[_V4RoPE] = None
+        self.rotary_emb: _V4RoPE | None = None
 
         # Register self in static_forward_context so the
         # `torch.ops.aiter.indexer_score_topk` dispatcher can look us up by
@@ -1310,9 +1313,9 @@ class Indexer(nn.Module):
         x_full: torch.Tensor,  # [total_tokens, dim]
         qr_full: torch.Tensor,  # [total_tokens, q_lora_rank] — fp8 when qr_full_scale given
         positions: torch.Tensor,  # [total_tokens]
-        qr_full_scale: Optional[
-            torch.Tensor
-        ] = None,  # per_1x128 scale paired with qr_full
+        qr_full_scale: (
+            torch.Tensor | None
+        ) = None,  # per_1x128 scale paired with qr_full
     ) -> torch.Tensor:
         """Q proj + RoPE + FP8-quant + weights compute (have module state),
         then dispatch to `torch.ops.aiter.indexer_score_topk`, which calls
@@ -1340,11 +1343,11 @@ class Indexer(nn.Module):
         x_full: torch.Tensor,
         qr_full: torch.Tensor,
         positions: torch.Tensor,
-        qr_full_scale: Optional[torch.Tensor] = None,
+        qr_full_scale: torch.Tensor | None = None,
         *,
-        pre_q_quant: Optional[torch.Tensor] = None,
-        pre_weights: Optional[torch.Tensor] = None,
-        pre_q_scale: Optional[torch.Tensor] = None,
+        pre_q_quant: torch.Tensor | None = None,
+        pre_weights: torch.Tensor | None = None,
+        pre_q_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute the top-k, reusing precomputed projections when available.
 
@@ -1363,7 +1366,7 @@ class Indexer(nn.Module):
         x_full: torch.Tensor,  # [total_tokens, dim]
         qr_full: torch.Tensor,  # [total_tokens, q_lora_rank] fp8
         positions: torch.Tensor,  # [total_tokens]
-        qr_full_scale: Optional[torch.Tensor] = None,
+        qr_full_scale: torch.Tensor | None = None,
     ):
         """Graphable indexer Q proj + RoPE + weights (num_tokens-shaped).
 
@@ -1470,7 +1473,7 @@ class Indexer(nn.Module):
         self,
         q_quant: torch.Tensor,
         weights: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Eager paged gather + score + top-k (reads compressor KV cache)."""
         return torch.ops.aiter.indexer_score_topk(
@@ -1481,7 +1484,7 @@ class Indexer(nn.Module):
         self,
         q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8, or packed FP4 (uint8) when the FP4 indexer is on
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
-        q_scale: Optional[torch.Tensor],  # FP4 e8m0 Q scale (None on the FP8 path)
+        q_scale: torch.Tensor | None,  # FP4 e8m0 Q scale (None on the FP8 path)
         topk: int,
     ) -> torch.Tensor:
         """Module-side entry invoked by `torch.ops.aiter.indexer_score_topk`.
@@ -2120,9 +2123,7 @@ class Indexer(nn.Module):
         )  # [padded_tokens, max_seq_len] fp32, seq-local
         # Seq-local output → indices returned directly. top_k writes every row
         # (real + empty pad rows → -1), so a bare torch.empty output is fine.
-        topk_out = torch.empty(
-            (padded_tokens, topk), dtype=torch.int32, device=device
-        )
+        topk_out = torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
         top_k_per_row_prefill(
             logits,
             local_starts,
@@ -2266,8 +2267,8 @@ class DeepseekV4Attention(nn.Module):
         layer_id: int,
         args: DeepseekV4Args,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-        indexer_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
+        indexer_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2718,9 +2719,13 @@ class DeepseekV4Attention(nn.Module):
         qr: torch.Tensor,  # [num_tokens, q_lora_rank] FP8  q RMSNorm out (for indexer)
         qr_scale: torch.Tensor,  # qr FP8 scale
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
-        idx_q_quant: Optional[torch.Tensor] = None,  # indexer quantized q — FP8 or packed FP4 (from _attn_pre)
-        idx_weights: Optional[torch.Tensor] = None,  # indexer weights (from _attn_pre)
-        idx_q_scale: Optional[torch.Tensor] = None,  # indexer FP4 e8m0 q-scale (from _attn_pre; None for FP8)
+        idx_q_quant: (
+            torch.Tensor | None
+        ) = None,  # indexer quantized q — FP8 or packed FP4 (from _attn_pre)
+        idx_weights: torch.Tensor | None = None,  # indexer weights (from _attn_pre)
+        idx_q_scale: (
+            torch.Tensor | None
+        ) = None,  # indexer FP4 e8m0 q-scale (from _attn_pre; None for FP8)
         compressor_already_launched: bool = False,
     ) -> torch.Tensor:  # [num_tokens, n_local_heads*head_dim]  flat attn output
         """Paged/dynamic attention core — SINGLE source of the paged attention
@@ -2958,8 +2963,10 @@ class DeepseekV4Attention(nn.Module):
                 pcp_ws = get_pcp_world_size()
                 from atom.utils.tbo.ubatching import (
                     tbo_active as _tbo_active_attn,
-                    tbo_yield_and_switch_from_compute_to_comm,
+                )
+                from atom.utils.tbo.ubatching import (
                     tbo_switch_to_compute_sync,
+                    tbo_yield_and_switch_from_compute_to_comm,
                 )
 
                 _tbo_attn = _tbo_active_attn()
@@ -3176,7 +3183,7 @@ class Expert(nn.Module):
         dim: int,
         inter_dim: int,
         swiglu_limit: float = 0.0,
-        quant_config: Optional[Any] = None,
+        quant_config: Any | None = None,
         reduce_results: bool = True,
         prefix: str = "",
     ):
@@ -3208,7 +3215,7 @@ class Expert(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
-        weights: Optional[torch.Tensor] = None,  # [num_tokens, 1]  optional gate
+        weights: torch.Tensor | None = None,  # [num_tokens, 1]  optional gate
     ) -> torch.Tensor:  # [num_tokens, dim]
 
         dtype = x.dtype
@@ -3264,7 +3271,7 @@ class MoE(nn.Module):
         layer_id: int,
         args: DeepseekV4Args,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3485,7 +3492,7 @@ class MoE(nn.Module):
     def combine_outputs(
         self,
         routed: torch.Tensor,  # [num_tokens, dim]
-        shared: Optional[torch.Tensor],  # [num_tokens, dim] or None
+        shared: torch.Tensor | None,  # [num_tokens, dim] or None
         prefix: str = "",
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Add shared-expert contribution (when not fused into routed) and
@@ -3559,9 +3566,9 @@ class MoE(nn.Module):
 @dataclass
 class HCState:
     residual: torch.Tensor
-    post_mix: Optional[torch.Tensor] = None
-    comb_mix: Optional[torch.Tensor] = None
-    x_prev: Optional[torch.Tensor] = None
+    post_mix: torch.Tensor | None = None
+    comb_mix: torch.Tensor | None = None
+    x_prev: torch.Tensor | None = None
 
 
 class Block(nn.Module):
@@ -3584,8 +3591,8 @@ class Block(nn.Module):
         layer_id: int,
         args: DeepseekV4Args,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-        indexer_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
+        indexer_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -3645,7 +3652,7 @@ class Block(nn.Module):
         hc_fn: torch.Tensor,  # [mix_hc, hc*dim]  fp32
         hc_scale: torch.Tensor,  # [3] fp32
         hc_base: torch.Tensor,  # [mix_hc] fp32
-        norm_weight: Optional[torch.Tensor] = None,
+        norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce mHC residual `[num_tokens, hc, dim]` to sub-layer input `[num_tokens, dim]`.
@@ -3741,7 +3748,7 @@ class Block(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: Optional[torch.Tensor] = None,
+        norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
         prefix: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3765,14 +3772,14 @@ class Block(nn.Module):
     @mark_trace
     def mhc_post_pre(
         self,
-        x: Optional[torch.Tensor],
+        x: torch.Tensor | None,
         residual: torch.Tensor,
-        post: Optional[torch.Tensor],
-        comb: Optional[torch.Tensor],
+        post: torch.Tensor | None,
+        comb: torch.Tensor | None,
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: Optional[torch.Tensor] = None,
+        norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
         prefix: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3791,7 +3798,7 @@ class Block(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: Optional[torch.Tensor] = None,
+        norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
     ) -> HCState:
         residual = hc_state.residual
@@ -3961,8 +3968,10 @@ def moe_pcp_merge_forward(
     if do_prefill:
         from atom.utils.tbo.ubatching import (
             tbo_active as _tbo_active,
-            tbo_yield_and_switch_from_compute_to_comm,
+        )
+        from atom.utils.tbo.ubatching import (
             tbo_switch_to_compute_sync,
+            tbo_yield_and_switch_from_compute_to_comm,
         )
 
         _tbo = _tbo_active()
@@ -4082,10 +4091,10 @@ class DeepseekV4Model(nn.Module):
         # Main Compressor overlap. indexer_stream: Indexer Compressor overlap.
         # Both allocated once, shared across all blocks. Attention runs before
         # MoE in each block, so attn and MoE never contend for alt_stream.
-        self.alt_stream: Optional[torch.cuda.Stream] = (
+        self.alt_stream: torch.cuda.Stream | None = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
-        self.indexer_stream: Optional[torch.cuda.Stream] = (
+        self.indexer_stream: torch.cuda.Stream | None = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
         self.layers = nn.ModuleList(

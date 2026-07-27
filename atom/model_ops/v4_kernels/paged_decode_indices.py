@@ -39,7 +39,9 @@ import triton.language as tl
 from atom.utils.decorators import mark_trace
 
 
-def hca_compress_paged_offsets(entry_idx, bid_per_entry, block_tables_np, swa_pages, k2_hca):
+def hca_compress_paged_offsets(
+    entry_idx, bid_per_entry, block_tables_np, swa_pages, k2_hca
+):
     """HCA compress entry -> unified paged row (numpy, decode index build).
 
     The compressor packs ``k2_hca = block_size // hca_ratio`` HCA compress entries
@@ -55,9 +57,9 @@ def hca_compress_paged_offsets(entry_idx, bid_per_entry, block_tables_np, swa_pa
     """
     blk = entry_idx // k2_hca
     slot = entry_idx % k2_hca
-    return (
-        swa_pages + block_tables_np[bid_per_entry, blk] * k2_hca + slot
-    ).astype(np.int32)
+    return (swa_pages + block_tables_np[bid_per_entry, blk] * k2_hca + slot).astype(
+        np.int32
+    )
 
 
 @triton.jit

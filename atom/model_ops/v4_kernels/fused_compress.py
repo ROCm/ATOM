@@ -389,10 +389,10 @@ def fused_compress_attn(
     cos_cache: torch.Tensor,  # [max_seq, ..., rope_head_dim/2] bf16/fp16
     sin_cache: torch.Tensor,  # same shape
     # KV cache scatter
-    kv_cache: Optional[
-        torch.Tensor
-    ],  # bf16: [NB, k_per_block, head_dim] / fp8: same shape, fp8
-    block_tables: Optional[torch.Tensor],  # [bs, max_blocks_per_seq] int32
+    kv_cache: (
+        torch.Tensor | None
+    ),  # bf16: [NB, k_per_block, head_dim] / fp8: same shape, fp8
+    block_tables: torch.Tensor | None,  # [bs, max_blocks_per_seq] int32
     k_per_block: int,
     # Geometry
     overlap: bool,
@@ -401,19 +401,19 @@ def fused_compress_attn(
     rope_head_dim: int,
     # FP8 quant fusion (Indexer-inner Compressor path)
     quant: bool = False,
-    cache_scale: Optional[
-        torch.Tensor
-    ] = None,  # fp32 [NB, k_per_block] (FP8) / uint8 (FP4); required when quant
+    cache_scale: (
+        torch.Tensor | None
+    ) = None,  # fp32 [NB, k_per_block] (FP8) / uint8 (FP4); required when quant
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
-    fp8_max: Optional[float] = None,  # E4M3 max; required for FP8 quant
-    quant_mode: Optional[str] = None,  # "none"|"fp8"|"fp4"; default from `quant`
+    fp8_max: float | None = None,  # E4M3 max; required for FP8 quant
+    quant_mode: str | None = None,  # "none"|"fp8"|"fp4"; default from `quant`
     # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
     # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
     # e8m0 nope-fp8 + inline dup-scale into `kv_cache` (fp8 [NB,k,512]) and bf16
     # rope into `kv_cache_rope` (bf16 [NB,k,64]) via the flydsl group_fp8 scatter.
     main_2buff_fp8: bool = False,
-    kv_cache_rope: Optional[torch.Tensor] = None,  # bf16 [NB,k_per_block,64]
+    kv_cache_rope: torch.Tensor | None = None,  # bf16 [NB,k_per_block,64]
     prefix: str = "",
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
@@ -693,15 +693,15 @@ def fused_compress_attn_reference(
     rms_eps: float,
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
-    kv_cache: Optional[torch.Tensor],
-    block_tables: Optional[torch.Tensor],
+    kv_cache: torch.Tensor | None,
+    block_tables: torch.Tensor | None,
     k_per_block: int,
     overlap: bool,
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
     out_dtype: torch.dtype = torch.bfloat16,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Pure-PyTorch reference equivalent of `fused_compress_attn` (plan path).
 
     Returns `[num_compress, head_dim]` BF16 in plan order. None if num_compress=0.

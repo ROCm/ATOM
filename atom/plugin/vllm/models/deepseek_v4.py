@@ -60,7 +60,7 @@ class IndexerVllm(IndexerBase):
         self,
         q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8 (this vLLM override handles the FP8 dispatch)
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
-        q_scale: Optional[torch.Tensor],  # FP4 e8m0 Q scale; None here (FP8-only override)
+        q_scale: torch.Tensor | None,  # FP4 e8m0 Q scale; None here (FP8-only override)
         topk: int,
     ) -> torch.Tensor:
         fc = get_forward_context()
@@ -115,8 +115,8 @@ class IndexerVllm(IndexerBase):
         indexer_meta: dict,
         topk: int,
         *,
-        next_n: Optional[int] = None,
-        n_committed_per_seq: Optional[torch.Tensor] = None,
+        next_n: int | None = None,
+        n_committed_per_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Paged decode top-k, extended for the DECODE slice of a mixed batch.
 
@@ -272,9 +272,9 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
         qr: torch.Tensor,
         qr_scale: torch.Tensor,
         positions: torch.Tensor,
-        idx_q_quant: Optional[torch.Tensor] = None,
-        idx_weights: Optional[torch.Tensor] = None,
-        idx_q_scale: Optional[torch.Tensor] = None,
+        idx_q_quant: torch.Tensor | None = None,
+        idx_weights: torch.Tensor | None = None,
+        idx_q_scale: torch.Tensor | None = None,
         compressor_already_launched: bool = False,
     ) -> torch.Tensor:
         # NARROW PIECEWISE entry (see class docstring): the ``v4_core_attention``
