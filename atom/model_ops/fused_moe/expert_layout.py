@@ -90,6 +90,29 @@ def count_local_base_experts(
     return int((expert_map[:num_logical] != -1).sum().item())
 
 
+def physical_expert_id(
+    expert_id: int,
+    global_num_experts: int,
+    num_redundant_experts: int,
+    num_fused_shared_experts: int,
+) -> int:
+    """Translate a checkpoint-side expert id into a physical slot index.
+
+    Checkpoints (and `FusedMoE.make_expert_params_mapping`) number a fused
+    shared expert immediately after the *logical* routed experts, because that
+    is all the HF config knows about.  `expert_map` is indexed by *physical*
+    slot, and EPLB inserts `num_redundant_experts` replicas between the two —
+    so without this translation a shared expert would be written over a
+    redundant replica while its own slot kept its init value.
+
+    A no-op unless EPLB is configured with redundant experts.
+    """
+    num_logical = global_num_experts - num_redundant_experts
+    if num_fused_shared_experts and expert_id >= num_logical:
+        return global_num_experts + (expert_id - num_logical)
+    return expert_id
+
+
 def expert_shard_dim(shard_id: str, is_transposed: bool = False) -> int:
     """Dimension of a single expert slot that `shard_id` is sharded along."""
     dim = _SHARD_ID_TO_SHARDED_DIM[shard_id]

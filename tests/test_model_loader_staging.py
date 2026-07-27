@@ -33,6 +33,7 @@ from atom.model_ops.fused_moe.expert_layout import (
     count_local_base_experts,
     determine_expert_map,
     expert_region,
+    physical_expert_id,
 )
 
 HIDDEN = 8
@@ -99,7 +100,16 @@ class FakeFusedMoE(nn.Module):
     def _map_global_expert_id_to_local_expert_id(self, global_expert_id: int) -> int:
         if self.expert_map is None:
             return global_expert_id
-        return int(self.expert_map[global_expert_id])
+        return int(
+            self.expert_map[
+                physical_expert_id(
+                    global_expert_id,
+                    self.global_num_experts,
+                    self.num_redundant_experts,
+                    self.num_fused_shared_experts,
+                )
+            ]
+        )
 
     def expected_batched_arrivals(self, param: nn.Parameter) -> int | None:
         n_local_base = count_local_base_experts(
@@ -433,12 +443,7 @@ class EPLBRedundantSlotTest(unittest.TestCase):
     NUM_ROUTED = 8
     NUM_REDUNDANT = 4
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="the rewrite uses hf_config.n_routed_experts, which lands on an "
-        "EPLB redundant slot when num_redundant_experts > 0",
-    )
-    def test_shared_expert_global_id_clears_the_redundant_slots(self):
+    def test_shared_expert_lands_past_the_redundant_slots(self):
         model = build_model(
             FakeMoEModel,
             self.NUM_LAYERS,
@@ -449,25 +454,26 @@ class EPLBRedundantSlotTest(unittest.TestCase):
         )
         moe = model.moes()[0]
         shards = per_expert_shards(self.NUM_LAYERS, self.NUM_ROUTED)
-        seen: list[int] = []
-        original = moe._map_global_expert_id_to_local_expert_id
-
-        def _record(global_expert_id: int) -> int:
-            seen.append(global_expert_id)
-            return original(global_expert_id)
-
-        moe._map_global_expert_id_to_local_expert_id = _record
         run_load(model, shards, HFConfig(self.NUM_LAYERS, self.NUM_ROUTED), 1)
 
-        shared_ids = {i for i in seen if i >= self.NUM_ROUTED}
-        self.assertTrue(shared_ids, "shared expert never reached the MoE module")
-        # The shared expert lives after every physical routed slot, redundant
-        # replicas included -- `global_num_experts`, not `n_routed_experts`.
-        self.assertEqual(
-            shared_ids,
-            {moe.global_num_experts},
-            "shared expert id collides with an EPLB redundant slot",
+        shared_slot = moe.local_num_experts - 1
+        self.assertTrue(
+            bool(moe.w13_weight[shared_slot].abs().sum() > 0),
+            "shared expert slot was never written",
         )
+        n_local_base = count_local_base_experts(
+            expert_map=moe.expert_map,
+            global_num_experts=moe.global_num_experts,
+            num_redundant_experts=moe.num_redundant_experts,
+            local_num_experts=moe.local_num_experts,
+        )
+        for slot in range(n_local_base, shared_slot):
+            self.assertEqual(
+                float(moe.w13_weight[slot].abs().sum()),
+                0.0,
+                f"redundant slot {slot} was overwritten by the shared expert; "
+                "fill_redundant populates these after loading",
+            )
 
 
 if __name__ == "__main__":

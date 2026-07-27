@@ -46,6 +46,7 @@ from atom.model_ops.fused_moe.expert_layout import (
     determine_expert_map,
     expert_shard_dim,
     expert_shard_view,
+    physical_expert_id,
 )
 from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
@@ -3120,7 +3121,14 @@ class FusedMoE(torch.nn.Module):
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         if self.expert_map is None:
             return expert_id
-        return self.expert_map[expert_id].item()
+        return self.expert_map[
+            physical_expert_id(
+                expert_id,
+                self.global_num_experts,
+                self.num_redundant_experts,
+                self.num_fused_shared_experts,
+            )
+        ].item()
 
     def mxf4_merged_weight_loader(
         self,

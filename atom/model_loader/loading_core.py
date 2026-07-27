@@ -196,6 +196,10 @@ def load_weights_into_model(
                 # Preserve the module-naming prefix (mlp. / ffn.) so the rewritten
                 # name matches this model's routed-expert param naming.
                 module_prefix = maybe_matching_name.split("shared_expert", 1)[0]
+                # Numbered right after the *logical* routed experts, matching
+                # `FusedMoE.make_expert_params_mapping`. `FusedMoE` translates
+                # this to a physical slot, which under EPLB also has to clear
+                # the redundant replicas.
                 n_routed_experts = (
                     getattr(hf_config, "n_routed_experts", None)
                     or getattr(hf_config, "num_local_experts", None)
