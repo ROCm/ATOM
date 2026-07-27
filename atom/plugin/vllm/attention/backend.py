@@ -457,13 +457,18 @@ class MiniMaxM3SparseAttentionBackend:
             raise ValueError(
                 f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
             )
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        raise NotImplementedError
+        if include_num_layers_dimension:
+            raise NotImplementedError
+        # Keep the logical block dimension first so vLLM does not normalize this
+        # cache together with the block-first index cache. Physically place K/V
+        # first so each cache remains contiguous for the page-16 ASM kernels.
+        return (1, 0, 2, 3, 4)
 
     @classmethod
     def indexes_kv_by_block_stride(cls) -> bool:
