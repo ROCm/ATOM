@@ -136,6 +136,8 @@ def safetensors_weights_iterator(
                         yield name, param
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in f.keys():
+                # `.keys()` is not redundant here: `safe_open` is a Rust object
+                # with no `__iter__`, so iterating it directly raises TypeError.
+                for name in f.keys():  # noqa: SIM118
                     if wants is None or wants(name):
                         yield name, f.get_tensor(name)
