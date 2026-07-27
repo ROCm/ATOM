@@ -2122,6 +2122,14 @@ def main():
     engine_args = EngineArgs.from_cli_args(args)
     engine = engine_args.create_engine(tokenizer=tokenizer)
 
+    # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
+    # their chunks into a thread-local; the engine core manager's output thread
+    # calls this flush after each step's callbacks to drain the buffer into the
+    # per-request asyncio queues (one call_soon_threadsafe per event loop).
+    # Registered lazily here to avoid the api_server <-> engine_core_mgr import
+    # cycle; the core manager leaves the hook as None until this resolves it.
+    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
+
     import signal
 
     def _sigint_handler(signum, frame):
