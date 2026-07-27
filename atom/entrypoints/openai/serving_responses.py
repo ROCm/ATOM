@@ -445,7 +445,10 @@ def extract_cwd(body: Dict[str, Any]) -> Optional[str]:
 
     global _CWD_RE
     if _CWD_RE is None:
-        _CWD_RE = re.compile(r"<cwd>\s*([^<\s]+)\s*</cwd>")
+        # [^<]+? keeps internal spaces/newlines but never spans a stray '<' (so a
+        # malformed/unclosed inner <cwd> can't over-capture); non-greedy stops at
+        # the first </cwd>.
+        _CWD_RE = re.compile(r"<cwd>\s*([^<]+?)\s*</cwd>")
     blob = _text_of(body.get("instructions"))
     inp = body.get("input")
     if isinstance(inp, str):
@@ -455,7 +458,7 @@ def extract_cwd(body: Dict[str, Any]) -> Optional[str]:
             if isinstance(it, dict):
                 blob += "\n" + _text_of(it.get("content", ""))
     m = _CWD_RE.search(blob or "")
-    return m.group(1) if m else None
+    return m.group(1).strip() if m else None
 
 
 # --------------------------------------------------------------- SSE emitter
