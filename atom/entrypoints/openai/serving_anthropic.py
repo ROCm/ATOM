@@ -161,6 +161,68 @@ def anthropic_to_openai_tools(tools: Optional[List[dict]]) -> Optional[List[dict
     return result
 
 
+def _text_of(block: Any) -> str:
+    """Flatten an Anthropic content block (str or list of {text} blocks) to text."""
+    if isinstance(block, str):
+        return block
+    if isinstance(block, list):
+        return "\n".join(
+            _text_of(b.get("text")) if isinstance(b, dict) else _text_of(b)
+            for b in block
+            if (b.get("text") if isinstance(b, dict) else b)
+        )
+    return ""
+
+
+def extract_cwd_from_system(system: Any) -> Optional[str]:
+    """Pull the working directory from Claude Code's system prompt.
+
+    Claude Code embeds the working directory as a `Working directory: <path>`
+    line in the system message it sends (it does not use Codex's
+    `<cwd>...</cwd>` environment_context, which is Anthropic-incompatible).
+    DSV4 (sparse indexer, index_topk=1024) cannot reliably verbatim-recall a
+    path buried in a ~20-40k-token system prompt, so when the Bash tool
+    description omits the cwd the model blind-`cd`s to whatever path the user
+    named. Returning the cwd here lets the caller inject it into the Bash tool
+    description so the model uses the absolute path or `pwd`s instead.
+    """
+    import re
+
+    blob = _text_of(system)
+    if not blob:
+        return None
+    m = re.search(r"(?:^|\n)\s*Working directory:\s*([^\s<\n]+)", blob)
+    return m.group(1) if m else None
+
+
+def inject_cwd_into_bash_tool(
+    tools: Optional[List[dict]], cwd: Optional[str]
+) -> Optional[List[dict]]:
+    """Append the working directory to the Bash tool's description.
+
+    Empirically (A/B on the same DSV4 server, temp 0, 2 runs each): with the
+    cwd in the Bash tool description, DSV4 stops blind-`cd`-ing to whatever
+    path the user named and instead `ls`'s the absolute path or `pwd`s first.
+    Without it, DSV4 faithfully `cd <user-named-path>` even when that path
+    does not exist. This is a prompt-content mitigation for a model-level
+    recall/cliff limitation (the ATOM /v1/messages prompt is otherwise
+    correctly constructed — cwd is in the system message), not a serving bug.
+    """
+    if not tools or not cwd:
+        return tools
+    for tool in tools:
+        if tool.get("name") == "Bash":
+            base = tool.get("description", "") or ""
+            hint = (
+                f" The current working directory is {cwd}."
+                if "current working directory" not in base.lower()
+                else ""
+            )
+            if hint and cwd not in base:
+                tool["description"] = base + hint
+    return tools
+
+
 # ── Response Construction ──────────────────────────────────────────────
 
 

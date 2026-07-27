@@ -54,6 +54,8 @@ from .serving_anthropic import (
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
+    extract_cwd_from_system,
+    inject_cwd_into_bash_tool,
     stream_content_block_delta,
     stream_content_block_start,
     stream_content_block_stop,
@@ -1469,6 +1471,24 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if request.tools:
             openai_messages = inject_tool_format_instruction(openai_messages)
 
+        # Claude Code does not send Codex's <cwd>...</cwd> environment_context
+        # (it's Anthropic-incompatible); it puts the working directory in the
+        # system message. DSV4 (sparse indexer) cannot reliably recall a path
+        # buried in a ~20-40k-token system prompt, so without the cwd in the
+        # Bash tool description it blind-`cd`s to whatever path the user named.
+        # Extract the cwd from the system message and inject it into the Bash
+        # tool description so the model uses the absolute path / `pwd`s first.
+        # (Empirically deterministic over 2 runs/condition; this is a
+        # prompt-content mitigation of a model-level recall cliff, not a fix to
+        # a serving bug — the prompt is otherwise correctly constructed.)
+        tools_with_cwd = request.tools
+        if request.tools:
+            cwd = extract_cwd_from_system(request.system)
+            if cwd:
+                tools_with_cwd = inject_cwd_into_bash_tool(
+                    [dict(t) for t in request.tools], cwd
+                )
+
         # Apply chat template
         from .protocol import ChatMessage
 
@@ -1479,7 +1499,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             tokenizer,
             custom_message_encoder,
             [msg.to_template_dict() for msg in messages],
-            tools=anthropic_to_openai_tools(request.tools),
+            tools=anthropic_to_openai_tools(tools_with_cwd),
             **merged_kwargs,
         )
 
