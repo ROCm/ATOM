@@ -1186,7 +1186,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         local_lens_allranks = np.stack(
             [get_dcp_local_seq_lens(cached_lens, dcp, r) for r in range(dcp)],
             axis=1,
-        ).astype(np.int64)  # [bs, dcp]
+        ).astype(
+            np.int64
+        )  # [bs, dcp]
 
         # Number of local blocks per seq is identical on every rank
         # (= ceil(global_len / vbs)), so the padded local length is uniform and
@@ -1218,9 +1220,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             c_hi = c_lo + chunk_size
 
             # Per-seq padded local chunk length (uniform across ranks).
-            plc = np.clip(
-                np.minimum(padded_local_len, c_hi) - c_lo, 0, None
-            ).astype(np.int64)  # [bs]
+            plc = np.clip(np.minimum(padded_local_len, c_hi) - c_lo, 0, None).astype(
+                np.int64
+            )  # [bs]
             # Per-(seq, rank) REAL local chunk length in this window.
             real_local_chunk = np.clip(
                 np.minimum(local_lens_allranks, c_hi) - c_lo, 0, None
