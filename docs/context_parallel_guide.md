@@ -321,14 +321,21 @@ Tips:
 ## How it works
 
 1. **KV cache layout.** The cache is interleaved across the DCP group: token `i`
-   → rank `i % dcp`. Block allocation uses a *virtual block* of
-   `block_size × dcp` tokens, so each physical block holds one rank's `block_size`
-   interleaved tokens and the block table shrinks by `dcp`.
+   lives on rank `i % dcp`, so each rank holds only `1/dcp` of the KV. Blocks are
+   allocated in *virtual blocks* of `block_size × dcp` global tokens: a single
+   block id — shared by all ranks — maps, on each rank, to that rank's own
+   physical block of `block_size` interleaved (every-`dcp`-th) tokens. Since one
+   block-table entry now spans `dcp×` more tokens, a sequence of a given length
+   needs `dcp×` fewer block-table entries than the same `block_size` without DCP.
 2. **Prefill KV write.** New-token KV is written interleaved via `slot_mapping`
-   (`-1` for tokens this rank does not own). Prefix-cache / chunked-prefill
-   context is read by gathering the local compressed KV, **AllGather** across the
-   DCP group, reorganizing to per-sequence layout (`reorg_kvcache`), then
-   `kv_b_proj` + attention + LSE merge (compressed-KV AllGather).
+   (`-1` for tokens this rank does not own). The cached prefix (prefix-cache /
+   chunked-prefill) **context** is read by gathering the local compressed KV,
+   **AllGather** across the DCP group, reorganizing to per-sequence layout
+   (`reorg_kvcache`), then `kv_b_proj` + attention — producing the context
+   `(out, LSE)` (LSE-merged across chunks when there is more than one). That
+   context output is then LSE-merged with the new-token (suffix) self-attention
+   to form the final output (standard chunked-prefill prefix+suffix merge).
+   (This is the *compressed-KV AllGather* scheme.)
 3. **Decode.** All-gather Q (all heads) → each rank runs attention over its local
    `1/dcp` KV and returns per-token LSE → all-gather LSE, correct each rank's
    partial output, and reduce-scatter so every rank ends with its head slice.
@@ -353,6 +360,7 @@ Tips:
 | `atom/model_engine/arg_utils.py` | `--decode-context-parallel-size` / `-dcp` CLI |
 | `atom/config.py` | DCP validation (`tp % dcp == 0`) |
 | `atom/model_engine/block_manager.py` | Interleaved block allocation; prefix-cache virtual-block accounting |
+| `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank` |
 | `atom/model_ops/dcp_ops.py` | AG+RS LSE-combine, `reorg_kvcache`, local compressed-KV gather |
 | `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context |
 | `atom/model_ops/attentions/aiter_mla.py`, `attentions/backends.py` | DCP decode / prefill metadata (interleaved slot_mapping, local seq lens) |

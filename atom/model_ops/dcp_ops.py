@@ -172,7 +172,7 @@ def dcp_gather_compressed_kv(
 ) -> torch.Tensor:
     """Gather this rank's compressed KV entries from the paged cache.
 
-    Scheme A's local-gather step: the MLA cache stores compressed latent KV as
+    Local-gather step: the MLA cache stores compressed latent KV as
     ``[num_slots, 1, kv_lora_rank + qk_rope_head_dim]`` (or ``[num_slots, d]``),
     so gathering the local rank's interleaved tokens for a chunk is a plain
     index_select over the token-slot axis. This replaces vLLM's
