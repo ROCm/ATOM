@@ -269,7 +269,7 @@ def enrich_payload(
         enriched["hardware"] = hardware
     elif runner == "atomesh-cicd-mi350":
         enriched["hardware"] = "MI350X"
-    elif runner == "atomesh-cicd":
+    elif runner in {"atomesh-cicd", "atomesh-cicd-p01"}:
         enriched["hardware"] = "MI355X"
 
     if "total_token_throughput" not in enriched:
