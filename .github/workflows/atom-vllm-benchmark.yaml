@@ -344,7 +344,7 @@ jobs:
           from pathlib import Path
 
           config = {}
-          for line in Path(".github/vllm-version.env").read_text(
+          for line in Path("atom/plugin/vllm/vllm-version.env").read_text(
               encoding="utf-8"
           ).splitlines():
               key, separator, value = line.partition("=")
@@ -356,7 +356,7 @@ jobs:
               print(config["VLLM_VERSION"])
           except KeyError as error:
               raise SystemExit(
-                  f"Missing {error.args[0]} in .github/vllm-version.env"
+                  f"Missing {error.args[0]} in atom/plugin/vllm/vllm-version.env"
               ) from error
 
           PY
@@ -434,7 +434,7 @@ jobs:
             printf -- '\nBecause an explicit `oot_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
               >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${REBUILD_OOT_IMAGE}" == "true" ]]; then
-            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `.github/vllm-version.env`\n' \
+            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `atom/plugin/vllm/vllm-version.env`\n' \
               "${OOT_BASE_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
               "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"

@@ -107,7 +107,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Load vLLM version
-        run: cat .github/vllm-version.env >> "$GITHUB_ENV"
+        run: cat atom/plugin/vllm/vllm-version.env >> "$GITHUB_ENV"
 
       - name: Login to Docker Hub
         uses: ./.github/actions/docker-auth
