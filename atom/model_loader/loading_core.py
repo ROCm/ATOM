@@ -13,13 +13,13 @@ AITER build, and `loader.py` imports AITER at module level.
 import concurrent.futures
 import logging
 import re
-import threading
 from collections.abc import Callable, Iterable
 
 import torch
 from torch import nn
 from transformers import AutoConfig
 
+from atom.model_loader.expert_staging import ExpertStagingPool
 from atom.model_loader.weight_names import (
     WeightsMapper,
     extract_expert_target_and_id,
@@ -111,12 +111,7 @@ def load_weights_into_model(
     # rewritten name doesn't correspond to any model param. (orig, mapped) pairs.
     dropped_ckpt_keys: list[tuple[str, str]] = []
 
-    staging_map: dict = {}  # id(param) -> entry, one per in-flight fused param
-    fallback_pids: set = set()  # params that opted out of batching
-    staging_lock = threading.Lock()
-
     moe_module_cache: dict = {}
-    param_batchable: dict = {}
 
     def _lookup_moe_module(full_param_name: str):
         module_path = full_param_name.rsplit(".", 1)[0]
@@ -126,122 +121,7 @@ def load_weights_into_model(
             )
         return moe_module_cache[module_path]
 
-    def _param_is_batchable(param, full_param_name: str) -> bool:
-        pid = id(param)
-        if pid not in param_batchable:
-            moe = _lookup_moe_module(full_param_name)
-            expected = (
-                moe.expected_batched_arrivals(param)
-                if moe is not None and hasattr(moe, "stage_expert_weight")
-                else None
-            )
-            param_batchable[pid] = bool(expected)
-        return param_batchable[pid]
-
-    def _do_flush(param, staging):
-        if staging.dtype != param.data.dtype:
-            param.data.view(torch.uint8).copy_(staging)
-        else:
-            param.data.copy_(staging)
-
-    def _make_staging(param):
-        pin = torch.cuda.is_available()
-
-        def _alloc(pinned):
-            try:
-                t = torch.empty(
-                    param.data.shape,
-                    dtype=param.data.dtype,
-                    device="cpu",
-                    pin_memory=pinned,
-                )
-                t.zero_()
-            except NotImplementedError:
-                t = torch.empty(
-                    param.data.shape,
-                    dtype=torch.uint8,
-                    device="cpu",
-                    pin_memory=pinned,
-                )
-                t.zero_()
-            return t
-
-        try:
-            return _alloc(pin)
-        except RuntimeError as e:
-            logger.warning("Pinned staging alloc failed (%s); using unpinned.", e)
-            return _alloc(False)
-
-    def _fallback(param, full_param_name, shard_id, global_expert_id, loaded_weight):
-        param.weight_loader(
-            param, loaded_weight, full_param_name, shard_id, global_expert_id
-        )
-
-    def _stage_task(param, full_param_name, shard_id, global_expert_id, loaded_weight):
-        pid = id(param)
-        with staging_lock:
-            opted_out = pid in fallback_pids
-            entry = None if opted_out else staging_map.get(pid)
-        if opted_out:
-            _fallback(param, full_param_name, shard_id, global_expert_id, loaded_weight)
-            return
-
-        # Map to this rank's local expert id BEFORE touching staging_map. Under
-        # expert parallelism every rank iterates all global experts, but a
-        # non-local expert contributes nothing to this rank's staging. If such a
-        # straggler ran after the param already reached `expected` and flushed
-        # (which deletes its staging entry), creating an entry here would leave a
-        # fresh, never-filled entry that is miscounted as "under-filled" at the
-        # end of loading. Return early so non-local shards never create entries.
-        moe = _lookup_moe_module(full_param_name)
-        local_eid = moe._map_global_expert_id_to_local_expert_id(global_expert_id)
-        if local_eid == -1:
-            return
-
-        if entry is None:
-            new_entry = {
-                "staging": _make_staging(param),
-                "arrived": 0,
-                "expected": moe.expected_batched_arrivals(param),
-                "moe": moe,
-                "param": param,
-                "lock": threading.Lock(),
-            }
-            with staging_lock:
-                opted_out = pid in fallback_pids
-                if not opted_out:
-                    entry = staging_map.get(pid)
-                    if entry is None:
-                        entry = staging_map[pid] = new_entry
-            if opted_out:
-                _fallback(
-                    param, full_param_name, shard_id, global_expert_id, loaded_weight
-                )
-                return
-
-        ok = moe.stage_expert_weight(
-            param=param,
-            staging=entry["staging"],
-            loaded_weight=loaded_weight,
-            local_expert_id=local_eid,
-            shard_id=shard_id,
-            weight_name=full_param_name,
-        )
-        if not ok:
-            with staging_lock:
-                fallback_pids.add(pid)
-                staging_map.pop(pid, None)
-            _fallback(param, full_param_name, shard_id, global_expert_id, loaded_weight)
-            return
-
-        with entry["lock"]:
-            entry["arrived"] += 1
-            flush_now = entry["arrived"] >= entry["expected"]
-        if flush_now:
-            _do_flush(param, entry["staging"])
-            with staging_lock:
-                if staging_map.get(pid) is entry:
-                    del staging_map[pid]
+    staging_pool = ExpertStagingPool(_lookup_moe_module)
 
     num_threads = envs.ATOM_LOADER_NUM_THREADS
     if num_threads > 1:
@@ -438,9 +318,11 @@ def load_weights_into_model(
                             # an unquantized drafter MTP block); skip silently.
                             matched = True
                             break
-                        if executor is not None and _param_is_batchable(param, name):
+                        if executor is not None and staging_pool.is_batchable(
+                            param, name
+                        ):
                             _submit(
-                                _stage_task,
+                                staging_pool.stage,
                                 param,
                                 name,
                                 shard_id,
@@ -513,9 +395,7 @@ def load_weights_into_model(
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        with staging_lock:
-            pending = list(staging_map.values())
-            staging_map.clear()
+        pending = staging_pool.take_pending()
         if pending:
             raise RuntimeError(
                 f"Batched loader: {len(pending)} MoE param group(s) under-filled "
