@@ -1461,6 +1461,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Convert Anthropic messages to OpenAI format
         openai_messages = anthropic_to_openai_messages(request.messages, request.system)
 
+        # Inject the mandatory DSML tool-call format instruction when tools are
+        # present, so the model emits parseable DSML (matching the model's native
+        # encoding) instead of ad-hoc <command>/```json text. Same injection the
+        # /v1/responses path applies; without it, Claude Code (which speaks the
+        # Anthropic /v1/messages API) hits malformed/weak tool calls.
+        if request.tools:
+            openai_messages = inject_tool_format_instruction(openai_messages)
+
         # Apply chat template
         from .protocol import ChatMessage
 
