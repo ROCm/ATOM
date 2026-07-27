@@ -6,7 +6,7 @@ FROM ${OOT_BASE_IMAGE} AS atom_oot
 ARG MAX_JOBS
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_COMMIT="v0.25.1"
+ARG VLLM_COMMIT
 ARG INSTALL_LM_EVAL=1
 ARG INSTALL_FASTSAFETENSORS=1
 # Let PR OOT CI verify whether a pulled prebuilt image still matches this vLLM commit
@@ -68,6 +68,7 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
 COPY docker/patches/vllm-torch210-compat.patch /tmp/vllm-torch210-compat.patch
 
 RUN echo "========== [OOT 3/7] Clone and patch vLLM ==========" && \
+    test -n "${VLLM_COMMIT}" && \
     rm -rf /app/vllm && \
     git clone "${VLLM_REPO}" /app/vllm && \
     cd /app/vllm && \

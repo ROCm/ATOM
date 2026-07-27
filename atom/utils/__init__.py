@@ -794,7 +794,10 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     return getattr(module, obj_name)
 
 
-_DYNAMO_METRICS_CONFIG_BLOCKLIST = {
+# Mirrored from Torch 2.11's private
+# _get_dynamo_config_for_logging().clean_for_json(). The cleanup function is
+# nested, so ATOM cannot reuse it while fixing the serializer below.
+_TORCH_DYNAMO_METRICS_CONFIG_BLOCKLIST = {
     "TYPE_CHECKING",
     "log_file_name",
     "verbose",
@@ -812,15 +815,20 @@ _DYNAMO_METRICS_CONFIG_BLOCKLIST = {
     "_autograd_backward_strict_mode_banned_ops",
     "reorderable_logging_functions",
     "ignore_logger_methods",
-    "ignore_logging_functions",
     "traceable_tensor_subclasses",
     "nontraceable_tensor_subclasses",
     "_custom_ops_profile",
 }
 
+# ATOM adds bound logger methods to this Torch 2.11 setting. Those callables are
+# the only extra value excluded from the metrics JSON.
+_DYNAMO_METRICS_CONFIG_BLOCKLIST = _TORCH_DYNAMO_METRICS_CONFIG_BLOCKLIST | {
+    "ignore_logging_functions"
+}
+
 
 def _patch_torch_dynamo_metrics_config_logging() -> None:
-    """Exclude callable logging ignores from Torch Dynamo metrics JSON."""
+    """Extend Torch's metrics cleanup for ATOM's callable logging ignores."""
     config = torch._dynamo.config
     if not hasattr(config, "ignore_logging_functions"):
         return

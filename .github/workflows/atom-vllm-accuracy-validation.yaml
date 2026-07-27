@@ -420,7 +420,6 @@ env:
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  VLLM_COMMIT: "752a3a504485790a2e8491cacbb35c137339ad34"
 
 jobs:
   # ---------- OOT full validation path (schedule / workflow_dispatch) ----------
@@ -443,6 +442,9 @@ jobs:
     steps:
       - name: Checkout selected ATOM branch
         uses: actions/checkout@v6
+
+      - name: Load vLLM version
+        run: cat .github/vllm-version.env >> "$GITHUB_ENV"
 
       - name: Docker Login
         if: ${{ github.event_name == 'workflow_dispatch' }}
