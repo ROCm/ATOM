@@ -96,6 +96,21 @@ def expert_shard_dim(shard_id: str, is_transposed: bool = False) -> int:
     return int(not dim) if is_transposed else dim
 
 
+def expert_shard_view(
+    slot: torch.Tensor, shard_id: str, shard_dim: int
+) -> torch.Tensor:
+    """The part of one expert slot that `shard_id` owns.
+
+    `w13` stacks the gate and up projections along `shard_dim`, so `w1` owns
+    the first half and `w3` the second; `w2` owns the whole slot.
+    """
+    if shard_id == "w2":
+        return slot
+    assert shard_id in ("w1", "w3"), f"unexpected shard_id {shard_id!r}"
+    half = slot.shape[shard_dim] // 2
+    return slot.narrow(shard_dim, 0 if shard_id == "w1" else half, half)
+
+
 def expert_region(
     tensor: torch.Tensor,
     local_expert_id: int,
@@ -104,21 +119,15 @@ def expert_region(
 ) -> torch.Tensor:
     """Sub-view of a param-shaped `tensor` owned by one (expert, shard) arrival.
 
-    `w1` and `w3` take the first and second half of the slot along the sharded
-    dimension; `w2` takes the whole slot.
-
     The region is the *full* half-slot, not the width a particular arrival
     copies: `_load_w13` / `_load_w2` narrow further to `loaded_weight`'s size
-    when the parameter is padded (MXFP4 alignment), and the flush does not have
-    `loaded_weight`.  The difference is the padding tail, which is zero on both
-    sides — staging buffers are zero-initialised and MXFP4 parameters are
-    zeroed in `create_weights` — so copying the full half is equivalent to what
-    the whole-parameter flush used to do.  Ownership is therefore tracked at
-    (slot, shard) granularity, not per byte.
+    when the parameter is padded (MXFP4 alignment), and a flush does not have
+    `loaded_weight` to hand.  The difference is the padding tail, which is zero
+    on both sides — staging buffers are zero-initialised and MXFP4 parameters
+    are zeroed in `create_weights` — so copying the full half matches what a
+    whole-parameter flush would have written.  Ownership is therefore tracked
+    at (slot, shard) granularity, not per byte.
     """
-    slot = tensor[local_expert_id]
-    if shard_id == "w2":
-        return slot
-    dim = expert_shard_dim(shard_id, is_transposed)
-    half = slot.shape[dim] // 2
-    return slot.narrow(dim, 0 if shard_id == "w1" else half, half)
+    return expert_shard_view(
+        tensor[local_expert_id], shard_id, expert_shard_dim(shard_id, is_transposed)
+    )

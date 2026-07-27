@@ -45,6 +45,7 @@ from atom.model_ops.fused_moe.expert_layout import (
     count_local_base_experts,
     determine_expert_map,
     expert_shard_dim,
+    expert_shard_view,
 )
 from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
@@ -3033,13 +3034,7 @@ class FusedMoE(torch.nn.Module):
         # for online local quantizaiton
         if load_full:
             expert_shard_size = expert_data.shape[shard_dim] // 2
-            if shard_id == "w1":
-                expert_data = expert_data.narrow(shard_dim, 0, expert_shard_size)
-            else:
-                assert shard_id == "w3"
-                expert_data = expert_data.narrow(
-                    shard_dim, expert_shard_size, expert_shard_size
-                )
+            expert_data = expert_shard_view(expert_data, shard_id, shard_dim)
             load_size = loaded_weight.shape[shard_dim]
             if load_size != expert_shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_size)
@@ -3055,16 +3050,9 @@ class FusedMoE(torch.nn.Module):
         loaded_weight = loaded_weight.narrow(
             shard_dim, load_shard_size * tp_rank, load_shard_size
         )
-        # Narrow parameter and load.
-        # w1, gate_proj: Load into first logical weight of w13.
-        if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, expert_shard_size)
-        # w3, up_proj: Load into second logical weight of w13.
-        else:
-            assert shard_id == "w3"
-            expert_data = expert_data.narrow(
-                shard_dim, expert_shard_size, expert_shard_size
-            )
+        # Narrow parameter and load: w1 (gate_proj) into the first logical
+        # weight of w13, w3 (up_proj) into the second.
+        expert_data = expert_shard_view(expert_data, shard_id, shard_dim)
         # When expert_data is padded beyond the actual weight size, narrow to
         # the loaded weight size so the copy shape matches.
         if load_shard_size != expert_shard_size:
