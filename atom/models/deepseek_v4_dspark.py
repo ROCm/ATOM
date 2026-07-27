@@ -369,20 +369,20 @@ def _dspark_block_sparse_attention(
 # Heavy ATOM imports are deferred to module load only when the real engine pulls
 # this in (unit tests import the heads/helpers above without these).
 try:
-    from atom.models.deepseek_v4 import (  # noqa: E402
+    from atom.model_ops.layernorm import RMSNorm
+    from atom.model_ops.linear import ReplicatedLinear
+    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
+        qk_norm_rope_maybe_quant,
+    )
+    from atom.model_ops.v4_kernels.state_writes import (
+        dspark_paged_window_gather,
+        swa_write,
+    )
+    from atom.models.deepseek_v4 import (
         Block,
         DeepseekV4Args,
         HCState,
         make_v4_quant_config,
-    )
-    from atom.model_ops.layernorm import RMSNorm  # noqa: E402
-    from atom.model_ops.linear import ReplicatedLinear  # noqa: E402
-    from atom.model_ops.v4_kernels.state_writes import (  # noqa: E402
-        dspark_paged_window_gather,
-        swa_write,
-    )
-    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (  # noqa: E402
-        qk_norm_rope_maybe_quant,
     )
 
     _ATOM_V4_AVAILABLE = True
@@ -550,10 +550,16 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # independent sources. Assert instead of casting so a mismatch surfaces
         # here rather than as a silent per-step copy (or a silently reinterpreted
         # store inside the swa_write kernel, which has no dtype guard).
-        assert main_kv.dtype == a.swa_kv.dtype, (
-            f"DSpark draft KV dtype {main_kv.dtype} != SWA pool dtype "
-            f"{a.swa_kv.dtype}."
-        )
+        # `raise`, not `assert`: a bare assert vanishes under `python -O`, and
+        # swa_write has no dtype guard, so the mismatch would become a silently
+        # reinterpreted store.
+        if main_kv.dtype != a.swa_kv.dtype:
+            raise TypeError(
+                f"DSpark draft KV dtype {main_kv.dtype} != SWA pool dtype "
+                f"{a.swa_kv.dtype}. The draft pool is allocated bf16 "
+                "unconditionally; a non-bf16 --dtype needs that allocation "
+                "widened, not a cast here."
+            )
         B = cu_seqlens_q.shape[0] - 1
         swa_write(
             main_kv,  # [T, head_dim]
