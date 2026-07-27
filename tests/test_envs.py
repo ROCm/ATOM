@@ -23,6 +23,7 @@ _ATOM_ENV_VARS = [
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_PROFILER_MORE",
     "ATOM_PROFILER_TIMEOUT",
+    "ATOM_LOG_LEVEL",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
     "ATOM_ONLINE_QUANT_STREAMING",
@@ -82,6 +83,9 @@ class TestEnvsDefaults:
     def test_profiler_timeout_default(self):
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
 
+    def test_log_level_default(self):
+        assert _get_envs().ATOM_LOG_LEVEL == "WARNING"
+
     def test_log_more_default(self):
         assert _get_envs().ATOM_LOG_MORE is False
 
@@ -133,6 +137,10 @@ class TestEnvsOverrides:
     def test_profiler_timeout_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 900.0
+
+    def test_log_level_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_LOG_LEVEL", "debug")
+        assert _get_envs().ATOM_LOG_LEVEL == "DEBUG"
 
     def test_log_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_LOG_MORE", "1")
