@@ -28,9 +28,12 @@ class DSparkProposer(Drafter):
         # DSpark-only. The ell (per-request verify length) machinery lives in a
         # reusable VerifyScheduler; propose() feeds it the confidence head and
         # the next step's calc_spec_decode_metadata consumes the ell map.
-        self.dspark_confidence_schedule = bool(self.config.dspark.confidence_schedule)
+        # Private on purpose: the public surface is the base's
+        # `uses_confidence_schedule`. A public `dspark_*` attribute is what let
+        # `getattr(drafter, "dspark_*", False)` probes keep silently working.
+        self._confidence_schedule = bool(self.config.dspark.confidence_schedule)
         self._verify_scheduler = (
-            VerifyScheduler(runner) if self.dspark_confidence_schedule else None
+            VerifyScheduler(runner) if self._confidence_schedule else None
         )
 
     def _resolve_mtp_k(self) -> int:
@@ -47,7 +50,7 @@ class DSparkProposer(Drafter):
 
     @property
     def uses_confidence_schedule(self) -> bool:
-        return self.dspark_confidence_schedule
+        return self._confidence_schedule
 
     @property
     def verify_scheduler(self):
@@ -144,21 +147,13 @@ class DSparkProposer(Drafter):
         # and the draft only reads [anchor-window+1, anchor], so they land on
         # future positions, unread until the step that accepts them rewrites them.
         #
-        # write_per_batch is only the grid's y extent (the kernel clamps to
-        # min(tok_n, WRITE_PER_BATCH) per sequence), so it costs nothing to
-        # over-provision and never needs a `seqlens.max().item()` sync. It must
-        # cover window + mtp_k, not just window: swa_write keeps the LAST
-        # write_per_batch rows of a span, while the anchor sits up to mtp_k rows
-        # BEFORE the span end, so a narrower bound drops the anchor's own row
-        # once mtp_k approaches the window. That is the same win_with_spec the
-        # prefix-cache gate uses (swa_pool.py). Under ATOM_SWA_FULL_RETAIN the
-        # target publishes every chunk block to the content-addressed cache, so
-        # the draft must fill them too — otherwise a cross-request prefix hit
-        # lands on draft blocks that were never written.
-        #
-        # NOTE: GSM8K cannot catch regressions here — spec decode is lossless,
-        # so accuracy only moves through batch-shape numerics while acceptance
-        # can halve. Verify against acceptance rate.
+        # write_per_batch is the grid's y extent; the kernel writes the LAST
+        # min(tok_n, WRITE_PER_BATCH) rows of each span. It must cover
+        # window + mtp_k, not just window: the anchor sits up to mtp_k rows
+        # before the span end, so a narrower bound drops the anchor's own row.
+        # Not clamped by max_seqlen_q the way the V4 target clamps its own
+        # swa_write — that was tried and measured worse (GSM8K 0.936/0.941 vs
+        # 0.942-0.950), so the over-provisioned grid stays.
         write_per_batch = (
             int(attn_metadata.max_seqlen_q)
             if envs.ATOM_SWA_FULL_RETAIN
@@ -172,10 +167,14 @@ class DSparkProposer(Drafter):
                 write_per_batch=write_per_batch,
             )
         # Draft width = the verify horizon mtp_k (num_speculative_tokens). This
-        # may exceed dspark_block_size (the training default); DSpark weights are
-        # draft-width-agnostic so the wider block is drafted in one pass, with
-        # positions past block_size RoPE-extrapolated. Capped at the rolling
-        # window so [window ++ draft] KV stays bounded.
+        # may exceed dspark_block_size (the training default); the DSpark weights
+        # carry no per-width parameters, so the wider block is drafted in one
+        # pass with positions past block_size RoPE-extrapolated. Capped at the
+        # rolling window so [window ++ draft] KV stays bounded.
+        #
+        # Width-agnostic in the WEIGHTS, not in the OUTPUT: block attention is
+        # bidirectional, so every draft token depends on T. Acceptance rates and
+        # confidence calibration are not comparable across K.
         window = int(self.model.window_size)
         num_draft = min(self.mtp_k, window)
         self._refresh_dp_metadata(forward_context, bs * num_draft)
