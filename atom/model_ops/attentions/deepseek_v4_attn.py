@@ -61,6 +61,8 @@ from atom.model_ops.attentions.backends import (
     CommonAttentionBuilder,
 )
 from atom.model_ops.v4_kernels import (
+    FP4_MQA_BLOCK_K,
+    FP4_MQA_PARALLEL_UNIT_NUM,
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
@@ -74,15 +76,6 @@ from atom.utils.forward_context import (
 )
 
 logger = logging.getLogger("atom")
-
-# FP4 indexer persistent-grid schedule params, shared by both the decode
-# (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels. The
-# metadata builder precomputes each path's cta_info with these and the score
-# calls pass block_k/parallel_unit_num so the cta_info layout + grid agree.
-# MUST match the values in `Indexer._score_topk_{decode,prefill}_fp4`. Mirror
-# the kernel defaults (parallel_unit_num=512, block_k=256).
-_FP4_DECODE_PARALLEL_UNIT_NUM = 512
-_FP4_DECODE_BLOCK_K = 256
 
 # ---------------------------------------------------------------------------
 # Typed metadata surface for V4. The base AttentionMetaData class is shared
@@ -1170,6 +1163,59 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             device=self.device,
         )
 
+    def _refresh_fp4_ragged_windows(
+        self,
+        attn_metadata: AttentionMetaData_DSV4,
+        ragged_lens,
+        positions_gpu,
+        meta: Dict[str, Any],
+    ) -> None:
+        """Rebuild the FP4 ragged-decode varlen windows + persistent-grid schedule.
+
+        Writes into the FIXED-ADDRESS buffers the captured scorer reads (`top_k`
+        reads the windows, the mqa kernel reads `cta_info`), so a CUDAGraph replay
+        sees this fwd's contents through stable pointers. Windows span ALL padded
+        rows (`positions_gpu.shape[0]`); the aiter kernel leaves the tail past the
+        real Σ empty, so pad rows cost 0 CTAs and yield top-k -1.
+
+        `ragged_lens` is `[scheduled_bs]` per-seq query lengths: the real lengths
+        on a ragged step, a uniform `next_n` fill on a rectangular one. Sync-free
+        — real Σ is baked into `cu_seq_q` on device.
+        """
+        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+            compute_prefill_schedule,
+            compute_varqlen_windows,
+        )
+
+        _rbs = int(ragged_lens.shape[0])
+        cu_seq_q = torch.zeros(_rbs + 1, dtype=torch.int32, device=ragged_lens.device)
+        torch.cumsum(ragged_lens.to(torch.int32), dim=0, out=cu_seq_q[1:])
+        # n_committed is padded_bs-long (index_topk pad sentinels); slice to `_rbs`
+        # so its length matches cu_seq_q (else the binary search over cu_seq_q
+        # reads OOB / maps real rows onto sentinel pad seqs).
+        _ncmt = attn_metadata.n_committed_csa_per_seq[:_rbs]
+        _padded = int(positions_gpu.shape[0])
+        _rtb = self._v4_fp4_ragged_row_to_batch[:_padded]
+        _ls = self._v4_fp4_ragged_local_starts[:_padded]
+        _le = self._v4_fp4_ragged_local_ends[:_padded]
+        compute_varqlen_windows(cu_seq_q, _ncmt, _padded, out=(_rtb, _ls, _le))
+        # Fixed logits width (max_model_len_idx) → the scorer's [padded, W] buffer
+        # is a static shape (CG-capturable), same as the rectangular decode path.
+        compute_prefill_schedule(
+            _rtb,
+            _ls,
+            _le,
+            self._fp4_block_k,
+            self._fp4_parallel_unit_num,
+            self.max_model_len_idx,
+            cta_info_out=self._v4_fp4_ragged_cta_info,
+        )
+        meta["fp4_ragged_row_to_batch"] = _rtb
+        meta["fp4_ragged_local_starts"] = _ls
+        meta["fp4_ragged_local_ends"] = _le
+        meta["fp4_ragged_cta_info"] = self._v4_fp4_ragged_cta_info
+        meta["fp4_ragged_n_ctas"] = self._fp4_parallel_unit_num
+
     def _build_v4_indexer_meta(
         self,
         *,
@@ -1233,53 +1279,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 getattr(attn_metadata, "dspark_ragged_lens_gpu", None) is not None
                 and getattr(attn_metadata, "dspark_full_q", 0) > 0
             )
+            # When `dspark.ragged` is on, `build_for_cudagraph_capture` captures
+            # EVERY decode graph through the ragged branch (uniform `max_q_len`),
+            # so even a rectangular step replays the ragged kernels and its
+            # windows must be refreshed too — see the rect branch below.
+            _drafter = getattr(self.model_runner, "drafter", None)
+            _graphs_are_ragged = (
+                self.model_runner.config.dspark.ragged
+                and _drafter is not None
+                and getattr(_drafter, "dspark_confidence_schedule", False)
+            )
             if self._indexer_fp4 and _ragged:
-                # CUDAGraph-safe RAGGED decode: build the varlen windows AND the
-                # persistent-grid schedule once/fwd (layer-invariant) into
-                # FIXED-ADDRESS buffers, so the captured scorer replays from stable
-                # pointers (top_k reads the windows; the mqa kernel reads cta_info)
-                # while build() refreshes their contents. Windows span ALL padded
-                # rows; the aiter kernel zeros the pad tail (rows >= real Σ) so pad
-                # rows are skipped (empty window → 0 CTAs → no KV read → top-k -1,
-                # ignored downstream). Sync-free: real Σ is baked into cu_seq_q,
-                # padded count = positions_gpu.shape[0] (= the q rows).
-                from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
-                    compute_prefill_schedule,
-                    compute_varqlen_windows,
+                self._refresh_fp4_ragged_windows(
+                    attn_metadata,
+                    attn_metadata.dspark_ragged_lens_gpu,
+                    positions_gpu,
+                    meta,
                 )
-
-                _ragged_lens = attn_metadata.dspark_ragged_lens_gpu
-                _rbs = int(_ragged_lens.shape[0])
-                cu_seq_q = torch.zeros(
-                    _rbs + 1, dtype=torch.int32, device=_ragged_lens.device
-                )
-                torch.cumsum(_ragged_lens.to(torch.int32), dim=0, out=cu_seq_q[1:])
-                # n_committed is padded_bs-long (index_topk pad sentinels); slice to
-                # `bs` so its length matches cu_seq_q (else the binary search over
-                # cu_seq_q reads OOB / maps real rows onto sentinel pad seqs).
-                _ncmt = attn_metadata.n_committed_csa_per_seq[:_rbs]
-                _padded = int(positions_gpu.shape[0])
-                _rtb = self._v4_fp4_ragged_row_to_batch[:_padded]
-                _ls = self._v4_fp4_ragged_local_starts[:_padded]
-                _le = self._v4_fp4_ragged_local_ends[:_padded]
-                compute_varqlen_windows(cu_seq_q, _ncmt, _padded, out=(_rtb, _ls, _le))
-                # Fixed logits width (max_model_len_idx) → the scorer's [padded, W]
-                # buffer is a static shape (CG-capturable), same as the rectangular
-                # decode path.
-                compute_prefill_schedule(
-                    _rtb,
-                    _ls,
-                    _le,
-                    self._fp4_decode_block_k,
-                    self._fp4_decode_parallel_unit_num,
-                    self.max_model_len_idx,
-                    cta_info_out=self._v4_fp4_ragged_cta_info,
-                )
-                meta["fp4_ragged_row_to_batch"] = _rtb
-                meta["fp4_ragged_local_starts"] = _ls
-                meta["fp4_ragged_local_ends"] = _le
-                meta["fp4_ragged_cta_info"] = self._v4_fp4_ragged_cta_info
-                meta["fp4_ragged_n_ctas"] = self._fp4_decode_parallel_unit_num
             elif self._indexer_fp4 and not _ragged:
                 # CUDAGraph-safe FP4 rectangular decode: precompute the
                 # persistent-grid schedule eagerly here (runs pre-replay during
@@ -1305,14 +1321,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
                 compute_varctx_schedule(
                     _ncmt_sched,
-                    self._fp4_decode_block_k,
-                    self._fp4_decode_parallel_unit_num,
+                    self._fp4_block_k,
+                    self._fp4_parallel_unit_num,
                     self.max_model_len_idx,
                     next_n=next_n,
                     cta_info_out=self._v4_fp4_cta_info,
                 )
                 meta["fp4_cta_info"] = self._v4_fp4_cta_info
-                meta["fp4_total_ctas"] = self._fp4_decode_parallel_unit_num
+                meta["fp4_total_ctas"] = self._fp4_parallel_unit_num
+                if _graphs_are_ragged:
+                    # The captured graph replays the ragged kernels even on this
+                    # rectangular step, so refresh their windows from stale data.
+                    # A rectangle is the uniform case: feed `next_n` per real seq
+                    # (same shape `build_for_cudagraph_capture` synthesizes).
+                    self._refresh_fp4_ragged_windows(
+                        attn_metadata,
+                        torch.full(
+                            (bs,),
+                            next_n,
+                            dtype=torch.int32,
+                            device=positions_gpu.device,
+                        ),
+                        positions_gpu,
+                        meta,
+                    )
             return meta
 
         ratio = 4  # CSA — also referenced by `visible_end_gpu` below
@@ -1430,14 +1462,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             #     (matters for decode; harmless here where rows dominate).
             # max() of both axes -> correct rows AND adequate chunk parallelism.
             prefill_rows = int(visible_end_gpu.shape[0])
-            prefill_parallel_unit_num = max(
-                self._fp4_decode_parallel_unit_num, prefill_rows
-            )
+            prefill_parallel_unit_num = max(self._fp4_parallel_unit_num, prefill_rows)
             _, prefill_cta_info, prefill_n_ctas = compute_prefill_schedule(
                 batch_id_per_token_gpu.to(torch.int32),
                 local_starts,
                 visible_end_gpu,
-                self._fp4_decode_block_k,
+                self._fp4_block_k,
                 prefill_parallel_unit_num,
                 fp4_prefill_max_seq_len,
             )
@@ -3337,13 +3367,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             #     ctx=128k -> only 8 rows; without the floor the schedule would
             #     fold the whole context onto 8 serial CTAs and starve the GPU).
             # The fixed CG cta_info buffer below is sized to this same P.
-            self._fp4_decode_parallel_unit_num = max(
-                _FP4_DECODE_PARALLEL_UNIT_NUM, T_dec
-            )
-            self._fp4_decode_block_k = _FP4_DECODE_BLOCK_K
-            self._v4_fp4_cta_info = torch.zeros(
-                (self._fp4_decode_parallel_unit_num, 4), **i32
-            )
+            self._fp4_parallel_unit_num = max(FP4_MQA_PARALLEL_UNIT_NUM, T_dec)
+            self._fp4_block_k = FP4_MQA_BLOCK_K
+            self._v4_fp4_cta_info = torch.zeros((self._fp4_parallel_unit_num, 4), **i32)
             # DSpark RAGGED decode CG buffers (fixed addresses). Windows are read
             # by top_k during the captured scorer; cta_info by the mqa kernel. The
             # ragged (prefill) schedule uses CTA_INFO_WIDTH=6 (vs 4 for the
@@ -3353,7 +3379,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._v4_fp4_ragged_local_starts = torch.zeros(T_dec, **i32)
             self._v4_fp4_ragged_local_ends = torch.zeros(T_dec, **i32)
             self._v4_fp4_ragged_cta_info = torch.zeros(
-                (self._fp4_decode_parallel_unit_num, 6), **i32
+                (self._fp4_parallel_unit_num, 6), **i32
             )
         # NOTE: decode-path `logits` ([T, max_model_len_idx] fp32) and
         # `topk_indices` ([T, index_topk] int32) are NOT pre-allocated —

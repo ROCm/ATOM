@@ -79,4 +79,15 @@ __all__ = [
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_reference",
     "qk_norm_rope_maybe_quant_fp8_2buff",
+    "FP4_MQA_PARALLEL_UNIT_NUM",
+    "FP4_MQA_BLOCK_K",
 ]
+
+# FP4 indexer persistent-grid schedule params, shared by the decode
+# (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels.
+# The attention metadata builder precomputes each path's cta_info with these
+# and the scorer passes the matching block_k, so layout and grid agree. They
+# live here (rather than in either caller) because both the builder and the
+# model-side scorer must use the SAME values. Mirrors the kernel defaults.
+FP4_MQA_PARALLEL_UNIT_NUM = 512
+FP4_MQA_BLOCK_K = 256

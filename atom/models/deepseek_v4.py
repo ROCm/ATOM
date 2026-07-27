@@ -91,6 +91,8 @@ from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
+    FP4_MQA_BLOCK_K,
+    FP4_MQA_PARALLEL_UNIT_NUM,
     CompressPlan,
     csa_translate_pack,
     fused_compress_attn,
@@ -128,15 +130,6 @@ logger = logging.getLogger(__name__)
 # a constant so Compressor code does not need to import the builder. MUST match
 # DeepseekV4AttentionMetadataBuilder.block_size and config.kv_cache_block_size.
 _V4_BLOCK_SIZE: int = 256
-
-# FP4 indexer decode (`pa_mqa_logits_fp4`) persistent-grid schedule params.
-# MUST match `_FP4_DECODE_PARALLEL_UNIT_NUM` / `_FP4_DECODE_BLOCK_K` in
-# deepseek_v4_attn.py — the metadata builder precomputes cta_info with those
-# values and `_score_topk_decode_fp4` passes block_k/parallel_unit_num so the
-# captured kernel's fixed grid (total_ctas == parallel_unit_num) and cta_info
-# layout agree.
-_V4_FP4_DECODE_PARALLEL_UNIT_NUM = 512
-_V4_FP4_DECODE_BLOCK_K = 256
 
 _V4_RMSNORM_BACKEND = os.environ.get("ATOM_V4_RMSNORM_BACKEND", "triton")
 _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
@@ -1840,13 +1833,6 @@ class Indexer(nn.Module):
         )
 
         def _score(chunk_start, chunk_end, rs, re):
-            # Prefill has one row per query token, so the schedule's
-            # parallel_unit_num MUST be >= chunk rows (plus the decode CTA floor)
-            # or compute_prefill_schedule drops surplus rows (logits stay -inf ->
-            # wrong top-k). NOTE: this only governs the schedule BUILD; the kernel
-            # ignores its `parallel_unit_num` kwarg whenever cta_info/n_ctas are
-            # passed (it skips the internal compute_prefill_schedule).
-            p = max(_V4_FP4_DECODE_PARALLEL_UNIT_NUM, chunk_end - chunk_start)
             if chunk_start == 0 and chunk_end == total_tokens:
                 # Single chunk (common case): reuse the schedule precomputed once
                 # outside the fwd (metadata builder, sized to the full
@@ -1854,13 +1840,16 @@ class Indexer(nn.Module):
                 cta_info, n_ctas = full_cta_info, full_n_ctas
             else:
                 # Multi-chunk (logits would exceed budget): rebuild the schedule
-                # for this chunk's rows.
+                # for this chunk's rows. Prefill has one row per query token, so
+                # the grid MUST cover this chunk's rows or surplus rows are
+                # dropped (their logits stay -inf -> wrong top-k); the shared CTA
+                # floor keeps a small chunk spread across the GPU.
                 _, cta_info, n_ctas = compute_prefill_schedule(
                     row_to_batch[chunk_start:chunk_end],
                     rs,
                     re,
-                    _V4_FP4_DECODE_BLOCK_K,
-                    p,
+                    FP4_MQA_BLOCK_K,
+                    max(FP4_MQA_PARALLEL_UNIT_NUM, chunk_end - chunk_start),
                     max_seq_len,
                 )
             # Write-once, NOT -inf-filled: the kernel writes every column in
@@ -1882,9 +1871,8 @@ class Indexer(nn.Module):
                 re,
                 max_seq_len,
                 weight_scale=self._weights_scale,
-                block_k=_V4_FP4_DECODE_BLOCK_K,
+                block_k=FP4_MQA_BLOCK_K,
                 kv_block_size=kv_block_size,
-                parallel_unit_num=p,
                 out=logits,
                 cta_info=cta_info,
                 n_ctas=n_ctas,
@@ -1919,10 +1907,11 @@ class Indexer(nn.Module):
         CUDAGraph-safe: the persistent-grid schedule (`cta_info`/`total_ctas`)
         is precomputed eagerly by `_build_v4_indexer_meta` into a fixed-address
         buffer (pre-replay) and passed in here, so the captured kernel uses a
-        fixed grid (total_ctas == parallel_unit_num) reading fresh per-fwd
-        schedule contents from a stable pointer — no host sync, no
-        data-dependent grid. `block_k`/`parallel_unit_num` must match the
-        values the schedule was built with (see `_FP4_DECODE_*` constants).
+        fixed grid (== `total_ctas`) reading fresh per-fwd schedule contents from
+        a stable pointer — no host sync, no data-dependent grid. Passing
+        `cta_info`/`total_ctas` makes the kernel skip its own schedule build, so
+        `parallel_unit_num` is not passed (it would be ignored); only `block_k`
+        must match the value the schedule was built with (see `FP4_MQA_BLOCK_K`).
         """
         from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import (
             flydsl_pa_mqa_logits_fp4,
@@ -1991,9 +1980,12 @@ class Indexer(nn.Module):
             max_seq_len,
             weight_scale=self._weights_scale,
             next_n=next_n,
-            block_k=_V4_FP4_DECODE_BLOCK_K,
+            block_k=FP4_MQA_BLOCK_K,
             kv_block_size=kv_block_size,
-            parallel_unit_num=_V4_FP4_DECODE_PARALLEL_UNIT_NUM,
+            # Grid is driven by the pre-built `cta_info`/`total_ctas`; the kernel
+            # ignores `parallel_unit_num` unless it builds the schedule itself
+            # (cta_info is None). Do NOT pass it here — the builder's real P is
+            # max(512, T_dec), so a hardcoded value would just mislead readers.
             out=logits,
             cta_info=cta_info,
             total_ctas=total_ctas,
@@ -2049,27 +2041,16 @@ class Indexer(nn.Module):
         static shape from stable pointers (like the rectangular decode path). It is
         exercised eagerly under PIECEWISE (the paged core is an eager splitting op).
 
-        `--cudagraph-mode FULL` (whole-forward capture) is NOT supported yet: the
-        scorer captures, but the broader FULL ragged-decode replay pipeline is
-        experimental (DSpark SPS calibration is disabled under a ragged graph) and
-        faults mid-run — so the guard below fails loudly at capture. Use PIECEWISE.
+        `--cudagraph-mode FULL` works too: `graph_key` is only
+        `(graph_bs, max_q_len)`, so a rectangular step (DP-sync dummy, boundary,
+        no-shrink) can replay a ragged-captured graph. The attn builder therefore
+        refreshes these windows on EVERY decode fwd — rectangular ones included —
+        so a replay never reads the previous step's stale windows (which faulted
+        the bounds-check-off paged-KV load in `pa_mqa_logits_fp4_prefill_kernel_0`).
         """
         from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
             flydsl_pa_mqa_logits_fp4_prefill,
         )
-
-        # FULL whole-forward capture of DSpark ragged decode is not supported yet
-        # (see docstring) — fail loudly at warmup capture instead of faulting mid
-        # replay. Never fires under PIECEWISE (the paged core runs eager, so no
-        # stream capture is active here). Sync-free: inspects capture state only.
-        if torch.cuda.is_current_stream_capturing():
-            raise NotImplementedError(
-                "FP4 DSpark ragged decode does not support --cudagraph-mode FULL "
-                "(whole-forward capture) yet; the FULL ragged replay pipeline is "
-                "experimental and faults mid-run. Use --cudagraph-mode PIECEWISE "
-                "(attention runs eager), or the FP8 indexer (--index_cache_dtype "
-                "fp8)."
-            )
 
         device = q_fp4.device
         padded_tokens = q_fp4.size(0)
@@ -2115,7 +2096,7 @@ class Indexer(nn.Module):
             local_ends,
             max_seq_len,
             weight_scale=self._weights_scale,
-            block_k=_V4_FP4_DECODE_BLOCK_K,
+            block_k=FP4_MQA_BLOCK_K,
             kv_block_size=kv_block_size,
             out=logits,
             cta_info=cta_info,
