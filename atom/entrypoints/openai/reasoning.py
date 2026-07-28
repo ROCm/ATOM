@@ -10,24 +10,10 @@ Also strips raw tool call tokens that the model may output.
 
 import re
 from dataclasses import dataclass
-
-KIMI_THINK_END = "<|close|>think<|sep|>"
-KIMI_RESPONSE_START = "<|open|>response<|sep|>"
-KIMI_RESPONSE_END = "<|close|>response<|sep|>"
-KIMI_MESSAGE_END = "<|close|>message<|sep|>"
-KIMI_END_OF_MSG = "<|end_of_msg|>"
+from typing import Optional, Tuple
 
 
-def _strip_kimi_response_markers(text: str) -> str:
-    text = text.removeprefix(KIMI_RESPONSE_START)
-
-    for marker in (KIMI_RESPONSE_END, KIMI_MESSAGE_END, KIMI_END_OF_MSG):
-        if marker in text:
-            text = text.partition(marker)[0]
-    return text.strip()
-
-
-def separate_reasoning(text: str) -> tuple[str | None, str]:
+def separate_reasoning(text: str) -> Tuple[Optional[str], str]:
     """Separate reasoning content from the final answer.
 
     Args:
@@ -37,23 +23,6 @@ def separate_reasoning(text: str) -> tuple[str | None, str]:
         Tuple of (reasoning_content, content). reasoning_content is None if
         no thinking block was found.
     """
-    kimi_response_delim = KIMI_THINK_END + KIMI_RESPONSE_START
-    if kimi_response_delim in text:
-        reasoning, _, content = text.partition(kimi_response_delim)
-        reasoning = reasoning.strip()
-        content = _strip_kimi_response_markers(content)
-        return (reasoning if reasoning else None, content)
-
-    if KIMI_RESPONSE_START in text:
-        _, _, content = text.partition(KIMI_RESPONSE_START)
-        return (None, _strip_kimi_response_markers(content))
-
-    if KIMI_THINK_END in text:
-        reasoning, _, content = text.partition(KIMI_THINK_END)
-        reasoning = reasoning.strip()
-        content = _strip_kimi_response_markers(content)
-        return (reasoning if reasoning else None, content)
-
     # Check for closed thinking block: <think>...</think>
     match = re.match(r"<think>(.*?)</think>\s*(.*)", text, flags=re.DOTALL)
     if match:
