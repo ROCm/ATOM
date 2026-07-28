@@ -41,6 +41,14 @@ ROUTER_POLICY="${ROUTER_POLICY:-random}"
 ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
+PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
+PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
+DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29700}"
+DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
+USE_EXPLICIT_DP_PORTS=0
+if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
+  USE_EXPLICIT_DP_PORTS=1
+fi
 
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
@@ -450,16 +458,25 @@ start_prefill() {
   local log_name="$1"
   local server_port="${2:-${PREFILL_PORT}}"
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
+  local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
+  local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
   apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
+  local -a prefill_dp_env=()
+  if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
+    prefill_dp_env=(
+      "ATOM_DP_MASTER_PORT=${dp_master_port}"
+      "ATOM_DP_BASE_PORT=${dp_base_port}"
+    )
+  fi
   local prefill_kv_transfer_config
   if [[ -n "${PREFILL_KV_TRANSFER_CONFIG}" ]]; then
     prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG}"
   else
     prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
   fi
-  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
+  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -471,12 +488,15 @@ start_prefill() {
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
   local log_name="${1:-decode-rank-${NODE_RANK}}"
   local server_port="${2:-${DECODE_PORT}}"
+  local handshake_port="${3:-${HANDSHAKE_PORT}}"
+  local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
+  local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
   apply_prefixed_env "ATOMESH_DECODE_ENV_" "${host_ip}"
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
@@ -495,13 +515,20 @@ start_decode() {
   fi
   local -a decode_cache_env=()
   build_server_cache_env "decode" "${server_port}" decode_cache_env
+  local -a decode_dp_env=()
+  if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
+    decode_dp_env=(
+      "ATOM_DP_MASTER_PORT=${dp_master_port}"
+      "ATOM_DP_BASE_PORT=${dp_base_port}"
+    )
+  fi
   local decode_kv_transfer_config
   if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
     decode_kv_transfer_config="${DECODE_KV_TRANSFER_CONFIG}"
   else
-    decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}"
+    decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
   fi
-  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} cudagraph=${DECODE_CUDAGRAPH:-none}"
+  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${DECODE_CUDAGRAPH:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -514,7 +541,7 @@ start_decode() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${decode_cache_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
 }
 
 start_router() {
@@ -855,7 +882,8 @@ write_metadata
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   start_prefill "prefill-rank-0"
   prefill_pid="${server_pid}"
-  start_decode
+  decode_handshake_port=$((HANDSHAKE_PORT + PREFILL_TP_SIZE))
+  start_decode "decode-rank-0" "${DECODE_PORT}" "${decode_handshake_port}"
   decode_pid="${server_pid}"
   trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   for ip in "${prefill_ips[@]}"; do
@@ -877,7 +905,9 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
     export HIP_VISIBLE_DEVICES="$(seq -s, "${gpu_start}" "${gpu_end}")"
     prefill_port="${prefill_ports[$idx]}"
     handshake_port=$((HANDSHAKE_PORT + idx * PREFILL_TP_SIZE))
-    start_prefill "prefill-rank-0-worker-${idx}" "${prefill_port}" "${handshake_port}"
+    prefill_dp_master_port=$((PREFILL_DP_MASTER_PORT + idx * 200))
+    prefill_dp_base_port=$((PREFILL_DP_BASE_PORT + idx * 200))
+    start_prefill "prefill-rank-0-worker-${idx}" "${prefill_port}" "${handshake_port}" "${prefill_dp_master_port}" "${prefill_dp_base_port}"
     prefill_pids+=("${server_pid}")
   done
   trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
@@ -921,7 +951,10 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
     gpu_end=$((gpu_start + DECODE_TP_SIZE - 1))
     export HIP_VISIBLE_DEVICES="$(seq -s, "${gpu_start}" "${gpu_end}")"
     decode_port="${decode_ports[$idx]}"
-    start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_port}"
+    decode_handshake_port=$((HANDSHAKE_PORT + idx * DECODE_TP_SIZE))
+    decode_dp_master_port=$((DECODE_DP_MASTER_PORT + idx * 200))
+    decode_dp_base_port=$((DECODE_DP_BASE_PORT + idx * 200))
+    start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_port}" "${decode_handshake_port}" "${decode_dp_master_port}" "${decode_dp_base_port}"
     decode_pids+=("${server_pid}")
   done
   trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
