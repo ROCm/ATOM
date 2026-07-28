@@ -79,6 +79,7 @@ from .serving_responses import (
     tool_name_lookup,
     translate_client_tool,
 )
+from .streaming_dispatch import StreamBatchDispatcher
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -103,6 +104,7 @@ _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
 _request_logger: Optional[logging.Logger] = None
+_stream_batch_dispatcher: Optional[StreamBatchDispatcher] = None
 
 
 # ============================================================================
@@ -336,36 +338,12 @@ def _prepare_multimodal_inputs(
 
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
-# Per-seq `call_soon_threadsafe` floods the API event loop at high batch size
-# (one call per token). Instead the callback only buffers the raw chunk; the
-# mgr flushes a whole step with a single `tokenizer.batch_decode` (one
-# GIL-released call instead of one decode per seq) plus one scheduled call per
-# loop (see `flush_stream_batch`).
-import threading as _threading  # noqa: E402
-
-_stream_batch_tls = _threading.local()
-
-# Per-request incremental detokenization state (vLLM-style sliding window).
-# Decoding each step's new tokens in isolation splits multi-byte UTF-8 chars
-# (byte-BPE tokenizers like DeepSeek-V4 split one CJK char across several
-# byte-tokens) into U+FFFD. Keep accumulated tokens + prefix/read offsets so
-# we only emit fully-formed characters.
-_stream_detok_state: Dict[str, dict] = {}
 
 
-def _send_stream_chunk_direct(
-    request_output: RequestOutput,
-    request_id: str,
-    stream_queue: asyncio.Queue,
-    loop: AbstractEventLoop,
-) -> None:
-    """Send stream chunk directly to the queue."""
-    global tokenizer
-
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
+    """Build a raw chunk; detokenization happens once in the batch dispatcher."""
     started_at = _request_start_times.get(request_id)
     chunk_data = {
-        "text": new_text,
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
@@ -375,76 +353,34 @@ def _send_stream_chunk_direct(
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-
-    chunk_data["request_id"] = request_id
-    buf = getattr(_stream_batch_tls, "buf", None)
-    if buf is None:
-        buf = _stream_batch_tls.buf = []
-    buf.append((loop, stream_queue, chunk_data))
+    return chunk_data
 
 
-def _drain_batch_into_queues(items: list) -> None:
-    """Runs ON the event loop: push each chunk into its per-request queue.
-    One scheduled call handles a whole step's worth of chunks."""
-    for _loop, q, chunk in items:
-        q.put_nowait(chunk)
+def _send_stream_chunk_direct(
+    request_output: RequestOutput,
+    request_id: str,
+    stream_queue: asyncio.Queue,
+    loop: AbstractEventLoop,
+) -> None:
+    """Buffer a single-request chunk for this engine step."""
+    assert _stream_batch_dispatcher is not None
+    _stream_batch_dispatcher.enqueue(
+        loop=loop,
+        queue=stream_queue,
+        state_key=request_id,
+        chunk=_build_stream_chunk(request_output, request_id),
+    )
 
 
 def flush_stream_batch() -> None:
-    """Flush a step's buffered chunks: one ``batch_decode`` for the whole step,
-    then one call_soon_threadsafe per loop (normally one — all requests on a
-    rank share the API loop)."""
-    global tokenizer
-
-    buf = getattr(_stream_batch_tls, "buf", None)
-    if not buf:
-        return
-    _stream_batch_tls.buf = []
-    # Decode the whole step in a single call. batch_decode is element-wise
-    # identical to per-seq decode but acquires/releases the GIL once instead of
-    # once per seq, cutting GIL ping-pong against the other rank output threads
-    # and the API event loop at high batch size.
-    # Incremental per-request detokenization: correct UTF-8 at token
-    # boundaries (see _stream_detok_state). Emits only fully-formed chars;
-    # a trailing partial multi-byte char is held until the next step.
-    for _loop, _q, chunk in buf:
-        rid = chunk.get("request_id")
-        st = _stream_detok_state.get(rid)
-        if st is None:
-            st = _stream_detok_state[rid] = {
-                "tokens": [],
-                "prefix_offset": 0,
-                "read_offset": 0,
-            }
-        toks = st["tokens"]
-        toks.extend(chunk["token_ids"])
-        prefix_text = tokenizer.decode(
-            toks[st["prefix_offset"] : st["read_offset"]], skip_special_tokens=True
-        )
-        new_text = tokenizer.decode(
-            toks[st["prefix_offset"] :], skip_special_tokens=True
-        )
-        if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
-            chunk["text"] = new_text[len(prefix_text) :]
-            st["prefix_offset"] = st["read_offset"]
-            st["read_offset"] = len(toks)
-        elif chunk["finished"]:
-            chunk["text"] = new_text[len(prefix_text) :]
-        else:
-            chunk["text"] = ""
-        if chunk["finished"]:
-            _stream_detok_state.pop(rid, None)
-    # Group by loop (normally a single loop). dict preserves insertion order
-    # so per-request chunk ordering within the step is maintained.
-    by_loop: Dict[AbstractEventLoop, list] = {}
-    for loop, q, chunk in buf:
-        by_loop.setdefault(loop, []).append((loop, q, chunk))
-    for loop, items in by_loop.items():
-        loop.call_soon_threadsafe(_drain_batch_into_queues, items)
+    """Flush this output thread's engine-step batch into asyncio queues."""
+    if _stream_batch_dispatcher is not None:
+        _stream_batch_dispatcher.flush()
 
 
 def _send_stream_chunk_tagged(
     request_output: RequestOutput,
+    request_id: str,
     sibling_index: int,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
@@ -458,18 +394,14 @@ def _send_stream_chunk_tagged(
     This path serves ``SamplingParams.n > 1`` by tagging each sibling's chunks
     so the shared stream consumer can merge them in order.
     """
-    global tokenizer
-
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
-    chunk_data = {
-        "text": new_text,
-        "token_ids": request_output.output_tokens,
-        "finished": request_output.finished,
-        "finish_reason": request_output.finish_reason,
-    }
-    if getattr(request_output, "kv_transfer_params_output", None):
-        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, (sibling_index, chunk_data))
+    assert _stream_batch_dispatcher is not None
+    _stream_batch_dispatcher.enqueue(
+        loop=loop,
+        queue=stream_queue,
+        state_key=(request_id, sibling_index),
+        chunk=_build_stream_chunk(request_output, request_id),
+        tag=sibling_index,
+    )
 
 
 async def generate_async(
@@ -925,6 +857,8 @@ def cleanup_streaming_request(
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    if _stream_batch_dispatcher is not None:
+        _stream_batch_dispatcher.discard_request(request_id)
     if aborted:
         try:
             engine.core_mgr.abort_request(seq_id)
@@ -1061,7 +995,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
-            _send_stream_chunk_tagged(request_output, idx, shared_queue, stream_loop)
+            _send_stream_chunk_tagged(
+                request_output, request_id, idx, shared_queue, stream_loop
+            )
 
         return _cb
 
@@ -2070,7 +2006,7 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global custom_message_encoder
+    global custom_message_encoder, _stream_batch_dispatcher
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -2120,6 +2056,7 @@ def main():
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    _stream_batch_dispatcher = StreamBatchDispatcher(tokenizer)
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
     # their chunks into a thread-local; the engine core manager's output thread
