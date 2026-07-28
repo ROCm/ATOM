@@ -1231,7 +1231,7 @@ class Config:
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
-    # EPLB master switch + sub-config (vLLM style).
+    # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 
@@ -1457,10 +1457,13 @@ class Config:
                 )
 
         # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
-        # lcm(m, m'). For V4-Pro / V4-Flash this is lcm(4, 128) = 128 original
-        # tokens. ATOM's BlockManager + slot_mapping math assume one global
-        # block_size, so we override `kv_cache_block_size` here when V4 is
-        # detected; the V4 attention builder enforces the same value.
+        # a multiple of lcm(m, m'). For V4-Pro / V4-Flash lcm(4, 128) = 128;
+        # we use 2*lcm = 256 so each block holds k1=256/4=64 CSA entries — the
+        # FP4 paged-MQA-logits indexer kernels require kv_block_size=64 (so
+        # NTPW=4 N-tiles share one physical block, N_PHYS=1). ATOM's
+        # BlockManager + slot_mapping math assume one global block_size, so we
+        # override `kv_cache_block_size` here when V4 is detected; the V4
+        # attention builder enforces the same value.
         #
         # NOTE: cannot use `hf_config.model_type` for detection — `_CONFIG_REGISTRY`
         # maps "deepseek_v4" → "deepseek_v3" so model_type reads as "deepseek_v3".
@@ -1468,7 +1471,7 @@ class Config:
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
         if any("DeepseekV4" in str(a) for a in arches):
-            v4_block_size = 128
+            v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
 

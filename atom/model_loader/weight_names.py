@@ -85,6 +85,15 @@ class WeightsMapper:
             if (out_name := self._map_name(name)) is not None
         }
 
+    def get_unstacked_mapper(self) -> "WeightsMapper":
+        """Return the mapper variant suitable for quantization config names.
+
+        ATOM keeps packed-module handling separate from checkpoint-name
+        rewriting, so this mapper never contains vLLM-style stacked mappings
+        and is already unstacked.
+        """
+        return self
+
 
 def have_shared_expert(name: str) -> str | None:
     """Return the `...shared_expert(s).` substring in `name`, if any.

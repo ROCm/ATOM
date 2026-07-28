@@ -30,6 +30,23 @@ def rewriter(**kwargs) -> CheckpointNameRewriter:
     return CheckpointNameRewriter(**kwargs)
 
 
+class WeightsMapperCompatibilityTest(unittest.TestCase):
+    def test_mapper_is_already_unstacked(self):
+        mapper = WeightsMapper(
+            orig_to_new_prefix={"model.language_model.": "language_model.model."}
+        )
+
+        unstacked_mapper = mapper.get_unstacked_mapper()
+
+        self.assertIs(unstacked_mapper, mapper)
+        self.assertEqual(
+            unstacked_mapper.apply_list(
+                ["model.language_model.layers.0.self_attn.q_proj"]
+            ),
+            ["language_model.model.layers.0.self_attn.q_proj"],
+        )
+
+
 class DroppedTensorsTest(unittest.TestCase):
     def test_drops_scale_and_frequency_tensors(self):
         r = rewriter()

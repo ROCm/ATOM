@@ -318,6 +318,39 @@ _THREAD_ID_TO_CONTEXT: dict[int, int] = {}
 _CURRENT_CONTEXTS: list["TBOContext | None"] = []
 _NUM_UBATCHES: int = 2
 
+# Per-ubatch independent pynccl TP communicators for the pure-TP all_reduce
+# overlap (see `tbo_all_reduce`).
+_TBO_TP_UBATCH_COMMS: "list | None" = None
+
+
+def tbo_get_ubatch_tp_comm(ubatch_id: int):
+    """Return this ubatch's dedicated pynccl TP communicator, building the pair
+    lazily on first use. Returns None if TP world size == 1 (no AR needed)."""
+    global _TBO_TP_UBATCH_COMMS
+    if _TBO_TP_UBATCH_COMMS is not None:
+        return _TBO_TP_UBATCH_COMMS[ubatch_id]
+
+    from aiter.dist.device_communicators.communicator_pynccl import (
+        PyNcclCommunicator,
+    )
+    from aiter.dist.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    if tp.world_size == 1:
+        _TBO_TP_UBATCH_COMMS = [None] * _NUM_UBATCHES
+        return None
+
+    # One independent communicator per ubatch. Construction runs a warmup
+    # all_reduce (a collective), so every rank must build the same number in the
+    # same order — guaranteed here because all ranks run TBO in lockstep and hit
+    # this on the same forward. Bound to the TP cpu_group (non-NCCL backend),
+    # exactly like the shared pynccl_comm.
+    comms = []
+    for _ in range(_NUM_UBATCHES):
+        comms.append(PyNcclCommunicator(group=tp.cpu_group, device=tp.device))
+    _TBO_TP_UBATCH_COMMS = comms
+    return _TBO_TP_UBATCH_COMMS[ubatch_id]
+
 
 class TBOContext:
     """Context manager for micro-batch dual-thread overlap.

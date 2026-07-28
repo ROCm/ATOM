@@ -29,10 +29,7 @@ from atom.config import (
 )
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.eplb import (
-    eplb_map_logical_to_physical,
-    record_eplb_expert_load,
-)
+from atom.model_ops.eplb import eplb_map_and_record_fused
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -463,8 +460,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        topk_physical = eplb_map_logical_to_physical(layer, topk_logical)
-        record_eplb_expert_load(layer, topk_physical)
+        # Fused logical->physical remap + expert-load record
+        topk_physical = eplb_map_and_record_fused(layer, topk_logical)
         return topk_weights, topk_physical
 
     @staticmethod
@@ -900,6 +897,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         else:
             self.use_triton_decode = False
 
+        # EPLB owns logical-to-physical routing, load recording, and live expert
+        # migration. The Triton forward paths bypass that routing flow, and their
+        # weight layout is not migration-safe, so EPLB must use the standard path
+        # even when no redundant experts are configured.
+        if getattr(get_current_atom_config(), "eplb_enable", False):
+            self.use_triton = False
+            self.use_triton_decode = False
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1037,10 +1042,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max().to(torch.float32)
             )
 
-        if self.use_triton and not (
-            getattr(get_current_atom_config(), "eplb_enable", False)
-            and getattr(layer, "num_redundant_experts", 0) > 0
-        ):
+        if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
 
             atom_config = get_current_atom_config()
