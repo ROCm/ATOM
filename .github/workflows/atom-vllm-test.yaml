@@ -169,6 +169,9 @@ jobs:
             accuracy_test_threshold: 0.83
             runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+      contents: read
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
@@ -243,10 +246,12 @@ jobs:
           echo "=== End container engine diagnostics ==="
       
       - name: Download aiter wheel
-        uses: actions/download-artifact@v8
-        with:
-          name: aiter-whl
-          path: aiter-whl
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_NAME: aiter-whl
+        run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Generate OOT overlay Dockerfile
         run: |
@@ -337,13 +342,12 @@ jobs:
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
             -t atom_oot:ci \
-            --target atom_oot \
             --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f docker/vllm_release.dockerfile .
 
       - name: Set OOT image tag
         run: |

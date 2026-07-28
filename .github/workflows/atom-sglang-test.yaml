@@ -208,6 +208,9 @@ jobs:
             accuracy_test_threshold: 0.94
             runner: atom-mi355-8gpu-vllm-sgl-ci
     runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+      contents: read
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_sglang_${{ strategy.job-index }}
@@ -265,10 +268,12 @@ jobs:
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Download aiter wheel
-        uses: actions/download-artifact@v8
-        with:
-          name: aiter-whl
-          path: aiter-whl
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_NAME: aiter-whl
+        run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Generate SGLANG overlay Dockerfile
         run: |
@@ -303,6 +308,9 @@ jobs:
               git clone "${GITHUB_REPO_URL}" /app/ATOM && \
               cd /app/ATOM && \
               git checkout "${GITHUB_COMMIT_SHA}" && \
+              echo "=== nofile BEFORE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)" && \
+              (ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true) && \
+              echo "=== nofile AFTER: soft=$(ulimit -Sn) hard=$(ulimit -Hn)" && \
               pip install -e . --no-deps && \
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
           RUN pip show amd-aiter atom sglang torch triton mori || true
@@ -359,13 +367,12 @@ jobs:
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
             -t atom_sglang:ci \
-            --target atom_sglang \
             --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f docker/sglang_release.dockerfile .
 
       - name: Set SGLANG image tag
         run: |

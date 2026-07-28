@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import bisect
+import ctypes
 import gc
 import inspect
 import logging
@@ -9,7 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -23,7 +23,15 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
+from torch.profiler import record_function
+
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.distributed.pcp_utils import (
+    PcpBalGroup,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+    pcp_round_robin_split,
+)
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -35,7 +43,8 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
-from atom.spec_decode.eagle import EagleProposer
+from atom.spec_decode.drafter import Drafter
+from atom.spec_decode.factory import build_drafter
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -62,13 +71,6 @@ from atom.utils.tbo import (
     maybe_create_ubatch_slices,
     sync_dp_metadata,
 )
-from atom.distributed.pcp_utils import (
-    PcpBalGroup,
-    pcp_allgather_rerange,
-    pcp_pad_len,
-    pcp_round_robin_split,
-)
-from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
 
@@ -235,11 +237,8 @@ class tokenIDProcessor:
         self.pending_mtp_status_copies: list[
             tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
         ] = []
-        self.mapped_bonus_list: Optional[list[int]] = (
-            None  # Mapped to current batch order
-        )
-        self.num_rejected: Optional[np.ndarray] = None
-        self.num_bonus: Optional[np.ndarray] = None
+        self.num_rejected: np.ndarray | None = None
+        self.num_bonus: np.ndarray | None = None
 
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
@@ -446,7 +445,8 @@ class tokenIDProcessor:
         self.num_rejected = batch.num_rejected
         self.num_bonus = batch.num_bonus
         if num_deferred_seqs > 0 and self.prev_rejected_num is not None:
-            # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
+            # Remap prev step's rejected/bonus counts onto the current batch order
+            # (prev_idx → curr_idx) for the deferred (carried-over) sequences.
             self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
                 deferred_prev_indices
             ]
@@ -605,19 +605,7 @@ class tokenIDProcessor:
             f"ragged total {total} > num_deferred_tokens {num_deferred_tokens} "
             f"(graph bucket capacity); ragged must fit within bs*q_eff"
         )
-        anchors = self.prev_token_ids.detach().to("cpu").numpy()  # [bs]
-        drafts = (
-            self.draft_token_ids.detach().to("cpu").numpy()
-            if self.draft_token_ids is not None
-            else None
-        )  # [bs, mtp_k]
-        flat = self.input_ids.np
-        for i in range(bs):
-            s = int(cu[i])
-            flat[s] = anchors[i]
-            d = int(lens[i]) - 1
-            if d > 0 and drafts is not None:
-                flat[s + 1 : s + 1 + d] = drafts[i, :d]
+
         # FLAT graph tail-padding. Under CUDAGraph the captured grid processes
         # C = effective_bs * q_eff tokens (effective_bs = the graph bs bucket
         # >= bs), but this ragged step has only Σ = total real tokens (Σ ≤ C).
@@ -632,9 +620,28 @@ class tokenIDProcessor:
             gbs = next((g for g in reversed(self.runner.graph_bs) if g >= bs), None)
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * q_eff)
+
+        # Per flat pos p in [0, total): seq_of_pos[p] = owning seq i,
+        # local_of_pos[p] = p - cu[i] (0 = anchor, >=1 = draft column local-1).
+        gpu = self.input_ids.gpu
+        if total > 0:
+            seq_of_pos = np.repeat(np.arange(bs, dtype=np.int64), lens)  # [total]
+            local_of_pos = np.arange(total, dtype=np.int64) - cu[seq_of_pos]
+            dev = self.prev_token_ids.device
+            seq_t = torch.as_tensor(seq_of_pos, device=dev)
+            local_t = torch.as_tensor(local_of_pos, device=dev)
+            anchor_vals = self.prev_token_ids[seq_t]  # [total]
+            if self.draft_token_ids is not None:
+                # draft column = local-1; clamp anchor rows (local==0) to 0 then
+                # mask them back to the anchor value.
+                draft_col = (local_t - 1).clamp_(min=0)
+                draft_vals = self.draft_token_ids[seq_t, draft_col]
+                out = torch.where(local_t == 0, anchor_vals, draft_vals)
+            else:
+                out = anchor_vals
+            gpu[:total] = out
         if fill_to > total:
-            flat[total:fill_to] = 0
-        self.input_ids.copy_to_gpu(fill_to)
+            gpu[total:fill_to].zero_()
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
@@ -719,14 +726,7 @@ class ModelRunner:
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
-        self.eagle3_mode = (
-            self.config.speculative_config is not None
-            and self.config.speculative_config.method == "eagle3"
-        )
 
-        self.use_aux_hidden_state_outputs = False
-        self.use_dspark_aux_capture = False
-        self._aux_hidden_states = None
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
@@ -753,24 +753,8 @@ class ModelRunner:
                 model_class, "quant_exclude_name_mapping", {}
             ),
         )
-        self.model = model_class(config)
-        fused_shared_expert_load_fn = None
-        if hasattr(self.model, "load_fused_expert_weights"):
-            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
-        torch.set_default_device(None)
-        load_start = time.perf_counter()
-        load_model(
-            self.model,
-            config.model,
-            config.hf_config,
-            config.load_dummy,
-            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
-        )
-        load_elapsed = time.perf_counter() - load_start
-        logger.info(
-            f"[{self.rank_name}] Model load done: {config.model} "
-            f"(weights loaded in {load_elapsed:.2f}s)"
-        )
+
+        self._build_and_load_model(model_class)
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -789,35 +773,14 @@ class ModelRunner:
 
             torch.set_default_device(self.device)
             with set_model_tag("drafter"):
-                self.drafter = EagleProposer(self.config, self.device, self)
+                self.drafter = build_drafter(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler()
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
-
-        if self.eagle3_mode and self.config.speculative_config.use_aux_hidden_state:
-            aux_ids = self.config.speculative_config.eagle3_aux_layer_ids
-            if not aux_ids and hasattr(
-                self.model, "get_eagle3_aux_hidden_state_layers"
-            ):
-                aux_ids = list(self.model.get_eagle3_aux_hidden_state_layers())
-            if aux_ids:
-                self.model.set_aux_hidden_state_layers(tuple(aux_ids))
-                self.use_aux_hidden_state_outputs = True
-                logger.info(f"Eagle3 aux hidden state layers: {aux_ids}")
-
-        # DSpark draft consumes target hidden states from configured target
-        # layers (dspark_target_layer_ids, e.g. [58,59,60]). The reference
-        # captures the per-layer mHC residual reduced over the hc axis
-        # (mean over dim=1: [N, hc, dim] -> [N, dim]) and concatenates the
-        # selected layers. V4ForCausalLM is @support_torch_compile (must not be
-        # edited), so we capture via forward hooks on the target decoder layers.
-        if (
-            self.config.speculative_config
-            and get_pp_group().is_last_rank
-            and getattr(self.config.speculative_config, "use_dspark", lambda: False)()
-        ):
-            self._install_dspark_aux_hooks()
+            # NOTE: aux-hidden-state capture is armed AFTER the optional TBO wrap
+            # below, so the drafter's capture hook lands on the object whose
+            # forward returns the final (concatenated) output. See arm_aux_capture.
 
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
@@ -855,10 +818,15 @@ class ModelRunner:
                 dp_gather_scatter=dp_gather_scatter,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
+        # Arm drafter-owned aux capture now that self.model is final (TBO-wrapped
+        # or not): the capture hook must sit on the object whose forward returns
+        # the concatenated output. Fully drafter-owned — ModelRunner stays
+        # aux-unaware (no tuple unpack, no aux buffers, no graph_aux state).
+        if getattr(self, "drafter", None) is not None:
+            self.drafter.arm_aux_capture(self.model)
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
-        self.warmup_model()
-        logger.info(f"Model warmup done: {config.model}")
+        self._maybe_warmup()
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -869,6 +837,44 @@ class ModelRunner:
                 self.drafter.model = torch.compile(
                     self.drafter.model, fullgraph=True, backend="eager"
                 )
+
+    def _build_and_load_model(self, model_class):
+        """Construct the model and load its weights from disk.
+
+        Override point: subclasses (e.g. the rapidserve decode process) may
+        construct on the meta device and import weights via IPC instead.
+        """
+        config = self.config
+        self.model = model_class(config)
+        fused_shared_expert_load_fn = None
+        if hasattr(self.model, "load_fused_expert_weights"):
+            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
+        torch.set_default_device(None)
+        load_start = time.perf_counter()
+        load_model(
+            self.model,
+            config.model,
+            config.hf_config,
+            config.load_dummy,
+            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
+        )
+        load_elapsed = time.perf_counter() - load_start
+        logger.info(
+            f"[{self.rank_name}] Model load done: {config.model} "
+            f"(weights loaded in {load_elapsed:.2f}s)"
+        )
+
+    def _maybe_warmup(self):
+        """Run model warmup. Override point: the rapidserve decode process
+        skips warmup since it imports weights/kvcache from prefill later."""
+        self.warmup_model()
+        logger.info(f"Model warmup done: {self.config.model}")
+
+    def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
+        """Extra GPU bytes to hold back from the KV cache budget beyond the
+        base overhead. Base runner reserves nothing; override point for
+        setups that share the GPU with another process."""
+        return 0
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -965,16 +971,9 @@ class ModelRunner:
             data_parallel_size=config.parallel_config.data_parallel_size,
             data_parallel_rank=config.parallel_config.data_parallel_rank,
             prefill_context_model_parallel_size=config.prefill_context_parallel_size,
-        )
-
-    def _make_buffer(
-        self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
-    ) -> CpuGpuBuffer:
-        # Bfloat16 torch tensors cannot be directly cast to a numpy array, so
-        # if a bfloat16 buffer is needed without a corresponding numpy array,
-        # don't bother instantiating the numpy array.
-        return CpuGpuBuffer(
-            *size, dtype=dtype, device=self.device, pin_memory=True, with_numpy=numpy
+            decode_context_parallel_size=getattr(
+                config, "decode_context_parallel_size", 1
+            ),
         )
 
     def _get_cumsum_and_arange(
@@ -1136,88 +1135,6 @@ class ModelRunner:
         if self.rank == 0:
             logger.info(*args)
 
-    def _install_dspark_aux_hooks(self) -> None:
-        """Capture DSpark target hidden states via forward hooks.
-
-        DSpark's draft reads, for each configured target layer L, the layer's
-        output mHC residual reduced over the hc axis (mean(dim=1):
-        [N, hc, dim] -> [N, dim]), and concatenates the selected layers into
-        [N, len(target_layers)*dim].
-
-        The captured per-layer [N, dim] tensors are stashed on the runner and
-        read out in run_model as ``self._aux_hidden_states`` (list, target order).
-        """
-        spec_cfg = self.config.speculative_config
-        draft_cfg = spec_cfg.draft_model_hf_config
-        target_layer_ids = tuple(
-            int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
-        )
-        if not target_layer_ids:
-            raise ValueError(
-                "DSpark requires dspark_target_layer_ids on the draft config."
-            )
-
-        base = getattr(self.model, "language_model", self.model)
-        inner = base.model  # DeepseekV4Model
-        layers = inner.layers
-        hidden_size = self.config.hf_config.hidden_size
-        max_tokens = self.config.max_num_batched_tokens
-
-        self._dspark_target_layer_ids = target_layer_ids
-        self._dspark_aux_buffers = [
-            torch.zeros(
-                max_tokens,
-                hidden_size,
-                device=self.device,
-                dtype=self.config.torch_dtype,
-            )
-            for _ in target_layer_ids
-        ]
-        # Map layer id -> buffer index (closed over by each hook; read-only).
-        layer_to_buf = {lid: i for i, lid in enumerate(target_layer_ids)}
-
-        def _make_hook(buf_idx: int, block):
-            buffer = self._dspark_aux_buffers[buf_idx]
-
-            def _hook(_module, _inputs, output):
-                # output is the HCState returned by Block.forward.
-                residual = getattr(output, "residual", None)
-                x_prev = getattr(output, "x_prev", None)
-                post = getattr(output, "post_mix", None)
-                comb = getattr(output, "comb_mix", None)
-                if residual is None:
-                    return
-                if x_prev is not None and post is not None and comb is not None:
-                    # Synthesize the post-layer residual [N, hc, dim].
-                    out_res = block.hc_post(x_prev, residual, post, comb)
-                else:
-                    out_res = residual
-                # Reduce over the hc axis to [N, dim] and write in-place into the
-                # fixed buffer (cudagraph-safe; no host-side dict mutation).
-                reduced = out_res.mean(dim=1)
-                buffer[: reduced.shape[0]].copy_(reduced)
-
-            return _hook
-
-        n_layers = len(layers)
-        for lid in target_layer_ids:
-            if lid < 0 or lid >= n_layers:
-                raise ValueError(
-                    f"dspark_target_layer_id {lid} out of range [0,{n_layers})."
-                )
-            layers[lid].register_forward_hook(
-                _make_hook(layer_to_buf[lid], layers[lid])
-            )
-
-        self.use_dspark_aux_capture = True
-        logger.info(f"DSpark aux capture hooks on target layers: {target_layer_ids}")
-
-    def _collect_dspark_aux(self, num_tokens: int) -> None:
-        """Assemble captured per-layer aux tensors (sliced to num_tokens)."""
-        if not getattr(self, "use_dspark_aux_capture", False):
-            return
-        self._aux_hidden_states = [buf[:num_tokens] for buf in self._dspark_aux_buffers]
-
     def _run_dummy_drafter(self, hidden_states, draft_bs=None):
         """Run drafter forward for DP synchronization (no real proposal)."""
         if not hasattr(self, "drafter"):
@@ -1249,7 +1166,6 @@ class ModelRunner:
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
-        # num_tokens_original = 1
         has_drafter = hasattr(self, "drafter")
         mtp_k = self.drafter.mtp_k if has_drafter else 0
         mtp_factor = mtp_k + 1
@@ -1277,49 +1193,6 @@ class ModelRunner:
         logger.debug(
             f"{self.label}: dummy batch executed with {dummy_batch.total_tokens_num} tokens"
         )
-        return True
-
-    def dummy_prefill_execution(self, num_tokens: int, num_reqs: int = 1):
-        """Execute dummy prefill batch for DP synchronization."""
-        if num_reqs < 1:
-            num_reqs = 1
-        if num_tokens < num_reqs:
-            num_tokens = num_reqs
-        # Distribute tokens evenly across requests
-        base = num_tokens // num_reqs
-        remainder = num_tokens % num_reqs
-        tokens_per_seq = [base + (1 if i < remainder else 0) for i in range(num_reqs)]
-
-        seqs = {}
-        for t in tokens_per_seq:
-            seq = Sequence([0] * t, block_size=self.block_size)
-            seqs[seq.id] = seq
-
-        dummy_batch = ScheduledBatch(
-            seqs=seqs,
-            num_scheduled_tokens=np.array(tokens_per_seq, dtype=np.int32),
-            total_tokens_num=num_tokens,
-            total_tokens_num_prefill=num_tokens,
-            total_seqs_num=num_reqs,
-            total_seqs_num_prefill=num_reqs,
-            is_dummy_run=True,
-        )
-
-        bs = self.prepare_inputs(dummy_batch)
-        self.forward_vars["input_ids"].gpu[:bs].zero_()
-        input_ids = self.forward_vars["input_ids"].gpu[:bs]
-
-        with torch.no_grad():
-            logits, hidden_states = self.run_model(input_ids)
-            self._run_dummy_drafter(hidden_states, draft_bs=1)
-
-        torch.cuda.synchronize()
-        reset_forward_context()
-
-        logger.info(
-            f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens, {num_reqs} reqs"
-        )
-        # TODO: initialize KV connector during warmup
         return True
 
     def warmup_model(self):
@@ -1497,7 +1370,7 @@ class ModelRunner:
                 full_q = self.drafter.mtp_k + 1
                 q_buckets = self._dspark_capture_q_buckets(full_q)
                 if (
-                    getattr(self.drafter, "dspark_confidence_schedule", False)
+                    self.drafter.uses_confidence_schedule
                     and os.environ.get("ATOM_PIECEWISE_FINE_TOKENS", "0") == "1"
                 ):
                     q_buckets = sorted(set(q_buckets) | set(range(1, full_q + 1)))
@@ -1539,9 +1412,7 @@ class ModelRunner:
         # number of captured buckets (the pool grows ~linearly with bucket
         # count, each bucket ~one graph set). This stays a safe upper bound:
         # measured per-bucket pool (~1.4GB) << 0.2*act.
-        if hasattr(self, "drafter") and getattr(
-            self.drafter, "dspark_confidence_schedule", False
-        ):
+        if hasattr(self, "drafter") and self.drafter.uses_confidence_schedule:
             # Match the capture loop's bucket source so we count the graphs
             # actually captured; the pool grows ~linearly with bucket count.
             buckets = self._dspark_capture_q_buckets(self.drafter.mtp_k + 1)
@@ -1581,6 +1452,8 @@ class ModelRunner:
         available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
+        # Subclasses may reserve extra headroom (override point).
+        available_for_kv_budget -= self._kv_budget_extra_reserve(total)
         # This prevents OOM when other processes share the GPU.
         available_for_kv = min(available_for_kv_budget, free)
 
@@ -1671,16 +1544,39 @@ class ModelRunner:
         b = self.attn_metadata_builder
         swa_block_bytes = b.swa_pool_block_bytes()
         if swa_block_bytes > 0:
-            num_swa_blocks = b.swa_pool_num_blocks(
-                config.max_num_seqs, config.max_model_len
-            )
-            swa_reserved = num_swa_blocks * swa_block_bytes
             # block_bytes (from _compute_block_bytes) currently includes the SWA
             # term; strip it so the compressed pool is sized on compressed bytes.
             compressed_block_bytes = block_bytes - swa_block_bytes
-            num_kvcache_blocks = max(
-                0, (available_for_pool - swa_reserved) // compressed_block_bytes
-            )
+            if envs.ATOM_SWA_FULL_RETAIN:
+                # Full-retain: give the SWA tail pool a small fraction `f` of the
+                # budget; the rest stays with the compressed pool. One SWA block is
+                # ~7x the bytes of one compressed block, so a 1:1 mirror
+                # (num_swa == num_kvcache) starves the compressed prefix index
+                # (measured: 298k -> 36.8k blocks -> hit rate collapsed). A small
+                # f keeps compressed near full while retaining the hot-boundary
+                # tail working set (LRU-evicted, same eviction discipline as
+                # vLLM's FreeKVCacheBlockQueue). Memory-bounded regardless of
+                # max_model_len. Live SWA footprint stays ~window/seq (window-free
+                # is kept); the tail pool holds lazily-freed-but-cached tails.
+                f = min(0.9, max(1e-3, envs.ATOM_SWA_TAIL_BUDGET_FRAC))
+                swa_budget = int(available_for_pool * f)
+                compressed_budget = available_for_pool - swa_budget
+                num_swa_blocks = swa_budget // swa_block_bytes
+                num_kvcache_blocks = compressed_budget // compressed_block_bytes
+                swa_reserved = num_swa_blocks * swa_block_bytes
+                logger.info(
+                    f"paged-SWA full-retain: tail_budget_frac={f:.3f}, "
+                    f"swa_budget={swa_budget / (1 << 30):.2f}GB, "
+                    f"compressed_budget={compressed_budget / (1 << 30):.2f}GB"
+                )
+            else:
+                num_swa_blocks = b.swa_pool_num_blocks(
+                    config.max_num_seqs, config.max_model_len
+                )
+                swa_reserved = num_swa_blocks * swa_block_bytes
+                num_kvcache_blocks = max(
+                    0, (available_for_pool - swa_reserved) // compressed_block_bytes
+                )
             config.num_swa_blocks = int(num_swa_blocks)
             config.swa_window_size = int(
                 getattr(hf_config, "sliding_window", 128) or 128
@@ -2151,6 +2047,7 @@ class ModelRunner:
             # multi-rank branch (`not enable_dp_attention` => True) and the
             # Context default — otherwise single-GPU/TP-only decode would
             # be forced into eager and lose the CUDAGraph decode path.
+            self._dspark_decode_replay = True
             return (
                 num_input_tokens,
                 None,
@@ -2171,6 +2068,7 @@ class ModelRunner:
             local_can_split=local_can_split,
             local_ub_tokens=(local_ub0, local_ub1),
             dspark_shape=dspark_shape,
+            local_is_dummy=bool(getattr(batch, "is_dummy_run", False)),
         )
 
         max_tokens = int(sync.num_tokens_across_dp.max())
@@ -2181,6 +2079,8 @@ class ModelRunner:
             # CUDAGraph path: all ranks pad to the same max for fixed-size all_gather.
             num_input_tokens = max_tokens
         # else: variable-length path — each rank keeps its own token count.
+
+        self._dspark_decode_replay = dp_uniform_decode and not sync.any_dummy
 
         return (
             num_input_tokens,
@@ -2209,10 +2109,7 @@ class ModelRunner:
         # it again — only the first application must shrink the batch.
         if getattr(batch, "_dspark_q_applied", False):
             return
-        if not (
-            hasattr(self, "drafter")
-            and getattr(self.drafter, "dspark_confidence_schedule", False)
-        ):
+        if not (hasattr(self, "drafter") and self.drafter.uses_confidence_schedule):
             return
         if batch.total_tokens_num_prefill > 0:
             return  # mixed/prefill step: keep full length
@@ -2388,20 +2285,29 @@ class ModelRunner:
         # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
         # [0:Σ] with the per-seq ragged new_len.
         #   * dynamic_spec_query_tokens_per_req : the true ragged per-seq lengths.
-        #   * num_spec_query_tokens (scalar) : graph CAPACITY selector q_eff, so
-        #     C = bs*q_eff >= Σ (q_eff = ceil(Σ/bs) quantized up to a captured
-        #     bucket). Graph replays a fixed C grid; tail [Σ:C] is -1-batch_id
-        #     padding (kernels skip it). C tracks the SUM, not bs*max_len, so a
-        #     long tail seq no longer inflates the whole batch (win over q-bucket).
+        #   * num_spec_query_tokens (scalar) q_eff : the PER-SEQ length bound
+        #     (>= max(new_len), quantized up to a captured bucket). Per-seq
+        #     structures (compressor grid, rectangular indexer) size by it, so no
+        #     seq can overflow them. It is NOT the total compute size -- that is
+        #     the flat num_tokens bucket (dynamic_num_tokens_pad), sized to the
+        #     real sum, so a long-tail seq no longer inflates the batch row count.
         buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
         if self.enforce_eager:
             # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
             # real len (positions/attn bound); layout is pure flat Σ.
             q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
         else:
-            # Graph: pick the smallest bucket q_eff with bs*q_eff >= Σ.
-            q_ceil = (total_new + scheduled_bs - 1) // max(scheduled_bs, 1)
-            q_eff = quantize_to_bucket(q_ceil, buckets)
+            # Graph: q_eff = smallest bucket >= the real MAX per-seq len, so no
+            # seq ever exceeds q_eff. Per-seq structures (compressor grid,
+            # rectangular indexer) size by q_eff and can't overflow -- no separate
+            # full_q cap needed. The TOTAL compute size is chosen apart from this
+            # by the flat num_tokens bucket (dynamic_num_tokens_pad, sized to the
+            # real sum), so q_eff no longer needs to track the sum/avg.
+            q_eff = (
+                quantize_to_bucket(int(new_len.max()), buckets)
+                if scheduled_bs > 0
+                else full_q
+            )
         batch.num_spec_query_tokens = int(q_eff)
         batch.dynamic_spec_query_tokens_per_req = new_len
 
@@ -2410,37 +2316,7 @@ class ModelRunner:
         # from prev_token_ids (anchor) + draft_token_ids, which never consults
         # scheduled_spec_decode_tokens.)
 
-    def _dspark_sync_graph_shape_dp(self, batch: ScheduledBatch) -> None:
-        """DP-attention: force the decode graph shape (bs, q) IDENTICAL on every
-        DP rank via an all-reduce MAX of (q, decode_bs, total_tokens).
-
-        DSpark scheduling picks q/bs per rank from the local batch, so they
-        diverge; the decode graph's MoE all_gather pads to ``graph_bs *
-        max_seqlen_q``, so divergent shapes -> mismatched collective rows ->
-        RCCL deadlock. Adopting the DP-max only enlarges graph capacity (real
-        tokens stay flat-packed, extra slots are skipped padding) -> lossless;
-        per-request ``num_scheduled_tokens`` is untouched so attention stays
-        ragged. Called on every rank each step (real + dummy) so the collective
-        never deadlocks; no-op for single-DP or non-spec.
-
-        The real hot-path collective is folded into ``sync_dp_metadata`` (see
-        ``_dspark_local_shape`` / ``_apply_dspark_shape_max``); this standalone
-        method is only the non-merged call path.
-        """
-        shape = self._dspark_local_shape(batch)
-        if shape is None:
-            return
-        import torch.distributed as dist
-
-        shape_t = torch.tensor(list(shape), device="cpu", dtype=torch.int64)
-        dist.all_reduce(shape_t, op=dist.ReduceOp.MAX, group=get_dp_group().cpu_group)
-        self._apply_dspark_shape_max(
-            batch, (int(shape_t[0]), int(shape_t[1]), int(shape_t[2]))
-        )
-
-    def _dspark_local_shape(
-        self, batch: ScheduledBatch
-    ) -> Optional[tuple[int, int, int]]:
+    def _dspark_local_shape(self, batch: ScheduledBatch) -> tuple[int, int, int] | None:
         """Local (q, decode_bs, total_tokens) for the DSpark DP graph-shape sync,
         or None when the sync does not apply (single-DP or non-DSpark).
 
@@ -2451,7 +2327,7 @@ class ModelRunner:
         if self.config.parallel_config.data_parallel_size <= 1:
             return None
         drafter = getattr(self, "drafter", None)
-        if drafter is None or not getattr(drafter, "use_dspark", False):
+        if drafter is None or not drafter.is_block_drafter:
             return None
         local_q = int(getattr(batch, "num_spec_query_tokens", 1))
         local_bs = int(getattr(batch, "total_seqs_num_decode", 0))
@@ -2464,11 +2340,15 @@ class ModelRunner:
         return local_q, local_bs, local_total_tokens
 
     def _apply_dspark_shape_max(
-        self, batch: ScheduledBatch, shape_max: Optional[tuple[int, int, int]]
+        self, batch: ScheduledBatch, shape_max: tuple[int, int, int] | None
     ) -> None:
-        """Adopt the DP-MAX (q, decode_bs, total_tokens). Raising q/bs/total only
-        enlarges graph capacity (real tokens stay flat-packed in [0:total]), so
-        it is always lossless; see _dspark_sync_graph_shape_dp docstring."""
+        """Adopt the DP-MAX (q, decode_bs, total_tokens) across DP ranks so every
+        rank captures/replays an identical decode graph shape (else the MoE
+        all_gather pads to divergent rows -> RCCL deadlock). Raising q/bs/total
+        only enlarges graph capacity (real tokens stay flat-packed in [0:total])
+        and leaves per-request num_scheduled_tokens untouched, so it is always
+        lossless. The DP-max is computed via ``_dspark_local_shape`` and the
+        collective is folded into ``sync_dp_metadata``'s packed all_gather."""
         if shape_max is None:
             return
         batch.num_spec_query_tokens = int(shape_max[0])
@@ -2506,6 +2386,12 @@ class ModelRunner:
             ub_max_tokens_across_dp,
             _dspark_shape_max,
         ) = preprocessed
+        # NOTE: self._dspark_decode_replay is set inside _preprocess (it needs
+        # sync.any_dummy), so it's already current here for build()/run_model.
+
+        # Precompute the flat replay token count once here (before attn build +
+        # run_model) so the attn builder's positions padding matches it.
+        batch.dynamic_num_tokens_pad = self._dynamic_num_tokens_pad(batch)
 
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
@@ -2575,7 +2461,7 @@ class ModelRunner:
         # but MoE pad needs the DP-unified padded_scheduled_bs.
         graph_bs = num_input_tokens if is_prefill else forward_mode.moe_pad_bs
         drafter = getattr(self, "drafter", None)
-        if not is_prefill and getattr(drafter, "use_dspark", False):
+        if not is_prefill and drafter is not None and drafter.is_block_drafter:
             graph_bs = self._dspark_ragged_moe_graph_bs(batch, graph_bs)
         context = Context(
             positions=positions,
@@ -2883,21 +2769,6 @@ class ModelRunner:
             # the label shows bs=<real>/<graph> when they differ.
             graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
             batch=batch,
-        )
-
-        # Profiler label. Kind (prefix) distinguishes real/dummy and
-        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
-        # `build_run_label`.
-        label = build_run_label(
-            is_prefill=is_prefill,
-            use_cudagraph=forward_mode.use_cudagraph,
-            is_dummy=context.is_dummy_run,
-            tbo_on=forward_context.ubatch_slices is not None,
-            bs=bs,
-            # The CUDAGraph replays a padded batch (context.graph_bs); pass it so
-            # the label shows bs=<real>/<graph> when they differ.
-            graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
-            batch=batch,
             detailed_suffix=self._detailed_label_suffix(batch),
         )
 
@@ -2961,26 +2832,13 @@ class ModelRunner:
                 # the full global sequence. Per-group (not single global) because
                 # each group was striped independently.
                 if _pcp_tbo_balanced:
-                    if self.use_aux_hidden_state_outputs:
-                        _h, _aux = model_output
-                        model_output = (
-                            self._restore_pcp_balanced_output(
-                                _h, _pcp_bal_groups, _pcp_size
-                            ),
-                            _aux,
-                        )
-                    else:
-                        model_output = self._restore_pcp_balanced_output(
-                            model_output, _pcp_bal_groups, _pcp_size
-                        )
-                if self.use_aux_hidden_state_outputs:
-                    hidden_states, self._aux_hidden_states = model_output
-                else:
-                    hidden_states = model_output
-                    self._aux_hidden_states = None
-                # DSpark captures aux hidden states via forward hooks (the model
-                # itself returns only hidden_states); assemble them in order.
-                self._collect_dspark_aux(hidden_states.shape[0])
+                    model_output = self._restore_pcp_balanced_output(
+                        model_output, _pcp_bal_groups, _pcp_size
+                    )
+                # model_output is always a plain Tensor: any drafter aux capture
+                # (EAGLE3 tuple-strip hook / DSpark layer hooks) already ran inside
+                # the forward and wrote the drafter's own buffers.
+                hidden_states = model_output
                 logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
@@ -3022,20 +2880,15 @@ class ModelRunner:
                     )
                     forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
                     forward_context.batch_descriptor = None
-                    if self.use_aux_hidden_state_outputs:
-                        hidden_states, self._aux_hidden_states = model_output
-                    else:
-                        hidden_states = model_output
-                        self._aux_hidden_states = None
-                    # DSpark: forward hooks wrote per-layer aux hidden during the
-                    # forward; assemble them. Spec keeps the padded [0:Σ] layout
-                    # (postprocess/draft re-gather to bs via next_token_locs);
-                    # non-spec slices to the real num_tokens so pad rows never leak
-                    # into sampled_token_ids -> prev_token_ids -> next-step shape
-                    # mismatch.
+                    # model_output is always a plain Tensor; drafter aux capture
+                    # (if any) already wrote its own buffers inside the forward.
+                    # Spec keeps the padded [0:Σ] layout (postprocess/draft
+                    # re-gather to bs via next_token_locs); non-spec slices to the
+                    # real num_tokens so pad rows never leak into sampled_token_ids
+                    # -> prev_token_ids -> next-step shape mismatch.
+                    hidden_states = model_output
                     _is_spec = hasattr(self, "drafter")
                     _slice_len = num_tokens_pad if _is_spec else num_tokens
-                    self._collect_dspark_aux(_slice_len)
                     hidden_states = hidden_states[:_slice_len]
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
@@ -3043,15 +2896,8 @@ class ModelRunner:
                 graph_key = (graph_bs, max_q_len)
                 self.graphs[graph_key].replay()
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
-                if graph_key in self.graph_aux_hidden:
-                    self._aux_hidden_states = [
-                        aux[:num_tokens] for aux in self.graph_aux_hidden[graph_key]
-                    ]
-                else:
-                    self._aux_hidden_states = None
-                # DSpark: hooks write aux hidden into fixed preallocated buffers
-                # in-place (cudagraph-safe); slice to this step's token count.
-                self._collect_dspark_aux(num_tokens)
+                # Drafter aux buffers (if any) refresh on replay: their in-place
+                # copy ops were captured into the graph.
                 if self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:num_tokens]
                 else:
@@ -3153,8 +2999,6 @@ class ModelRunner:
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
-                # self.debug(f"{sampled_tokens=}")
-                # self.debug(f"{next_token_locs=}")
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
@@ -3210,6 +3054,7 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
+
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -3220,6 +3065,7 @@ class ModelRunner:
             hidden_states,
             needs_independent_noise=needs_independent_noise,
         )
+
         reset_forward_context()
 
         return fwd_output
@@ -3289,7 +3135,7 @@ class ModelRunner:
             last_token_offset = lens_t - num_bonus
         elif (
             hasattr(self, "drafter")
-            and getattr(self.drafter, "dspark_confidence_schedule", False)
+            and self.drafter.uses_confidence_schedule
             and batch.total_tokens_num_prefill == 0
         ):
             full_q = self.drafter.mtp_k + 1
@@ -3297,7 +3143,7 @@ class ModelRunner:
             if 1 <= q_actual < full_q:
                 last_token_offset = last_token_offset - (full_q - q_actual)
 
-        assert isinstance(self.drafter, EagleProposer)
+        assert isinstance(self.drafter, Drafter)
 
         last_token_indices = self.drafter.prepare_inputs(
             batch.total_seqs_num, last_token_offset
@@ -3310,7 +3156,6 @@ class ModelRunner:
             num_reject_tokens=num_reject_tokens,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
-            aux_hidden_states=self._aux_hidden_states,
         )
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
@@ -3425,6 +3270,34 @@ class ModelRunner:
                     getter,
                 )
 
+    def _dynamic_num_tokens_pad(self, batch) -> int | None:
+        """Flat PIECEWISE replay token count for a ragged decode step, or None so
+        callers fall back to ``bs * max_seqlen_q``.
+
+        Mirrors the ragged branch of ``_piecewise_replay_shape``: the smallest
+        captured q-divisible num_tokens bucket >= the (DP-max) real token total.
+        None for non-ragged / non-piecewise / dummy / prefill / no-match."""
+        if (
+            batch is None
+            or batch.is_dummy_run
+            or batch.total_tokens_num_prefill > 0
+            or not self._piecewise_cg_active()
+            or not self._piecewise_sorted_tokens
+            or not hasattr(self, "drafter")
+        ):
+            return None
+        dp_total = batch.dspark_dp_total_tokens
+        real_tokens = (
+            int(dp_total)
+            if dp_total is not None
+            else int(batch.total_tokens_num_decode)
+        )
+        q = int(batch.num_spec_query_tokens)
+        for b in self._piecewise_sorted_tokens:
+            if b >= real_tokens and q > 0 and b % q == 0:
+                return int(b)
+        return None
+
     def _piecewise_replay_shape(self, batch, graph_bs, max_q_len):
         """Pick the PIECEWISE replay token count for one decode step.
 
@@ -3454,10 +3327,13 @@ class ModelRunner:
                 else int(batch.total_tokens_num_decode)
             )
             buckets = self._piecewise_sorted_tokens
-            idx = bisect.bisect_left(buckets, real_tokens)
-            if idx < len(buckets):
-                return buckets[idx], real_tokens, True
-            # total tokens exceeds the largest captured bucket -> eager.
+            q = int(max_q_len)
+            # Pick the q-divisible bucket N; replay only when all-real (see
+            # _dspark_decode_replay -- any dummy this step -> everyone eager).
+            _replay = bool(getattr(self, "_dspark_decode_replay", False))
+            for b in buckets:
+                if b >= real_tokens and q > 0 and b % q == 0:
+                    return b, real_tokens, _replay
             return max(real_tokens, graph_bs * max_q_len), real_tokens, False
 
         num_tokens_pad = graph_bs * max_q_len
@@ -3485,9 +3361,14 @@ class ModelRunner:
             return default_graph_bs
         q = int(batch.num_spec_query_tokens)
         buckets = self._piecewise_sorted_tokens
-        idx = bisect.bisect_left(buckets, int(dp_total_tokens))
-        if idx < len(buckets) and q > 0 and buckets[idx] % q == 0:
-            return buckets[idx] // q
+        # Select the SAME q-divisible bucket N that _piecewise_replay_shape picks
+        # (smallest captured bucket >= dp_total_tokens with q | N), and return
+        # graph_bs = N // q. Then graph_bs*max_seqlen_q == N on EVERY rank, so the
+        # eager (dummy) MoE all_gather size equals the size baked into the real
+        # ranks' replayed piecewise graph -> no cross-rank collective mismatch.
+        for b in buckets:
+            if b >= int(dp_total_tokens) and q > 0 and b % q == 0:
+                return int(b) // q
         return default_graph_bs
 
     def _dspark_capture_q_buckets(self, full_q: int) -> list[int]:
@@ -3498,10 +3379,7 @@ class ModelRunner:
         q-bucket path use independent size sets. Defaults to ``[full_q]`` (the
         Phase-1 single-graph behavior) when confidence scheduling is off.
         """
-        if not (
-            hasattr(self, "drafter")
-            and getattr(self.drafter, "dspark_confidence_schedule", False)
-        ):
+        if not (hasattr(self, "drafter") and self.drafter.uses_confidence_schedule):
             return [full_q]
         from atom.spec_decode.dspark_scheduler import resolve_q_buckets
 
@@ -3600,7 +3478,6 @@ class ModelRunner:
             )
             self._force_aiter_unreg_capture_for_piecewise()
         start_time = time.time()
-        # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.config.compilation_config.cudagraph_capture_sizes
         else:
@@ -3645,9 +3522,8 @@ class ModelRunner:
         if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
-        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
-        self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
-        self.graph_aux_hidden: dict[tuple[int, int], list[torch.Tensor]] = dict()
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.graph_logits: dict[tuple[int, int], torch.Tensor] = {}
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
@@ -3758,10 +3634,7 @@ class ModelRunner:
                         else positions[:num_tokens]
                     )
                     model_output = self.model(input_ids[:num_tokens], model_positions)
-                    if self.use_aux_hidden_state_outputs:
-                        outputs[:num_tokens] = model_output[0]
-                    else:
-                        outputs[:num_tokens] = model_output
+                    outputs[:num_tokens] = model_output
                     if self.logits_in_graph:
                         self.model.compute_logits(outputs[:num_tokens])
                     if prof is not None:
@@ -3787,20 +3660,20 @@ class ModelRunner:
                     ):
                         if ubatch_slices is not None:
                             # TBO capture: threads + multi-stream captured in graph.
-                            graph, graph_output = self.model.capture_tbo_graph(
+                            # Drafter aux (if any) is written inside the graph by
+                            # capture_tbo_graph replaying the model's forward hooks.
+                            graph, _ = self.model.capture_tbo_graph(
                                 input_ids[:num_tokens],
                                 positions[:num_tokens],
                                 self.graph_pool,
                                 capture_ctx.stream,
                                 output_buffer=outputs[:num_tokens],
                             )
-                            graph_aux = (
-                                graph_output[1]
-                                if self.use_aux_hidden_state_outputs
-                                else None
-                            )
                         else:
-                            # Standard single-stream capture
+                            # Standard single-stream capture. The drafter's aux
+                            # capture hook runs inside the forward and writes its
+                            # own buffers (captured in-graph); model_output is a
+                            # plain Tensor.
                             graph = torch.cuda.CUDAGraph()
                             with torch.cuda.graph(
                                 graph, self.graph_pool, stream=capture_ctx.stream
@@ -3808,12 +3681,7 @@ class ModelRunner:
                                 model_output = self.model(
                                     input_ids[:num_tokens], model_positions
                                 )
-                                if self.use_aux_hidden_state_outputs:
-                                    outputs[:num_tokens] = model_output[0]
-                                    graph_aux = model_output[1]
-                                else:
-                                    outputs[:num_tokens] = model_output
-                                    graph_aux = None
+                                outputs[:num_tokens] = model_output
                                 if self.logits_in_graph:
                                     graph_logits = self.model.compute_logits(
                                         outputs[:num_tokens]
@@ -3825,8 +3693,6 @@ class ModelRunner:
                         self.graph_logits[(bs, max_q_len)] = graph_logits
                     if prof is not None:
                         prof.step()
-                    if graph_aux is not None:
-                        self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
                     torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
 
@@ -3893,7 +3759,7 @@ class ModelRunner:
         drafter with confidence scheduling enabled is present.
         """
         drafter = getattr(self, "drafter", None)
-        if drafter is None or not getattr(drafter, "use_dspark", False):
+        if drafter is None or not drafter.is_block_drafter:
             return
         verify_scheduler = getattr(drafter, "verify_scheduler", None)
         if verify_scheduler is None:
@@ -3960,3 +3826,510 @@ class ModelRunner:
             token_points[-1],
             sps_table.numel(),
         )
+
+
+class RapidServeModelRunner(ModelRunner):
+    """ModelRunner for intra-GPU prefill/decode disaggregation.
+
+    The same class runs in both the prefill and decode processes; behavior that
+    differs between them keys off config.disagg_is_decode.
+    """
+
+    def __init__(self, rank, config):
+        if not config.disagg_is_decode:
+            self.forward = self.prefill_forward
+        super().__init__(rank, config)
+        import hashlib
+
+        # Session ID derived from the disagg IPC address so IPC handoff temp
+        # files from different engine runs never collide.
+        self._disagg_session_id = hashlib.md5(
+            config.disagg_kvcache_ipc_addr.encode()
+        ).hexdigest()[:12]
+
+    @staticmethod
+    @contextmanager
+    def _init_weight_params_on_meta():
+        """Construct a model with all `nn.Parameter`s on the meta device (no
+        persistent GPU weight allocation), leaving the default device unchanged
+        so init code that explicitly targets CUDA (e.g. aiter RoPE) and buffers
+        work normally. Each parameter is briefly created on the real device then
+        replaced with a meta tensor, so the transient peak is one parameter, not
+        the whole model. Used by decode in disagg, which fills params from
+        prefill via IPC.
+        """
+        orig_register = torch.nn.Module.register_parameter
+
+        def register_parameter(self, name, param):
+            orig_register(self, name, param)
+            p = self._parameters.get(name)
+            if p is not None:
+                self._parameters[name] = torch.nn.Parameter(
+                    p.detach().to("meta"), requires_grad=p.requires_grad
+                )
+
+        torch.nn.Module.register_parameter = register_parameter
+        try:
+            yield
+        finally:
+            torch.nn.Module.register_parameter = orig_register
+
+    # ------------------------------------------------------------------
+    # Base ModelRunner override points
+    # ------------------------------------------------------------------
+
+    def _build_and_load_model(self, model_class):
+        config = self.config
+        if not config.disagg_is_decode:
+            super()._build_and_load_model(model_class)
+            return
+        # Decode imports prefill's weights via CUDA IPC and owns no weight
+        # memory. Build on the meta device so construction allocates zero GPU
+        # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
+        # import_model_weight_ipc_handles() materializes params from prefill,
+        # and RoPE caches are recomputed locally.
+        with self._init_weight_params_on_meta():
+            self.model = model_class(config)
+        torch.set_default_device(None)
+
+    def _maybe_warmup(self):
+        # Decode owns no GPU memory yet (weights/kvcache imported from prefill
+        # later), so warmup would run against meta-device tensors — skip it.
+        if self.config.disagg_is_decode:
+            return
+        super()._maybe_warmup()
+
+    def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
+        # Two processes share the GPU in disagg mode; reserve extra headroom so
+        # NCCL/system allocs (e.g. the 512MB NCCL barrier buffer) don't OOM.
+        safety_margin = int(total_bytes * 0.02)
+        return 4 * safety_margin
+
+    def get_num_blocks(self) -> dict[str, int]:
+        # Decode in disagg mode owns no GPU memory — kvcache is imported from
+        # prefill.
+        if self.config.disagg_is_decode:
+            return {"num_kvcache_blocks": 0}
+        return super().get_num_blocks()
+
+    def allocate_kv_cache(self, num_kvcache_blocks):
+        # Decode in disagg mode: kvcache is imported from prefill, not allocated.
+        if self.config.disagg_is_decode:
+            logger.info("decode skipping kv cache allocation")
+            return True
+        return super().allocate_kv_cache(num_kvcache_blocks)
+
+    @torch.inference_mode()
+    def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        # Decode runs the model forward on a dynamically selected (optionally
+        # CU-masked) stream so it doesn't contend with prefill on the shared
+        # GPU; postprocess (sampling + async CPU copy) stays on the default
+        # stream. The stream pool is created by DecodeEngineCore via
+        # create_decode_stream_pool().
+        stream = self._decode_streams[batch.cu_stream_fraction]
+        self._done_event.record()
+        stream.wait_event(self._done_event)
+        with torch.cuda.stream(stream):
+            (
+                input_ids,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise,
+            ) = self.prepare_model(batch)
+            logits, hidden_states = self.run_model(input_ids, batch)
+        self._model_fwd_event.record(stream)
+        torch.cuda.current_stream().wait_event(self._model_fwd_event)
+
+        # postprocess (sampling + async CPU copy) always runs on default stream.
+        fwd_output = self.postprocess(
+            batch,
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            hidden_states,
+            needs_independent_noise=needs_independent_noise,
+        )
+
+        reset_forward_context()
+        return fwd_output
+
+    # ------------------------------------------------------------------
+    # Disagg IPC helpers (TP-aware)
+    #
+    # With TP>1, AsyncIOProcManager broadcasts each RPC to all ranks but only
+    # rank 0's return value reaches the engine (the other ranks' output sockets
+    # are wired to None).  For IPC handle exchange we therefore use a per-rank
+    # temp-file rendezvous: every rank pickles its local handles to
+    #   /tmp/atom_disagg_<tag>_rank<N>.pkl
+    # Rank 0 waits until all N files exist, then returns the list of paths to
+    # the engine.  On the import side every rank reads its own file (index=self.rank).
+    # ------------------------------------------------------------------
+
+    def _disagg_rank_file_path(self, tag: str, rank: int) -> str:
+        import tempfile
+
+        return os.path.join(
+            tempfile.gettempdir(),
+            f"atom_disagg_{self._disagg_session_id}_{tag}_rank{rank}.pkl",
+        )
+
+    def _disagg_write_rank_file(self, tag: str, payload) -> str:
+        """Pickle *payload* to a session-unique per-rank temp file.
+
+        Uses a session ID derived from the disagg IPC address so that files
+        from different engine runs never collide.  No deletion: all ranks
+        write concurrently when they receive the broadcast RPC, so rank 0
+        must never delete sibling files.
+        """
+        import pickle
+
+        path = self._disagg_rank_file_path(tag, self.rank)
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)
+        return path
+
+    def _disagg_collect_rank_files(self, tag: str) -> list[str] | None:
+        """Rank 0: poll until all world_size rank files exist, return paths.
+        Other ranks: return None immediately (rank 0 is the sole publisher).
+        """
+        import time
+
+        if self.rank != 0:
+            return None
+        paths = [self._disagg_rank_file_path(tag, r) for r in range(self.world_size)]
+        deadline = time.monotonic() + 120  # 2 min timeout
+        while time.monotonic() < deadline:
+            if all(os.path.exists(p) for p in paths):
+                return paths
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"Timed out waiting for disagg rank files for tag={tag!r}: "
+            + str([p for p in paths if not os.path.exists(p)])
+        )
+
+    def export_model_weight_ipc_handles(self) -> list[str] | None:
+        """Export all model parameters as CUDA IPC handles (prefill process only).
+
+        TP-aware: each rank writes its own handles to a temp file.  Rank 0 waits
+        for all ranks' files and returns the list of paths; other ranks return None.
+        Decode calls import_model_weight_ipc_handles(paths) to replace its own
+        weight tensors with zero-copy views into prefill's allocation.
+        """
+        from atom.model_engine.ipc_utils import export_model_weight_handles
+
+        logger.info(f"ModelRunner rank {self.rank}: export_model_weight_ipc_handles")
+        handles = export_model_weight_handles(self.model)
+        self._disagg_write_rank_file("weights", handles)
+        paths = self._disagg_collect_rank_files("weights")
+        if paths is not None:
+            logger.info(f"ModelRunner rank 0: all {self.world_size} weight files ready")
+        return paths  # non-None only for rank 0
+
+    def import_model_weight_ipc_handles(self, paths: list[str]) -> bool:
+        """Replace model parameters with views into prefill's GPU allocation.
+
+        TP-aware: each rank reads its own handles file (index=self.rank) and
+        deletes it after import.  Returns True as sentinel for wait_out=True.
+        """
+        import gc
+        import pickle
+
+        from atom.model_engine.ipc_utils import import_model_weights
+
+        path = paths[self.rank]
+        logger.info(f"ModelRunner rank {self.rank}: reading weight handles from {path}")
+        with open(path, "rb") as f:
+            handles = pickle.load(f)
+        os.remove(path)
+        import_model_weights(self.model, handles)
+        gc.collect()
+        torch.cuda.empty_cache()
+        # Surface any tensor prefill didn't export (would crash later in forward).
+        leftover = [n for n, p in self.model.named_parameters() if p.is_meta] + [
+            n
+            for n, b in self.model.named_buffers()
+            if isinstance(b, torch.Tensor) and b.is_meta
+        ]
+        if leftover:
+            logger.warning(
+                f"ModelRunner rank {self.rank}: {len(leftover)} tensors still on "
+                f"meta after IPC import (not materialized): {leftover[:10]}"
+            )
+        logger.info(
+            f"ModelRunner rank {self.rank}: weight IPC import complete — own weights freed"
+        )
+        return True
+
+    def export_kv_cache_ipc_handle(self) -> list[str] | None:
+        """Export self.kv_cache (and self.kv_scale for fp8) as CUDA IPC handles.
+
+        TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
+        all ranks and returns the list of paths; other ranks return None.
+        """
+        from atom.model_engine.ipc_utils import export_kv_cache_handle
+
+        logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
+        kv_scale = getattr(self, "kv_scale", None)
+        handles = export_kv_cache_handle(self.kv_cache, kv_scale)
+        self._disagg_write_rank_file("kvcache", handles)
+        paths = self._disagg_collect_rank_files("kvcache")
+        if paths is not None:
+            logger.info(
+                f"ModelRunner rank 0: all {self.world_size} kvcache files ready"
+            )
+        return paths  # non-None only for rank 0
+
+    def import_kv_cache_ipc_handle(
+        self, paths: list[str], num_kvcache_blocks: int
+    ) -> bool:
+        """Import kvcache from prefill's GPU allocation into this (decode) process.
+
+        TP-aware: each rank reads its own handles file (index=self.rank) and
+        deletes it after import.  Also imports kv_scale when present (fp8).
+        Returns True as sentinel for wait_out=True.
+        """
+        import pickle
+
+        from atom.model_engine.ipc_utils import import_kv_cache
+
+        self.num_physical_kvcache_blocks = (
+            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
+        )
+        path = paths[self.rank]
+        logger.info(
+            f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"
+        )
+        with open(path, "rb") as f:
+            meta = pickle.load(f)
+        os.remove(path)
+        logger.info(f"ModelRunner rank {self.rank}: hipIpcOpenMemHandle for kvcache...")
+        self.kv_cache, kv_scale = import_kv_cache(meta)
+        if kv_scale is not None:
+            self.kv_scale = kv_scale
+        logger.info(
+            f"ModelRunner rank {self.rank}: kvcache IPC import done, binding..."
+        )
+        self._bind_kv_cache_to_modules()
+        logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
+        return True
+
+    def _bind_kv_cache_to_modules(self):
+        """Bind self.kv_cache (and self.kv_scale if present) to all attention
+        modules.  Called after replacing self.kv_cache with an IPC-imported
+        tensor (decode process), where the builder-based binding path in
+        allocate_kv_cache() is skipped."""
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads >= self.world_size:
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            num_kv_heads = 1
+        x = 16 // self.kv_cache.element_size()
+
+        models_to_bind = [("target", self.model)]
+        if self.config.speculative_config and hasattr(self, "drafter"):
+            models_to_bind.append(("draft", self.drafter.model))
+
+        kv_cache_tensors = []
+        layer_id = 0
+        for _model_name, model in models_to_bind:
+            for module in model.modules():
+                if hasattr(module, "base_attention"):
+                    if hasattr(module, "use_mla") and not module.use_mla:
+                        if self.is_qwen_next():
+                            attn_idx = layer_id // self.full_attention_interval
+                        else:
+                            attn_idx = layer_id
+                        k_cache = self.kv_cache[0, attn_idx].view(
+                            self.num_physical_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim // x,
+                            self.physical_block_size,
+                            x,
+                        )
+                        v_cache = self.kv_cache[1, attn_idx].view(
+                            self.num_physical_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim,
+                            self.physical_block_size,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        if config.kv_cache_dtype == "fp8":
+                            module.k_scale = self.kv_scale[0, attn_idx]
+                            module.v_scale = self.kv_scale[1, attn_idx]
+                        from atom.config import KVCacheTensor
+
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                layer_num=layer_id,
+                                k_cache=k_cache,
+                                v_cache=v_cache,
+                                k_scale=module.k_scale,
+                                v_scale=module.v_scale,
+                            )
+                        )
+                        module.k_cache = k_cache
+                        module.v_cache = v_cache
+                        layer_id += 1
+                    elif hasattr(module, "use_mla") and module.use_mla:
+                        kv_cache = self.kv_cache[layer_id].view(
+                            self.num_physical_kvcache_blocks * self.physical_block_size,
+                            1,
+                            576,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        from atom.config import KVCacheTensor
+
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                layer_num=layer_id,
+                                k_cache=kv_cache,
+                                v_cache=None,
+                                k_scale=None,
+                                v_scale=None,
+                            )
+                        )
+                        module.kv_cache = kv_cache
+                        layer_id += 1
+
+        from atom.utils.forward_context import set_kv_cache_data
+
+        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
+        set_kv_cache_data(kv_cache_data)
+
+    # ------------------------------------------------------------------
+    # CU-masked stream pools + prefill forward
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stream_with_cu_mask(mask_bits: list[int]) -> torch.cuda.ExternalStream:
+        """Create a HIP stream restricted to the CUs described by mask_bits.
+
+        mask_bits is a list of uint32 words; bit i of word w represents
+        CU (w*32 + i).  Uses hipExtStreamCreateWithCUMask (ROCm only).
+        """
+        hip = ctypes.CDLL("libamdhip64.so")
+        hip.hipExtStreamCreateWithCUMask.restype = ctypes.c_int
+        hip.hipExtStreamCreateWithCUMask.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        raw_stream = ctypes.c_void_p()
+        mask_arr = (ctypes.c_uint * len(mask_bits))(*mask_bits)
+        ret = hip.hipExtStreamCreateWithCUMask(
+            ctypes.byref(raw_stream), len(mask_bits), mask_arr
+        )
+        assert ret == 0, f"HIP err {ret} creating masked stream"
+        return torch.cuda.ExternalStream(raw_stream.value)
+
+    @staticmethod
+    def _cu_mask_for_fraction(fraction: float, upper: bool) -> list[int]:
+        """Return CU mask bits for the given fraction.
+
+        For upper=False (prefill): CUs [0, split).
+        For upper=True  (decode):  CUs [split, total).
+        split = round(total * fraction).
+        """
+        total = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        split = max(1, min(total - 1, round(total * fraction)))
+        start = split if upper else 0
+        end = total if upper else split
+        num_words = (total + 31) // 32
+        words = [0] * num_words
+        for cu in range(start, end):
+            words[cu // 32] |= 1 << (cu % 32)
+        side = "decode" if upper else "prefill"
+        logger.info(
+            f"CU mask ({side}): CUs [{start},{end}) "
+            f"(fraction={fraction}, total={total})"
+        )
+        return words
+
+    # CU fractions for which we pre-create masked streams.
+    _CU_POOL_FRACTIONS = [0.5]
+
+    def create_prefill_stream_pool(self) -> bool:
+        """Create a pool of CUDA streams for disaggregated prefill.
+
+        Called once by PrefillEngineCore._init_disagg() after IPC import.
+        In constrained mode, pre-creates one CU-masked stream per fraction
+        in _CU_POOL_FRACTIONS plus a full-CU fallback (None key);
+        prefill_forward() selects the stream dynamically each iteration via
+        _optimal_cu_fraction().  In unconstrained mode, only the plain
+        full-CU stream (None key) is created.
+        """
+        self._prefill_streams = {}
+        if getattr(self.config, "disagg_constrained", False):
+            for f in self._CU_POOL_FRACTIONS:
+                mask = self._cu_mask_for_fraction(f, upper=False)
+                self._prefill_streams[f] = self._stream_with_cu_mask(mask)
+        # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
+        self._prefill_streams[None] = torch.cuda.Stream()
+        logger.info(
+            f"Prefill stream pool created: fractions={list(self._prefill_streams.keys())}"
+        )
+        return True
+
+    def create_decode_stream_pool(self) -> bool:
+        """Create a pool of CUDA streams for disaggregated decode.
+
+        Called once by DecodeEngineCore._init_disagg().  In constrained mode,
+        complementary to the prefill pool: for fraction F, decode gets CUs
+        [F*total, total).  forward() selects the stream dynamically each
+        iteration.  In unconstrained mode, only the plain full-CU stream
+        (None key) is created.
+        """
+        self._decode_streams = {}
+        if getattr(self.config, "disagg_constrained", False):
+            for f in self._CU_POOL_FRACTIONS:
+                mask = self._cu_mask_for_fraction(f, upper=True)
+                self._decode_streams[f] = self._stream_with_cu_mask(mask)
+        # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
+        self._decode_streams[None] = torch.cuda.Stream()
+        self._model_fwd_event = torch.cuda.Event()
+        self._done_event = torch.cuda.Event()
+        logger.info(
+            f"Decode stream pool created: fractions={list(self._decode_streams.keys())}"
+        )
+        return True
+
+    @torch.inference_mode()
+    def prefill_forward(self, batch: ScheduledBatch) -> list[int]:
+        """Run a prefill forward pass on a dynamically selected CU-masked stream.
+
+        Writes KV for all prompt tokens, samples the first generated token for
+        each sequence, then synchronizes before returning so decode's default
+        stream sees all KV writes.  Returns a list of sampled token IDs (one
+        per sequence, in batch order) — these are included in PrefillDone so
+        the decode process can append them before the first decode step,
+        matching the num_tokens state that non-disagg postprocess would produce.
+        """
+        prefill_streams = getattr(self, "_prefill_streams", None)
+        if prefill_streams is not None:
+            stream = self._prefill_streams[batch.cu_stream_fraction]
+        else:
+            stream = torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            (
+                input_ids,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise,
+            ) = self.prepare_model(batch)
+            logits, _ = self.run_model(input_ids, batch)
+            # Sample the first generated token from each sequence's last logit
+            sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            sampled_cpu = sampled.view(-1).tolist()
+        # Synchronize so decode's default stream sees all KV writes.
+        stream.synchronize()
+        reset_forward_context()
+        return sampled_cpu

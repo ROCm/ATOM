@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+# The CI checkout is mounted into the container. Avoid leaving root-owned
+# __pycache__ files in that host workspace between matrix jobs.
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+
 # Usage:
 #   .github/scripts/atom_sglang_test.sh start
 #   .github/scripts/atom_sglang_test.sh launch
@@ -39,7 +43,8 @@ fi
 MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
 SGLANG_PORT=${SGLANG_PORT:-8000}
-SGLANG_HOST=${SGLANG_HOST:-localhost}
+# Prefer IPv4 loopback: Docker often sets disable_ipv6=1 while localhost still resolves to ::1.
+SGLANG_HOST=${SGLANG_HOST:-127.0.0.1}
 SGLANG_PID_FILE=${SGLANG_PID_FILE:-/tmp/atom_sglang.pid}
 SGLANG_LOG_FILE=${SGLANG_LOG_FILE:-/tmp/atom_sglang.log}
 RESULT_DIR=${RESULT_DIR:-/tmp/atom_sglang_accuracy_results}
@@ -66,15 +71,24 @@ if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
 fi
 
 prepare_runtime_paths() {
-  if [[ -d /app/sglang/python && -d /app/ATOM ]]; then
-    local path_prefix="/app/sglang/python:/app/ATOM"
-    if [[ -d /app/aiter-test ]]; then
-      path_prefix="/app/aiter-test:${path_prefix}"
-    fi
-    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
-    cd /app
-  elif [[ -d /workspace ]]; then
+  local path_prefix=""
+  if [[ -d /app/aiter-test ]]; then
+    path_prefix="/app/aiter-test"
+  fi
+  if [[ -d /app/sglang/python ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/sglang/python"
+  fi
+  if [[ -d /workspace ]]; then
+    # The CI checkout is mounted at /workspace; prefer it over the ATOM copy
+    # baked into the base image so validation covers the current branch.
+    path_prefix="${path_prefix:+${path_prefix}:}/workspace"
     cd /workspace
+  elif [[ -d /app/ATOM ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/ATOM"
+    cd /app
+  fi
+  if [[ -n "${path_prefix}" ]]; then
+    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
   fi
 }
 

@@ -37,6 +37,7 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    decode_context_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
@@ -68,6 +69,9 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: Optional[str] = None
     mark_trace: bool = False
+    enable_rapidserve: bool = False
+    disagg_prefill_max_num_seqs: Optional[int] = None
+    disagg_constrained: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
     dspark_config: Optional[dict] = None
@@ -85,6 +89,13 @@ class EngineArgs:
         # Model configuration
         parser.add_argument(
             "--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path."
+        )
+        parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=None,
+            help="Override the model name returned by the API. "
+            "If not specified, defaults to the --model value.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -114,6 +125,13 @@ class EngineArgs:
             help="Data parallel size.",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            "-dcp",
+            type=int,
+            default=1,
+            help="Decode context parallel size. Must divide tensor_parallel_size.",
+        )
+        parser.add_argument(
             "--enforce-eager",
             action="store_true",
             help="Enforce eager mode execution.",
@@ -132,9 +150,7 @@ class EngineArgs:
             help="Engine internal port",
         )
         parser.add_argument(
-            "--kv-cache-dtype",
             "--kv_cache_dtype",
-            dest="kv_cache_dtype",
             choices=["bf16", "fp8"],
             type=str,
             default="bf16",
@@ -320,6 +336,28 @@ class EngineArgs:
             "--mark-trace",
             action="store_true",
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
+        )
+        parser.add_argument(
+            "--enable-rapidserve",
+            action="store_true",
+            help="Enable intra-GPU prefill/decode disaggregation. "
+            "Defaults to unconstrained mode (plain separate streams, "
+            "no CU masking). Pass --disagg-constrained to enable "
+            "CU-masked streams + shm coordination.",
+        )
+        parser.add_argument(
+            "--disagg-prefill-max-num-seqs",
+            type=int,
+            default=None,
+            help="Max sequences per prefill batch in disagg mode. "
+            "Defaults to --max-num-seqs when not set.",
+        )
+        parser.add_argument(
+            "--disagg-constrained",
+            action="store_true",
+            help="With --enable-rapidserve, enable CU-masked streams and "
+            "shm-based prefill/decode coordination. Default (off) "
+            "uses plain separate streams with no CU masking.",
         )
         parser.add_argument(
             "--online_quant_config",

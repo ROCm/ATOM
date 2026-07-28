@@ -19,7 +19,8 @@ documented at the bottom of this file but NOT managed here.
 """
 
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # --- Data Parallelism ---
@@ -37,6 +38,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
+    # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
+    # attention TP size to 1.
+    # ATOM remaps the SGLang world into internal TP x PCP groups.
+    # 0 means unset.
+    "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -83,6 +89,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
+    ),
+    # DeepSeek-V4 paged-SWA: retain the FULL sliding-window KV history in the
+    # content-addressed SWA cache instead of the default window-only prefill
+    # write. Default OFF preserves the window-only optimization (writes only each
+    # prefill chunk's trailing `window` tokens). When ON, swa_write persists the
+    # whole chunk and ensure_for_tokens materializes every block, so cross-request
+    # prefix hits can reuse the middle SWA blocks (agentic branch/replay reuse) —
+    # the live sliding-window free is UNCHANGED (out-of-window refs still released
+    # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
+    # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
+    # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
+    "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
+    # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
+    # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
+    # the bytes of one compressed block, so a 1:1 mirror starves the compressed
+    # prefix index; a small fraction keeps compressed near full while retaining
+    # the hot-boundary tail working set (LRU-evicted). Only consulted when
+    # ATOM_SWA_FULL_RETAIN=1. Default 0.2; tune 0.15-0.25 with cache-hit
+    # instrumentation. Clamped to (0, 0.9).
+    "ATOM_SWA_TAIL_BUDGET_FRAC": lambda: float(
+        os.getenv("ATOM_SWA_TAIL_BUDGET_FRAC", "0.2")
+    ),
+    # DeepSeek-V4 paged-SWA sparse checkpoint retention (only with
+    # ATOM_SWA_FULL_RETAIN=1). Tokens per retained SWA-tail checkpoint: 0 = dense
+    # (retain every written tail, relies on pool size — floods a small pool);
+    # >0 = keep a tail only once per this-many-tokens segment plus at each prompt
+    # boundary, and PIN those so live-window churn cannot overwrite them (mirrors
+    # vLLM VLLM_PREFIX_CACHE_RETENTION_INTERVAL / SlidingWindowManager sparse
+    # reachable_block_mask). Should be a multiple of the KV block size; 32768
+    # matches the vLLM trace-replay tuning. Default 0 (dense).
+    "ATOM_SWA_RETENTION_INTERVAL": lambda: int(
+        os.getenv("ATOM_SWA_RETENTION_INTERVAL", "0")
+    ),
+    # Fraction of the SWA pool that pinned checkpoint tails may occupy (LRU-capped)
+    # when sparse retention is on; the rest stays free for live-window churn.
+    "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(
+        os.getenv("ATOM_SWA_CHECKPOINT_FRAC", "0.5")
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
@@ -157,6 +200,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Fail loading when the checkpoint does not deliver every routed expert of
+    # a fused MoE parameter. On by default: the alternative is a model that
+    # loads happily with some expert slots left at their init values, which
+    # only shows up much later as an accuracy drop. Set to false to downgrade
+    # to a warning when bringing up a checkpoint that is known to be partial.
+    "ATOM_LOADER_STRICT_COVERAGE": lambda: (
+        os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
@@ -285,25 +336,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fill target: release prefill once accumulated pending tokens reach
     # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
     # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT
-    # cost. Default 0.7.
+    # cost. Default 0.9.
     "ATOM_PREFILL_DELAYER_TARGET_FILL": lambda: float(
-        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.7")
+        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.9")
     ),
     # TTFT bound: max consecutive scheduler ticks a held prefill waits before
     # force-release (deterministic across ranks; replaces the old wall-clock +
     # pass-count pair).
     "ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "30")
+        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "200")
     ),
     # Tight bound (ticks) for a held mid-chunked-prefill: a partial holds already
     # allocated KV, so it force-releases sooner than a fresh prefill.
     "ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "8")
+        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "100")
     ),
     # Consecutive non-growing ticks after which the coalescer gives up waiting
     # (burst ended, more won't come) and releases.
     "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "3")
+        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "10")
     ),
     # KV high watermark: at/above this KV usage a prefillable rank force-releases
     # (can't accumulate a bigger batch anyway).

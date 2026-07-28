@@ -250,6 +250,9 @@ The `BenchmarkMetrics` dataclass tracks:
 | Output Token Throughput | -- | Generated tokens per second |
 | Total Token Throughput | -- | (input + output) tokens per second |
 | Request Goodput | -- | Requests per second meeting SLO targets |
+| Concurrency | -- | Average in-flight requests (sum of per-request end-to-end latency / benchmark duration) |
+| Accept Length | -- | Speculative decoding only: mean tokens per model forward (1 + accepted draft tokens), from `/debug/mtp_stats`; printed only when spec-decode is enabled |
+| Acceptance Rate | -- | Speculative decoding only: fraction of drafted tokens accepted (accepted / drafted), from `/debug/mtp_stats`; printed only when spec-decode is enabled |
 
 For each latency metric, mean, median, standard deviation, and configurable
 percentiles (default: P99) are reported.

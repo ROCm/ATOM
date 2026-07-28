@@ -38,12 +38,13 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Type, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_is_enabled,
@@ -110,23 +111,23 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """
 
     # ----- CPU mirrors (avoid GPU→CPU `.item()` / `.tolist()` syncs) -----
-    state_slot_mapping_cpu: Optional[Any] = None
+    state_slot_mapping_cpu: Any | None = None
     """[bs] np.int32 — per-seq state cache slot id (host copy)."""
-    n_committed_csa_per_seq_cpu: Optional[Any] = None
+    n_committed_csa_per_seq_cpu: Any | None = None
     """[bs] np.int32 — `ctx_len // 4` (CSA committed K per seq). Built once
     in `_attach_v4_per_fwd_meta` from `var["context_lens"].np`; consumed by
     `_attach_v4_paged_decode_meta`, `_build_paged_prefill_meta`, and
     `_build_v4_indexer_meta` (indptr cumsums). Single source of truth so
     those callers don't each re-read context_lens + divide."""
-    n_committed_hca_per_seq_cpu: Optional[Any] = None
+    n_committed_hca_per_seq_cpu: Any | None = None
     """[bs] np.int32 — `ctx_len // 128` (HCA committed compress entries per
     seq). Same lifecycle as `n_committed_csa_per_seq_cpu`."""
 
     # ----- Per-seq GPU scalars (single-source-of-truth, shared by kernels) -----
-    state_slot_mapping: Optional[torch.Tensor] = None
+    state_slot_mapping: torch.Tensor | None = None
     """[bs] int32 GPU — per-seq state cache slot. Shared by swa_write +
     Compressor + paged-decode kernels (looked up via batch_id_per_token)."""
-    n_committed_csa_per_seq: Optional[torch.Tensor] = None
+    n_committed_csa_per_seq: torch.Tensor | None = None
     """[bs] int32 GPU — RAW `ctx_len // 4` per-seq committed count. Consumed
     by the indexer (cast to long inline) AND by csa_translate_pack
     (kernel derives per-token valid_k inline from this + positions +
@@ -137,11 +138,11 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     # prepare_decode's ragged branch; consumed by `_score_topk_decode` to pad Q
     # back to a [bs, full_q] rectangle for the (rectangular-only) decode indexer
     # kernel, then gather results back to the ragged layout.
-    dspark_ragged_lens_gpu: Optional[torch.Tensor] = None
+    dspark_ragged_lens_gpu: torch.Tensor | None = None
     dspark_full_q: int = 0
 
     # ----- Per-fwd hoisted (built in `_attach_v4_per_fwd_meta`) -----
-    batch_id_per_token: Optional[torch.Tensor] = None
+    batch_id_per_token: torch.Tensor | None = None
     """[padded_T] int32 GPU — the SINGLE per-token mapping
     (token_idx → seq_idx). int32 indices are accepted by PyTorch
     advanced-indexing (used in the indexer); triton kernels (swa_write,
@@ -149,13 +150,13 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     tail [T:padded_T] = -1 sentinel; consumer kernels skip on `bid < 0`. All
     other per-token quantities resolved as `per_seq_data[batch_id_per_token[t]]`
     — no [T] aliases of seq data."""
-    batch_id_per_token_cpu: Optional[Any] = None
+    batch_id_per_token_cpu: Any | None = None
     """[T] int32 — CPU mirror of the unpadded batch_id slice. Built once in
     `_attach_v4_per_fwd_meta` (host-side `np.repeat`); reused by
     `_attach_v4_paged_decode_meta` for indptr fancy-index math. Avoids a
     duplicate `np.repeat` per fwd. None for prefill paths that don't go
     through paged_decode_meta (it's only consumed there)."""
-    compress_plans: Optional[Dict[int, Any]] = None
+    compress_plans: dict[int, Any] | None = None
     """dict[ratio:int -> CompressPlan] — packed plan tensors per
     compress_ratio (4=CSA, 128=HCA)."""
 
@@ -163,31 +164,31 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     # `state` lives on the base AttentionMetaData; every V4 `prepare_*` path
     # overrides it. Below buffers are populated only when state is DECODE
     # (built by `_attach_v4_paged_decode_meta`).
-    kv_indices_swa: Optional[torch.Tensor] = None
+    kv_indices_swa: torch.Tensor | None = None
     """[swa_indptr[T]] int32 GPU — ragged-packed paged offsets into `unified_kv`
     for the SWA path (per-token length `min(positions[t]+1, win)`)."""
-    kv_indices_csa: Optional[torch.Tensor] = None
+    kv_indices_csa: torch.Tensor | None = None
     """[csa_indptr[T]] int32 GPU — packed paged offsets for CSA layers
     (CSA topk compress at slice head + SWA window prefix at tail; topk section
     filled per-layer by csa_translate_pack)."""
-    kv_indices_hca: Optional[torch.Tensor] = None
+    kv_indices_hca: torch.Tensor | None = None
     """[hca_indptr[T]] int32 GPU — packed paged offsets for HCA layers
     (HCA compress at slice head + SWA window prefix at tail; layer-invariant)."""
-    kv_indptr_swa: Optional[torch.Tensor] = None
+    kv_indptr_swa: torch.Tensor | None = None
     """[padded_T+1] int32 GPU — ragged cumsum of per-token SWA length
     `min(positions[t]+1, win)`. Padded tail repeats last value → kv_len=0
     sentinel for CG-padded slots."""
-    kv_indptr_csa: Optional[torch.Tensor] = None
+    kv_indptr_csa: torch.Tensor | None = None
     """[padded_T+1] int32 GPU — packed cumsum of per-token CSA kv_len
     (= `min(positions[t]+1, win) + min(n_committed_csa[bid], index_topk)`).
     Padded tail = last value."""
-    kv_indptr_hca: Optional[torch.Tensor] = None
+    kv_indptr_hca: torch.Tensor | None = None
     """[padded_T+1] int32 GPU — packed cumsum of per-token HCA kv_len
     (= `min(positions[t]+1, win) + n_committed_hca[bid]`). Padded tail = last value."""
     swa_pages: int = 0
     """Boundary in `unified_kv`: index < swa_pages → SWA region; index >=
     swa_pages → compress region. paged-SWA: `num_swa_blocks * block_size`."""
-    swa_block_tables: Optional[torch.Tensor] = None
+    swa_block_tables: torch.Tensor | None = None
     """[bs, max_blocks] int32 GPU — paged-SWA logical→physical block table
     for the independent SWA pool (parallel to `block_tables`, which addresses
     the compressed pool). -1 entries are window-freed blocks (never indexed)."""
@@ -199,16 +200,16 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     # content — the values are always arange(N+1) / ones(N). Staged every fwd via
     # the SAME forward_vars path as `kv_indptr_*` (CpuGpuBuffer H2D), which is
     # what makes them CUDAGraph-safe. Only populated on the fp8 path.
-    qo_indptr: Optional[torch.Tensor] = None
+    qo_indptr: torch.Tensor | None = None
     """[padded_T+1] int32 GPU — per-token q indptr `arange(N+1)` (page_size=1,
     max_seqlen_q=1). NOT `cu_seqlens_q` (which is per-seq and differs under
     MTP); this is the per-token indptr the decode kernel consumes."""
-    kv_last_page_lens: Optional[torch.Tensor] = None
+    kv_last_page_lens: torch.Tensor | None = None
     """[padded_T] int32 GPU — per-token last-page length `ones(N)` (page_size=1
     → every page is full)."""
 
     # ----- Indexer / sparse-layout side metadata -----
-    indexer_meta: Optional[Dict[str, Any]] = None
+    indexer_meta: dict[str, Any] | None = None
     """dict — `Indexer.forward_batched` per-fwd GPU tensors. Notable keys:
       cu_committed_gpu              [bs+1] int32  per-seq committed cumsum
       seq_base_per_token_gpu        [T] int32  prefill subtract base (also
@@ -228,7 +229,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     directly — no separate width-mask / offset / future-threshold staging
     needed.
     """
-    skip_prefix_len_csa: Optional[torch.Tensor] = None
+    skip_prefix_len_csa: torch.Tensor | None = None
     """[padded_T] int32 GPU — per-token SWA prefix length within each token's
     region. Decode path: filled with `window_size`; csa_translate_pack uses it
     to recover the CSA topk length (`valid_k = slice_len - skip`) and writes
@@ -244,32 +245,32 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     #   extend region from per-fwd `kv` tensor (in-chunk SWA tail)
     # Per-ratio prefix buffers (SWA-only stride for Dense, SWA + compress
     # for CSA/HCA). Extend buffer is layer-invariant, shared by all 3.
-    kv_indices_prefix_swa: Optional[torch.Tensor] = None
+    kv_indices_prefix_swa: torch.Tensor | None = None
     """[sum(prefix_swa_count)] int32 GPU — flat paged offsets into
     `unified_kv` for Dense (ratio==0) layers' prefix region (SWA history
     only)."""
-    kv_indptr_prefix_swa: Optional[torch.Tensor] = None
+    kv_indptr_prefix_swa: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `prefix_swa_count`."""
-    kv_indices_prefix_csa: Optional[torch.Tensor] = None
+    kv_indices_prefix_csa: torch.Tensor | None = None
     """[sum(prefix_swa_count + min(n_csa, index_topk))] int32 GPU — CSA topk
     (head) + SWA history (tail) per token. CSA section is filled per-layer by
     `csa_translate_pack`; SWA prefix section is filled by builder at the slice
     tail (head-CSA / tail-SWA convention, matching decode, #1116)."""
-    kv_indptr_prefix_csa: Optional[torch.Tensor] = None
+    kv_indptr_prefix_csa: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of
     `prefix_swa_count + min(n_committed_csa, index_topk)`."""
-    kv_indices_prefix_hca: Optional[torch.Tensor] = None
+    kv_indices_prefix_hca: torch.Tensor | None = None
     """[sum(prefix_swa_count + n_committed_hca)] int32 GPU — SWA history
     (head) + HCA all-committed compress entries (tail). Layer-invariant,
     fully filled by builder."""
-    kv_indptr_prefix_hca: Optional[torch.Tensor] = None
+    kv_indptr_prefix_hca: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of
     `prefix_swa_count + n_committed_hca`."""
-    kv_indices_extend: Optional[torch.Tensor] = None
+    kv_indices_extend: torch.Tensor | None = None
     """[sum(extend_count)] int32 GPU — flat row offsets into the per-fwd
     `kv` tensor (in-chunk SWA tail) for the extend region. Layer-invariant
     (same `kv` shared by all 3 ratios; one builder pass)."""
-    kv_indptr_extend: Optional[torch.Tensor] = None
+    kv_indptr_extend: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
 
 
@@ -287,7 +288,7 @@ class DeepseekV4Backend(AttentionBackend):
         return "DEEPSEEK_V4"
 
     @staticmethod
-    def get_builder_cls() -> Type["AttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return DeepseekV4AttentionMetadataBuilder
 
 
@@ -459,7 +460,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `torch.as_tensor(arr)` allocations.
         self._alloc_v4_metadata_buffers()
 
-        self._ubatch_decode_meta: Optional[list] = None
+        self._ubatch_decode_meta: list | None = None
 
     @property
     def prep_stream(self):
@@ -531,6 +532,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ceil(max_model_len/bs) (e.g. 1024 → ~66 blocks at 131072/8192/128/128).
         """
         bs = self.block_size
+        # NOTE: full-retain (ATOM_SWA_FULL_RETAIN) does NOT size the pool here.
+        # It sizes num_swa_blocks == num_kvcache_blocks from the shared memory
+        # budget in ModelRunner._compute_kv_budget (lockstep with the compressed
+        # pool), which is memory-bounded. Sizing on max_model_len here would
+        # explode to ~TB at DSV4's 1M max_position_embeddings. This method is only
+        # consulted for the default (window-only) pool below.
         # per_decode uses win_with_spec (= window + max_spec_steps), not window
         # alone: under MTP each decoding seq writes up to `max_spec_steps` draft
         # tokens into the SWA pool before the next window-free, so its peak
@@ -683,7 +690,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Same [swa_pages + compress_pages] page count as unified_kv, but width
         # = rope_head_dim (64) and dtype bf16 (rope is never quantized). bf16
         # path: list of None (no rope pool; rope stays inline in unified_kv).
-        unified_kv_rope: list[Optional[torch.Tensor]] = []
+        unified_kv_rope: list[torch.Tensor | None] = []
         if self._kv_fp8:
             for layer_id in range(self.num_layers):
                 ratio = ratios[layer_id]
@@ -1212,7 +1219,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         max_seqlen_k: int,
         positions: torch.Tensor,  # [bs] int — eagle's current draft-step positions
         only_update: bool = False,
-        num_reject_tokens: Optional[torch.Tensor] = None,
+        num_reject_tokens: torch.Tensor | None = None,
     ):
         """Per-draft-step V4 region metadata rebuild for 1-token-per-seq shape.
 
@@ -1384,10 +1391,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ) + np.repeat(context_lens_np - full_q, max_seqlen_q)
         sum_scheduled_tokens = batch.total_tokens_num_decode
 
-        # DSpark FLAT graph tail-padding: the graph replays a fixed C=bs*max_seqlen_q
-        # token grid but ragged has only Σ≤C real tokens, so pad positions[Σ:C]=0
-        # (valid; masked out via batch_id==-1). Eager (Σ==C) is a no-op.
-        graph_cap_tokens = int(bs) * int(max_seqlen_q)
+        # Pad positions up to the graph's replayed token count. Prefer the real
+        # flat bucket run_model actually replays (dynamic_num_tokens_pad); else
+        # bs*max_seqlen_q (non-ragged / non-piecewise).
+        dynamic_num_tokens_pad = getattr(batch, "dynamic_num_tokens_pad", None)
+        graph_cap_tokens = (
+            int(dynamic_num_tokens_pad)
+            if dynamic_num_tokens_pad is not None
+            else int(bs) * int(max_seqlen_q)
+        )
         if graph_cap_tokens > sum_scheduled_tokens:
             _pad_positions = np.zeros(graph_cap_tokens, dtype=positions_np.dtype)
             _pad_positions[:sum_scheduled_tokens] = positions_np
@@ -1465,9 +1477,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.compress_plans = compress_plans
         attn_metadata.swa_block_tables = swa_bt_gpu
         # DSpark RAGGED: pass per-seq verify lengths + full_q to the (rectangular-
-        # only) decode indexer so it can pad Q back to [bs, full_q]. Eager-only;
-        # None on the regular rectangular path.
-        if ragged_lens is not None:
+        # only) decode indexer so it can pad Q back to [bs, full_q].
+        _drafter = getattr(self.model_runner, "drafter", None)
+        _dspark_ragged_graph = (
+            self.model_runner.config.dspark.ragged
+            and _drafter is not None
+            and _drafter.uses_confidence_schedule
+        )
+        if ragged_lens is not None or _dspark_ragged_graph:
             attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
                 extend_lens_np, device=positions.device
             )
@@ -2100,8 +2117,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         GLOBAL for the group (the compressor/swa_write see the group's full
         all-gathered tokens), exactly as non-TBO PCP does for the whole batch.
         """
-        from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
         from atom.model_ops.v4_kernels import make_compress_plans
+        from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
 
         mr = self.model_runner
         grp = mr._pcp_bal_groups[ubatch_idx]  # PcpBalGroup
@@ -2237,8 +2254,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
         *,
-        padded_bs: Optional[int] = None,
-        max_q_len: Optional[int] = None,
+        padded_bs: int | None = None,
+        max_q_len: int | None = None,
         buf_prefix_ubatch: str = "",
     ) -> None:
         """Hoist per-fwd, layer-invariant metadata used by every V4 layer.
@@ -2359,7 +2376,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         state_slot_mapping_cpu,
         scheduled_bs: int,
         total_tokens: int,
-        padded_total_tokens: Optional[int] = None,
+        padded_total_tokens: int | None = None,
         buf_prefix_ubatch: str = "",
     ) -> None:
         """Phase B: build per-fwd paged-decode index buffers (layer-invariant).
@@ -2466,8 +2483,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         T_pad = (
             total_tokens if padded_total_tokens is None else int(padded_total_tokens)
         )
-        if T_pad < T:
-            T_pad = T
+        T_pad = max(T_pad, T)
 
         # All three indptr cumsums output int32 directly. Values are bounded
         # (T ≤ mnbt=8192, per-tok ≤ win + index_topk ≈ 2200 → max cumsum ~18M,
@@ -2616,9 +2632,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
         *,
-        positions_gpu: Optional[torch.Tensor] = None,
-        cu_q_per_seq_gpu: Optional[torch.Tensor] = None,
-        block_tables_gpu: Optional[torch.Tensor] = None,
+        positions_gpu: torch.Tensor | None = None,
+        cu_q_per_seq_gpu: torch.Tensor | None = None,
+        block_tables_gpu: torch.Tensor | None = None,
     ) -> None:
         """Build per-fwd index buffers consumed by sparse_attn_v4_paged_prefill.
 
@@ -2964,7 +2980,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return gpu
 
     def build_for_cudagraph_capture(
-        self, bs: int, max_q_len: Optional[int] = None
+        self, bs: int, max_q_len: int | None = None
     ) -> tuple[AttentionMetaData_DSV4, Context]:
         """Build attn_metadata for CUDAGraph capture using a synthetic decode batch.
 
@@ -3065,7 +3081,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if (
             self.model_runner.config.dspark.ragged
             and drafter is not None
-            and getattr(drafter, "dspark_confidence_schedule", False)
+            and drafter.uses_confidence_schedule
         ):
             full_q_real = drafter.mtp_k + 1
             attn_metadata.dspark_ragged_lens_gpu = torch.full(
@@ -3077,7 +3093,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # helpers used at runtime — guarantees addresses match.
         extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
         attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np, context_lens_np, graph_bs=bs, max_q_len=max_q_len
+            extend_lens_np,
+            context_lens_np,
+            graph_bs=bs,
+            max_q_len=max_q_len,
         )
         # Capture: padded_bs == scheduled_bs == bs (synthetic batch is full).
         # Must run BEFORE `_attach_v4_indexer_meta` so the indexer-side meta

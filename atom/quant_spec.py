@@ -216,6 +216,7 @@ class QuarkOnlineParser(QuantConfigParser):
         - ``"per_block_fp8"``   — per-block FP8 (128x128; alias of per_block128_fp8)
         - ``"per_block128_fp8"``— per-block FP8, 128x128 block
         - ``"mxfp4"``           — microscaling FP4 (block size 32)
+        - ``"mxfp8"``           — microscaling FP8 (block size 32)
         """
         if not isinstance(online_quant_config, dict):
             raise TypeError("online_quant_config must be a dict parsed from JSON.")
@@ -227,6 +228,7 @@ class QuarkOnlineParser(QuantConfigParser):
             "per_block_fp8": (QuantType.per_1x128, "fp8"),
             "per_block128_fp8": (QuantType.per_1x128, "fp8"),
             "mxfp4": (QuantType.per_1x32, "fp4"),
+            "mxfp8": (QuantType.per_1x32, "fp8"),
         }
 
         def _parse_online_quant_format(quant_format_str: str) -> LayerQuantConfig:

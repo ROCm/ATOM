@@ -26,6 +26,19 @@ def maybe_get_glm52_dsa_pools_from_sglang_backend(forward_batch=None):
         req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
         if token_to_kv_pool is not None and req_to_token_pool is not None:
             return token_to_kv_pool, req_to_token_pool
+
+    try:
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+    except Exception:  # noqa: BLE001 - forward context is optional
+        backend = None
+
+    token_to_kv_pool = getattr(backend, "token_to_kv_pool", None)
+    req_to_token_pool = getattr(backend, "req_to_token_pool", None)
+    if token_to_kv_pool is not None and req_to_token_pool is not None:
+        return token_to_kv_pool, req_to_token_pool
+
     return None, None
 
 
@@ -113,7 +126,7 @@ def _get_index_topk(atom_config) -> int:
 
 def _local_num_attention_heads(atom_config) -> int:
     hf_config = atom_config.hf_config
-    num_heads = int(getattr(hf_config, "num_attention_heads"))
+    num_heads = int(hf_config.num_attention_heads)
     tp_size = int(getattr(atom_config, "tensor_parallel_size", 1))
     return max(1, num_heads // max(1, tp_size))
 
@@ -220,6 +233,71 @@ def _ensure_shared_sparse_buffer(
         buffer = torch.empty(required, dtype=torch.int32, device=device)
         setattr(token_to_kv_pool, _SHARED_SPARSE_INDICES_ATTR, buffer)
     return buffer[:required]
+
+
+def _maybe_apply_pcp_prefill_reindex(
+    md,
+    *,
+    sparse_counts: np.ndarray,
+    total_tokens: int,
+    topk: int,
+    token_to_kv_pool,
+    atom_config,
+    dtype_q,
+) -> None:
+    try:
+        from atom.distributed.pcp_utils import (
+            get_pcp_world_size,
+            pcp_is_enabled,
+            pcp_pad_dense,
+            pcp_pad_len,
+            pcp_round_robin_query_indices,
+        )
+    except ImportError:
+        return
+
+    if not pcp_is_enabled():
+        return
+
+    device = md.slot_mapping.device
+    pcp_size = get_pcp_world_size()
+    padded_total = pcp_pad_len(int(total_tokens), pcp_size)
+    n_pad = padded_total - int(total_tokens)
+    owned_q = pcp_round_robin_query_indices(padded_total, pcp_size).to(device)
+    n_owned = int(owned_q.shape[0])
+
+    md.cu_seqlen_ks = pcp_pad_dense(md.cu_seqlen_ks, n_pad)[owned_q].contiguous()
+    md.cu_seqlen_ke = pcp_pad_dense(md.cu_seqlen_ke, n_pad)[owned_q].contiguous()
+    md.token_to_seq_idxs = pcp_pad_dense(md.token_to_seq_idxs, n_pad)[
+        owned_q
+    ].contiguous()
+    md.sparse_cu_seqlens_q = torch.arange(n_owned + 1, dtype=torch.int32, device=device)
+
+    counts = torch.as_tensor(sparse_counts, dtype=torch.int64, device=device)
+    owned_counts = pcp_pad_dense(counts, n_pad)[owned_q]
+    owned_counts = torch.clamp(owned_counts, max=int(topk))
+    sparse_kv_indptr = torch.zeros(n_owned + 1, dtype=torch.int32, device=device)
+    sparse_kv_indptr[1:] = torch.cumsum(owned_counts, dim=0).to(torch.int32)
+    md.sparse_kv_indptr = sparse_kv_indptr
+    md.sparse_kv_last_page_lens = torch.ones(n_owned, dtype=torch.int32, device=device)
+
+    sparse_work = _make_mla_work_buffers(
+        cu_seqlens_q=md.sparse_cu_seqlens_q,
+        kv_indptr=md.sparse_kv_indptr,
+        kv_last_page_lens=md.sparse_kv_last_page_lens,
+        num_heads=_local_num_attention_heads(atom_config),
+        dtype_q=dtype_q,
+        dtype_kv=dtype_q,
+        page_size=_attention_page_size(token_to_kv_pool),
+    )
+    for key, value in sparse_work.items():
+        setattr(md, f"sparse_prefill_{key}", value)
+
+    if int(total_tokens) > 0:
+        owned_clamped = torch.clamp(owned_q, max=int(total_tokens) - 1)
+        md.slot_mapping_owned = md.slot_mapping[owned_clamped].contiguous()
+    else:
+        md.slot_mapping_owned = md.slot_mapping[:0].contiguous()
 
 
 class _GLM52DecodeGraphBuffers:
@@ -654,6 +732,15 @@ def _build_prefill_metadata(
         )
         for key, value in sparse_work.items():
             setattr(md, f"sparse_prefill_{key}", value)
+        _maybe_apply_pcp_prefill_reindex(
+            md,
+            sparse_counts=sparse_counts,
+            total_tokens=total_tokens,
+            topk=topk,
+            token_to_kv_pool=token_to_kv_pool,
+            atom_config=atom_config,
+            dtype_q=dtype_q,
+        )
     else:
         _ensure_shared_sparse_buffer(
             token_to_kv_pool,
@@ -738,7 +825,7 @@ def bind_glm52_dsa_cache_views(model, token_to_kv_pool) -> bool:
         indexer = getattr(module, "indexer", None)
         if indexer is not None:
             index_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
-            index_entry_dim = int(getattr(indexer, "head_dim")) + 4
+            index_entry_dim = int(indexer.head_dim) + 4
             indexer.k_cache.kv_cache[0] = index_cache.view(
                 -1, page_size, index_entry_dim
             )

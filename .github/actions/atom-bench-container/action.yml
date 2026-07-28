@@ -59,8 +59,8 @@ runs:
         MODEL_PROGRESS_INTERVAL: "60"
       run: |
         set -euo pipefail
-        if [ ! -d "/models" ]; then
-          echo "/models directory not found, skipping model download"
+        if [ -z "${MODEL_HOST_ROOT:-}" ]; then
+          echo "Model cache directory not found, skipping model download"
           exit 0
         fi
         model_dir="/models/${{ inputs.model-path }}"

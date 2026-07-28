@@ -12,7 +12,6 @@ Usage:
     python -m atom.entrypoints.openai_server --model <model> [options]
 """
 
-import argparse
 import asyncio
 import base64
 import binascii
@@ -31,6 +30,7 @@ from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
+from atom.utils.arg_parser import FlexibleArgumentParser
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
@@ -1745,7 +1745,7 @@ def main():
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
     global custom_message_encoder
 
-    parser = argparse.ArgumentParser(description="ATOM OpenAI API Server")
+    parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
     parser.add_argument("--host", type=str, default=DEFAULT_HOST, help="Server host")
     parser.add_argument(
@@ -1787,7 +1787,7 @@ def main():
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
-    model_name = args.model
+    model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
     logger.info(f"Initializing engine with model {args.model}...")

@@ -44,7 +44,8 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_MMAP** | bool | false | If set to `true`, disable memory-mapped file loading for model weights. Useful in containerized environments where mmap may cause issues. |
-| **ATOM_LOADER_NUM_THREADS** | int | 16 | Worker threads for weight loading. `>1` (default `16`) enables the batched parallel loader (per-fused-param CPU staging flushed with a single H2D copy) with that many threads; set to `1` to fall back to the original sequential per-expert path. Raise on high-core hosts if loading is CPU-bound. |
+| **ATOM_LOADER_NUM_THREADS** | int | 16 | Worker threads for weight loading. `>1` (default `16`) enables the batched parallel loader (routed expert weights staged in a CPU buffer, flushed with a single H2D copy when every routed expert of that parameter has arrived) with that many threads; set to `1` to fall back to the original sequential per-expert path. Raise on high-core hosts if loading is CPU-bound. |
+| **ATOM_LOADER_STRICT_COVERAGE** | bool | `true` | Fail loading when a fused MoE parameter does not receive every routed expert from the checkpoint. Set to `false` to downgrade to a warning and load anyway, leaving those expert slots at their init values — useful when bringing up a checkpoint known to be partial, misleading otherwise (the symptom is an accuracy drop much later). |
 
 ## Plugin mode
 

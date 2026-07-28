@@ -139,6 +139,7 @@ _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+_V4_SWA_FULL_RETAIN = envs.ATOM_SWA_FULL_RETAIN
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
@@ -2433,12 +2434,22 @@ class DeepseekV4Attention(nn.Module):
             # runtime fixups here are on the actual K/V data:
             #   - swa_write must write the FULL sequence SWA ring (every PCP
             #     rank keeps full KV), and
-            #   - sparse_attn's extend source must be the FULL `kv` so each 1/W
-            #     query can attend the whole in-chunk SWA window.
-            # So all-gather `kv` back to full order; positions/cu_seqlens_q/
-            # state_slot_mapping for the SWA write stay full (cu_seqlens_q /
-            # state_slot_mapping are per-seq, never split; positions_full comes
-            # from the forward context which holds the pre-split copy).
+            #   - sparse_attn's extend source must be the FULL extend K so each
+            #     1/W query can attend the whole in-chunk SWA window.
+            # So all-gather the extend K back to full order; positions/
+            # cu_seqlens_q/state_slot_mapping for the SWA write stay full
+            # (cu_seqlens_q / state_slot_mapping are per-seq, never split;
+            # positions_full comes from the forward context which holds the
+            # pre-split copy).
+            #
+            # The extend K's representation depends on the kv-cache layout:
+            #   - bf16 → single `qkn.kv` [T, 1, 576]; all-gather it (kv_full).
+            #   - fp8 2buff → `qkn.k_packed` [T, 1, 512] fp8 (nope + inline e8m0
+            #     scale) + `qkn.k_rope` [T, 1, 64] bf16; all-gather BOTH (the
+            #     scale rides inside k_packed, so no separate scale gather). fp8
+            #     all_gather is a pure byte movement — RCCL supports it directly.
+            # Both use the SAME rerange, so the gathered tensors stay aligned
+            # with the full-sequence kv_indices_extend / positions_full.
             pcp_on = _pcp_active()
             if pcp_on:
                 pcp_ws = get_pcp_world_size()
@@ -2451,17 +2462,24 @@ class DeepseekV4Attention(nn.Module):
                 _tbo_attn = _tbo_active_attn()
                 if _tbo_attn:
                     tbo_yield_and_switch_from_compute_to_comm()
-                kv_full = pcp_allgather_rerange(qkn.kv, pcp_ws)
-                # positions must match kv_full's full-sequence coords for the
+                if self.kv_fp8:
+                    k_packed_full = pcp_allgather_rerange(qkn.k_packed, pcp_ws)
+                    k_rope_full = pcp_allgather_rerange(qkn.k_rope, pcp_ws)
+                    kv_full = None
+                else:
+                    k_packed_full = k_rope_full = None
+                    kv_full = pcp_allgather_rerange(qkn.kv, pcp_ws)
+                # positions must match the full-sequence coords for the
                 # swa_write ring addressing (`positions[src] % cache_size`).
                 # `positions` here is this rank's 1/W shard (split in
                 # ForCausalLM.forward); all-gather it back to full order with
-                # the same rerange used for kv (NOT fc.context.positions, which
-                # the builder reindexed to 1/W).
+                # the same rerange used for the extend K (NOT fc.context.
+                # positions, which the builder reindexed to 1/W).
                 positions_full = pcp_allgather_rerange(positions, pcp_ws)
                 if _tbo_attn:
                     tbo_switch_to_compute_sync()
             else:
+                k_packed_full, k_rope_full = qkn.k_packed, qkn.k_rope
                 kv_full = qkn.kv
                 positions_full = positions
 
@@ -2478,13 +2496,14 @@ class DeepseekV4Attention(nn.Module):
                 raise ValueError(f"Unsupported compress_ratio {ratio}")
             # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
             # (unified_kv_rope set) → aiter op4 with the 2buff fp8 prefix pool
-            # (nope-fp8 + rope-bf16) + op-quantized fp8 Q and extend K, no dequant
-            # of the prefix and no torch quant; bf16 → OPUS / Triton over q_sa and
-            # the bf16 extend kv_full. (fp8 + PCP is out of scope: k_packed/k_rope
-            # are this fwd's shard, NOT PCP all-gathered like kv_full.) On bf16 the
-            # wrapper reuses out=qkn.q_sa as the attention output buffer (q_sa is
-            # not needed after this call → avoids an extra empty_like); fp8 ignores
-            # both q_sa and out.
+            # (nope-fp8 + rope-bf16) + op-quantized fp8 Q and the extend K
+            # (k_packed_full/k_rope_full), no dequant of the prefix and no torch
+            # quant; bf16 → OPUS / Triton over q_sa and the bf16 extend kv_full.
+            # Under PCP the extend K is the PCP all-gathered full sequence
+            # (k_*_full for fp8, kv_full for bf16); off PCP it is this fwd's
+            # tensor unchanged. On bf16 the wrapper reuses out=qkn.q_sa as the
+            # attention output buffer (q_sa is not needed after this call →
+            # avoids an extra empty_like); fp8 ignores both q_sa and out.
             o = sparse_attn_v4_paged_prefill(
                 qkn.q_sa,
                 self.unified_kv,
@@ -2501,8 +2520,8 @@ class DeepseekV4Attention(nn.Module):
                 unified_kv_rope=self.unified_kv_rope,
                 q_packed=qkn.q_packed,
                 q_rope=qkn.q_rope,
-                k_packed=qkn.k_packed,
-                k_rope=qkn.k_rope,
+                k_packed=k_packed_full,
+                k_rope=k_rope_full,
                 prefix=f"{self.layer_name}.sparse_attn_prefill",
             )  # [S, H, head_dim] bf16
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
@@ -2519,10 +2538,13 @@ class DeepseekV4Attention(nn.Module):
             # free_after_prefill_chunk keeps that trailing block until read.
             # Dispatch on kv-cache layout inside the wrapper (swa_region_rope set
             # → fp8 2buff path, which scatters the op-quantized extend K
-            # (k_packed/k_rope) into both paged SWA pools; else bf16 single-pool
-            # write over kv_full). Both are window-only (same trailing-window
-            # semantics). fp8 uses this fwd's shard, no PCP — positions_full ==
-            # positions when PCP off, and kv_full is None on fp8.
+            # (k_packed_full/k_rope_full) into both paged SWA pools; else bf16
+            # single-pool write over kv_full). Both are window-only (same
+            # trailing-window semantics). Under PCP every rank writes the FULL
+            # sequence SWA ring, so the extend K and positions_full are the PCP
+            # all-gathered full versions (k_*_full / kv_full for the data,
+            # positions_full for the ring addressing); off PCP they are this
+            # fwd's tensors (positions_full == positions, kv_full == qkn.kv).
             swa_write(
                 kv_full,
                 positions_full,
@@ -2530,9 +2552,21 @@ class DeepseekV4Attention(nn.Module):
                 swa_block_tables_gpu,
                 self.swa_kv,
                 swa_block_size,
-                min(self.window_size, attn_md.max_seqlen_q),
-                k_packed=qkn.k_packed,
-                k_rope=qkn.k_rope,
+                # Full-retain (ATOM_SWA_FULL_RETAIN): persist the WHOLE chunk's
+                # SWA KV (every token) so the content-addressed cache holds the
+                # full history for cross-request prefix reuse. Default: window-only
+                # (trailing `window` tokens) — see the OPT note above. Pairs with
+                # SlidingWindowPool.ensure_for_tokens materializing all chunk
+                # blocks (free_before=0) so every dst block is valid here.
+                # K source is the PCP all-gathered full extend K (k_*_full); off
+                # PCP it falls back to qkn.k_packed/k_rope (single-rank identical).
+                (
+                    attn_md.max_seqlen_q
+                    if _V4_SWA_FULL_RETAIN
+                    else min(self.window_size, attn_md.max_seqlen_q)
+                ),
+                k_packed=k_packed_full,
+                k_rope=k_rope_full,
                 swa_region_rope=self.swa_kv_rope,
                 prefix=f"{self.layer_name}.swa_write",
             )
