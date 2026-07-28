@@ -526,7 +526,14 @@ def fused_compress_attn(
             cache_scale=cache_scale,
             use_ue8m0=use_ue8m0,
             preshuffle=preshuffle and not main_2buff_fp8,
-            quant_mode="group_fp8" if main_2buff_fp8 else "per_row_fp8",
+            # AITER treats quant_mode as authoritative; BF16 fallback must use "none".
+            quant_mode=(
+                "group_fp8"
+                if main_2buff_fp8
+                else "per_row_fp8"
+                if quant
+                else "none"
+            ),
             k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
         )
         return
