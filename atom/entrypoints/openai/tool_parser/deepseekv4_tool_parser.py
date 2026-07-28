@@ -42,25 +42,15 @@ _INVOKE_RE = re.compile(
     re.DOTALL,
 )
 
-# Canonical param key -> emitted synonyms the model uses interchangeably. Only
-# applied when the canonical key is in the tool's declared schema and the model
-# used a synonym instead (e.g. Codex's exec_command wants `cmd`, but the model
-# habitually emits `command` -> "missing field cmd" retry loop). Scoped to the
-# schema so it never renames a key a tool legitimately declares.
-_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
-    "cmd": ("command",),
-}
-
-
 def _unwrap_wrapper_args(args: Any, allowed: set) -> Any:
     """Strip spurious ``{"arguments": {...}}`` / ``{"input": {...}}`` envelopes.
 
     Non-tuned models (DeepSeek-V4-Pro) frequently wrap the real args in an extra
     ``arguments``/``input`` object — sometimes nested 2-3 deep, or stringified —
     so a call meant as ``{"cmd": "ls"}`` arrives as ``{"arguments": {"cmd":
-    "ls"}}`` and the client (Codex) rejects it ("missing field cmd"). Recursively
-    unwrap while the sole key is a wrapper that is NOT itself a declared param of
-    the tool. Mirrors vLLM's ``_unwrap_wrapper_args`` (deepseek_v4.py)."""
+    "ls"}}``. Recursively unwrap while the sole key is a wrapper that is NOT
+    itself a declared param of the tool. Mirrors vLLM's ``_unwrap_wrapper_args``
+    (deepseek_v4.py)."""
     for _ in range(4):  # bounded against pathological nesting
         if not (isinstance(args, dict) and len(args) == 1):
             break
@@ -77,18 +67,6 @@ def _unwrap_wrapper_args(args: Any, allowed: set) -> Any:
         if not isinstance(v, dict):
             break
         args = v
-    return args
-
-
-def _apply_key_aliases(args: Any, allowed: set) -> Any:
-    if not (isinstance(args, dict) and allowed):
-        return args
-    for canon, syns in _KEY_ALIASES.items():
-        if canon in allowed and canon not in args:
-            for s in syns:
-                if s in args:
-                    args[canon] = args.pop(s)
-                    break
     return args
 
 
@@ -179,7 +157,6 @@ class DsmlParser(BufferedMarkerParser):
                         except Exception:
                             pass
                 args = _unwrap_wrapper_args(args, set(types))
-                args = _apply_key_aliases(args, set(types))
                 calls.append((name, args))
         else:
             # malformed: no complete invoke wrapper -> collect params, infer tool name
@@ -192,7 +169,6 @@ class DsmlParser(BufferedMarkerParser):
                 types = param_types.get(name, {})
                 args = {k: _coerce(v, s, types.get(k)) for k, (v, s) in raw.items()}
                 args = _unwrap_wrapper_args(args, set(types))
-                args = _apply_key_aliases(args, set(types))
                 calls.append((name, args))
 
         tool_calls = [
