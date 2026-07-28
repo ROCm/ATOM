@@ -15,7 +15,6 @@ This module provides:
 
 import logging
 import multiprocessing
-import os
 import pickle
 import queue
 import threading
@@ -70,13 +69,9 @@ class AsyncIOProc:
         rank: int,
         kv_output_addr: str | None = None,
         all_ranks_barrier=None,
-        env_snapshot: dict[str, str] | None = None,
         *args,
         **kwargs,
     ):
-        if env_snapshot:
-            os.environ.update(env_snapshot)
-
         # Bind this worker's lifetime to its parent EngineCore: if the parent
         # exits for any reason, have the kernel reap this process immediately
         # instead of leaving it orphaned. A ModelRunner worker holds a large GPU
@@ -280,7 +275,6 @@ class AsyncIOProcManager:
         atexit.register(self._cleanup_shared_memory)
         self.all_ranks_barrier = ctx.Barrier(proc_num)
         init_exit_handler(self)
-        env_snapshot = dict(os.environ)
 
         # KV output aggregation infrastructure
         self.kv_output_aggregator: KVOutputAggregator | None = None
@@ -306,7 +300,6 @@ class AsyncIOProcManager:
                     i,
                     self.kv_output_addrs[i],
                     self.all_ranks_barrier,
-                    env_snapshot,
                     *args,
                 ),
             )

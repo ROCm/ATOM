@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
 import pickle
 import queue
 import threading
@@ -188,15 +187,7 @@ class EngineCore:
         self.output_thread.join(timeout=0.5)
 
     @staticmethod
-    def run_engine(
-        config: Config,
-        input_address: str,
-        output_address: str,
-        env_snapshot: dict[str, str] | None = None,
-    ):
-        if env_snapshot:
-            os.environ.update(env_snapshot)
-
+    def run_engine(config: Config, input_address: str, output_address: str):
         # Bind this EngineCore's lifetime to its parent (the server /
         # CoreManager): if the parent exits, have the kernel reap this process —
         # and, transitively, the ModelRunner workers it spawns — instead of
