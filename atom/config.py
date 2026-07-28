@@ -840,6 +840,12 @@ class ParallelConfig:
             self.data_parallel_rank = envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
+        if envs.is_set("ATOM_DP_MASTER_IP"):
+            self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
+        if envs.is_set("ATOM_DP_MASTER_PORT"):
+            self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
+        if envs.is_set("ATOM_DP_BASE_PORT"):
+            self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
 
 
 def _normalize_moe_config_fields(
