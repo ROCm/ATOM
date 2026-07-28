@@ -1536,7 +1536,7 @@ class MLAAttention(nn.Module):
                         self.rotary_emb.sin_cache,
                         is_neox=self.rotary_emb.is_neox_style,
                         is_nope_first=True,
-                        compute_all_q=self.dcp_world_size > 1,
+                        compute_all_q_rope=self.dcp_world_size > 1,
                     )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
