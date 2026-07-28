@@ -18,10 +18,11 @@ import json
 import logging
 import math
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
@@ -272,7 +273,7 @@ class DeepseekV4Args:
     window_size: int = 128  # sliding_window
 
     # Per-layer attention type: 0=Dense, 4=CSA, 128 (or other large m')=HCA
-    compress_ratios: Tuple[int, ...] = field(default_factory=tuple)
+    compress_ratios: tuple[int, ...] = field(default_factory=tuple)
 
     # Indexer (CSA layers only)
     index_n_heads: int = 64
@@ -747,7 +748,7 @@ def _build_cos_sin_cache(
     beta_slow: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Shared cos/sin cache for `_V4RoPE`, keyed by (rope params, dtype, device).
 
     V4 has only 3 distinct rope param sets (HCA / CSA / Dense) — without
@@ -3654,7 +3655,7 @@ class Block(nn.Module):
         hc_base: torch.Tensor,  # [mix_hc] fp32
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce mHC residual `[num_tokens, hc, dim]` to sub-layer input `[num_tokens, dim]`.
 
         Prefers the fused aiter `mhc_pre` kernel (single ROCm op for RMSNorm +

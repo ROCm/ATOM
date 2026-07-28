@@ -23,8 +23,6 @@ Currently registered:
   - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
 """
 
-from typing import Optional
-
 import torch
 
 from atom.config import get_current_atom_config

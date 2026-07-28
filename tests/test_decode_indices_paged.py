@@ -1,17 +1,16 @@
-#!/usr/bin/env python3
 """Offline P2 gate for M1 paged decode-indices: kernel vs reference, no model."""
 
 import pytest
 import torch
 
 try:
-    import atom.model_ops.v4_kernels
-except Exception as _e:  # pre-existing atom.config circular import under bare pytest
+    from atom.model_ops.v4_kernels import hca_compress_paged_offsets
+    from atom.model_ops.v4_kernels.paged_decode_indices import (
+        write_v4_paged_decode_indices,
+        write_v4_paged_decode_indices_reference,
+    )
+except ImportError as _e:  # pre-existing atom.config circular import under bare pytest
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
-from atom.model_ops.v4_kernels.paged_decode_indices import (
-    write_v4_paged_decode_indices,
-    write_v4_paged_decode_indices_reference,
-)
 
 dev = "cuda"
 torch.manual_seed(0)
@@ -95,8 +94,6 @@ print(f"PASS: seq1 window-start pos=13 -> phys={phys} paged={exp}")
 # block_tables[bid, e//k2] slot e%k2 -> swa_pages + phys*k2 + slot. The pre-fix
 # math used swa_pages + block_tables[bid, e] (k2==1), reading wrong blocks.
 import numpy as np
-
-from atom.model_ops.v4_kernels import hca_compress_paged_offsets
 
 k2 = 2
 swa_pages_h = 10_000
