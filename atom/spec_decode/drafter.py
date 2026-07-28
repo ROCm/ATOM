@@ -119,6 +119,10 @@ support_draft_model_arch_dict = {
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
+    # Standalone MLA DSpark draft (Kimi-K3-DSpark). The arch string
+    # names the DRAFT, not the target, so one entry covers every target a
+    # standalone DSpark draft is trained against.
+    "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
 }
 
 
@@ -327,28 +331,34 @@ class Drafter(abc.ABC):
             setattr(owner, attr, source)
 
     def load_model(self, target_model: nn.Module) -> None:
-        if self.speculative_config.method == "eagle3":
-            load_model(
-                self.model,
-                self.speculative_config.model,
-                self.speculative_config.draft_model_hf_config,
-                self.config.load_dummy,
-                False,
-            )
-            logger.info(
-                "Eagle3 draft model loaded from %s (independent embed/lm_head)",
-                self.speculative_config.model,
-            )
-            return
-
-        # MTP: load from the target model checkpoint and share embeddings/lm_head.
+        # WHERE the draft weights live and WHETHER the draft shares the target's
+        # embed/lm_head are independent questions, and the three drafter flavors
+        # cover three of the four combinations:
+        #   eagle3          standalone ckpt, independent embed + lm_head
+        #   K3 DSpark       standalone ckpt, SHARED embed + lm_head (Kimi-K3:
+        #                   the checkpoint ships neither)
+        #   MTP / V4 DSpark weights inside the target ckpt, shared embed/lm_head
+        # so they are decided separately below rather than by one method probe.
+        spec = self.speculative_config
+        standalone_ckpt = spec.method == "eagle3" or spec.use_dspark_with_draft()
+        # spec_decode=True turns on the loader's `mtp.*` name filtering, which
+        # exists to pick the draft's weights out of a shared target checkpoint.
+        # A standalone draft checkpoint contains nothing else, so filtering it
+        # would drop every weight.
         loaded = load_model(
             self.model,
-            self.config.model,
-            self.speculative_config.draft_model_hf_config,
+            spec.model if standalone_ckpt else self.config.model,
+            spec.draft_model_hf_config,
             self.config.load_dummy,
-            True,
+            not standalone_ckpt,
         )
+
+        if spec.method == "eagle3":
+            logger.info(
+                "Eagle3 draft model loaded from %s (independent embed/lm_head)",
+                spec.model,
+            )
+            return
 
         # Resolve the base model (unwrap multimodal wrapper if present)
         target_base = getattr(target_model, "language_model", target_model)

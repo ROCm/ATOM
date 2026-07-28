@@ -272,7 +272,10 @@ class EngineArgs:
             "--draft-model",
             type=str,
             default=None,
-            help="Path to external Eagle3 draft model. Required when --method eagle3.",
+            help="Path to a standalone draft-model checkpoint. Required when "
+            "--method eagle3; optional for --method dspark (needed for the "
+            "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
+            "V4-Pro-DSpark which ships inside the target checkpoint).",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -489,18 +492,24 @@ class EngineArgs:
             method = kwargs.pop("method")
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
-            if method == "eagle3":
-                kwargs["speculative_config"] = SpeculativeConfig(
-                    method=method,
-                    model=draft_model,
-                    num_speculative_tokens=num_spec_tokens,
+            # Which checkpoint the drafter reads is a property of the DRAFT, not
+            # of the method: eagle3 is always standalone, mtp always ships
+            # inside the target, and dspark comes both ways (V4-Pro-DSpark lives
+            # in the target's `mtp.*` namespace; Kimi-K3-DSpark is its own
+            # checkpoint). So key off whether --draft-model was actually given
+            # rather than off the method name.
+            if method == "eagle3" and not draft_model:
+                raise ValueError("--draft-model is required when --method eagle3.")
+            if draft_model and method == "mtp":
+                raise ValueError(
+                    "--draft-model is not supported with --method mtp: the MTP "
+                    "draft is loaded from the target checkpoint."
                 )
-            else:
-                kwargs["speculative_config"] = SpeculativeConfig(
-                    method=method,
-                    model=self.model,
-                    num_speculative_tokens=num_spec_tokens,
-                )
+            kwargs["speculative_config"] = SpeculativeConfig(
+                method=method,
+                model=draft_model or self.model,
+                num_speculative_tokens=num_spec_tokens,
+            )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
