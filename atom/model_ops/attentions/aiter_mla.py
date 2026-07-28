@@ -163,6 +163,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
 
+        # DCP decode all-gathers Q on the head dim across the DCP group, so the
+        # head count that reaches mla_decode_fwd (and thus the persistent decode
+        # metadata) is padded_num_attention_heads * dcp_world_size. The module's
+        # head-repeat compensates the _MLA_MIN_HEADS padding, so this product
+        # matches the kernel's actual nhead in every case. dcp=1 -> unchanged.
+        self.persistent_num_heads = self.padded_num_attention_heads * self.dcp_world_size
+
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
             (work_meta_data_size, work_meta_data_type),
@@ -174,7 +181,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ) = get_mla_metadata_info_v1(
             self.max_bs,
             max_seqlen_qo,
-            self.padded_num_attention_heads,
+            self.persistent_num_heads,
             self.dtype_q,
             self.dtype_kv,
             is_sparse=self.is_sparse,
@@ -602,7 +609,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["cu_seqlens_q"].gpu[: bs + 1],
                 kv_indptr_for_metadata,
                 kv_last_page_lens_for_metadata,
-                self.padded_num_attention_heads,
+                self.persistent_num_heads,
                 1,  # nhead_kv,
                 True,
                 work_meta_data,
@@ -623,7 +630,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["cu_seqlens_q"].gpu[: bs + 1],
                 kv_indptr_for_metadata,
                 kv_last_page_lens_for_metadata,
-                self.padded_num_attention_heads,
+                self.persistent_num_heads,
                 1,  # nhead_kv,
                 True,
                 work_meta_data,
@@ -1772,7 +1779,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
             kv_indptr_for_mla,
             kv_last_page_lens_for_mla,
-            self.padded_num_attention_heads,
+            self.persistent_num_heads,
             1,  # nhead_kv
             True,
             var[f"{p}work_meta_data"],

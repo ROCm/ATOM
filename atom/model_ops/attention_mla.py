@@ -1239,10 +1239,7 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
 
             dp_size = get_dp_group().world_size
-            # DCP needs the per-token LSE (return_lse); the persistent
-            # reduce path doesn't emit it, so fall back to the non-persistent
-            # decode when LSE is requested.
-            use_persistent_mode = not (dp_size > 1) and not return_lse
+            use_persistent_mode = not (dp_size > 1)
             if envs.ATOM_MLA_PAGE_SIZE > 1:
                 use_persistent_mode = False
 
@@ -1273,7 +1270,7 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            num_kv_splits = max(1, 16 // self.dcp_world_size)
+            num_kv_splits = 16
 
             # TODO refactor this
             if envs.ATOM_MLA_PAGE_SIZE is not None:
@@ -1293,8 +1290,7 @@ class MLAAttention(nn.Module):
                 max_q_len,
                 page_size=page_size,
                 # The seg/asm decode path runs with a single kv split; the
-                # original (page_size=1) persistent path keeps 16 splits, scaled
-                # down by dcp_world_size when DCP shards KV across ranks.
+                # page_size=1 persistent path keeps 16 splits (metadata-derived).
                 num_kv_splits=None if self.use_seg_mla else num_kv_splits,
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,

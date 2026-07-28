@@ -1049,6 +1049,15 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
         self.num_attention_heads = num_attention_heads // get_tp_group().world_size
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        # DCP decode all-gathers Q across the DCP group on the head dim, so the
+        # head count reaching mla_decode_fwd (and thus the persistent decode
+        # metadata) is padded_num_attention_heads * dcp_world_size. Sourced from
+        # the parallel config so it is available here in __init__. dcp=1 ->
+        # equals padded_num_attention_heads (zero regression for non-DCP).
+        self.persistent_num_heads = (
+            self.padded_num_attention_heads
+            * self.parallel_config.decode_context_parallel_size
+        )
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
         self.dtype_kv = get_aiter_kv_cache_dtype(config)
@@ -1077,7 +1086,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         ) = get_mla_metadata_info_v1(
             max_num_reqs,
             1,
-            self.padded_num_attention_heads,
+            self.persistent_num_heads,
             self.dtype_q,
             self.dtype_kv,
             is_sparse=False,
@@ -1168,7 +1177,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             cu_seqlens_q,
             self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
             self.paged_kv_last_page_len[:bs],
-            self.padded_num_attention_heads,
+            self.persistent_num_heads,
             1,  # nhead_kv,
             True,
             work_meta_data,
