@@ -99,39 +99,6 @@ def responses_input_to_messages(instructions: Any, inp: Any) -> List[Dict[str, A
     return messages
 
 
-_DSML_TOOL_INSTRUCTION = (
-    "\n\n# Tool-call format (MANDATORY — overrides any other format instruction)\n"
-    "When you call a tool, output ONLY a DSML tool-call block and NOTHING else "
-    "in that message — no markdown, no ```json, no <command>/<plan>/<function>/"
-    "<exec_command> tags, no prose. Use EXACTLY this syntax (the \uff5c characters "
-    "are U+FF5C fullwidth vertical bars, not ASCII '|'):\n"
-    "<\uff5cDSML\uff5ctool_calls>\n"
-    '<\uff5cDSML\uff5cinvoke name="TOOL_NAME">\n'
-    '<\uff5cDSML\uff5cparameter name="PARAM_NAME" string="true">VALUE'
-    "</\uff5cDSML\uff5cparameter>\n"
-    "</\uff5cDSML\uff5cinvoke>\n"
-    "</\uff5cDSML\uff5ctool_calls>\n"
-    "Use the exact tool and parameter names from the tools provided to you. "
-    "For a shell/exec tool, put the whole shell command string in its "
-    "command/cmd parameter. Emit one <\uff5cDSML\uff5cinvoke> per tool call."
-)
-
-
-def inject_tool_format_instruction(messages):
-    """Append the mandatory DSML tool-call format to the system message so the
-    model emits parseable DSML instead of ad-hoc <command>/```json text. Codex
-    (/v1/responses) path only. Idempotent per request."""
-    for m in messages:
-        if m.get("role") == "system":
-            base = m.get("content") or ""
-            if "\uff5cDSML\uff5ctool_calls" not in base:
-                m["content"] = _text_of(base) + _DSML_TOOL_INSTRUCTION
-            return messages
-    return [{"role": "system", "content": _DSML_TOOL_INSTRUCTION.strip()}] + list(
-        messages
-    )
-
-
 def responses_tools_to_openai(tools: Any) -> List[Dict[str, Any]]:
     """Translate Responses function tools into OpenAI chat tool defs.
 

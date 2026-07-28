@@ -70,7 +70,6 @@ from .serving_completion import (
 )
 from .serving_responses import (
     ResponsesStreamEmitter,
-    inject_tool_format_instruction,
     shell_arg_key,
     build_responses_object,
     remap_tool_name,
@@ -1461,14 +1460,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Convert Anthropic messages to OpenAI format
         openai_messages = anthropic_to_openai_messages(request.messages, request.system)
 
-        # Inject the mandatory DSML tool-call format instruction when tools are
-        # present, so the model emits parseable DSML (matching the model's native
-        # encoding) instead of ad-hoc <command>/```json text. Same injection the
-        # /v1/responses path applies; without it, Claude Code (which speaks the
-        # Anthropic /v1/messages API) hits malformed/weak tool calls.
-        if request.tools:
-            openai_messages = inject_tool_format_instruction(openai_messages)
-
         # Apply chat template
         from .protocol import ChatMessage
 
@@ -1777,8 +1768,6 @@ async def responses_endpoint(raw_request: Request):
         openai_messages = responses_input_to_messages(
             body.get("instructions"), body.get("input")
         )
-        if openai_tools:
-            openai_messages = inject_tool_format_instruction(openai_messages)
         messages = [ChatMessage(**m) for m in openai_messages]
 
         merged_kwargs = dict(default_chat_template_kwargs)
@@ -1844,7 +1833,7 @@ async def responses_endpoint(raw_request: Request):
                     reasoning_filter.state = 1
                 tool_parser = ToolCallStreamParser()
                 tool_parser.tools = openai_tools or None  # enables schema-based
-                # type coercion + key-alias (command->cmd) in _parse_dsml
+                # type coercion + key-alias (command->cmd) in DsmlParser.parse
                 output_tokens = 0
 
                 # Buffer each tool call (name + full args) so read/grep/ls/find
