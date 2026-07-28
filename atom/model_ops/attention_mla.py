@@ -43,6 +43,7 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import (
+    dcp_persistent_supported,
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
@@ -329,6 +330,11 @@ class MLAAttention(nn.Module):
             self.dcp_group = None
             self.dcp_rank = 0
             self._cp_triton_ctx = None
+
+        # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
+        # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
+        # once here to avoid a per-forward get_gfx() (graph-break).
+        self.dcp_persistent_supported = dcp_persistent_supported()
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -1242,6 +1248,8 @@ class MLAAttention(nn.Module):
             use_persistent_mode = not (dp_size > 1)
             if envs.ATOM_MLA_PAGE_SIZE > 1:
                 use_persistent_mode = False
+            if self.dcp_world_size > 1 and not self.dcp_persistent_supported:
+                use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
@@ -1270,7 +1278,10 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            num_kv_splits = 16
+            # persistent lets metadata (reduce_partial_map) drive the split, so
+            # 16 is inert; the non-persistent fallback (gfx942 DCP) still needs
+            # the DCP-scaled split to keep the fp32 `logits` small (CUDA-graph OOM).
+            num_kv_splits = 16 if use_persistent_mode else max(1, 16 // self.dcp_world_size)
 
             # TODO refactor this
             if envs.ATOM_MLA_PAGE_SIZE is not None:

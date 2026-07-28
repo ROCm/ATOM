@@ -15,8 +15,11 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
-
-from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.distributed.dcp_utils import (
+    dcp_persistent_supported,
+    get_dcp_rank,
+    get_dcp_world_size,
+)
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_is_enabled,
@@ -168,7 +171,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # metadata) is padded_num_attention_heads * dcp_world_size. The module's
         # head-repeat compensates the _MLA_MIN_HEADS padding, so this product
         # matches the kernel's actual nhead in every case. dcp=1 -> unchanged.
-        self.persistent_num_heads = self.padded_num_attention_heads * self.dcp_world_size
+        # Only gfx950 runs DCP in persistent mode (gfx942 lacks the lse persistent
+        # kernel and stays non-persistent, where this metadata is unused); scale
+        # by dcp only there so gfx942 keeps the original per-rank head sizing.
+        self.persistent_num_heads = self.padded_num_attention_heads * (
+            self.dcp_world_size if dcp_persistent_supported() else 1
+        )
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (

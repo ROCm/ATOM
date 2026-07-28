@@ -9,6 +9,7 @@ from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.chip_info import get_gfx
 from atom.config import get_current_atom_config
+from atom.distributed.dcp_utils import dcp_persistent_supported
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
@@ -1049,14 +1050,21 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
         self.num_attention_heads = num_attention_heads // get_tp_group().world_size
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
+        # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
+        # once to gate both the metadata sizing and the runtime persistent path.
+        self.dcp_persistent_supported = dcp_persistent_supported()
         # DCP decode all-gathers Q across the DCP group on the head dim, so the
         # head count reaching mla_decode_fwd (and thus the persistent decode
         # metadata) is padded_num_attention_heads * dcp_world_size. Sourced from
         # the parallel config so it is available here in __init__. dcp=1 ->
-        # equals padded_num_attention_heads (zero regression for non-DCP).
-        self.persistent_num_heads = (
-            self.padded_num_attention_heads
-            * self.parallel_config.decode_context_parallel_size
+        # equals padded_num_attention_heads (zero regression for non-DCP). Only
+        # scale by dcp on gfx950 (DCP persistent); gfx942 stays non-persistent
+        # where this metadata is unused, so keep the original per-rank sizing.
+        self.persistent_num_heads = self.padded_num_attention_heads * (
+            self.parallel_config.decode_context_parallel_size
+            if self.dcp_persistent_supported
+            else 1
         )
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
@@ -1269,6 +1277,11 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         use_persistent_metadata = (not dp_enabled) or (
             self._mla_dp_native_persistent_enabled and max_qo_len == 1
         )
+        if (
+            self.parallel_config.decode_context_parallel_size > 1
+            and not self.dcp_persistent_supported
+        ):
+            use_persistent_metadata = False
         if use_persistent_metadata:
             ctx_mla_ps = self._set_mla_persistent_worker_buffers(
                 num_reqs,
