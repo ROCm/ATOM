@@ -389,6 +389,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
     # "0": MoE runs on each rank's 1/W token shard with no extra comm.
     "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
+    # Pure-TP TBO all_reduce overlap mode (see module_dispatch_ops.tbo_all_reduce):
+    #   "overlap" (default): move the AR onto the comm stream so it overlaps the
+    #             partner ubatch's compute. Per-ubatch pynccl comms keep the
+    #             cross-rank enqueue order consistent (hang-free).
+    #   "inline": run the AR on the current stream, no overlap. Plan-A baseline.
+    "ATOM_TBO_TP_AR_MODE": lambda: os.getenv("ATOM_TBO_TP_AR_MODE", "overlap"),
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.
