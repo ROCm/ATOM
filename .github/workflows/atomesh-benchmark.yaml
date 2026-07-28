@@ -119,8 +119,9 @@ env:
   ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != '' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && '' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47')) }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Keep manual benchmark dispatches independent so different cases on the same branch can run together.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
 
 permissions:
   actions: read
