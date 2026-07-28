@@ -167,6 +167,7 @@ async def stream_chat_response(
             "object": CHAT_COMPLETION_CHUNK_OBJECT,
             "created": int(time.time()),
             "model": model,
+            "choices": [],
             "usage": usage,
         }
         if kv_transfer_params_value is not None:
@@ -424,6 +425,7 @@ async def stream_chat_response_fanout(
             "object": CHAT_COMPLETION_CHUNK_OBJECT,
             "created": int(time.time()),
             "model": model,
+            "choices": [],
             "usage": usage,
         }
         if kv_transfer_params_value is not None:
