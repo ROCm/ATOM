@@ -29,6 +29,8 @@ allow = (
     "OSL",
     "CONC_LIST",
     "BENCH_",
+    "BENCHMARK_KIND",
+    "AIPERF_",
     "RANDOM_RANGE_RATIO",
     "REQUEST_RATE",
     "WAIT_",
@@ -42,6 +44,7 @@ allow = (
     "MAX_MODEL_LEN",
     "MAX_NUM_SEQS",
     "MAX_NUM_BATCHED_TOKENS",
+    "DECODE_MAX_NUM_BATCHED_TOKENS",
     "ONLINE_QUANT_CONFIG",
     "HF_OVERRIDES",
     # Preserve FlyDSL cache overrides for non-root Spur containers.

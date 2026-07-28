@@ -298,6 +298,7 @@ def build_cell(
         defaults.get("benchmark", {}),
         suite_cfg.get("benchmark", {}),
     )
+    benchmark_cfg = resolve_env_refs_in_value(benchmark_cfg)
     accuracy_cfg = deep_merge(
         model_cfg.get("accuracy", {}), suite_cfg.get("accuracy", {})
     )
@@ -347,6 +348,7 @@ def build_cell(
         "num_prompts_multiplier": int(benchmark_cfg.get("num_prompts_multiplier", 10)),
         "wait_server_timeout": int(benchmark_cfg.get("wait_server_timeout", 2500)),
         "wait_router_timeout": int(benchmark_cfg.get("wait_router_timeout", 300)),
+        "benchmark": benchmark_cfg,
         "runner": runner_cfg,
         "service": {
             "prefill": prefill_cfg,

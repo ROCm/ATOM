@@ -71,6 +71,7 @@ prefill = service.get("prefill", {})
 decode = service.get("decode", {})
 router = service.get("router", {})
 server_args = cell.get("server_args", {})
+benchmark = cell.get("benchmark", {})
 accuracy = cell.get("accuracy", {})
 
 def shell_value(value):
@@ -109,6 +110,30 @@ exports = {
     "RANDOM_RANGE_RATIO": cell["random_range_ratio"],
     "REQUEST_RATE": cell["request_rate"],
     "BENCH_NUM_PROMPTS_MULTIPLIER": cell["num_prompts_multiplier"],
+    "BENCHMARK_KIND": benchmark.get("kind", "random"),
+    "AIPERF_DIR": benchmark.get("aiperf_dir", ""),
+    "AIPERF_VENV": benchmark.get("aiperf_venv", ""),
+    "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
+    "AIPERF_SCENARIO": benchmark.get("scenario", ""),
+    "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
+    "AIPERF_MAX_CONTEXT_LENGTH": benchmark.get("max_context_length", ""),
+    "AIPERF_NUM_DATASET_ENTRIES": benchmark.get("num_dataset_entries", ""),
+    "AIPERF_BENCHMARK_DURATION": benchmark.get("benchmark_duration", ""),
+    "AIPERF_AGENTIC_CACHE_WARMUP_DURATION": benchmark.get(
+        "agentic_cache_warmup_duration", ""
+    ),
+    "AIPERF_TRAJECTORY_START_MIN_RATIO": benchmark.get(
+        "trajectory_start_min_ratio", ""
+    ),
+    "AIPERF_TRAJECTORY_START_MAX_RATIO": benchmark.get(
+        "trajectory_start_max_ratio", ""
+    ),
+    "AIPERF_FAILED_REQUEST_THRESHOLD": benchmark.get("failed_request_threshold", ""),
+    "AIPERF_SLICE_DURATION": benchmark.get("slice_duration", ""),
+    "AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT": benchmark.get(
+        "cancel_drain_timeout", ""
+    ),
+    "AIPERF_UNSAFE_OVERRIDE": benchmark.get("unsafe_override", ""),
     "WAIT_SERVER_TIMEOUT": cell["wait_server_timeout"],
     "WAIT_ROUTER_TIMEOUT": cell["wait_router_timeout"],
     "PREFILL_WORKERS": prefill.get("workers", 1),
@@ -131,6 +156,9 @@ exports = {
     "MAX_NUM_SEQS": server_args.get("max_num_seqs", 256),
     "DECODE_MAX_NUM_SEQS": server_args.get("decode_max_num_seqs", ""),
     "MAX_NUM_BATCHED_TOKENS": server_args.get("max_num_batched_tokens", ""),
+    "DECODE_MAX_NUM_BATCHED_TOKENS": server_args.get(
+        "decode_max_num_batched_tokens", ""
+    ),
     "ONLINE_QUANT_CONFIG": server_args.get("online_quant_config", ""),
     "HF_OVERRIDES": server_args.get("hf_overrides", ""),
     "SPEC_METHOD": server_args.get("method", ""),
