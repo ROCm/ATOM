@@ -89,6 +89,7 @@ support_model_arch_dict = {
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
+    "KimiK3ForConditionalGeneration": "atom.models.kimi_k3.KimiK3ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
@@ -863,6 +864,15 @@ class ModelRunner:
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
         )
+        if (
+            os.getenv("ATOM_SYNC_AFTER_LOAD", "0").lower() in ("1", "true", "yes")
+            and get_tp_group().world_size > 1
+        ):
+            logger.info(
+                "Waiting for all TP ranks to finish model loading before warmup"
+            )
+            get_tp_group().barrier()
+            logger.info("All TP ranks finished model loading")
 
     def _maybe_warmup(self):
         """Run model warmup. Override point: the rapidserve decode process
@@ -905,9 +915,13 @@ class ModelRunner:
             "qwen3_next_mtp",
             "qwen3_5_text",
             "qwen3_5_moe_text",
+            "kimi_linear",
         ):
             return True
         return False
+
+    def is_kimi_linear(self) -> bool:
+        return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
 
     def is_deepseek_v4(self) -> bool:
         # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
@@ -1212,6 +1226,12 @@ class ModelRunner:
         pcp_size = self.config.prefill_context_parallel_size
         if pcp_size > 1:
             warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
+
+        # Optional gfx1250 workaround: cap only the dummy warmup prefill. Real
+        # inference still uses the configured max_num_batched_tokens.
+        warmup_cap = int(os.environ.get("ATOM_WARMUP_MAX_TOKENS", "0") or "0")
+        if warmup_cap > 0:
+            warmup_max_tokens = min(warmup_max_tokens, warmup_cap)
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 

@@ -266,6 +266,17 @@ class QuantizationConfig:
     - ``quant_type``, ``quant_dtype``, ``is_dynamic`` convenience properties
     """
 
+    _ONLINE_QUANT_SOURCE_METHODS = frozenset(
+        {
+            "",
+            "fp8",
+            "mxfp4",
+            "mxfp8",
+            "quark",
+            "compressed-tensors",
+        }
+    )
+
     def __init__(
         self,
         config: PretrainedConfig = None,
@@ -306,14 +317,15 @@ class QuantizationConfig:
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
         self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
         self.online_exclude_layers: list[str] = []
-        if online_quant_config and self.quant_method in [
-            "",
-            "fp8",
-            "mxfp4",
-            "mxfp8",
-            "quark",
-        ]:
+        online_source_supported = self.quant_method in self._ONLINE_QUANT_SOURCE_METHODS
+        if online_quant_config and online_source_supported:
             self.online_quant = True
+            if self.quant_method == "compressed-tensors":
+                logger.warning(
+                    "Online quantization for compressed-tensors checkpoints "
+                    "relies on the caller's exclude_layer configuration. Ensure "
+                    "unsupported or already-quantized layers are excluded."
+                )
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec
@@ -585,6 +597,7 @@ _CONFIG_REGISTRY: dict[str, str] = {
 
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
+    "kimi_k3": "text_config",
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
@@ -634,9 +647,15 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         ):
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
-        mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        config_class = AutoConfig.for_model(mapped_type)
-        hf_config = config_class.from_dict(text_config_dict)
+        if text_model_type == "kimi_linear":
+            # Transformers does not ship KimiLinearConfig yet in this image.
+            # Keep the remote-code fields as plain PretrainedConfig attrs; the
+            # ATOM model normalizes the aliases it needs at construction time.
+            hf_config = PretrainedConfig.from_dict(text_config_dict)
+        else:
+            mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
+            config_class = AutoConfig.for_model(mapped_type)
+            hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.
         original_arch = config_dict.get("architectures", [])

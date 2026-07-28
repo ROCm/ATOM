@@ -1231,6 +1231,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
             # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
+            # NOTE: the a8w4 GGUU decode kernel hardcodes SiLU activation and does
+            # not implement Kimi situ — guard so it fails loudly instead of
+            # silently degrading accuracy if enabled for a situ model.
+            if activation == ActivationType.Situv2:
+                raise RuntimeError(
+                    "ATOM_USE_TRITON_MOE_DECODE (a8w4 GGUU) does not support situ "
+                    "activation; disable it for Kimi-K3."
+                )
             from aiter.ops.triton.moe.moe_routing.routing import routing
 
             from atom.model_ops.fused_moe_triton import (
@@ -1345,6 +1353,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
                     act_quant=self.act_quant,
+                    situ_beta=getattr(layer, "activation_situ_beta", None),
+                    situ_linear_beta=getattr(
+                        layer, "activation_situ_linear_beta", None
+                    ),
                 )
 
                 # Always-on shared expert(s) via a standalone dense GEMM,
@@ -1381,6 +1393,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 act_quant=self.act_quant,
+                situ_beta=getattr(layer, "activation_situ_beta", None),
+                situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
             )
 
         topk_weights, topk_ids = self.select_experts_with_record(
@@ -1408,6 +1422,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
+        if activation == ActivationType.Situv2:
+            moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
+            moe_extra_args["linear_beta"] = getattr(
+                layer, "activation_situ_linear_beta", None
+            )
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -2562,6 +2581,14 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
+        if config is not None:
+            self.activation_situ_beta = getattr(config, "activation_situ_beta", None)
+            self.activation_situ_linear_beta = getattr(
+                config, "activation_situ_linear_beta", None
+            )
+        else:
+            self.activation_situ_beta = None
+            self.activation_situ_linear_beta = None
 
         self.use_chunked = get_dp_group().world_size > 1
 
@@ -3004,6 +3031,9 @@ class FusedMoE(torch.nn.Module):
     @staticmethod
     def _copy_quant_storage(dst: torch.Tensor, src: torch.Tensor) -> None:
         """Copy quantized tensors without numeric conversion of byte formats."""
+        if src.device.type == "cpu" and not src.is_contiguous():
+            src = src.contiguous()
+
         if dst.dtype == dtypes.fp4x2:
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
             return
