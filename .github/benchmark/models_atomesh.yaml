@@ -191,11 +191,11 @@ models:
           eval_concurrency: [65]
 
         # Keep each AgentX concurrency in its own job so every measurement starts
-        # from a fresh ATOM/LMCache service instead of inheriting another run's cache.
-        - &glm52_agentic_lmcache_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c1
+        # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
+        - &glm52_agentic_tp8_tp8
+          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c1
           topology: 1p1d
-          display_topology: 1P1D-TP8-agentic-LMCache
+          display_topology: 1P1D-TP8-agentic
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [1048576]
@@ -221,14 +221,6 @@ models:
             tp: 8
             cudagraph: none
           env:
-            common:
-              PYTHONHASHSEED: "0"
-            prefill:
-              LMCACHE_LOCAL_CPU: "True"
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
-              LMCACHE_CHUNK_SIZE: "256"
-              PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               MAX_JOBS: "16"
           benchmark:
@@ -254,22 +246,22 @@ models:
             wait_router_timeout: 600
           run_eval: false
 
-        - <<: *glm52_agentic_lmcache_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c2
+        - <<: *glm52_agentic_tp8_tp8
+          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c2
           concurrency: [2]
 
-        - <<: *glm52_agentic_lmcache_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c4
+        - <<: *glm52_agentic_tp8_tp8
+          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c4
           concurrency: [4]
 
-        - <<: *glm52_agentic_lmcache_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-lmcache-1m-c8
+        - <<: *glm52_agentic_tp8_tp8
+          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c8
           concurrency: [8]
 
-        - &glm52_agentic_lmcache_tp4_tp4
-          <<: *glm52_agentic_lmcache_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp4-agentic-lmcache-1m-c1
-          display_topology: 1P1D-TP4-agentic-LMCache
+        - &glm52_agentic_tp4_tp4
+          <<: *glm52_agentic_tp8_tp8
+          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
+          display_topology: 1P1D-TP4-agentic
           pd_worker_layout: multi_node
           prefill:
             workers: 1
@@ -279,37 +271,51 @@ models:
             tp: 4
             cudagraph: none
 
-        - <<: *glm52_agentic_lmcache_tp4_tp4
-          name: glm-52-mxfp4-1p1d-tp4-agentic-lmcache-1m-c2
+        - <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
 
-        - <<: *glm52_agentic_lmcache_tp4_tp4
-          name: glm-52-mxfp4-1p1d-tp4-agentic-lmcache-1m-c4
+        - <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
           concurrency: [4]
 
-        - <<: *glm52_agentic_lmcache_tp4_tp4
-          name: glm-52-mxfp4-1p1d-tp4-agentic-lmcache-1m-c8
+        - <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
 
-        - &glm52_agentic_lmcache_tp4_tp8
-          <<: *glm52_agentic_lmcache_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-lmcache-1m-c1
-          display_topology: 1P1D-TP4-TP8-agentic-LMCache
+        - &glm52_agentic_tp4_tp8
+          <<: *glm52_agentic_tp8_tp8
+          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c1
+          display_topology: 1P1D-TP4-TP8-agentic
           prefill:
             workers: 1
             tp: 4
 
-        - <<: *glm52_agentic_lmcache_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-lmcache-1m-c2
+        - <<: *glm52_agentic_tp4_tp8
+          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c2
           concurrency: [2]
 
-        - <<: *glm52_agentic_lmcache_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-lmcache-1m-c4
+        - <<: *glm52_agentic_tp4_tp8
+          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c4
           concurrency: [4]
 
-        - <<: *glm52_agentic_lmcache_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-lmcache-1m-c8
+        - <<: *glm52_agentic_tp4_tp8
+          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c8
           concurrency: [8]
+
+        - <<: *glm52_agentic_tp8_tp8
+          name: glm-52-mxfp4-1p2d-tp4-agentic-1m-c2
+          topology: 1p2d
+          display_topology: 1P2D-TP4-agentic
+          pd_worker_layout: decode_single_node
+          concurrency: [2]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 2
+            tp: 4
+            cudagraph: none
 
     accuracy:
       task: gsm8k
