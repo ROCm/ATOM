@@ -760,9 +760,9 @@ class MooncakeConnector(KVConnectorBase):
             )
             remote_addr = make_zmq_path("tcp", meta.remote_host, remote_port)
 
+            consumer_staging_pool_idx = -1
             if self._has_slot_regions:
                 # Acquire staging pool slot for this request's state RDMA
-                consumer_staging_pool_idx = -1
                 consumer_staging_addr = 0
                 if self._staging_pool_size > 0:
                     consumer_staging_pool_idx = self._acquire_staging_slot()

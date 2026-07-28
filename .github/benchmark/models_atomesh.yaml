@@ -11,7 +11,7 @@ defaults:
     random_range_ratio: 0.8
     request_rate: inf
     num_prompts_multiplier: 10
-    wait_server_timeout: 2500
+    wait_server_timeout: 3600
     wait_router_timeout: 300
   env:
     common:

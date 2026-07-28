@@ -952,11 +952,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if not hasattr(runner, "v4_unified_kv"):
             return None
-        if self._kv_fp8:
-            # PD disaggregation with 2buff fp8 KV cache is not yet supported:
-            # the byte-region math below assumes a single unified pool and
-            # ignores the parallel rope pool. Disable KV transfer for fp8.
-            return None
 
         num_slots = runner.max_per_req_cache_slots
         # paged-SWA: SWA lives in a SEPARATE num_swa_blocks pool at the head
@@ -988,6 +983,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             else:
                 continue
             block_regions.append(KVTransferRegion(compress_base, compress_total, bpb))
+            if self._kv_fp8:
+                rope = runner.v4_unified_kv_rope[layer_id]
+                rope_entries_per_block = self.k1_csa if ratio == 4 else self.k2_hca
+                rope_bpb = (
+                    rope_entries_per_block
+                    * self.rope_head_dim
+                    * self._rope_dtype.itemsize
+                )
+                rope_offset = swa_pages * self.rope_head_dim
+                block_regions.append(
+                    KVTransferRegion(
+                        rope.data_ptr() + rope_offset * self._rope_dtype.itemsize,
+                        (rope.numel() - rope_offset) * self._rope_dtype.itemsize,
+                        rope_bpb,
+                    )
+                )
 
         # Block regions: CSA Indexer KV (FP8)
         for pos in range(len(self.csa_layers)):
@@ -1003,7 +1014,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # swa_block_table — window-freeing leaves only the live tail (the last
         # ~128-token block) as non-(-1) entries, so only that gets transferred.
         # block b's SWA lives at uv[0] + b*block_size*head_dim*elem.
-        swa_block_bytes = self.swa_block_bytes_per_layer()
+        swa_block_bytes = self.block_size * self.head_dim * elem_classical
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
             swa_block_regions.append(
@@ -1013,6 +1024,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     swa_block_bytes,
                 )
             )
+            if self._kv_fp8:
+                rope = runner.v4_unified_kv_rope[layer_id]
+                swa_rope_block_bytes = (
+                    self.block_size
+                    * self.rope_head_dim
+                    * self._rope_dtype.itemsize
+                )
+                swa_block_regions.append(
+                    KVTransferRegion(
+                        rope.data_ptr(),
+                        swa_pages
+                        * self.rope_head_dim
+                        * self._rope_dtype.itemsize,
+                        swa_rope_block_bytes,
+                    )
+                )
 
         # Staging pool for compressor states (not in slot_regions — managed
         # separately by the connector with pool acquire/release).
