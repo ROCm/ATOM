@@ -132,19 +132,6 @@ class Sampler(nn.Module):
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
             )
-        if envs.ATOM_USE_TORCH_SAMPLER:
-            greedy_mask = temperatures <= self.eps
-            sampled = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
-            if greedy_mask.any():
-                sampled[greedy_mask] = logits[greedy_mask].argmax(dim=-1).to(torch.int)
-            if (~greedy_mask).any():
-                rows = ~greedy_mask
-                scaled_logits = logits[rows] / temperatures[rows].unsqueeze(-1)
-                probs = torch.softmax(scaled_logits, dim=-1, dtype=torch.float32)
-                sampled[rows] = torch.multinomial(probs, num_samples=1).squeeze(-1).to(
-                    torch.int
-                )
-            return sampled
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
@@ -182,7 +169,7 @@ class Sampler(nn.Module):
         has_topk = top_ks is not None
         has_topp = top_ps is not None
 
-        if AITER_TOPK_TOPP_AVAILABLE and not envs.ATOM_USE_TORCH_SAMPLER:
+        if AITER_TOPK_TOPP_AVAILABLE:
             return self._aiter_sample(
                 probs, top_ks, top_ps, has_topk, has_topp, temperatures
             )

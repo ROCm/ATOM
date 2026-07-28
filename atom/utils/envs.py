@@ -178,13 +178,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FASTSAFETENSORS_DEBUG": lambda: (
         os.getenv("ATOM_FASTSAFETENSORS_DEBUG", "0") == "1"
     ),
-    # Force MoE grouped topK routing through the torch reference path. Useful
-    # when aiter.jit.module_moe_asm cannot compile for the current ROCm/CK arch.
-    "AITER_USE_TORCH_TOPK": lambda: os.getenv("AITER_USE_TORCH_TOPK", "0") == "1",
-    # Force sampling through PyTorch instead of aiter.jit.module_sample.
-    "ATOM_USE_TORCH_SAMPLER": lambda: os.getenv("ATOM_USE_TORCH_SAMPLER", "0") == "1",
-    # Force bf16 KV cache insert through PyTorch instead of aiter.jit.module_cache.
-    "ATOM_USE_TORCH_CACHE": lambda: os.getenv("ATOM_USE_TORCH_CACHE", "0") == "1",
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
@@ -208,14 +201,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
-    ),
-    # Kimi-K3: overlap the shared-expert MLP with the routed experts on a
-    # separate CUDA stream (shared compute runs on alt_stream while routed
-    # experts + latent post-proc run on the main stream). Default OFF; set to
-    # "1" to enable. Per-call decode/prefill gating still uses
-    # ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD.
-    "ATOM_K3_SHARED_EXPERT_OVERLAP": lambda: (
-        os.getenv("ATOM_K3_SHARED_EXPERT_OVERLAP", "0") == "1"
     ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
@@ -270,9 +255,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
-    "ATOM_FWD_DUMP_STATS_ONLY": lambda: (
-        os.getenv("ATOM_FWD_DUMP_STATS_ONLY", "0") == "1"
-    ),
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),
