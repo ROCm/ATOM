@@ -18,7 +18,7 @@ from .protocol import (
 logger = logging.getLogger("atom")
 
 
-def _strip_stop_strings(text: str, stop_strings: Optional[List[str]]) -> str:
+def _strip_stop_strings(text: str, stop_strings: list[str] | None) -> str:
     """OpenAI responses must not include the matched stop string."""
     if not stop_strings:
         return text
@@ -140,8 +140,8 @@ async def stream_completion_response(
 def build_completion_response(
     request_id: str,
     model: str,
-    final_output: Dict[str, Any],
-    stop_strings: Optional[List[str]] = None,
+    final_output: dict[str, Any],
+    stop_strings: list[str] | None = None,
 ) -> CompletionResponse:
     """Build a non-streaming text completion response (single choice)."""
     response = CompletionResponse(
@@ -177,8 +177,8 @@ def build_completion_response(
 def build_completion_response_multi(
     request_id: str,
     model: str,
-    final_outputs: List[Dict[str, Any]],
-    stop_strings: Optional[List[str]] = None,
+    final_outputs: list[dict[str, Any]],
+    stop_strings: list[str] | None = None,
 ) -> CompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling."""
     assert final_outputs, "build_completion_response_multi requires at least one output"

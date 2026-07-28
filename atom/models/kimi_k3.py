@@ -9,7 +9,7 @@ the same object hierarchy and skips the vision tower/projector tensors.
 """
 
 import os
-from typing import Optional, Union
+from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType
@@ -25,8 +25,10 @@ from torch import nn
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
-
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -39,9 +41,6 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from atom.model_ops.fla_ops.fused_sigmoid_gating import (
-    fused_sigmoid_gating_delta_rule_update,
-)
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import RotaryEmbedding
 from atom.model_ops.utils import atom_parameter
@@ -53,8 +52,8 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import mark_spliting_op
-from atom.utils.forward_context import get_forward_context
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import get_forward_context
 
 
 def _text_config(config):
@@ -750,29 +749,29 @@ class KimiKDAAttention(nn.Module):
     ):
         from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
-        kwargs = dict(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
+        kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "g": g,
             # Keep beta in fp32: fla computes b = sigmoid(beta) in-kernel with
             # use_beta_sigmoid_in_kernel, and triton's sigmoid follows the input
             # dtype -- a bf16 beta yields a bf16 write strength, which erodes the
             # delta-rule state update across the 71 KDA layers (measured gsm8k
             # regression). b_proj stays bf16; only this reduction is widened.
-            beta=beta.float(),
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            safe_gate=self._kda_gate_lower_bound is not None,
-            lower_bound=self._kda_gate_lower_bound,
-            transpose_state_layout=True,
-            cu_seqlens=cu_seqlens,
-        )
+            "beta": beta.float(),
+            "A_log": self.A_log,
+            "dt_bias": self.dt_bias,
+            "initial_state": initial_state,
+            "output_final_state": output_final_state,
+            "use_qk_l2norm_in_kernel": True,
+            "use_gate_in_kernel": True,
+            "use_beta_sigmoid_in_kernel": True,
+            "safe_gate": self._kda_gate_lower_bound is not None,
+            "lower_bound": self._kda_gate_lower_bound,
+            "transpose_state_layout": True,
+            "cu_seqlens": cu_seqlens,
+        }
         if recurrent:
             kwargs.pop("safe_gate", None)
             return fused_recurrent_kda(**kwargs)
@@ -1175,9 +1174,9 @@ class KimiLinearModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             hidden_states = (
                 inputs_embeds
@@ -1234,7 +1233,7 @@ class KimiLinearModel(nn.Module):
 
 class KimiLinearForCausalLM(nn.Module):
     packed_modules_mapping = _kda_packed_modules_mapping([])
-    weights_mapping = {
+    weights_mapping: ClassVar[dict[str, str]] = {
         "weight_packed": "weight",
     }
 
@@ -1268,12 +1267,12 @@ class KimiLinearForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -1281,8 +1280,8 @@ class KimiLinearForCausalLM(nn.Module):
 
 
 class KimiK3ForCausalLM(nn.Module):
-    skip_weight_prefixes = ["vision_tower.", "mm_projector."]
-    quant_exclude_name_mapping = {
+    skip_weight_prefixes: ClassVar[list[str]] = ["vision_tower.", "mm_projector."]
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
         "language_model.model.": "language_model.model.",
         "language_model.lm_head": "language_model.lm_head",
     }
@@ -1336,14 +1335,14 @@ class KimiK3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

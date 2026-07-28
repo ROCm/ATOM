@@ -229,7 +229,7 @@ def _validate_sequence_context_length(seq) -> None:
         )
 
 
-def _has_multimodal_content(messages: List[Any]) -> bool:
+def _has_multimodal_content(messages: list[Any]) -> bool:
     for message in messages:
         content = getattr(message, "content", None)
         if not isinstance(content, list):

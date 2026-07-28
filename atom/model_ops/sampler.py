@@ -7,8 +7,9 @@ import torch
 from aiter import mixed_sample_outer_exponential
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
-from atom.utils import envs
 from torch import nn
+
+from atom.utils import envs
 
 # Try to import aiter top-k/top-p sampling ops
 try:

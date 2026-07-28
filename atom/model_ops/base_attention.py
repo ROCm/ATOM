@@ -2,19 +2,19 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # from flash_attn import flash_attn_with_kvcache
-from typing import Optional
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
-from torch import nn
 import triton
 import triton.language as tl
+from torch import nn
 
-
-from atom.utils import mark_spliting_op
-from .attention_mla import MLAModules, _mla_output_width
 from atom.config import get_current_atom_config
+from atom.utils import mark_spliting_op
 from atom.utils.selector import get_attn_backend
+
+from .attention_mla import MLAModules, _mla_output_width
 
 
 # frontend interface class for constructing attention

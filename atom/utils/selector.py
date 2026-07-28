@@ -2,12 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import cache
-from typing import Type
 
 from atom.model_ops.attentions.backends import AttentionBackend
-from atom.utils import resolve_obj_by_qualname
 from atom.plugin.prepare import is_sglang, is_vllm
-from atom.utils import envs
+from atom.utils import envs, resolve_obj_by_qualname
 
 
 def get_attn_backend(
@@ -16,7 +14,7 @@ def get_attn_backend(
     use_gdn: bool = False,
     use_v4: bool = False,
     use_kimi_mla: bool = False,
-) -> Type[AttentionBackend]:
+) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
     return _cached_get_attn_backend(
         block_size=block_size,
@@ -38,7 +36,7 @@ def _cached_get_attn_backend(
     use_sglang: bool = False,
     use_vllm: bool = False,
     use_kimi_mla: bool = False,
-) -> Type[AttentionBackend]:
+) -> type[AttentionBackend]:
 
     # get device-specific attn_backend
     attention_cls = get_attn_backend_cls(

@@ -27,7 +27,7 @@ try:
     import triton.language as tl
 
     _HAS_TRITON = True
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
 
