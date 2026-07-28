@@ -9,6 +9,11 @@ take batched tensors (positions, slot_per_token, cu_seqlens_q) — nothing is
 derived from device data via `.item()`.
 """
 
+import logging
+from typing import Any
+
+from aiter.jit.utils.chip_info import get_gfx
+
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
@@ -61,6 +66,7 @@ __all__ = [
     "QKNormRopeOut",
     "csa_translate_pack",
     "csa_translate_pack_reference",
+    "fp4_indexer_enabled",
     "fused_compress_attn",
     "fused_compress_attn_reference",
     "hca_compress_paged_offsets",
@@ -83,6 +89,8 @@ __all__ = [
     "write_v4_paged_prefill_indices_reference",
 ]
 
+logger = logging.getLogger("atom")
+
 # FP4 indexer persistent-grid schedule params, shared by the decode
 # (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels.
 # The attention metadata builder precomputes each path's cta_info with these
@@ -91,3 +99,43 @@ __all__ = [
 # model-side scorer must use the SAME values. Mirrors the kernel defaults.
 FP4_MQA_PARALLEL_UNIT_NUM = 512
 FP4_MQA_BLOCK_K = 256
+
+
+def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
+    """Is the FP4 CSA indexer active? Single source of truth for the predicate.
+
+    Two call sites must reach the SAME verdict, and neither can be dropped:
+
+    * `DeepseekV4AttentionMetadataBuilder.__init__` — authoritative. Picks the
+      cache-pool layout and re-asserts the flag onto each Indexer in
+      `build_kv_cache_tensor`.
+    * `Indexer.__init__` — must already be correct BEFORE that re-assert.
+      `model_runner._maybe_warmup()` traces the graphed `_attn_pre`/`forward_pre`
+      piece before `allocate_kv_cache()` -> `build_kv_cache_tensor()` runs, so an
+      Indexer that defaulted to False would bake the FP8 branch (`q_scale=None`)
+      into the graph while the eager `indexer_score_topk` later took the FP4
+      branch. It is also the ONLY setter under the vLLM / SGLang plugins, which
+      never call `build_kv_cache_tensor`.
+
+    Keeping the predicate in one place is what stops the two from drifting —
+    a divergence is silent at startup and only surfaces as a graph/eager dtype
+    mismatch. Lives here rather than in either caller for the same reason as
+    `FP4_MQA_*` above.
+
+    The FP4 mqa-logits / scatter kernels are gfx950 (MI355X / CDNA4) only; on any
+    other arch fall back to the FP8 indexer instead of failing. Pass `warn=True`
+    from the builder only — it runs once, while `Indexer.__init__` runs per CSA
+    layer and would repeat the message.
+    """
+    if index_cache_dtype != "fp4":
+        return False
+    gfx = get_gfx()
+    if gfx != "gfx950":
+        if warn:
+            logger.warning(
+                "--index_cache_dtype fp4 requires a gfx950 (MI355X / CDNA4) GPU; "
+                "current arch is %r. Falling back to the FP8 indexer.",
+                gfx,
+            )
+        return False
+    return True

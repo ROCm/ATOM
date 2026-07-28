@@ -101,6 +101,7 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     CompressPlan,
     csa_translate_pack,
+    fp4_indexer_enabled,
     fused_compress_attn,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
@@ -1269,12 +1270,13 @@ class Indexer(nn.Module):
         # this branch, and the builder's re-assert in `build_kv_cache_tensor` does
         # NOT reliably precede that trace (verified: defaulting False here bakes
         # the FP8 branch → q_scale None → the eager FP4 `indexer_score_topk`
-        # disagrees). Mirror the builder's decision (index_cache_dtype fp4 +
-        # gfx950); the builder still re-asserts the authoritative value (with the
-        # non-gfx950 warn+fallback) onto this module when it binds the cache.
-        self._indexer_fp4 = (
-            get_current_atom_config().index_cache_dtype == "fp4"
-            and get_gfx() == "gfx950"
+        # disagrees). Under the vLLM / SGLang plugins, which never call
+        # `build_kv_cache_tensor`, this is also the ONLY setter.
+        # Shared predicate with the builder (see `fp4_indexer_enabled`) so the two
+        # cannot drift apart; `warn` is left to the builder because this runs once
+        # per CSA layer and would repeat the message.
+        self._indexer_fp4 = fp4_indexer_enabled(
+            get_current_atom_config().index_cache_dtype
         )
 
         self.compressor = Compressor(

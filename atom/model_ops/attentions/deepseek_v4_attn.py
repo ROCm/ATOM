@@ -63,6 +63,7 @@ from atom.model_ops.attentions.backends import (
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
+    fp4_indexer_enabled,
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
@@ -408,20 +409,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # written by `fused_compress_attn(quant_mode="fp4")`. The scoring path
         # auto-detects FP4 via `kv_cache.dtype == uint8`. Default (fp8) → the
         # existing FP8 (+fp32 scale) path is byte-identical.
-        # Switch: `--index_cache_dtype fp4`. The FP4 mqa-logits / scatter kernels
-        # are gfx950 (MI355X / CDNA4) only; on any other arch warn and fall back
-        # to the FP8 indexer instead of failing.
-        _fp4_requested = (
-            getattr(model_runner.config, "index_cache_dtype", None) == "fp4"
+        # Switch: `--index_cache_dtype fp4`. Authoritative decision — this is the
+        # value re-asserted onto every Indexer in `build_kv_cache_tensor`.
+        # `warn=True`: the gfx950 fallback message is emitted here only, since the
+        # builder is constructed once while `Indexer.__init__` runs per CSA layer.
+        # Shared predicate (see `fp4_indexer_enabled`) so the builder and
+        # `Indexer.__init__` cannot drift apart.
+        self._indexer_fp4 = fp4_indexer_enabled(
+            getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
-        if _fp4_requested and get_gfx() != "gfx950":
-            logger.warning(
-                "--index_cache_dtype fp4 requires a gfx950 (MI355X / CDNA4) GPU; "
-                "current arch is %r. Falling back to the FP8 indexer.",
-                get_gfx(),
-            )
-            _fp4_requested = False
-        self._indexer_fp4 = _fp4_requested
         # FP4 KV tile geometry (group_size 32; 16 packed bytes per group).
         self._idx_k_tiles = self.index_head_dim // 128
 
