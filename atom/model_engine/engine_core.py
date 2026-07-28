@@ -19,6 +19,7 @@ from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Sched
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import (
     envs,
+    get_hf_text_config,
     init_exit_handler,
     make_zmq_socket,
     set_process_title,
@@ -119,6 +120,20 @@ class EngineCore:
             )
             if not good:
                 self._finalizer()
+
+        hf_text_config = get_hf_text_config(config.hf_config)
+        arches = getattr(hf_text_config, "architectures", None) or []
+        is_kimi_kda_hybrid = any("KimiK3" in str(a) for a in arches) or (
+            getattr(hf_text_config, "model_type", None) == "kimi_linear"
+            and hasattr(hf_text_config, "full_attn_layer_ids")
+        )
+        if is_kimi_kda_hybrid and config.enable_prefix_caching:
+            logger.info(
+                "%s: Kimi-K3 KDA hybrid disables prefix caching engine-wide "
+                "because recurrent attention state is per request.",
+                self.label,
+            )
+            config.enable_prefix_caching = False
 
         # Decode in disagg mode defers Scheduler creation until after kvcache IPC
         # import sets config.num_kvcache_blocks (BlockManager asserts num_blocks > 0).

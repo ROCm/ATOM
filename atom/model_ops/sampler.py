@@ -7,6 +7,7 @@ import torch
 from aiter import mixed_sample_outer_exponential
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
+from atom.utils import envs
 from torch import nn
 
 # Try to import aiter top-k/top-p sampling ops
@@ -73,6 +74,11 @@ class Sampler(nn.Module):
         Returns:
             Sampled token IDs (num_tokens,)
         """
+        if envs.ATOM_DEBUG_TOPK > 0:
+            from atom.utils.debug_helper import maybe_log_topk
+
+            maybe_log_topk(logits, prefix="sampler ")
+
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             return self._temperature_sample(
