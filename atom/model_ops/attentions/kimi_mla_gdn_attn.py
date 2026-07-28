@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Type
-
 import numpy as np
 import torch
 from aiter import dtypes
+
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import envs
@@ -22,13 +21,13 @@ class KimiMLAGDNBackend(AttentionBackend):
         return "KIMI_MLA_GDN"
 
     @staticmethod
-    def get_builder_cls() -> Type["_KimiMLAGDNCommon"]:
+    def get_builder_cls() -> type["_KimiMLAGDNCommon"]:
         if envs.ATOM_USE_TRITON_MLA:
             return KimiTritonMLAGDNMetadataBuilder
         return KimiAiterMLAGDNMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["MLAAttention"]:
+    def get_impl_cls() -> type["MLAAttention"]:
         return MLAAttention
 
 

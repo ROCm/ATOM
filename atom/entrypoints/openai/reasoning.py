@@ -10,7 +10,6 @@ Also strips raw tool call tokens that the model may output.
 
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 KIMI_THINK_END = "<|close|>think<|sep|>"
 KIMI_RESPONSE_START = "<|open|>response<|sep|>"
@@ -20,8 +19,7 @@ KIMI_END_OF_MSG = "<|end_of_msg|>"
 
 
 def _strip_kimi_response_markers(text: str) -> str:
-    if text.startswith(KIMI_RESPONSE_START):
-        text = text[len(KIMI_RESPONSE_START) :]
+    text = text.removeprefix(KIMI_RESPONSE_START)
 
     for marker in (KIMI_RESPONSE_END, KIMI_MESSAGE_END, KIMI_END_OF_MSG):
         if marker in text:
@@ -29,7 +27,7 @@ def _strip_kimi_response_markers(text: str) -> str:
     return text.strip()
 
 
-def separate_reasoning(text: str) -> Tuple[Optional[str], str]:
+def separate_reasoning(text: str) -> tuple[str | None, str]:
     """Separate reasoning content from the final answer.
 
     Args:

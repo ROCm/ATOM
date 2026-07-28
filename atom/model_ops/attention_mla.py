@@ -180,7 +180,7 @@ class MLAModules:
     # sparsity must be derived from the model, not from whether this layer owns
     # an indexer. Defaults keep non-sparse models unchanged.
     is_sparse: bool = False
-    topk_tokens: Optional[int] = None
+    topk_tokens: int | None = None
 
 
 class _MLAOutputShape(Protocol):
@@ -333,7 +333,7 @@ class MLAAttention(nn.Module):
         return q
 
     def _restore_query_heads(
-        self, output: torch.Tensor, num_heads: Optional[int] = None
+        self, output: torch.Tensor, num_heads: int | None = None
     ) -> torch.Tensor:
         if self.head_repeat_factor > 1:
             return output[:, :: self.head_repeat_factor, ...].contiguous()
