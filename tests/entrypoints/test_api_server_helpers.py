@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -205,3 +206,40 @@ class TestValidateContextLength:
             max_tokens=8,
             max_model_len=None,
         )
+
+    def test_prompt_over_batch_tokens_without_chunked_prefill_is_rejected(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    max_model_len=8192,
+                    max_num_batched_tokens=128,
+                    enable_chunked_prefill=False,
+                )
+            ),
+        )
+        seq = SimpleNamespace(num_prompt_tokens=685, max_tokens=256)
+
+        with pytest.raises(ValueError, match="max_num_batched_tokens=128"):
+            api_server._validate_sequence_context_length(seq)
+
+    def test_prompt_over_batch_tokens_with_chunked_prefill_is_allowed(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    max_model_len=8192,
+                    max_num_batched_tokens=128,
+                    enable_chunked_prefill=True,
+                )
+            ),
+        )
+        seq = SimpleNamespace(num_prompt_tokens=685, max_tokens=256)
+
+        api_server._validate_sequence_context_length(seq)

@@ -617,7 +617,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         # attn_idx: hybrid models (Qwen3-Next) skip linear-attention layers
         # in the kv_cache slot ordering; non-hybrid models use layer_id 1:1.
-        if runner.is_qwen_next():
+        if getattr(runner, "is_kimi_linear", lambda: False)():
+            mtp_start = runner.mtp_start_layer_idx
+            if layer_id < mtp_start:
+                attn_idx = runner.full_attention_layers.index(layer_id)
+            else:
+                attn_idx = runner.num_full_attn + (layer_id - mtp_start)
+        elif runner.is_qwen_next():
             mtp_start = runner.mtp_start_layer_idx
             if layer_id < mtp_start:
                 attn_idx = layer_id // runner.full_attention_interval
@@ -668,6 +674,33 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             runner._kv_layer_cache_store.append(
                 (k_cache, v_cache, module.k_scale, module.v_scale)
             )
+        elif getattr(runner, "is_kimi_linear", lambda: False)():
+            # Kimi-K3 full-attn (MLA-as-MHA) layers run at head_dim=192
+            # (non-power-of-2) and are bound in the 4D FLASH layout
+            # [num_blocks, block_size, num_kv_heads, head_dim]:
+            # unified_attention(shuffled_kv_cache=False) reads it correctly at
+            # 192, writes go through reshape_and_cache_flash, and the backing
+            # storage runner.kv_cache[k/v, attn_idx] is already exactly this 4D
+            # shape, so no reshape is needed. Validated: gsm8k-1319 graph =
+            # 0.9431 flex / 0.9424 strict (> baseline 0.9378).
+            #
+            # The 5D SHUFFLE decode path is deliberately NOT used at 192:
+            #  (1) the stock aiter SHUFFLE read mis-indexes the padded head_dim
+            #      at 192 (~100% error);
+            #  (2) a candidate kernel fix for (1) (kept in
+            #      code_k3/shuffle_kernel_fix.patch) is bit-accurate in op-tests
+            #      and eager server decode, but it still (a) regresses under
+            #      CUDA-graph capture (full-1319 graph: SHUFFLE 0.9204 vs FLASH
+            #      0.9431) and (b) destabilises the SHARED unified_attention
+            #      FLASH path in-server (non-deterministic garbage) even though
+            #      the edit is SHUFFLED_KV_CACHE-guarded and op-test-clean.
+            # So SHUFFLE decode at 192 stays a follow-up; keep FLASH.
+            k_cache = runner.kv_cache[0, attn_idx]
+            v_cache = runner.kv_cache[1, attn_idx]
+            module.impl.use_flash_layout = True
+            if config.kv_cache_dtype == "fp8":
+                module.k_scale = runner.kv_scale[0, attn_idx]
+                module.v_scale = runner.kv_scale[1, attn_idx]
         else:
             x = 16 // runner.kv_cache.element_size()
             k_cache = runner.kv_cache[0, attn_idx].view(

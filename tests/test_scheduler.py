@@ -752,6 +752,30 @@ class TestPostprocess:
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
 
+    def test_aborted_deferred_output_finishes_without_placeholder(
+        self, scheduler, seq_factory
+    ):
+        seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
+        seq.status = SequenceStatus.ABORTED
+        assert seq.output_tokens == []
+
+        finished = scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(10,)],
+                num_rejected=np.array([0], dtype=np.int32),
+                num_bonus=np.array([0], dtype=np.int32),
+                draft_token_ids=None,
+                is_deferred_out=True,
+            ),
+        )
+
+        assert finished == [seq]
+        assert seq.status == SequenceStatus.FINISHED
+        assert seq.leave_reason == "aborted"
+        assert scheduler.get_request_counts() == (0, 0)
+
 
 # ── get_next_batch_info ────────────────────────────────────────────────────
 

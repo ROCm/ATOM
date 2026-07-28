@@ -96,6 +96,23 @@ class TestSeparateReasoning:
         assert reasoning == "Reasoning only"
         assert content == ""
 
+    def test_kimi_token_reasoning_and_response(self):
+        text = (
+            "The user asks for the capital."
+            "<|close|>think<|sep|><|open|>response<|sep|>"
+            "Paris"
+            "<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>"
+        )
+        reasoning, content = separate_reasoning(text)
+        assert reasoning == "The user asks for the capital."
+        assert content == "Paris"
+
+    def test_kimi_response_without_reasoning(self):
+        text = "<|open|>response<|sep|>42<|close|>response<|sep|>"
+        reasoning, content = separate_reasoning(text)
+        assert reasoning is None
+        assert content == "42"
+
 
 # ============================================================================
 # ReasoningFilter (Streaming) Tests

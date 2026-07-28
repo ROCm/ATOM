@@ -84,13 +84,42 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         # a hidden ordering dependency on _compute_block_bytes being
         # called first.
         hf = model_runner.config.hf_config
-        model_runner.full_attention_interval = hf.full_attention_interval
-        model_runner.num_full_attn = (
-            hf.num_hidden_layers // model_runner.full_attention_interval
-        )
-        model_runner.num_gdn_attn_state = (
-            hf.num_hidden_layers - model_runner.num_full_attn
-        )
+        if getattr(hf, "model_type", None) == "kimi_linear":
+            lin = getattr(hf, "linear_attn_config", {}) or {}
+            model_runner.full_attention_layers = [
+                int(i) - 1 for i in lin.get("full_attn_layers", [])
+            ]
+            model_runner.kda_attention_layers = [
+                int(i) - 1 for i in lin.get("kda_layers", [])
+            ]
+            model_runner.num_full_attn = len(model_runner.full_attention_layers)
+            model_runner.num_gdn_attn_state = len(model_runner.kda_attention_layers)
+            hf.linear_num_key_heads = getattr(
+                hf, "linear_num_key_heads", lin.get("num_heads", hf.num_attention_heads)
+            )
+            hf.linear_num_value_heads = getattr(
+                hf, "linear_num_value_heads", lin.get("num_heads", hf.num_attention_heads)
+            )
+            hf.linear_key_head_dim = getattr(
+                hf, "linear_key_head_dim", lin.get("head_dim", hf.qk_nope_head_dim)
+            )
+            hf.linear_value_head_dim = getattr(
+                hf, "linear_value_head_dim", lin.get("head_dim", hf.v_head_dim)
+            )
+            hf.linear_conv_kernel_dim = getattr(
+                hf,
+                "linear_conv_kernel_dim",
+                lin.get("short_conv_kernel_size", 4),
+            )
+            hf.head_dim = hf.qk_nope_head_dim + hf.qk_rope_head_dim
+        else:
+            model_runner.full_attention_interval = hf.full_attention_interval
+            model_runner.num_full_attn = (
+                hf.num_hidden_layers // model_runner.full_attention_interval
+            )
+            model_runner.num_gdn_attn_state = (
+                hf.num_hidden_layers - model_runner.num_full_attn
+            )
 
         self.num_spec = 0
         if hasattr(model_runner, "drafter"):
@@ -186,6 +215,11 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         return conv_state_shape, temporal_state_shape
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
+        if getattr(self.model_runner.config.hf_config, "model_type", None) == "kimi_linear":
+            return (
+                self.model_runner.config.torch_dtype,
+                torch.float32,
+            )
         return (
             self.model_runner.config.torch_dtype,
             self.model_runner.config.torch_dtype,
@@ -316,8 +350,11 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             from atom.config import KVCacheTensor
 
             runner = self.model_runner
-            interval = runner.full_attention_interval
-            gdn_idx = (layer_id // interval) * (interval - 1) + (layer_id % interval)
+            if getattr(runner, "is_kimi_linear", lambda: False)():
+                gdn_idx = runner.kda_attention_layers.index(layer_id)
+            else:
+                interval = runner.full_attention_interval
+                gdn_idx = (layer_id // interval) * (interval - 1) + (layer_id % interval)
             return KVCacheTensor(
                 layer_num=layer_id,
                 k_cache=runner.mamba_k_cache[gdn_idx],

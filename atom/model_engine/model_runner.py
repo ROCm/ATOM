@@ -87,6 +87,7 @@ support_model_arch_dict = {
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
+    "KimiK3ForConditionalGeneration": "atom.models.kimi_k3.KimiK3ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
@@ -679,6 +680,7 @@ class ModelRunner:
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
         self.use_v4 = self.is_deepseek_v4()
+
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
         self.is_deepseek_v32 = (
@@ -771,6 +773,15 @@ class ModelRunner:
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
         )
+        if (
+            os.getenv("ATOM_SYNC_AFTER_LOAD", "0").lower() in ("1", "true", "yes")
+            and get_tp_group().world_size > 1
+        ):
+            logger.info(
+                "Waiting for all TP ranks to finish model loading before warmup"
+            )
+            get_tp_group().barrier()
+            logger.info("All TP ranks finished model loading")
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -899,9 +910,13 @@ class ModelRunner:
             "qwen3_next_mtp",
             "qwen3_5_text",
             "qwen3_5_moe_text",
+            "kimi_linear",
         ):
             return True
         return False
+
+    def is_kimi_linear(self) -> bool:
+        return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
 
     def is_deepseek_v4(self) -> bool:
         # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
@@ -1339,6 +1354,16 @@ class ModelRunner:
         pcp_size = self.config.prefill_context_parallel_size
         if pcp_size > 1:
             warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
+
+        # TEMPORARY (benign, warmup-only): cap the dummy warmup prefill. A large
+        # all-zero warmup batch samples garbage logits over all positions and
+        # faults the sampler/softmax on gfx1250; real inference only samples the
+        # last token per seq so it is unaffected. Proper fix = skip/greedy sampling
+        # during is_dummy_run warmup, then this cap can go. Not needed for the MoE
+        # (that large-M crash is fixed in aiter grouped_moe_gfx1250).
+        _warmup_cap = int(os.environ.get("ATOM_WARMUP_MAX_TOKENS", "0") or "0")
+        if _warmup_cap > 0:
+            warmup_max_tokens = min(warmup_max_tokens, _warmup_cap)
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 

@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
+import time
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -72,6 +74,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 logger = logging.getLogger("atom")
+_MOE_LOAD_COPY_LOG_SECONDS = float(os.getenv("ATOM_MOE_LOAD_COPY_LOG_SECONDS", "0"))
 
 
 class MoEActivationQuant(Enum):
@@ -1215,6 +1218,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
             # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
+            # NOTE: the a8w4 GGUU decode kernel hardcodes SiLU activation and does
+            # not implement Kimi situ — guard so it fails loudly instead of
+            # silently degrading accuracy if enabled for a situ model.
+            assert activation != ActivationType.Situv2, (
+                "ATOM_USE_TRITON_MOE_DECODE (a8w4 GGUU) does not support situ "
+                "activation; disable it for Kimi-K3."
+            )
             from aiter.ops.triton.moe.moe_routing.routing import routing
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts_a8w4_silu_gguu,
@@ -1328,6 +1338,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
                     act_quant=self.act_quant,
+                    situ_beta=getattr(layer, "activation_situ_beta", None),
+                    situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
                 )
 
                 # Always-on shared expert(s) via a standalone dense GEMM,
@@ -1364,6 +1376,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 act_quant=self.act_quant,
+                situ_beta=getattr(layer, "activation_situ_beta", None),
+                situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
             )
 
         topk_weights, topk_ids = self.select_experts_with_record(
@@ -1391,6 +1405,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
+        if activation == ActivationType.Situv2:
+            moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
+            moe_extra_args["linear_beta"] = getattr(
+                layer, "activation_situ_linear_beta", None
+            )
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -2591,6 +2610,14 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
+        if config is not None:
+            self.activation_situ_beta = getattr(config, "activation_situ_beta", None)
+            self.activation_situ_linear_beta = getattr(
+                config, "activation_situ_linear_beta", None
+            )
+        else:
+            self.activation_situ_beta = None
+            self.activation_situ_linear_beta = None
 
         self.use_chunked = get_dp_group().world_size > 1
 
@@ -3025,8 +3052,31 @@ class FusedMoE(torch.nn.Module):
     @staticmethod
     def _copy_quant_storage(dst: torch.Tensor, src: torch.Tensor) -> None:
         """Copy quantized tensors without numeric conversion of byte formats."""
+        if src.device.type == "cpu" and not src.is_contiguous():
+            src = src.contiguous()
+        start = time.perf_counter() if _MOE_LOAD_COPY_LOG_SECONDS > 0 else None
+
+        def log_slow_copy() -> None:
+            if start is None:
+                return
+            if dst.device.type == "cuda":
+                torch.cuda.synchronize(dst.device)
+            elapsed = time.perf_counter() - start
+            if elapsed >= _MOE_LOAD_COPY_LOG_SECONDS:
+                logger.info(
+                    "Slow MoE quant copy: %.3fs dst_shape=%s dst_dtype=%s "
+                    "src_shape=%s src_dtype=%s src_contiguous=%s",
+                    elapsed,
+                    tuple(dst.shape),
+                    dst.dtype,
+                    tuple(src.shape),
+                    src.dtype,
+                    src.is_contiguous(),
+                )
+
         if dst.dtype == dtypes.fp4x2:
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            log_slow_copy()
             return
         fp8_storage_dtypes = (
             torch.float8_e4m3fn,
@@ -3040,11 +3090,13 @@ class FusedMoE(torch.nn.Module):
             # numeric conversion when destination storage uses a different FP8
             # variant; later scale fixups expect the original bytes.
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            log_slow_copy()
             return
         if dst.dtype == dtypes.fp8_e8m0 and src.dtype == torch.uint8:
             # e8m0 microscale tensors are byte-encoded; copy_ would convert the
             # uint8 values numerically instead of preserving the scale bits.
             dst.view(torch.uint8).copy_(src)
+            log_slow_copy()
             return
         if dst.dtype == torch.uint8 and src.dtype in (
             torch.float8_e8m0fnu,
@@ -3052,6 +3104,7 @@ class FusedMoE(torch.nn.Module):
         ):
             src = src.view(torch.uint8)
         dst.copy_(src)
+        log_slow_copy()
 
     def _load_w13(
         self,
@@ -3125,9 +3178,9 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
         load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, load_shard_size * tp_rank, load_shard_size
-        )
+        shard_start = load_shard_size * tp_rank
+        loaded_shard = loaded_weight.narrow(shard_dim, shard_start, load_shard_size)
+        loaded_weight = loaded_shard
         if load_shard_size != shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
@@ -3734,9 +3787,16 @@ class FusedMoE(torch.nn.Module):
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
-            final_hidden_states = get_tp_group().all_reduce(
-                final_hidden_states, ca_fp8_quant=False
-            )
+            from atom.model_ops.linear import fp32_allreduce_enabled
+
+            if fp32_allreduce_enabled():
+                hs32 = final_hidden_states.float()
+                torch.distributed.all_reduce(hs32, group=get_tp_group().device_group)
+                final_hidden_states = hs32.to(final_hidden_states.dtype)
+            else:
+                final_hidden_states = get_tp_group().all_reduce(
+                    final_hidden_states, ca_fp8_quant=False
+                )
 
         return final_hidden_states
 
@@ -3787,9 +3847,16 @@ class FusedMoE(torch.nn.Module):
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
-            final_hidden_states = get_tp_group().all_reduce(
-                final_hidden_states, ca_fp8_quant=False
-            )
+            from atom.model_ops.linear import fp32_allreduce_enabled
+
+            if fp32_allreduce_enabled():
+                hs32 = final_hidden_states.float()
+                torch.distributed.all_reduce(hs32, group=get_tp_group().device_group)
+                final_hidden_states = hs32.to(final_hidden_states.dtype)
+            else:
+                final_hidden_states = get_tp_group().all_reduce(
+                    final_hidden_states, ca_fp8_quant=False
+                )
 
         return final_hidden_states
 
