@@ -8,8 +8,9 @@ several separate torch ops (each a kernel launch + full HBM round-trip):
 - ``apply_attn_res``    : block-residual soft-attention mix (attn_res boundaries)
 
 The activation and gated-rmsnorm kernels remain gated behind ``ATOM_K3_FUSED``
-in kimi_k3.py. ``apply_attn_res`` is the production path; correctness is checked
-against a local torch reference in my_script/optest_fused.py.
+in kimi_k3.py, with the torch reference implementations at the bottom of this
+module doubling as the no-triton fallback. ``apply_attn_res`` is the production
+path and is not env-gated.
 """
 
 from __future__ import annotations

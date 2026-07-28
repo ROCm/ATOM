@@ -687,13 +687,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # The 5D SHUFFLE decode path is deliberately NOT used at 192:
             #  (1) the stock aiter SHUFFLE read mis-indexes the padded head_dim
             #      at 192 (~100% error);
-            #  (2) a candidate kernel fix for (1) (kept in
-            #      code_k3/shuffle_kernel_fix.patch) is bit-accurate in op-tests
-            #      and eager server decode, but it still (a) regresses under
-            #      CUDA-graph capture (full-1319 graph: SHUFFLE 0.9204 vs FLASH
-            #      0.9431) and (b) destabilises the SHARED unified_attention
-            #      FLASH path in-server (non-deterministic garbage) even though
-            #      the edit is SHUFFLED_KV_CACHE-guarded and op-test-clean.
+            #  (2) a candidate aiter-side kernel fix for (1) is bit-accurate in
+            #      op-tests and eager server decode, but it still (a) regresses
+            #      under CUDA-graph capture (full-1319 graph: SHUFFLE 0.9204 vs
+            #      FLASH 0.9431) and (b) destabilises the SHARED
+            #      unified_attention FLASH path in-server (non-deterministic
+            #      garbage) even though the edit is SHUFFLED_KV_CACHE-guarded
+            #      and op-test-clean.
             # So SHUFFLE decode at 192 stays a follow-up; keep FLASH.
             k_cache = runner.kv_cache[0, attn_idx]
             v_cache = runner.kv_cache[1, attn_idx]
