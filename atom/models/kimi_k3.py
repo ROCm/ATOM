@@ -776,7 +776,11 @@ class KimiKDAAttention(nn.Module):
         if recurrent:
             kwargs.pop("safe_gate", None)
             return fused_recurrent_kda(**kwargs)
-        return chunk_kda(**kwargs)
+        # FLA 0.5.1's default KDA recompute specialization is non-deterministic
+        # for long, packed gfx950 prefills and can emit extreme values. Selecting
+        # disable_recompute enables its STORE_QG specialization, which is stable
+        # and preserves the same chunk-KDA forward semantics.
+        return chunk_kda(**kwargs, disable_recompute=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Route through the opaque custom op so torch.compile splits the graph
