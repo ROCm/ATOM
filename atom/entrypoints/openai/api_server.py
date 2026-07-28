@@ -200,36 +200,22 @@ def _validate_context_length(
     )
 
 
-def _get_engine_config():
+def _get_engine_max_model_len() -> Optional[int]:
     config = getattr(engine, "config", None)
     if config is None:
         config = getattr(getattr(engine, "io_processor", None), "config", None)
-    return config
+    return getattr(config, "max_model_len", None)
 
 
 def _validate_sequence_context_length(seq) -> None:
-    config = _get_engine_config()
     _validate_context_length(
         seq.num_prompt_tokens,
         seq.max_tokens,
-        getattr(config, "max_model_len", None),
+        _get_engine_max_model_len(),
     )
-    max_num_batched_tokens = getattr(config, "max_num_batched_tokens", None)
-    enable_chunked_prefill = bool(getattr(config, "enable_chunked_prefill", False))
-    if (
-        not enable_chunked_prefill
-        and max_num_batched_tokens is not None
-        and seq.num_prompt_tokens > max_num_batched_tokens
-    ):
-        raise ValueError(
-            f"Prompt contains {seq.num_prompt_tokens} input tokens, which exceeds "
-            f"max_num_batched_tokens={max_num_batched_tokens} while chunked prefill "
-            f"is disabled. Increase --max-num-batched-tokens, enable chunked "
-            f"prefill, or shorten the prompt."
-        )
 
 
-def _has_multimodal_content(messages: list[Any]) -> bool:
+def _has_multimodal_content(messages: List[Any]) -> bool:
     for message in messages:
         content = getattr(message, "content", None)
         if not isinstance(content, list):
@@ -1334,9 +1320,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_completion_response_multi(
-                request_id, model_name, outputs, request.stop
-            )
+            resp = build_completion_response_multi(request_id, model_name, outputs)
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
@@ -1353,9 +1337,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             if final_output is None:
                 raise RuntimeError("No output generated")
 
-            resp = build_completion_response(
-                request_id, model_name, final_output, request.stop
-            )
+            resp = build_completion_response(request_id, model_name, final_output)
         _log_request_event("response", request_id, resp.model_dump())
         return resp
 
