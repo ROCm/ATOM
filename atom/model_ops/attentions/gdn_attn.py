@@ -113,7 +113,6 @@ class GDNStateMixin:
                 "linear_conv_kernel_dim",
                 lin.get("short_conv_kernel_size", 4),
             )
-            hf.head_dim = hf.qk_nope_head_dim + hf.qk_rope_head_dim
         else:
             model_runner.full_attention_interval = hf.full_attention_interval
             model_runner.num_full_attn = (
@@ -581,21 +580,15 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         - `base_linear_attention` (GDN linear attention) → wrap the slot
           slice of mamba_k_cache / mamba_v_cache
-        - everything else (full-attention MHA layers in the hybrid model,
-          plus modules of types this builder doesn't recognize) → defer
-          to AiterAttentionMetadataBuilder.build_kv_cache_tensor
+        - everything else → defer to
+          AiterAttentionMetadataBuilder.build_kv_cache_tensor
         """
         if hasattr(module, "base_linear_attention"):
             from atom.config import KVCacheTensor
 
             runner = self.model_runner
-            if getattr(runner, "is_kimi_linear", lambda: False)():
-                gdn_idx = runner.kda_attention_layers.index(layer_id)
-            else:
-                interval = runner.full_attention_interval
-                gdn_idx = (layer_id // interval) * (interval - 1) + (
-                    layer_id % interval
-                )
+            interval = runner.full_attention_interval
+            gdn_idx = (layer_id // interval) * (interval - 1) + (layer_id % interval)
             return KVCacheTensor(
                 layer_num=layer_id,
                 k_cache=runner.mamba_k_cache[gdn_idx],

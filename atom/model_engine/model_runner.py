@@ -1230,12 +1230,6 @@ class ModelRunner:
         if pcp_size > 1:
             warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
 
-        # Optional gfx1250 workaround: cap only the dummy warmup prefill. Real
-        # inference still uses the configured max_num_batched_tokens.
-        warmup_cap = int(os.environ.get("ATOM_WARMUP_MAX_TOKENS", "0") or "0")
-        if warmup_cap > 0:
-            warmup_max_tokens = min(warmup_max_tokens, warmup_cap)
-
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
         if num_seqs == 0:
