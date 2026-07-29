@@ -283,40 +283,6 @@ models:
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
 
-        - &glm52_agentic_tp4_tp8
-          <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c1
-          display_topology: 1P1D-TP4-TP8-agentic
-          prefill:
-            workers: 1
-            tp: 4
-
-        - <<: *glm52_agentic_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c2
-          concurrency: [2]
-
-        - <<: *glm52_agentic_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c4
-          concurrency: [4]
-
-        - <<: *glm52_agentic_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c8
-          concurrency: [8]
-
-        - <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p2d-tp4-agentic-1m-c2
-          topology: 1p2d
-          display_topology: 1P2D-TP4-agentic
-          pd_worker_layout: decode_single_node
-          concurrency: [2]
-          prefill:
-            workers: 1
-            tp: 4
-          decode:
-            workers: 2
-            tp: 4
-            cudagraph: none
-
     accuracy:
       task: gsm8k
       fewshot: 20
