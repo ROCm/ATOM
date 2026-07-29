@@ -9,22 +9,22 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Optional, Union
 
 import torch
 from aiter import QuantType
-from torch.distributed import ProcessGroup, ReduceOp
-from transformers import AutoConfig, GenerationConfig, PretrainedConfig
-
-# plugin-related utilities
-from atom.plugin import is_plugin_mode, is_vllm
-from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
     LayerQuantConfig,
     get_quant_parser,
 )
 from atom.utils import envs, get_open_port
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
+from torch.distributed import ProcessGroup, ReduceOp
+from transformers import AutoConfig, GenerationConfig, PretrainedConfig
+
+# plugin-related utilities
+from atom.plugin import is_plugin_mode, is_vllm
+from atom.plugin.config import PluginConfig
 
 logger = logging.getLogger("atom")
 
@@ -108,7 +108,7 @@ class CompilationConfig:
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
     # cudagraph_capture_sizes: Optional[list[int]] = [1,2,4,8]
-    cudagraph_capture_sizes: list[int] | None = None
+    cudagraph_capture_sizes: Optional[list[int]] = None
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
     """Cuda graph capture sizes
@@ -128,7 +128,7 @@ class CompilationConfig:
     use_inductor: bool = True
 
     # CudaGraph compilation
-    cudagraph_mode: CUDAGraphMode | None = None
+    cudagraph_mode: Optional[CUDAGraphMode] = None
     """
     The mode of the cudagraph:
 
@@ -168,7 +168,7 @@ class CompilationConfig:
 
     compilation_time: float = field(default=0.0, init=False)
 
-    splitting_ops: list[str] | None = None
+    splitting_ops: Optional[list[str]] = None
     """A list of ops to split the full graph into subgraphs, used in piecewise
     compilation."""
 
@@ -187,7 +187,7 @@ class CompilationConfig:
     """Additional configurations for inductor.
     - None: use default configurations."""
 
-    compile_sizes: list[int | str] | None = None
+    compile_sizes: Optional[list[Union[int, str]]] = None
     """Sizes to compile for inductor. In addition
     to integers, it also supports "cudagraph_capture_sizes" to
     specify the sizes for cudagraph capture."""
@@ -269,7 +269,7 @@ class QuantizationConfig:
     def __init__(
         self,
         config: PretrainedConfig = None,
-        online_quant_config: dict | None = None,
+        online_quant_config: Optional[dict] = None,
     ):
         if config is None:
             self.torch_dtype = torch.bfloat16
@@ -424,7 +424,7 @@ class QuantizationConfig:
     def _is_excluded(
         self,
         layer_name: str,
-        exclude_layers: list[str] | None = None,
+        exclude_layers: Optional[list[str]] = None,
         *,
         check_children: bool = False,
     ) -> bool:
@@ -752,7 +752,7 @@ class ParallelConfig:
     """Number of local data parallel groups."""
     data_parallel_rank: int = 0
     """Rank of the data parallel group."""
-    data_parallel_rank_local: int | None = None
+    data_parallel_rank_local: Optional[int] = None
     """Local rank of the data parallel group,
     set only in SPMD mode."""
     decode_context_parallel_size: int = 1
@@ -853,7 +853,7 @@ class ParallelConfig:
 
 def _normalize_moe_config_fields(
     hf_config: PretrainedConfig,
-    model_path: str | None = None,
+    model_path: Optional[str] = None,
 ) -> None:
     """Normalize common MoE config field names across model families."""
     moe_config = getattr(hf_config, "text_config", hf_config)
@@ -887,10 +887,10 @@ def _normalize_moe_config_fields(
 
 @dataclass
 class SpeculativeConfig:
-    method: str | None = ""
-    model: str | None = None
-    num_speculative_tokens: int | None = None
-    draft_model_hf_config: PretrainedConfig | None = None
+    method: Optional[str] = ""
+    model: Optional[str] = None
+    num_speculative_tokens: Optional[int] = None
+    draft_model_hf_config: Optional[PretrainedConfig] = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
 
@@ -961,7 +961,7 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(
-        hf_config: PretrainedConfig, model_path: str | None = None
+        hf_config: PretrainedConfig, model_path: Optional[str] = None
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
@@ -1091,7 +1091,7 @@ class DSparkConfig:
     disable_sps_calib: bool = False
 
     @classmethod
-    def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
+    def from_dict(cls, cfg: Optional[dict]) -> "DSparkConfig":
         """Build from the ``--dspark-config`` JSON dict.
 
         ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
@@ -1157,7 +1157,7 @@ class EPLBConfig:
         }, "eplb.placement_policy must be one of {'naive','biased'}"
 
     @classmethod
-    def from_dict(cls, cfg: dict | None) -> "EPLBConfig":
+    def from_dict(cls, cfg: Optional[dict]) -> "EPLBConfig":
         """Build from the ``--eplb-config`` JSON dict.
 
         ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
@@ -1209,10 +1209,10 @@ class Config:
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
     mark_trace: bool = False
-    load_dummy: str | None = None
+    load_dummy: Optional[str] = None
     enable_expert_parallel: bool = False
     master_addr: str = "127.0.0.1"
-    graph_bs: list[int] | None = None
+    graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
     # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
@@ -1229,7 +1229,7 @@ class Config:
     # atom/plugin/config.py, not queried via is_vllm() at the call site.
     moe_ep_flatten_tp_across_dp: bool = False
     torch_dtype: torch.dtype = field(init=False)
-    speculative_config: SpeculativeConfig | None = None
+    speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
     # DSpark runtime knobs. Built once in the parent from --dspark-config (see
@@ -1246,10 +1246,10 @@ class Config:
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 
     # only use for plugin mode
-    plugin_config: PluginConfig | None = None
+    plugin_config: Optional[PluginConfig] = None
     # only for quark_online_quantization
-    online_quant_config: dict | None = None
-    hf_overrides: dict[str, Any] | None = None
+    online_quant_config: Optional[dict] = None
+    hf_overrides: Optional[dict[str, Any]] = None
 
     # Intra-GPU prefill/decode disaggregation
     enable_rapidserve: bool = False
@@ -1270,7 +1270,7 @@ class Config:
     disagg_cu_shm_name: str = ""
     # Override max_num_seqs for the prefill process in disagg mode.
     # When None, prefill inherits the base max_num_seqs.
-    disagg_prefill_max_num_seqs: int | None = None
+    disagg_prefill_max_num_seqs: Optional[int] = None
     # When True (and enable_rapidserve=True), use CU-masked streams + shm
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
@@ -1569,7 +1569,7 @@ class Config:
         return hash_str
 
 
-_current_atom_config: Config | None = None
+_current_atom_config: Optional[Config] = None
 
 
 def set_current_atom_config(atom_config: Config):
@@ -1577,15 +1577,13 @@ def set_current_atom_config(atom_config: Config):
     _current_atom_config = atom_config
 
 
-def _get_current_atom_config_from_vllm_forward_context() -> Config | None:
+def _get_current_atom_config_from_vllm_forward_context() -> Optional[Config]:
     # In vLLM plugin mode (especially speculative decode), main/draft models
     # can coexist in one process. Resolve per-forward config first to avoid
     # reading a stale global singleton.
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
-        )
-        from vllm.forward_context import (
             is_forward_context_available,
         )
     except Exception:

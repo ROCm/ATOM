@@ -18,10 +18,10 @@ This module provides:
 from __future__ import annotations
 
 import logging
-import struct
 import threading
 import time
 from collections import deque
+from typing import Optional
 
 import numpy as np
 
@@ -30,6 +30,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+import struct
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -39,12 +40,12 @@ class SpecStats:
     """Tracks speculative decoding acceptance statistics."""
 
     __slots__ = (
-        "_interval_distribution",
-        "_interval_draft_tokens",
-        "_log_interval",
-        "distribution",
         "mtp_k",
         "total_draft_tokens",
+        "distribution",
+        "_log_interval",
+        "_interval_draft_tokens",
+        "_interval_distribution",
     )
 
     def __init__(self, mtp_k: int, log_interval: int = 1000):
@@ -136,15 +137,15 @@ class CacheStats:
     """Tracks prefix caching hit statistics."""
 
     __slots__ = (
-        "_interval_cached_tokens",
-        "_interval_compressed_tokens",
-        "_interval_full_tokens",
-        "_interval_requests",
         "_log_interval",
-        "total_cached_tokens",
-        "total_compressed_tokens",
-        "total_full_tokens",
         "total_requests",
+        "total_cached_tokens",
+        "total_full_tokens",
+        "total_compressed_tokens",
+        "_interval_requests",
+        "_interval_cached_tokens",
+        "_interval_full_tokens",
+        "_interval_compressed_tokens",
     )
 
     def __init__(self, log_interval: int = 100):
@@ -229,7 +230,7 @@ class CacheStats:
 
 def _optimal_cu_fraction(
     decode_batch: int, prefill_waiting_tokens: int
-) -> float | None:
+) -> Optional[float]:
     """Return the prefill CU fraction for the current workload, or None for no mask.
 
     Called by the DecodeScheduler, which has visibility into both the decode
@@ -281,7 +282,7 @@ class ScheduledBatch:
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
         scheduled_spec_decode_tokens: dict[int, np.ndarray] | None = None,
-        cu_stream_fraction: float | None = None,
+        cu_stream_fraction: Optional[float] = None,
         remote_kv_block_ids: list[int] | None = None,
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
@@ -472,13 +473,13 @@ class ScheduledBatchOutput:
         self,
         req_ids: list[int],
         token_ids: list[tuple[int, ...]],
-        num_rejected: np.ndarray | None,
-        num_bonus: np.ndarray | None,
-        draft_token_ids: np.ndarray | None,
+        num_rejected: Optional[np.ndarray],
+        num_bonus: Optional[np.ndarray],
+        draft_token_ids: Optional[np.ndarray],
         is_deferred_out: bool = False,
         is_prev_prefill=False,
         logprobs=None,
-        dspark_ell: np.ndarray | None = None,
+        dspark_ell: Optional[np.ndarray] = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -494,9 +495,9 @@ class ScheduledBatchOutput:
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
         # O(1) lookup: req_id -> index (lazy-built on first access)
-        self._req_id_to_idx: dict[int, int] | None = None
+        self._req_id_to_idx: Optional[dict[int, int]] = None
 
-    def get_idx(self, req_id: int) -> int | None:
+    def get_idx(self, req_id: int) -> Optional[int]:
         """O(1) lookup of request index by id."""
         if self._req_id_to_idx is None:
             self._req_id_to_idx = {rid: i for i, rid in enumerate(self.req_ids)}
@@ -557,10 +558,10 @@ class Scheduler:
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
-        self.spec_stats: SpecStats | None = (
+        self.spec_stats: Optional[SpecStats] = (
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
-        self.cache_stats: CacheStats | None = (
+        self.cache_stats: Optional[CacheStats] = (
             CacheStats() if config.enable_prefix_caching else None
         )
         self.profile_active = False
@@ -602,8 +603,6 @@ class Scheduler:
 
         from atom.distributed.kv_events import (
             EventPublisher as _EventPublisher,
-        )
-        from atom.distributed.kv_events import (
             make_publisher as _make_publisher,
         )
 
@@ -641,7 +640,7 @@ class Scheduler:
         # dp_group is available. See `prefill_delayer.py` for rationale.
         from atom.model_engine.prefill_delayer import PrefillDelayer
 
-        self.prefill_delayer: PrefillDelayer | None = None
+        self.prefill_delayer: Optional[PrefillDelayer] = None
 
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
@@ -825,7 +824,7 @@ class Scheduler:
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
 
-    def _unschedulable_reason(self, seq: Sequence) -> str | None:
+    def _unschedulable_reason(self, seq: Sequence) -> Optional[str]:
         """Return a human-readable reason if `seq` is permanently unschedulable.
 
         Only checks static (configuration-time) capacity. Dynamic conditions
@@ -1345,7 +1344,7 @@ class Scheduler:
     # -- Remote KV / offload admission helpers ------------------------------
     def _resolve_waiting_remote_kv(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
-    ) -> bool | None:
+    ) -> Optional[bool]:
         """Resolve a ``WAITING_FOR_REMOTE_KVS`` request before admission.
 
         Returns:
@@ -1452,7 +1451,7 @@ class Scheduler:
 
     def _prefill_chunk_for_budget(
         self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
-    ) -> int | None:
+    ) -> Optional[int]:
         if self.enable_chunked_prefill:
             chunk = min(num_new_tokens, budget_remaining)
             if chunk < num_new_tokens:
@@ -1873,7 +1872,7 @@ class Scheduler:
             # `eos_idx=0`, `num_new=2`, `num_rejected=0` for V4-Pro MTP-1.
             # Track the earliest stop position so `num_tokens` can drop the
             # spurious tail below.
-            stop_at_idx: int | None = None
+            stop_at_idx: Optional[int] = None
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
                 stop_len = len(stop_seq)
@@ -2511,7 +2510,7 @@ class DecodeScheduler(Scheduler):
         # Protects prefill_waiting and running: on_prefill_done is called
         # from the _recv_prefill_done background thread.
         self._prefill_lock = threading.Lock()
-        self.cu_fraction: float | None = None
+        self.cu_fraction: Optional[float] = None
 
     def is_finished(self) -> bool:
         return (

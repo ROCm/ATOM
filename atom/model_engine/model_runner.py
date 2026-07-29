@@ -9,7 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Any
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.utils.cuda_graph import BatchDescriptor
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -58,7 +59,6 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.utils.cuda_graph import BatchDescriptor
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -142,8 +142,8 @@ class tokenIDProcessor:
         gpu_tensor: torch.Tensor,
         cpu_tensor_handle,
         data_ready: torch.cuda.Event,
-        copy_done: torch.cuda.Event | None = None,
-        gpu_logprobs: torch.Tensor | None = None,
+        copy_done: Optional[torch.cuda.Event] = None,
+        gpu_logprobs: Optional[torch.Tensor] = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
@@ -165,7 +165,7 @@ class tokenIDProcessor:
         event.synchronize()
         return cpu_tensor
 
-    def recv_logprobs(self) -> list[float] | None:
+    def recv_logprobs(self) -> Optional[list[float]]:
         """Pop and return the earliest logprobs from the async copy queue.
         Must be called after recv_async_output (which synchronizes the event).
         """
@@ -218,7 +218,7 @@ class tokenIDProcessor:
 
     def recv_mtp_status_async(
         self,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         if not self.pending_mtp_status_copies:
             return None, None
         cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
@@ -229,13 +229,13 @@ class tokenIDProcessor:
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
-        self.logprobs_cpu: list[torch.Tensor | None] = []
+        self.logprobs_cpu: list[Optional[torch.Tensor]] = []
 
-        self.prev_batch: ScheduledBatch | None = None
-        self.prev_token_ids: torch.Tensor | None = None
+        self.prev_batch: Optional[ScheduledBatch] = None
+        self.prev_token_ids: Optional[torch.Tensor] = None
 
         self.pre_num_decode_token_per_seq = 1
-        self.draft_token_ids: torch.Tensor | None = None
+        self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
         # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
         # D2H copies fired by send_mtp_status_to_cpu_async, drained by
@@ -272,8 +272,8 @@ class tokenIDProcessor:
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-        sampled_logprobs: torch.Tensor | None = None,
-    ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
+        sampled_logprobs: Optional[torch.Tensor] = None,
+    ) -> tuple[dict[int, tuple[int, ...]], Optional[dict[int, float]]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
@@ -815,7 +815,7 @@ class ModelRunner:
             from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
-            known = _IOProc._per_req_cache_model_types()
+            known = _IOProc._per_req_cache_model_types()  # noqa: SLF001
             assert mt in known, (
                 f"Attention builder {type(self.attn_metadata_builder).__name__} "
                 f"reports per_req_cache_bytes>0 but model_type={mt!r} is not in "
@@ -1009,7 +1009,7 @@ class ModelRunner:
             )
 
     def _make_buffer(
-        self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
+        self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
     ) -> CpuGpuBuffer:
         return CpuGpuBuffer(
             *size, dtype=dtype, device=self.device, pin_memory=True, with_numpy=numpy
@@ -1018,7 +1018,7 @@ class ModelRunner:
     def _get_cumsum_and_arange(
         self,
         num_tokens: np.ndarray,
-        cumsum_dtype: np.dtype | None = None,
+        cumsum_dtype: Optional[np.dtype] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Get the cumulative sum and batched arange of the given array.
         # E.g., [2, 5, 3] -> ([2, 7, 10], [0, 1, 0, 1, 2, 3, 4, 0, 1, 2])
@@ -1064,7 +1064,7 @@ class ModelRunner:
         torch.cuda.empty_cache()
         return True
 
-    def start_profiler(self, trace_name: str | None = None):
+    def start_profiler(self, trace_name: Optional[str] = None):
         """
         Start profiling for this rank.
 
@@ -2020,7 +2020,7 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
-    def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
+    def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
         dp_size = self.config.parallel_config.data_parallel_size
         dp_rank = self.config.parallel_config.data_parallel_rank
 
@@ -2080,8 +2080,8 @@ class ModelRunner:
     def _preprocess(
         self,
         batch: ScheduledBatch,
-        num_scheduled_tokens: np.ndarray | None = None,
-        dspark_shape: tuple[int, int, int] | None = None,
+        num_scheduled_tokens: Optional[np.ndarray] = None,
+        dspark_shape: Optional[tuple[int, int, int]] = None,
     ):
         """Per-step DP sync: token padding, prefill fan-out, TBO decision.
 
@@ -2492,7 +2492,7 @@ class ModelRunner:
         self,
         batch: ScheduledBatch,
         input_ids: torch.Tensor = None,
-        preprocessed: tuple | None = None,
+        preprocessed: Optional[tuple] = None,
     ):
         # NOTE: DSpark q-bucket shrink happens in prepare_model BEFORE
         # prepare_input_ids, so the batch is already reduced when we get here.
@@ -2734,7 +2734,7 @@ class ModelRunner:
         )
 
     @staticmethod
-    def _detailed_label_suffix(batch: ScheduledBatch | None) -> str:
+    def _detailed_label_suffix(batch: Optional[ScheduledBatch]) -> str:
         """Detailed attention aggregates for the trace label, or ``""``.
 
         These fields are only populated by
@@ -2867,7 +2867,7 @@ class ModelRunner:
     def run_model(
         self,
         input_ids: torch.Tensor,
-        batch: ScheduledBatch | None = None,
+        batch: Optional[ScheduledBatch] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         forward_context = get_forward_context()
         context = forward_context.context
@@ -3159,7 +3159,7 @@ class ModelRunner:
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
-        draft_token_ids: np.ndarray | None = None
+        draft_token_ids: Optional[np.ndarray] = None
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num

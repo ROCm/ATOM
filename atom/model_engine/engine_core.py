@@ -7,12 +7,11 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
+from typing import List
 
 import torch
 import zmq
-
 from atom.config import Config, ParallelConfig
-from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
@@ -28,6 +27,8 @@ from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
 
+from atom.kv_transfer.disaggregation import KVOutputAggregator
+
 logger = logging.getLogger("atom")
 
 
@@ -35,7 +36,7 @@ class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[list[Sequence]]()
+        self.output_queue = queue.Queue[List[Sequence]]()
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -173,6 +174,7 @@ class EngineCore:
         """Called after ModelRunner is initialized (model loaded) but before
         get_num_blocks/allocate_kv_cache.  Override in subclasses to inject
         inter-process synchronization at this point in the init sequence."""
+        pass
 
     def _init_data_parallel(self, config: Config):
         pass
