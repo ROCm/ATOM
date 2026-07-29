@@ -186,13 +186,12 @@
         "extra_args": "--gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching"
       },
       "variants": [
-        { "label": "", "suffix": "", "conc_min": 16, "conc_max": 256 },
+        { "label": "", "suffix": "", "conc_max": 256 },
         {
           "label": "DSpark",
           "suffix": "-dspark",
           "extra_args": "--method dspark --draft-model Inferact/Kimi-K3-DSpark --num-speculative-tokens 7 --max-num-seqs 64",
           "bench_args": "--use-chat-template",
-          "conc_min": 16,
           "conc_max": 256
         }
       ]
