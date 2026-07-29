@@ -32,7 +32,9 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )  # noqa: F401
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.topK import (
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -202,7 +204,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.is_rocm_aiter_fusion_shared_expert_enabled = (
-            is_rocm_aiter_fusion_shared_expert_enabled(
+            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                quant_config,
                 shared_expert_prefix=f"{prefix}.shared_expert",
                 routed_expert_prefix=f"{prefix}.experts",
             )

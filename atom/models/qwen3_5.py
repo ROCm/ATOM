@@ -462,7 +462,44 @@ class Qwen3_5Model(Qwen3NextModel):
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
+_QWEN3_5_PACKED_MODULES_MAPPING = {
+    "q_proj": ("qkv_proj", "q"),
+    "k_proj": ("qkv_proj", "k"),
+    "v_proj": ("qkv_proj", "v"),
+    "gate_proj": ("gate_up_proj", 0),
+    "up_proj": ("gate_up_proj", 1),
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+    "in_proj_z": ("in_proj_qkvz", 3),
+    "in_proj_b": ("in_proj_ba", 0),
+    "in_proj_a": ("in_proj_ba", 1),
+    ".gate.": (".gate.", 0),
+    "shared_expert_gate": ("gate", 1),
+}
+
+
+_BF16_IN_PROJ_MAPPING = {
+    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
+    "in_proj_z": ("in_proj_qkvzba", 3),
+    "in_proj_b": ("in_proj_qkvzba", 4),
+    "in_proj_a": ("in_proj_qkvzba", 5),
+}
+
+
+def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
+    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
+        return mapping
+
+    mapping.pop("in_proj_qkvz", None)
+    mapping.pop("in_proj_ba", None)
+    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
+    mapping.update(_BF16_IN_PROJ_MAPPING)
+    return mapping
+
+
 class Qwen3_5ForCausalLMBase(nn.Module):
+    packed_modules_mapping = _QWEN3_5_PACKED_MODULES_MAPPING
+
     def __init__(self, atom_config: Config, prefix: str = ""):
         config: Qwen3_5MoeTextConfig = get_qwen3_5_text_config(atom_config)
         self.atom_config = atom_config
@@ -470,6 +507,9 @@ class Qwen3_5ForCausalLMBase(nn.Module):
         self.quant_config = atom_config.quant_config
 
         super().__init__()
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
         self.config = config
         self.model = Qwen3_5Model(
             atom_config=atom_config,
@@ -536,41 +576,35 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
             + (self.config.n_shared_experts or 0),
         )
 
+    def detect_fused_expert_format(self, weight_name: str) -> bool:
+        """Detect if weight is from fused expert checkpoint (BF16 format)."""
+        return detect_fused_expert_format(weight_name)
 
-_BF16_IN_PROJ_MAPPING = {
-    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
-    "in_proj_z": ("in_proj_qkvzba", 3),
-    "in_proj_b": ("in_proj_qkvzba", 4),
-    "in_proj_a": ("in_proj_qkvzba", 5),
-}
+    def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
+        """Return mapping for fused expert weights (BF16 format)."""
+        return get_fused_expert_mapping()
 
-
-def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
-    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
-        return mapping
-
-    mapping.pop("in_proj_qkvz", None)
-    mapping.pop("in_proj_ba", None)
-    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
-    mapping.update(_BF16_IN_PROJ_MAPPING)
-    return mapping
+    def load_fused_expert_weights(
+        self,
+        original_name: str,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
+        return load_fused_expert_weights(
+            original_name,
+            name,
+            params_dict,
+            loaded_weight,
+            shard_id,
+            num_experts,
+        )
 
 
 class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
-    packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-        "gate_up_proj": ["gate_proj", "up_proj"],
-        "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
-        "in_proj_z": ("in_proj_qkvz", 3),
-        "in_proj_b": ("in_proj_ba", 0),
-        "in_proj_a": ("in_proj_ba", 1),
-        ".gate.": (".gate.", 0),
-        "shared_expert_gate": ("gate", 1),
-    }
+    packed_modules_mapping = _QWEN3_5_PACKED_MODULES_MAPPING
     weights_mapping = {
         "model.language_model.": "language_model.model.",
         "lm_head.": "language_model.lm_head.",
