@@ -86,11 +86,13 @@ async def stream_chat_response(
     # finally aborts the still-running seq; normal completion flips it to False.
     aborted = True
     try:
-        # Send initial role chunk
-        yield create_chat_chunk(request_id, model, delta={"role": "assistant"})
-
+        role_sent = False
         while True:
             chunk_data = await stream_queue.get()
+
+            if not role_sent:
+                yield create_chat_chunk(request_id, model, delta={"role": "assistant"})
+                role_sent = True
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
             _ct = chunk_data.get("num_cached_tokens", 0)
@@ -334,13 +336,16 @@ async def stream_chat_response_fanout(
     # whichever siblings are still running.
     aborted = True
     try:
-        for i in range(n):
-            yield create_chat_chunk(
-                request_id, model, delta={"role": "assistant"}, index=i
-            )
-
+        role_sent = [False] * n
         while not all(finished):
             idx, chunk_data = await shared_queue.get()
+
+            if not role_sent[idx]:
+                yield create_chat_chunk(
+                    request_id, model, delta={"role": "assistant"}, index=idx
+                )
+                role_sent[idx] = True
+
             if finished[idx]:
                 # Defensive: should not happen, engine emits finished once per seq.
                 continue
