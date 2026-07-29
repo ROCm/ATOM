@@ -9,19 +9,7 @@ logger = logging.getLogger("atom")
 
 
 class Eagle3DraftBuilder:
-    """KV cache subsystem for a draft that owns its pool alongside a target
-    whose pool it cannot share.
-
-    Two draft flavors are handled, selected from the draft config:
-
-    * **MHA** (default) — an Eagle3-style draft with a `[2, L, blocks,
-      block_size, kv_heads, head_dim]` K/V-split cache. Used when the target
-      is MLA (which the MHA draft cannot borrow).
-    * **MLA** (`kv_lora_rank` present, e.g. a Kimi-K3 DSpark draft) — a single
-      `kv_lora_rank + qk_rope_head_dim`-wide latent cache per layer, mirroring
-      `aiter_mla.build_kv_cache_tensor`. Used when the target is a `kimi_linear`
-      hybrid (MHA@192 full-attn + linear-attn), which allocates NO MLA pool for
-      the draft to borrow — so the draft must own its own 576-wide latent cache.
+    """KV cache subsystem for an Eagle3 MHA draft alongside a non-MHA target.
 
     Implements the same subset of `AttentionMetadataBuilder` hooks that
     ModelRunner consults during KV pool sizing and per-module binding —
@@ -62,13 +50,6 @@ class Eagle3DraftBuilder:
             self.model_runner.config.kv_cache_dtype
         ].itemsize
         if self.is_mla:
-            # Single latent cache: no K/V split, one "head" of width mla_dim,
-            # no per-head dequant scale (MLA reads the latent directly). The pool
-            # is allocated bf16 regardless of the target's kv_cache_dtype (see
-            # allocate_kv_cache_tensors), so budget it at bf16's itemsize --
-            # using the target's fp8 itemsize here under-counts the draft's
-            # per-block cost 2x, inflating num_kvcache_blocks until the real
-            # bf16 allocation overshoots the memory budget.
             return self.num_layers * self.block_size * self.mla_dim * dtypes.bf16.itemsize
         bb = (
             2

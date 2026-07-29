@@ -862,21 +862,27 @@ class ParallelConfig:
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
 
 
+_DSPARK_DEFAULT_MAX_BLOCK = 16
+_DSPARK_DEFAULT_ROLLING_WINDOW = 128
+
+
 def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
-    Two DSpark checkpoint flavors reach ATOM and they name the same quantities
+    DSpark checkpoints come in two shapes and name the same quantities
     differently:
 
-    - V4-Pro-DSpark ships INSIDE the target checkpoint and already uses the
-      ``dspark_*`` names the rest of ATOM reads. It never comes here.
-    - Kimi-K3-DSpark is a standalone MLA draft (``architectures:
-      ["K3DSparkModel"]``) whose DSpark fields sit at the config top level:
-      ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
+    - INLINE (e.g. V4-Pro-DSpark) ships inside the target checkpoint and already
+      uses the ``dspark_*`` names the rest of ATOM reads. It never comes here.
+    - STANDALONE drafts are their OWN checkpoint (``architectures:
+      ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
+      their DSpark fields at the config top level: ``target_layer_ids``,
+      ``mask_token_id``, ``markov_rank``, and optionally a training block width.
 
-    Normalizing in the one place both flavors pass through keeps every
-    downstream reader (config validation, ``DSparkProposer``) flavor-neutral;
-    the draft-only fields stay untouched for the model itself to read.
+    This adapter runs for every standalone draft, so it stays model-neutral:
+    downstream readers (config validation, ``DSparkProposer``) only ever see the
+    canonical ``dspark_*`` names and never branch on the specific model. The
+    draft-only fields stay untouched for the model itself to read.
 
     Raises rather than defaulting: a DSpark draft that loads with the wrong aux
     layers or noise token produces valid-looking tokens at a silently degraded
@@ -1015,12 +1021,6 @@ class SpeculativeConfig:
     def use_dspark_with_draft(self) -> bool:
         """True when DSpark was given a separate draft model (--draft-model).
 
-        Distinguishes the two DSpark flavors where they genuinely differ: the
-        draft checkpoint is separate from the target's, the backbone is a plain
-        MLA + dense-MLP stack rather than V4 decoder layers (no mHC, no MoE),
-        and the target context reaches it through the full paged latent cache
-        rather than a private rolling window.
-
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
         :func:`_normalize_draft_dspark_config`, which runs from
@@ -1066,12 +1066,7 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        # Standalone MLA DSpark draft (Kimi-K3). Unlike the V4
-        # flavor this is its OWN checkpoint, so `model_type` describes the draft
-        # backbone ("qwen3") and says nothing about the target — arch is the
-        # only reliable discriminator, and it must be checked before the
-        # model_type-driven MTP rewrite below.
-        if arch == "K3DSparkModel":
+        if arch.endswith("DSparkModel"):
             _normalize_draft_dspark_config(hf_config)
             return
         if arch == "LlamaForCausalLMEagle3":
@@ -1555,40 +1550,42 @@ class Config:
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
-            # DSpark is a parallel block drafter: the whole block is produced in
-            # one backbone pass, so its verify horizon ceiling is set by the
-            # draft's own context mechanism, which differs per flavor (below).
             is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
             if not is_dspark:
+                # Sequential drafters (MTP / Eagle): one drafted token per
+                # backbone pass, so the horizon is a small fixed depth.
                 max_spec = 4
-            elif getattr(draft_cfg, "dspark_with_draft", False):
-                # Kimi-K3-DSpark: the config carries no block width, so there is
-                # nothing to validate against — the block is whatever
-                # --num-speculative-tokens says. The checkpoint was trained at 7
-                # and its own serving recipe uses 7; going wider is not a shape
-                # error, just a silent acceptance loss (the block is a run of
-                # mask tokens attended bidirectionally, and a longer run than
-                # training ever saw drafts worse). Cap generously and warn.
-                max_spec = 16
-                if num_spec is not None and num_spec > 7:
-                    logger.warning(
-                        "num_speculative_tokens=%d exceeds the Kimi-K3-DSpark "
-                        "training block size (7). This is accepted but expect a "
-                        "lower accepted length.",
-                        num_spec,
-                    )
             else:
-                # V4 flavor: dspark_block_size (5 for V4-Pro-DSpark) is only the
-                # TRAINING default draft width, NOT a hard ceiling. The DSpark
-                # weights are draft-width-agnostic (no parameter shape depends
-                # on it), so a wider verify horizon is drafted in the same
-                # single pass, with positions past block_size RoPE-extrapolated.
-                # The real ceiling is the rolling target-KV window, beyond which
-                # the [window ++ draft] block attention no longer fits its
-                # context. `sliding_window` may be present-but-None, so `or` the
-                # default rather than relying on getattr's.
-                max_spec = int(getattr(draft_cfg, "sliding_window", None) or 128)
+                # DSpark is a PARALLEL block drafter: all flavors
+                # (inline V4, standalone K3 / Qwen3 / ...) share this path with
+                # no per-model constants.
+                train_block = getattr(draft_cfg, "dspark_block_size", None)
+                if getattr(draft_cfg, "dspark_with_draft", False):
+                    # Standalone draft: attends a paged sibling KV holding the
+                    # full context, so the hard ceiling is a block cap the
+                    # checkpoint may set, else a generous default.
+                    max_spec = int(
+                        getattr(draft_cfg, "dspark_max_block", None)
+                        or _DSPARK_DEFAULT_MAX_BLOCK
+                    )
+                else:
+                    # Inline draft (V4): attends a ROLLING target-KV window, so
+                    # the hard ceiling is that window -- beyond it the
+                    # [window ++ draft] block attention no longer fits its
+                    # context. `sliding_window` may be present-but-None.
+                    max_spec = int(
+                        getattr(draft_cfg, "sliding_window", None)
+                        or _DSPARK_DEFAULT_ROLLING_WINDOW
+                    )
+                if train_block and num_spec is not None and num_spec > train_block:
+                    logger.warning(
+                        "num_speculative_tokens=%d exceeds the DSpark draft's "
+                        "training block size (%d): accepted, but expect a lower "
+                        "accepted length.",
+                        num_spec,
+                        train_block,
+                    )
             if num_spec is None or num_spec < 1 or num_spec > max_spec:
                 raise ValueError(
                     f"num_speculative_tokens must be between 1 and {max_spec}, "

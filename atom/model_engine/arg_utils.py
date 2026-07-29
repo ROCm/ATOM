@@ -492,12 +492,6 @@ class EngineArgs:
             method = kwargs.pop("method")
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
-            # Which checkpoint the drafter reads is a property of the DRAFT, not
-            # of the method: eagle3 is always standalone, mtp always ships
-            # inside the target, and dspark comes both ways (V4-Pro-DSpark lives
-            # in the target's `mtp.*` namespace; Kimi-K3-DSpark is its own
-            # checkpoint). So key off whether --draft-model was actually given
-            # rather than off the method name.
             if method == "eagle3" and not draft_model:
                 raise ValueError("--draft-model is required when --method eagle3.")
             if draft_model and method == "mtp":

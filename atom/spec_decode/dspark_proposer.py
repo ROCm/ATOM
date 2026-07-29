@@ -40,19 +40,7 @@ class DSparkProposer(Drafter):
             self._init_draft_block_buffers()
 
     def _init_draft_block_buffers(self) -> None:
-        """Preallocate the block-pass metadata the separate-draft path rebinds.
-
-        CUDAGRAPH CONTRACT: the metadata below is computed eagerly, before the
-        (possibly graph-replayed) draft forward, so only the tensors that get
-        BOUND — onto ``attn_metadata`` or passed into ``forward_spec`` — need a
-        stable address across steps; a captured kernel holds the pointer it saw
-        at capture time. Scratch used to derive them may allocate freely.
-
-        dtypes mirror the attention builder's own buffers exactly
-        (``aiter_attention.py``: slot_mapping int64, context_lens / cu_seqlens_q
-        / block_tables int32) — a mismatch here would be reinterpreted by the
-        kernels rather than caught.
-        """
+        """Preallocate the block-pass metadata the separate-draft path rebinds."""
         max_bs = self.config.max_num_seqs
         t = self.mtp_k
         i64 = {"dtype": torch.int64, "device": self.device}
@@ -65,65 +53,14 @@ class DSparkProposer(Drafter):
         self._blk_ctx_lens = torch.zeros(max_bs, **i32)
         # Every request contributes exactly T query rows, so cu_seqlens_q is a
         # constant ramp — build it once and only ever slice it.
-        self._blk_cu_seqlens_q = torch.arange(
-            0, (max_bs + 1) * t, step=t, **i32
-        )
+        self._blk_cu_seqlens_q = torch.arange(0, (max_bs + 1) * t, step=t, **i32)
         # Constant 1..T ramp used to expand anchors into block positions.
         self._blk_offsets = torch.arange(1, t + 1, **i64)
-        # Valid tokens in each request's LAST page. Only the pure-MLA builder
-        # (aiter_mla) registers a forward_vars buffer for this; the GDN hybrid
-        # one the Kimi-K3 target uses does not, so the draft owns it.
-        #
-        # The draft decodes at page_size=1 (one page per token), so every page
-        # is exactly full and this is all-ones forever -- filled once here
-        # rather than recomputed per step. Same thing aiter_mla.py:198 does for
-        # a pure-MLA target.
         self._blk_last_page_lens = torch.ones(max_bs, **i32)
-        # Flat per-token KV index triple for the draft's MLA decode. At
-        # page_size=1 kv_indices holds ONE ENTRY PER TOKEN (its slot), so the
-        # width is max_model_len per request -- the same formula the pure-MLA
-        # builder uses (`max_bs * max_num_blocks_per_seq` with its block_size
-        # of 1, backends.py:259). 4 MB at max_bs 64 / max_model_len 16384;
-        # it scales with max_model_len, which is the standing cost of
-        # page_size=1 MLA in ATOM and not specific to the draft.
         self._blk_kv_indptr = torch.zeros(max_bs + 1, **i32)
-        self._blk_kv_indices = torch.zeros(
-            max_bs * self.config.max_model_len, **i32
-        )
-        # q_out dtype for the draft's MLA decode; see the assignment site in
-        # _propose_with_draft for why the draft has to carry this itself.
-        # Read lazily off the cache the draft is actually bound to rather than
-        # derived from config.kv_cache_dtype: the draft's sibling pool is bf16
-        # by construction even when the target runs fp8 KV, so the config is
-        # simply not the right source here.
+        self._blk_kv_indices = torch.zeros(max_bs * self.config.max_model_len, **i32)
+
         self._blk_dtype_q = None
-
-    def _resolve_dtype_q(self, forward_context) -> "tuple[torch.dtype, bool]":
-        """q_out dtype for the draft's MLA decode, read from its bound cache.
-
-        Returns ``(dtype, final)``; ``final`` is False when the pool is not
-        allocated yet, so the caller uses the answer for this step without
-        caching it.
-
-        `attention_mla.forward_impl` allocates q_out with this and then hands
-        both it and `kv_cache_data[f"layer_{layer_num}"].k_cache` to
-        `fused_qk_rope_concat_and_cache_mla`, whose kernel derives the KV dtype
-        from the tensor and rejects a bf16 cache paired with an fp8 q_out
-        (cache_kernels.cu:4209). Reading q_out's dtype off that same tensor
-        makes the pair agree by construction -- which matters here because the
-        draft's sibling pool is deliberately bf16 even when the target's cache
-        is fp8, so `config.kv_cache_dtype` is the wrong thing to ask.
-        """
-        layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
-        cache_data = forward_context.kv_cache_data or {}
-        entry = cache_data.get(f"layer_{layer_num}")
-        bound = getattr(entry, "k_cache", None) if entry is not None else None
-        if bound is None or bound.numel() == 0:
-            # warmup_model() runs before allocate_kv_cache(), so on that pass
-            # there is no pool to read. `final=False` keeps the caller from
-            # caching this fallback.
-            return self.dtype, False
-        return bound.dtype, True
 
     @property
     def _with_draft(self) -> bool:
@@ -536,12 +473,6 @@ class DSparkProposer(Drafter):
         is_dummy = forward_context.context.is_dummy_run
 
         # ---- 1. Context rows -------------------------------------------------
-        # Write a latent row for EVERY token the target just forwarded, using the
-        # target's own slot mapping -- the draft's sibling pool is paged by the
-        # same logical block table, so the same slots address it. Rows for tokens
-        # that end up rejected are written too and that is harmless: they sit at
-        # positions beyond the accepted prefix, and the next step overwrites them
-        # before anything reads them.
         if not is_dummy:
             with record_function(f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"):
                 self.model.write_context_kv(
@@ -551,16 +482,6 @@ class DSparkProposer(Drafter):
                 )
 
         # ---- 2. Block metadata ----------------------------------------------
-        # The block occupies the T positions AFTER the anchor row: the anchor
-        # token itself (next_token_ids, sampled at anchor_positions) lands at
-        # anchor+1, and the block is drafted over anchor+1 .. anchor+T. Same
-        # convention as the V4 path's _build_block_plan.
-        #
-        # Everything bound below is written IN PLACE into the preallocated
-        # buffers from _init_draft_block_buffers, so the addresses a captured
-        # cudagraph recorded stay valid across replays. Derivation scratch
-        # (page indices, remainders) is free to allocate — it is consumed here
-        # and never handed to a kernel that gets captured.
         block_positions = self._blk_positions[:bs]  # [bs, T] view, stable
         torch.add(
             anchor_positions.view(bs, 1),
@@ -568,15 +489,6 @@ class DSparkProposer(Drafter):
             out=block_positions,
         )
 
-        # On a dummy (warmup) run there is no paged state yet: warmup_model()
-        # runs at the end of ModelRunner.__init__, before allocate_kv_cache(),
-        # so `attn_metadata.block_tables` is still None and there are no slots to
-        # map to. Skip the retarget — MLAAttention short-circuits dummy runs and
-        # returns an empty output without reading any of it.
-        #
-        # The block forward itself still RUNS, deliberately: warmup doubles as
-        # the memory-profiling pass, and skipping the draft here would leave its
-        # activations out of the KV-cache budget and OOM later under load.
         if not is_dummy:
             # `attn_metadata.block_tables` is only conditionally copied over on
             # the K3 target (unified_attention / triton_mha leaves it None on
@@ -685,16 +597,6 @@ class DSparkProposer(Drafter):
         # rebuilt per forward, the same reason `is_draft` above is not restored.
         forward_context.context.is_prefill = False
 
-        # `dtype_q` is NOT an AttentionMetaData field -- the pure-MLA builder
-        # monkey-patches it on at every construction site (aiter_mla.py:1034,
-        # 1447, 1684, 1753) and the MLA decode reads it to allocate q_out
-        # (attention_mla.py:1338/1348). The Kimi-K3 target runs the GDN hybrid
-        # builder, which never sets it, so the draft has to supply its own.
-        #
-        # Same value the MLA builder derives: q is written in the KV cache's
-        # dtype so the fp8 decode can multiply fp8 x fp8. The draft's sibling
-        # pool is allocated from the very same `config.kv_cache_dtype`
-        # (eagle3_kv_builder.py:109), so the two agree by construction.
         dtype_q = self._blk_dtype_q
         if dtype_q is None:
             dtype_q, final = self._resolve_dtype_q(forward_context)
