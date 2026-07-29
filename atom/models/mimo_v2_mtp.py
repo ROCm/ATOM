@@ -5,8 +5,9 @@
 import re
 
 import torch
-import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from torch import nn
+
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm

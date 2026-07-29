@@ -21,11 +21,11 @@ from atom.kv_transfer.disaggregation.types import (
 )
 
 __all__ = [
+    "ConnectorMetadata",
     "KVConnectorBase",
-    "KVConnectorSchedulerBase",
     "KVConnectorFactory",
     "KVConnectorOutput",
+    "KVConnectorSchedulerBase",
     "KVOutputAggregator",
-    "ConnectorMetadata",
     "ReqMeta",
 ]

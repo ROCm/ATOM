@@ -18,11 +18,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 from math import prod
+
+import torch
 from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+
 from atom.utils import envs
 
 if (
@@ -30,20 +32,19 @@ if (
     or envs.ATOM_USE_TRITON_MOE
     or envs.ATOM_USE_TRITON_MOE_DECODE
 ):
-    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+        moe_gemm_a4w4,
+        mxfp4_quant,
+    )
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
     )
-    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-        moe_gemm_a4w4,
-        mxfp4_quant,
-    )
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
     from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
-    from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
-    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 from atom.model_ops.moe import MoEActivationQuant
 

@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-
-
 import triton
 import triton.language as tl
 
@@ -43,7 +41,7 @@ def validate_minimax_m3_page_size(page_size: int) -> None:
 
 
 def _get_batch_size(forward_batch) -> int:
-    return int(getattr(forward_batch, "batch_size"))
+    return int(forward_batch.batch_size)
 
 
 def _slice_i32(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -53,7 +51,7 @@ def _slice_i32(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
 def _get_query_lens(forward_batch, batch_size: int) -> torch.Tensor:
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
-        query_lens = getattr(forward_batch, "seq_lens")
+        query_lens = forward_batch.seq_lens
     return _slice_i32(query_lens, batch_size)
 
 

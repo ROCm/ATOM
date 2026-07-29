@@ -20,6 +20,7 @@ import time
 
 import msgspec
 import pytest
+from conftest import MockConfig
 
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
@@ -34,7 +35,6 @@ from atom.distributed.kv_events import (
     make_publisher,
 )
 from atom.model_engine.block_manager import BlockManager
-from conftest import MockConfig
 
 # ── helpers ───────────────────────────────────────────────────────────────
 

@@ -23,6 +23,7 @@ import msgpack
 import msgspec
 import torch
 import zmq
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation.base import (
@@ -37,7 +38,6 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.model_engine.sequence import Sequence
 from atom.utils import get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 logger = logging.getLogger("atom")
 

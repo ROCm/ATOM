@@ -30,7 +30,6 @@ ops anyway.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -63,14 +62,14 @@ class QKNormRopeOut:
       - ``k_rope``   [T, 1, 64]  bf16 — rotated K-PE.
     """
 
-    q_sa: Optional[torch.Tensor] = None
-    kv: Optional[torch.Tensor] = None
-    q_scale: Optional[torch.Tensor] = None
-    kv_scale: Optional[torch.Tensor] = None
-    q_packed: Optional[torch.Tensor] = None
-    q_rope: Optional[torch.Tensor] = None
-    k_packed: Optional[torch.Tensor] = None
-    k_rope: Optional[torch.Tensor] = None
+    q_sa: torch.Tensor | None = None
+    kv: torch.Tensor | None = None
+    q_scale: torch.Tensor | None = None
+    kv_scale: torch.Tensor | None = None
+    q_packed: torch.Tensor | None = None
+    q_rope: torch.Tensor | None = None
+    k_packed: torch.Tensor | None = None
+    k_rope: torch.Tensor | None = None
 
 
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
@@ -354,16 +353,16 @@ def _qk_norm_rope_maybe_quant_bf16(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_cu_seqlens_q: Optional[torch.Tensor] = None,
-    swa_cache_size: Optional[int] = None,
-    swa_write_per_batch: Optional[int] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
+    swa_kv: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    swa_cu_seqlens_q: torch.Tensor | None = None,
+    swa_cache_size: int | None = None,
+    swa_write_per_batch: int | None = None,
+    swa_block_tables: torch.Tensor | None = None,
+    swa_block_size: int | None = None,
     prefix: str = "",
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
 
     Args:
@@ -608,19 +607,19 @@ def qk_norm_rope_maybe_quant(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_cu_seqlens_q: Optional[torch.Tensor] = None,
-    swa_cache_size: Optional[int] = None,
-    swa_write_per_batch: Optional[int] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
+    swa_kv: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    swa_cu_seqlens_q: torch.Tensor | None = None,
+    swa_cache_size: int | None = None,
+    swa_write_per_batch: int | None = None,
+    swa_block_tables: torch.Tensor | None = None,
+    swa_block_size: int | None = None,
     prefix: str = "",
     *,
     fp8_2buff: bool = False,
-    swa_nope_scale_buff: Optional[torch.Tensor] = None,
-    swa_rope_buff: Optional[torch.Tensor] = None,
+    swa_nope_scale_buff: torch.Tensor | None = None,
+    swa_rope_buff: torch.Tensor | None = None,
 ) -> QKNormRopeOut:
     """Per-token RMSNorm + GPT-J RoPE, dispatching on the kv-cache layout.
 
@@ -726,7 +725,7 @@ def qk_norm_rope_maybe_quant_reference(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Pure-torch reference. Matches the kernel modulo bf16 reduction-order
     noise. Performs RMSNorm (Q weightless, KV weighted), then a manual GPT-J
     interleaved RoPE on the tail ``rope_head_dim``, then optional per-row
@@ -810,7 +809,7 @@ def qk_norm_rope_maybe_quant_fp8_2buff(
     head_dim: int,
     rope_head_dim: int,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compile-safe Triton fp8 2buff Q/K: per-head weightless Q RMSNorm +
     weighted KV RMSNorm + GPT-J RoPE (bf16), then per-64-elt-tile e8m0 fp8 quant
     of the NoPE half + 2buff pack (RoPE tail kept bf16).

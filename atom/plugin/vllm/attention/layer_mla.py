@@ -1,16 +1,21 @@
-from typing import Optional
-
 import functools
 import logging
 
 import aiter
 import torch
+import triton
+import triton.language as tl
 from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton import (
-    batched_gemm_a16wfp4 as _fp4_bmm_module,
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _fp8_bmm_module,
 )
+from aiter.ops.triton import (
+    batched_gemm_a16wfp4 as _fp4_bmm_module,
+)
+from torch import nn
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAAttention, MLAModules
 from atom.model_ops.linear import use_triton_gemm
@@ -23,11 +28,6 @@ from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
 from atom.utils import envs
-from torch import nn
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-
-import triton
-import triton.language as tl
 
 logger = logging.getLogger("atom")
 
@@ -226,13 +226,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         alibi_slopes: list[float] = None,
         kv_cache_dtype="bf16",
         layer_num=0,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        prefix: Optional[str] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        prefix: str | None = None,
         **kwargs,
     ):
-        from vllm.v1.attention.backend import AttentionType
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+        from vllm.v1.attention.backend import AttentionType
 
         if mla_modules is None:
             raise ValueError("mla_modules is required for vLLM MLA attention")
@@ -289,6 +289,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         from vllm.config import get_current_vllm_config
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available,
         )
         from vllm.model_executor.layers.attention.mla_attention import (
@@ -921,8 +923,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
 
         if not hasattr(self, "_cached_ops"):
-            from vllm.distributed.parallel_state import get_dcp_group
             from vllm import _custom_ops as ops
+            from vllm.distributed.parallel_state import get_dcp_group
             from vllm.platforms import current_platform
             from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 
@@ -1412,7 +1414,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         **kwargs,
     ):

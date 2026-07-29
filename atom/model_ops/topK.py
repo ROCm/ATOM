@@ -2,10 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import lru_cache
-from typing import Optional
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
+
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
 from atom.utils.custom_register import direct_register_custom_op
@@ -13,8 +13,8 @@ from atom.utils.custom_register import direct_register_custom_op
 
 def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     quant_config,
-    shared_expert_prefix: Optional[str] = None,
-    routed_expert_prefix: Optional[str] = None,
+    shared_expert_prefix: str | None = None,
+    routed_expert_prefix: str | None = None,
 ) -> bool:
     config = get_current_atom_config()
     if quant_config is None:
@@ -71,8 +71,8 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
 
 @torch_compile_guard()
 def is_rocm_aiter_fusion_shared_expert_enabled(
-    shared_expert_prefix: Optional[str] = None,
-    routed_expert_prefix: Optional[str] = None,
+    shared_expert_prefix: str | None = None,
+    routed_expert_prefix: str | None = None,
 ) -> bool:
     config = get_current_atom_config()
     return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -141,7 +141,7 @@ def rocm_aiter_topk_softmax_impl(
     renormalize: bool,
     num_fused_shared_experts: int = 0,
     num_routing_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
+    fused_shared_experts_scoring_func: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter import topk_softmax
 
@@ -192,7 +192,7 @@ def rocm_aiter_topk_softmax_fake(
     topk: int,
     renormalize: bool,
     num_fused_shared_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
+    fused_shared_experts_scoring_func: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = gating_output.shape[0]
     device = gating_output.device
@@ -409,7 +409,7 @@ def rocm_aiter_topk_softmax(
     renormalize: bool,
     num_fused_shared_experts: int = 0,
     num_routing_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
+    fused_shared_experts_scoring_func: str | None = None,
 ) -> tuple[torch.Tensor, ...]:
     return rocm_aiter_topk_softmax_impl(
         gating_output,
@@ -444,7 +444,7 @@ def rocm_aiter_grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None,
+    e_score_correction_bias: torch.Tensor | None = None,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:

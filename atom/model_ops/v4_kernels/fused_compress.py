@@ -51,16 +51,13 @@ from `unified_kv` (Main) or the FP8 indexer pool, not from the kernel
 return).
 """
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
 
-from atom.utils.decorators import mark_trace
-
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 
 # Optional flydsl path (aiter ROCm kernels). Falls back to Triton when
 # unavailable. HCA = compress + norm_rope_scatter 2-kernel split for

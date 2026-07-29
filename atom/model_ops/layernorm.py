@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 
 import aiter
 import torch
@@ -20,13 +19,14 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from torch import Tensor, nn
+from torch.overrides import handle_torch_function, has_torch_function_unary
+
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
-from atom.utils.decorators import mark_trace
 from atom.utils import envs
-from torch import Tensor, nn
-from torch.overrides import handle_torch_function, has_torch_function_unary
+from atom.utils.decorators import mark_trace
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -66,7 +66,7 @@ def rmsnorm2d_fwd_(
 @torch_compile_guard()
 def rmsnorm2d_fwd_with_add_(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)
@@ -103,7 +103,7 @@ def fused_add_rmsnorm_pad_fake_tensors(
     epsilon: float,
     res: torch.Tensor,
     x_pad_to_multiple: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
     N_out = (N + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
     out = torch.empty((M, N_out), dtype=x.dtype, device=x.device)
@@ -118,7 +118,7 @@ def fused_add_rmsnorm_pad_(
     epsilon: float,
     res: torch.Tensor,
     x_pad_to_multiple: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
@@ -148,7 +148,7 @@ def _aiter_rms_quant_fake(
     eps: float,
     quant_type_value: int,
     transpose_scale: bool,
-    res1: Optional[torch.Tensor] = None,
+    res1: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.utility.dtypes import fp8
 
@@ -194,7 +194,7 @@ def _aiter_rms_quant(
     eps: float,
     quant_type_value: int,
     transpose_scale: bool,
-    res1: Optional[torch.Tensor] = None,
+    res1: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter import add_rmsnorm_quant, rmsnorm_quant
 
@@ -225,7 +225,7 @@ class RMSNorm(nn.Module):
         fused_allreduce: bool = False,
         fused_quant: bool = False,
         fused_quant_emit_bf16: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -329,7 +329,7 @@ class RMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
-        x_scale: Optional[torch.Tensor] = None,
+        x_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
             assert (
@@ -858,8 +858,8 @@ def fused_allreduce_gemma_rms_norm_quant(
 # ---------------------------------------------------------------------------
 # Fused Q/K RMSNorm Triton kernel
 # ---------------------------------------------------------------------------
-import triton  # noqa: E402
-import triton.language as tl  # noqa: E402
+import triton
+import triton.language as tl
 
 
 @triton.jit
@@ -967,11 +967,11 @@ def _fused_qk_norm_single_kernel(
 def fused_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_weight: Optional[torch.Tensor],
+    q_weight: torch.Tensor | None,
     k_weight: torch.Tensor,
     eps: float,
     add_unit_offset: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Q/K RMSNorm in a single Triton kernel launch.
 
     Args:
@@ -1080,7 +1080,7 @@ class DualRMSNorm:
     @mark_trace
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             q: [num_tokens, num_q_heads * head_dim]
@@ -1225,7 +1225,7 @@ def layernorm2d_fwd_with_add_(
     bias: torch.Tensor,
     eps: float,
     dim: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)

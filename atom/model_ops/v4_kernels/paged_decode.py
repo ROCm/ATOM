@@ -54,12 +54,12 @@ import os
 import torch
 import triton
 import triton.language as tl
-
-from atom.utils.decorators import mark_trace
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.utils.device_info import get_num_sms
-from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+from aiter.ops.triton.utils.device_info import get_num_sms
+
+from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.utils.decorators import mark_trace
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).

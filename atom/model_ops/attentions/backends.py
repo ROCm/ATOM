@@ -3,7 +3,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
@@ -11,17 +11,18 @@ if TYPE_CHECKING:
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
+from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.tbo.ubatch_splitting import (
     UBatchSlice,
     attach_tbo_cpu_lens,
     split_attn_metadata,
 )
 from atom.utils.tbo.ubatching import tbo_enabled
-from atom.utils.forward_context import AttentionMetaData, AttnState
-from torch import nn
 
 logger = logging.getLogger("atom")
 T = TypeVar("T", bound="BroadcastableModelInput")
@@ -30,7 +31,7 @@ T = TypeVar("T", bound="BroadcastableModelInput")
 class BroadcastableModelInput(ABC):
 
     @abstractmethod
-    def as_broadcastable_tensor_dict(self) -> Dict[str, Any]:
+    def as_broadcastable_tensor_dict(self) -> dict[str, Any]:
         """
         Extract broadcastable fields. Override for fields that require some
         custom deserialization.
@@ -40,8 +41,8 @@ class BroadcastableModelInput(ABC):
     @classmethod
     @abstractmethod
     def from_broadcasted_tensor_dict(
-        cls: Type[T],
-        tensor_dict: Dict[str, Any],
+        cls: type[T],
+        tensor_dict: dict[str, Any],
         attn_backend: Optional["AttentionBackend"] = None,
     ) -> T:
         """
@@ -66,11 +67,11 @@ class AttentionBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def get_builder_cls() -> Type["AttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError
 
     @staticmethod
-    def get_impl_cls() -> Type["AttentionImpl"]:
+    def get_impl_cls() -> type["AttentionImpl"]:
         return AttentionImpl
 
 
@@ -236,7 +237,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
         Default returns None for unknown module types.
         """
-        return None
+        return
 
 
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
@@ -544,7 +545,7 @@ class AttentionImpl(nn.Module):
         num_heads: int,
         head_size: int,
         scale: float,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         kv_cache_dtype: str = "auto",
         layer_num: int = 0,
         mla_modules: MLAModules = None,

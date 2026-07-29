@@ -15,6 +15,7 @@ def apply_attention_mha_rtpllm_patch() -> None:
         return
 
     import atom.model_ops as ops
+
     from .rtp_full_attention import RTPFullAttention
 
     if not is_rtpllm():

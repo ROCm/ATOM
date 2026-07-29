@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -31,14 +31,14 @@ class VerifyScheduler:
     def __init__(self, runner):
         # runner: provides the shared async D2H stream (tokenID_processor).
         self.runner = runner
-        self.sps_table: Optional[torch.Tensor] = None
-        self.sts_temperatures: Optional[torch.Tensor] = None
-        self._last_ell: Optional[torch.Tensor] = None
+        self.sps_table: torch.Tensor | None = None
+        self.sts_temperatures: torch.Tensor | None = None
+        self._last_ell: torch.Tensor | None = None
         # req_id -> ell map from the PREVIOUS step's propose(), re-mapped onto the
         # next step's (possibly reordered) batch by req_id. Resolved lazily from
         # the async D2H fired by record_ell (event complete by next read).
         self._ell_map_cache: dict = {}
-        self._ell_pending: Optional[tuple] = None  # (event, cpu_buf, req_ids)
+        self._ell_pending: tuple | None = None  # (event, cpu_buf, req_ids)
 
     def compute_ell(self, confidence: torch.Tensor) -> torch.Tensor:
         """Run the Hardware-Aware Prefix Scheduler (paper Algorithm 1) and return
@@ -78,7 +78,7 @@ class VerifyScheduler:
             sts_temperatures=self.sts_temperatures,
         )
 
-    def set_last_ell(self, ell: Optional[torch.Tensor]) -> None:
+    def set_last_ell(self, ell: torch.Tensor | None) -> None:
         """Stash the ell computed by this step's propose() (or None)."""
         self._last_ell = ell
 

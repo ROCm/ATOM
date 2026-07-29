@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -183,7 +183,7 @@ class DPSyncResult:
     # that structurally can't split, or a mixed prefill/decode step, vetoes it.)
     tbo_collective_active: bool
     # (ub0_max, ub1_max) across DP — only set when tbo_collective_active.
-    ub_max_tokens_across_dp: Optional[tuple[int, int]]
+    ub_max_tokens_across_dp: tuple[int, int] | None
     # DP-MAX of the DSpark decode shape (q, decode_bs, total_tokens) — only set when
     # ``dspark_shape`` was passed in (DSpark active + DP). Folded into this
     # packed all_gather so DSpark's graph-shape sync no longer needs its own
@@ -270,7 +270,7 @@ def sync_dp_metadata(
     num_tokens_across_dp = sync[0]
     any_rank_has_prefill = bool(sync[1].any())
     tbo_collective_active = False
-    ub_max_tokens_across_dp: Optional[tuple[int, int]] = None
+    ub_max_tokens_across_dp: tuple[int, int] | None = None
     if tbo_on:
         # OR(meets_min_tokens): one rank reaching the min-token bar turns TBO on
         # for all. AND(can_split): but EVERY rank must be structurally splittable, else
@@ -390,13 +390,13 @@ class TBOContext:
         self.gpu_comm_done_event = gpu_comm_done_event
         self.gpu_compute_done_event = gpu_compute_done_event
         self.current_stream = compute_stream
-        self.recv_hook: Optional[Callable] = None
+        self.recv_hook: Callable | None = None
         # Set True when this ubatch's model.forward returns (or raises).
         # Partner thread checks this in `_cpu_yield` so it doesn't sleep
         # forever if we exited (cleanly or via exception) ahead of it.
         self.done: bool = False
         # Filled by `make_tbo_contexts` — points to the OTHER ubatch's ctx.
-        self.partner: Optional["TBOContext"] = None
+        self.partner: TBOContext | None = None
 
     # -- context manager protocol ----------------------------------------
 

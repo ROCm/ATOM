@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 from aiter import get_pa_metadata_info_v1, get_pa_metadata_v1
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -45,7 +43,7 @@ def allocate_pa_metadata_buffers(backend, buffer_specs):
 def build_pa_metadata_for_decode(
     backend,
     batch_size: int,
-    tp_q_head_num: Optional[int] = None,
+    tp_q_head_num: int | None = None,
 ):
     """Build pa_metadata buffers for pa_persistent_fwd in decode mode."""
     max_qlen = 1

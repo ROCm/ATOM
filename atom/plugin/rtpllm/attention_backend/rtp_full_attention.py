@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import torch
 
@@ -447,7 +446,6 @@ class RTPFullAttention(BaseAttention):
             update_kv_cache_offset = getattr(params, "update_kv_cache_offset", None)
             if callable(update_kv_cache_offset):
                 update_kv_cache_offset(attn_inputs.kv_cache_kernel_block_id_device)
-        return
 
     def prewarm_for_cuda_graph(
         self,
@@ -811,8 +809,8 @@ class RTPFullAttention(BaseAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del q_scale

@@ -40,8 +40,6 @@ Correctness:
     (batch_id=-1) bail in the kernel preamble.
 """
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -148,7 +146,7 @@ def csa_translate_pack(
     positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
     batch_id_per_token: torch.Tensor,
-    skip_prefix_len_per_token: Optional[torch.Tensor],
+    skip_prefix_len_per_token: torch.Tensor | None,
     kv_indices_csa: torch.Tensor,
     *,
     swa_pages: int,
@@ -274,7 +272,7 @@ def csa_translate_pack_reference(
     positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
     batch_id_per_token: torch.Tensor,
-    skip_prefix_len_per_token: Optional[torch.Tensor],
+    skip_prefix_len_per_token: torch.Tensor | None,
     kv_indices_csa: torch.Tensor,
     *,
     swa_pages: int,

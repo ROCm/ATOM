@@ -12,8 +12,11 @@ forward_impl_sparse handles everything end-to-end: RoPE, KV cache
 write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
-import torch
+import logging
 
+import torch
+import triton
+import triton.language as tl
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
@@ -27,12 +30,6 @@ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-
-import triton
-import triton.language as tl
-
-from typing import Optional
-import logging
 
 logger = logging.getLogger("atom")
 
@@ -248,7 +245,7 @@ def sparse_attn_indexer_plugin_mode(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -273,6 +270,8 @@ def sparse_attn_indexer_plugin_mode(
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available as is_vllm_ctx_available,
         )
 
@@ -524,7 +523,7 @@ def sparse_attn_indexer_fake(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,

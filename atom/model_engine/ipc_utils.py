@@ -20,7 +20,7 @@ Phase 2 (weight sharing):
 import logging
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 logger = logging.getLogger("atom")
 

@@ -1,33 +1,36 @@
-from collections.abc import Iterable
-
 import functools
 import importlib
 import json
+import logging
 import os
 import types
+from collections.abc import Iterable
+
 import torch
-import torch.nn as nn
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
+from torch import nn
 from vllm.config import VllmConfig
+from vllm.forward_context import (
+    get_forward_context as get_vllm_forward_context,
+)
+from vllm.forward_context import (
+    is_forward_context_available,
+)
 from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMRoPE,
+    SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
-    SupportsMultiModal,
-    SupportsMRoPE,
-    MultiModalEmbeddings,
 )
 from vllm.model_executor.models.interfaces_base import (
     VllmModel,
     VllmModelForTextGeneration,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.forward_context import (
-    get_forward_context as get_vllm_forward_context,
-    is_forward_context_available,
-)
 
 import atom  # noqa: F401
 from atom.plugin.config import (
@@ -35,8 +38,6 @@ from atom.plugin.config import (
     generate_atom_config_for_plugin_mode,
 )
 from atom.plugin.prepare import _set_framework_backbone
-
-import logging
 
 logger = logging.getLogger("atom")
 
@@ -186,7 +187,7 @@ def _get_atom_model_cls(model_arch: str) -> type:
 
 
 def _prepare_env(atom_config) -> None:
-    from atom.plugin.register import set_attn_cls, init_aiter_dist
+    from atom.plugin.register import init_aiter_dist, set_attn_cls
 
     # set global attention class
     logger.info("Set global attention class")
@@ -321,7 +322,7 @@ def _patch_required_act_dtype_post_load_hooks(
         def wrapped(act_dtype: torch.dtype = act_dtype, _orig=orig):
             return _orig(act_dtype)
 
-        setattr(wrapped, "_atom_vllm_act_dtype_patched", True)
+        wrapped._atom_vllm_act_dtype_patched = True
         submodule.process_weights_after_loading = wrapped
         patched += 1
 

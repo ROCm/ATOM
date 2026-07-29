@@ -6,8 +6,8 @@ the content-addressed SWA region and checks the Triton kernel matches the
 pure-PyTorch reference (and that a prefix-cache hit, modelled as two seqs
 sharing the same physical blocks, lands SWA in the SAME rows)."""
 
-import torch
 import pytest
+import torch
 
 try:
     import atom.model_ops.v4_kernels  # noqa: F401  (triggers the heavy import chain)

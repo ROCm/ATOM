@@ -17,14 +17,13 @@ overridable methods and injected here, so native files stay clean:
 from __future__ import annotations
 
 import functools
-from typing import Optional
 
 import torch
+from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
 from atom.plugin.config import VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD
-from aiter.jit.utils.chip_info import get_cu_num
 
 _MORI_PATCH_APPLIED = False
 
@@ -54,7 +53,7 @@ def _is_uniform_full_graph_batch() -> bool:
     )
 
 
-def _try_get_exact_valid_rows(dispatch_recv_token_num: torch.Tensor) -> Optional[int]:
+def _try_get_exact_valid_rows(dispatch_recv_token_num: torch.Tensor) -> int | None:
     if dispatch_recv_token_num.numel() == 0 or _is_stream_capturing():
         return None
     return int(dispatch_recv_token_num.reshape(-1)[0].item())
@@ -118,7 +117,7 @@ def apply_vllm_mori_patch() -> None:
             return min(128, mp), 16
         return min(64, mp), 4
 
-    setattr(vllm_get_dispatch_config, "_atom_vllm_mori_patched", True)
+    vllm_get_dispatch_config._atom_vllm_mori_patched = True
     MoriPrepareAndFinalize._get_dispatch_config = vllm_get_dispatch_config
 
     original_trim = mk.FusedMoEModularKernel._maybe_trim_dispatch_output
@@ -147,7 +146,7 @@ def apply_vllm_mori_patch() -> None:
             expert_tokens_meta.expert_num_tokens,
         )
 
-    setattr(vllm_maybe_trim_dispatch_output, "_atom_vllm_mori_patched", True)
+    vllm_maybe_trim_dispatch_output._atom_vllm_mori_patched = True
     mk.FusedMoEModularKernel._maybe_trim_dispatch_output = (
         vllm_maybe_trim_dispatch_output
     )

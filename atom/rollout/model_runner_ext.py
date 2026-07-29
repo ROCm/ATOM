@@ -4,14 +4,13 @@
 import inspect
 import logging
 import os
-from typing import Optional
 
 import numpy as np
 import torch
-
 from aiter import init_dist_env
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method
+
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.memory_manager import MemoryManagerMixin
@@ -214,8 +213,8 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         mc_cfg = MooncakeConfig(**mooncake_config)
         self._mooncake_store = EagleMooncakeStore(mc_cfg)
         self._extract_mode = True
-        self._captured_hidden_states: Optional[dict[int, torch.Tensor]] = None
-        self._captured_last_hidden_states: Optional[torch.Tensor] = None
+        self._captured_hidden_states: dict[int, torch.Tensor] | None = None
+        self._captured_last_hidden_states: torch.Tensor | None = None
         self._hook_capture_enabled = False
         self._hook_captured_hidden_states: dict[int, torch.Tensor] = {}
         self._use_hook_capture = self._register_hidden_state_hooks()
@@ -229,7 +228,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     def run_model(
         self,
         input_ids: torch.Tensor,
-        batch: Optional[ScheduledBatch] = None,
+        batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._extract_mode:
             return super().run_model(input_ids, batch)

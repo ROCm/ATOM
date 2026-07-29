@@ -1,11 +1,10 @@
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
+from torch import nn
+
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
-from torch import nn
 
 ATOM_ENABLE_RELAXED_MTP = envs.ATOM_ENABLE_RELAXED_MTP
 if ATOM_ENABLE_RELAXED_MTP:
@@ -59,7 +58,7 @@ def rejection_sample(
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     # [batch_size, 1]

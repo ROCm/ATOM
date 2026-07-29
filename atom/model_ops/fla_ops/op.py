@@ -36,7 +36,7 @@ if not is_gather_supported:
         This is a fallback implementation that returns None.
         Just to make triton compiler happy.
         """
-        return None
+        return
 
 else:
     gather = tl.gather

@@ -24,12 +24,15 @@
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from aiter import QuantType
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import LlamaConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 
@@ -52,8 +55,6 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import LlamaConfig
 
 ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT = (
     envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
@@ -101,7 +102,7 @@ class LlamaMLP(nn.Module):
         )
         self.quant_type = quant_config.get_layer_quant_config(prefix).quant_type
 
-    def forward(self, x, x_scale: Optional[torch.Tensor] = None):
+    def forward(self, x, x_scale: torch.Tensor | None = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
         scale = getattr(self.down_proj, "input_scale", None)
         x = self.act_fn(x, scale)
@@ -123,9 +124,9 @@ class LlamaAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[dict[str, Any]] = None,
+        rope_scaling: dict[str, Any] | None = None,
         max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         bias_o_proj: bool = False,
         cache_config: str = "bf16",
@@ -206,7 +207,7 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        x_scale: Optional[torch.Tensor] = None,
+        x_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -217,8 +218,8 @@ class LlamaAttention(nn.Module):
     def _init_rotary_emb(
         self,
         config: LlamaConfig,
-        rope_scaling: Optional[dict[str, Any]],
-        quant_config: Optional[QuantizationConfig],
+        rope_scaling: dict[str, Any] | None,
+        quant_config: QuantizationConfig | None,
     ) -> None:
         is_neox_style = True
         is_gguf = quant_config and quant_config.get_name() == "gguf"
@@ -315,7 +316,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
@@ -405,13 +406,11 @@ class LlamaModel(nn.Module):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[
-        torch.Tensor, IntermediateTensors, tuple[torch.Tensor, list[torch.Tensor]]
-    ]:
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -500,9 +499,9 @@ class LlamaForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         model_output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -511,6 +510,6 @@ class LlamaForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits

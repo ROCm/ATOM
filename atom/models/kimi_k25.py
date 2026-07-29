@@ -12,8 +12,6 @@ Vision encoder and multimodal projector weights are skipped during loading
 via :pyattr:`skip_weight_prefixes`.
 """
 
-from typing import Optional, Union
-
 import torch
 from torch import nn
 
@@ -79,9 +77,9 @@ class KimiK25ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -89,7 +87,7 @@ class KimiK25ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:

@@ -1,5 +1,3 @@
-from typing import Optional, Union
-
 import torch
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
@@ -12,6 +10,9 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.fused_qk_norm_rope_cache_quant import minimax_qk_norm_rope
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -28,8 +29,6 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import PretrainedConfig
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 
@@ -38,7 +37,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -128,7 +127,7 @@ class MiniMaxM2Attention(nn.Module):
         qkv_bias: bool,
         kv_cache_dtype: str,
         layer_num: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         use_qk_norm: bool = True,
     ) -> None:
@@ -294,7 +293,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         prefix: str,
         cache_config: str = "bf16",
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         layer_num: int = 0,
     ) -> None:
         super().__init__()
@@ -505,10 +504,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
     def make_empty_intermediate_tensors(

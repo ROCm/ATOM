@@ -11,8 +11,9 @@ import pytest
 import torch
 
 try:
-    import atom.model_ops.v4_kernels  # noqa: F401  (heavy import chain)
     from aiter import dtypes
+
+    import atom.model_ops.v4_kernels  # noqa: F401  (heavy import chain)
 except Exception as _e:  # pragma: no cover - bare-pytest import env
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 

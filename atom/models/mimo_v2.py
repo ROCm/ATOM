@@ -4,7 +4,6 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mimo_v2_flash.py
 
-from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +13,9 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
@@ -34,8 +36,6 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from torch import nn
-from transformers import PretrainedConfig
 from atom.utils.decorators import support_torch_compile
 
 
@@ -133,7 +133,7 @@ class MiMoV2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -216,7 +216,7 @@ class MiMoV2Attention(nn.Module):
         partial_rotary_factor: float = 1.0,
         kv_cache_dtype: str = "bf16",
         layer_num: int = 0,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -580,7 +580,7 @@ class MiMoV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -592,7 +592,7 @@ class MiMoV2ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 

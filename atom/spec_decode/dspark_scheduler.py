@@ -21,7 +21,7 @@ paper Appendix A), not a perf optimization — see ``_GREEDY_EARLY_STOP``.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 

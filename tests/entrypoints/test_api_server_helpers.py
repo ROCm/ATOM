@@ -52,14 +52,14 @@ def _install_api_server_stubs() -> list[str]:
             sys.modules[mod_name] = stub
             injected.append(mod_name)
 
-    class _StubCoreManager:  # noqa: D401 - placeholder
+    class _StubCoreManager:
         def __init__(self, *a, **kw):
             pass
 
         def add_request(self, reqs):
             return None
 
-    class _StubEngineArgs:  # noqa: D401 - placeholder
+    class _StubEngineArgs:
         @classmethod
         def add_cli_args(cls, parser):
             return parser

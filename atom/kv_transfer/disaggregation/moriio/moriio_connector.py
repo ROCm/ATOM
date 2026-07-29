@@ -22,6 +22,7 @@ import msgpack
 import msgspec
 import numpy as np
 import zmq
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation.base import (
@@ -29,12 +30,11 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.moriio.moriio_common import (
+    _MORIIO_AVAILABLE,
     MoRIIOAgentMetadata,
     MoRIIOConstants,
-    _MORIIO_AVAILABLE,
     get_port_offset,
 )
-from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
 from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
@@ -43,6 +43,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqMeta,
     TransferId,
 )
+from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
     get_open_port,
@@ -50,7 +51,6 @@ from atom.utils import (
     zmq_socket_ctx,
 )
 from atom.utils.network import get_ip
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 if _MORIIO_AVAILABLE:
     from mori.io import (

@@ -5,7 +5,6 @@
 
 import json
 
-
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
     build_chat_response_multi,

@@ -1,7 +1,3 @@
-# -*- coding: utf-8 -*-
-
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -279,7 +275,7 @@ def fused_merge_recompute(
     A: torch.Tensor,
     Ai16: torch.Tensor,
     chunk_size: int = 64,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
 ):
     """
     Fused merge + recompute.

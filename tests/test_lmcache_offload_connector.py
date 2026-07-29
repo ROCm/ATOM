@@ -3,26 +3,26 @@
 
 from __future__ import annotations
 
-import threading
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
 import pytest
 
 try:
-    import torch  # noqa: F401
+    import torch
 except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
-from atom.kv_transfer.offload.connector import (
-    LMCacheOffloadConnector,
-    LMCacheOffloadConnectorScheduler,
-)
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
     ATOMLMCacheGPUConnector,
+)
+from atom.kv_transfer.offload.connector import (
+    LMCacheOffloadConnector,
+    LMCacheOffloadConnectorScheduler,
 )
 from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
 from atom.model_engine.scheduler import Scheduler

@@ -6,8 +6,8 @@ from __future__ import annotations
 import ast
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Optional
 
 _SUBGRAPH_ID_RE = re.compile(r"artifact_shape_[^/]+_subgraph_(\d+)")
 
@@ -37,9 +37,9 @@ class _ParsedMarkerAssignment:
 _GRAPH_MARKER_PREFIX = "torch.ops.aiter.graph_marker.default("
 
 
-def _find_matching_paren(s: str, open_idx: int) -> Optional[int]:
+def _find_matching_paren(s: str, open_idx: int) -> int | None:
     depth = 0
-    in_str: Optional[str] = None
+    in_str: str | None = None
     escaped = False
     for i in range(open_idx, len(s)):
         ch = s[i]
@@ -71,7 +71,7 @@ def _split_top_level_args(s: str) -> list[str]:
     depth_paren = 0
     depth_bracket = 0
     depth_brace = 0
-    in_str: Optional[str] = None
+    in_str: str | None = None
     escaped = False
     start = 0
     for i, ch in enumerate(s):
@@ -113,7 +113,7 @@ def _split_top_level_args(s: str) -> list[str]:
     return out
 
 
-def _parse_graph_marker_call_expr(expr: str) -> Optional[tuple[str, str]]:
+def _parse_graph_marker_call_expr(expr: str) -> tuple[str, str] | None:
     idx = expr.find(_GRAPH_MARKER_PREFIX)
     if idx < 0:
         return None
@@ -141,7 +141,7 @@ def _parse_graph_marker_call_expr(expr: str) -> Optional[tuple[str, str]]:
     return arg_expr, name
 
 
-def _parse_graph_marker_assignment_line(line: str) -> Optional[_ParsedMarkerAssignment]:
+def _parse_graph_marker_assignment_line(line: str) -> _ParsedMarkerAssignment | None:
     m = _ASSIGNMENT_RE.match(line.rstrip("\n"))
     if not m:
         return None
@@ -158,7 +158,7 @@ def _parse_graph_marker_assignment_line(line: str) -> Optional[_ParsedMarkerAssi
     )
 
 
-def _extract_graph_marker_name(line: str) -> Optional[str]:
+def _extract_graph_marker_name(line: str) -> str | None:
     idx = line.find(_GRAPH_MARKER_PREFIX)
     if idx < 0:
         return None
@@ -185,7 +185,7 @@ def _iter_py_files(root: str) -> Iterable[str]:
                 yield os.path.join(dirpath, fn)
 
 
-def _initial_docstring_span(lines: list[str]) -> Optional[tuple[int, int]]:
+def _initial_docstring_span(lines: list[str]) -> tuple[int, int] | None:
     """
     Best-effort detection of the initial module docstring / leading triple-quoted
     block, including variants like r\"\"\"...\"\"\" and '''...'''.
@@ -250,7 +250,7 @@ def _collect_markers(lines: list[str]) -> list[_Marker]:
     return out
 
 
-def _prefix_and_kind(name: str) -> Optional[tuple[str, str]]:
+def _prefix_and_kind(name: str) -> tuple[str, str] | None:
     if name.endswith("_start"):
         return name[: -len("_start")], "start"
     if name.endswith("_end"):
@@ -275,7 +275,7 @@ def _wrap_region_with_record_function(
     end_marker_idx: int,
     prefix: str,
     indent: str,
-    layer_id: Optional[int] = None,
+    layer_id: int | None = None,
 ) -> None:
     """
     Transform:
@@ -322,7 +322,7 @@ def _wrap_region_with_record_function(
             lines[i] = indent_prefix + extra + line[len(indent_prefix) :]
 
 
-def _layer_id_from_wrapper_path(path: str) -> Optional[int]:
+def _layer_id_from_wrapper_path(path: str) -> int | None:
     """
     Derive layer id from wrapper file path:
       .../artifact_shape_<shape>_subgraph_<N>/... -> layer_id = N - 1

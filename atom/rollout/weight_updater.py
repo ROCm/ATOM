@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Optional
 
 import torch
 
@@ -297,12 +296,14 @@ class WeightUpdaterMixin:
             return
 
         from aiter import QuantType as _QT
+
         from atom.model_ops.utils import shuffle_weights
 
         needs_shuffle = False
-        if quant_type.value == _QT.per_1x128.value:
-            needs_shuffle = True
-        elif quant_type.value == _QT.per_1x32.value:
+        if (
+            quant_type.value == _QT.per_1x128.value
+            or quant_type.value == _QT.per_1x32.value
+        ):
             needs_shuffle = True
         elif quant_type.value == _QT.per_Token.value:
             try:
@@ -538,7 +539,7 @@ class WeightUpdaterMixin:
         ipc_handle,
         bucket_meta: dict,
         is_last: bool = True,
-        ipc_handles: Optional[dict] = None,
+        ipc_handles: dict | None = None,
     ) -> int:
         """Update model weights by reading tensor data from a CUDA IPC shared buffer.
 

@@ -7,7 +7,6 @@
 
 import numpy as np
 import torch
-
 import triton
 import triton.language as tl
 
@@ -859,7 +858,6 @@ def _causal_conv1d_update_kernel(
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return

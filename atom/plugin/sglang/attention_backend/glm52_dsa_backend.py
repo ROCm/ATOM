@@ -109,7 +109,6 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
             max_bs=bs,
         )
         del max_num_tokens
-        return None
 
     def get_cuda_graph_seq_len_fill_value(self):
         return int(self._cuda_graph_seq_len_fill_value)

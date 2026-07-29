@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-import torch.fx as fx
+from torch import fx
 
+from atom.config import Config
 from atom.utils.backends import VllmBackend
 from atom.utils.decorators import end_monitoring_torch_compile
-from atom.config import Config
 
 
 @dataclasses.dataclass
@@ -55,7 +56,7 @@ class PiecewiseBackend:
 
         self.first_run_finished = False
 
-        self.compiled_graph_for_general_shape = compiled_graph_for_general_shape  # noqa
+        self.compiled_graph_for_general_shape = compiled_graph_for_general_shape
 
         self.sym_shape_indices = sym_shape_indices
 

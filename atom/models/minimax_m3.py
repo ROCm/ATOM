@@ -3,8 +3,6 @@
 
 """Inference-only MiniMax-M3 model support for ATOM."""
 
-from typing import Optional, Union
-
 import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.parallel_state import (
@@ -12,27 +10,30 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
-from atom.model_ops.base_attention import Attention
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_quant,
 )
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.linear import (
-    MinimaxM3QKVParallelLinearWithIndexer,
     MergedColumnParallelLinear,
+    MinimaxM3QKVParallelLinearWithIndexer,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.moe import FusedMoE
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
+from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -43,8 +44,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import PretrainedConfig
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -190,7 +189,7 @@ class MiniMaxM3MLP(nn.Module):
         self,
         config: PretrainedConfig,
         intermediate_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
@@ -239,8 +238,8 @@ class MiniMaxM3MoE(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        params_dtype: Optional[torch.dtype] = None,
+        quant_config: QuantizationConfig | None = None,
+        params_dtype: torch.dtype | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -328,7 +327,7 @@ class MiniMaxM3Attention(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         cache_config: str = "bf16",
         index_cache_config: str = "auto",
@@ -407,7 +406,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         cache_config: str = "bf16",
         index_cache_config: str = "auto",
@@ -557,8 +556,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         prefix: str,
         cache_config: str = "bf16",
         index_cache_config: str = "auto",
-        quant_config: Optional[QuantizationConfig] = None,
-        params_dtype: Optional[torch.dtype] = None,
+        quant_config: QuantizationConfig | None = None,
+        params_dtype: torch.dtype | None = None,
         layer_num: int = 0,
     ) -> None:
         super().__init__()
@@ -830,10 +829,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
     def make_empty_intermediate_tensors(
@@ -901,7 +900,7 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         return self.language_model(
             input_ids,
             positions,
@@ -910,7 +909,7 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
             **kwargs,
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

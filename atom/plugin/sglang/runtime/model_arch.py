@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from typing import Any
 
 GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
@@ -31,10 +32,10 @@ class SGLangModelAdapterSpec:
 
     wrapper_binds_gdn_context: bool = False
     uses_context_only_forward: bool = False
-    prepare_config: Optional[Callable[[Any, str], None]] = None
-    construction_context: Optional[Callable[[], AbstractContextManager[Any]]] = None
-    install_adapters: Optional[Callable[[Any], None]] = None
-    bind_cache_views: Optional[Callable[[Any, Any], None]] = None
+    prepare_config: Callable[[Any, str], None] | None = None
+    construction_context: Callable[[], AbstractContextManager[Any]] | None = None
+    install_adapters: Callable[[Any], None] | None = None
+    bind_cache_views: Callable[[Any, Any], None] | None = None
 
 
 def _prepare_qwen35_config(atom_config: Any, model_arch: str) -> None:

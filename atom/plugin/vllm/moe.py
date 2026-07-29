@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Type, TypeVar
 import logging
+from typing import TypeVar
+
 from atom.plugin.prepare import is_vllm
 
 logger = logging.getLogger("atom")
@@ -10,7 +11,7 @@ logger = logging.getLogger("atom")
 T = TypeVar("T")
 
 
-def _apply_moe_decoration(original_cls: Type[T]) -> Type[T]:
+def _apply_moe_decoration(original_cls: type[T]) -> type[T]:
     """
     Apply the actual decoration to the MoE class.
     This is called lazily during instantiation.
@@ -28,7 +29,7 @@ def _apply_moe_decoration(original_cls: Type[T]) -> Type[T]:
     return original_cls
 
 
-def FusedMoEDecoratorForPluginMode(cls: Type[T]) -> Type[T]:
+def FusedMoEDecoratorForPluginMode(cls: type[T]) -> type[T]:
     """
     Lazy decorator that defers class modification until first instantiation
     """

@@ -10,7 +10,7 @@ torch = pytest.importorskip("torch")
 # import that only surfaces when atom.model_ops is the entry-point import).
 try:
     import atom.config  # noqa: F401
-    import atom.model_ops.eplb as eplb
+    from atom.model_ops import eplb
 except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 

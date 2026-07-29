@@ -577,10 +577,8 @@ def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
             )
             if impl.index_topk_cache_state is None:
                 impl.index_topk_cache_state = {}
-                setattr(
-                    token_to_kv_pool,
-                    "_atom_minimax_m3_topk_cache_state",
-                    impl.index_topk_cache_state,
+                token_to_kv_pool._atom_minimax_m3_topk_cache_state = (
+                    impl.index_topk_cache_state
                 )
         kv_cache_data[f"layer_{layer_id}"] = KVCacheTensor(
             layer_num=layer_id,

@@ -51,7 +51,7 @@ def _gpu_fence_kernel(
 
 
 def gpu_memory_fence(
-    kv_cache: "torch.Tensor",
+    kv_cache: torch.Tensor,
     block_ids: list[int],
     use_mla: bool,
 ) -> None:

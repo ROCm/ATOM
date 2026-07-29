@@ -5,12 +5,11 @@ single Triton kernel. The output can be passed directly to
 ``LinearBase.forward(x_fp8, x_scale=scale)`` to skip the internal quant step.
 """
 
+import aiter
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
-
-import aiter
+from torch import Tensor
 
 fp8_dtype = aiter.dtypes.fp8
 

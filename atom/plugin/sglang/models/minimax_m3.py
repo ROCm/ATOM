@@ -14,7 +14,7 @@ from atom.models.minimax_m3 import MiniMaxM3Attention, MiniMaxM3SparseAttention
 def minimax_m3_native_sparse_attention_construction():
     """Construct MiniMax-M3 attention layers with ATOM's native impls."""
 
-    import atom.models.minimax_m3 as minimax_m3
+    from atom.models import minimax_m3
 
     previous = minimax_m3.Attention
 

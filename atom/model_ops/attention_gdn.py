@@ -4,22 +4,23 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.dist.parallel_state import get_tp_group
 from einops import rearrange
-from atom.model_ops.mamba_ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+from torch import nn
+
 from atom.model_ops.fla_ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
     gdn_decode_update_lossy_fast,
 )
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from atom.utils import envs
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
-from torch import nn
-from aiter.dist.parallel_state import get_tp_group
 
 
 @triton.jit
@@ -181,10 +182,8 @@ class GatedDeltaNet(nn.Module):
         spec_sequence_masks = gdn_metadata.spec_sequence_masks
         spec_token_indx = gdn_metadata.spec_token_indx
         non_spec_token_indx = gdn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = (
-            gdn_metadata.non_spec_state_indices_tensor
-        )  # noqa: E501
+        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
+        non_spec_state_indices_tensor = gdn_metadata.non_spec_state_indices_tensor
 
         # `causal_conv1d_*` expects the logical shape [slot, conv_dim, state_len].
         # ModelRunner stores [slot, state_len, conv_dim], so it needs the

@@ -22,8 +22,8 @@ def prefill_scheduler():
 
 @pytest.fixture
 def seq_factory():
-    from atom.sampling_params import SamplingParams
     from atom.model_engine.sequence import Sequence
+    from atom.sampling_params import SamplingParams
 
     def make(token_ids, block_size=4):
         return Sequence(token_ids, block_size, sampling_params=SamplingParams())

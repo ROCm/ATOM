@@ -1,13 +1,16 @@
-from typing import Any, Iterable, Optional, Union
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 from vllm.model_executor.models.kimi_k25 import (
     KimiK25DummyInputsBuilder,
-    KimiK25ForConditionalGeneration as vLLMKimiK25,
     KimiK25MultiModalProcessor,
     KimiK25ProcessingInfo,
+)
+from vllm.model_executor.models.kimi_k25 import (
+    KimiK25ForConditionalGeneration as vLLMKimiK25,
 )
 from vllm.model_executor.models.kimi_k25_vit import (
     KimiK25MultiModalProjector,
@@ -57,7 +60,7 @@ class KimiK25Model(DeepseekV2Model):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream: Optional[torch.cuda.Stream] = None
+        self.alt_stream: torch.cuda.Stream | None = None
         if getattr(config, "n_shared_experts", None) is not None:
             self.alt_stream = torch.cuda.Stream()
 
@@ -131,9 +134,9 @@ class KimiK25ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -142,7 +145,7 @@ class KimiK25ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 

@@ -2,16 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+from collections.abc import Callable
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any
 
 import torch
+from aiter import QuantType, dtypes
+from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.utils.forward_context import get_forward_context
-from aiter import QuantType, dtypes
-from aiter.jit.utils.chip_info import get_cu_num
 
 try:
     import mori
@@ -340,8 +341,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> mk.ReceiverType:
         from atom.utils.tbo.ubatching import (
             tbo_current_ubatch_id,
-            tbo_yield_and_switch_from_compute_to_comm,
             tbo_switch_to_compute_sync,
+            tbo_yield_and_switch_from_compute_to_comm,
         )
 
         block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
@@ -427,8 +428,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> Callable:
         from atom.utils.tbo.ubatching import (
             tbo_current_ubatch_id,
-            tbo_yield_and_switch_from_compute_to_comm,
             tbo_switch_to_compute_sync,
+            tbo_yield_and_switch_from_compute_to_comm,
         )
 
         block_num, warp_per_block = self._get_dispatch_config(num_token)

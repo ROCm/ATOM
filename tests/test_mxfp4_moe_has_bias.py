@@ -56,6 +56,7 @@ class TestFusedMoEDefaultHasBias(unittest.TestCase):
 
     def test_default_is_false(self):
         import inspect
+
         from atom.model_ops.moe import FusedMoE
 
         sig = inspect.signature(FusedMoE.__init__)
@@ -99,6 +100,7 @@ class TestGptOssKeepsBias(unittest.TestCase):
 
     def test_gpt_oss_has_bias_true(self):
         import inspect
+
         from atom.models.gpt_oss import MLPBlock as SparseMoeBlock
 
         source = inspect.getsource(SparseMoeBlock.__init__)
@@ -113,12 +115,13 @@ class TestMxfp4NoBiasCreated(unittest.TestCase):
     """When has_bias=False, Mxfp4MoEMethod must not create bias parameters."""
 
     def test_no_bias_when_has_bias_false(self):
-        import torch
         from unittest.mock import MagicMock
 
-        from atom.model_ops.moe import Mxfp4MoEMethod
-        from atom.config import LayerQuantConfig
+        import torch
         from aiter import QuantType
+
+        from atom.config import LayerQuantConfig
+        from atom.model_ops.moe import Mxfp4MoEMethod
 
         qc = LayerQuantConfig(
             quant_type=QuantType.per_1x32,
@@ -163,12 +166,13 @@ class TestMxfp4NoBiasCreated(unittest.TestCase):
         )
 
     def test_bias_created_when_has_bias_true(self):
-        import torch
         from unittest.mock import MagicMock
 
-        from atom.model_ops.moe import Mxfp4MoEMethod
-        from atom.config import LayerQuantConfig
+        import torch
         from aiter import QuantType
+
+        from atom.config import LayerQuantConfig
+        from atom.model_ops.moe import Mxfp4MoEMethod
 
         qc = LayerQuantConfig(
             quant_type=QuantType.per_1x32,
@@ -230,6 +234,7 @@ class TestSwiGLUInterleavingWithoutBias(unittest.TestCase):
     def test_swiglu_branch_does_not_couple_bias_and_shuffle(self):
         """Ensure the old coupled condition is gone."""
         import inspect
+
         from atom.model_ops.moe import Mxfp4MoEMethod
 
         source = inspect.getsource(Mxfp4MoEMethod.process_weights_after_loading)
@@ -246,6 +251,7 @@ class TestQwen3MoeQKNormShape(unittest.TestCase):
 
     def test_qk_norm_is_per_head(self):
         import inspect
+
         from atom.models.qwen3_moe import Qwen3MoeAttention
 
         source = inspect.getsource(Qwen3MoeAttention.forward)

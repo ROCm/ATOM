@@ -10,10 +10,9 @@ Also strips raw tool call tokens that the model may output.
 
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 
-def separate_reasoning(text: str) -> Tuple[Optional[str], str]:
+def separate_reasoning(text: str) -> tuple[str | None, str]:
     """Separate reasoning content from the final answer.
 
     Args:

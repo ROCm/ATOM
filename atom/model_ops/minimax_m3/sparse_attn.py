@@ -12,7 +12,7 @@ and split-K decode with a separate merge step.
 
 from dataclasses import dataclass
 
-import aiter  # noqa: F401  (used by the gluon PA runners for aiter.dtypes.fp8)
+import aiter
 import torch
 
 try:
@@ -1140,8 +1140,9 @@ def minimax_m3_sparse_attn_decode_asm(
     Requires per-rank num_kv_heads == 1 (the indexer top-k is per-kv-head; one
     shared block_table cannot express per-kv-head selection) and head_dim == 128.
     """
-    from atom.model_ops.base_attention import run_pa_decode_gluon
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    from atom.model_ops.base_attention import run_pa_decode_gluon
 
     assert q.shape[-1] == 128, "Gluon paged-attention requires head_dim == 128."
 
@@ -1255,8 +1256,9 @@ def _run_prefill_fp8_gluon(
     ``num_seqs == total_q``. This avoids the pa_fwd_asm maskless-fp8 NaN bug at
     the 256-token boundary (see caller).
     """
-    from atom.model_ops.base_attention import run_pa_decode_gluon
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    from atom.model_ops.base_attention import run_pa_decode_gluon
 
     # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1, mirroring
     # minimax_m3_sparse_attn_decode_asm. sparse_bt/ctx are already [T*Hkv, ...] with

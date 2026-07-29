@@ -17,7 +17,6 @@ processed across two micro-batches:
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 
@@ -32,7 +31,7 @@ __all__ = [
 class TokenSplitPrefillState:
     block_tables: list
     cu_tokens: np.ndarray
-    num_cached: Optional[np.ndarray]
+    num_cached: np.ndarray | None
 
 
 @dataclass

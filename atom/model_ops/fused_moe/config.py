@@ -1,6 +1,7 @@
 import logging
-from typing import Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Union
+
 import torch
 
 if TYPE_CHECKING:

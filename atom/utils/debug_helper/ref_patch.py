@@ -35,7 +35,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
-from typing import Callable, Iterator, Optional
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -52,7 +52,7 @@ def _make_dump_fn(
     layer_id: int,
     cls_name: str,
     side_prefix: str = "ref",
-) -> Optional[Callable[[str, torch.Tensor], None]]:
+) -> Callable[[str, torch.Tensor], None] | None:
     """Return a ``dump(stage_name, tensor)`` closure or None when disabled.
 
     Filename format: ``{side_prefix}_layer{LL}_{cls_name}__{stage_name}_rank{R}.pt``
@@ -123,7 +123,7 @@ def patch_block_forward(
     block_class: type,
     layer_attr: str = "layer_id",
     side_prefix: str = "ref",
-    extra_stages: Optional[dict[str, Callable]] = None,
+    extra_stages: dict[str, Callable] | None = None,
 ) -> Iterator[None]:
     """Patch ``block_class.forward`` to dump hidden_in / hidden_out per layer.
 
@@ -167,7 +167,7 @@ def patch_block_forward(
 def patch_module_dump(
     target_class: type,
     method_name: str = "forward",
-    cls_name_override: Optional[str] = None,
+    cls_name_override: str | None = None,
     side_prefix: str = "ref",
     parent_layer_attr: str = "layer_id",
 ) -> Iterator[None]:

@@ -18,7 +18,7 @@ def apply_attention_gdn_rtpllm_patch() -> None:
     if _PATCHED:
         return
 
-    import atom.model_ops.attention_gdn as attention_gdn
+    from atom.model_ops import attention_gdn
 
     def _patched_gdn_forward(
         self,

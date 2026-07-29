@@ -63,7 +63,7 @@ def setup_deepseek_for_sglang(model) -> None:
 
 
 def _patch_mla_attention_for_sglang(
-    attn: "DeepseekV2MLAAttention",
+    attn: DeepseekV2MLAAttention,
     config: Any,
     kv_cache_dtype: str = "bf16",
 ) -> None:
@@ -79,13 +79,14 @@ def _patch_mla_attention_for_sglang(
     )
 
 
-def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None:
+def _patch_indexer_for_sglang_sparse_mla(attn: DeepseekV2MLAAttention) -> None:
     """Adapt DeepSeek-V3.2 sparse indexer buffers for SGLang plugin mode."""
     indexer = getattr(attn, "indexer", None)
     if indexer is None or getattr(indexer, "_atom_sglang_topk_buffer_patched", False):
         return
 
     import torch
+
     import atom.plugin.sglang.attention_backend.sparse_mla_indexer  # noqa: F401
 
     original_forward = indexer.forward
@@ -121,7 +122,7 @@ def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None
     indexer._atom_sglang_topk_buffer_patched = True
 
 
-def _align_qknorm_fusion_for_sglang(attn: "DeepseekV2MLAAttention") -> None:
+def _align_qknorm_fusion_for_sglang(attn: DeepseekV2MLAAttention) -> None:
     """Keep non-quant q/k norm fusion on the BF16 path in SGLang plugin mode."""
     if getattr(attn, "fuse_qknorm", False) and not getattr(
         attn, "fuse_qknorm_quant", False

@@ -13,12 +13,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
     MultiConnectorMetadata,
     MultiConnectorScheduler,
 )
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors

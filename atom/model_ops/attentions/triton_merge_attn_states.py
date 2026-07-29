@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import aiter
 import torch
 import triton
 import triton.language as tl
-
-import aiter
 
 float8_info = torch.finfo(aiter.dtypes.fp8)
 

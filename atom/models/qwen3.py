@@ -24,14 +24,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Iterable, Union
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import Qwen3Config
+
 from atom.config import Config
+from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.model_ops.activation import SiluAndMul
 
 # from atom.model_ops.attention import Attention
@@ -43,12 +48,8 @@ from atom.model_ops.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import Qwen3Config
-
-from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.models.utils import maybe_prefix
+from atom.utils.decorators import support_torch_compile
 
 
 class Qwen3Attention(nn.Module):
@@ -265,7 +266,7 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         **model_kwargs: dict[str, Any],
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[int, torch.Tensor]]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
         capture_layer_ids = model_kwargs.pop("capture_hidden_state_layers", None)
 
         hidden_states = self.embed_tokens(input_ids)

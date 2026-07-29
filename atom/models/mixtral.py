@@ -24,11 +24,12 @@
 # limitations under the License.
 """Inference-only Mixtral model."""
 
-from typing import Optional, Union
-
 import torch
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import MixtralConfig
+
 from atom.config import Config, QuantizationConfig
 
 # from atom.model_ops.attention import Attention
@@ -44,8 +45,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import MixtralConfig
 
 
 class MixtralMoE(nn.Module):
@@ -64,9 +63,9 @@ class MixtralMoE(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
-        dp_size: Optional[int] = None,
+        quant_config: QuantizationConfig | None = None,
+        tp_size: int | None = None,
+        dp_size: int | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -117,7 +116,7 @@ class MixtralAttention(nn.Module):
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
         cache_config: str = "bf16",
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_num: int = 0,
     ) -> None:
@@ -200,7 +199,7 @@ class MixtralDecoderLayer(nn.Module):
         self,
         config: MixtralConfig,
         cache_config: str = "bf16",
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_num: int = 0,
     ) -> None:
@@ -238,7 +237,7 @@ class MixtralDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -304,9 +303,9 @@ class MixtralModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -371,9 +370,9 @@ class MixtralForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -382,7 +381,7 @@ class MixtralForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 

@@ -220,7 +220,7 @@ class MultiConnector(KVConnectorBase):
             if reqs:
                 for req in reqs:
                     if getattr(req, "save_spec", None) is not None:
-                        self._pending_save.add(str(getattr(req, "req_id")))
+                        self._pending_save.add(str(req.req_id))
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:

@@ -6,9 +6,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.nn as nn
 from aiter import dtypes
-
+from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -86,7 +85,7 @@ def _v4_entry_bytes(head_dim: int, rope_head_dim: int, kv_fp8: bool) -> int:
 
 def deepseek_v4_draft_proxy_layer_name(hf_config) -> str:
     return (
-        f"model.layers.{int(getattr(hf_config, 'num_hidden_layers'))}."
+        f"model.layers.{int(hf_config.num_hidden_layers)}."
         f"{ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX}"
     )
 
@@ -1847,7 +1846,6 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     # the shared SWA window prefix into all three buffers, a second appends
     # the HCA compress tail straight from the GPU block table
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
-
     from atom.plugin.vllm.deepseek_v4_ops import (
         write_v4_decode_hca_compress_tail,
     )

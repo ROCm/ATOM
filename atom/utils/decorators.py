@@ -1,31 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
+import os
+import sys
+import time
+from abc import abstractmethod
+from collections.abc import Callable
+from contextlib import contextmanager
+from functools import wraps
+from types import CodeType
 from typing import (
-    Callable,
     Literal,
     Optional,
     ParamSpec,
     TypeVar,
-    Union,
+)
+from typing import (
     overload as _overload,
 )
-import inspect
-import os
-import sys
-from functools import wraps
-from types import CodeType
-from abc import abstractmethod
-from contextlib import contextmanager
 from unittest.mock import patch
 
-from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 import torch
-import torch.nn as nn
-import time
+from torch import nn
+from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 
-from atom.config import CompilationConfig, Config, CompilationLevel
-
+from atom.config import CompilationConfig, CompilationLevel, Config
 from atom.utils.graph_marker import graph_marker
 
 # from atom.utils import start_monitoring_torch_compile
@@ -42,7 +42,7 @@ def _resolve_record_span_name(
     func: Callable,
     args,
     kwargs,
-    explicit_prefix: Optional[str] = None,
+    explicit_prefix: str | None = None,
 ):
     if explicit_prefix is not None:
         return str(explicit_prefix)
@@ -77,7 +77,7 @@ def _resolve_record_span_name(
     return span_name
 
 
-def _decorate_record_function(func: Callable, prefix: Optional[str] = None):
+def _decorate_record_function(func: Callable, prefix: str | None = None):
     @wraps(func)
     def _wrapped(*args, **kwargs):
         # Keep this decorator no-op unless mark-trace is enabled.
@@ -133,7 +133,7 @@ def _graph_marker_first_tensor(obj, name: str):
     return obj, False
 
 
-def _decorate_mark_trace_torch_compile(func: Callable, prefix: Optional[str] = None):
+def _decorate_mark_trace_torch_compile(func: Callable, prefix: str | None = None):
     if getattr(func, "__mark_trace_wrapped__", False):
         return func
 
@@ -202,7 +202,7 @@ def _is_torch_compiling() -> bool:
         return False
 
 
-def _decorate_mark_trace_auto(func: Callable, prefix: Optional[str] = None):
+def _decorate_mark_trace_auto(func: Callable, prefix: str | None = None):
     compiled_wrapped = _decorate_mark_trace_torch_compile(func, prefix)
     record_wrapped = _decorate_record_function(func, prefix)
 
@@ -225,14 +225,14 @@ def mark_trace(func: Callable[_P, _R], /) -> Callable[_P, _R]: ...
 @_overload
 def mark_trace(
     *,
-    torch_compile: Union[bool, Literal["auto"]] = ...,
-    prefix: Optional[str] = ...,
+    torch_compile: bool | Literal["auto"] = ...,
+    prefix: str | None = ...,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
 def mark_trace(
-    func: Optional[Callable] = None,
+    func: Callable | None = None,
     *,
-    torch_compile: Union[bool, Literal["auto"]] = "auto",
-    prefix: Optional[str] = None,
+    torch_compile: bool | Literal["auto"] = "auto",
+    prefix: str | None = None,
 ):
     """
     Unified trace decorator.
@@ -306,7 +306,7 @@ class TorchCompileWrapperWithCustomDispatcher:
     def __init__(
         self,
         vllm_config: Config,
-        compiled_callable: Optional[Callable] = None,
+        compiled_callable: Callable | None = None,
         compilation_level: int = 0,
     ):
         self.vllm_config = vllm_config
@@ -398,7 +398,7 @@ class TorchCompileWrapperWithCustomDispatcher:
             msg = (
                 "Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code. The following code contains clues about which buffer is being modified (please search for the usage of the function `update`):\n"
                 + src
-            )  # noqa
+            )
             raise RuntimeError(msg)
 
     @contextmanager
@@ -410,17 +410,17 @@ class TorchCompileWrapperWithCustomDispatcher:
         the code object in the function and call it.
 
         See https://dev-discuss.pytorch.org/t/what-is-the-relationship-requirement-among-original-bytecode-transformed-bytecode-and-bytecode-returned-by-hooks-in-dynamo/1693/7 for more details.
-        """  # noqa
+        """
         self.__class__.forward.__code__ = self.compiled_codes[index]
         yield
         self.__class__.forward.__code__ = self.original_code_object
 
 
 def support_torch_compile(
-    cls: Optional[_T] = None,
+    cls: _T | None = None,
     *,
-    dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None,
-) -> Union[Callable[[_T], _T], _T]:
+    dynamic_arg_dims: dict[str, int | list[int]] | None = None,
+) -> Callable[[_T], _T] | _T:
     def cls_decorator_helper(cls: _T) -> _T:
         # helper to pass `dynamic_arg_dims`` to `_support_torch_compile``
         # to avoid too much indentation for `_support_torch_compile``
@@ -460,7 +460,7 @@ def support_torch_compile(
 
 def _support_torch_compile(
     cls: _T,
-    dynamic_arg_dims: dict[str, Union[int, list[int]]],
+    dynamic_arg_dims: dict[str, int | list[int]],
 ) -> _T:
     """
     A decorator to add support for compiling the forward method of a class.

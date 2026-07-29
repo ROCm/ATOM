@@ -1,9 +1,13 @@
 from itertools import islice
+from typing import Any
 
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_ep_group, get_pp_group, get_tp_group
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers.models.glm4_moe import Glm4MoeConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
@@ -17,16 +21,13 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.utils import atom_parameter
 from atom.model_ops.topK import (
     is_rocm_aiter_fuse_routed_scaling_factor,
     is_rocm_aiter_fusion_shared_expert_enabled,
 )
+from atom.model_ops.utils import atom_parameter
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers.models.glm4_moe import Glm4MoeConfig
-from typing import Any
 
 from .utils import (
     IntermediateTensors,

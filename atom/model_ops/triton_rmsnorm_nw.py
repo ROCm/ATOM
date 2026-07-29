@@ -1,10 +1,9 @@
 """Weight-free RMSNorm Triton kernel: out = x * rsqrt(mean(x², -1) + eps)."""
 
 import torch
-from torch import Tensor
-
 import triton
 import triton.language as tl
+from torch import Tensor
 
 
 @triton.jit

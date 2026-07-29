@@ -1,24 +1,8 @@
 from collections.abc import Iterable
 
 import torch
-from torch import nn
-
 from aiter.dist.parallel_state import get_tensor_model_parallel_rank
-from atom.config import Config
-from atom.models import qwen3_5 as qwen3_5_base
-from atom.models.qwen3_5 import (
-    Qwen3_5Config,
-    Qwen3_5ForCausalLM as Qwen3_5ForCausalLMBase,
-    Qwen3_5GatedDeltaNet,
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeForCausalLM as Qwen3_5MoeForCausalLMBase,
-    detect_fused_expert_format,
-    get_fused_expert_mapping,
-    load_fused_expert_weights,
-    maybe_prefix,
-)
-from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
-from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
+from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -30,17 +14,41 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.models.interfaces import IsHybrid
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration as vLLMQwen3_5,
+)
+from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration as vLLMQwen3_5Moe,
+)
+from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5MoeProcessingInfo,
     Qwen3_5ProcessingInfo,
 )
 from vllm.model_executor.models.qwen3_vl import (
+    Qwen3_VisionTransformer,
     Qwen3VLDummyInputsBuilder,
     Qwen3VLMultiModalProcessor,
-    Qwen3_VisionTransformer,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+from atom.config import Config
+from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
+from atom.models import qwen3_5 as qwen3_5_base
+from atom.models.qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5GatedDeltaNet,
+    Qwen3_5MoeConfig,
+    detect_fused_expert_format,
+    get_fused_expert_mapping,
+    load_fused_expert_weights,
+    maybe_prefix,
+)
+from atom.models.qwen3_5 import (
+    Qwen3_5ForCausalLM as Qwen3_5ForCausalLMBase,
+)
+from atom.models.qwen3_5 import (
+    Qwen3_5MoeForCausalLM as Qwen3_5MoeForCausalLMBase,
+)
+from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 
 
 class Qwen3_5GatedDeltaNetVllm(Qwen3_5GatedDeltaNet, MambaBase):

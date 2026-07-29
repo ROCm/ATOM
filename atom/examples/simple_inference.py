@@ -3,6 +3,8 @@
 
 import argparse
 
+from transformers import AutoTokenizer
+
 from atom import SamplingParams
 from atom.entrypoints.openai.chat_encoders import (
     apply_chat_template,
@@ -10,7 +12,6 @@ from atom.entrypoints.openai.chat_encoders import (
 )
 from atom.model_engine.arg_utils import EngineArgs
 from atom.utils.arg_parser import FlexibleArgumentParser
-from transformers import AutoTokenizer
 
 parser = FlexibleArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

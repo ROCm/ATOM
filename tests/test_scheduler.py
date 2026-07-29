@@ -7,16 +7,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+from conftest import MockConfig
 
 from atom.model_engine.scheduler import (
     ScheduledBatch,
-    Scheduler,
     ScheduledBatchOutput,
+    Scheduler,
     SpecStats,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
-from conftest import MockConfig
 
 # ── SpecStats ──────────────────────────────────────────────────────────────
 

@@ -66,6 +66,7 @@ def _build_module():
 class TestDummyWeightInit(unittest.TestCase):
     def test_xavier_mode(self):
         import torch
+
         from atom.model_loader.loader import (
             _E8M0_UNIT_CODE,
             _FP4_UNIT_BYTE,

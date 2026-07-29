@@ -6,14 +6,11 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from atom.model_ops.mamba_ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+from torch import nn
+from vllm.distributed import get_tensor_model_parallel_world_size
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from vllm.forward_context import get_forward_context
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
@@ -38,10 +35,11 @@ from atom.model_ops.fla_ops.chunk_vk import chunk_gated_delta_rule_vk
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
-
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from atom.utils import envs
-
-from torch import nn
 
 USE_FLYDSL_GDR = envs.ATOM_USE_FLYDSL_GDR
 try:
@@ -442,12 +440,8 @@ class GatedDeltaNet(nn.Module):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = (
-            attn_metadata.spec_state_indices_tensor
-        )  # noqa: E501
-        non_spec_state_indices_tensor = (
-            attn_metadata.non_spec_state_indices_tensor
-        )  # noqa: E501
+        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
         compilation_config = forward_context.no_compile_layers
         self_kv_cache = compilation_config[layer_name].kv_cache
         conv_state = self_kv_cache[0].transpose(-1, -2)

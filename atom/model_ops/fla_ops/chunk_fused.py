@@ -28,7 +28,6 @@ Correctness reference: vllm.model_executor.layers.fla.ops.chunk_gated_delta_rule
 from __future__ import annotations
 
 import torch
-
 import triton
 import triton.language as tl
 

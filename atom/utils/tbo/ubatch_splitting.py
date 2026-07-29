@@ -3,7 +3,6 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -58,10 +57,10 @@ def maybe_create_ubatch_slices(
     num_tokens: int,
     num_ubatches: int = 2,
     is_prefill: bool = False,
-    num_scheduled_tokens: Optional[np.ndarray] = None,
-    max_tokens_per_ubatch: Optional[int] = None,
+    num_scheduled_tokens: np.ndarray | None = None,
+    max_tokens_per_ubatch: int | None = None,
     force: bool = False,
-) -> Optional[list[UBatchSlice]]:
+) -> list[UBatchSlice] | None:
     """Split a batch into N micro-batch slices.
 
     For decode: split by request count (uniform tokens per request).
@@ -136,8 +135,8 @@ def _split_prefill_balanced(
     num_reqs: int,
     num_scheduled_tokens: list[int],
     num_ubatches: int,
-    max_tokens_per_ubatch: Optional[int],
-) -> Optional[list[UBatchSlice]]:
+    max_tokens_per_ubatch: int | None,
+) -> list[UBatchSlice] | None:
     """Split prefill requests into ubatches balanced by token count.
 
     Finds the request boundary closest to total_tokens / num_ubatches,
@@ -193,8 +192,8 @@ def _split_prefill_token_midpoint(
     num_reqs: int,
     num_scheduled_tokens: list[int],
     num_ubatches: int,
-    max_tokens_per_ubatch: Optional[int],
-) -> Optional[list[UBatchSlice]]:
+    max_tokens_per_ubatch: int | None,
+) -> list[UBatchSlice] | None:
     """split prefill at the exact token midpoint."""
     toks = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
     total_tokens = int(toks.sum())

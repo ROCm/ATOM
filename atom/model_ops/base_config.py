@@ -3,7 +3,6 @@
 
 import inspect
 from abc import ABC, abstractmethod
-from typing import Type
 
 import torch
 from torch import nn
@@ -43,7 +42,7 @@ class QuantizeMethodBase(ABC):
         return
 
 
-def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:
+def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
     """
     Not all quant methods have embedding implemented, so we need to check that
     it exists for our given method. We check this by making sure the function

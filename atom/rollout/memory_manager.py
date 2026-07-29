@@ -2,9 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Optional
 
 import torch
+
 from atom.utils.forward_context import set_kv_cache_data
 
 logger = logging.getLogger("atom")
@@ -38,7 +38,7 @@ class MemoryManagerMixin:
         logger.debug(f"{self.label}: KV cache cleared")
         return True
 
-    def release_memory(self, tags: Optional[list[str]] = None) -> bool:
+    def release_memory(self, tags: list[str] | None = None) -> bool:
 
         if tags is None:
             tags = ["weights", "kv_cache"]
@@ -67,7 +67,7 @@ class MemoryManagerMixin:
         logger.info(f"{self.label}: GPU memory released, tags={tags}")
         return True
 
-    def resume_memory(self, tags: Optional[list[str]] = None) -> bool:
+    def resume_memory(self, tags: list[str] | None = None) -> bool:
 
         if tags is None:
             tags = ["weights", "kv_cache"]

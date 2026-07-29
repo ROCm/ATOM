@@ -19,9 +19,9 @@ import msgpack
 import zmq
 
 from atom.kv_transfer.disaggregation.moriio.moriio_common import (
+    _MORIIO_AVAILABLE,
     MoRIIOConstants,
     Role,
-    _MORIIO_AVAILABLE,
     get_role,
 )
 from atom.kv_transfer.disaggregation.types import RemoteAllocInfo

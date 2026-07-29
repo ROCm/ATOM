@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any
 
 import filelock
 import huggingface_hub.constants
@@ -49,7 +49,7 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
-def get_lock(model_name_or_path: Union[str, Path], cache_dir: Optional[str] = None):
+def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     lock_dir = cache_dir or temp_dir
     model_name_or_path = str(model_name_or_path)
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
@@ -64,10 +64,10 @@ def get_lock(model_name_or_path: Union[str, Path], cache_dir: Optional[str] = No
 
 def download_weights_from_hf(
     model_name_or_path: str,
-    cache_dir: Optional[str],
+    cache_dir: str | None,
     allow_patterns: list[str],
-    revision: Optional[str] = None,
-    ignore_patterns: Optional[Union[str, list[str]]] = None,
+    revision: str | None = None,
+    ignore_patterns: str | list[str] | None = None,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -125,7 +125,7 @@ def download_weights_from_hf(
 
 def set_weight_attrs(
     weight: torch.Tensor,
-    weight_attrs: Optional[dict[str, Any]],
+    weight_attrs: dict[str, Any] | None,
 ):
     """Set attributes on a weight tensor.
 
@@ -154,8 +154,8 @@ def set_weight_attrs(
 
 
 def filter_duplicate_safetensors_files(
-    hf_weights_files: List[str], hf_folder: str, index_file: str
-) -> List[str]:
+    hf_weights_files: list[str], hf_folder: str, index_file: str
+) -> list[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, index_file)

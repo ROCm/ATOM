@@ -17,7 +17,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -31,6 +30,9 @@ from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_wo
 
 # from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import GptOssConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -41,8 +43,6 @@ from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParall
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
 
-from atom.utils import envs
-
 # from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from atom.models.utils import (
     IntermediateTensors,
@@ -50,9 +50,8 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import GptOssConfig
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 
@@ -65,7 +64,7 @@ class OAIAttention(nn.Module):
     def __init__(
         self,
         config: GptOssConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         cache_config: str = "bf16",
         prefix: str = "",
         layer_num: int = 0,

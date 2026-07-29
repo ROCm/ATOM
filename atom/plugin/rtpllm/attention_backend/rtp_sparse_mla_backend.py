@@ -6,7 +6,7 @@ import importlib
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -28,7 +28,7 @@ def _resolve_plugin_sparse_index_converter():
     ):
         try:
             module = importlib.import_module(module_name)
-            return getattr(module, "triton_convert_req_index_to_global_index")
+            return module.triton_convert_req_index_to_global_index
         except Exception as exc:
             errors.append(f"{module_name}: {exc}")
     raise _SparseUnavailable(
@@ -76,7 +76,7 @@ class _LightweightSparseMlaImpl:
         *,
         topk_indices: torch.Tensor,
         attn_metadata: object,
-        positions: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.calls.append(
             {
@@ -101,13 +101,13 @@ class _RealSparseMlaImpl:
         *,
         mla_modules: Any,
         v_head_dim: int,
-        scale: Optional[float] = None,
+        scale: float | None = None,
     ) -> None:
         self.mla_modules = mla_modules
         self.v_head_dim = int(v_head_dim)
-        self.kv_lora_rank = int(getattr(mla_modules, "kv_lora_rank"))
-        self.qk_nope_head_dim = int(getattr(mla_modules, "qk_nope_head_dim"))
-        self.qk_rope_head_dim = int(getattr(mla_modules, "qk_rope_head_dim"))
+        self.kv_lora_rank = int(mla_modules.kv_lora_rank)
+        self.qk_nope_head_dim = int(mla_modules.qk_nope_head_dim)
+        self.qk_rope_head_dim = int(mla_modules.qk_rope_head_dim)
         self.num_heads = int(getattr(mla_modules, "num_heads", 0) or 0)
         self.rotary_emb = getattr(mla_modules, "rotary_emb", None)
         self.kv_b_proj = getattr(mla_modules, "kv_b_proj", None)
@@ -302,7 +302,7 @@ class _RealSparseMlaImpl:
         self,
         q: torch.Tensor,
         k_pe: torch.Tensor,
-        positions: Optional[torch.Tensor],
+        positions: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rope_dim = int(self.qk_rope_head_dim)
         if rope_dim == 0:
@@ -1264,7 +1264,7 @@ class _RealSparseMlaImpl:
         *,
         topk_indices: torch.Tensor,
         attn_metadata: object,
-        positions: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del layer_id
         if attn_metadata is None:
@@ -1370,17 +1370,17 @@ class RTPSparseMlaBackend:
     def __init__(
         self,
         *,
-        sparse_impl: Optional[object] = None,
-        v_head_dim: Optional[int] = None,
-        mla_modules: Optional[object] = None,
-        scale: Optional[float] = None,
+        sparse_impl: object | None = None,
+        v_head_dim: int | None = None,
+        mla_modules: object | None = None,
+        scale: float | None = None,
     ) -> None:
         if v_head_dim is None:
             if mla_modules is None or not hasattr(mla_modules, "v_head_dim"):
                 raise ValueError(
                     "RTPSparseMlaBackend requires v_head_dim or mla_modules.v_head_dim."
                 )
-            v_head_dim = getattr(mla_modules, "v_head_dim")
+            v_head_dim = mla_modules.v_head_dim
         self.v_head_dim = int(v_head_dim)
         if sparse_impl is not None:
             self.sparse_impl = sparse_impl
@@ -1408,7 +1408,7 @@ class RTPSparseMlaBackend:
             self.sparse_impl
         )
 
-    def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
+    def prepare_cuda_graph(self, attn_inputs) -> None:
         del attn_inputs
 
     def prewarm_for_cuda_graph(
@@ -1472,8 +1472,8 @@ class RTPSparseMlaBackend:
         k_pe: torch.Tensor,
         kv_cache: object,
         layer_id: int,
-        topk_indices: Optional[torch.Tensor] = None,
-        positions: Optional[torch.Tensor] = None,
+        topk_indices: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_metadata = self._get_attn_metadata()
         if getattr(
@@ -1524,7 +1524,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -1552,6 +1552,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
     )
     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
     from atom.config import get_current_atom_config
 
     slot_mapping = getattr(attn_metadata, "slot_mapping", None)
@@ -1730,7 +1731,7 @@ def rtp_sparse_attn_indexer(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -1856,7 +1857,7 @@ def rtp_sparse_attn_indexer_fake(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,

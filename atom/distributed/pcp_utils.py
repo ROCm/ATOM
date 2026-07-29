@@ -14,10 +14,9 @@ Ported from SGLang's DSA round-robin CP path
 """
 
 import logging
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import torch
-
 from aiter.dist.parallel_state import (
     get_pcp_group,
     get_prefill_context_model_parallel_rank,
@@ -61,7 +60,7 @@ def pcp_is_enabled() -> bool:
 
 def pcp_pad_len(
     total_tokens: int,
-    pcp_size: Optional[int] = None,
+    pcp_size: int | None = None,
     multiple: int = 1,
 ) -> int:
     """Padded token count so the global sequence is divisible by pcp_size * multiple.
@@ -86,7 +85,7 @@ def pcp_pad_len(
 
 
 def pcp_round_robin_split(
-    input_: torch.Tensor, pcp_size: Optional[int] = None, pcp_rank: Optional[int] = None
+    input_: torch.Tensor, pcp_size: int | None = None, pcp_rank: int | None = None
 ) -> torch.Tensor:
     """Take this rank's round-robin shard along dim 0.
 
@@ -109,7 +108,7 @@ def pcp_round_robin_split(
 
 
 def pcp_allgather_rerange(
-    input_: torch.Tensor, pcp_size: Optional[int] = None
+    input_: torch.Tensor, pcp_size: int | None = None
 ) -> torch.Tensor:
     """All-gather round-robin shards along dim 0 and restore original token order.
 
@@ -150,7 +149,7 @@ def pcp_allgather_rerange(
 
 
 def pcp_allgather_rankmajor(
-    input_: torch.Tensor, pcp_size: Optional[int] = None
+    input_: torch.Tensor, pcp_size: int | None = None
 ) -> torch.Tensor:
     """Gather this rank's 1/W stripe shard into the full rank-major sequence
     via a plain all_gather (dim=0). Inverse of pcp_reduce_scatter."""
@@ -162,7 +161,7 @@ def pcp_allgather_rankmajor(
 
 
 def pcp_reduce_scatter(
-    input_: torch.Tensor, pcp_size: Optional[int] = None
+    input_: torch.Tensor, pcp_size: int | None = None
 ) -> torch.Tensor:
     """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
     stripe via a plain reduce_scatter (dim=0). Inverse of pcp_allgather_rankmajor."""
@@ -173,9 +172,7 @@ def pcp_reduce_scatter(
     return get_pcp_group().reduce_scatter(input_.contiguous(), dim=0)
 
 
-def pcp_all_reduce(
-    input_: torch.Tensor, pcp_size: Optional[int] = None
-) -> torch.Tensor:
+def pcp_all_reduce(input_: torch.Tensor, pcp_size: int | None = None) -> torch.Tensor:
     """All-reduce (sum) over the PCP group, no token reshaping. DECODE path:
     tokens are pcp-redundant (every rank holds the same full batch), so just sum
     the pcp-half of the intermediate that combine_outputs' tp all_reduce missed.
@@ -189,7 +186,7 @@ def pcp_all_reduce(
 
 
 def pcp_round_robin_query_indices(
-    n_global_q: int, pcp_size: Optional[int] = None, pcp_rank: Optional[int] = None
+    n_global_q: int, pcp_size: int | None = None, pcp_rank: int | None = None
 ) -> torch.Tensor:
     """Global query indices owned by this rank under round-robin split.
 

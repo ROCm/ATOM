@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 
 import torch
-
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,

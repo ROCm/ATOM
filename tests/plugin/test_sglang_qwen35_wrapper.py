@@ -82,7 +82,7 @@ def _make_fake_modules() -> dict[str, ModuleType]:
             Qwen3_5Model=type("Qwen3_5Model", (), {}),
             Qwen3_5MoeForCausalLM=type("Qwen3_5MoeForCausalLM", (), {}),
             detect_fused_expert_format=lambda *_a, **_k: False,
-            get_fused_expert_mapping=lambda: [],
+            get_fused_expert_mapping=list,
             load_fused_expert_weights=lambda *_a, **_k: True,
         ),
         "atom.models.utils": _module(

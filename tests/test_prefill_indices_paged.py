@@ -3,8 +3,8 @@
 Exercises prefix_swa_count>0 (the cross-request prefix-hit boundary path)."""
 
 import numpy as np
-import torch
 import pytest
+import torch
 
 try:
     import atom.model_ops.v4_kernels  # noqa: F401  (triggers the heavy import chain)

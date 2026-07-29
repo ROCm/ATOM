@@ -13,9 +13,9 @@ Returns freshly allocated contiguous (q_out, k_out).
 """
 
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
 
 @triton.jit

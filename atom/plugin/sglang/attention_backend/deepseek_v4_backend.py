@@ -391,7 +391,6 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
         ATOMDeepseekV4BackendForSgl._last_atom_v4_graph_metadata = (
             self.atom_v4_graph_metadata
         )
-        return None
 
     def get_cuda_graph_seq_len_fill_value(self):
         return int(self._cuda_graph_seq_len_fill_value)

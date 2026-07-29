@@ -18,6 +18,8 @@ Weight keys map directly to model attribute paths; no key rewriting needed.
 import torch
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
+from torch import nn
+
 from atom.config import Config
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
@@ -39,7 +41,6 @@ from atom.model_ops.linear import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from torch import nn
 
 # AR+RMSNorm fusion: when on (default), RowParallel o_proj/down_proj skip their
 # own all-reduce (reduce_results=False) and the downstream RMSNorm fuses

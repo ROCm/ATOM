@@ -10,10 +10,10 @@ import pickle
 import queue
 import weakref
 from threading import Lock, Thread
-from typing import List, Optional
 
 import zmq
 import zmq.asyncio
+
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
@@ -50,7 +50,7 @@ class CoreManager:
         else:
             self.local_engine_count = config.parallel_config.data_parallel_size
         self.ctx = zmq.Context(io_threads=2)
-        self.outputs_queue = queue.Queue[List[Sequence]]()
+        self.outputs_queue = queue.Queue[list[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
         self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
@@ -335,7 +335,7 @@ class CoreManager:
                 break
             await self.async_output_queue.put(seqs)
 
-    async def get_output_async(self) -> List[Sequence]:
+    async def get_output_async(self) -> list[Sequence]:
         if not self.async_output_queue:
             raise RuntimeError("Engine async mode not enabled")
 
@@ -410,7 +410,7 @@ class CoreManager:
 
         logger.info(f"{self.label}: All EngineCores shut down")
 
-    def add_request(self, seqs: List[Sequence]):
+    def add_request(self, seqs: list[Sequence]):
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
@@ -432,7 +432,7 @@ class CoreManager:
         else:
             self._dispatch_to_dp_ranks(seqs)
 
-    def _resolve_and_validate_hints(self, seqs: List[Sequence]) -> List[Optional[int]]:
+    def _resolve_and_validate_hints(self, seqs: list[Sequence]) -> list[int | None]:
         """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
         the whole batch, once.
 
@@ -444,7 +444,7 @@ class CoreManager:
         of a batch cannot leave earlier siblings charged-but-undispatched (a
         permanent in-flight-load leak).
         """
-        hints: List[Optional[int]] = []
+        hints: list[int | None] = []
         for seq in seqs:
             raw = getattr(seq, "data_parallel_rank", None)
             hint = None if raw is None else int(raw)
@@ -456,7 +456,7 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: List[Sequence]) -> None:
+    def _dispatch_to_dp_ranks(self, seqs: list[Sequence]) -> None:
         """Route a batch across DP ranks and send each rank its sub-batch.
 
         Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
@@ -744,7 +744,7 @@ class CoreManager:
                     f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}"
                 )
 
-    def get_output(self) -> List[Sequence]:
+    def get_output(self) -> list[Sequence]:
         seqs = self.outputs_queue.get()
         if isinstance(seqs, BaseException):
             raise seqs
@@ -894,7 +894,7 @@ class DisaggCoreManager(CoreManager):
         decode_input_addr = get_open_zmq_ipc_path()
         decode_output_addr = get_open_zmq_ipc_path()
 
-        from atom.model_engine.engine_core import PrefillEngineCore, DecodeEngineCore
+        from atom.model_engine.engine_core import DecodeEngineCore, PrefillEngineCore
 
         prefill_proc = multiprocessing.Process(
             target=PrefillEngineCore.run_engine,
@@ -1023,7 +1023,7 @@ class DisaggCoreManager(CoreManager):
                     f"{self.label}: process {idx} sent SHUTDOWN during initialization"
                 )
 
-    def add_request(self, seqs: List[Sequence]):
+    def add_request(self, seqs: list[Sequence]):
         """Fan-out: send every new sequence to BOTH prefill and decode."""
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
         # Register stream callbacks before sending (decode will produce output).

@@ -5,10 +5,10 @@ import gc
 import logging
 import time
 import uuid
-from typing import Callable
+from collections.abc import Callable
+from multiprocessing import shared_memory
 
 import torch
-from multiprocessing import shared_memory
 
 logger = logging.getLogger("atom")
 

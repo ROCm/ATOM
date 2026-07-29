@@ -22,19 +22,21 @@ import time
 import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any
 
 import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
+
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.utils.arg_parser import FlexibleArgumentParser
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
 from .protocol import (
@@ -42,12 +44,6 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
-)
-from .serving_chat import (
-    build_chat_response,
-    build_chat_response_multi,
-    stream_chat_response,
-    stream_chat_response_fanout,
 )
 from .serving_anthropic import (
     AnthropicMessagesRequest,
@@ -61,6 +57,12 @@ from .serving_anthropic import (
     stream_message_start,
     stream_message_stop,
     stream_signature_delta,
+)
+from .serving_chat import (
+    build_chat_response,
+    build_chat_response_multi,
+    stream_chat_response,
+    stream_chat_response_fanout,
 )
 from .serving_completion import (
     build_completion_response,
@@ -82,16 +84,16 @@ DEFAULT_PORT = 8000
 # ============================================================================
 
 engine = None
-tokenizer: Optional[AutoTokenizer] = None
-processor: Optional[Any] = None
+tokenizer: AutoTokenizer | None = None
+processor: Any | None = None
 model_name: str = ""
-default_chat_template_kwargs: Dict[str, Any] = {}
-custom_message_encoder: Optional[Any] = None
-_stream_queues: Dict[str, asyncio.Queue] = {}
-_seq_id_to_request_id: Dict[int, str] = {}
-_stream_loops: Dict[str, AbstractEventLoop] = {}
-_request_start_times: Dict[str, float] = {}
-_request_logger: Optional[logging.Logger] = None
+default_chat_template_kwargs: dict[str, Any] = {}
+custom_message_encoder: Any | None = None
+_stream_queues: dict[str, asyncio.Queue] = {}
+_seq_id_to_request_id: dict[int, str] = {}
+_stream_loops: dict[str, AbstractEventLoop] = {}
+_request_start_times: dict[str, float] = {}
+_request_logger: logging.Logger | None = None
 
 
 # ============================================================================
@@ -134,7 +136,7 @@ async def _logged_stream(
 def _build_sampling_params(
     temperature: float,
     max_tokens: int,
-    stop_strings: Optional[List[str]],
+    stop_strings: list[str] | None,
     ignore_eos: bool,
     top_k: int = -1,
     top_p: float = 1.0,
@@ -151,7 +153,7 @@ def _build_sampling_params(
     )
 
 
-def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
+def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     """Return an effective ``n`` for a request.
 
     * ``None``/``<1`` coerce to ``1`` (matches OpenAI default).
@@ -165,8 +167,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
         n = int(n)
     except (TypeError, ValueError):
         n = 1
-    if n < 1:
-        n = 1
+    n = max(n, 1)
     if n > 1 and (temperature is None or temperature <= 0.0):
         logger.info(
             "n=%s requested with temperature=%s; collapsing to n=1 because "
@@ -181,7 +182,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
-    max_model_len: Optional[int],
+    max_model_len: int | None,
 ) -> None:
     if max_model_len is None:
         return
@@ -200,7 +201,7 @@ def _validate_context_length(
     )
 
 
-def _get_engine_max_model_len() -> Optional[int]:
+def _get_engine_max_model_len() -> int | None:
     config = getattr(engine, "config", None)
     if config is None:
         config = getattr(getattr(engine, "io_processor", None), "config", None)
@@ -215,7 +216,7 @@ def _validate_sequence_context_length(seq) -> None:
     )
 
 
-def _has_multimodal_content(messages: List[Any]) -> bool:
+def _has_multimodal_content(messages: list[Any]) -> bool:
     for message in messages:
         content = getattr(message, "content", None)
         if not isinstance(content, list):
@@ -240,8 +241,7 @@ def _load_image_from_url(url: str) -> Image.Image:
             image_bytes = response.read()
         return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    if url.startswith("file://"):
-        url = url[len("file://") :]
+    url = url.removeprefix("file://")
     return Image.open(url).convert("RGB")
 
 
@@ -254,12 +254,12 @@ def _get_multimodal_processor():
 
 
 def _prepare_multimodal_inputs(
-    messages: List[Any],
-    chat_template_kwargs: Dict[str, Any],
-) -> Tuple[List[int], Dict[str, Any]]:
+    messages: list[Any],
+    chat_template_kwargs: dict[str, Any],
+) -> tuple[list[int], dict[str, Any]]:
     mm_processor = _get_multimodal_processor()
-    processor_messages: List[Dict[str, Any]] = []
-    images: List[Image.Image] = []
+    processor_messages: list[dict[str, Any]] = []
+    images: list[Image.Image] = []
 
     for message in messages:
         content = getattr(message, "content", None)
@@ -267,8 +267,8 @@ def _prepare_multimodal_inputs(
             processor_messages.append({"role": message.role, "content": content or ""})
             continue
 
-        image_parts: List[Dict[str, Any]] = []
-        text_parts: List[str] = []
+        image_parts: list[dict[str, Any]] = []
+        text_parts: list[str] = []
         for part in content:
             if not isinstance(part, dict):
                 continue
@@ -382,9 +382,9 @@ async def generate_async(
     prompt: str,
     sampling_params: SamplingParams,
     request_id: str,
-    kv_transfer_params: Optional[Dict[str, Any]] = None,
-    data_parallel_rank: Optional[int] = None,
-) -> AsyncGenerator[Dict[str, Any], None]:
+    kv_transfer_params: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     global engine, tokenizer
 
@@ -392,10 +392,10 @@ async def generate_async(
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    first_token_at: Optional[float] = None
-    last_token_at: Optional[float] = None
-    all_token_ids: List[int] = []
-    finish_reason: Optional[str] = None
+    first_token_at: float | None = None
+    last_token_at: float | None = None
+    all_token_ids: list[int] = []
+    finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
     num_cached_tokens_seen = 0
@@ -504,11 +504,11 @@ async def generate_async(
 
 
 async def generate_async_multimodal(
-    token_ids: List[int],
-    multimodal_data: Dict[str, Any],
+    token_ids: list[int],
+    multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
-) -> AsyncGenerator[Dict[str, Any], None]:
+) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
     global engine, tokenizer
 
@@ -516,10 +516,10 @@ async def generate_async_multimodal(
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    first_token_at: Optional[float] = None
-    last_token_at: Optional[float] = None
-    all_token_ids: List[int] = []
-    finish_reason: Optional[str] = None
+    first_token_at: float | None = None
+    last_token_at: float | None = None
+    all_token_ids: list[int] = []
+    finish_reason: str | None = None
     seq = None
 
     def completion_callback(request_output: RequestOutput):
@@ -601,13 +601,13 @@ async def generate_async_multimodal(
 
 
 async def generate_async_fanout(
-    prompt_or_tokens: str | List[int],
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
-    kv_transfer_params: Optional[Dict[str, Any]] = None,
-    multimodal_data: Optional[Dict[str, Any]] = None,
-    data_parallel_rank: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+    kv_transfer_params: dict[str, Any] | None = None,
+    multimodal_data: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
+) -> list[dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
     Returns a list of per-sibling output dicts in the same shape as
@@ -623,10 +623,10 @@ async def generate_async_fanout(
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    per_tokens: List[List[int]] = [[] for _ in range(n)]
-    per_first_token_at: List[Optional[float]] = [None] * n
-    per_last_token_at: List[Optional[float]] = [None] * n
-    per_finish_reason: List[Optional[str]] = [None] * n
+    per_tokens: list[list[int]] = [[] for _ in range(n)]
+    per_first_token_at: list[float | None] = [None] * n
+    per_last_token_at: list[float | None] = [None] * n
+    per_finish_reason: list[str | None] = [None] * n
     finished = [False] * n
 
     def make_callback(idx: int):
@@ -705,7 +705,7 @@ async def generate_async_fanout(
             engine.io_processor.requests.pop(_seq.id, None)
 
     finished_at = time.time()
-    outputs: List[Dict[str, Any]] = []
+    outputs: list[dict[str, Any]] = []
     for i in range(n):
         num_tokens_output = len(per_tokens[i])
         ttft = (
@@ -735,7 +735,7 @@ async def generate_async_fanout(
     return outputs
 
 
-def validate_model(requested_model: Optional[str]) -> None:
+def validate_model(requested_model: str | None) -> None:
     """Validate that the requested model matches the server's model."""
     if requested_model is None:
         return
@@ -751,12 +751,12 @@ def validate_model(requested_model: Optional[str]) -> None:
 
 
 async def setup_streaming_request(
-    prompt_or_tokens: str | List[int],
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
-    kv_transfer_params: Optional[Dict[str, Any]] = None,
-    multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, asyncio.Queue, int]:
+    kv_transfer_params: dict[str, Any] | None = None,
+    multimodal_data: dict[str, Any] | None = None,
+) -> tuple[int, asyncio.Queue, int]:
     """Set up a streaming request with the engine.
 
     Returns ``(seq_id, stream_queue, num_prompt_tokens)``. ``num_prompt_tokens``
@@ -937,12 +937,12 @@ async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
 
 
 async def setup_streaming_request_fanout(
-    prompt_or_tokens: str | List[int],
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
-    kv_transfer_params: Optional[Dict[str, Any]] = None,
-    multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], asyncio.Queue, int]:
+    kv_transfer_params: dict[str, Any] | None = None,
+    multimodal_data: dict[str, Any] | None = None,
+) -> tuple[list[int], asyncio.Queue, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
     Creates ``sampling_params.n`` sibling sequences sharing one output
@@ -1397,7 +1397,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             lambda: engine.config.max_model_len,
             lambda: engine.model_config.max_model_len,
             lambda: engine.scheduler.max_model_len,
-            lambda: getattr(engine, "max_model_len"),
+            lambda: engine.max_model_len,
         ):
             try:
                 _v = _path()
@@ -1662,7 +1662,7 @@ async def get_mtp_stats():
     except Exception as e:
         logger.error(f"Failed to get MTP statistics: {e}", exc_info=True)
         raise HTTPException(
-            status_code=500, detail=f"Failed to get MTP statistics: {str(e)}"
+            status_code=500, detail=f"Failed to get MTP statistics: {e!s}"
         )
 
 
@@ -1712,9 +1712,7 @@ async def start_profile():
         return {"status": "success", "message": "Profiling started"}
     except Exception as e:
         logger.error(f"Failed to start profiling: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to start profiling: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
 
 
 @app.post("/stop_profile")
@@ -1730,9 +1728,7 @@ async def stop_profile():
         }
     except Exception as e:
         logger.error(f"Failed to stop profiling: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to stop profiling: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
 
 
 # ============================================================================

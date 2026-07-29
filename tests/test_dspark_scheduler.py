@@ -468,6 +468,7 @@ def test_ragged_graph_bucket_plan_b():
     ForwardMode-recovery / pad-tail invariants for the 10-req example.
     """
     import numpy as np
+
     from atom.spec_decode.dspark_scheduler import quantize_to_bucket, resolve_q_buckets
 
     bs, full_q = 10, 6

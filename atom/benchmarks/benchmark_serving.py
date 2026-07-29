@@ -35,9 +35,10 @@ import os
 import random
 import time
 import warnings
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiohttp
 import numpy as np
@@ -74,22 +75,22 @@ class BenchmarkMetrics:
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
-    percentiles_ttft_ms: List[Tuple[float, float]]
+    percentiles_ttft_ms: list[tuple[float, float]]
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
-    percentiles_tpot_ms: List[Tuple[float, float]]
+    percentiles_tpot_ms: list[tuple[float, float]]
     mean_itl_ms: float
     median_itl_ms: float
     std_itl_ms: float
-    percentiles_itl_ms: List[Tuple[float, float]]
+    percentiles_itl_ms: list[tuple[float, float]]
     # E2EL stands for end-to-end latency per request.
     # It is the time taken on the client side from sending
     # a request to receiving a complete response.
     mean_e2el_ms: float
     median_e2el_ms: float
     std_e2el_ms: float
-    percentiles_e2el_ms: List[Tuple[float, float]]
+    percentiles_e2el_ms: list[tuple[float, float]]
 
 
 def sample_random_requests(
@@ -101,7 +102,7 @@ def sample_random_requests(
     tokenizer: PreTrainedTokenizerBase,
     use_chat_template: bool = False,
     apply_chat_template_fn: Callable = lambda x: x,
-) -> List[Tuple[str, int, int]]:
+) -> list[tuple[str, int, int]]:
     prefix_token_ids = np.random.randint(
         0, tokenizer.vocab_size, size=prefix_len
     ).tolist()
@@ -179,10 +180,10 @@ def sample_random_requests(
 
 
 async def get_request(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: list[tuple[str, int, int]],
     request_rate: float,
     burstiness: float = 1.0,
-) -> AsyncGenerator[Tuple[str, int, int], None]:
+) -> AsyncGenerator[tuple[str, int, int], None]:
     """
     Asynchronously generates requests at a specified rate
     with OPTIONAL burstiness.
@@ -224,23 +225,23 @@ async def get_request(
 
 
 def calculate_metrics(
-    input_requests: List[Tuple[str, int, int]],
-    outputs: List[RequestFuncOutput],
+    input_requests: list[tuple[str, int, int]],
+    outputs: list[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
-    selected_percentile_metrics: List[str],
-    selected_percentiles: List[float],
-    goodput_config_dict: Dict[str, float],
-) -> Tuple[BenchmarkMetrics, List[int]]:
-    actual_output_lens: List[int] = []
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    goodput_config_dict: dict[str, float],
+) -> tuple[BenchmarkMetrics, list[int]]:
+    actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
     good_completed = 0
-    itls: List[float] = []
-    tpots: List[float] = []
-    all_tpots: List[float] = []
-    ttfts: List[float] = []
-    e2els: List[float] = []
+    itls: list[float] = []
+    tpots: list[float] = []
+    all_tpots: list[float] = []
+    ttfts: list[float] = []
+    e2els: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -344,7 +345,7 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
-async def get_spec_stats(base_url: str) -> Optional[dict]:
+async def get_spec_stats(base_url: str) -> dict | None:
     """Fetch speculative-decoding statistics from the ATOM server.
 
     Returns the ``/debug/mtp_stats`` payload (which includes
@@ -374,20 +375,20 @@ async def benchmark(
     model_id: str,
     model_name: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[Tuple[str, int, int]],
-    logprobs: Optional[int],
+    input_requests: list[tuple[str, int, int]],
+    logprobs: int | None,
     best_of: int,
     request_rate: float,
     burstiness: float,
     disable_tqdm: bool,
     num_warmups: int,
     profile: bool,
-    selected_percentile_metrics: List[str],
-    selected_percentiles: List[str],
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[str],
     ignore_eos: bool,
-    goodput_config_dict: Dict[str, float],
-    max_concurrency: Optional[int],
-    lora_modules: Optional[List[str]],
+    goodput_config_dict: dict[str, float],
+    max_concurrency: int | None,
+    lora_modules: list[str] | None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -489,7 +490,7 @@ async def benchmark(
     print("Starting main benchmark run...")
 
     benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
+    tasks: list[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content = request
         req_model_id, req_model_name = model_id, model_name
@@ -514,7 +515,7 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
         pbar.close()
@@ -662,7 +663,7 @@ def check_goodput_args(args):
                 raise ValueError(
                     f"Invalid metric name found, {slo_name}: {slo_val}. "
                     "The service level objective name should be one of "
-                    f"{str(VALID_NAMES)}. "
+                    f"{VALID_NAMES!s}. "
                 )
             if slo_val < 0:
                 raise ValueError(
@@ -690,7 +691,7 @@ def parse_goodput(slo_pairs):
 
 
 def save_to_pytorch_benchmark_format(
-    args: argparse.Namespace, results: Dict[str, Any], file_name: str
+    args: argparse.Namespace, results: dict[str, Any], file_name: str
 ) -> None:
     metrics = [
         "median_ttft_ms",
@@ -809,7 +810,7 @@ def main(args: argparse.Namespace):
 
     # Save config and results to json
     if args.save_result:
-        result_json: Dict[str, Any] = {}
+        result_json: dict[str, Any] = {}
 
         # Setup
         current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -863,7 +864,7 @@ def main(args: argparse.Namespace):
             if args.max_concurrency is not None
             else ""
         )
-        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
         if args.result_filename:
             file_name = args.result_filename
         if args.result_dir:
@@ -935,7 +936,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenizer",
         type=str,
-        help="Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
+        help="Name or path of the tokenizer, if not using the default tokenizer.",
     )
     parser.add_argument(
         "--best-of",

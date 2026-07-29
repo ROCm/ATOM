@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 from types import MethodType
-from typing import Optional
 
 import torch
 
@@ -65,7 +64,7 @@ def _use_rtp_sparse_attn_indexer(indexer: object | None) -> None:
         num_tokens = int(hidden_states.shape[0])
         topk_tokens = getattr(self, "topk_tokens", None)
         if topk_tokens is None:
-            topk_tokens = getattr(self, "index_topk")
+            topk_tokens = self.index_topk
         topk_tokens = int(topk_tokens)
         buffer = getattr(self, "topk_indices_buffer", None)
         needs_new_buffer = (
@@ -152,7 +151,7 @@ class RTPMLAAttention:
         )
 
     def _project_query(
-        self, query: torch.Tensor, q_scale: Optional[torch.Tensor]
+        self, query: torch.Tensor, q_scale: torch.Tensor | None
     ) -> tuple[torch.Tensor, bool]:
         if query.ndim == 3:
             return query, False
@@ -177,10 +176,10 @@ class RTPMLAAttention:
     def _resolve_topk_indices(
         self,
         query: torch.Tensor,
-        q_scale: Optional[torch.Tensor],
-        positions: Optional[torch.Tensor],
-        explicit_topk_indices: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
+        q_scale: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        explicit_topk_indices: torch.Tensor | None,
+    ) -> torch.Tensor | None:
         if explicit_topk_indices is not None:
             return explicit_topk_indices
         if self.indexer is None:
@@ -196,9 +195,9 @@ class RTPMLAAttention:
         query: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
+        topk_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if self.sparse_backend is None:
@@ -247,7 +246,7 @@ def apply_attention_mla_rtpllm_patch() -> None:
     deepseek_v2 = sys.modules.get("atom.models.deepseek_v2")
     if deepseek_v2 is None:
         try:
-            import atom.models.deepseek_v2 as deepseek_v2
+            from atom.models import deepseek_v2
         except (ImportError, ModuleNotFoundError):
             return
     deepseek_v2.Attention = RTPMLAAttention

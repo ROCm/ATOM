@@ -1704,8 +1704,8 @@ class EPLBManager:
         num_redundant = int(getattr(first_layer, "num_redundant_experts", 0))
         assert num_physical > num_redundant
         num_logical = num_physical - num_redundant
-        ep_size = int(getattr(first_layer, "ep_size"))
-        ep_rank = int(getattr(first_layer, "ep_rank"))
+        ep_size = int(first_layer.ep_size)
+        ep_rank = int(first_layer.ep_rank)
         if num_physical % ep_size != 0:
             raise RuntimeError(
                 "EPLB physical experts must be divisible by ep_size: "
@@ -1716,7 +1716,7 @@ class EPLBManager:
             layer_redundant = int(getattr(layer, "num_redundant_experts", 0))
             assert layer_physical > layer_redundant
             layer_logical = layer_physical - layer_redundant
-            layer_ep_size = int(getattr(layer, "ep_size"))
+            layer_ep_size = int(layer.ep_size)
             if (
                 layer_logical != num_logical
                 or layer_physical != num_physical
@@ -1889,7 +1889,7 @@ class EPLBManager:
             if isinstance(old_map, torch.Tensor) and old_map.numel() > int(
                 getattr(layer, "global_num_experts", num_physical)
             ):
-                tail = old_map[int(getattr(layer, "global_num_experts")) :].clone()
+                tail = old_map[int(layer.global_num_experts) :].clone()
             else:
                 tail = torch.empty(
                     0, dtype=torch.int32, device=self.live_metadata.expert_map.device

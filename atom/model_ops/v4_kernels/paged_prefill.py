@@ -48,9 +48,8 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.utils.decorators import mark_trace
-
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus

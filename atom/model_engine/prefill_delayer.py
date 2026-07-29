@@ -77,7 +77,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import torch
 
@@ -127,8 +126,8 @@ class PrefillDelayer:
         partial_max_ticks: int = 8,
         stall_ticks: int = 3,
         kv_high_watermark: float = 0.9,
-        token_usage_low_watermark: Optional[float] = None,
-        max_queue_ms: Optional[float] = None,
+        token_usage_low_watermark: float | None = None,
+        max_queue_ms: float | None = None,
     ):
         self.dp_size = dp_size
         self.cpu_group = cpu_group

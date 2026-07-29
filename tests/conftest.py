@@ -2,13 +2,13 @@
 # Shared fixtures and module stubs for ATOM unit tests.
 # Must be imported before any atom.* module to avoid triggering heavy imports.
 
-import importlib
-import importlib.util
-import importlib.machinery
-import sys
-import os
-import types
 import hashlib
+import importlib
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import types
 from itertools import count
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -38,8 +38,6 @@ _atom_config.__package__ = "atom.config"
 class _StubConfig:
     """Placeholder so `from atom.config import Config` doesn't fail."""
 
-    pass
-
 
 class _StubKVCacheTensor:
     """Placeholder for KVCacheTensor."""
@@ -51,8 +49,6 @@ class _StubKVCacheTensor:
 
 class _StubParallelConfig:
     """Placeholder for ParallelConfig."""
-
-    pass
 
 
 class _StubEPLBConfig:
@@ -144,10 +140,10 @@ if importlib.util.find_spec("xxhash") is None:
 
 # ── 6. Now safe to import atom submodules ──────────────────────────────────
 
-from atom.sampling_params import SamplingParams  # noqa: E402
-from atom.model_engine.sequence import Sequence  # noqa: E402
-from atom.model_engine.block_manager import BlockManager  # noqa: E402
-from atom.model_engine.scheduler import Scheduler  # noqa: E402
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.sequence import Sequence
+from atom.sampling_params import SamplingParams
 
 # ── 7. MockConfig ──────────────────────────────────────────────────────────
 

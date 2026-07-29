@@ -7,7 +7,6 @@
 # from __future__ import annotations
 
 import torch
-
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _GRAPH_MARKER_ENABLED: bool = False

@@ -6,7 +6,7 @@ import copy
 import logging
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -28,11 +28,11 @@ def _is_dummy_forward(forward_batch: ForwardBatch) -> bool:
 
 
 def _pad_dummy_like(
-    tensor: Optional[torch.Tensor],
+    tensor: torch.Tensor | None,
     *,
     length: int,
-    fill_value: int | float = 0,
-) -> Optional[torch.Tensor]:
+    fill_value: float = 0,
+) -> torch.Tensor | None:
     if tensor is None:
         return None
     shape = (length, *tensor.shape[1:])
@@ -40,14 +40,14 @@ def _pad_dummy_like(
 
 
 def _materialize_atom_dummy_forward(
-    input_ids: Optional[torch.Tensor],
-    positions: Optional[torch.Tensor],
-    input_embeds: Optional[torch.Tensor],
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor | None,
+    input_embeds: torch.Tensor | None,
     forward_batch: ForwardBatch,
 ) -> tuple[
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
     ForwardBatch,
 ]:
     """Convert an empty SGLang IDLE batch into ATOM-style dummy inputs."""
@@ -507,14 +507,14 @@ class SGLangPluginRuntime:
     atom_config: Any
     forward_batch: ForwardBatch
     positions: torch.Tensor
-    input_ids: Optional[torch.Tensor] = None
-    input_embeds: Optional[torch.Tensor] = None
+    input_ids: torch.Tensor | None = None
+    input_embeds: torch.Tensor | None = None
     set_forward_context: bool = True
     _original_forward_batch: ForwardBatch = field(init=False, repr=False)
     _is_dummy_run: bool = field(init=False, default=False)
     _exit_stack: ExitStack = field(init=False, repr=False)
 
-    def __enter__(self) -> "SGLangPluginRuntime":
+    def __enter__(self) -> SGLangPluginRuntime:
         self._original_forward_batch = self.forward_batch
         self._is_dummy_run = _is_dummy_forward(self.forward_batch)
 

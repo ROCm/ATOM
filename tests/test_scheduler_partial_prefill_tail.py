@@ -21,8 +21,9 @@ never occupy position 0 and the new decode seqs stay contiguous from 0 (safe
 
 from types import SimpleNamespace
 
-from atom.model_engine.scheduler import Scheduler
 from conftest import MockConfig
+
+from atom.model_engine.scheduler import Scheduler
 
 
 def _spec_config(k=3):

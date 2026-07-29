@@ -3,10 +3,11 @@
 
 from collections.abc import Iterable
 from typing import Any
+
 import regex as re
+import torch
 import triton
 import triton.language as tl
-import torch
 from aiter import QuantType
 
 _FP8_SOURCE_DTYPES = frozenset(

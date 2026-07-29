@@ -1,5 +1,4 @@
 import logging
-from typing import Optional
 
 import torch
 from transformers import AutoConfig, PretrainedConfig
@@ -136,7 +135,7 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
-def register_platform() -> Optional[str]:
+def register_platform() -> str | None:
 
     if disable_vllm_plugin:
         # return None instead of error because the flag can be used to

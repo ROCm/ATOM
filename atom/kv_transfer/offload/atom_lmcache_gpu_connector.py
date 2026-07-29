@@ -12,19 +12,20 @@ how those blocks are packed as opaque bytes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_staging import (
-    _StagingBuffer,
-    _ThreadTransferState,
     _env_flag,
     _env_int,
     _env_optional_int,
+    _StagingBuffer,
+    _ThreadTransferState,
 )
 
 

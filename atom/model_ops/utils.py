@@ -4,7 +4,6 @@
 import importlib.util
 import logging
 from functools import cache
-from typing import List, Optional, Tuple, Union
 
 import torch
 from aiter import QuantType, dtypes, per_tensor_quant
@@ -46,7 +45,7 @@ MXFP4_QUANT_BLOCK_SIZE = 32
 
 
 def per_tensor_dequantize(
-    tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
+    tensor: torch.Tensor, inv_scale: float | torch.Tensor
 ) -> torch.Tensor:
     fake_qweight = tensor.to(torch.float)
     dq_weight = fake_qweight * inv_scale
@@ -56,8 +55,8 @@ def per_tensor_dequantize(
 def normalize_e4m3fn_to_e4m3fnuz(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    input_scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    input_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     def _double_scale(scale: torch.Tensor) -> torch.Tensor:
         if scale.dtype == dtypes.fp8_e8m0:
             scale_u8 = scale.view(torch.uint8)
@@ -91,9 +90,9 @@ def normalize_e4m3fn_to_e4m3fnuz(
 def requantize_with_max_scale(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    logical_widths: List[int],
+    logical_widths: list[int],
     normalize_e4m3fn_to_e4m3fnuz=False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     # Max scale to be used for requanitzation.
     if normalize_e4m3fn_to_e4m3fnuz:
         quant_dtype = torch.float8_e4m3fnuz

@@ -7,8 +7,6 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-# ruff: noqa: E501
-
 
 import torch
 

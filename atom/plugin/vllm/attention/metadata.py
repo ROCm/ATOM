@@ -1,21 +1,10 @@
-from typing import Optional
 import logging
-
 from dataclasses import dataclass
 
 import torch
-
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.chip_info import get_gfx
-from atom.config import get_current_atom_config
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS
-from atom.plugin.vllm.attention.layer_mla import (
-    disabled_mla_persistent_metadata,
-    mla_fold_kv_metadata_triton,
-)
-from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import kv_indices_generate_triton
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
@@ -25,6 +14,15 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 
+from atom.config import get_current_atom_config
+from atom.model_ops.attention_mla import _MLA_MIN_HEADS
+from atom.plugin.vllm.attention.layer_mla import (
+    disabled_mla_persistent_metadata,
+    mla_fold_kv_metadata_triton,
+)
+from atom.utils import CpuGpuBuffer
+from atom.utils.block_convert import kv_indices_generate_triton
+
 logger = logging.getLogger("atom")
 
 _PARTITION_SIZE_ROCM = 256
@@ -33,9 +31,7 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 
 def get_aiter_kv_cache_dtype(config) -> torch.dtype:
     kv_cache_dtype = config.cache_config.cache_dtype
-    if kv_cache_dtype == "auto":
-        kv_cache_dtype = "bf16"
-    elif kv_cache_dtype == "bfloat16":
+    if kv_cache_dtype == "auto" or kv_cache_dtype == "bfloat16":
         kv_cache_dtype = "bf16"
     elif kv_cache_dtype == "float16":
         kv_cache_dtype = "fp16"
@@ -71,7 +67,7 @@ class AiterChunkContextMetadata:
     seq_lens: torch.Tensor
     num_chunks: int
     total_token_per_batch: list[int]
-    swa_metadata: Optional[AiterChunkSlidingWindowMetadata] = None
+    swa_metadata: AiterChunkSlidingWindowMetadata | None = None
 
 
 @dataclass
@@ -110,9 +106,9 @@ class AiterMhaMetadataForVllm:
     num_extend_tokens: int
     dropout_p: float = 0.0
 
-    decode_metadata: Optional[AiterMhaPhaseMetadata] = None
-    prefill_metadata: Optional[AiterMhaPhaseMetadata] = None
-    extend_metadata: Optional[AiterChunkPrefillMetadata] = None
+    decode_metadata: AiterMhaPhaseMetadata | None = None
+    prefill_metadata: AiterMhaPhaseMetadata | None = None
+    extend_metadata: AiterChunkPrefillMetadata | None = None
 
     use_cascade: bool = False
     common_prefix_len: int = 0
@@ -453,8 +449,9 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         del model_runner
         super().__init__(kv_cache_spec, layer_names, config, device)
         logger.info("init MinimaxM3SparseAttentionMetadataBuilder")
-        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
         from vllm.config import VllmConfig
+
+        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
         assert isinstance(config, VllmConfig)
         self.vllm_config = config
@@ -1335,13 +1332,14 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         fast_build: bool = False,
     ):
 
-        from vllm.v1.attention.backends.utils import split_decodes_and_prefills
         from vllm.model_executor.layers.attention.mla_attention import (
             QueryLenSupport,
         )
-
         from vllm.utils.math_utils import cdiv, round_down
-        from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+        from vllm.v1.attention.backends.utils import (
+            get_dcp_local_seq_lens,
+            split_decodes_and_prefills,
+        )
 
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
@@ -1761,11 +1759,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
 
         def _resolve_indexer(layer_name):
-            attention_prefix = (
-                layer_name[: -len(".attn")]
-                if layer_name.endswith(".attn")
-                else layer_name
-            )
+            attention_prefix = layer_name.removesuffix(".attn")
             indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
             owner_atom_config = getattr(indexer_cache, "atom_config", None)
             sfc = (
@@ -2053,8 +2047,9 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             from vllm.utils.platform_utils import num_compute_units
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
-        from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
+        from vllm.v1.worker.cp_utils import get_total_cp_world_size
+
         from atom.models.utils import extract_layer_index
 
         assert isinstance(config, VllmConfig)
@@ -2182,14 +2177,14 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata=None,
         fast_build: bool = False,
     ) -> AiterMlaSparseIndexerMetadataForVllm:
-        from vllm.v1.attention.backends.utils import (
-            split_decodes_and_prefills,
-            split_prefill_chunks,
-        )
         from vllm.platforms import current_platform
         from vllm.utils.deep_gemm import (
             get_paged_mqa_logits_metadata,
             is_deep_gemm_supported,
+        )
+        from vllm.v1.attention.backends.utils import (
+            split_decodes_and_prefills,
+            split_prefill_chunks,
         )
 
         num_reqs = common_attn_metadata.num_reqs

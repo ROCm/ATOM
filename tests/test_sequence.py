@@ -2,8 +2,9 @@
 # Tests for atom/model_engine/sequence.py — public API only
 
 import pytest
-from atom.sampling_params import SamplingParams
+
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
+from atom.sampling_params import SamplingParams
 
 
 class TestSequenceCreation:

@@ -4,7 +4,7 @@
 import logging
 
 from atom.model_engine.llm_engine import LLMEngine
-from atom.rollout.weight_sync import load_weights_via_shm, load_weights_via_ipc
+from atom.rollout.weight_sync import load_weights_via_ipc, load_weights_via_shm
 
 logger = logging.getLogger("atom")
 

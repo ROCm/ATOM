@@ -98,7 +98,7 @@ def kv_indices_convert_kernel(
     out_bs_start = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
 
     acc_block = 0
-    for j in range(0, bs):
+    for j in range(bs):
         start_j = tl.load(kv_indptr_convert_ptr + j)
         end_j = tl.load(kv_indptr_convert_ptr + (j + 1))
         ctx_len = end_j - start_j
@@ -109,7 +109,7 @@ def kv_indices_convert_kernel(
         out_bs_start = tl.where(in_this, start_j, out_bs_start)
         acc_block += num_block
 
-    for r_i in range(0, ratio):
+    for r_i in range(ratio):
         cond = (col + r_i) < ctx
         cand = val * ratio + r_i
         tl.store(output_ptr + out_bs_start + col + r_i, cand, mask=mask & cond)

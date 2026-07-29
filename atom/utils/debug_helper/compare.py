@@ -34,7 +34,6 @@ import os
 import re
 import sys
 from collections import defaultdict
-from typing import Optional
 
 import torch
 
@@ -139,7 +138,7 @@ def is_pow2(n: int) -> bool:
 
 def pick_prefill_call(
     calls: list[tuple[int, str, int]], n_slots: int
-) -> Optional[tuple[int, str, int]]:
+) -> tuple[int, str, int] | None:
     """Pick the real-prefill call from a list of (call_idx, path, n_tok).
 
     Heuristic (matches ATOM model_runner behavior):
@@ -382,7 +381,7 @@ def cmd_schema(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="ATOM debug-dump comparison primitives + CLI."
     )

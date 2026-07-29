@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import cache
-from typing import Optional
 
 import aiter
 import torch
@@ -11,19 +10,19 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
-from atom.config import get_current_atom_config
-from atom.utils import envs
-from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 
-from .attention_mla import MLAModules
-
-from atom.utils.decorators import mark_trace
+from atom.config import get_current_atom_config
 from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
+from atom.utils import envs
+from atom.utils.decorators import mark_trace
+from atom.utils.forward_context import ForwardContext, get_forward_context
+
+from .attention_mla import MLAModules
 
 
 @cache
@@ -47,17 +46,17 @@ class PagedAttentionImpl(nn.Module):
         scale,
         num_kv_heads,
         alibi_slopes: list[float] | None,
-        sliding_window: Optional[int] = None,
+        sliding_window: int | None = None,
         kv_cache_dtype="bf16",
         logits_soft_cap: float | None = None,
         attn_type=None,
         kv_sharing_target_layer_name: int | None = None,
         layer_num=0,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -890,7 +889,7 @@ class PagedAttentionImpl(nn.Module):
         kv_cache: torch.Tensor = None,
         attn_metadata=None,
         position: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         output: torch.Tensor = None,
         **kwargs,
@@ -936,21 +935,21 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         scale,
         num_kv_heads,
         alibi_slopes: list[float] | None = None,
-        sliding_window: Optional[int] = None,
+        sliding_window: int | None = None,
         kv_cache_dtype="bf16",
         logits_soft_cap: float | None = None,
         attn_type=None,
         kv_sharing_target_layer_name: int | None = None,
         layer_num=0,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
         # --- MiniMax-M3 sparse-attention indexer kwargs (all impl-local) ---
-        index_q_norm: Optional[torch.nn.Module] = None,
-        index_k_norm: Optional[torch.nn.Module] = None,
-        index_rotary_emb: Optional[torch.nn.Module] = None,
+        index_q_norm: torch.nn.Module | None = None,
+        index_k_norm: torch.nn.Module | None = None,
+        index_rotary_emb: torch.nn.Module | None = None,
         index_q_size: int = 0,
         index_head_dim: int = 0,
         topk: int = 0,
@@ -1001,14 +1000,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
-        self.index_cache: Optional[torch.Tensor] = None
+        self.index_cache: torch.Tensor | None = None
         # Optional shared dict bound by the metadata builder. It is scoped to the
         # current sparse metadata object and carries the last full layer top-k.
-        self.index_topk_cache_state: Optional[dict] = None
-        self._index_q_cache_key_info: Optional[tuple] = None
+        self.index_topk_cache_state: dict | None = None
+        self._index_q_cache_key_info: tuple | None = None
         # Rotated indexer query produced by rope_cache, consumed (and cleared) by
         # dispatch_backend within the same single-threaded layer forward.
-        self._index_q: Optional[torch.Tensor] = None
+        self._index_q: torch.Tensor | None = None
 
     @staticmethod
     def _to_page16_shuffle(k_cache, v_cache, k_scale, v_scale):
@@ -1219,7 +1218,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         state = getattr(sparse_metadata, "_index_topk_cache_state", None)
         if state is None:
             state = {}
-            setattr(sparse_metadata, "_index_topk_cache_state", state)
+            sparse_metadata._index_topk_cache_state = state
         return state
 
     def _topk_cache_key(

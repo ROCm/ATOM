@@ -26,7 +26,6 @@ All constants and pack arithmetic mirror
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -69,7 +68,7 @@ def _duplicate_each_lastdim(x: torch.Tensor) -> torch.Tensor:
 
 def quantize_v4_nope_bpad8(
     nope_src: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-tile (64-elt) E8M0 quantization of the NOPE segment.
 
     Returns ``(nope_fp8 [..., 448], scale_e8m0 [..., 7] uint8)``.
@@ -173,7 +172,7 @@ def dequantize_v4_2buff_to_bf16(
 
 def quantize_bf16_to_v4_2buff(
     bf16_src: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """End-to-end helper: bf16 [..., 512] -> (packed_fp8 [..., 512], rope_bf16 [..., 64]).
 
     Splits the input on the NoPE/RoPE boundary, quantizes the NoPE half via
@@ -277,7 +276,7 @@ def _bf16_to_v4_2buff_kernel(
 
 def quantize_bf16_to_v4_2buff_triton(
     bf16_src: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton port of :func:`quantize_bf16_to_v4_2buff` (compile-safe, single
     launch). ``bf16_src`` may have any leading shape; the last dim must be 512.
 
@@ -354,8 +353,8 @@ def _attn_decode_bf16_golden(
     kv_last_page_lens: torch.Tensor,  # [num_seqs]
     sm_scale: float,
     v_head_dim: int,
-    attn_sink: Optional[torch.Tensor] = None,  # [num_heads] or None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    attn_sink: torch.Tensor | None = None,  # [num_heads] or None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Pure-torch BF16 attention reference (FP32 accum).
 
     Per-batch loop, scaled-dot-product attention over the full D=NoPE+RoPE

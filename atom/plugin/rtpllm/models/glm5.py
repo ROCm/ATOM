@@ -22,14 +22,14 @@ RTPForwardContext = None
 
 
 class _NoopWeightManager:
-    def update(self, req):  # noqa: ANN001
+    def update(self, req):
         return None
 
 
 class _NoopModelWeightsLoader:
     _py_eplb = None
 
-    def load_lora_weights(self, adapter_name, lora_path, device):  # noqa: ANN001
+    def load_lora_weights(self, adapter_name, lora_path, device):
         logger.warning(
             "No-op model_weights_loader received load_lora_weights(%s, %s, %s); "
             "external plugin mode uses ATOM model weights path only.",
@@ -37,13 +37,12 @@ class _NoopModelWeightsLoader:
             lora_path,
             device,
         )
-        return None
 
 
 class _ATOMGlm5AttnPyObj:
     """Container returned to RTP CudaGraphRunner for replay-time hooks."""
 
-    def __init__(self, runtime: "_ATOMGlm5MoeRuntime") -> None:
+    def __init__(self, runtime: _ATOMGlm5MoeRuntime) -> None:
         self._runtime = runtime
         self.is_cuda_graph = False
         self._rtp_mla_layers: list[Any] = []
@@ -96,7 +95,7 @@ class _ATOMGlm5AttnPyObj:
     def fmha_params(self):
         return None
 
-    def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
+    def prepare_cuda_graph(self, attn_inputs) -> None:
         for layer in self._rtp_mla_layers:
             prepare = getattr(layer, "prepare_cuda_graph", None)
             if callable(prepare):
@@ -512,9 +511,7 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
                     )
         return positions
 
-    def forward(
-        self, inputs: PyModelInputs, fmha_impl=None
-    ) -> PyModelOutputs:  # noqa: ANN001
+    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
         is_cuda_graph = bool(getattr(fmha_impl, "is_cuda_graph", False))
         if is_cuda_graph:
             inputs.attention_inputs.is_cuda_graph = True

@@ -2,15 +2,16 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # from flash_attn import flash_attn_with_kvcache
-from typing import Optional
+
 import torch
 from torch import nn
 
+from atom.config import get_current_atom_config
+from atom.plugin.prepare import is_plugin_mode
+from atom.utils.selector import get_attn_backend
+
 from .attention_mla import MLAModules
 from .base_attention import BaseAttention
-from atom.config import get_current_atom_config
-from atom.utils.selector import get_attn_backend
-from atom.plugin.prepare import is_plugin_mode
 
 
 class Attention(BaseAttention):
@@ -28,14 +29,14 @@ class Attention(BaseAttention):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
-        impl_cls: Optional[type] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
+        impl_cls: type | None = None,
         **kwargs,
     ):
         assert (
@@ -105,7 +106,7 @@ class Attention(BaseAttention):
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name
         if self.layer_name in compilation_config.static_forward_context:
-            raise ValueError("Duplicate layer: {}".format(self.layer_name))
+            raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
 
     def forward(
@@ -114,7 +115,7 @@ class Attention(BaseAttention):
         key: torch.Tensor,
         value: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         **kwargs,
     ):

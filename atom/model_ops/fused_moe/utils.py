@@ -1,9 +1,11 @@
 import functools
-from atom.utils import is_torch_equal_or_newer
-import torch
 from math import prod
+
+import torch
 import triton
 import triton.language as tl
+
+from atom.utils import is_torch_equal_or_newer
 
 
 def cdiv(a: int, b: int) -> int:

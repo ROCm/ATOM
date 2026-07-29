@@ -1,19 +1,17 @@
-from typing import Optional
-
 import torch
-import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
-from transformers import PretrainedConfig
 
 from .deepseek_mtp import rewrite_spec_layer_name
-
 from .glm4_moe import (
     ENABLE_ALLREDUCE_RMSNORM_FUSION,
     Glm4MoeDecoderLayer,
@@ -27,7 +25,7 @@ class SharedHead(nn.Module):
         self,
         config: PretrainedConfig,
         prefix: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

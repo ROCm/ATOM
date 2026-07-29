@@ -1,16 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from collections.abc import Iterable
+from typing import Any
 
 import torch
-from torch import nn
-
-from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
-from atom.plugin.sglang.runtime import (
-    SGLangForwardBatchMetadata,
-    SGLangPluginRuntime,
-    plugin_runtime_scope,
-)
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -19,6 +12,14 @@ from sglang.srt.models.kimi_k25 import (
     KimiK25ForConditionalGeneration as _SglangKimiK25ForConditionalGeneration,
 )
 from sglang.srt.utils import LazyValue
+from torch import nn
+
+from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
+from atom.plugin.sglang.runtime import (
+    SGLangForwardBatchMetadata,
+    SGLangPluginRuntime,
+    plugin_runtime_scope,
+)
 
 _KIMI_K25_PACKED_MODULES_MAPPING = {
     "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -70,7 +71,7 @@ class _AtomKimiK25LanguageModelAdapter(nn.Module):
     def __init__(
         self,
         atom_lm: nn.Module,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
@@ -119,11 +120,11 @@ class _AtomKimiK25LanguageModelAdapter(nn.Module):
     @torch.no_grad()
     def forward(
         self,
-        input_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
         **model_kwargs: Any,
     ):
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
@@ -194,7 +195,7 @@ class KimiK25ForConditionalGeneration(_SglangKimiK25ForConditionalGeneration):
     def __init__(
         self,
         config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         **kwargs: Any,
     ) -> None:

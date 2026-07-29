@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import threading
 from enum import Enum
-from typing import Optional
 
 import msgspec
 
@@ -59,7 +58,7 @@ class MoRIIOAgentMetadata(
 
     engine_id: str
     agent_metadata: bytes
-    kv_caches_base_addr: Optional[list[int]] = None
+    kv_caches_base_addr: list[int] | None = None
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
@@ -112,7 +111,7 @@ class _RoleManager:
     instead of accessing this class directly.
     """
 
-    _instance: Optional[_RoleManager] = None
+    _instance: _RoleManager | None = None
     _lock = threading.Lock()
 
     def __init__(self) -> None:

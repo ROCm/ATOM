@@ -3,19 +3,19 @@
 
 import math
 from dataclasses import dataclass
-from typing import Type
 
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_attention import (
-    AiterBackend,
     AiterAttentionMetadataBuilder,
+    AiterBackend,
     kv_indices_generate_triton,
 )
 
@@ -26,11 +26,11 @@ class GDNAttentionBackend(AiterBackend):
         return "ROCM_GDN_ATTENTION"
 
     @staticmethod
-    def get_builder_cls() -> Type["GDNAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["GDNAttentionMetadataBuilder"]:
         return GDNAttentionMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["GatedDeltaNet"]:
+    def get_impl_cls() -> type["GatedDeltaNet"]:
         return GatedDeltaNet
 
 
@@ -367,7 +367,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
         context_lens_tensor = attn_metadata.context_lens
         query_start_loc = attn_metadata.cu_seqlens_q
-        context_lens_tensor = torch.zeros((batch.total_seqs_num_prefill)).cuda()
+        context_lens_tensor = torch.zeros(batch.total_seqs_num_prefill).cuda()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
             self.prepare_state_indices(batch, with_spec=False)

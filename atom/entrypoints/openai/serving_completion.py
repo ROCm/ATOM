@@ -7,7 +7,8 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from .protocol import (
     STREAM_DONE_MESSAGE,
@@ -22,8 +23,8 @@ def create_completion_chunk(
     request_id: str,
     model: str,
     text: str,
-    finish_reason: Optional[str] = None,
-    usage: Optional[Dict] = None,
+    finish_reason: str | None = None,
+    usage: dict | None = None,
     index: int = 0,
     **extra_fields: Any,
 ) -> str:
@@ -80,7 +81,7 @@ async def stream_completion_response(
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
 
-            extra_fields: Dict[str, Any] = {}
+            extra_fields: dict[str, Any] = {}
             if "kv_transfer_params" in chunk_data:
                 extra_fields["kv_transfer_params"] = chunk_data["kv_transfer_params"]
 
@@ -126,7 +127,7 @@ async def stream_completion_response(
 def build_completion_response(
     request_id: str,
     model: str,
-    final_output: Dict[str, Any],
+    final_output: dict[str, Any],
 ) -> CompletionResponse:
     """Build a non-streaming text completion response (single choice)."""
     response = CompletionResponse(
@@ -162,7 +163,7 @@ def build_completion_response(
 def build_completion_response_multi(
     request_id: str,
     model: str,
-    final_outputs: List[Dict[str, Any]],
+    final_outputs: list[dict[str, Any]],
 ) -> CompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling."""
     assert final_outputs, "build_completion_response_multi requires at least one output"
@@ -203,7 +204,7 @@ async def stream_completion_response_fanout(
     request_id: str,
     model: str,
     shared_queue: asyncio.Queue,
-    seq_ids: List[int],
+    seq_ids: list[int],
     num_prompt_tokens: int,
     cleanup_fn,
 ) -> AsyncGenerator[str, None]:
@@ -234,7 +235,7 @@ async def stream_completion_response_fanout(
             new_text = chunk_data["text"]
             num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
 
-            extra_fields: Dict[str, Any] = {}
+            extra_fields: dict[str, Any] = {}
             if "kv_transfer_params" in chunk_data:
                 extra_fields["kv_transfer_params"] = chunk_data["kv_transfer_params"]
 

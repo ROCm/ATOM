@@ -16,7 +16,7 @@ def apply_qwen3_next_rtpllm_patch() -> None:
     if _PATCHED:
         return
 
-    import atom.models.qwen3_next as qwen3_next
+    from atom.models import qwen3_next
 
     def _split_router_logits(self, router_logits: torch.Tensor):
         n_shared = int(getattr(self, "n_shared_experts", 0) or 0)

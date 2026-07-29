@@ -14,7 +14,7 @@ from atom.model_ops.attention_mla import MLAAttention
 def glm52_native_mla_attention_construction():
     """Temporarily make GLM sparse MLA layers construct native ATOM attention."""
 
-    import atom.models.deepseek_v2 as deepseek_v2
+    from atom.models import deepseek_v2
 
     previous = deepseek_v2.Attention
 

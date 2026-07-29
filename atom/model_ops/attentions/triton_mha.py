@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Type
 
 import torch
 
@@ -23,7 +22,7 @@ class TritonMHABackend(AttentionBackend):
         return "ROCM_TRITON_MHA"
 
     @staticmethod
-    def get_builder_cls() -> Type["TritonMHAMetadataBuilder"]:
+    def get_builder_cls() -> type["TritonMHAMetadataBuilder"]:
         return TritonMHAMetadataBuilder
 
     @staticmethod

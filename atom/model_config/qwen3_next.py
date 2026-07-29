@@ -157,7 +157,7 @@ class Qwen3NextConfig(PretrainedConfig):
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```
-    """  # noqa: E501
+    """
 
     model_type = "qwen3_next"
     keys_to_ignore_at_inference = ["past_key_values"]

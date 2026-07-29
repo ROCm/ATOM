@@ -24,14 +24,14 @@ from atom.entrypoints.openai.chat_encoders import (
     load_custom_message_encoder,
 )
 from atom.entrypoints.openai.protocol import (
+    CHAT_COMPLETION_CHUNK_OBJECT,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
-    CHAT_COMPLETION_CHUNK_OBJECT,
-    CompletionRequest,
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
+    CompletionRequest,
 )
 from atom.entrypoints.openai.reasoning import ReasoningFilter
 from atom.entrypoints.openai.serving_chat import (

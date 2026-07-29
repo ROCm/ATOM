@@ -11,7 +11,6 @@ glue needed to load `Mistral3ForConditionalGeneration` checkpoints text-only.
 """
 
 import copy
-from typing import Optional
 
 import torch
 from torch import nn
@@ -84,8 +83,8 @@ class Mistral3TextOnly(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **_: object,
     ):
         return self.language_model(

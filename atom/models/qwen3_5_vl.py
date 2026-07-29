@@ -12,8 +12,8 @@ from functools import lru_cache
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 
 class Qwen3VisionPatchEmbed(nn.Module):

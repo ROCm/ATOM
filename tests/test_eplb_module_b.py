@@ -8,7 +8,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 try:
-    import atom.model_ops.eplb as eplb
+    from atom.model_ops import eplb
 except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
@@ -30,7 +30,7 @@ def _init_monitor(monitor, *, num_layers=1, num_physical=2, device=None):
 
 
 def _record_single_pass(monitor, *, counts):
-    if monitor._cur_pass_count is None:  # noqa: SLF001
+    if monitor._cur_pass_count is None:
         _init_monitor(monitor, num_layers=1, num_physical=len(counts))
     monitor.on_forward_start()
     pairs = []

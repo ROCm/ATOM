@@ -14,7 +14,8 @@ import glob
 import importlib.util
 import logging
 import os
-from typing import Any, Callable, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 from huggingface_hub import snapshot_download
 
@@ -32,7 +33,7 @@ def _resolve_model_path(model: str) -> str:
         return model
 
 
-def _load_encoder_from_dir(model_path: str) -> Optional[MessageEncoder]:
+def _load_encoder_from_dir(model_path: str) -> MessageEncoder | None:
     """Look for ``<model>/encoding/encoding_*.py`` and load ``encode_messages``.
 
     Returns ``None`` when the directory or matching file is absent (model uses
@@ -60,7 +61,7 @@ def _load_encoder_from_dir(model_path: str) -> Optional[MessageEncoder]:
         spec = importlib.util.spec_from_file_location(module_name, enc_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        raw = getattr(mod, "encode_messages")
+        raw = mod.encode_messages
     except Exception as e:
         logger.warning(f"Failed to load encoder from {enc_path}: {e}")
         return None
@@ -75,7 +76,7 @@ def _load_encoder_from_dir(model_path: str) -> Optional[MessageEncoder]:
     return encode
 
 
-def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoder]:
+def load_custom_message_encoder(model_path: str) -> MessageEncoder | None:
     """Probe ``model_path`` once at startup for a custom message encoder.
 
     Returns the encoder, or ``None`` when the model uses the standard Jinja
@@ -87,10 +88,10 @@ def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoder]:
 
 def apply_chat_template(
     tokenizer: Any,
-    custom_encoder: Optional[MessageEncoder],
-    messages: List[dict],
+    custom_encoder: MessageEncoder | None,
+    messages: list[dict],
     *,
-    tools: Optional[List[dict]] = None,
+    tools: list[dict] | None = None,
     **kwargs: Any,
 ) -> str:
     """Render ``messages`` to a prompt string.

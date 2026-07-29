@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from atom.utils import mark_spliting_op
@@ -18,13 +16,13 @@ def _get_layer_context(layer_name: str):
 
 def atom_vllm_mha_attention_fake(
     query: torch.Tensor,
-    key: Optional[torch.Tensor],
-    value: Optional[torch.Tensor],
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
     kv_cache: torch.Tensor,
     layer_name: str,
-    positions: Optional[torch.Tensor] = None,
-    q_scale: Optional[torch.Tensor] = None,
-    qkv: Optional[torch.Tensor] = None,
+    positions: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(query).contiguous()
 
@@ -36,13 +34,13 @@ def atom_vllm_mha_attention_fake(
 )
 def atom_vllm_mha_attention(
     query: torch.Tensor,
-    key: Optional[torch.Tensor],
-    value: Optional[torch.Tensor],
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
     kv_cache: torch.Tensor,
     layer_name: str,
-    positions: Optional[torch.Tensor] = None,
-    q_scale: Optional[torch.Tensor] = None,
-    qkv: Optional[torch.Tensor] = None,
+    positions: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     layer, attn_metadata, _ = _get_layer_context(layer_name)
     return layer.forward_impl(

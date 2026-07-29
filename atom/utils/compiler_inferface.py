@@ -6,13 +6,15 @@ import copy
 import hashlib
 import logging
 import os
+from collections.abc import Callable
 from contextlib import ExitStack
-from typing import Any, Callable, Optional
+from typing import Any
 from unittest.mock import patch
 
 import torch
 import torch._inductor.compile_fx
-import torch.fx as fx
+from torch import fx
+
 from atom.config import Config
 from atom.utils import compilation_counter, is_torch_equal_or_newer
 
@@ -136,7 +138,6 @@ class CompilerInterface:
         cache_dir = "/path/to/dir/backbone", prefix = "backbone"
         cache_dir = "/path/to/dir/eagle_head", prefix = "eagle_head"
         """
-        pass
 
     def compute_hash(self, vllm_config: Config) -> str:
         """
@@ -155,9 +156,9 @@ class CompilerInterface:
         graph: fx.GraphModule,
         example_inputs: list[Any],
         compiler_config: dict[str, Any],
-        runtime_shape: Optional[int] = None,
-        key: Optional[str] = None,
-    ) -> tuple[Optional[Callable], Optional[Any]]:
+        runtime_shape: int | None = None,
+        key: str | None = None,
+    ) -> tuple[Callable | None, Any | None]:
         """
         Compile the graph with the given example inputs and compiler config,
         with a runtime shape. If the `runtime_shape` is None, it means
@@ -190,7 +191,7 @@ class CompilerInterface:
         graph: fx.GraphModule,
         example_inputs: list[Any],
         graph_index: int,
-        runtime_shape: Optional[int] = None,
+        runtime_shape: int | None = None,
     ) -> Callable:
         """
         Load the compiled function from the handle.
@@ -310,9 +311,9 @@ class InductorAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         compiler_config: dict[str, Any],
-        runtime_shape: Optional[int] = None,
-        key: Optional[str] = None,
-    ) -> tuple[Optional[Callable], Optional[Any]]:
+        runtime_shape: int | None = None,
+        key: str | None = None,
+    ) -> tuple[Callable | None, Any | None]:
         compilation_counter.num_inductor_compiles += 1
         from torch._inductor.compile_fx import compile_fx
 
@@ -346,7 +347,7 @@ class InductorAdaptor(CompilerInterface):
                 inductor_compiled_graph = original_load(*args, **kwargs)
                 nonlocal file_path
                 compiled_fn = inductor_compiled_graph.current_callable
-                file_path = compiled_fn.__code__.co_filename  # noqa
+                file_path = compiled_fn.__code__.co_filename
                 if not file_path.startswith(self.base_cache_dir):
                     # hooked in the align_inputs_from_check_idxs function
                     # in torch/_inductor/utils.py
@@ -361,9 +362,7 @@ class InductorAdaptor(CompilerInterface):
                             break
                 return inductor_compiled_graph
 
-            hijacked_compile_fx_inner = (
-                torch._inductor.compile_fx.compile_fx_inner
-            )  # noqa
+            hijacked_compile_fx_inner = torch._inductor.compile_fx.compile_fx_inner
         elif torch.__version__ >= "2.6":
             # function renamed in 2.6
             original_load_name = None
@@ -375,7 +374,7 @@ class InductorAdaptor(CompilerInterface):
                 if inductor_compiled_graph is not None:
                     nonlocal file_path
                     compiled_fn = inductor_compiled_graph.current_callable
-                    file_path = compiled_fn.__code__.co_filename  # noqa
+                    file_path = compiled_fn.__code__.co_filename
                     if not file_path.startswith(self.base_cache_dir):
                         # hooked in the align_inputs_from_check_idxs function
                         # in torch/_inductor/utils.py
@@ -403,7 +402,7 @@ class InductorAdaptor(CompilerInterface):
             # tracing context, and also disables caching for graphs
             # with high-order ops.
             # For vLLM, in either case, we want to cache the graph.
-            # see https://github.com/pytorch/pytorch/blob/9f5ebf3fc609105a74eab4ccc24932d6353ff566/torch/_inductor/codecache.py#L1221 # noqa
+            # see https://github.com/pytorch/pytorch/blob/9f5ebf3fc609105a74eab4ccc24932d6353ff566/torch/_inductor/codecache.py#L1221
             return
 
         def _get_shape_env() -> AlwaysHitShapeEnv:
@@ -517,7 +516,7 @@ class InductorAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         graph_index: int,
-        runtime_shape: Optional[int] = None,
+        runtime_shape: int | None = None,
     ) -> Callable:
         assert isinstance(handle, tuple)
         assert isinstance(handle[0], str)
@@ -642,9 +641,9 @@ class InductorStandaloneAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         compiler_config: dict[str, Any],
-        runtime_shape: Optional[int] = None,
-        key: Optional[str] = None,
-    ) -> tuple[Optional[Callable], Optional[Any]]:
+        runtime_shape: int | None = None,
+        key: str | None = None,
+    ) -> tuple[Callable | None, Any | None]:
         compilation_counter.num_inductor_compiles += 1
         current_config = {}
         if compiler_config is not None:
@@ -707,7 +706,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         graph_index: int,
-        runtime_shape: Optional[int] = None,
+        runtime_shape: int | None = None,
     ) -> Callable:
         assert isinstance(handle, tuple)
         assert isinstance(handle[0], str)

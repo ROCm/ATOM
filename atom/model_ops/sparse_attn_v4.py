@@ -14,7 +14,6 @@ kernel's accumulation precision. They are correct but not performant.
 """
 
 import os
-from typing import Tuple
 
 import torch
 import triton
@@ -507,7 +506,7 @@ def hc_split_sinkhorn(
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split + project mHC mixing parameters.
 
     Reference: /data/DeepSeek-V4-Pro/inference/kernel.py:371-440

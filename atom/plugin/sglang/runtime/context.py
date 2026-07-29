@@ -5,12 +5,12 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, ClassVar, Optional, Union
+from typing import Any, ClassVar
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 _RUNTIME_SENTINEL = object()
-_current_forward_batch: ContextVar[Optional[ForwardBatch]] = ContextVar(
+_current_forward_batch: ContextVar[ForwardBatch | None] = ContextVar(
     "atom_sglang_current_forward_batch", default=None
 )
 
@@ -20,7 +20,7 @@ def get_current_forward_batch():
 
 
 @contextmanager
-def bind_current_forward_batch(forward_batch: Optional[ForwardBatch]):
+def bind_current_forward_batch(forward_batch: ForwardBatch | None):
     token = _current_forward_batch.set(forward_batch)
     try:
         yield
@@ -46,7 +46,7 @@ def is_draft_extend_mode(forward_mode: Any, include_v2: bool = False) -> bool:
 @contextmanager
 def plugin_runtime_scope(
     *,
-    framework: Optional[str] = None,
+    framework: str | None = None,
     atom_config=_RUNTIME_SENTINEL,
 ):
     """Temporarily bind process-global ATOM plugin runtime state.
@@ -78,28 +78,26 @@ def plugin_runtime_scope(
 class SGLangForwardBatchMetadata:
     """Small context object for one SGLang model forward."""
 
-    forward_batch: Optional[ForwardBatch]
-    pp_proxy_tensors: Optional[PPProxyTensors] = None
+    forward_batch: ForwardBatch | None
+    pp_proxy_tensors: PPProxyTensors | None = None
     save_kv_cache: bool = True
-    _current: ClassVar[ContextVar[Optional["SGLangForwardBatchMetadata"]]] = ContextVar(
+    _current: ClassVar[ContextVar[SGLangForwardBatchMetadata | None]] = ContextVar(
         "atom_sglang_current_forward_batch_metadata",
         default=None,
     )
 
     @classmethod
-    def current(cls) -> Optional["SGLangForwardBatchMetadata"]:
+    def current(cls) -> SGLangForwardBatchMetadata | None:
         return cls._current.get()
 
     @classmethod
     def build(
         cls,
-        forward_batch: Optional[
-            Union[ForwardBatch, "SGLangForwardBatchMetadata"]
-        ] = None,
+        forward_batch: ForwardBatch | SGLangForwardBatchMetadata | None = None,
         *,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        save_kv_cache: Optional[bool] = None,
-    ) -> Optional["SGLangForwardBatchMetadata"]:
+        pp_proxy_tensors: PPProxyTensors | None = None,
+        save_kv_cache: bool | None = None,
+    ) -> SGLangForwardBatchMetadata | None:
         if isinstance(forward_batch, cls):
             return forward_batch
         if forward_batch is None and pp_proxy_tensors is None and save_kv_cache is None:
@@ -112,7 +110,7 @@ class SGLangForwardBatchMetadata:
 
     @classmethod
     @contextmanager
-    def bind(cls, metadata: Optional["SGLangForwardBatchMetadata"]):
+    def bind(cls, metadata: SGLangForwardBatchMetadata | None):
         meta_token = cls._current.set(metadata)
         batch_token = _current_forward_batch.set(
             None if metadata is None else metadata.forward_batch
@@ -126,7 +124,7 @@ class SGLangForwardBatchMetadata:
     @staticmethod
     def to_intermediate_tensors(
         intermediate_tensors,
-        metadata: Optional["SGLangForwardBatchMetadata"],
+        metadata: SGLangForwardBatchMetadata | None,
     ):
         if intermediate_tensors is not None or metadata is None:
             return intermediate_tensors

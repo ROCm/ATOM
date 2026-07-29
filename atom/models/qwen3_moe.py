@@ -1,4 +1,4 @@
-from typing import Optional, Union, Any
+from typing import Any
 
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -6,6 +6,11 @@ from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_wo
 
 # from atom.model_ops.rotary_embedding import get_rope
 from aiter.rotary_embedding import get_rope
+from torch import nn
+
+# import torch.distributed as dist
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 
@@ -20,8 +25,6 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 
-from atom.utils.decorators import support_torch_compile
-
 # from atom.model_ops.rotary_embedding import get_rope
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import (
@@ -32,10 +35,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
-from torch import nn
-
-# import torch.distributed as dist
-from transformers import PretrainedConfig
+from atom.utils.decorators import support_torch_compile
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
@@ -86,7 +86,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -505,7 +505,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **model_kwargs: dict[str, Any] | None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -518,7 +518,7 @@ class Qwen3MoeForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 

@@ -1,7 +1,6 @@
-from typing import Optional, Union
-
 import torch
 import torch.nn.functional as F
+from aiter import QuantType
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_ep_group,
@@ -10,16 +9,17 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
+from einops import rearrange
+from torch import nn
+from transformers.activations import ACT2FN
+
 from atom.config import Config, QuantizationConfig
 from atom.model_config.qwen3_next import Qwen3NextConfig
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import LinearAttention
-from atom.model_ops.triton_mrope import try_mrope_qk_fused
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import DualRMSNorm
-from atom.model_ops.layernorm import GemmaRMSNorm
+from atom.model_ops.layernorm import DualRMSNorm, GemmaRMSNorm, RMSNormGated
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
-from atom.model_ops.layernorm import RMSNormGated
 from atom.model_ops.linear import (
     BAParallelLinear,
     ColumnParallelLinear,
@@ -30,9 +30,10 @@ from atom.model_ops.linear import (
     QKVZBAParallelLinear,
     QKVZParallelLinear,
     RowParallelLinear,
-)  # noqa: F401
+)
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.triton_mrope import try_mrope_qk_fused
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -45,10 +46,6 @@ from atom.models.utils import (
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from einops import rearrange
-from torch import nn
-from transformers.activations import ACT2FN
-from aiter import QuantType
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
@@ -530,18 +527,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         value_settings = (self.value_dim, 0, False)
 
         delattr(self.conv1d.weight, "weight_loader")
-        setattr(
-            self.conv1d.weight,
-            "weight_loader",
-            mamba_v2_sharded_weight_loader(
-                [
-                    query_key_settings,
-                    query_key_settings,
-                    value_settings,
-                ],
-                self.tp_size,
-                self.tp_rank,
-            ),
+        self.conv1d.weight.weight_loader = mamba_v2_sharded_weight_loader(
+            [query_key_settings, query_key_settings, value_settings],
+            self.tp_size,
+            self.tp_rank,
         )
 
         # selective projection used to make dt, B and C input dependant
@@ -1032,7 +1021,7 @@ class Qwen3NextForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -1041,7 +1030,7 @@ class Qwen3NextForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 

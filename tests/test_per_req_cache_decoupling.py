@@ -13,9 +13,10 @@
 
 
 from conftest import MockConfig
+
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.scheduler import Scheduler, ScheduledBatch
 
 # ── helpers ────────────────────────────────────────────────────────────────
 

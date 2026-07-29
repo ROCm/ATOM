@@ -11,8 +11,9 @@ def _patch_eagle3_model_type_checks() -> None:
     # through the ATOMModelBase wrapper, so patch the type checks to accept the
     # ATOMModelBase wrapper
     try:
+        from vllm.v1.spec_decode import llm_base_proposer
+
         from atom.plugin.vllm.model_wrapper import ATOMModelBase
-        import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
     except Exception:
         logger.warning(
             "vLLM plugin: failed to patch vLLM V1 EAGLE3 proposer type checks. "
@@ -35,7 +36,7 @@ def _patch_eagle3_model_type_checks() -> None:
             widened = (original, ATOMModelBase)
         setattr(llm_base_proposer, name, widened)
 
-    setattr(llm_base_proposer, "_atom_eagle3_model_types_patched", True)
+    llm_base_proposer._atom_eagle3_model_types_patched = True
     logger.info("ATOM plugin: patched vLLM EAGLE3 proposer type checks.")
 
 
@@ -356,7 +357,7 @@ def _patch_vllm_llm_base_model_sharing() -> None:
                     "DeepSeek-V4 MTP draft attention type check."
                 )
 
-    setattr(wrapped_load_model, "_atom_share_with_target_patched", True)
+    wrapped_load_model._atom_share_with_target_patched = True
     SpecDecodeBaseProposer.load_model = wrapped_load_model
 
 
@@ -425,16 +426,8 @@ def _patch_vllm_draft_kv_group_validation() -> None:
             return
         return original_initialize(self, kv_cache_config, kernel_block_sizes)
 
-    setattr(
-        wrapped_validate_same_kv_cache_group,
-        "_atom_kv_group_validation_patched",
-        True,
-    )
-    setattr(
-        wrapped_initialize_attn_backend,
-        "_atom_kv_group_validation_patched",
-        True,
-    )
+    wrapped_validate_same_kv_cache_group._atom_kv_group_validation_patched = True
+    wrapped_initialize_attn_backend._atom_kv_group_validation_patched = True
     SpecDecodeBaseProposer.validate_same_kv_cache_group = (
         wrapped_validate_same_kv_cache_group
     )
@@ -480,9 +473,7 @@ def _patch_vllm_draft_positions_on_metadata() -> None:
             common_attn_metadata.positions = self._get_positions(num_tokens)
         return original_build(self, common_attn_metadata, draft_index)
 
-    setattr(
-        wrapped_build_per_group_and_layer_attn_metadata, "_atom_positions_patched", True
-    )
+    wrapped_build_per_group_and_layer_attn_metadata._atom_positions_patched = True
     SpecDecodeBaseProposer.build_per_group_and_layer_attn_metadata = (
         wrapped_build_per_group_and_layer_attn_metadata
     )
@@ -531,7 +522,7 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
             num_rejected_tokens_gpu,
         )
 
-    setattr(wrapped_set_inputs_first_pass, "_atom_v4_mtp_inputs_patched", True)
+    wrapped_set_inputs_first_pass._atom_v4_mtp_inputs_patched = True
     SpecDecodeBaseProposer.set_inputs_first_pass = wrapped_set_inputs_first_pass
 
 
@@ -542,6 +533,8 @@ def apply_vllm_spec_decode_patch() -> None:
     _patch_vllm_draft_positions_on_metadata()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()
 
+    from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
+
     from atom.plugin.vllm.attention.metadata import (
         AiterMhaMetadataForVllm,
         AiterMlaMetadataForVllm,
@@ -551,7 +544,6 @@ def apply_vllm_spec_decode_patch() -> None:
     from atom.utils.forward_context import (
         AttentionMetaData as AtomAttentionMetaData,
     )
-    from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 
     _patch_eagle3_model_type_checks()
     _patch_heterogeneous_eagle3_kv_cache()
@@ -586,7 +578,7 @@ def apply_vllm_spec_decode_patch() -> None:
                 dict.fromkeys((*allowed, *atom_allowed_attn_types))
             )
 
-    setattr(wrapped_init, "_atom_allowed_attn_types_patched", True)
+    wrapped_init._atom_allowed_attn_types_patched = True
     SpecDecodeBaseProposer.__init__ = wrapped_init
 
     logger.info(

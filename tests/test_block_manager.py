@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/block_manager.py — public API only
 
-from atom.model_engine.block_manager import BlockManager
 from conftest import MockConfig
+
+from atom.model_engine.block_manager import BlockManager
 
 # ── compute_hash ───────────────────────────────────────────────────────────
 

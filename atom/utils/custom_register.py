@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Callable
+
 import torch
 from torch.library import Library
-from typing import Callable, Optional
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -12,8 +13,8 @@ def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
     mutates_args: list[str],
-    fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None,
+    fake_impl: Callable | None = None,
+    target_lib: Library | None = None,
     dispatch_key: str = "CUDA",
     tags: tuple[torch.Tag, ...] = (),
 ):

@@ -19,8 +19,6 @@ These ops do NOT change tensor shape or dtype — they round-trip the values
 in-place to simulate the precision loss of low-bit storage.
 """
 
-from typing import Optional
-
 import torch
 
 # FP4 e2m1 representable magnitudes (positive half). Symmetric around 0.
@@ -116,7 +114,7 @@ def dequant_fp4_e2m1(
 
 
 def act_quant_inplace(
-    x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
+    x: torch.Tensor, block_size: int = 128, scale_fmt: str | None = None
 ) -> None:
     """In-place BF16 -> FP8 e4m3 -> BF16 round-trip, blocked along the last dim.
 

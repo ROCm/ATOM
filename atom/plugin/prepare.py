@@ -149,15 +149,15 @@ def prepare_model(config: Any, engine: str):
         )
 
     # import here to avoid partial initialization
+    from atom.plugin.config import generate_atom_config_for_plugin_mode
+
     from .register import (
         _ATOM_SUPPORTED_MODELS,
+        init_aiter_dist,
         # register_ops_to_vllm,
         register_ops_to_sglang,
-        init_aiter_dist,
         set_attn_cls,
     )
-
-    from atom.plugin.config import generate_atom_config_for_plugin_mode
 
     atom_config = generate_atom_config_for_plugin_mode(config)
 

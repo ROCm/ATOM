@@ -1,13 +1,11 @@
-from typing import Optional
-
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
+from atom.plugin.vllm.attention import ops as _atom_vllm_attention_ops  # noqa: F401
 from atom.plugin.vllm.attention.layer_mha import AttentionForVllmMHA
 from atom.plugin.vllm.attention.layer_mla import (
     AttentionForVllmMLA,
     AttentionForVllmSparseMLA,
 )
-from atom.plugin.vllm.attention import ops as _atom_vllm_attention_ops  # noqa: F401
 
 _MINIMAX_M3_MODEL_TYPES = {"minimax_m3", "minimax_m3_text", "minimax_m3_vl"}
 
@@ -60,7 +58,7 @@ class AttentionForVllm:
         cls,
         *args,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
+        mla_modules: MLAModules | None = None,
         **kwargs,
     ):
         atom_config = get_current_atom_config()

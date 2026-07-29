@@ -2,4 +2,4 @@
 
 from .register import register_model, register_platform
 
-__all__ = ["register_platform", "register_model"]
+__all__ = ["register_model", "register_platform"]

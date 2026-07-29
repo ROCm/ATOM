@@ -3,6 +3,7 @@
 
 import argparse
 import random
+
 from transformers import AutoTokenizer
 
 from atom import SamplingParams
