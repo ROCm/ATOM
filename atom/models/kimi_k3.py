@@ -913,6 +913,62 @@ class KimiKDAAttention(nn.Module):
                 is_kda=True,
                 lower_bound=self._kda_gate_lower_bound,
             )
+        elif gdn_metadata.num_spec_decodes > 0:
+            # Speculative-decode verify: each request feeds `1 + num_spec` query
+            # tokens against a paged KV. gdn_attn zeroes `num_decodes` and routes
+            # here via `num_spec_decodes`, handing over the multi-slot spec
+            # buffers (`spec_state_indices_tensor` [bs, 1+num_spec]) plus
+            # `num_accepted_tokens`. Both kernels then snapshot per-token state
+            # into those slots and, next step, resume from the last ACCEPTED
+            # token's snapshot -- so a rejected draft's state advance is rolled
+            # back instead of permanently corrupting the KDA recurrence (the
+            # missing piece that made spec decode output garbage). Mirrors the
+            # native-GDN spec path in attention_gdn.py.
+            spec_state_indices = gdn_metadata.spec_state_indices_tensor
+            spec_query_start_loc = gdn_metadata.spec_query_start_loc
+            num_accepted_tokens = gdn_metadata.num_accepted_tokens
+            q, k, v = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.local_proj_size,
+                self.local_proj_size,
+                None,
+                self.activation,
+                # First reserved slot per seq holds the resume state; the kernel
+                # walks forward via num_accepted_tokens + query_start_loc.
+                conv_state_indices=spec_state_indices[:, 0][
+                    : gdn_metadata.num_spec_decodes
+                ],
+                num_accepted_tokens=num_accepted_tokens,
+                query_start_loc=spec_query_start_loc,
+                max_query_len=spec_state_indices.size(-1),
+                validate_data=False,
+            )
+            q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
+            k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
+            v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                a=gate,
+                b=beta,
+                dt_bias=self.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                o=out,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=spec_query_start_loc[: gdn_metadata.num_spec_decodes + 1],
+                # 2D [bs, 1+num_spec]: per-token snapshot slots. Paired with
+                # num_accepted_tokens the kernel reads the resume state from
+                # slot[num_accepted-1] and writes a snapshot after each token.
+                ssm_state_indices=spec_state_indices,
+                num_accepted_tokens=num_accepted_tokens,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=True,
+                lower_bound=self._kda_gate_lower_bound,
+            )
         else:
             out.zero_()
 

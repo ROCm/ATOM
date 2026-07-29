@@ -759,15 +759,10 @@ class ModelRunner:
         )
 
         self._build_and_load_model(model_class)
-        if (
-            os.getenv("ATOM_SYNC_AFTER_LOAD", "0").lower() in ("1", "true", "yes")
-            and get_tp_group().world_size > 1
-        ):
-            logger.info(
-                "Waiting for all TP ranks to finish model loading before warmup"
-            )
-            get_tp_group().barrier()
-            logger.info("All TP ranks finished model loading")
+        # NOTE: the ATOM_SYNC_AFTER_LOAD TP barrier lives inside
+        # `_build_and_load_model` (base impl). A second copy here — introduced by
+        # the #1712 cherry-pick merge — made the barrier run twice and deadlocked
+        # TP load. Removed to restore the single-barrier design.
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
