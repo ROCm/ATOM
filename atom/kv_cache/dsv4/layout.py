@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from atom.kv_cache.dsv4.arena import ArenaGroupSpec
 from atom.kv_cache.layout import KvLayoutOptions, KvPoolLayout
-from atom.model_engine.unified_kv_arena import ArenaGroupSpec
 
 
 class Dsv4LayoutProvider(Protocol):

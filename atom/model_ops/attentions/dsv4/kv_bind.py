@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from atom.model_engine.unified_kv_arena import ArenaGroupSpec, group_of_ratio
+from atom.kv_cache.dsv4.arena import ArenaGroupSpec, group_of_ratio
 
 
 def _prepare_bind_layout(builder: Any) -> tuple[Any, int, bool]:

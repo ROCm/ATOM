@@ -59,7 +59,7 @@ from atom.distributed.pcp_utils import (
     pcp_reindex_ragged,
     pcp_round_robin_query_indices,
 )
-from atom.model_engine.unified_kv_arena import ArenaGroupSpec, group_of_ratio
+from atom.kv_cache.dsv4.arena import ArenaGroupSpec, group_of_ratio
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,

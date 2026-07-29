@@ -16,13 +16,13 @@ from atom.distributed.kv_events import (
     KVCacheEvent,
 )
 from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.dsv4.arena import Dsv4UnifiedArena
 from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
+from atom.kv_cache.dsv4.swa_pool import Dsv4SwaPool
 from atom.kv_cache.pools.chunk_arena import ArenaEmpty
 from atom.kv_cache.pools.pooled_free_list import PooledFreeList
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.swa_pool import SlidingWindowPool
-from atom.model_engine.unified_kv_arena import UnifiedKvArena
 from atom.utils import envs
 
 
@@ -138,7 +138,7 @@ class BlockManager:
         _num_swa = getattr(config, "num_swa_blocks", 0)
         if self.arena is not None and self.arena.enabled:
             _num_swa = max(_num_swa, self.arena.max_swa_blocks())
-        self.swa = SlidingWindowPool(
+        self.swa = Dsv4SwaPool(
             num_blocks=_num_swa,
             window=getattr(config, "swa_window_size", 0),
             block_size=block_size,
@@ -179,7 +179,7 @@ class BlockManager:
         specs = getattr(config, "v4_arena_group_specs", None)
         if not specs:
             return None
-        return UnifiedKvArena(block_size=block_size, group_specs=list(specs))
+        return Dsv4UnifiedArena(block_size=block_size, group_specs=list(specs))
 
     def _evict_cold_compressed(self) -> bool:
         """Truly evict the coldest ref-0 compressed block (drop hash + return its
