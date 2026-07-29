@@ -61,6 +61,7 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 16
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.85
         max_num_seqs: 256
         extra_args: ""
@@ -142,6 +143,7 @@ models:
       common_args:
         trust_remote_code: true
         kv_cache_dtype: fp8
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.8
         max_num_batched_tokens: 16384
         max_model_len: 16384
@@ -317,7 +319,8 @@ models:
             tp: 4
             cudagraph: none
 
-        - <<: *glm52_agentic_lmcache
+        - &glm52_agentic_lmcache
+          <<: *glm52_agentic_tp8_tp8
           name: glm-52-mxfp4-1p1d-tp8-dpa-agentic-lmcache-1m-c48
           topology: 1p1d_dpa
           concurrency: [48]
@@ -334,6 +337,17 @@ models:
             tp: 8
             cudagraph: none
             extra_args: "--enable-dp-attention --enable-tbo"
+          env:
+            common:
+              PYTHONHASHSEED: "0"
+            prefill:
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+              LMCACHE_CHUNK_SIZE: "256"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              MAX_JOBS: "16"
 
         - <<: *glm52_agentic_lmcache
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
@@ -451,6 +465,7 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 16
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.9
         max_num_seqs: 256
         max_num_batched_tokens: 32768
@@ -580,6 +595,7 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 128
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.8
         max_model_len: 32768
         max_num_seqs: 256
@@ -719,6 +735,7 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 128
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.8
         max_model_len: 32768
         max_num_seqs: 256

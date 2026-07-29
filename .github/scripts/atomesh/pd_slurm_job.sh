@@ -44,8 +44,10 @@ allow = (
     "ENABLE_PREFIX_CACHING",
     "MAX_MODEL_LEN",
     "MAX_NUM_SEQS",
+    "DECODE_MAX_NUM_SEQS",
     "MAX_NUM_BATCHED_TOKENS",
     "DECODE_MAX_NUM_BATCHED_TOKENS",
+    "DISABLE_PREFIX_CACHING",
     "ONLINE_QUANT_CONFIG",
     "HF_OVERRIDES",
     # Preserve FlyDSL cache overrides for non-root Spur containers.
