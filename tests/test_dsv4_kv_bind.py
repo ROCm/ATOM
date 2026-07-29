@@ -50,7 +50,14 @@ def _install_model_types(monkeypatch):
 
 def _fixture(*, arena: bool = False, fp8: bool = False):
     # index_dim includes room for each row's inline fp32 scale.
-    nb, k1, head_dim, index_dim, rope_dim = 3, 2, 4, 8, 2
+    nb, k1, head_dim, index_head_dim, aligned_index_dim, rope_dim = (
+        3,
+        2,
+        4,
+        4,
+        8,
+        2,
+    )
     swa_blocks, block_size = 2, 4
     swa_rows = swa_blocks * block_size
 
@@ -88,7 +95,9 @@ def _fixture(*, arena: bool = False, fp8: bool = False):
     runner.v4_unified_kv = [torch.zeros((n, head_dim)) for n in rows]
     runner.v4_unified_kv_rope = [torch.zeros((n, rope_dim)) for n in rows]
     # Keep a layer-major base so the second slice has a non-zero storage offset.
-    runner.v4_csa_idx_kv = torch.zeros((2, nb, k1, index_dim), dtype=torch.uint8)
+    runner.v4_csa_idx_kv = torch.zeros(
+        (2, nb, k1, aligned_index_dim), dtype=torch.uint8
+    )
     state = torch.zeros((2, 1, 1))
     for name in (
         "v4_csa_idx_kv_state",
@@ -108,7 +117,7 @@ def _fixture(*, arena: bool = False, fp8: bool = False):
         model_runner=runner,
         block_size=block_size,
         head_dim=head_dim,
-        index_head_dim=index_dim,
+        index_head_dim=index_head_dim,
         rope_head_dim=rope_dim,
         k1_csa=k1,
         k2_hca=1,
