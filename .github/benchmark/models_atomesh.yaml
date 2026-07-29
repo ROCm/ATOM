@@ -192,10 +192,10 @@ models:
 
         # Keep each AgentX concurrency in its own job so every measurement starts
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
-        - &glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c1
+        - &glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
           topology: 1p1d
-          display_topology: 1P1D-TP8-agentic
+          display_topology: 1P1D-TP4-agentic
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [1048576]
@@ -215,10 +215,10 @@ models:
               online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
           prefill:
             workers: 1
-            tp: 8
+            tp: 4
           decode:
             workers: 1
-            tp: 8
+            tp: 4
             cudagraph: none
           env:
             decode:
@@ -246,31 +246,6 @@ models:
             wait_router_timeout: 600
           run_eval: false
 
-        - <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c2
-          concurrency: [2]
-
-        - <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c4
-          concurrency: [4]
-
-        - <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c8
-          concurrency: [8]
-
-        - &glm52_agentic_tp4_tp4
-          <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
-          display_topology: 1P1D-TP4-agentic
-          pd_worker_layout: multi_node
-          prefill:
-            workers: 1
-            tp: 4
-          decode:
-            workers: 1
-            tp: 4
-            cudagraph: none
-
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
@@ -282,6 +257,10 @@ models:
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
+
+        - <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c48
+          concurrency: [48]
 
     accuracy:
       task: gsm8k
