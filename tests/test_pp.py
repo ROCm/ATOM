@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-import torch.nn as nn
 import zmq
+from torch import nn
 
 # pp_comm imports aiter.dist.parallel_state and aiter.ops.communication, which
 # need a GPU build; stub them so the wrapper logic can be tested on CPU.
