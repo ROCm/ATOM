@@ -437,18 +437,18 @@ class Capture:
 
     def wrap_prefill(self, orig):
         def f(q, unified_kv, kvi_p, kvp_p, kv, kvi_e, kvp_e, sink, scale, *a, **kw):
-            self.rec = dict(
-                kind="prefill",
-                q=q.detach().clone(),
-                unified_kv=unified_kv.detach().clone(),
-                kvi_p=kvi_p.detach().clone(),
-                kvp_p=kvp_p.detach().clone(),
-                kv=kv.detach().clone(),
-                kvi_e=kvi_e.detach().clone(),
-                kvp_e=kvp_e.detach().clone(),
-                sink=sink.detach().clone(),
-                scale=scale,
-            )
+            self.rec = {
+                "kind": "prefill",
+                "q": q.detach().clone(),
+                "unified_kv": unified_kv.detach().clone(),
+                "kvi_p": kvi_p.detach().clone(),
+                "kvp_p": kvp_p.detach().clone(),
+                "kv": kv.detach().clone(),
+                "kvi_e": kvi_e.detach().clone(),
+                "kvp_e": kvp_e.detach().clone(),
+                "sink": sink.detach().clone(),
+                "scale": scale,
+            }
             return orig(
                 q, unified_kv, kvi_p, kvp_p, kv, kvi_e, kvp_e, sink, scale, *a, **kw
             )
@@ -457,18 +457,18 @@ class Capture:
 
     def wrap_decode(self, orig):
         def f(q, unified_kv, kv_indices, kv_indptr, sink, scale, *a, **kw):
-            self.rec = dict(
-                kind="decode",
-                q=q.detach().clone(),
-                unified_kv=unified_kv.detach().clone(),
-                kvi_p=kv_indices.detach().clone(),
-                kvp_p=kv_indptr.detach().clone(),
-                kv=None,
-                kvi_e=None,
-                kvp_e=None,
-                sink=sink.detach().clone(),
-                scale=scale,
-            )
+            self.rec = {
+                "kind": "decode",
+                "q": q.detach().clone(),
+                "unified_kv": unified_kv.detach().clone(),
+                "kvi_p": kv_indices.detach().clone(),
+                "kvp_p": kv_indptr.detach().clone(),
+                "kv": None,
+                "kvi_e": None,
+                "kvp_e": None,
+                "sink": sink.detach().clone(),
+                "scale": scale,
+            }
             return orig(q, unified_kv, kv_indices, kv_indptr, sink, scale, *a, **kw)
 
         return f
@@ -519,9 +519,8 @@ def run_prefill(attn, hf, cfg, builder, batch_size, seq_len, block_size, max_mod
 def run_decode(attn, hf, cfg, builder, batch_size, ctx_len, block_size, max_model_len):
     """Fill the SWA ring + compressor state with a ctx_len-1 prefill, then check
     one decode step (the token at position ctx_len-1)."""
-    from atom.utils.forward_context import Context, set_forward_context
-
     import atom.models.deepseek_v4 as v4
+    from atom.utils.forward_context import Context, set_forward_context
 
     bpr = (max_model_len + block_size - 1) // block_size
     bt, swa_bt = paged_tables(batch_size, ctx_len, block_size, bpr)
@@ -679,7 +678,7 @@ def main():
 
     print(f"\n{'phase':8} {'layer':6} {'ratio':>5} {'pass':>6}")
     for ph, k, r, ok in rows:
-        print(f"{ph:8} {k:6} {r:>5} {str(ok):>6}")
+        print(f"{ph:8} {k:6} {r:>5} {ok!s:>6}")
     print("\nAll passed." if not fail else f"\n{fail} FAILED")
     return 0 if not fail else 1
 
