@@ -1104,10 +1104,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # block_table). Emit it as swa_block_regions so the connector keys it by
         # swa_block_table — window-freeing leaves only the live tail (the last
         # ~128-token block) as non-(-1) entries, so only that gets transferred.
-        # block b's SWA lives at uv[0] + b*block_size*head_dim*elem. FP8 uses
-        # an additional RoPE region per layer; do not use
-        # swa_block_bytes_per_layer() there because it is the combined 2buff
-        # footprint, while each KVTransferRegion has one contiguous base.
+        # FP8 2buf KV registers NoPE and RoPE SWA pools as separate regions.
         nope_swa_bpb = self.block_size * self.head_dim * elem_classical
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
