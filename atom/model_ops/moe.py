@@ -1233,14 +1233,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
             # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
-            # NOTE: the a8w4 GGUU decode kernel hardcodes SiLU activation and does
-            # not implement Kimi situ — guard so it fails loudly instead of
-            # silently degrading accuracy if enabled for a situ model.
-            if activation == ActivationType.Situv2:
-                raise RuntimeError(
-                    "ATOM_USE_TRITON_MOE_DECODE (a8w4 GGUU) does not support situ "
-                    "activation; disable it for Kimi-K3."
-                )
             from aiter.ops.triton.moe.moe_routing.routing import routing
 
             from atom.model_ops.fused_moe_triton import (
@@ -1355,10 +1347,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
                     act_quant=self.act_quant,
-                    situ_beta=getattr(layer, "activation_situ_beta", None),
-                    situ_linear_beta=getattr(
-                        layer, "activation_situ_linear_beta", None
-                    ),
                 )
 
                 # Always-on shared expert(s) via a standalone dense GEMM,
@@ -1395,8 +1383,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 act_quant=self.act_quant,
-                situ_beta=getattr(layer, "activation_situ_beta", None),
-                situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
             )
 
         topk_weights, topk_ids = self.select_experts_with_record(

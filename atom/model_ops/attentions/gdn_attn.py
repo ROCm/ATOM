@@ -67,15 +67,15 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
-class GDNStateMixin:
-    def __init__(self, model_runner, **kwargs):
-        super().__init__(model_runner=model_runner, **kwargs)
-        self._init_gdn_state(model_runner)
+class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
-    def _init_gdn_state(
+    reorder_batch_threshold: int = 1
+
+    def __init__(
         self,
         model_runner,
     ):
+        super().__init__(model_runner=model_runner)
         # Hybrid model layer-counting state (formerly set as a side effect
         # inside ModelRunner._compute_block_bytes' qwen_next branch).
         # Promoted to runner attributes here so all consumers
@@ -84,43 +84,13 @@ class GDNStateMixin:
         # a hidden ordering dependency on _compute_block_bytes being
         # called first.
         hf = model_runner.config.hf_config
-        if getattr(hf, "model_type", None) == "kimi_linear":
-            lin = getattr(hf, "linear_attn_config", {}) or {}
-            model_runner.full_attention_layers = [
-                int(i) - 1 for i in lin.get("full_attn_layers", [])
-            ]
-            model_runner.kda_attention_layers = [
-                int(i) - 1 for i in lin.get("kda_layers", [])
-            ]
-            model_runner.num_full_attn = len(model_runner.full_attention_layers)
-            model_runner.num_gdn_attn_state = len(model_runner.kda_attention_layers)
-            hf.linear_num_key_heads = getattr(
-                hf, "linear_num_key_heads", lin.get("num_heads", hf.num_attention_heads)
-            )
-            hf.linear_num_value_heads = getattr(
-                hf,
-                "linear_num_value_heads",
-                lin.get("num_heads", hf.num_attention_heads),
-            )
-            hf.linear_key_head_dim = getattr(
-                hf, "linear_key_head_dim", lin.get("head_dim", hf.qk_nope_head_dim)
-            )
-            hf.linear_value_head_dim = getattr(
-                hf, "linear_value_head_dim", lin.get("head_dim", hf.v_head_dim)
-            )
-            hf.linear_conv_kernel_dim = getattr(
-                hf,
-                "linear_conv_kernel_dim",
-                lin.get("short_conv_kernel_size", 4),
-            )
-        else:
-            model_runner.full_attention_interval = hf.full_attention_interval
-            model_runner.num_full_attn = (
-                hf.num_hidden_layers // model_runner.full_attention_interval
-            )
-            model_runner.num_gdn_attn_state = (
-                hf.num_hidden_layers - model_runner.num_full_attn
-            )
+        model_runner.full_attention_interval = hf.full_attention_interval
+        model_runner.num_full_attn = (
+            hf.num_hidden_layers // model_runner.full_attention_interval
+        )
+        model_runner.num_gdn_attn_state = (
+            hf.num_hidden_layers - model_runner.num_full_attn
+        )
 
         self.num_spec = 0
         if hasattr(model_runner, "drafter"):
@@ -216,14 +186,6 @@ class GDNStateMixin:
         return conv_state_shape, temporal_state_shape
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
-        if (
-            getattr(self.model_runner.config.hf_config, "model_type", None)
-            == "kimi_linear"
-        ):
-            return (
-                self.model_runner.config.torch_dtype,
-                torch.float32,
-            )
         return (
             self.model_runner.config.torch_dtype,
             self.model_runner.config.torch_dtype,
@@ -272,6 +234,99 @@ class GDNStateMixin:
             ),
         }
 
+    def compute_block_bytes(self) -> int:
+        """GDN hybrid: only full-attention layer slots contribute paged KV
+        bytes (linear-attention layers' state lives in the per-request
+        cache pool, accounted separately via compute_per_req_cache_bytes).
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        num_kv_heads = runner._get_num_kv_heads()
+        total = runner._get_total_num_layers()
+        num_draft = total - hf_config.num_hidden_layers
+        n_full = runner.num_full_attn + num_draft
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
+        # kv_cache: [2, n_full, blocks, block_size, num_kv_heads, head_dim]
+        block_bytes = (
+            2
+            * n_full
+            * runner.physical_block_size
+            * num_kv_heads
+            * hf_config.head_dim
+            * kv_dtype_size
+        )
+        # kv_scale: [2, n_full, blocks, num_kv_heads, block_size] fp32
+        block_bytes += 2 * n_full * num_kv_heads * runner.physical_block_size * 4
+        return block_bytes
+
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads: int, num_draft_layers: int
+    ) -> dict:
+        """GDN hybrid: KV cache only covers full-attention layer slots
+        (linear-attention layers don't store paged KV; they use the
+        per-request mamba_k/v_cache pool allocated separately).
+
+        Layout: `[2, num_full_attn + num_draft_layers, ...]` — note this
+        differs from AiterAttentionMetadataBuilder's `num_hidden_layers`
+        first dim. The slot index math is in build_kv_cache_tensor's
+        attn_idx computation (skips linear-attn slots).
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        n_full = runner.num_full_attn + num_draft_layers
+        return {
+            "kv_cache": torch.zeros(
+                2,
+                n_full,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                num_kv_heads,
+                hf_config.head_dim,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            ),
+            "kv_scale": torch.zeros(
+                2,
+                n_full,
+                runner.num_physical_kvcache_blocks,
+                num_kv_heads,
+                runner.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            ),
+        }
+
+    def build_kv_cache_tensor(self, layer_id: int, module):
+        """Dispatch by module type:
+
+        - `base_linear_attention` (GDN linear attention) → wrap the slot
+          slice of mamba_k_cache / mamba_v_cache
+        - everything else (full-attention MHA layers in the hybrid model,
+          plus modules of types this builder doesn't recognize) → defer
+          to AiterAttentionMetadataBuilder.build_kv_cache_tensor
+        """
+        if hasattr(module, "base_linear_attention"):
+            from atom.config import KVCacheTensor
+
+            runner = self.model_runner
+            interval = runner.full_attention_interval
+            gdn_idx = (layer_id // interval) * (interval - 1) + (layer_id % interval)
+            return KVCacheTensor(
+                layer_num=layer_id,
+                k_cache=runner.mamba_k_cache[gdn_idx],
+                v_cache=runner.mamba_v_cache[gdn_idx],
+                k_scale=None,
+                v_scale=None,
+            )
+        return super().build_kv_cache_tensor(layer_id, module)
+
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
@@ -301,8 +356,6 @@ class GDNStateMixin:
         batch: ScheduledBatch,
         attn_metadata: AttentionMetaData,
         is_prefill: bool = False,
-        *,
-        prepare_block_tables: bool = True,
     ) -> GDNAttentionMetadata:
 
         num_decodes = batch.total_seqs_num_decode
@@ -310,8 +363,7 @@ class GDNStateMixin:
         num_decode_tokens = batch.total_tokens_num_decode
         num_prefill_tokens = batch.total_tokens_num_prefill
         num_reqs = batch.total_seqs_num
-        if prepare_block_tables:
-            self.prepare_block_tables(batch)
+        self.prepare_block_tables(batch)
 
         context_lens_tensor = attn_metadata.context_lens
         query_start_loc = attn_metadata.cu_seqlens_q
@@ -391,19 +443,35 @@ class GDNStateMixin:
         )
         return gdn_attn_metadata
 
-    def _attach_gdn_decode_metadata(
+    def prepare_prefill(  # type: ignore[override]
         self,
-        batch,
-        attn_metadata,
-        *,
-        prepare_block_tables: bool = True,
-    ) -> None:
+        batch: ScheduledBatch,
+    ) -> GDNAttentionMetadata:
+        attn_metadata, positions = super().prepare_prefill(batch)
+        if batch.block_tables == []:
+            attn_metadata.gdn_metadata = None
+            return attn_metadata, positions
+        gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
+
+        attn_metadata.gdn_metadata = gdn_metadata
+        return attn_metadata, positions
+
+    def prepare_decode(  # type: ignore[override]
+        self,
+        batch: ScheduledBatch,
+        bs: int,
+    ) -> GDNAttentionMetadata:
         num_decodes = batch.total_seqs_num_decode
-        gdn_metadata = self.prepare_gdn_metadata(
-            batch,
-            attn_metadata,
-            prepare_block_tables=prepare_block_tables,
-        )
+        attn_metadata, positions = super().prepare_decode(batch, bs)
+        self.model_runner.forward_vars["cu_seqlens_q"].cpu[
+            bs:
+        ] = batch.total_tokens_num_decode
+        # we fill the attn_metadata cu_seqlens_q here since aiter attn won't calc it for decode
+        attn_metadata.cu_seqlens_q = self.model_runner.forward_vars[
+            "cu_seqlens_q"
+        ].copy_to_gpu(bs + 1)
+
+        gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata)
 
         # transfer data to ps buffer
         if self.use_spec_decode:
@@ -451,181 +519,6 @@ class GDNStateMixin:
             ]
 
         attn_metadata.gdn_metadata = gdn_metadata
-
-    def _build_gdn_capture_metadata(self, bs: int):
-        if self.use_spec_decode:
-            gdn_metadata = GDNAttentionMetadata(
-                num_prefills=0,
-                num_prefill_tokens=0,
-                num_decodes=0,
-                num_decode_tokens=0,
-                num_spec_decodes=bs,
-                num_spec_decode_tokens=bs * (self.num_spec + 1),
-                num_actual_tokens=bs * (self.num_spec + 1),
-                has_initial_state=None,
-                spec_query_start_loc=self.spec_query_start_loc[: bs + 1],
-                non_spec_query_start_loc=None,
-                spec_state_indices_tensor=self.spec_state_indices_tensor.gpu[:bs],
-                non_spec_state_indices_tensor=None,
-                spec_sequence_masks=self.spec_sequence_masks[:bs],
-                spec_token_indx=self.spec_token_indx[: bs * (self.num_spec + 1)],
-                non_spec_token_indx=self.non_spec_token_indx[:0],
-                num_accepted_tokens=self.num_accepted_tokens[:bs],
-                nums_dict=None,
-                batch_ptr=None,
-                token_chunk_offset_ptr=None,
-            )
-        else:
-            gdn_metadata = GDNAttentionMetadata(
-                num_prefills=0,
-                num_prefill_tokens=0,
-                num_decodes=bs,
-                num_decode_tokens=bs,
-                num_spec_decodes=0,
-                num_spec_decode_tokens=0,
-                num_actual_tokens=bs,
-                has_initial_state=None,
-                spec_query_start_loc=None,
-                non_spec_query_start_loc=self.non_spec_query_start_loc[: bs + 1],
-                spec_state_indices_tensor=None,
-                non_spec_state_indices_tensor=self.non_spec_state_indices_tensor.gpu[
-                    :bs
-                ],
-                spec_sequence_masks=None,
-                spec_token_indx=None,
-                non_spec_token_indx=None,
-                num_accepted_tokens=None,
-                nums_dict=None,
-                batch_ptr=None,
-                token_chunk_offset_ptr=None,
-            )
-        return gdn_metadata
-
-
-class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
-
-    reorder_batch_threshold: int = 1
-
-    def compute_block_bytes(self) -> int:
-        """GDN hybrid: only full-attention layer slots contribute paged KV
-        bytes (linear-attention layers' state lives in the per-request
-        cache pool, accounted separately via compute_per_req_cache_bytes).
-        """
-        from aiter import dtypes
-
-        runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        num_kv_heads = runner._get_num_kv_heads()
-        total = runner._get_total_num_layers()
-        num_draft = total - hf_config.num_hidden_layers
-        n_full = runner.num_full_attn + num_draft
-        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-
-        # kv_cache: [2, n_full, blocks, block_size, num_kv_heads, head_dim]
-        block_bytes = (
-            2
-            * n_full
-            * runner.physical_block_size
-            * num_kv_heads
-            * hf_config.head_dim
-            * kv_dtype_size
-        )
-        # kv_scale: [2, n_full, blocks, num_kv_heads, block_size] fp32
-        block_bytes += 2 * n_full * num_kv_heads * runner.physical_block_size * 4
-        return block_bytes
-
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
-    ) -> dict:
-        """GDN hybrid: KV cache only covers full-attention layer slots
-        (linear-attention layers don't store paged KV; they use the
-        per-request mamba_k/v_cache pool allocated separately).
-
-        Layout: `[2, num_full_attn + num_draft_layers, ...]` — note this
-        differs from AiterAttentionMetadataBuilder's `num_hidden_layers`
-        first dim. The slot index math is in build_kv_cache_tensor's
-        attn_idx computation (skips linear-attn slots).
-        """
-        from aiter import dtypes
-
-        runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        n_full = runner.num_full_attn + num_draft_layers
-        return {
-            "kv_cache": torch.zeros(
-                2,
-                n_full,
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            ),
-            "kv_scale": torch.zeros(
-                2,
-                n_full,
-                runner.num_physical_kvcache_blocks,
-                num_kv_heads,
-                runner.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            ),
-        }
-
-    def build_kv_cache_tensor(self, layer_id: int, module):
-        """Dispatch by module type:
-
-        - `base_linear_attention` (GDN linear attention) → wrap the slot
-          slice of mamba_k_cache / mamba_v_cache
-        - everything else → defer to
-          AiterAttentionMetadataBuilder.build_kv_cache_tensor
-        """
-        if hasattr(module, "base_linear_attention"):
-            from atom.config import KVCacheTensor
-
-            runner = self.model_runner
-            interval = runner.full_attention_interval
-            gdn_idx = (layer_id // interval) * (interval - 1) + (layer_id % interval)
-            return KVCacheTensor(
-                layer_num=layer_id,
-                k_cache=runner.mamba_k_cache[gdn_idx],
-                v_cache=runner.mamba_v_cache[gdn_idx],
-                k_scale=None,
-                v_scale=None,
-            )
-        return super().build_kv_cache_tensor(layer_id, module)
-
-    def prepare_prefill(  # type: ignore[override]
-        self,
-        batch: ScheduledBatch,
-    ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_prefill(batch)
-        if batch.block_tables == []:
-            attn_metadata.gdn_metadata = None
-            return attn_metadata, positions
-        gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
-
-        attn_metadata.gdn_metadata = gdn_metadata
-        return attn_metadata, positions
-
-    def prepare_decode(  # type: ignore[override]
-        self,
-        batch: ScheduledBatch,
-        bs: int,
-    ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_decode(batch, bs)
-        self.model_runner.forward_vars["cu_seqlens_q"].cpu[
-            bs:
-        ] = batch.total_tokens_num_decode
-        # we fill the attn_metadata cu_seqlens_q here since aiter attn won't calc it for decode
-        attn_metadata.cu_seqlens_q = self.model_runner.forward_vars[
-            "cu_seqlens_q"
-        ].copy_to_gpu(bs + 1)
-
-        self._attach_gdn_decode_metadata(batch, attn_metadata)
         return attn_metadata, positions
 
     def prepare_mtp_decode(
@@ -678,7 +571,53 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             **ctx_pa_ps,
         )
 
-        attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
+        if self.use_spec_decode:
+            gdn_metadata = GDNAttentionMetadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_spec_decodes=bs,
+                num_spec_decode_tokens=bs * (self.num_spec + 1),
+                num_actual_tokens=bs * (self.num_spec + 1),
+                has_initial_state=None,
+                spec_query_start_loc=self.spec_query_start_loc[: bs + 1],
+                non_spec_query_start_loc=None,
+                spec_state_indices_tensor=self.spec_state_indices_tensor.gpu[:bs],
+                non_spec_state_indices_tensor=None,
+                spec_sequence_masks=self.spec_sequence_masks[:bs],
+                spec_token_indx=self.spec_token_indx[: bs * (self.num_spec + 1)],
+                non_spec_token_indx=self.non_spec_token_indx[:0],
+                num_accepted_tokens=self.num_accepted_tokens[:bs],
+                nums_dict=None,
+                batch_ptr=None,
+                token_chunk_offset_ptr=None,
+            )
+        else:
+            gdn_metadata = GDNAttentionMetadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=bs,
+                num_decode_tokens=bs,
+                num_spec_decodes=0,
+                num_spec_decode_tokens=0,
+                num_actual_tokens=bs,
+                has_initial_state=None,
+                spec_query_start_loc=None,
+                non_spec_query_start_loc=self.non_spec_query_start_loc[: bs + 1],
+                spec_state_indices_tensor=None,
+                non_spec_state_indices_tensor=self.non_spec_state_indices_tensor.gpu[
+                    :bs
+                ],
+                spec_sequence_masks=None,
+                spec_token_indx=None,
+                non_spec_token_indx=None,
+                num_accepted_tokens=None,
+                nums_dict=None,
+                batch_ptr=None,
+                token_chunk_offset_ptr=None,
+            )
+        attn_metadata.gdn_metadata = gdn_metadata
 
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(

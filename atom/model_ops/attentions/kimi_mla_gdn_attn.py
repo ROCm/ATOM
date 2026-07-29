@@ -7,11 +7,11 @@ from aiter import dtypes
 
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.kimi_k3.metadata import KimiGDNStateMixin
 from atom.utils import envs
 
 from .aiter_mla import AiterMLAMetadataBuilder
 from .backends import AttentionBackend
-from .gdn_attn import GDNStateMixin
 from .triton_mla import TritonMLAMetadataBuilder
 
 
@@ -31,7 +31,7 @@ class KimiMLAGDNBackend(AttentionBackend):
         return MLAAttention
 
 
-class _KimiMLAGDNCommon(GDNStateMixin):
+class _KimiMLAGDNCommon(KimiGDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
         self.mla_idx_by_layer = {

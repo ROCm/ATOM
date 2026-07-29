@@ -918,7 +918,6 @@ class ModelRunner:
             "qwen3_next_mtp",
             "qwen3_5_text",
             "qwen3_5_moe_text",
-            "kimi_linear",
         ):
             return True
         return False

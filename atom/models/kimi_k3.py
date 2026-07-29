@@ -8,7 +8,6 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
-import os
 from typing import ClassVar
 
 import torch
@@ -163,17 +162,9 @@ class SituAndMul(nn.Module):
         self.linear_beta = linear_beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if os.environ.get("ATOM_K3_FUSED", "1") == "1":
-            from atom.models.kimi_k3_fused import situ_and_mul
+        from atom.model_ops.kimi_k3 import situ_and_mul
 
-            return situ_and_mul(x, self.beta, self.linear_beta)
-        gate, up = x.chunk(2, dim=-1)
-        gate_f = gate.float()
-        up_f = up.float()
-        out = self.beta * torch.tanh(gate_f / self.beta) * torch.sigmoid(gate_f)
-        if self.linear_beta is not None:
-            up_f = self.linear_beta * torch.tanh(up_f / self.linear_beta)
-        return (out * up_f).to(x.dtype)
+        return situ_and_mul(x, self.beta, self.linear_beta)
 
 
 class KimiRMSNormGated(nn.Module):
@@ -183,15 +174,9 @@ class KimiRMSNormGated(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        if os.environ.get("ATOM_K3_FUSED", "1") == "1":
-            from atom.models.kimi_k3_fused import rmsnorm_gated
+        from atom.model_ops.kimi_k3 import rmsnorm_gated
 
-            return rmsnorm_gated(x, self.weight, gate, self.variance_epsilon)
-        dtype = x.dtype
-        x_f = x.float()
-        var = x_f.pow(2).mean(dim=-1, keepdim=True)
-        x = x_f * torch.rsqrt(var + self.variance_epsilon)
-        return (x.to(dtype) * self.weight.to(dtype)) * torch.sigmoid(gate)
+        return rmsnorm_gated(x, self.weight, gate, self.variance_epsilon)
 
 
 def _sharded_vector_loader(tp_rank: int, tp_size: int):
@@ -345,22 +330,6 @@ class KimiSparseMoeBlock(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # gfx1250 work-around (REQUIRED for correctness, not just stability): the
-        # grouped MoE + MXFP4 latent projections are only numerically correct at
-        # small M on gfx1250 — at large prefill M the contiguous-M path OOB-faults
-        # AND the non-contiguous path returns coherent-but-wrong values (gsm8k
-        # 0.0). The MoE block is per-token independent, so split a large prefill
-        # into <=chunk sub-batches (numerically identical) so every kernel sees a
-        # small, correct M. Keeps whole-prompt prefill (correct MLA). Gated by
-        # ATOM_K3_MOE_CHUNK; remove once the gfx1250 MoE kernel is fixed at large M.
-        chunk = int(os.environ.get("ATOM_K3_MOE_CHUNK", "0") or "0")
-        n = hidden_states.shape[0]
-        if chunk > 0 and n > chunk:
-            outs = [
-                self._forward_impl(hidden_states[i : i + chunk])
-                for i in range(0, n, chunk)
-            ]
-            return torch.cat(outs, dim=0)
         return self._forward_impl(hidden_states)
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -502,7 +471,7 @@ class KimiFullAttention(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        from atom.models.kimi_k3_fused import dual_rmsnorm
+        from atom.model_ops.kimi_k3 import dual_rmsnorm
 
         q, kv, k_rope = torch.split(
             self.fused_qkv_a_proj(hidden_states),
@@ -732,9 +701,6 @@ class KimiKDAAttention(nn.Module):
         ).contiguous()
         self._in_proj_fused = True
 
-    def _conv_weights(self) -> torch.Tensor:
-        return self.conv_weight
-
     def _run_kda(
         self,
         q: torch.Tensor,
@@ -745,9 +711,8 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
-        recurrent: bool,
     ):
-        from fla.ops.kda import chunk_kda, fused_recurrent_kda
+        from fla.ops.kda import chunk_kda
 
         kwargs = {
             "q": q,
@@ -772,9 +737,6 @@ class KimiKDAAttention(nn.Module):
             "transpose_state_layout": True,
             "cu_seqlens": cu_seqlens,
         }
-        if recurrent:
-            kwargs.pop("safe_gate", None)
-            return fused_recurrent_kda(**kwargs)
         # FLA 0.5.1's default KDA recompute specialization is non-deterministic
         # for long, packed gfx950 prefills and can emit extreme values. Selecting
         # disable_recompute enables its STORE_QG specialization, which is stable
@@ -830,7 +792,7 @@ class KimiKDAAttention(nn.Module):
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
 
-        conv_weights = self._conv_weights()
+        conv_weights = self.conv_weight
         state_indices = gdn_metadata.non_spec_state_indices_tensor
         query_start_loc = gdn_metadata.non_spec_query_start_loc
 
@@ -854,18 +816,11 @@ class KimiKDAAttention(nn.Module):
             # Fused masked gather: ssm_state[state_indices] with fresh
             # sequences (~has_initial_state) written as zeros in one pass,
             # replacing the gather + separate zero-write.
-            from atom.models.kimi_k3_fused import gather_kda_initial_state
+            from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
             initial = gather_kda_initial_state(
                 ssm_state, state_indices, gdn_metadata.has_initial_state
             )
-            # gfx1250 workaround: chunk_kda NaNs on short prompts (seq < chunk
-            # size) and its `transpose_state_layout` output can mismatch the
-            # decode-time fused_recurrent_kda reader, producing NaN on the first
-            # decode step. Forcing the recurrent path for prefill keeps the KDA
-            # state layout consistent across prefill/decode. Env-gated so the
-            # fast chunk path stays default on archs where it is correct.
-            _kda_force_recurrent = os.getenv("ATOM_KDA_FORCE_RECURRENT", "0") == "1"
             kda_out, last_state = self._run_kda(
                 q,
                 k,
@@ -875,7 +830,6 @@ class KimiKDAAttention(nn.Module):
                 initial,
                 query_start_loc,
                 True,
-                recurrent=_kda_force_recurrent,
             )
             # last_state already has ssm_state's dtype (fla preserves the
             # initial_state dtype; the gathered initial is allocated as such),
@@ -895,7 +849,7 @@ class KimiKDAAttention(nn.Module):
                 None,
                 self.activation,
                 conv_state_indices=decode_state_indices,
-                validate_data=True,
+                validate_data=False,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -1107,7 +1061,7 @@ def _apply_attn_res(
     score_weight = getattr(proj, "score_weight", None)
     if score_weight is None:
         score_weight = _attn_res_score_weight(proj, norm)
-    from atom.models.kimi_k3_fused import apply_attn_res
+    from atom.model_ops.kimi_k3 import apply_attn_res
 
     return apply_attn_res(prefix_sum, block_residual, score_weight, eps, add_hidden)
 

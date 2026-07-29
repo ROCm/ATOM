@@ -7,12 +7,11 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
+from typing import List
 
 import torch
 import zmq
-
 from atom.config import Config, ParallelConfig
-from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
@@ -20,7 +19,6 @@ from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Sched
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import (
     envs,
-    get_hf_text_config,
     init_exit_handler,
     make_zmq_socket,
     set_process_title,
@@ -29,6 +27,8 @@ from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
 
+from atom.kv_transfer.disaggregation import KVOutputAggregator
+
 logger = logging.getLogger("atom")
 
 
@@ -36,7 +36,7 @@ class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[list[Sequence]]()
+        self.output_queue = queue.Queue[List[Sequence]]()
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -119,20 +119,6 @@ class EngineCore:
             )
             if not good:
                 self._finalizer()
-
-        hf_text_config = get_hf_text_config(config.hf_config)
-        arches = getattr(hf_text_config, "architectures", None) or []
-        is_kimi_kda_hybrid = any("KimiK3" in str(a) for a in arches) or (
-            getattr(hf_text_config, "model_type", None) == "kimi_linear"
-            and hasattr(hf_text_config, "full_attn_layer_ids")
-        )
-        if is_kimi_kda_hybrid and config.enable_prefix_caching:
-            logger.info(
-                "%s: Kimi-K3 KDA hybrid disables prefix caching engine-wide "
-                "because recurrent attention state is per request.",
-                self.label,
-            )
-            config.enable_prefix_caching = False
 
         # Decode in disagg mode defers Scheduler creation until after kvcache IPC
         # import sets config.num_kvcache_blocks (BlockManager asserts num_blocks > 0).
