@@ -591,6 +591,7 @@ class Scheduler:
         self._log_prefix_cache_per_req = envs.ATOM_LOG_PREFIX_CACHE_PER_REQ
         self._per_req_evicted_base = 0
         self._last_pool_log_time = 0.0
+        self._peak_decode_batch = 0
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
         # V4 SWA correctness on a prefix-cache hit is now handled entirely in
@@ -975,8 +976,21 @@ class Scheduler:
                 logger.info(
                     f"[Cache Pool Tick] used {occ['used']} ({occ['used'] * 100 // total}%), "
                     f"free {occ['free']}, retained-cache {occ['retained']}, "
-                    f"evicted total {occ['evicted_total']}"
+                    f"evicted total {occ['evicted_total']}, "
+                    f"running {len(self.running)}, "
+                    f"peak-decode-batch {self._peak_decode_batch}"
                 )
+                self._peak_decode_batch = 0
+                # Producer holds each finished prefill's KV until the decode node
+                # pulls it (deferred_free_blocks, drained by finished_sending).
+                if self._connector_flag("is_producer") and self.deferred_free_blocks:
+                    held_blocks = sum(
+                        len(s.block_table) for s in self.deferred_free_blocks.values()
+                    )
+                    logger.info(
+                        f"[KV Hold Tick] deferred-reqs {len(self.deferred_free_blocks)}, "
+                        f"deferred-blocks {held_blocks}"
+                    )
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
@@ -1339,6 +1353,8 @@ class Scheduler:
                 seq.is_first_decode = False
 
         total_tokens_num_decode = sum(num_scheduled_tokens)
+        if num_seqs_decode > self._peak_decode_batch:
+            self._peak_decode_batch = num_seqs_decode
 
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
