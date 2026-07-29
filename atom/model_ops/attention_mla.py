@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import Optional
+from typing import Optional, Protocol
 
 import torch
 import triton
@@ -180,7 +180,19 @@ class MLAModules:
     # sparsity must be derived from the model, not from whether this layer owns
     # an indexer. Defaults keep non-sparse models unchanged.
     is_sparse: bool = False
-    topk_tokens: Optional[int] = None
+    topk_tokens: int | None = None
+
+
+class _MLAOutputShape(Protocol):
+    o_proj: nn.Module
+    num_heads: int
+    v_head_dim: int
+
+
+def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
+    if isinstance(getattr(impl, "o_proj", None), nn.Identity):
+        return impl.num_heads * impl.v_head_dim
+    return hidden_size
 
 
 def dynamic_per_batched_tensor_quant(
@@ -216,18 +228,19 @@ class MLAAttention(nn.Module):
         self.dtype = dtype
 
         self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
-        self.head_repeat_factor = self.padded_num_heads // num_heads
-        if self.head_repeat_factor > 1:
-            assert self.padded_num_heads % num_heads == 0, (
-                f"Padded head count ({self.padded_num_heads}) must be divisible "
-                f"by num_heads ({num_heads}) for head repeat"
-            )
-            if not getattr(MLAAttention, "_head_repeat_logged", False):
-                MLAAttention._head_repeat_logged = True
-                logger.info(
-                    f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
-                    f"(repeat factor {self.head_repeat_factor})"
-                )
+        self.head_repeat_factor = 1
+        self.head_pad = 0
+        if self.padded_num_heads != num_heads:
+            if self.padded_num_heads % num_heads == 0:
+                self.head_repeat_factor = self.padded_num_heads // num_heads
+                if not getattr(MLAAttention, "_head_repeat_logged", False):
+                    MLAAttention._head_repeat_logged = True
+                    logger.info(
+                        f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
+                        f"(repeat factor {self.head_repeat_factor})"
+                    )
+            else:
+                self.head_pad = self.padded_num_heads - num_heads
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -311,6 +324,22 @@ class MLAAttention(nn.Module):
             self.dcp_group = None
             self.dcp_rank = 0
             self._cp_triton_ctx = None
+
+    def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
+        if self.head_repeat_factor > 1:
+            return q.repeat_interleave(self.head_repeat_factor, dim=1)
+        if self.head_pad > 0:
+            return torch.nn.functional.pad(q, (0, 0, 0, self.head_pad))
+        return q
+
+    def _restore_query_heads(
+        self, output: torch.Tensor, num_heads: int | None = None
+    ) -> torch.Tensor:
+        if self.head_repeat_factor > 1:
+            return output[:, :: self.head_repeat_factor, ...].contiguous()
+        if self.head_pad > 0:
+            return output[:, : (num_heads or self.num_heads), ...].contiguous()
+        return output
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Reshape the KV cache buffer into the page-level flat seg layout
@@ -863,9 +892,9 @@ class MLAAttention(nn.Module):
     ) -> torch.Tensor:
         assert attn_metadata is not None
         B = q.shape[0]
+        num_heads_q = q.shape[1]
 
-        if self.head_repeat_factor > 1:
-            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+        q = self._pad_query_heads(q)
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -877,7 +906,7 @@ class MLAAttention(nn.Module):
 
         o = torch.empty(
             B,
-            self.padded_num_heads,
+            q.shape[1],
             self.kv_lora_rank,
             dtype=self.dtype,
             device=q.device,
@@ -950,8 +979,7 @@ class MLAAttention(nn.Module):
                     None,
                 )
 
-        if self.head_repeat_factor > 1:
-            o = o[:, :: self.head_repeat_factor, :].contiguous()
+        o = self._restore_query_heads(o, num_heads_q)
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -988,10 +1016,7 @@ class MLAAttention(nn.Module):
         B = q.shape[0]
         num_heads_q = q.shape[1]
 
-        if self.head_repeat_factor > 1:
-            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
-
-        padded_heads = max(num_heads_q * self.head_repeat_factor, _MLA_MIN_HEADS)
+        q = self._pad_query_heads(q)
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -1003,7 +1028,7 @@ class MLAAttention(nn.Module):
 
         o = torch.empty(
             B,
-            padded_heads,
+            q.shape[1],
             self.kv_lora_rank,
             dtype=self.dtype,
             device=q.device,
@@ -1160,10 +1185,9 @@ class MLAAttention(nn.Module):
                 return_lse=return_lse,
             )
 
-        if self.head_repeat_factor > 1:
-            o = o[:, :: self.head_repeat_factor, :].contiguous()
-            if final_lse is not None:
-                final_lse = final_lse[:, :: self.head_repeat_factor].contiguous()
+        o = self._restore_query_heads(o, num_heads_q)
+        if final_lse is not None:
+            final_lse = self._restore_query_heads(final_lse, num_heads_q)
 
         if return_lse:
             return o, final_lse
@@ -1228,7 +1252,9 @@ class MLAAttention(nn.Module):
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
-            output_shape[-1] = atom_config.hf_config.hidden_size
+            output_shape[-1] = _mla_output_width(
+                self, atom_config.hf_config.hidden_size
+            )
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output

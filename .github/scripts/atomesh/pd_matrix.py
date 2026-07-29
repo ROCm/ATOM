@@ -70,6 +70,17 @@ def parse_case_filter(value: str | None) -> set[str] | None:
     return cases or None
 
 
+def parse_benchmark_kind_filter(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    kinds = {
+        item.strip()
+        for item in value.split(",")
+        if item.strip() and item.strip().lower() != "all"
+    }
+    return kinds or None
+
+
 def model_path_env_key(model_name: str) -> str:
     suffix = re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_").upper()
     return f"ATOMESH_MODEL_PATH_{suffix}"
@@ -298,6 +309,7 @@ def build_cell(
         defaults.get("benchmark", {}),
         suite_cfg.get("benchmark", {}),
     )
+    benchmark_cfg = resolve_env_refs_in_value(benchmark_cfg)
     accuracy_cfg = deep_merge(
         model_cfg.get("accuracy", {}), suite_cfg.get("accuracy", {})
     )
@@ -347,6 +359,7 @@ def build_cell(
         "num_prompts_multiplier": int(benchmark_cfg.get("num_prompts_multiplier", 10)),
         "wait_server_timeout": int(benchmark_cfg.get("wait_server_timeout", 2500)),
         "wait_router_timeout": int(benchmark_cfg.get("wait_router_timeout", 300)),
+        "benchmark": benchmark_cfg,
         "runner": runner_cfg,
         "service": {
             "prefill": prefill_cfg,
@@ -384,6 +397,7 @@ def build_cells(
     suite: str,
     model_filter: set[str] | None,
     case_filter: set[str] | None,
+    benchmark_kind_filter: set[str] | None,
     override_image: str | None,
     override_benchmark_concurrency: list[int] | None,
     override_eval_concurrency: list[int] | None,
@@ -395,6 +409,13 @@ def build_cells(
         suites = model_cfg.get("suites", {})
         for suite_cfg in normalize_list(suites.get(suite)):
             if case_filter and str(suite_cfg.get("name", "")) not in case_filter:
+                continue
+            benchmark_cfg = deep_merge(
+                cfg.get("defaults", {}).get("benchmark", {}),
+                suite_cfg.get("benchmark", {}),
+            )
+            benchmark_kind = str(benchmark_cfg.get("kind", "random"))
+            if benchmark_kind_filter and benchmark_kind not in benchmark_kind_filter:
                 continue
             cells.append(
                 build_cell(
@@ -435,6 +456,11 @@ def main() -> int:
         default=os.environ.get("ATOMESH_CASE_NAME") or None,
         help="Optional case filter: one case name, comma-separated case names, or all",
     )
+    parser.add_argument(
+        "--benchmark-kind",
+        default=os.environ.get("ATOMESH_BENCHMARK_KIND") or None,
+        help="Optional benchmark kind filter: one kind, comma-separated kinds, or all",
+    )
     parser.add_argument("--image", default=os.environ.get("ATOMESH_IMAGE") or None)
     parser.add_argument(
         "--benchmark-concurrency",
@@ -460,6 +486,7 @@ def main() -> int:
         suite=args.suite,
         model_filter=parse_model_filter(args.model),
         case_filter=parse_case_filter(args.case),
+        benchmark_kind_filter=parse_benchmark_kind_filter(args.benchmark_kind),
         override_image=args.image,
         override_benchmark_concurrency=benchmark_concurrency or None,
         override_eval_concurrency=eval_concurrency or None,

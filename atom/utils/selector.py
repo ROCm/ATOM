@@ -2,12 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import cache
-from typing import Type
 
 from atom.model_ops.attentions.backends import AttentionBackend
-from atom.utils import resolve_obj_by_qualname
 from atom.plugin.prepare import is_sglang, is_vllm
-from atom.utils import envs
+from atom.utils import envs, resolve_obj_by_qualname
 
 
 def get_attn_backend(
@@ -15,7 +13,8 @@ def get_attn_backend(
     use_mla: bool = False,
     use_gdn: bool = False,
     use_v4: bool = False,
-) -> Type[AttentionBackend]:
+    use_kimi_mla: bool = False,
+) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
     return _cached_get_attn_backend(
         block_size=block_size,
@@ -24,6 +23,7 @@ def get_attn_backend(
         use_v4=use_v4,
         use_sglang=is_sglang(),
         use_vllm=is_vllm(),
+        use_kimi_mla=use_kimi_mla,
     )
 
 
@@ -35,11 +35,18 @@ def _cached_get_attn_backend(
     use_v4: bool = False,
     use_sglang: bool = False,
     use_vllm: bool = False,
-) -> Type[AttentionBackend]:
+    use_kimi_mla: bool = False,
+) -> type[AttentionBackend]:
 
     # get device-specific attn_backend
     attention_cls = get_attn_backend_cls(
-        block_size, use_mla, use_gdn, use_v4, use_sglang, use_vllm
+        block_size=block_size,
+        use_mla=use_mla,
+        use_gdn=use_gdn,
+        use_v4=use_v4,
+        use_sglang=use_sglang,
+        use_vllm=use_vllm,
+        use_kimi_mla=use_kimi_mla,
     )
     if not attention_cls:
         raise ValueError(f"Invalid attention backend for {attention_cls}")
@@ -47,10 +54,18 @@ def _cached_get_attn_backend(
 
 
 def get_attn_backend_cls(
-    block_size, use_mla, use_gdn, use_v4, use_sglang, use_vllm
+    block_size,
+    use_mla,
+    use_gdn,
+    use_v4,
+    use_sglang,
+    use_vllm,
+    use_kimi_mla=False,
 ) -> str:
     if use_v4:
         return "atom.model_ops.attentions.deepseek_v4_attn.DeepseekV4Backend"
+    if use_kimi_mla:
+        return "atom.model_ops.attentions.kimi_mla_gdn_attn.KimiMLAGDNBackend"
     if use_mla:
         if envs.ATOM_USE_TRITON_MLA:
             return "atom.model_ops.attentions.triton_mla.TritonMLABackend"
