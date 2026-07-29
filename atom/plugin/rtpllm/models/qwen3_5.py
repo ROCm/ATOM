@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -19,14 +18,14 @@ logger = logging.getLogger("atom.plugin.rtpllm.models")
 
 
 class _NoopWeightManager:
-    def update(self, req):  # noqa: ANN001
+    def update(self, req):
         return None
 
 
 class _NoopModelWeightsLoader:
     _py_eplb = None
 
-    def load_lora_weights(self, adapter_name, lora_path, device):  # noqa: ANN001
+    def load_lora_weights(self, adapter_name, lora_path, device):
         logger.warning(
             "No-op model_weights_loader received load_lora_weights(%s, %s, %s); "
             "external plugin mode uses ATOM model weights path only.",
@@ -34,7 +33,6 @@ class _NoopModelWeightsLoader:
             lora_path,
             device,
         )
-        return None
 
 
 class _StubWeightInfo(ModelDeployWeightInfo):
@@ -581,23 +579,16 @@ class ATOMQwen35Moe(BaseModel):
         )
 
     @staticmethod
-    @contextmanager
-    def _maybe_disable_shared_expert_fusion_for_load(atom_model: Any):
-        has_standalone_shared_expert = any(
-            ".shared_expert." in name for name, _ in atom_model.named_parameters()
-        )
-        if not has_standalone_shared_expert:
-            yield
-            return
+    def _mark_standalone_shared_experts(atom_model: Any) -> None:
+        """Tell the loader to leave `shared_expert.*` on its own module.
 
-        import atom.model_loader.loader as atom_loader
-
-        origin_fn = atom_loader.is_rocm_aiter_fusion_shared_expert_enabled
-        atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = lambda: False
-        try:
-            yield
-        finally:
-            atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = origin_fn
+        Some Qwen3.5 FP8 checkpoints keep the shared expert standalone rather
+        than fused into the routed MoE buffer, in which case rewriting those
+        keys into `mlp.experts.<n_routed_experts>.*` sends them to a parameter
+        that does not exist.
+        """
+        if any(".shared_expert." in name for name, _ in atom_model.named_parameters()):
+            atom_model.disable_fused_shared_loading = True
 
     def load(self, skip_python_model: bool = False):
         # External plugin mode: bypass rtp-llm native weight loading path and
@@ -786,14 +777,14 @@ class ATOMQwen35Moe(BaseModel):
 
             # External plugin mode: load checkpoint once through ATOM loader.
             # Keep Qwen3.5 MoE weight semantics aligned with #532 plugin path.
-            with self._maybe_disable_shared_expert_fusion_for_load(atom_model):
-                load_model_in_plugin_mode(
-                    model=atom_model,
-                    config=atom_config,
-                    prefix="model.",
-                    weights_mapper=self._make_qwen35_hf_mapper(),
-                    load_fused_expert_weights_fn=_load_fused_expert_weights_for_qwen35,
-                )
+            self._mark_standalone_shared_experts(atom_model)
+            load_model_in_plugin_mode(
+                model=atom_model,
+                config=atom_config,
+                prefix="model.",
+                weights_mapper=self._make_qwen35_hf_mapper(),
+                load_fused_expert_weights_fn=_load_fused_expert_weights_for_qwen35,
+            )
             _assert_norm_weights_loaded(atom_model)
             _inject_rtp_projection_weights(atom_model)
         finally:

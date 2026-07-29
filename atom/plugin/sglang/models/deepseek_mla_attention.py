@@ -188,6 +188,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
         from aiter import dtypes
 
         from atom.model_ops.attention_mla import fused_qk_rope_concat_and_cache_mla
+        from atom.models.deepseek_v2 import _pcp_active
         from atom.plugin.sglang.models.deepseek_mla_forward import (
             _get_sglang_radix_attn,
             _get_sglang_token_to_kv_pool_from_backend,
@@ -216,7 +217,17 @@ class SGLangDeepseekMLAAttention(nn.Module):
         ):
             q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch):
+        atom_pcp_on = _pcp_active()
+        if atom_pcp_on:
+            from atom.distributed.pcp_utils import (
+                get_pcp_world_size,
+                pcp_allgather_rerange,
+            )
+
+            pcp_ws = get_pcp_world_size()
+            k_nope = pcp_allgather_rerange(k_nope.squeeze(1), pcp_ws).unsqueeze(1)
+            k_pe = pcp_allgather_rerange(k_pe.squeeze(1), pcp_ws).unsqueeze(1)
+        elif dsa_use_prefill_cp(forward_batch):
             latent_cache = torch.cat([k_nope.squeeze(1), k_pe.squeeze(1)], dim=-1)
             k_nope, k_pe = attn.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -225,7 +236,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
         save_kv_cache = True
         topk_indices = self._get_sparse_topk_indices(q_input.shape[0])
         q_descale = None
-        if attn.use_fused_qk_rope_concat_and_cache_mla:
+        if attn.use_fused_qk_rope_concat_and_cache_mla and not atom_pcp_on:
             mla_attn = _get_sglang_radix_attn(self.base_attn)
             token_to_kv_pool = _get_sglang_token_to_kv_pool_from_backend(
                 "SGLang DeepSeek MLA fused cache path"

@@ -140,6 +140,10 @@ class Sequence:
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
 
+        self.prefix_cache_hit_tokens = (kv_transfer_params or {}).get(
+            "prefix_cache_hit_tokens", 0
+        )
+
         # accepted tokens for spec decode
         self.num_bonus_tokens = 0
 

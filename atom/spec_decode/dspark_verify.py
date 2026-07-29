@@ -58,8 +58,19 @@ class VerifyScheduler:
         sps_table = self.sps_table
         if sps_table is None:
             # Synthetic monotone-decreasing SPS stub until real calibration lands.
+            # The stub's slope is ~1/steps, and the prefix scheduler indexes it by
+            # B = R + m (R = LOCAL decode bs). Under DP-attention each rank holds
+            # only 1/dp_size of the batch, so a local-bs ramp is dp_size x too
+            # steep -> throughput looks to drop dp_size x faster per admitted draft
+            # -> the scheduler early-stops sooner -> per-request ell is
+            # over-truncated (the acceptance tail collapses; a DP-only regression
+            # vs TP, which sees the same stub but with a large bs / shallow slope).
+            # Scale steps by dp_size so the local B range sits in the shallow head
+            # of the ramp, matching the TP curve. (Real DP-aware SPS calibration
+            # under ragged is the proper long-term fix; this keeps the stub sane.)
+            dp = max(1, self.runner.config.parallel_config.data_parallel_size)
             sps_table = torch.linspace(
-                1.0, 0.1, steps=bs * (L + 1) + 1, device=confidence.device
+                1.0, 0.1, steps=dp * bs * (L + 1) + 1, device=confidence.device
             )
         return schedule_prefix_lengths_tensor(
             confidence.detach(),

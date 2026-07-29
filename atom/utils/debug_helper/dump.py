@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Optional
 
 import torch
 
@@ -44,7 +43,7 @@ from atom.utils import envs
 # === helpers =========================================================
 
 
-def _parse_layer_set(env_value: str) -> Optional[set[int]]:
+def _parse_layer_set(env_value: str) -> set[int] | None:
     """Return None for empty (= dump all), else parsed integer set."""
     if not env_value:
         return None
@@ -64,6 +63,58 @@ def _get_world_size() -> int:
 
 
 # === Forward dump ====================================================
+
+
+def _output_tensor(output) -> torch.Tensor | None:
+    """Best-effort "the hidden state" out of whatever a block returned.
+
+    Plain tensor and tuple-of-tensors cover most blocks. DeepSeek-V4 style mHC
+    blocks instead return a state object carrying the residual stream in a
+    field, so fall back to the first tensor attribute rather than silently
+    dumping nothing.
+    """
+    if isinstance(output, torch.Tensor):
+        return output
+    for attr in ("x_prev", "hidden_states", "hidden", "last_hidden_state"):
+        val = getattr(output, attr, None)
+        if isinstance(val, torch.Tensor):
+            return val
+    if isinstance(output, (tuple, list)):
+        # State objects first: a hook's args are (hc_state, positions) and the
+        # bare `positions` tensor would otherwise win and silently compare as
+        # identical everywhere.
+        for item in output:
+            if not isinstance(item, torch.Tensor):
+                found = _output_tensor(item)
+                if found is not None:
+                    return found
+        for item in output:
+            if isinstance(item, torch.Tensor):
+                return item
+    return None
+
+
+def _tensor_fields(obj) -> dict:
+    """Every tensor attribute of a state object, keyed by attribute name.
+
+    Returns {} for plain tensors/tuples — there is nothing extra to say about
+    those beyond what `_output_tensor` already picked.
+    """
+    if isinstance(obj, (tuple, list)):
+        for item in obj:
+            if not isinstance(item, torch.Tensor):
+                fields = _tensor_fields(item)
+                if fields:
+                    return fields
+        return {}
+    out = {}
+    for name in getattr(obj, "__dataclass_fields__", ()) or dir(obj):
+        if name.startswith("_"):
+            continue
+        val = getattr(obj, name, None)
+        if isinstance(val, torch.Tensor):
+            out[name] = val.detach().cpu()
+    return out
 
 
 def install_block_forward_hooks(model: torch.nn.Module) -> int:
@@ -103,7 +154,7 @@ def install_block_forward_hooks(model: torch.nn.Module) -> int:
         base = os.path.join(dump_dir, f"layer{layer_id:02d}_{cls_name}_rank{rank}")
         one_shot_fname = base + ".pt"
 
-        def _hook(_mod, _args, output):
+        def _hook(_mod, args, output):
             if one_shot:
                 if os.path.exists(one_shot_fname):
                     return
@@ -113,11 +164,24 @@ def install_block_forward_hooks(model: torch.nn.Module) -> int:
                 n = _call_counters.get(key, 0)
                 _call_counters[key] = n + 1
                 fname = f"{base}_call{n:03d}.pt"
-            t = output[0] if isinstance(output, tuple) else output
-            if not isinstance(t, torch.Tensor):
+            t = _output_tensor(output)
+            if t is None:
                 return
+            # The input is saved alongside the output so a divergence can be
+            # attributed to this block rather than inherited from the previous
+            # one without dumping every layer.
+            inp = _output_tensor(args)
             torch.save(
-                {"hidden": t.detach().cpu(), "shape": tuple(t.shape)},
+                {
+                    "hidden": t.detach().cpu(),
+                    "shape": tuple(t.shape),
+                    "input": None if inp is None else inp.detach().cpu(),
+                    # A block whose input is a multi-field state object (mHC
+                    # carries residual / post_mix / comb_mix beside the hidden)
+                    # can diverge through any field, so keep them all.
+                    "input_fields": _tensor_fields(args),
+                    "output_fields": _tensor_fields(output),
+                },
                 fname,
             )
 
@@ -132,7 +196,7 @@ def install_block_forward_hooks(model: torch.nn.Module) -> int:
         if lid is not None:
             block_layer_ids[name] = int(lid)
 
-    def _find_layer_id(mod_name: str) -> Optional[int]:
+    def _find_layer_id(mod_name: str) -> int | None:
         """Walk up the dotted name to find the nearest enclosing block layer_id."""
         if mod_name in block_layer_ids:
             return block_layer_ids[mod_name]

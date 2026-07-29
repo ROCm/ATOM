@@ -1787,7 +1787,7 @@ def main():
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
-    model_name = args.model
+    model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
     logger.info(f"Initializing engine with model {args.model}...")

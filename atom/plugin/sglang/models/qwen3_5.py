@@ -4,8 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from contextlib import contextmanager
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from aiter.dist.parallel_state import get_pp_group as _aiter_pp_group
@@ -136,11 +135,11 @@ def apply_prepare_model_adaptations(atom_config: Any, model_arch: str) -> None:
 
 def _forward_qwen35_decoder_stack(
     decoder_stack: Qwen3_5Model,
-    input_ids: Optional[torch.Tensor],
+    input_ids: torch.Tensor | None,
     positions: torch.Tensor,
     intermediate_tensors: IntermediateTensors | None = None,
-    inputs_embeds: Optional[torch.Tensor] = None,
-    input_deepstack_embeds: Optional[torch.Tensor] = None,
+    inputs_embeds: torch.Tensor | None = None,
+    input_deepstack_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor | IntermediateTensors:
     if input_deepstack_embeds is None or input_deepstack_embeds.numel() == 0:
         return decoder_stack(
@@ -201,7 +200,7 @@ def _get_qwen35_language_model_stack_cls(
         def __init__(
             self,
             config: Any,
-            quant_config: Optional[SGLangQuantizationConfig] = None,
+            quant_config: SGLangQuantizationConfig | None = None,
             prefix: str = "",
         ) -> None:
             del prefix
@@ -257,7 +256,7 @@ def _get_qwen35_language_model_stack_cls(
             return self._atom_lm.lm_head
 
         def get_input_embeddings(
-            self, input_ids: Optional[torch.Tensor] = None
+            self, input_ids: torch.Tensor | None = None
         ) -> torch.Tensor | nn.Module:
             if input_ids is None:
                 return self.model.embed_tokens
@@ -268,14 +267,14 @@ def _get_qwen35_language_model_stack_cls(
 
         def forward(
             self,
-            input_ids: Optional[torch.Tensor],
+            input_ids: torch.Tensor | None,
             positions: torch.Tensor,
             intermediate_tensors: IntermediateTensors | None = None,
-            inputs_embeds: Optional[torch.Tensor] = None,
-            forward_batch: Optional[ForwardBatch] = None,
-            input_embeds: Optional[torch.Tensor] = None,
-            pp_proxy_tensors: Optional[PPProxyTensors] = None,
-            input_deepstack_embeds: Optional[torch.Tensor] = None,
+            inputs_embeds: torch.Tensor | None = None,
+            forward_batch: ForwardBatch | None = None,
+            input_embeds: torch.Tensor | None = None,
+            pp_proxy_tensors: PPProxyTensors | None = None,
+            input_deepstack_embeds: torch.Tensor | None = None,
             save_kv_cache: bool = True,
             **kwargs: Any,
         ):
@@ -345,7 +344,7 @@ class _Qwen3_5ConditionalGenerationSglangBase:
     def __init__(
         self,
         config: Any,
-        quant_config: Optional[SGLangQuantizationConfig] = None,
+        quant_config: SGLangQuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         self._prepare_sglang_root_config(config)
@@ -377,7 +376,7 @@ class _Qwen3_5ConditionalGenerationSglangBase:
     def _load_weights_in_plugin_mode(
         self,
         *,
-        weights_mapper: Optional[WeightsMapper] = None,
+        weights_mapper: WeightsMapper | None = None,
         load_fused_expert_weights_fn=None,
     ) -> set[str]:
         from atom.model_loader.loader import load_model_in_plugin_mode
@@ -390,26 +389,14 @@ class _Qwen3_5ConditionalGenerationSglangBase:
             load_fused_expert_weights_fn=load_fused_expert_weights_fn,
         )
 
-    @contextmanager
-    def _maybe_disable_shared_expert_fusion_for_load(self):
-        # Some Qwen3.5 FP8 checkpoints keep `shared_expert.*` as standalone
-        # modules. In that case, the generic loader must not rewrite those keys
-        # into `mlp.experts.<n_routed_experts>.*` during load.
-        has_standalone_shared_expert = any(
-            ".shared_expert." in name for name, _ in self.named_parameters()
-        )
-        if not has_standalone_shared_expert:
-            yield
-            return
-
-        import atom.model_loader.loader as atom_loader
-
-        original = atom_loader.is_rocm_aiter_fusion_shared_expert_enabled
-        atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = lambda: False
-        try:
-            yield
-        finally:
-            atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = original
+    @property
+    def disable_fused_shared_loading(self) -> bool:
+        """True when this checkpoint keeps `shared_expert.*` as standalone
+        modules, so the loader must not rewrite those keys into
+        `mlp.experts.<n_routed_experts>.*`. Read from the built model so it
+        always agrees with the structure the weights have to land in.
+        """
+        return any(".shared_expert." in name for name, _ in self.named_parameters())
 
 
 class Qwen3_5ForConditionalGeneration(
@@ -459,11 +446,10 @@ class Qwen3_5MoeForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         del weights
-        with self._maybe_disable_shared_expert_fusion_for_load():
-            return self._load_weights_in_plugin_mode(
-                weights_mapper=self.hf_to_sglang_mapper,
-                load_fused_expert_weights_fn=self.load_fused_expert_weights,
-            )
+        return self._load_weights_in_plugin_mode(
+            weights_mapper=self.hf_to_sglang_mapper,
+            load_fused_expert_weights_fn=self.load_fused_expert_weights,
+        )
 
 
 # SGLang discovers these multimodal wrappers from this module's `EntryClass`.

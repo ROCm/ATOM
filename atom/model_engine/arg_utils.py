@@ -91,6 +91,13 @@ class EngineArgs:
             "--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path."
         )
         parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=None,
+            help="Override the model name returned by the API. "
+            "If not specified, defaults to the --model value.",
+        )
+        parser.add_argument(
             "--trust-remote-code",
             action="store_true",
             help="Trust remote code when loading model.",
@@ -152,10 +159,12 @@ class EngineArgs:
         parser.add_argument(
             "--index-cache-dtype",
             "--index_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp4"],
             type=str,
             default=None,
-            help="Index cache type. Defaults to --kv_cache_dtype.",
+            help="Index cache type. Defaults to --kv_cache_dtype. 'fp4' selects "
+            "the DeepSeek-V4 FP4 CSA indexer (gfx950 only; falls back to fp8 "
+            "elsewhere).",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
