@@ -858,6 +858,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)
+        # `prefill_attention_triton` reads the paged KV cache, so it needs a
+        # block_table even with no cached tokens. The base builder only uploads
+        # one when `has_cached`.
+        if (
+            attn_metadata.block_tables is None
+            and envs.ATOM_USE_UNIFIED_ATTN
+            and batch.block_tables
+        ):
+            bs = batch.total_seqs_num_prefill
+            self.prepare_block_tables(batch)
+            attn_metadata.block_tables = self.model_runner.forward_vars[
+                "block_tables"
+            ].copy_to_gpu(bs)
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_prefill_metadata,
