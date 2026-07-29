@@ -409,17 +409,40 @@ jobs:
           fi
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
           SLURM_CANCEL_HELPER="${RESULT_DIR}/${{ matrix.id }}.slurm-cancel.sh"
+          SLURM_JOB_NAME="${{ matrix.id }}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
+          if [[ -z "${SPUR_CONTROLLER_ADDR}" && "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
+            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
+          elif [[ -z "${SPUR_CONTROLLER_ADDR}" && "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
+          fi
           PD_SUBMIT_PID=""
+          scancel_slurm_by_name_from_wrapper() {
+            command -v scancel >/dev/null 2>&1 || return 0
+            local -a scancel_cmd=(scancel)
+            if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
+              scancel_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+            fi
+            scancel_cmd+=(--user "${CURRENT_USER}" --name "${SLURM_JOB_NAME}")
+            if command -v timeout >/dev/null 2>&1; then
+              timeout "${SLURM_SCANCEL_TIMEOUT_SECONDS:-8}" "${scancel_cmd[@]}" || true
+            else
+              "${scancel_cmd[@]}" || true
+            fi
+          }
           cleanup_slurm_from_wrapper() {
             local rc=$?
             trap - EXIT HUP INT TERM
             if [[ "${rc}" -ne 0 ]]; then
               echo "=== cancelling Slurm job from workflow wrapper rc=${rc} ==="
               if [[ -x "${SLURM_CANCEL_HELPER}" ]]; then
-                bash "${SLURM_CANCEL_HELPER}" || true
+                SLURM_CANCEL_WAIT_SECONDS="${SLURM_CANCEL_WAIT_SECONDS:-5}" \
+                  SLURM_CANCEL_KILL_WAIT_SECONDS="${SLURM_CANCEL_KILL_WAIT_SECONDS:-5}" \
+                  bash "${SLURM_CANCEL_HELPER}" || true
               else
                 echo "Slurm cancel helper is not available yet"
               fi
+              scancel_slurm_by_name_from_wrapper
             fi
             if [[ -n "${PD_SUBMIT_PID}" ]] && kill -0 "${PD_SUBMIT_PID}" 2>/dev/null; then
               kill "${PD_SUBMIT_PID}" 2>/dev/null || true
