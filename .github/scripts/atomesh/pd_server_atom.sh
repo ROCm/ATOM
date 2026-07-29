@@ -654,6 +654,9 @@ payload = {
     or data.get("model")
     or data.get("model_id"),
     "backend": "atom",
+    "benchmark_kind": os.environ.get("BENCHMARK_KIND") or "aiperf_agentic",
+    "scenario": os.environ.get("AIPERF_SCENARIO"),
+    "public_dataset": os.environ.get("AIPERF_PUBLIC_DATASET"),
     "topology": os.environ.get("TOPOLOGY") or data.get("topology"),
     "display_topology": os.environ.get("DISPLAY_TOPOLOGY")
     or data.get("display_topology"),
