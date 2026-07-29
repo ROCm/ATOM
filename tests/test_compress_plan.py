@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """CPU unit tests for `make_compress_plans` write/compress slice capacities.
 
 Covers the three slicing modes (eager / decode-CUDAGraph / extend-shaped verify)

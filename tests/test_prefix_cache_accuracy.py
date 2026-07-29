@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Test prefix caching accuracy with high cache-hit workloads.
 

@@ -29,7 +29,7 @@ def _resolve_model_path(model: str) -> str:
         return model
     try:
         return snapshot_download(model, local_files_only=True, allow_patterns=[])
-    except Exception:
+    except (OSError, ValueError):
         return model
 
 
@@ -62,7 +62,7 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoder | None:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         raw = mod.encode_messages
-    except Exception as e:
+    except (ImportError, AttributeError) as e:
         logger.warning(f"Failed to load encoder from {enc_path}: {e}")
         return None
 

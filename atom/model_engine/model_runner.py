@@ -1045,9 +1045,8 @@ class ModelRunner:
                     c if c.isalnum() or c in ("_", "-", ".") else "_"
                     for c in trace_name
                 )
-            if worker_name == "capture_graph":
-                if safe_model_name:
-                    worker_name = f"{worker_name}_{safe_model_name}"
+            if worker_name == "capture_graph" and safe_model_name:
+                worker_name = f"{worker_name}_{safe_model_name}"
             output_prefix = os.path.join(self.profiler_dir, worker_name)
 
             def _on_trace_ready(prof):
@@ -1315,10 +1314,13 @@ class ModelRunner:
         drafts that share the target's KV pool contribute.
         """
         total = self.config.hf_config.num_hidden_layers
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            if not hasattr(self, "eagle3_draft_builder"):
-                draft_hf = self.config.speculative_config.draft_model_hf_config
-                total += getattr(draft_hf, "num_nextn_predict_layers", 1)
+        if (
+            self.config.speculative_config
+            and hasattr(self, "drafter")
+            and not hasattr(self, "eagle3_draft_builder")
+        ):
+            draft_hf = self.config.speculative_config.draft_model_hf_config
+            total += getattr(draft_hf, "num_nextn_predict_layers", 1)
         return total
 
     def _compute_block_bytes(self):
@@ -2369,7 +2371,7 @@ class ModelRunner:
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-        cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
         if preprocessed is None:
             preprocessed = self._preprocess(
                 batch,
@@ -2381,7 +2383,7 @@ class ModelRunner:
             num_input_tokens,
             num_tokens_across_dp,
             dp_uniform_decode,
-            max_tokens,
+            _max_tokens,
             tbo_collective_active,
             ub_max_tokens_across_dp,
             _dspark_shape_max,
@@ -4323,7 +4325,7 @@ class RapidServeModelRunner(ModelRunner):
                 top_ks,
                 top_ps,
                 all_greedy,
-                needs_independent_noise,
+                _needs_independent_noise,
             ) = self.prepare_model(batch)
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit

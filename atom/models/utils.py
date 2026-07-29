@@ -280,7 +280,7 @@ def ckpt_has_tensor_suffix(model_path: str, suffix: str) -> bool:
             from safetensors import safe_open
 
             with safe_open(safetensors_files[0], framework="pt") as sf:
-                return any(k.endswith(suffix) for k in sf.keys())
+                return any(k.endswith(suffix) for k in sf)
         except Exception as e:
             logger.warning(
                 "ckpt_has_tensor_suffix: failed to read %s (%s); "

@@ -6,7 +6,10 @@ import copy
 import logging
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from typing import Self
 
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -514,7 +517,7 @@ class SGLangPluginRuntime:
     _is_dummy_run: bool = field(init=False, default=False)
     _exit_stack: ExitStack = field(init=False, repr=False)
 
-    def __enter__(self) -> SGLangPluginRuntime:
+    def __enter__(self) -> Self:
         self._original_forward_batch = self.forward_batch
         self._is_dummy_run = _is_dummy_forward(self.forward_batch)
 

@@ -45,11 +45,11 @@ def _bm_with_events(**overrides) -> BlockManager:
     class _KVEventsConfig:
         enable = True
 
-    kwargs = dict(
-        enable_prefix_caching=True,
-        kv_cache_block_size=4,
-        num_kvcache_blocks=8,
-    )
+    kwargs = {
+        "enable_prefix_caching": True,
+        "kv_cache_block_size": 4,
+        "num_kvcache_blocks": 8,
+    }
     kwargs.update(overrides)
     cfg = MockConfig(**kwargs)
     cfg.kv_events_config = _KVEventsConfig()

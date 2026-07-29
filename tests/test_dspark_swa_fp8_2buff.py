@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Offline gate for DSpark native 2buff fp8 SWA: kernel vs reference + roundtrip.
 
 Validates the read side of the fp8 draft window (DSPARK_SWA_FP8_PLAN.md step 3):
@@ -14,7 +13,7 @@ try:
     from aiter import dtypes
 
     import atom.model_ops.v4_kernels  # noqa: F401  (heavy import chain)
-except Exception as _e:  # pragma: no cover - bare-pytest import env
+except ImportError as _e:  # pragma: no cover - bare-pytest import env
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
 from atom.model_ops.v4_kernels.state_writes import (

@@ -167,14 +167,15 @@ def _split_prefill_balanced(
     ub1_tokens = total_tokens - tok_boundary
 
     # Reject if either ubatch exceeds the AsyncLL buffer
-    if max_tokens_per_ubatch is not None:
-        if ub0_tokens > max_tokens_per_ubatch or ub1_tokens > max_tokens_per_ubatch:
-            logger.info(
-                f"[TBO] prefill split rejected: ubatch tokens "
-                f"({ub0_tokens}, {ub1_tokens}) exceed buffer "
-                f"{max_tokens_per_ubatch}"
-            )
-            return None
+    if max_tokens_per_ubatch is not None and (
+        ub0_tokens > max_tokens_per_ubatch or ub1_tokens > max_tokens_per_ubatch
+    ):
+        logger.info(
+            f"[TBO] prefill split rejected: ubatch tokens "
+            f"({ub0_tokens}, {ub1_tokens}) exceed buffer "
+            f"{max_tokens_per_ubatch}"
+        )
+        return None
 
     return [
         UBatchSlice(

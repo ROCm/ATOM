@@ -652,9 +652,7 @@ class Scheduler:
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
-            if self.block_manager.can_allocate(seq) < 0:
-                return False  # KV-pressured: definitely cannot prefill
-            return True
+            return self.block_manager.can_allocate(seq) >= 0
         return False
 
     def _kv_usage(self) -> float:
@@ -869,18 +867,21 @@ class Scheduler:
         # We check the slot list length below; without the accounting dict we
         # infer "no slots ever existed" from `num_per_req_cache_groups == 0`,
         # exposed via the free list at init time (slot ids 0..N-1).
-        if seq.has_per_req_cache and len(bm.free_per_req_cache_groups) == 0:
+        if (
+            seq.has_per_req_cache
+            and len(bm.free_per_req_cache_groups) == 0
+            and getattr(self.config, "num_per_req_cache_groups", 0) == 0
+        ):
             # All slots are currently in-use OR no slots were ever created.
             # The schedule loop handles "currently full" by waiting; only
             # warn for the permanent "never created" case, identified by
             # `num_per_req_cache_groups` being 0 in the config.
-            if getattr(self.config, "num_per_req_cache_groups", 0) == 0:
-                logger.warning(
-                    "Request %s will never be scheduled: needs per-req cache "
-                    "slot but no slots were allocated (max_num_seqs=0 for "
-                    "this model type).",
-                    seq.id,
-                )
+            logger.warning(
+                "Request %s will never be scheduled: needs per-req cache "
+                "slot but no slots were allocated (max_num_seqs=0 for "
+                "this model type).",
+                seq.id,
+            )
 
     def take_rejected(self) -> list[Sequence]:
         """Pop and return any seqs the prefill scheduler dropped because

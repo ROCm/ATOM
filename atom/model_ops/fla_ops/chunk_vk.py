@@ -108,7 +108,7 @@ class ChunkGatedDeltaRuleFunctionVk(torch.autograd.Function):
         # For our intended caller (a contiguous output buffer) that is a no-op
         # and returns the same storage, so the inplace contract is preserved.
         # chunk_fwd_o_vk asserts contiguity again as a backstop.
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd_vk(
+        g, o, _A, final_state, _w, _h, _v_new = chunk_gated_delta_rule_fwd_vk(
             q=q,
             k=k,
             v=v,
@@ -136,7 +136,7 @@ def chunk_gated_delta_rule_vk(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,

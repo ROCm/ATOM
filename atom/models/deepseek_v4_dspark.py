@@ -287,7 +287,7 @@ def _dspark_block_sparse_attention_torch(
     Kept as a kernel-free, inspectable reference. The production path
     (``_dspark_block_sparse_attention``) dispatches to the fused flash kernel.
     """
-    B, T, H, D = q.shape
+    B, T, H, _D = q.shape
     W = kv.shape[1] - T
     # Scores: [B, H, T, W+T]  (broadcast single KV head over H query heads).
     scores = torch.einsum("bthd,bsd->bhts", q.float(), kv.float()) * scale

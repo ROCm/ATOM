@@ -624,7 +624,7 @@ def dspark_paged_window_gather(
         block_tables.dim() == 2
     ), f"block_tables must be [B, MB], got {block_tables.shape}"
     B = block_tables.shape[0]
-    num_pages, head_dim = swa_region.shape
+    _num_pages, head_dim = swa_region.shape
     assert anchor_pos.shape[0] >= B
     assert swa_region.is_contiguous()
 

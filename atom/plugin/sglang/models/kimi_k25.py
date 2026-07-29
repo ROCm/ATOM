@@ -127,42 +127,42 @@ class _AtomKimiK25LanguageModelAdapter(nn.Module):
         pp_proxy_tensors: PPProxyTensors | None = None,
         **model_kwargs: Any,
     ):
-        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
-            with SGLangPluginRuntime(
+        with (
+            plugin_runtime_scope(framework="sglang", atom_config=self.atom_config),
+            SGLangPluginRuntime(
                 atom_config=self.atom_config,
                 forward_batch=forward_batch,
                 positions=positions,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
-            ) as runtime:
-                metadata = SGLangForwardBatchMetadata.build(
-                    runtime.forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    save_kv_cache=model_kwargs.get("save_kv_cache"),
+            ) as runtime,
+        ):
+            metadata = SGLangForwardBatchMetadata.build(
+                runtime.forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                save_kv_cache=model_kwargs.get("save_kv_cache"),
+            )
+            intermediate_tensors = SGLangForwardBatchMetadata.to_intermediate_tensors(
+                pp_proxy_tensors,
+                metadata,
+            )
+            with SGLangForwardBatchMetadata.bind(metadata):
+                hidden_states = self._atom_lm(
+                    input_ids=runtime.input_ids,
+                    positions=runtime.positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=runtime.input_embeds,
                 )
-                intermediate_tensors = (
-                    SGLangForwardBatchMetadata.to_intermediate_tensors(
-                        pp_proxy_tensors,
-                        metadata,
-                    )
-                )
-                with SGLangForwardBatchMetadata.bind(metadata):
-                    hidden_states = self._atom_lm(
-                        input_ids=runtime.input_ids,
-                        positions=runtime.positions,
-                        intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=runtime.input_embeds,
-                    )
-                hidden_states = runtime.trim_output(hidden_states)
+            hidden_states = runtime.trim_output(hidden_states)
 
-                if self.pp_group.is_last_rank:
-                    return self.logits_processor(
-                        runtime.input_ids,
-                        hidden_states,
-                        self.lm_head,
-                        runtime.forward_batch,
-                    )
-                return hidden_states
+            if self.pp_group.is_last_rank:
+                return self.logits_processor(
+                    runtime.input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    runtime.forward_batch,
+                )
+            return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         # The outer Kimi wrapper owns loading so vision/projector weights are

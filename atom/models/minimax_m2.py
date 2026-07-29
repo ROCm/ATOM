@@ -93,7 +93,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         ), "MiniMaxM2SparseMoeBlock only supports 1D or 2D inputs"
         is_input_1d = hidden_states.dim() == 1
 
-        num_tokens, hidden_dim = hidden_states.shape
+        _num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Use fp32 for gate computation to match reference precision.

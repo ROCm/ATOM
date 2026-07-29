@@ -284,7 +284,7 @@ def _next_anchor(cu_end, mtp_k, ell, accepted):
     num_reject = mtp_k - num_bonus   (engine hardcodes mtp_k here)
     anchor_idx = cu_end - (1 + num_reject)
     """
-    num_bonus = accepted + 1 if accepted == ell else accepted + 1
+    num_bonus = accepted + 1
     num_reject = mtp_k - num_bonus
     return cu_end - (1 + num_reject)
 

@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from catalog import load_variants  # noqa: E402
+from catalog import load_variants
 
 
 def build_map(catalog_path: str) -> dict[str, str]:

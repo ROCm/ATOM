@@ -46,8 +46,7 @@ def model_name_from_trace(path: str) -> str | None:
     if "_ts_" not in base:
         return None
     prefix = base.split("_ts_", 1)[0]
-    if prefix.startswith("capture_graph_"):
-        prefix = prefix[len("capture_graph_") :]
+    prefix = prefix.removeprefix("capture_graph_")
     return prefix or None
 
 
@@ -301,7 +300,7 @@ def build_warmup_mapping(
 
 
 def print_first_warmup_mappings(mapping: list[dict[str, Any]], limit: int) -> None:
-    print("")
+    print()
     print(f"First {limit} warmup mappings:")
     print("| # | module/tag | stream | kernel |")
     print("|---:|---|---:|---|")
@@ -903,18 +902,18 @@ def main() -> None:
 
     print(f"Run trace: {args.run_trace}")
     print(f"Capture trace: {capture_trace}")
-    print("")
+    print()
     print("First decode:")
     print(f"  name: {decode.get('name')}")
     print(f"  ts: {decode.get('ts'):.3f}")
     print(f"  dur: {decode.get('dur'):.3f}")
     print(f"  batch size: {batch_size}")
-    print("")
+    print()
     print("Matching capture graph:")
     print(f"  name: {graph.get('name')}")
     print(f"  ts: {graph.get('ts'):.3f}")
     print(f"  dur: {graph.get('dur'):.3f}")
-    print("")
+    print()
     print("Decode warmup window:")
     print(f"  start: {warmup_start:.3f}")
     print(f"  end: {warmup_end:.3f}")
@@ -935,7 +934,7 @@ def main() -> None:
         print_head=args.print_head,
     )
     unmatched = sum(1 for row in matched_rows if row["cpu_module"] == "<unmatched>")
-    print("")
+    print()
     print("Decode replay mapping:")
     print(f"  replay kernels: {len(replay_kernels)}")
     print(f"  unmatched kernels: {unmatched}")

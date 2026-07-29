@@ -52,9 +52,11 @@ def _patched_graph_capture(original_graph_capture):
     @contextmanager
     def wrapped(self, graph_capture_context=None, **kwargs):
         aiter_ca_context = _get_aiter_ca_capture_context()
-        with aiter_ca_context:
-            with original_graph_capture(self, graph_capture_context, **kwargs) as ctx:
-                yield ctx
+        with (
+            aiter_ca_context,
+            original_graph_capture(self, graph_capture_context, **kwargs) as ctx,
+        ):
+            yield ctx
 
     return wrapped
 

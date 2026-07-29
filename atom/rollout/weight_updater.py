@@ -55,7 +55,7 @@ class WeightUpdaterMixin:
         """Build {target_suffix: [shard_id_0, shard_id_1, ...]} preserving declaration order."""
         if not hasattr(self, "_cached_packed_shard_order"):
             order: dict[str, list] = {}
-            for _, (tgt, shard_id) in self._get_packed_modules_mapping().items():
+            for (tgt, shard_id) in self._get_packed_modules_mapping().values():
                 order.setdefault(tgt, []).append(shard_id)
             self._cached_packed_shard_order = order
         return self._cached_packed_shard_order

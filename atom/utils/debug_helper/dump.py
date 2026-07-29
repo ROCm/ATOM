@@ -284,7 +284,11 @@ def maybe_log_topk(logits: torch.Tensor, prefix: str = "") -> None:
     probs = logits.float().softmax(dim=-1)
     top = probs.topk(k, dim=-1)
     out_path = envs.ATOM_DEBUG_TOPK_PATH
-    fp = open(out_path, "a", encoding="utf-8") if out_path else sys.stderr
+    fp = (
+        open(out_path, "a", encoding="utf-8")  # noqa: SIM115
+        if out_path
+        else sys.stderr
+    )
     try:
         for row in range(logits.size(0)):
             triples = " ".join(

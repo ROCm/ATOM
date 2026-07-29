@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Offline P2 gate for M1 paged prefill-indices: kernel vs reference, no model.
 Exercises prefix_swa_count>0 (the cross-request prefix-hit boundary path)."""
 

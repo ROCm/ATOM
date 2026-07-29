@@ -67,7 +67,7 @@ class SGLangGDNForwardContext:
 
             if has_forward_context():
                 return get_attn_backend()
-        except Exception:  # noqa: BLE001, S110 - forward context is optional
+        except Exception:
             pass
 
         return None
@@ -80,7 +80,7 @@ class SGLangGDNForwardContext:
                 if pool is not None:
                     try:
                         setattr(forward_batch, attr, pool)
-                    except Exception:  # noqa: BLE001, S110
+                    except Exception:
                         pass
 
     @staticmethod
@@ -99,7 +99,7 @@ class SGLangGDNForwardContext:
 
                 if has_forward_context():
                     pool = get_req_to_token_pool()
-            except Exception:  # noqa: BLE001 - forward context is optional
+            except Exception:
                 pool = None
         if pool is None:
             return {}

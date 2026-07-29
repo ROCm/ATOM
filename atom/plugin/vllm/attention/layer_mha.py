@@ -79,7 +79,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         head_dim,
         scale,
         num_kv_heads,
-        alibi_slopes: list[float] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
@@ -394,7 +394,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # `num_decodes` (not q.shape[0]) and `query_group_size` must include
         # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
         _, num_q_heads_total, head_size = q.shape
-        num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
+        _num_blocks, num_kv_heads, _, _block_size, _ = k_cache.shape
         decode_metadata = attn_metadata.decode_metadata
         max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
         assert num_q_heads_total % num_kv_heads == 0
@@ -759,20 +759,21 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
         # create kv scale according to the num_blocks
         # usually it is created when cuda graph capture for decode phase
-        if self.kv_cache_dtype == "fp8":
-            if self.k_scale is None or self.v_scale is None:
-                # origin kv_scale is per tensor scale of value one.
-                self.per_tensor_scale = self.kv_scale
-                self.kv_scale = torch.zeros(
-                    2,
-                    num_blocks,
-                    num_kv_heads,
-                    block_size,
-                    dtype=dtypes.fp32,
-                    device=self.device,
-                )
-                self.k_scale = self.kv_scale[0]
-                self.v_scale = self.kv_scale[1]
+        if self.kv_cache_dtype == "fp8" and (
+            self.k_scale is None or self.v_scale is None
+        ):
+            # origin kv_scale is per tensor scale of value one.
+            self.per_tensor_scale = self.kv_scale
+            self.kv_scale = torch.zeros(
+                2,
+                num_blocks,
+                num_kv_heads,
+                block_size,
+                dtype=dtypes.fp32,
+                device=self.device,
+            )
+            self.k_scale = self.kv_scale[0]
+            self.v_scale = self.kv_scale[1]
 
         # as vLLM cuda graph capture padding mechanism, here split the qkvo with
         # the actual tokens

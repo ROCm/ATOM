@@ -1009,8 +1009,8 @@ def _plan_single_layer_migration(
         rbase = r * num_local_physical_experts
         old_r = old_list[rbase : rbase + num_local_physical_experts]
         new_r = new_list[rbase : rbase + num_local_physical_experts]
-        old_set = set(x for x in old_r if x >= 0)
-        new_set = set(x for x in new_r if x >= 0)
+        old_set = {x for x in old_r if x >= 0}
+        new_set = {x for x in new_r if x >= 0}
         for logical in sorted(new_set):
             if logical not in old_set:
                 recv_ranks_by_logical.setdefault(logical, []).append(r)
@@ -1783,7 +1783,7 @@ class EPLBManager:
                 self._dp_is_migration_group = sorted(dp_ranks) == sorted(
                     ep_global_ranks
                 )
-            except Exception:  # noqa: BLE001 - defensive DP-group detection
+            except Exception:
                 self._dp_is_migration_group = False
             logger.info("EPLB dp_is_migration_group=%s", self._dp_is_migration_group)
         except Exception as exc:
@@ -1800,7 +1800,7 @@ class EPLBManager:
                 getattr(cfg, "rebalance_layers_per_chunk", 64)
             )
             self._p2p_batch_chunk_size = int(getattr(cfg, "p2p_batch_chunk_size", 32))
-        except Exception:  # noqa: BLE001 - optional eplb_config, fall back to defaults
+        except Exception:
             self._rebalance_layers_per_chunk = 64
             self._p2p_batch_chunk_size = 32
 
@@ -2238,7 +2238,7 @@ class EPLBManager:
                 num_redundant / logcnt_cpu.shape[0],
                 frac,
             )
-        except Exception as exc:  # noqa: BLE001  # pragma: no cover - diagnostic only
+        except Exception as exc:  # pragma: no cover - diagnostic only
             logger.warning("EPLB rebalance #%d metrics calc failed: %s", rc, exc)
 
     def _need_rebalance(self, physical_load: torch.Tensor) -> bool:

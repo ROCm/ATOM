@@ -110,7 +110,7 @@ class TestParseToolCalls:
             f"<|tool_call_begin|>functions.chat:0<|tool_call_argument_begin|>{args}<|tool_call_end|>"
             "<|tool_calls_section_end|>"
         )
-        content, tool_calls = parse_tool_calls(text)
+        _content, tool_calls = parse_tool_calls(text)
         assert len(tool_calls) == 1
         assert tool_calls[0].function["arguments"] == args
 
@@ -179,9 +179,9 @@ class TestToolCallStreamParser:
         tokens = [
             "I'll fetch that for you.",
             "<|tool_calls_section_begin|>",
-            "<|tool_call_begin|>functions.curl:0"
+            ("<|tool_call_begin|>functions.curl:0"
             '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "POST", "body": "{\\"key\\": \\"value\\"}"}'
-            "<|tool_call_end|>",
+            "<|tool_call_end|>"),
             "<|tool_calls_section_end|>",
         ]
         results = self._run_parser(tokens)

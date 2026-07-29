@@ -14,10 +14,12 @@ if file_path.endswith(".py"):
     black = shutil.which("black")
     ruff = shutil.which("ruff")
     if black:
-        subprocess.run([black, "--quiet", file_path], capture_output=True)
+        subprocess.run([black, "--quiet", file_path], capture_output=True, check=False)
     if ruff:
         subprocess.run(
-            [ruff, "check", "--fix", "--quiet", file_path], capture_output=True
+            [ruff, "check", "--fix", "--quiet", file_path],
+            capture_output=True,
+            check=False,
         )
 
 # Output original data to stdout per hook protocol

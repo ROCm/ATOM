@@ -109,7 +109,7 @@ def init_aiter_topK_meta_data(
         dtype=torch.int32,
         device="cuda",
     )
-    ns_topk_ids, s_topk_ids = torch.split(
+    _ns_topk_ids, s_topk_ids = torch.split(
         total_topk_ids, [top_k, n_shared_experts + is_EP], dim=1
     )
     shared_expert_ids = [n_routed_experts + i for i in range(n_shared_experts + is_EP)]
@@ -128,7 +128,7 @@ def init_aiter_topK_meta_data(
         dtype=torch.float32,
         device="cuda",
     )
-    ns_topk_weights, s_topk_weights = torch.split(
+    _ns_topk_weights, s_topk_weights = torch.split(
         total_topk_weights, [top_k, n_shared_experts + is_EP], dim=1
     )
     s_topk_weights.fill_(shared_experts_score)

@@ -154,7 +154,7 @@ def _patch_sglang_dsv4_draft_backends() -> None:
         from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
             ATOMDeepseekV4BackendForSgl,
         )
-    except Exception as exc:  # noqa: BLE001 - optional SGLang symbols vary by version
+    except Exception as exc:
         logger.debug("Skip patching SGLang DSV4 draft backends: %s", exc)
         return
 
@@ -205,7 +205,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
         from atom.plugin.sglang.runtime.context import is_draft_extend_mode
-    except Exception as exc:  # noqa: BLE001 - optional SGLang symbols vary by version
+    except Exception as exc:
         logger.debug("Skip patching SGLang DSV4 spec cuda graph: %s", exc)
         return
 
@@ -220,7 +220,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 or []
             )
             return any("DeepseekV4ForCausalLMNextN" in str(arch) for arch in arches)
-        except Exception:  # noqa: BLE001 - defensive runner introspection
+        except Exception:
             return False
 
     def _is_dsv4_runner(runner) -> bool:
@@ -234,7 +234,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 or []
             )
             return any("DeepseekV4" in str(arch) for arch in arches)
-        except Exception:  # noqa: BLE001 - defensive runner introspection
+        except Exception:
             return False
 
     def _flatten_spec_hidden_states(forward_batch):
@@ -344,7 +344,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     and not getattr(model_runner, "is_draft_worker", False)
                     and _target_verify_graph_enabled()
                 )
-            except Exception:  # noqa: BLE001 - optional graph cap detection
+            except Exception:
                 should_cap = False
 
             try:
@@ -392,7 +392,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     return False
                 if is_dsv4 and is_draft_extend:
                     return False
-            except Exception:  # noqa: BLE001, S110 - fall back to original can_run
+            except Exception:
                 pass
             return original_can_run(self, forward_batch)
 
@@ -494,7 +494,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if bool(torch.equal(graph_accept_lens, accept_lens)):
                     return original_draft_extend_for_decode(self, batch, batch_result)
             except (
-                Exception  # noqa: BLE001 - preserve upstream behavior on probing errors
+                Exception
             ):
                 return original_draft_extend_for_decode(self, batch, batch_result)
 

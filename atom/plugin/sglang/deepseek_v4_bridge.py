@@ -15,7 +15,7 @@ try:
     from atom.model_ops.v4_kernels.v4_quant import (
         V4_DIM_QK_PACKED as ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
     )
-except Exception:  # noqa: BLE001
+except Exception:
     ATOM_DEEPSEEK_V4_FP8_PACKED_DIM = 512
 _V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
 _V4_FP8_DOWNGRADE_WARNED = False
@@ -96,14 +96,14 @@ def _resolve_sglang_spec_steps() -> int:
         value = getattr(server_args, "speculative_num_steps", None)
         if value is not None:
             return max(0, int(value))
-    except Exception:  # noqa: BLE001, S110 - SGLang server args are optional here
+    except Exception:
         pass
     for name in ("ATOM_SGLANG_V4_MAX_SPEC_STEPS", "MTP_STEPS"):
         try:
             value = os.environ.get(name)
             if value:
                 return max(0, int(value))
-        except Exception:  # noqa: BLE001, S110 - env overrides are best effort
+        except Exception:
             pass
     return 0
 
@@ -118,7 +118,7 @@ def _get_gfx_name() -> str | None:
         from aiter.jit.utils.chip_info import get_gfx
 
         return get_gfx()
-    except Exception:  # noqa: BLE001 - gfx helper is optional outside ROCm runtime
+    except Exception:
         return None
 
 
@@ -138,7 +138,7 @@ def _warn_dsv4_fp8_downgrade(gfx: str | None) -> None:
 
 try:
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-except Exception:  # noqa: BLE001  # pragma: no cover - SGLang import-time fallback
+except Exception:  # pragma: no cover - SGLang import-time fallback
     BaseSWAKVPool = object
 
 
@@ -189,7 +189,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 self.use_fp8_kv = _is_fp8_dtype(
                     getattr(atom_config, "kv_cache_dtype", None)
                 )
-            except Exception:  # noqa: BLE001, S110 - config fallback is best effort
+            except Exception:
                 pass
         # aiter DSV4 native 2-buffer fp8 op4/op5 kernels are not shipped for
         # MI308/gfx942.  Match the native ATOM builder: keep gfx950/gfx1250 on
@@ -314,7 +314,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
             from aiter import dtypes
 
             fp8_dtype = dtypes.fp8
-        except Exception:  # noqa: BLE001 - fp8 dtype fallback for older aiter
+        except Exception:
             fp8_dtype = torch.float8_e4m3fnuz
 
         offset = 0
@@ -2219,7 +2219,7 @@ def maybe_get_proxy_pool_from_sglang_backend():
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         backend = get_attn_backend()
-    except Exception:  # noqa: BLE001 - forward context is optional
+    except Exception:
         backend = None
 
     proxy_pool = getattr(backend, "token_to_kv_pool", None)
@@ -2231,7 +2231,7 @@ def maybe_get_proxy_pool_from_sglang_backend():
         from atom.plugin.sglang.runtime import get_current_forward_batch
 
         forward_batch = get_current_forward_batch()
-    except Exception:  # noqa: BLE001 - runtime forward batch is optional
+    except Exception:
         forward_batch = None
 
     proxy_pool = getattr(forward_batch, "token_to_kv_pool", None)

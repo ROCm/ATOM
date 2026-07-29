@@ -12,7 +12,6 @@ from functools import wraps
 from types import CodeType
 from typing import (
     Literal,
-    Optional,
     ParamSpec,
     TypeVar,
 )
@@ -433,7 +432,7 @@ def support_torch_compile(
             for k, v in sig.parameters.items():
                 if v.annotation in [
                     torch.Tensor,
-                    Optional[torch.Tensor],
+                    torch.Tensor | None,
                 ]:
                     inferred_dynamic_arg_dims[k] = 0
 

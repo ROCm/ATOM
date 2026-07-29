@@ -41,24 +41,24 @@ from atom.utils.debug_helper.ref_patch import (
 )
 
 __all__ = [
+    "COS_ALGO_DIFF",
+    "COS_BIT_EQUAL",
+    "COS_BUG",
+    "COS_NUM_DRIFT",
+    "byte_equal_pct",
+    "compare_slots",
+    # compare primitives
+    "cos_max",
+    "flag_for",
     # dump
     "install_block_forward_hooks",
     "maybe_dump_weights_and_exit",
     "maybe_log_topk",
-    # compare primitives
-    "cos_max",
-    "flag_for",
-    "byte_equal_pct",
-    "slot_split",
-    "compare_slots",
-    "pick_prefill_call",
-    "schema_diff",
-    "COS_BIT_EQUAL",
-    "COS_NUM_DRIFT",
-    "COS_ALGO_DIFF",
-    "COS_BUG",
+    "patch_block_forward",
     # ref patching
     "patch_method",
-    "patch_block_forward",
     "patch_module_dump",
+    "pick_prefill_call",
+    "schema_diff",
+    "slot_split",
 ]

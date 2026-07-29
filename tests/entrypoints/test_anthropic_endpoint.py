@@ -286,7 +286,7 @@ class TestBuildAnthropicResponse:
         types = [b["type"] for b in resp["content"]]
         assert "text" in types
         assert "tool_use" in types
-        tool_block = [b for b in resp["content"] if b["type"] == "tool_use"][0]
+        tool_block = next(b for b in resp["content"] if b["type"] == "tool_use")
         assert tool_block["name"] == "read_file"
         assert tool_block["input"] == {"path": "/tmp/foo.py"}
         assert tool_block["id"] == "call_0"

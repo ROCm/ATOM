@@ -155,7 +155,7 @@ class RTPForwardContext:
             getattr(attn_inputs, "cu_seqlens", None),
             device=device,
         )
-        if cu_seqlens is not None and cu_seqlens.numel() > 1:
+        if cu_seqlens is not None and cu_seqlens.numel() > 1:  # noqa: SIM102
             # Decode steps may carry placeholder [0, 0] cu_seqlens from upper layers.
             # Only trust cu_seqlens when it represents non-empty query tokens.
             # In cuda-graph capture the .item() host-sync would abort capture
@@ -1447,7 +1447,7 @@ class RTPForwardContext:
         # Build full-attn cache references from RTP LayerKVCache.
         # Keep raw RTP layout here (no reshape/repack) and normalize layout
         # in the rtpllm attention patch at call time.
-        for layer_num in full_attn_layer_map.keys():
+        for layer_num in full_attn_layer_map:
             layer_key = f"layer_{layer_num}"
             if layer_key in cache_tensors:
                 continue
@@ -1474,7 +1474,7 @@ class RTPForwardContext:
             )
         # Build MLA cache references separately from full attention. MLA adapters
         # own their kv_cache pointer and refresh it in bind() for every forward.
-        for layer_num in mla_layer_map.keys():
+        for layer_num in mla_layer_map:
             layer_key = f"layer_{layer_num}"
             if layer_key in cache_tensors:
                 continue

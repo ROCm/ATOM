@@ -93,43 +93,43 @@ def test_rebalance_experts_global_invariants():
     "kwargs,err",
     [
         (
-            dict(
-                num_physical=8,
-                num_groups=3,
-                num_nodes=1,
-                num_gpus=4,
-                enable_hierarchical=True,
-            ),
+            {
+                "num_physical": 8,
+                "num_groups": 3,
+                "num_nodes": 1,
+                "num_gpus": 4,
+                "enable_hierarchical": True,
+            },
             "num_logical must be divisible by num_groups",
         ),
         (
-            dict(
-                num_physical=8,
-                num_groups=4,
-                num_nodes=3,
-                num_gpus=6,
-                enable_hierarchical=True,
-            ),
+            {
+                "num_physical": 8,
+                "num_groups": 4,
+                "num_nodes": 3,
+                "num_gpus": 6,
+                "enable_hierarchical": True,
+            },
             "num_groups must be divisible by num_nodes",
         ),
         (
-            dict(
-                num_physical=8,
-                num_groups=4,
-                num_nodes=2,
-                num_gpus=3,
-                enable_hierarchical=True,
-            ),
+            {
+                "num_physical": 8,
+                "num_groups": 4,
+                "num_nodes": 2,
+                "num_gpus": 3,
+                "enable_hierarchical": True,
+            },
             "num_gpus must be divisible by num_nodes",
         ),
         (
-            dict(
-                num_physical=10,
-                num_groups=4,
-                num_nodes=2,
-                num_gpus=4,
-                enable_hierarchical=True,
-            ),
+            {
+                "num_physical": 10,
+                "num_groups": 4,
+                "num_nodes": 2,
+                "num_gpus": 4,
+                "enable_hierarchical": True,
+            },
             "num_physical must be divisible by num_gpus",
         ),
     ],

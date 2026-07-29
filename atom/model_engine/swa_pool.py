@@ -81,7 +81,7 @@ class SlidingWindowPool:
             else 0
         )
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
+        self.hash_to_block_id: dict[int, int] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.free_block_ids_set: set[int] = set(range(num_blocks))
         self.used_block_ids: set[int] = set()
@@ -125,9 +125,7 @@ class SlidingWindowPool:
         if i % rb >= rb - need:  # last `need` blocks of this segment
             return True
         prompt_blocks = seq.num_prompt_tokens // self.block_size
-        if i >= prompt_blocks - need:  # trailing tail before the prompt boundary
-            return True
-        return False
+        return i >= prompt_blocks - need  # trailing tail before the prompt boundary
 
     def _pin_checkpoint(self, block_id: int) -> None:
         """Pin a checkpoint SWA block: hold an extra ref so free_out_of_window

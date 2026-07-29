@@ -19,6 +19,7 @@ Reference: ROCm/rocm-systems#4401, ROCm/pytorch#2579, ROCm/pytorch#3056
 import json
 import os
 import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -99,6 +100,7 @@ def _get_libtorch_profiler_backend():
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         for line in result.stdout.splitlines():
             if "libroctracer64" in line:
@@ -254,7 +256,7 @@ class TestProfilerRegression:
         torch.cuda.synchronize()
 
         # Profile
-        trace, prof = _profile_graph_replay(model, g, static_input)
+        trace, _prof = _profile_graph_replay(model, g, static_input)
         stats = _analyze_trace(trace)
 
         # Report
@@ -305,7 +307,7 @@ if __name__ == "__main__":
 
     if not torch.cuda.is_available():
         print("SKIP: No GPU available")
-        exit(0)
+        sys.exit(0)
 
     device = "cuda:0"
     torch.cuda.set_device(device)
@@ -358,7 +360,7 @@ if __name__ == "__main__":
 
     if failed:
         print("\nREGRESSION DETECTED. Check profiler backend linkage.")
-        exit(1)
+        sys.exit(1)
     else:
         print("\nPASS")
-        exit(0)
+        sys.exit(0)

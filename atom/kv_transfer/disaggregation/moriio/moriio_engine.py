@@ -234,7 +234,7 @@ class MoRIIOWrapper:
             with _zmq_ctx(zmq.ROUTER, path) as sock:
                 while True:
                     try:
-                        identity, msg = sock.recv_multipart()
+                        _identity, msg = sock.recv_multipart()
                         self._dispatch_message(msg)
                     except Exception as e:
                         logger.error("Error processing message: %s", e)

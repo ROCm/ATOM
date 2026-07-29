@@ -461,7 +461,7 @@ def _wo_a_is_bf16_on_disk(model_path):
                 return True  # BF16 weight; no scale needed regardless of index
             if not scale_present_in_idx:
                 return False
-            if "layers.0.attn.wo_a.scale" not in h.keys():
+            if "layers.0.attn.wo_a.scale" not in h:
                 # Index lies. wo_a still FP8 but no scale → loader will fail
                 # anyway; safer to fall back to no_spec, although this case is
                 # unexpected.
@@ -650,7 +650,7 @@ def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
     Mirrors convert.py:137-141. The wo_a weight is stored FP8 on disk but
     used as BF16 in inference because aiter doesn't support FP8 grouped einsum.
     """
-    out_dim, in_dim = w_fp8.shape
+    _out_dim, _in_dim = w_fp8.shape
     w = w_fp8.unflatten(0, (-1, block)).unflatten(-1, (-1, block)).float()
     s = scale.float()
     deq = w * s[:, None, :, None]
@@ -3651,7 +3651,7 @@ class Block(nn.Module):
             getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
         )
         self.enable_fused_hc = (
-            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+            hasattr(aiter, "mhc_fused_post_pre") and self.layer_id != 0
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.

@@ -513,23 +513,23 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # )
             # mori_dtype = torch.bfloat16
 
-            all_to_all_args = dict(
-                rank=all2all_manager.rank,
-                num_ep_ranks=all2all_manager.world_size,
+            all_to_all_args = {
+                "rank": all2all_manager.rank,
+                "num_ep_ranks": all2all_manager.world_size,
                 # quant_dtype=mori_dtype,
                 # We now use bfloat16 for mori
                 # TODO: To support quant
-                quant_dtype=moe.in_dtype,
-                token_hidden_size=moe.hidden_dim,
-                scale_dim=scale_dim,
-                scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=moe.max_num_tokens,
+                "quant_dtype": moe.in_dtype,
+                "token_hidden_size": moe.hidden_dim,
+                "scale_dim": scale_dim,
+                "scale_type_size": torch.float32.itemsize,
+                "max_num_tokens_per_dp_rank": moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
-                input_dtype=moe.in_dtype,
-                num_local_experts=moe.num_experts // all2all_manager.world_size,
-                num_experts_per_token=moe.experts_per_token,
-                gpu_per_node=moe.moe_parallel_config.local_ep_size,
-            )
+                "input_dtype": moe.in_dtype,
+                "num_local_experts": moe.num_experts // all2all_manager.world_size,
+                "num_experts_per_token": moe.experts_per_token,
+                "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+            }
             from atom.utils.tbo.ubatching import tbo_enabled
 
             handle = all2all_manager.get_handle(all_to_all_args)
@@ -541,20 +541,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             use_fp8_dispatch = False
             quant_type = None
 
-            common_args = dict(
-                rank=all2all_manager.rank,
-                world_size=all2all_manager.world_size,
-                hidden_dim=moe.hidden_dim,
-                scale_dim=scale_dim,
+            common_args = {
+                "rank": all2all_manager.rank,
+                "world_size": all2all_manager.world_size,
+                "hidden_dim": moe.hidden_dim,
+                "scale_dim": scale_dim,
                 # Match max_num_tokens_per_dp_rank / max_tokens_per_rank (= moe.max_num_tokens);
                 # leaving this hardcoded 16384 truncates the TBO mori buffer at mbt>16384.
-                max_num_inp_token_per_rank=moe.max_num_tokens,
-                num_local_experts=moe.num_experts // all2all_manager.world_size,
-                num_experts_per_token=moe.experts_per_token,
-                gpu_per_node=moe.moe_parallel_config.local_ep_size,
-                data_type_itemsize=moe.in_dtype.itemsize,
-                max_token_type_size=moe.in_dtype.itemsize,
-            )
+                "max_num_inp_token_per_rank": moe.max_num_tokens,
+                "num_local_experts": moe.num_experts // all2all_manager.world_size,
+                "num_experts_per_token": moe.experts_per_token,
+                "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+                "data_type_itemsize": moe.in_dtype.itemsize,
+                "max_token_type_size": moe.in_dtype.itemsize,
+            }
 
             tbo_mori_ops = None
             sync_handle = handle  # IntraNode handle for prefill (sync path)
@@ -1318,7 +1318,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = routing_data.n_expts_act
 
                 # Convert to triton routing data structures
-                num_tokens, n_expts_tot = router_logits.shape
+                _num_tokens, n_expts_tot = router_logits.shape
 
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts

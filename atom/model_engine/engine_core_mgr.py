@@ -208,7 +208,7 @@ class CoreManager:
                     continue
 
                 obj = socket.recv(copy=False)
-                request_type, data = pickle.loads(obj)
+                request_type, _data = pickle.loads(obj)
 
                 if request_type == EngineCoreRequestType.READY:
                     logger.info(
@@ -639,7 +639,7 @@ class CoreManager:
         except queue.Empty:
             return None
 
-    def send_utility_command(self, cmd: str, dp_rank: int = None):
+    def send_utility_command(self, cmd: str, dp_rank: int | None = None):
         if dp_rank is None:
             # Send to all DP ranks
             for rank in range(self.local_engine_count):

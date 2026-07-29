@@ -90,11 +90,11 @@ class TestSplitZmqPath:
         assert port == "5555"
 
     def test_ipc_path(self):
-        scheme, host, port = split_zmq_path("ipc:///tmp/test.sock")
+        scheme, _host, _port = split_zmq_path("ipc:///tmp/test.sock")
         assert scheme == "ipc"
 
     def test_inproc_path(self):
-        scheme, host, port = split_zmq_path("inproc://my-endpoint")
+        scheme, _host, port = split_zmq_path("inproc://my-endpoint")
         assert scheme == "inproc"
         assert port == ""
 

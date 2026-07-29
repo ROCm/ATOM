@@ -9,7 +9,7 @@ try:
     from sglang.srt.multimodal.processors.transformers_auto import (
         TransformersAutoMultimodalProcessor,
     )
-except Exception:  # noqa: BLE001 - SGLang multimodal symbols are optional
+except Exception:
     Modality = None
     TransformersAutoMultimodalProcessor = object
 else:
@@ -66,7 +66,7 @@ def register_minimax_m3_text_only_processor() -> None:
 
     try:
         from sglang.srt.managers.multimodal_processor import PROCESSOR_MAPPING
-    except Exception:  # noqa: BLE001 - processor mapping is optional outside SGLang
+    except Exception:
         return
 
     PROCESSOR_MAPPING.setdefault(MiniMaxM3SparseForCausalLM, MiniMaxM3TextOnlyProcessor)

@@ -76,7 +76,7 @@ class TestSchedule:
     def test_prefill(self, scheduler, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
-        batch, seqs = scheduler.schedule()
+        batch, _seqs = scheduler.schedule()
         assert batch.total_seqs_num_prefill == 1
         assert batch.total_tokens_num_prefill == 4
         assert seq.status == SequenceStatus.RUNNING

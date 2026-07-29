@@ -64,7 +64,7 @@ class CompilerManager:
     """
 
     def __init__(self, compilation_config: CompilationConfig):
-        self.cache: dict[tuple[int | None, int, str], Any] = dict()
+        self.cache: dict[tuple[int | None, int, str], Any] = {}
         self.is_cache_updated = False
         self.compilation_config = compilation_config
         self.compiler = make_compiler(compilation_config)
@@ -237,7 +237,7 @@ class CompilerManager:
             from atom.utils.graph_marker import is_graph_marker_enabled
 
             force_reload = is_graph_marker_enabled()
-        except Exception:
+        except (AttributeError, RuntimeError):
             force_reload = False
         if force_reload and handle is not None and not self.disable_cache:
             try:
@@ -286,12 +286,7 @@ class SplitItem:
 # used to judge whether the node should be split or not
 def _split_judge_func(node: fx.Node) -> bool:
     # ATOM use mark_spliting_op to mark the attn as splitting op
-    if node.op == "call_function" and (
-        hasattr(node.target, "spliting_op") and (node.target.spliting_op)
-    ):
-        return True
-
-    return False
+    return bool(node.op == "call_function" and (hasattr(node.target, "spliting_op") and node.target.spliting_op))
 
 
 def split_graph(
@@ -396,7 +391,6 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             sym_shape_indices = [
                 i for i, x in enumerate(args) if isinstance(x, torch.SymInt)
             ]
-            global compilation_start_time
             compiled_graph_for_dynamic_shape = (
                 self.vllm_backend.compiler_manager.compile(
                     submod,

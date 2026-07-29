@@ -269,7 +269,7 @@ def load_model(
         # failure here degrades to "report from this rank".
         try:
             return get_tp_group().rank == 0
-        except Exception:  # noqa: BLE001
+        except Exception:
             return True
 
     loaded_weights_record = load_weights_into_model(

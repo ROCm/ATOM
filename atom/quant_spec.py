@@ -338,7 +338,7 @@ class GenericParser(QuantConfigParser):
         # checkpoint, so the activation quant is NOT dynamic (load the scales);
         # `dynamic` (or unspecified) quantizes activations at runtime.
         act_scheme = (hf_quant_config.get("activation_scheme") or "").lower()
-        default_dynamic = False if act_scheme == "static" else True
+        default_dynamic = act_scheme != "static"
         is_dynamic = hf_quant_config.get("is_dynamic", default_dynamic)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",

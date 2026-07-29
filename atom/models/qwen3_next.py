@@ -247,7 +247,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
-        num_tokens, hidden_dim = hidden_states.shape
+        _num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts + 1)
@@ -376,11 +376,11 @@ class Qwen3NextAttention(nn.Module):
 
         fusion_kwargs = {}
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            fusion_kwargs = dict(
-                rotary_emb=self.rotary_emb,
-                q_norm=self.q_norm,
-                k_norm=self.k_norm,
-            )
+            fusion_kwargs = {
+                "rotary_emb": self.rotary_emb,
+                "q_norm": self.q_norm,
+                "k_norm": self.k_norm,
+            }
 
         self.attn = Attention(
             self.num_heads,
@@ -632,10 +632,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             ],
             dim=-1,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
-        )
+        query, key = (rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim) for x in (query, key))
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 

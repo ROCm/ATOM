@@ -14,7 +14,7 @@ def _patch_eagle3_model_type_checks() -> None:
         from vllm.v1.spec_decode import llm_base_proposer
 
         from atom.plugin.vllm.model_wrapper import ATOMModelBase
-    except Exception:
+    except ImportError:
         logger.warning(
             "vLLM plugin: failed to patch vLLM V1 EAGLE3 proposer type checks. "
             "This can happen if you are using an in-compatible vLLM version. "
@@ -65,7 +65,7 @@ def _get_mha_block_size() -> int:
 def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
     try:
         from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         return False
 
     has_mla = False
@@ -141,7 +141,7 @@ def _groups_are_heterogeneous_mla_mha(kv_cache_groups) -> bool:
             MLAAttentionSpec,
             UniformTypeKVCacheSpecs,
         )
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         logger.warning(
             "vLLM plugin: failed to recognize ATOM heterogeneous EAGLE3 KV pool. "
             "This can happen if you are using an in-compatible vLLM version. "
@@ -252,7 +252,7 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
     """
     try:
         import vllm.v1.core.kv_cache_utils as vllm_kv_cache_utils
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         logger.warning(
             "ATOM plugin: failed to import vLLM kv_cache_utils; cannot enable "
             "MLA target with MHA EAGLE3 draft. This can happen with "

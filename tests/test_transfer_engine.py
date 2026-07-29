@@ -241,7 +241,7 @@ class TestZMQHandshake:
             expected_keys = {"layer0", "layer1"}
             actual_keys = {
                 k if isinstance(k, str) else k.decode()
-                for k in received_layer_meta.keys()
+                for k in received_layer_meta
             }
             assert actual_keys == expected_keys
         finally:
@@ -423,7 +423,7 @@ class TestSchedulerLifecycle:
             seqs.append(seq)
 
         for seq in seqs:
-            n, load = sched.get_num_new_matched_tokens(seq)
+            _n, load = sched.get_num_new_matched_tokens(seq)
             assert load is True
 
         for seq in seqs:

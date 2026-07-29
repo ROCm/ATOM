@@ -105,7 +105,7 @@ def _layer_counts(hf_config) -> tuple[list[int], int, int, int]:
 
 
 def _classical_block_bytes(hf_config, kv_fp8: bool = False) -> int:
-    ratios, _dense, csa_layers, hca_layers = _layer_counts(hf_config)
+    _ratios, _dense, csa_layers, hca_layers = _layer_counts(hf_config)
     head_dim = int(getattr(hf_config, "head_dim", 512))
     rope_head_dim = _v4_rope_head_dim(hf_config)
     index_head_dim = int(getattr(hf_config, "index_head_dim", 128))
@@ -1169,11 +1169,7 @@ class _V4StateSlotAllocator:
             if victim_seen is None or self._last_seen[s] < victim_seen:
                 victim = s
                 victim_seen = self._last_seen[s]
-        if victim < 0:
-            # All slots belong to requests active this step: only possible if
-            # concurrency exceeds num_slots, which vLLM forbids. Fall back to
-            # slot 0 rather than crash.
-            victim = 0
+        victim = max(victim, 0)
         old = self._slot_to_key[victim]
         if old is not None:
             self._key_to_slot.pop(old, None)

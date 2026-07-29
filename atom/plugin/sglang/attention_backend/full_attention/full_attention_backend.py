@@ -201,12 +201,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                         if pool is None:
                             full_backend = getattr(backend, "full_attn_backend", None)
                             pool = getattr(full_backend, attr, None)
-                except Exception:  # noqa: BLE001 - forward context is optional
+                except Exception:
                     pool = None
             if pool is not None:
                 try:
                     setattr(forward_batch, attr, pool)
-                except Exception:  # noqa: BLE001, S110
+                except Exception:
                     pass
 
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:

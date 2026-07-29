@@ -119,9 +119,12 @@ def _run_init_aiter_dist(
         config.plugin_config.is_plugin_mode
     ), "Make sure ATOM is running in plugin mode"
 
-    if config.plugin_config.is_vllm:
-        if mock_init_tp is not None and mock_init_tp(tensor_parallel_size):
-            return
+    if (
+        config.plugin_config.is_vllm
+        and mock_init_tp is not None
+        and mock_init_tp(tensor_parallel_size)
+    ):
+        return
 
     if config.plugin_config.is_vllm:
         dp_master_ip = config.parallel_config.data_parallel_master_ip

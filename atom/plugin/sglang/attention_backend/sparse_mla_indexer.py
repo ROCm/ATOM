@@ -176,7 +176,7 @@ def _maybe_apply_pcp_query_split(
         )
 
         pcp_size = get_pcp_world_size()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pcp_size = 1
 
     if pcp_size <= 1:
@@ -212,7 +212,7 @@ def _maybe_apply_pcp_dense_query_split(
         )
 
         pcp_size = get_pcp_world_size()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pcp_size = 1
 
     if pcp_size <= 1:

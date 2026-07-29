@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote

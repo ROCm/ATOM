@@ -190,7 +190,7 @@ class RadixAttention(BaseAttention):
                     )
 
                     attn_backend = get_attn_backend() if has_forward_context() else None
-                except Exception:  # noqa: BLE001 - forward context is optional
+                except Exception:
                     attn_backend = None
 
                 return forward_sparse_mla_for_sglang(

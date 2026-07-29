@@ -501,7 +501,7 @@ def minimax_m3_sparse_attn(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
 ) -> None:
     """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
-    total_q, num_heads, head_dim = q.shape
+    _total_q, num_heads, head_dim = q.shape
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads

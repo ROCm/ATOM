@@ -79,7 +79,7 @@ class TestSeparateReasoning:
 
     def test_whitespace_after_thinking(self):
         text = "<think>thought</think>\n\nThe answer."
-        reasoning, content = separate_reasoning(text)
+        _reasoning, content = separate_reasoning(text)
         assert content == "The answer."
 
     def test_no_think_start_tag(self):

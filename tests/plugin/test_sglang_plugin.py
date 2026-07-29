@@ -27,34 +27,34 @@ class _Obj:
 
 def _make_fake_server_args(**overrides):
     """Return a minimal mock of sglang's ServerArgs."""
-    defaults = dict(
-        model_path="/fake/model",
-        tp_size=2,
-        dp_size=1,
-        ep_size=1,
-        context_length=8192,
-        max_running_requests=64,
-        mem_fraction_static=0.85,
-        kv_cache_dtype="bf16",
-        modelopt_quant=None,
-        modelopt_checkpoint_restore_path=None,
-        modelopt_checkpoint_save_path=None,
-        modelopt_export_path=None,
-        nccl_port=29500,
-        dist_init_addr="127.0.0.1:29500",
-        load_format="auto",
-        download_dir=None,
-        model_loader_extra_config=None,
-        remote_instance_weight_loader_seed_instance_ip=None,
-        remote_instance_weight_loader_seed_instance_service_port=None,
-        remote_instance_weight_loader_send_weights_group_ports=None,
-        remote_instance_weight_loader_backend=None,
-        rl_quant_profile=None,
-        enable_torch_compile=False,
-        disable_cuda_graph=False,
-        enable_dp_attention=False,
-        trust_remote_code=False,
-    )
+    defaults = {
+        "model_path": "/fake/model",
+        "tp_size": 2,
+        "dp_size": 1,
+        "ep_size": 1,
+        "context_length": 8192,
+        "max_running_requests": 64,
+        "mem_fraction_static": 0.85,
+        "kv_cache_dtype": "bf16",
+        "modelopt_quant": None,
+        "modelopt_checkpoint_restore_path": None,
+        "modelopt_checkpoint_save_path": None,
+        "modelopt_export_path": None,
+        "nccl_port": 29500,
+        "dist_init_addr": "127.0.0.1:29500",
+        "load_format": "auto",
+        "download_dir": None,
+        "model_loader_extra_config": None,
+        "remote_instance_weight_loader_seed_instance_ip": None,
+        "remote_instance_weight_loader_seed_instance_service_port": None,
+        "remote_instance_weight_loader_send_weights_group_ports": None,
+        "remote_instance_weight_loader_backend": None,
+        "rl_quant_profile": None,
+        "enable_torch_compile": False,
+        "disable_cuda_graph": False,
+        "enable_dp_attention": False,
+        "trust_remote_code": False,
+    }
     defaults.update(overrides)
     return _Obj(**defaults)
 
@@ -218,11 +218,13 @@ def test_generate_sglang_config_raises_on_none_server_args(monkeypatch):
         MagicMock(),
     )
 
-    with patch.dict(sys.modules, sgl_mods):
-        with pytest.raises(RuntimeError, match="not initialized"):
-            plugin_config._generate_atom_config_from_sglang_config(
-                config=_Obj(architectures=["DeepseekV3ForCausalLM"])
-            )
+    with (
+        patch.dict(sys.modules, sgl_mods),
+        pytest.raises(RuntimeError, match="not initialized"),
+    ):
+        plugin_config._generate_atom_config_from_sglang_config(
+            config=_Obj(architectures=["DeepseekV3ForCausalLM"])
+        )
 
 
 def test_generate_sglang_config_raises_on_server_args_exception(monkeypatch):
@@ -250,11 +252,13 @@ def test_generate_sglang_config_raises_on_server_args_exception(monkeypatch):
         MagicMock(),
     )
 
-    with patch.dict(sys.modules, sgl_mods):
-        with pytest.raises(RuntimeError, match="Failed to retrieve"):
-            plugin_config._generate_atom_config_from_sglang_config(
-                config=_Obj(architectures=["DeepseekV3ForCausalLM"])
-            )
+    with (
+        patch.dict(sys.modules, sgl_mods),
+        pytest.raises(RuntimeError, match="Failed to retrieve"),
+    ):
+        plugin_config._generate_atom_config_from_sglang_config(
+            config=_Obj(architectures=["DeepseekV3ForCausalLM"])
+        )
 
 
 # ---------------------------------------------------------------------------

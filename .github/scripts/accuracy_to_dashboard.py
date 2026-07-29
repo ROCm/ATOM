@@ -28,8 +28,7 @@ def build_entries(
 
         # Artifact name format: "accuracy-ModelName"
         model_name = artifact_dir.name
-        if model_name.startswith("accuracy-"):
-            model_name = model_name[len("accuracy-") :]
+        model_name = model_name.removeprefix("accuracy-")
 
         # Find the latest JSON result file
         json_files = sorted(artifact_dir.glob("*.json"), reverse=True)

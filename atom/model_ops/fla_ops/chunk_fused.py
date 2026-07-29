@@ -466,7 +466,7 @@ def chunk_gated_delta_rule_fused(
     )
 
     # --- launch the fused kernel ---
-    B, T, Hg, K = q.shape
+    _B, T, Hg, K = q.shape
     H = v.shape[-2]
     V = v.shape[-1]
     BT = 64  # algorithmic chunk size (must match the prologue's chunk_size)

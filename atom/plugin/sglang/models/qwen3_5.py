@@ -294,16 +294,18 @@ def _get_qwen35_language_model_stack_cls(
                     )
                 )
             del kwargs
-            with SGLangForwardBatchMetadata.bind(metadata):
-                with SGLangGDNForwardContext.bind(metadata):
-                    out = _forward_qwen35_decoder_stack(
-                        self.model,
-                        input_ids,
-                        positions,
-                        intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
-                        input_deepstack_embeds=input_deepstack_embeds,
-                    )
+            with (
+                SGLangForwardBatchMetadata.bind(metadata),
+                SGLangGDNForwardContext.bind(metadata),
+            ):
+                out = _forward_qwen35_decoder_stack(
+                    self.model,
+                    input_ids,
+                    positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    input_deepstack_embeds=input_deepstack_embeds,
+                )
             if isinstance(out, IntermediateTensors):
                 return PPProxyTensors(dict(out.tensors))
             return out

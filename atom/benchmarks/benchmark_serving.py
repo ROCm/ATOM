@@ -37,7 +37,7 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -294,7 +294,7 @@ def calculate_metrics(
             )
 
         for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+            is_good_req = all(s >= r for s, r in zip(slo_values, req_metric))
             if is_good_req:
                 good_completed += 1
 
@@ -356,12 +356,14 @@ async def get_spec_stats(base_url: str) -> dict | None:
     benchmark flow) that is effectively this run.
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{base_url}/debug/mtp_stats") as resp:
-                if resp.status != 200:
-                    return None
-                stats = await resp.json()
-    except Exception:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(f"{base_url}/debug/mtp_stats") as resp,
+        ):
+            if resp.status != 200:
+                return None
+            stats = await resp.json()
+    except (aiohttp.ClientError, OSError):
         return None
     if not stats.get("enabled"):
         return None
@@ -813,7 +815,7 @@ def main(args: argparse.Namespace):
         result_json: dict[str, Any] = {}
 
         # Setup
-        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        current_dt = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
         result_json["date"] = current_dt
         result_json["backend"] = backend
         result_json["model_id"] = model_id

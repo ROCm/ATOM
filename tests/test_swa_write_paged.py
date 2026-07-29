@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Offline P2 gate for M1 paged swa_write: kernel vs reference, no model.
 
 Validates the block-table addressing: writes the last-N tokens of each seq to

@@ -280,9 +280,11 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
     # checkpoint uses the standard indexer.wk / indexer.weights_proj tensor names
     # (the "indexers_proj" alias only lives in the HF quant config), so the merge
     # loads correctly; see _can_fuse_indexer_wk_weights_proj.
-    if getattr(config, "model_type", None) == "glm_moe_dsa":
-        if not ENABLE_GLM_FUSED_INDEXER:
-            return False
+    if (
+        getattr(config, "model_type", None) == "glm_moe_dsa"
+        and not ENABLE_GLM_FUSED_INDEXER
+    ):
+        return False
     return (
         getattr(config, "index_head_dim", None) == 128
         and getattr(config, "qk_rope_head_dim", None) == 64
@@ -1130,22 +1132,22 @@ class DeepseekV2MoE(nn.Module):
             )
         )
 
-        if config.n_shared_experts is not None:
-            if not self.is_rocm_aiter_fusion_shared_expert_enabled:
-                tbo_active = get_current_atom_config().enable_tbo
-                if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
-                    self._use_dual_stream = True
-                intermediate_size = (
-                    config.moe_intermediate_size * config.n_shared_experts
-                )
-                self.shared_experts = DeepseekV2MLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    prefix=f"{prefix}.shared_experts",
-                )
+        if (
+            config.n_shared_experts is not None
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
+        ):
+            tbo_active = get_current_atom_config().enable_tbo
+            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+                self._use_dual_stream = True
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=f"{prefix}.shared_experts",
+            )
 
         if self._pcp_moe_merge_enabled or self._use_dual_stream:
             compilation_config = get_current_atom_config().compilation_config
@@ -1567,7 +1569,7 @@ def sparse_attn_indexer(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == context.batch_size
         num_padded_tokens = batch_size * next_n
-        batch_size, next_n, heads, _ = padded_q_fp8_decode_tokens.shape
+        batch_size, next_n, _heads, _ = padded_q_fp8_decode_tokens.shape
         logits = torch.empty(
             [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
         )
@@ -2389,9 +2391,12 @@ class DeepseekV2MLAAttention(nn.Module):
         self.fuse_qknorm_quant = False
         # always fuse qknorm
         self.fuse_qknorm = ENABLE_DS_QKNORM_FUSION
-        if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if eff_dtype in (dtypes.fp8, dtypes.fp4x2):
-                self.fuse_qknorm_quant = True
+        if (
+            quant_config is not None
+            and ENABLE_DS_QKNORM_QUANT_FUSION
+            and eff_dtype in (dtypes.fp8, dtypes.fp4x2)
+        ):
+            self.fuse_qknorm_quant = True
 
     def forward(
         self,
@@ -2907,7 +2912,7 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
-        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size

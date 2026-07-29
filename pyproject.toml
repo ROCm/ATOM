@@ -34,6 +34,44 @@ atom = [
     "mesh/target/release/libmesh.so",
 ]
 
+[tool.ruff]
+target-version = "py310"
+exclude = ["mi355_replay_traffic_20260718"]
+
+[tool.ruff.lint]
+ignore = [
+    "BLE001",   # blind Exception catch — intentional for optional/fallback paths
+    "S110",     # try-except-pass — used for best-effort cleanup
+    "S102",     # exec usage — required by the codebase
+    "S112",     # try-except-continue — intentional
+    "TRY201",   # raise-within-except without from — style preference
+    "TRY002",   # create own exception — too opinionated
+    "TRY004",   # prefer TypeError — too opinionated
+    "TRY401",   # redundant exception in logging.exception — sometimes intentional
+    "PLW0602",  # global without assignment — intentional pattern
+    "RUF012",   # mutable class variable not annotated with ClassVar
+    "F822",     # undefined __all__ exports — dynamic imports
+    "PYI034",   # __aenter__ return Self — stub-only rule
+    "PYI019",   # methods return Self — stub-only rule
+    "PYI059",   # generic not in stub — stub-only rule
+    "PYI032",   # __eq__ arg type — stub-only rule
+    "PYI006",   # bad version info — stub-only rule
+    "PYI030",   # union literal — stub-only rule
+    "PYI063",   # pre-PEP 570 positional-only — stub-only rule
+    "PYI041",   # redundant numeric union — stub-only rule
+    "G201",     # logging .exception with exc_info — intentional
+    "ASYNC230", # async open — not applicable (sync on purpose)
+    "N999",     # invalid module name — existing convention
+    "PLR0124",  # x != x NaN check — idiomatic in Triton kernels
+    "PLW0406",  # module imports itself — intentional for monkey-patching
+    "PLW1508",  # invalid env-var default type — intentional
+    "DTZ007",   # naive datetime — no timezone needed for local timestamps
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S"]
+".github/*" = ["S"]
+
 [project.entry-points."vllm.platform_plugins"]
 # by default the entry-points will be installed anyway
 # but the plugin mode for platforms can be disabled by 

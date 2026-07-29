@@ -18,7 +18,6 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -31,7 +30,7 @@ class StepEvent:
 
 @dataclass
 class DecodeIteration:
-    decode: Optional[StepEvent] = None
+    decode: StepEvent | None = None
     draft_steps: list[StepEvent] = field(default_factory=list)
 
 
@@ -78,7 +77,7 @@ def parse_label(name: str) -> dict[str, str]:
 def group_decode_iterations(events: list[StepEvent]) -> list[DecodeIteration]:
     """Group sequential decode + draft events into iterations."""
     iterations: list[DecodeIteration] = []
-    current: Optional[DecodeIteration] = None
+    current: DecodeIteration | None = None
 
     for ev in events:
         if ev.name.startswith("decode["):

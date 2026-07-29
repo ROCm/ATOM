@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -41,7 +41,7 @@ class KVConnectorFactory:
         connector = KVConnectorFactory.create_connector(config, role="worker")
     """
 
-    _registry: dict[str, dict[str, str]] = {}
+    _registry: ClassVar[dict[str, dict[str, str]]] = {}
 
     @classmethod
     def register(
@@ -152,5 +152,8 @@ KVConnectorFactory.register(
 # the connector module is imported lazily by create_connector when selected).
 try:
     import atom.kv_transfer.offload  # noqa: F401
-except Exception as _e:  # pragma: no cover - offload optional (needs lmcache)
+except (
+    ImportError,
+    ModuleNotFoundError,
+) as _e:  # pragma: no cover - offload optional (needs lmcache)
     logger.debug("lmcache_offload backend not registered: %s", _e)

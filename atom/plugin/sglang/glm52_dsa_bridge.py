@@ -31,7 +31,7 @@ def maybe_get_glm52_dsa_pools_from_sglang_backend(forward_batch=None):
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         backend = get_attn_backend()
-    except Exception:  # noqa: BLE001 - forward context is optional
+    except Exception:
         backend = None
 
     token_to_kv_pool = getattr(backend, "token_to_kv_pool", None)

@@ -251,13 +251,12 @@ def register_model() -> None:
     for arch, qual in _VLLM_MODEL_REGISTRY_OVERRIDES.items():
         module_name, class_name = qual.split(":", 1)
         existing = vllm_model_registry.ModelRegistry.models.get(arch)
-        if existing is not None:
-            # If already overridden to the same target, skip re-registering.
-            if (
-                getattr(existing, "module_name", None) == module_name
-                and getattr(existing, "class_name", None) == class_name
-            ):
-                continue
+        if existing is not None and (
+            getattr(existing, "module_name", None) == module_name
+            and getattr(existing, "class_name", None) == class_name
+        ):
+            # Already overridden to the same target, skip re-registering.
+            continue
 
         logger.info(f"Register model {arch} to vLLM with {qual}")
         vllm_model_registry.ModelRegistry.register_model(arch, qual)

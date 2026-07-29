@@ -130,7 +130,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         # NOTE: input_guard calls .contiguous() on every Tensor arg including
         # o. The public chunk_gated_delta_rule entry point pre-asserts o is
         # contiguous before .apply() so this can't silently clone.
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
+        g, o, _A, final_state, _w, _h, _v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -158,7 +158,7 @@ def chunk_gated_delta_rule(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
@@ -254,9 +254,7 @@ def chunk_gated_delta_rule(
             "Please use head_first=False for now instead.",
             stacklevel=2,
         )
-        q, k, v, beta, g = map(
-            lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g)
-        )
+        q, k, v, beta, g = (rearrange(x, "b h t ... -> b t h ...") for x in (q, k, v, beta, g))
     if not head_first and q.shape[1] < q.shape[2]:
         warnings.warn(
             f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "

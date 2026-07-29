@@ -926,7 +926,7 @@ class DecodeEngineCore(EngineCore):
         config.num_kvcache_blocks = num_kvcache_blocks
 
         if not config.enforce_eager:
-            cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
+            cap_cost, bs, _pool_bytes = self.runner_mgr.call_func(
                 "capture_cudagraph", wait_out=True
             )
             logger.info(

@@ -20,22 +20,15 @@ import json
 import os
 import re
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 
 AUTH_URL = "https://auth.docker.io/token"
 REGISTRY_URL = "https://registry-1.docker.io"
-MANIFEST_ACCEPT = ", ".join(
-    (
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-        "application/vnd.oci.image.manifest.v1+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-    )
-)
+MANIFEST_ACCEPT = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
 USER_AGENT = "ATOM Image Resolver/1.0"
 IMAGE_FAMILY_CONFIG = {
     "native": {
@@ -128,7 +121,7 @@ def get_registry_token(repository: str) -> str:
     docker_user = os.environ.get("DOCKER_USERNAME")
     docker_pass = os.environ.get("DOCKER_PASSWORD")
     if docker_user and docker_pass:
-        creds = base64.b64encode(f"{docker_user}:{docker_pass}".encode("utf-8")).decode(
+        creds = base64.b64encode(f"{docker_user}:{docker_pass}".encode()).decode(
             "ascii"
         )
         headers["Authorization"] = f"Basic {creds}"

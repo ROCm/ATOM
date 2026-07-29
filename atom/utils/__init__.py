@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -134,8 +134,11 @@ def get_device_indices(
 def mark_spliting_op(
     is_custom: bool,
     gen_fake: Callable[..., Any] | None = None,
-    mutates_args: list[str] = [],
+    mutates_args: list[str] | None = None,
 ):
+    if mutates_args is None:
+        mutates_args = []
+
     def decorator(func):
         if not is_custom:
             func.spliting_op = True
@@ -615,7 +618,7 @@ def is_torch_equal_or_newer(target: str) -> bool:
     """
     try:
         return _is_torch_equal_or_newer(str(torch.__version__), target)
-    except Exception:
+    except (ValueError, TypeError):
         # Fallback to PKG-INFO to load the package info, needed by the doc gen.
         return Version(importlib.metadata.version("torch")) >= Version(target)
 
@@ -688,7 +691,7 @@ at::Tensor atom_weak_ref_tensor(at::Tensor input) {
         )
         _ATOM_WEAKREF_OP = _mod.atom_weak_ref_tensor
         return _ATOM_WEAKREF_OP
-    except Exception as _e:  # noqa: BLE001
+    except Exception as _e:
         # Any build/compile failure -> disable (return-as-is is functionally
         # correct, just uses more memory). Logged once.
         try:
@@ -700,7 +703,7 @@ at::Tensor atom_weak_ref_tensor(at::Tensor input) {
                 "ATOM_DISABLE_JIT_WEAKREF=1 to silence.",
                 _e,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         _ATOM_WEAKREF_OP = False
         return None

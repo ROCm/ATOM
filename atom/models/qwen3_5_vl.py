@@ -40,7 +40,7 @@ class Qwen3VisionPatchEmbed(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [L, C * temporal_patch_size * patch_size * patch_size]
-        L, C = x.shape
+        L, _C = x.shape
         x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
         x = self.proj(x).view(L, self.hidden_size)
         return x

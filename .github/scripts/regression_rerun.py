@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from catalog import load_variants  # noqa: E402
+from catalog import load_variants
 
 
 def _find_model_config(regression_entry, models):

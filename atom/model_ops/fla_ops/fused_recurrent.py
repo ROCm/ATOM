@@ -481,7 +481,7 @@ def fused_recurrent_gated_delta_rule(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor = None,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     inplace_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,

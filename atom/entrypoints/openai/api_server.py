@@ -246,7 +246,7 @@ def _load_image_from_url(url: str) -> Image.Image:
 
 
 def _get_multimodal_processor():
-    global processor, model_name
+    global processor
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
         processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
@@ -331,7 +331,6 @@ def _send_stream_chunk_direct(
     loop: AbstractEventLoop,
 ) -> None:
     """Send stream chunk directly to the queue."""
-    global tokenizer
 
     new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     started_at = _request_start_times.get(request_id)
@@ -364,7 +363,6 @@ def _send_stream_chunk_tagged(
     This path serves ``SamplingParams.n > 1`` by tagging each sibling's chunks
     so the shared stream consumer can merge them in order.
     """
-    global tokenizer
 
     new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     chunk_data = {
@@ -386,7 +384,6 @@ async def generate_async(
     data_parallel_rank: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
-    global engine, tokenizer
 
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -510,7 +507,6 @@ async def generate_async_multimodal(
     request_id: str,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
-    global engine, tokenizer
 
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -614,7 +610,6 @@ async def generate_async_fanout(
     :func:`generate_async` yields for n==1, so response builders can treat
     each entry the same way.
     """
-    global engine, tokenizer
 
     n = int(sampling_params.n)
     assert n >= 1
@@ -763,8 +758,6 @@ async def setup_streaming_request(
     is the engine-computed prompt length so the stream response generator does
     not have to re-tokenize the prompt on the event loop.
     """
-    global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
 
     stream_queue: asyncio.Queue = asyncio.Queue()
     stream_loop = asyncio.get_running_loop()
@@ -824,8 +817,6 @@ def cleanup_streaming_request(
     no-op that just floods the control path (one broadcast per engine core, per
     request).
     """
-    global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
 
     _stream_queues.pop(request_id, None)
     _seq_id_to_request_id.pop(seq_id, None)
@@ -953,8 +944,6 @@ async def setup_streaming_request_fanout(
     tokenize the same prompt once, so ``num_prompt_tokens`` is shared and lets
     the stream response generator skip re-tokenizing on the event loop.
     """
-    global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
 
     n = int(sampling_params.n)
     assert n >= 1
@@ -1045,7 +1034,7 @@ async def value_error_handler(request: Request, exc: ValueError):
 
 @app.exception_handler(Exception)
 async def general_error_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled error: {exc}", exc_info=True)
+    logger.error(f"Unhandled error: {exc}")
     return JSONResponse(
         status_code=500,
         content={
@@ -1064,7 +1053,6 @@ async def general_error_handler(request: Request, exc: Exception):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
-    global engine, tokenizer, model_name
 
     validate_model(request.model)
 
@@ -1239,14 +1227,13 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         logger.error(f"Validation error in chat_completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in chat_completions: {e}", exc_info=True)
+        logger.exception(f"Error in chat_completions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
-    global engine, tokenizer, model_name
 
     validate_model(request.model)
 
@@ -1348,7 +1335,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         logger.error(f"Validation error in completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in completions: {e}", exc_info=True)
+        logger.exception(f"Error in completions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1360,7 +1347,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     and returns Anthropic-formatted responses. Enables Claude Code and other
     Anthropic-compatible tools to use ATOM as a backend.
     """
-    global engine, tokenizer, model_name
 
     try:
         # Convert Anthropic messages to OpenAI format
@@ -1404,7 +1390,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 if _v:
                     max_ctx = int(_v)
                     break
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 continue
         if not max_ctx:
             max_ctx = 30720
@@ -1628,7 +1614,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
     except Exception as e:
-        logger.error(f"Error in anthropic_messages: {e}", exc_info=True)
+        logger.exception(f"Error in anthropic_messages: {e}")
         return JSONResponse(
             status_code=500,
             content={
@@ -1641,7 +1627,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
-    global model_name
     return ModelList(data=[ModelCard(id=model_name)])
 
 
@@ -1654,13 +1639,12 @@ async def health():
 @app.get("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""
-    global engine
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine is not initialized")
     try:
         return engine.get_mtp_statistics()
     except Exception as e:
-        logger.error(f"Failed to get MTP statistics: {e}", exc_info=True)
+        logger.exception(f"Failed to get MTP statistics: {e}")
         raise HTTPException(
             status_code=500, detail=f"Failed to get MTP statistics: {e!s}"
         )
@@ -1691,7 +1675,6 @@ def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
 
 @app.get("/kv_transfer_info")
 async def kv_transfer_info():
-    global engine
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
     kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
@@ -1706,19 +1689,17 @@ async def kv_transfer_info():
 @app.post("/start_profile")
 async def start_profile():
     """Start profiling the engine."""
-    global engine
     try:
         engine.start_profile()
         return {"status": "success", "message": "Profiling started"}
     except Exception as e:
-        logger.error(f"Failed to start profiling: {e}", exc_info=True)
+        logger.exception(f"Failed to start profiling: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
 
 
 @app.post("/stop_profile")
 async def stop_profile():
     """Stop profiling the engine."""
-    global engine
     try:
         traces = engine.stop_profile()
         return {
@@ -1727,7 +1708,7 @@ async def stop_profile():
             "traces": traces,
         }
     except Exception as e:
-        logger.error(f"Failed to stop profiling: {e}", exc_info=True)
+        logger.exception(f"Failed to stop profiling: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
 
 

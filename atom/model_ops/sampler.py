@@ -251,7 +251,7 @@ class Sampler(nn.Module):
             )
             _NATIVE_SAMPLING_WARNING_ISSUED = True
 
-        batch_size, vocab_size = probs.shape
+        _batch_size, vocab_size = probs.shape
         device = probs.device
 
         # Sort probs descending

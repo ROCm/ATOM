@@ -93,6 +93,8 @@ else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_triton = None
     gemm_a8w8_triton = None
+import itertools
+
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 
@@ -174,7 +176,7 @@ def gemm_a4w4_quant(
         and not use_fp4_non_shuffle_triton_gemm()
         and gemm_afp4wfp4_preshuffle is not None
     ):
-        m, k = x.view(-1, x.size(-1)).shape
+        m, _k = x.view(-1, x.size(-1)).shape
 
         y = torch.empty(
             (
@@ -702,9 +704,12 @@ class LinearBase(nn.Module):
             loaded_weight_scale_parts = getattr(
                 self, "_loaded_weight_scale_for_requant_parts", None
             )
-            if loaded_weight_scale is None and loaded_weight_scale_parts is not None:
-                if all(part is not None for part in loaded_weight_scale_parts):
-                    loaded_weight_scale = torch.cat(loaded_weight_scale_parts, dim=0)
+            if (
+                loaded_weight_scale is None
+                and loaded_weight_scale_parts is not None
+                and all(part is not None for part in loaded_weight_scale_parts)
+            ):
+                loaded_weight_scale = torch.cat(loaded_weight_scale_parts, dim=0)
             weight_scale_for_requant = (
                 loaded_weight_scale
                 if loaded_weight_scale is not None
@@ -773,9 +778,8 @@ class LinearBase(nn.Module):
                     self, "needs_preshuffled_weight", False
                 ):
                     need_shuffle = True
-            if need_shuffle:
-                if self.weight.dim() == 2:
-                    shuffle_weights(self.weight)
+            if need_shuffle and self.weight.dim() == 2:
+                shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32 and (
@@ -1025,7 +1029,7 @@ class MergedColumnParallelLinear(LinearBase):
                     f"valid range is [0, {len(self.output_sizes) - 1}]"
                 )
             if len(loaded_shard_id) > 1 and any(
-                b - a != 1 for a, b in zip(loaded_shard_id[:-1], loaded_shard_id[1:])
+                b - a != 1 for a, b in itertools.pairwise(loaded_shard_id)
             ):
                 raise ValueError(
                     "Shard id with multiple indices should be consecutive. "
@@ -1037,9 +1041,9 @@ class MergedColumnParallelLinear(LinearBase):
             shard_sizes = [self.output_sizes[i] for i in loaded_shard_id]
             current_offset = 0
             for shard_id, shard_size in zip(loaded_shard_id, shard_sizes):
-                if param is getattr(self, "weight_scale", None) or param is getattr(
-                    self, "input_scale", None
-                ):
+                if param is getattr(  # noqa: SIM102
+                    self, "weight_scale", None
+                ) or param is getattr(self, "input_scale", None):
                     if self.quant_type not in (
                         QuantType.per_1x32,
                         QuantType.per_Token,

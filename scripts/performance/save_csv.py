@@ -1,9 +1,10 @@
-import os
-import sys
-import re
 import argparse
+import os
+import re
+import sys
+
 from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 

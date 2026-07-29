@@ -243,10 +243,7 @@ class GatedDeltaNet(nn.Module):
             ],
             dim=-1,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
-        )
+        query, key = (rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim) for x in (query, key))
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 

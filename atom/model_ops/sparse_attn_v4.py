@@ -415,7 +415,7 @@ def _sparse_attn_torch(
           (sum_exp = exp(sink - (-inf)) = 0; division below uses safe eps).
     """
     B, M, H, D = q.shape
-    _, N, D_kv = kv.shape
+    _, _N, D_kv = kv.shape
     K = topk_idxs.shape[-1]
     assert kv.shape[0] == B, f"batch mismatch: q={B} vs kv={kv.shape[0]}"
     assert D_kv == D, f"head_dim mismatch: q={D} vs kv={D_kv}"

@@ -201,76 +201,78 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         pp_proxy_tensors: PPProxyTensors | None = None,
         **model_kwargs: Any,
     ) -> LogitsProcessorOutput | PPProxyTensors:
-        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
-            with SGLangPluginRuntime(
+        with (
+            plugin_runtime_scope(framework="sglang", atom_config=self.atom_config),
+            SGLangPluginRuntime(
                 atom_config=self.atom_config,
                 forward_batch=forward_batch,
                 positions=positions,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
                 set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
-            ) as runtime:
-                if self.model_arch_spec.bind_cache_views is not None:
-                    self.model_arch_spec.bind_cache_views(self.model, runtime)
+            ) as runtime,
+        ):
+            if self.model_arch_spec.bind_cache_views is not None:
+                self.model_arch_spec.bind_cache_views(self.model, runtime)
 
-                metadata = SGLangForwardBatchMetadata.build(
-                    runtime.forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    save_kv_cache=model_kwargs.get("save_kv_cache"),
-                )
-                model_inputs = dict(
-                    input_ids=runtime.input_ids,
-                    positions=runtime.positions,
-                    intermediate_tensors=SGLangForwardBatchMetadata.to_intermediate_tensors(
-                        pp_proxy_tensors, metadata
-                    ),
-                    inputs_embeds=runtime.input_embeds,
-                )
+            metadata = SGLangForwardBatchMetadata.build(
+                runtime.forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                save_kv_cache=model_kwargs.get("save_kv_cache"),
+            )
+            model_inputs = {
+                "input_ids": runtime.input_ids,
+                "positions": runtime.positions,
+                "intermediate_tensors": SGLangForwardBatchMetadata.to_intermediate_tensors(
+                    pp_proxy_tensors, metadata
+                ),
+                "inputs_embeds": runtime.input_embeds,
+            }
 
-                with SGLangForwardBatchMetadata.bind(metadata):
-                    if self.model_arch_spec.wrapper_binds_gdn_context:
-                        from atom.plugin.sglang.attention_backend.attention_gdn import (
-                            SGLangGDNForwardContext,
-                        )
+            with SGLangForwardBatchMetadata.bind(metadata):
+                if self.model_arch_spec.wrapper_binds_gdn_context:
+                    from atom.plugin.sglang.attention_backend.attention_gdn import (
+                        SGLangGDNForwardContext,
+                    )
 
-                        with SGLangGDNForwardContext.bind(metadata):
-                            hidden_states = self.model(
-                                **self._filter_model_forward_kwargs(model_inputs)
-                            )
-                    elif self.model_arch_spec.uses_context_only_forward:
+                    with SGLangGDNForwardContext.bind(metadata):
                         hidden_states = self.model(
                             **self._filter_model_forward_kwargs(model_inputs)
                         )
-                    else:
-                        model_call_kwargs = dict(
-                            model_inputs,
-                            forward_batch=runtime.forward_batch,
-                            get_embedding=get_embedding,
-                            pp_proxy_tensors=pp_proxy_tensors,
-                        )
-                        model_call_kwargs.update(model_kwargs)
-                        hidden_states = self.model(
-                            **self._filter_model_forward_kwargs(model_call_kwargs)
-                        )
+                elif self.model_arch_spec.uses_context_only_forward:
+                    hidden_states = self.model(
+                        **self._filter_model_forward_kwargs(model_inputs)
+                    )
+                else:
+                    model_call_kwargs = dict(
+                        model_inputs,
+                        forward_batch=runtime.forward_batch,
+                        get_embedding=get_embedding,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
+                    model_call_kwargs.update(model_kwargs)
+                    hidden_states = self.model(
+                        **self._filter_model_forward_kwargs(model_call_kwargs)
+                    )
 
-                hidden_states = runtime.trim_output(hidden_states)
+            hidden_states = runtime.trim_output(hidden_states)
 
-                if self.pp_group.is_last_rank:
-                    if self.model_arch == "DeepseekV4ForCausalLM":
-                        return self.logits_processor(
-                            input_ids,
-                            hidden_states,
-                            self.logits_head,
-                            forward_batch,
-                            hidden_states_before_norm=hidden_states,
-                        )
+            if self.pp_group.is_last_rank:
+                if self.model_arch == "DeepseekV4ForCausalLM":
                     return self.logits_processor(
                         input_ids,
                         hidden_states,
                         self.logits_head,
                         forward_batch,
+                        hidden_states_before_norm=hidden_states,
                     )
-                return hidden_states
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.logits_head,
+                    forward_batch,
+                )
+            return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         # The passed `weights` iterable from sglang is ignored because ATOM

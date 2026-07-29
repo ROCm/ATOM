@@ -99,9 +99,12 @@ class PagedAttentionImpl(nn.Module):
         self.supports_quant_query_input = False
 
     def process_weights_after_loading(self):
-        if use_pa_decode_bf16_asm():
-            if self.sinks is not None and self.sinks.dtype != torch.float32:
-                self.sinks.data = self.sinks.data.to(torch.float32).contiguous()
+        if (
+            use_pa_decode_bf16_asm()
+            and self.sinks is not None
+            and self.sinks.dtype != torch.float32
+        ):
+            self.sinks.data = self.sinks.data.to(torch.float32).contiguous()
 
     def _can_attempt_prefill_sink_asm(self, fwd_ctx: ForwardContext) -> bool:
         if not fwd_ctx.context.is_prefill:
@@ -129,9 +132,9 @@ class PagedAttentionImpl(nn.Module):
         # sq != sk (chunked-prefill). cu_seqlens_q / cu_seqlens_k carry the
         # per-request new-token vs cached+new lengths, so we no longer require
         # max_seqlen_q == max_seqlen_k.
-        if attn_metadata.cu_seqlens_q is None or attn_metadata.cu_seqlens_k is None:
-            return False
-        return True
+        return not (
+            attn_metadata.cu_seqlens_q is None or attn_metadata.cu_seqlens_k is None
+        )
 
     def _can_use_prefill_sink_asm(
         self,
@@ -157,9 +160,7 @@ class PagedAttentionImpl(nn.Module):
             return False
         if q.shape[0] != k.shape[0] or k.shape[0] != v.shape[0]:
             return False
-        if q.shape[1] % k.shape[1] != 0:
-            return False
-        return True
+        return q.shape[1] % k.shape[1] == 0
 
     def forward_impl(
         self,
@@ -524,7 +525,7 @@ class PagedAttentionImpl(nn.Module):
             )
         else:
             _, num_q_heads_total, head_size = q.shape
-            num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
+            _num_blocks, num_kv_heads, _, _block_size, _ = k_cache.shape
             query_group_size = attn_metadata.max_seqlen_q * (
                 num_q_heads_total // num_kv_heads
             )

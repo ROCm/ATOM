@@ -123,7 +123,7 @@ def test_schedule_respects_max_num_seqs(seq_factory):
     s2.num_cached_tokens = 0
     sched.extend([s1, s2])
 
-    batch, seqs = sched.schedule()
+    batch, _seqs = sched.schedule()
     assert batch.total_seqs_num_prefill == 1
 
 

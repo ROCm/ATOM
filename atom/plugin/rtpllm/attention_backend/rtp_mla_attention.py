@@ -44,9 +44,7 @@ def _should_emit_topk_indices(attn) -> bool:
         return True
 
     context = getattr(forward_context, "context", None)
-    if getattr(context, "is_dummy_run", False):
-        return False
-    return True
+    return not getattr(context, "is_dummy_run", False)
 
 
 def _use_rtp_sparse_attn_indexer(indexer: object | None) -> None:

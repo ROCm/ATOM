@@ -29,7 +29,7 @@ def _resolve_plugin_sparse_index_converter():
         try:
             module = importlib.import_module(module_name)
             return module.triton_convert_req_index_to_global_index
-        except Exception as exc:
+        except (ImportError, AttributeError) as exc:
             errors.append(f"{module_name}: {exc}")
     raise _SparseUnavailable(
         "plugin sparse MLA index converter unavailable; " + "; ".join(errors)
@@ -218,7 +218,7 @@ class _RealSparseMlaImpl:
     def _infer_num_heads_from_weight(self, fallback: int) -> int:
         try:
             weight = self._read_kv_b_proj_weight()
-        except Exception:
+        except (AttributeError, RuntimeError):
             return int(fallback)
         per_head_dim = int(self.qk_nope_head_dim + self.v_head_dim)
         if per_head_dim <= 0 or weight.ndim != 2:
@@ -238,7 +238,7 @@ class _RealSparseMlaImpl:
             from atom.model_ops.utils import get_and_maybe_dequant_weights
 
             weight = get_and_maybe_dequant_weights(self.kv_b_proj)
-        except Exception:
+        except (AttributeError, RuntimeError):
             weight = getattr(self.kv_b_proj, "weight", None)
         if not isinstance(weight, torch.Tensor):
             raise _SparseUnavailable(
@@ -485,7 +485,7 @@ class _RealSparseMlaImpl:
             raise _SparseUnavailable(
                 f"GLM5 RTP sparse MLA requires positive block_size, got {block_size}."
             )
-        num_tokens, topk = topk_indices.shape
+        num_tokens, _topk = topk_indices.shape
         device = topk_indices.device
         block_table = _RealSparseMlaImpl._block_table(attn_metadata, device)
         req_id = _RealSparseMlaImpl._build_req_id_per_token(
@@ -1434,7 +1434,7 @@ class RTPSparseMlaBackend:
             from atom.utils.forward_context import get_forward_context
 
             return getattr(get_forward_context(), "attn_metadata", None)
-        except Exception:
+        except (AttributeError, RuntimeError):
             return None
 
     @staticmethod
@@ -1751,7 +1751,7 @@ def rtp_sparse_attn_indexer(
         from atom.utils.forward_context import get_forward_context
 
         forward_context = get_forward_context()
-    except Exception:
+    except (AttributeError, RuntimeError):
         forward_context = None
     context = getattr(forward_context, "context", None)
     attn_metadata = getattr(forward_context, "attn_metadata", None)
