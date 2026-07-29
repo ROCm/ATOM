@@ -23,7 +23,6 @@ This guide targets **AMD MI355 (gfx950) only**, `-tp 8`.
 # ---- load ----
 export ATOM_LOADER_USE_THREADPOOL=1
 export ATOM_LOADER_THREADPOOL_WORKERS=16
-export ATOM_SYNC_AFTER_LOAD=1               # startup-only TP barrier
 export ATOM_DIST_TIMEOUT_SECONDS=3600
 
 # ---- gfx950 MoE: FlyDSL native SiTUv2 ----
