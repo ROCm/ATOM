@@ -15,11 +15,12 @@ import socket
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -132,7 +133,7 @@ def get_device_indices(
 
 def mark_spliting_op(
     is_custom: bool,
-    gen_fake: Optional[Callable[..., Any]] = None,
+    gen_fake: Callable[..., Any] | None = None,
     mutates_args: list[str] = [],
 ):
     def decorator(func):
@@ -167,14 +168,12 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
-def get_mp_context() -> Union[ForkContext, SpawnContext]:
+def get_mp_context() -> ForkContext | SpawnContext:
     """Get a multiprocessing context with 'spawn' start method."""
     return multiprocessing.get_context("spawn")
 
 
-def set_process_title(
-    name: str, suffix: str = "", prefix: Optional[str] = None
-) -> None:
+def set_process_title(name: str, suffix: str = "", prefix: str | None = None) -> None:
     """Set the current process title (comm/cmdline) for ps/top/rocm-smi.
 
     rocm-smi --showpids reads the process ``comm`` field, which defaults to the
@@ -393,7 +392,7 @@ def _get_open_port() -> int:
             return s.getsockname()[1]
 
 
-@lru_cache()
+@lru_cache
 def get_zmq_base_path() -> str:
     return tempfile.gettempdir()
 
@@ -419,7 +418,7 @@ def get_engine_client_zmq_addr(local_only: bool, host: str, port: int = 0) -> st
     )
 
 
-def close_sockets(sockets: Sequence[Union[zmq.Socket, zmq.asyncio.Socket]]):
+def close_sockets(sockets: Sequence[zmq.Socket | zmq.asyncio.Socket]):
     for sock in sockets:
         if sock is not None:
             sock.close(linger=0)
@@ -446,7 +445,7 @@ def split_zmq_path(path: str) -> tuple[str, str, str]:
     return scheme, host, port
 
 
-def make_zmq_path(scheme: str, host: str, port: Optional[int] = None) -> str:
+def make_zmq_path(scheme: str, host: str, port: int | None = None) -> str:
     """Make a ZMQ path from its parts.
 
     Args:
@@ -464,15 +463,15 @@ def make_zmq_path(scheme: str, host: str, port: Optional[int] = None) -> str:
     return f"{scheme}://{host}:{port}"
 
 
-# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783 # noqa: E501
+# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783
 def make_zmq_socket(
-    ctx: Union[zmq.asyncio.Context, zmq.Context],  # type: ignore[name-defined]
+    ctx: zmq.asyncio.Context | zmq.Context,  # type: ignore[name-defined]
     path: str,
     socket_type: Any,
-    bind: Optional[bool] = None,
-    identity: Optional[bytes] = None,
-    linger: Optional[int] = None,
-) -> Union[zmq.Socket, zmq.asyncio.Socket]:  # type: ignore[name-defined]
+    bind: bool | None = None,
+    identity: bytes | None = None,
+    linger: int | None = None,
+) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics."""
 
     mem = psutil.virtual_memory()
@@ -547,9 +546,9 @@ def init_exit_handler(self: Any):
 def zmq_socket_ctx(
     path: str,
     socket_type: Any,
-    bind: Optional[bool] = None,
+    bind: bool | None = None,
     linger: int = 0,
-    identity: Optional[bytes] = None,
+    identity: bytes | None = None,
 ) -> Iterator[zmq.Socket]:
     """Context manager for a ZMQ socket"""
 
@@ -568,7 +567,7 @@ class CpuGpuBuffer:
 
     def __init__(
         self,
-        *size: Union[int, torch.SymInt],
+        *size: int | torch.SymInt,
         dtype: torch.dtype,
         device: torch.device,
         pin_memory: bool = True,
@@ -588,12 +587,12 @@ class CpuGpuBuffer:
                 )
             self.np = self.cpu.numpy()
 
-    def copy_to_gpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
 
-    def copy_to_cpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization
         is needed to ensure the data is copied to CPU."""
         if n is None:
@@ -744,8 +743,8 @@ def weak_ref_tensor(tensor: Any) -> Any:
 
 
 def weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]],
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
+    tensors: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor],
+) -> torch.Tensor | list[Any] | tuple[Any] | Any:
     """
     Convenience function to create weak references to tensors,
     for single tensor, list of tensors or tuple of tensors.

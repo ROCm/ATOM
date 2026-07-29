@@ -24,7 +24,6 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
-from typing import Optional, Tuple, Union
 
 import torch
 from aiter import (
@@ -246,8 +245,8 @@ _install_increment_version_pcp_shim()
 
 def _enable_non_triton_global_mxfp4_input_norm_quant(
     config: PretrainedConfig,
-    quant_config: Optional[QuantizationConfig],
-    quant_dtype: Optional[torch.dtype],
+    quant_config: QuantizationConfig | None,
+    quant_dtype: torch.dtype | None,
     is_mtp_block: bool,
 ) -> bool:
     if (
@@ -309,7 +308,7 @@ def _is_neox_rope_style(
 
 def _can_fuse_indexer_wk_weights_proj(
     config: PretrainedConfig,
-    quant_config: Optional[QuantizationConfig],
+    quant_config: QuantizationConfig | None,
     indexer_prefixes: list[str],
 ) -> bool:
     if not ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION:
@@ -402,14 +401,14 @@ def _fuse_rmsnorm_fp4_quant_fake(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
+    x2_weight: torch.Tensor | None = None,
+    x2_epsilon: float | None = None,
+    res1: torch.Tensor | None = None,
     shuffle: bool = True,
     scale_shuffle_padding: bool = True,
     output_unquantized_inp1: bool = False,
-) -> Tuple[
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -444,7 +443,7 @@ def _fuse_rmsnorm_fp4_quant_fake(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
-def _mxfp4_activation_quant_layout(num_tokens: int) -> Tuple[bool, bool]:
+def _mxfp4_activation_quant_layout(num_tokens: int) -> tuple[bool, bool]:
     if use_fp4_non_shuffle_triton_gemm():
         return False, False
     if use_triton_gemm():
@@ -457,16 +456,16 @@ def _fused_rms_fp8_quant_fake(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
+    x2_weight: torch.Tensor | None = None,
+    x2_epsilon: float | None = None,
+    res1: torch.Tensor | None = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     group_size: int = 128,
-    quant_type: Optional[int] = None,
+    quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
-) -> Tuple[
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -502,14 +501,14 @@ def _fuse_rmsnorm_fp4_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
+    x2_weight: torch.Tensor | None = None,
+    x2_epsilon: float | None = None,
+    res1: torch.Tensor | None = None,
     shuffle: bool = True,
     scale_shuffle_padding: bool = True,
     output_unquantized_inp1: bool = False,
-) -> Tuple[
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -540,16 +539,16 @@ def _fused_rms_fp8_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
+    x2_weight: torch.Tensor | None = None,
+    x2_epsilon: float | None = None,
+    res1: torch.Tensor | None = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     group_size: int = 128,
-    quant_type: Optional[int] = None,
+    quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
-) -> Tuple[
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -603,15 +602,15 @@ def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
+    x2_weight: torch.Tensor | None = None,
+    x2_epsilon: float | None = None,
+    res1: torch.Tensor | None = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     shuffle: bool = True,
     scale_shuffle_padding: bool = False,
     group_size: int = 128,
-    quant_type: Optional[int] = None,
+    quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ):
@@ -665,11 +664,11 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
     q_lora_rank: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    hidden_states_quant_scale: Optional[torch.Tensor] = None,
-    shuffle: Optional[bool] = True,
-    scale_shuffle_padding: Optional[bool] = True,
-    output_unquantized_inp1: Optional[bool] = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    hidden_states_quant_scale: torch.Tensor | None = None,
+    shuffle: bool | None = True,
+    scale_shuffle_padding: bool | None = True,
+    output_unquantized_inp1: bool | None = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
     device = hidden_states_quant.device
     q_c = torch.empty((M, q_lora_rank // 2), dtype=torch.uint8, device=device)
@@ -701,10 +700,10 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8_fake(
     q_lora_rank: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    hidden_states_quant_scale: Optional[torch.Tensor] = None,
-    output_unquantized_inp1: Optional[bool] = False,
+    hidden_states_quant_scale: torch.Tensor | None = None,
+    output_unquantized_inp1: bool | None = False,
     transpose_scale: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
     FP8_QUANT_BLOCK_SIZE = 128
     device = hidden_states_quant.device
@@ -734,11 +733,11 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
     q_lora_rank: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    hidden_states_quant_scale: Optional[torch.Tensor] = None,
-    shuffle: Optional[bool] = True,
-    scale_shuffle_padding: Optional[bool] = True,
-    output_unquantized_inp1: Optional[bool] = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    hidden_states_quant_scale: torch.Tensor | None = None,
+    shuffle: bool | None = True,
+    scale_shuffle_padding: bool | None = True,
+    output_unquantized_inp1: bool | None = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
 
     if hidden_states_quant_scale is None:
@@ -858,10 +857,10 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
     q_lora_rank: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    hidden_states_quant_scale: Optional[torch.Tensor] = None,
-    output_unquantized_inp1: Optional[bool] = False,
+    hidden_states_quant_scale: torch.Tensor | None = None,
+    output_unquantized_inp1: bool | None = False,
     transpose_scale: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
 
     # NOTE: this fused path always calls aiter's *preshuffle* blockscale GEMMs,
@@ -971,12 +970,12 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     dtype_quant=dtypes.fp8,
-    hidden_states_quant_scale: Optional[torch.Tensor] = None,
-    shuffle: Optional[bool] = False,
-    scale_shuffle_padding: Optional[bool] = False,
-    group_size: Optional[int] = 128,
-    output_unquantized_inp1: Optional[bool] = False,
-    transpose_scale: Optional[bool] = False,
+    hidden_states_quant_scale: torch.Tensor | None = None,
+    shuffle: bool | None = False,
+    scale_shuffle_padding: bool | None = False,
+    group_size: int | None = 128,
+    output_unquantized_inp1: bool | None = False,
+    transpose_scale: bool | None = False,
 ):
     if dtype_quant == dtypes.fp4x2:
         q_c, q_c_scale, kv_c_normed, k_pe = _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
@@ -1026,7 +1025,7 @@ class DeepseekV2MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
@@ -1063,10 +1062,10 @@ class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -1162,7 +1161,7 @@ class DeepseekV2MoE(nn.Module):
     def combine_outputs(
         self,
         final_hidden_states: torch.Tensor,
-        shared_output: Optional[torch.Tensor],
+        shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         if shared_output is not None:
@@ -1353,7 +1352,7 @@ def sparse_attn_indexer(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -1626,7 +1625,7 @@ def sparse_attn_indexer_fake(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -1713,8 +1712,8 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         n_head: int,
         prefix: str = "",
     ):
-        self._wk_pending_weight: Optional[torch.Tensor] = None
-        self._wk_pending_scale: Optional[torch.Tensor] = None
+        self._wk_pending_weight: torch.Tensor | None = None
+        self._wk_pending_scale: torch.Tensor | None = None
         self._wk_loaded = False
         super().__init__(
             hidden_size,
@@ -1754,7 +1753,7 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[int] = None,
+        loaded_shard_id: int | None = None,
     ):
         if param is self.weight_scale:
             if loaded_shard_id == 0:
@@ -1796,7 +1795,7 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
 def _indexer_with_output_fake(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
-    qr_scale: Optional[torch.Tensor],
+    qr_scale: torch.Tensor | None,
     positions: torch.Tensor,
     layer_name: str,
     sparse_kv_indices_buffer: torch.Tensor,
@@ -1811,7 +1810,7 @@ def _indexer_with_output_fake(
 def indexer_with_output(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
-    qr_scale: Optional[torch.Tensor],
+    qr_scale: torch.Tensor | None,
     positions: torch.Tensor,
     layer_name: str,
     sparse_kv_indices_buffer: torch.Tensor,
@@ -1880,7 +1879,7 @@ class Indexer(nn.Module):
         config: PretrainedConfig,
         hidden_size: int,
         q_lora_rank: int,
-        quant_config: Optional[QuantizationConfig],
+        quant_config: QuantizationConfig | None,
         cache_config: str,
         use_wk_weights_proj_fusion: bool = True,
         prefix: str = "",
@@ -1966,7 +1965,7 @@ class Indexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
-        qr_scale: Optional[torch.Tensor],
+        qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
     ) -> torch.Tensor:
@@ -1996,7 +1995,7 @@ class Indexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
-        qr_scale: Optional[torch.Tensor],
+        qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
     ) -> torch.Tensor:
@@ -2105,14 +2104,14 @@ class DeepseekV2MLAAttention(nn.Module):
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
         v_head_dim: int,
-        q_lora_rank: Optional[int],
+        q_lora_rank: int | None,
         kv_lora_rank: int,
         max_position_embeddings: int = 8192,
         cache_config: str = "bf16",
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_num: int = 0,
-        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
+        use_indexer_wk_weights_proj_fusion: bool | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -2520,11 +2519,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         prefix: str,
         cache_config: str = "bf16",
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         layer_num: int = 0,
         is_mtp_block: bool = False,
-        alt_stream: Optional[torch.cuda.Stream] = None,
-        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
+        alt_stream: torch.cuda.Stream | None = None,
+        use_indexer_wk_weights_proj_fusion: bool | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2697,7 +2696,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
     ) -> torch.Tensor:
         # Self Attention
         if self.fuse_input_norm_quant:
@@ -2845,7 +2844,7 @@ class DeepseekV2Model(nn.Module):
         atom_config: Config,
         prefix: str = "",
         layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
-        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
+        use_indexer_wk_weights_proj_fusion: bool | None = None,
     ):
         super().__init__()
 
@@ -2877,7 +2876,7 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream: Optional[torch.cuda.Stream] = None
+        self.alt_stream: torch.cuda.Stream | None = None
         if getattr(config, "n_shared_experts", None) is not None:
             self.alt_stream = torch.cuda.Stream()
 
@@ -2919,11 +2918,9 @@ class DeepseekV2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[
-        torch.Tensor, IntermediateTensors, Tuple[torch.Tensor, list[torch.Tensor]]
-    ]:
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -3044,9 +3041,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         # ---- Prefill Context Parallel (PCP) query split ------------------
         # During prefill with pcp_size > 1 the token sequence is round-robin
         # split so each PCP rank runs the whole model (embed / norm / q-proj /
@@ -3090,7 +3087,7 @@ class DeepseekV2ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 
