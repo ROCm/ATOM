@@ -94,18 +94,40 @@ def make_hf_config(path, max_model_len):
     return hf
 
 
+def _dspark_config():
+    """Real DSparkConfig if this tree has one (prepare_decode reads
+    config.dspark.ragged unguarded), else an all-defaults stand-in."""
+    try:
+        from atom.config import DSparkConfig
+
+        return DSparkConfig()
+    except ImportError:
+        return SimpleNamespace(
+            confidence_schedule=False,
+            ragged=False,
+            ragged_graph_sizes="",
+            q_buckets="",
+            disable_sps_calib=False,
+        )
+
+
 def set_atom_config(hf, block_size, kv_cache_dtype, max_model_len):
     from atom.config import set_current_atom_config
 
     cfg = SimpleNamespace(
         torch_dtype=torch.bfloat16,
         kv_cache_dtype=kv_cache_dtype,
+        # Real Config defaults this to kv_cache_dtype in __post_init__; the
+        # indexer reads it unguarded (deepseek_v4.py: get_current_atom_config()
+        # .index_cache_dtype), so the stub has to mirror the default.
+        index_cache_dtype=kv_cache_dtype,
         kv_cache_block_size=block_size,
         max_model_len=max_model_len,
         hf_config=hf,
         speculative_config=None,
         kv_transfer_config=None,
         enable_tbo_decode=False,
+        dspark=_dspark_config(),
         # cudagraph_mode=None keeps DeepseekV4Attention.forward on the WIDE
         # split (-> forward_impl) instead of the PIECEWISE custom-op path.
         compilation_config=SimpleNamespace(
@@ -547,7 +569,14 @@ def main():
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--seqlen", type=int, default=512)
     p.add_argument("--ctx-len", type=int, default=512)
-    p.add_argument("--block-size", type=int, default=128)
+    p.add_argument(
+        "--block-size",
+        type=int,
+        default=None,
+        help="KV page size; default = the V4 builder's own block_size, which "
+        "CommonAttentionBuilder asserts model_runner.block_size is a multiple "
+        "of. Hardcoding it breaks when that constant moves (it went 128 -> 256).",
+    )
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--kv-cache-dtype", default="bf16", choices=["bf16", "fp8"])
     p.add_argument("--atol", type=float, default=3e-2)
@@ -568,6 +597,13 @@ def main():
     _init_tp1()
     torch.set_default_device("cuda")
     torch.manual_seed(0)
+
+    if args_cli.block_size is None:
+        from atom.model_ops.attentions.deepseek_v4_attn import (
+            DeepseekV4AttentionMetadataBuilder,
+        )
+
+        args_cli.block_size = DeepseekV4AttentionMetadataBuilder.block_size
 
     hf = make_hf_config(args_cli.config, args_cli.max_model_len)
     cfg = set_atom_config(
