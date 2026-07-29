@@ -285,6 +285,20 @@ class CoreManager:
                                 logger.debug(
                                     f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                 )
+                        # Batched stream dispatch: the per-seq callbacks only buffer
+                        # their chunks into a thread-local; flush the whole step's
+                        # buffer into the per-request asyncio queues now (one
+                        # call_soon_threadsafe per loop). Resolved lazily by the API
+                        # server to avoid the api_server <-> engine_core_mgr import
+                        # cycle. No-op when no streaming request is in flight.
+                        if self._flush_stream_batch_fn is not None:
+                            try:
+                                self._flush_stream_batch_fn()
+                            except Exception as e:
+                                logger.warning(
+                                    f"{self.label}: flush_stream_batch failed: {e}",
+                                    exc_info=True,
+                                )
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:
