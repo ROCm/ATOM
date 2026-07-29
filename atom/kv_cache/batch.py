@@ -25,6 +25,7 @@ class KvBatchTables:
     arena_swa_block_tables: dict[str, list[list[int]]] = field(default_factory=dict)
     csa_main_page_tables: list[list[int]] = field(default_factory=list)
     csa_idx_page_tables: list[list[int]] = field(default_factory=list)
+    logical_csa_boundary_source_ids: np.ndarray = field(default_factory=_empty_sources)
     v4_csa_boundary_source_main: np.ndarray = field(default_factory=_empty_sources)
     v4_csa_boundary_source_idx: np.ndarray = field(default_factory=_empty_sources)
 
@@ -42,6 +43,7 @@ class KvBatchTables:
             sources = np.asarray(boundary_source_ids, dtype=np.int32)
         # Main and indexer intentionally share the same source array.
         return cls(
+            logical_csa_boundary_source_ids=sources,
             v4_csa_boundary_source_main=sources,
             v4_csa_boundary_source_idx=sources,
         )

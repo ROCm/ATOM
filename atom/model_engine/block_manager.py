@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Iterable
+
 import numpy as np
 import xxhash
 
@@ -13,6 +15,8 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
+from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
 from atom.kv_cache.pools.chunk_arena import ArenaEmpty
 from atom.kv_cache.pools.pooled_free_list import PooledFreeList
 from atom.model_engine.kv_block import Block
@@ -247,6 +251,47 @@ class BlockManager:
         that does not ride the SWA pin would gate its own lifecycle here.
         """
         return self._require_csa_boundary_state
+
+    # ---------------- Scheduler-facing manager contract ---------------- #
+
+    def materialize_window(self, seq: Sequence, seq_len: int) -> None:
+        self.swa.materialize_window(seq, seq_len)
+
+    def ensure_window_for_tokens(
+        self, seq: Sequence, num_cached_tokens: int, num_new_tokens: int
+    ) -> None:
+        self.swa.ensure_for_tokens(seq, num_cached_tokens, num_new_tokens)
+
+    def finish_prefill_chunk(self, seq: Sequence) -> None:
+        self.swa.free_after_prefill_chunk(seq)
+
+    def build_batch_tables(self, seqs: Iterable[Sequence]) -> KvBatchTables:
+        seqs = list(seqs)
+        block_tables = [seq.block_table for seq in seqs if seq.block_table]
+        swa_block_tables = [seq.swa_block_table for seq in seqs if seq.block_table]
+        boundary_sources = [
+            int(getattr(seq, "csa_boundary_state_block_id", -1)) for seq in seqs
+        ]
+        return build_dsv4_batch_tables(
+            arena=self.arena,
+            block_tables=block_tables,
+            swa_block_tables=swa_block_tables,
+            v4_csa_boundary_source_ids=boundary_sources,
+        )
+
+    @property
+    def num_total_blocks(self) -> int:
+        return len(self.blocks)
+
+    @property
+    def num_free_per_req_cache_groups(self) -> int:
+        return len(self.free_per_req_cache_groups)
+
+    def kv_usage(self) -> float:
+        return len(self.used_block_ids) / len(self.blocks) if self.blocks else 0.0
+
+    def get_block(self, block_id: int) -> Block:
+        return self.blocks[block_id]
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):

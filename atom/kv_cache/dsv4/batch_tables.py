@@ -82,6 +82,7 @@ def build_dsv4_batch_tables(
         arena_swa_block_tables=physical_swa,
         csa_main_page_tables=csa_pages,
         csa_idx_page_tables=csa_pages,
+        logical_csa_boundary_source_ids=logical_sources,
         v4_csa_boundary_source_main=source_pages,
         v4_csa_boundary_source_idx=source_pages,
     )

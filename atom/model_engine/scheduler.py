@@ -28,8 +28,9 @@ import numpy as np
 from atom.config import Config
 from atom.kv_cache.batch import KvBatchTables
 from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
+from atom.kv_cache.factory import make_kv_cache_manager
+from atom.kv_cache.protocol import KvCacheManager
 from atom.kv_transfer.disaggregation import KVConnectorOutput
-from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 import struct
@@ -353,7 +354,15 @@ class ScheduledBatch:
         # build the restore plan on a hit's first suffix chunk. -1 everywhere
         # unless enable_v4_csa_prefix_state_cache is on and the seq hit.
         if v4_csa_boundary_source_ids is None:
-            v4_csa_boundary_source_ids = [-1] * len(self.req_ids)
+            if (
+                kv_batch_tables is not None
+                and kv_batch_tables.logical_csa_boundary_source_ids.size
+            ):
+                v4_csa_boundary_source_ids = (
+                    kv_batch_tables.logical_csa_boundary_source_ids.tolist()
+                )
+            else:
+                v4_csa_boundary_source_ids = [-1] * len(self.req_ids)
         if len(v4_csa_boundary_source_ids) != len(self.req_ids):
             raise ValueError(
                 "v4_csa_boundary_source_ids must have one entry per sequence"
@@ -547,7 +556,7 @@ class Scheduler:
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
         self.stop_token_ids = config.stop_token_ids
-        self.block_manager = BlockManager(config)
+        self.kv_cache_manager: KvCacheManager = make_kv_cache_manager(config)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
@@ -645,6 +654,17 @@ class Scheduler:
 
         self.prefill_delayer: Optional[PrefillDelayer] = None
 
+    @property
+    def block_manager(self) -> KvCacheManager:
+        """Temporary compatibility alias for the scheduler's KV manager."""
+        return self.kv_cache_manager
+
+    @block_manager.setter
+    def block_manager(self, manager: KvCacheManager) -> None:
+        # Some connector integrations construct Scheduler via __new__ and inject
+        # a test manager.  Keep that migration path while the alias is public.
+        self.kv_cache_manager = manager
+
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
 
@@ -694,11 +714,7 @@ class Scheduler:
         optional low watermark (GPU starving → release, feed it). Derived from
         BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
-        bm = self.block_manager
-        total = len(bm.blocks)
-        if total <= 0:
-            return 0.0
-        return len(bm.used_block_ids) / total
+        return self.block_manager.kv_usage()
 
     def _waiting_new_token_count(self) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
@@ -868,7 +884,7 @@ class Scheduler:
                 f"enable chunked prefill, or shorten the prompt."
             )
         bm = self.block_manager
-        total_blocks = len(bm.blocks)
+        total_blocks = bm.num_total_blocks
         if seq.num_blocks > total_blocks:
             return (
                 f"needs {seq.num_blocks} KV blocks for {num_tokens} input tokens "
@@ -898,7 +914,7 @@ class Scheduler:
         # We check the slot list length below; without the accounting dict we
         # infer "no slots ever existed" from `num_per_req_cache_groups == 0`,
         # exposed via the free list at init time (slot ids 0..N-1).
-        if seq.has_per_req_cache and len(bm.free_per_req_cache_groups) == 0:
+        if seq.has_per_req_cache and bm.num_free_per_req_cache_groups == 0:
             # All slots are currently in-use OR no slots were ever created.
             # The schedule loop handles "currently full" by waiting; only
             # warn for the permanent "never created" case, identified by
@@ -1123,7 +1139,7 @@ class Scheduler:
                 # the trailing-window SWA blocks now — matching the producer's
                 # post-free swa_block_table positions — so the RDMA transfer has
                 # real dst slots to write the sliding-window KV into.
-                self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
+                self.block_manager.materialize_window(seq, seq.num_prompt_tokens)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
@@ -1155,25 +1171,19 @@ class Scheduler:
             # range in-place (out-of-window blocks are freed in postprocess after
             # num_cached_tokens advances). scheduled_seqs / num_scheduled_tokens
             # are index-aligned; all seqs here are PREFILL.
-            if self.block_manager.swa_enabled:
-                for seq, chunk in zip(scheduled_seqs.values(), num_scheduled_tokens):
-                    self.block_manager.swa.ensure_for_tokens(
-                        seq, seq.num_cached_tokens, chunk
-                    )
+            for seq, chunk in zip(scheduled_seqs.values(), num_scheduled_tokens):
+                self.block_manager.ensure_window_for_tokens(
+                    seq, seq.num_cached_tokens, chunk
+                )
             # DSV4 CSA (feat/csa-swa-fusion): no separate boundary-page claim —
             # the boundary is captured into each block's SWA chunk, whose pages
             # ensure_swa_for_tokens above already materialized.
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
-            # DSV4 CSA snapshot: one-shot restore source per seq (terminal hit
-            # block id or -1). Non-negative only on a hit's first suffix chunk;
-            # postprocess clears it once the ring is seeded. -1 unless
-            # enable_v4_csa_prefix_state_cache set it in BlockManager.allocate.
-            v4_csa_boundary_source_ids = [
-                int(getattr(seq, "csa_boundary_state_block_id", -1))
-                for seq in scheduled_seqs.values()
-            ]
+            kv_batch_tables = self.block_manager.build_batch_tables(
+                scheduled_seqs.values()
+            )
             cached_per_req = [s.num_cached_tokens for s in scheduled_seqs.values()]
             logger.info(
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
@@ -1190,7 +1200,6 @@ class Scheduler:
             return (
                 ScheduledBatch(
                     seqs=scheduled_seqs,
-                    arena=self.block_manager.arena,
                     num_scheduled_tokens=num_scheduled_tokens,
                     total_tokens_num=total_tokens_num_prefill,
                     total_tokens_num_prefill=total_tokens_num_prefill,
@@ -1198,7 +1207,7 @@ class Scheduler:
                     total_seqs_num_prefill=num_seqs_prefill,
                     connector_meta_output=connector_meta_output,
                     num_cached_tokens=num_cached_tokens_list,
-                    v4_csa_boundary_source_ids=v4_csa_boundary_source_ids,
+                    kv_batch_tables=kv_batch_tables,
                 ),
                 scheduled_seqs,
             )
@@ -1287,9 +1296,9 @@ class Scheduler:
         if self.kv_connector is not None:
             connector_meta_output = self.kv_connector.build_connector_meta()
 
+        kv_batch_tables = self.block_manager.build_batch_tables(scheduled_seqs.values())
         decode_batch = ScheduledBatch(
             seqs=scheduled_seqs,
-            arena=self.block_manager.arena,
             num_scheduled_tokens=num_scheduled_tokens,
             total_tokens_num=total_tokens_num_decode,
             total_tokens_num_decode=total_tokens_num_decode,
@@ -1301,6 +1310,7 @@ class Scheduler:
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
+            kv_batch_tables=kv_batch_tables,
         )
         return (decode_batch, scheduled_seqs)
 
@@ -1548,7 +1558,7 @@ class Scheduler:
                 # the window, using the computed-so-far length
                 # (num_cached_tokens). Bounds peak SWA to ~window during prefill
                 # instead of waiting for the first decode step's may_append.
-                self.block_manager.swa.free_after_prefill_chunk(seq)
+                self.block_manager.finish_prefill_chunk(seq)
                 # Prefill is partial until the whole PROMPT's KV is computed.
                 # Compare against num_prompt_tokens, not num_tokens: once a
                 # completion token is appended (this step's sampled token, or an
@@ -1970,7 +1980,7 @@ class Scheduler:
             parent_block_hash: int | None = None
             prev_hash: int | None = None
             for i, block_id in enumerate(seq.block_table):
-                blk = bm.blocks[block_id]
+                blk = bm.get_block(block_id)
                 if blk.hash == -1:
                     continue
                 if i < num_cached_blocks:
@@ -2310,6 +2320,9 @@ class PrefillScheduler:
                 total_seqs_num=num_seqs,
                 total_seqs_num_prefill=num_seqs,
                 cu_stream_fraction=cu_fraction,
+                kv_batch_tables=self.block_manager.build_batch_tables(
+                    scheduled_seqs.values()
+                ),
             ),
             scheduled_seqs,
         )
@@ -2510,6 +2523,9 @@ class DecodeScheduler(Scheduler):
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
+                kv_batch_tables=self.block_manager.build_batch_tables(
+                    scheduled_seqs.values()
+                ),
             ),
             scheduled_seqs,
         )
