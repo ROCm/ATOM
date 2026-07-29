@@ -93,6 +93,10 @@ def q(value):
 
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
 spur_controller_addr = runner.get("spur_controller_addr")
+if slurm_submit_runner == "atomesh-cicd-crusoe-mi355":
+    default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
+else:
+    default_spur_accounting_addr = "http://134.199.196.72:6819"
 if not spur_controller_addr:
     if slurm_submit_runner == "atomesh-cicd-crusoe-mi355":
         spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
@@ -214,7 +218,7 @@ exports = {
     "SPUR_CONTROLLER_ADDR": spur_controller_addr,
     "SPUR_ACCOUNTING_ADDR": runner.get(
         "spur_accounting_addr",
-        os.environ.get("SPUR_ACCOUNTING_ADDR", "http://134.199.196.72:6819"),
+        os.environ.get("SPUR_ACCOUNTING_ADDR", default_spur_accounting_addr),
     ),
 }
 
@@ -260,7 +264,7 @@ echo "log_root=${LOG_ROOT}"
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
 fi
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
 fi
 
@@ -560,7 +564,7 @@ read_slurm_exit_code() {
     return 0
   fi
 
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
     sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
   else
     sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
