@@ -20,7 +20,7 @@ on:
     # TW weekend nightly at 21:00 Beijing time (13:00 UTC).
     - cron: '0 13 * * 6'
     - cron: '0 13 * * 0'
-    # Spur nightly at 00:10 Beijing time (16:10 UTC).
+    # Spur Agentic Trace nightly at 00:10 Beijing time (16:10 UTC).
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
@@ -224,6 +224,7 @@ jobs:
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
+          BENCHMARK_KIND_FILTER: ${{ github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'aiperf_agentic' || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
@@ -247,6 +248,7 @@ jobs:
             --suite "$SUITE" \
             ${MODEL_NAME:+--model "$MODEL_NAME"} \
             ${CASE_NAME:+--case "$CASE_NAME"} \
+            ${BENCHMARK_KIND_FILTER:+--benchmark-kind "$BENCHMARK_KIND_FILTER"} \
             ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
             ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
             ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
