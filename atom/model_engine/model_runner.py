@@ -9,7 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
