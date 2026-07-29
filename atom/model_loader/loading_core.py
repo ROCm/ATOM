@@ -130,6 +130,12 @@ def load_weights_into_model(
     staging_pool = ExpertStagingPool(_lookup_moe_module)
 
     num_threads = envs.ATOM_LOADER_NUM_THREADS
+    if envs.ATOM_USE_FASTSAFETENSORS and num_threads > 1:
+        logger.warning(
+            "Disabling parallel weight loading because fastsafetensors tensors "
+            "must be consumed before their file context closes."
+        )
+        num_threads = 1
     if num_threads > 1:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
     else:

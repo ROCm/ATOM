@@ -200,6 +200,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Use the optional fastsafetensors package for safetensors file reads. Its
+    # multi-threaded pread (nogds) saturates a RAID array that single-stream
+    # safe_open leaves at ~1/4 of its bandwidth, which dominates load time for
+    # very large (>1TB) bf16 checkpoints like Kimi-K3.
+    "ATOM_USE_FASTSAFETENSORS": lambda: (
+        os.getenv("ATOM_USE_FASTSAFETENSORS", "0") == "1"
+    ),
+    # Split safetensors shard ownership across TP ranks when using
+    # fastsafetensors. This reduces disk/GDS read amplification while keeping
+    # the existing ATOM weight-loader semantics.
+    "ATOM_FASTSAFETENSORS_DIST_LOAD": lambda: (
+        os.getenv("ATOM_FASTSAFETENSORS_DIST_LOAD", "0") == "1"
+    ),
+    "ATOM_FASTSAFETENSORS_NOGDS": lambda: (
+        os.getenv("ATOM_FASTSAFETENSORS_NOGDS", "1") == "1"
+    ),
+    # fastsafetensors target device. Keep "cpu" as the conservative default;
+    # set to "cuda" to read tensors directly onto the current rank's GPU.
+    "ATOM_FASTSAFETENSORS_DEVICE": lambda: os.getenv(
+        "ATOM_FASTSAFETENSORS_DEVICE", "cpu"
+    ),
+    "ATOM_FASTSAFETENSORS_DEBUG": lambda: (
+        os.getenv("ATOM_FASTSAFETENSORS_DEBUG", "0") == "1"
+    ),
     # Fail loading when the checkpoint does not deliver every routed expert of
     # a fused MoE parameter. On by default: the alternative is a model that
     # loads happily with some expert slots left at their init values, which
