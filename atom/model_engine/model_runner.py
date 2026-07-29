@@ -1764,14 +1764,10 @@ class ModelRunner:
             specs = b.compute_arena_group_specs(available_for_pool)
             if specs:
                 config.v4_arena_group_specs = specs
-                num_chunks = specs[0]["num_chunks"]
+                num_chunks = specs[0].num_chunks
                 # max elastic compressed = tightest compress group's
                 # num_chunks * (bytes_per_chunk // compress_page_bytes) (c4 -> 4).
-                cmp_caps = [
-                    s["num_chunks"] * (s["bytes_per_chunk"] // s["owners"]["compress"])
-                    for s in specs
-                    if "compress" in s["owners"]
-                ]
+                cmp_caps = [s.max_compressed_blocks for s in specs if s.has_compress]
                 num_kvcache_blocks = min(cmp_caps) if cmp_caps else num_chunks
                 config.num_swa_blocks = num_chunks
                 self.num_swa_blocks = num_chunks

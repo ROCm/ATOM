@@ -54,6 +54,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.unified_kv_arena import ArenaGroupSpec, group_of_ratio
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -609,21 +610,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if num_chunks <= 0:
             return []
 
-        def _grp(name: str, chunk_bytes: int, owners: dict, csa: bool = False) -> dict:
-            spec = {
-                "name": name,
-                "num_chunks": num_chunks,
-                "bytes_per_chunk": chunk_bytes,
-                "chunk_rows": _rows(chunk_bytes),
-                "owners": owners,
-            }
-            if csa:
-                # Byte offset (within a chunk) where the fused CSA state segment
-                # begins, right after the SWA nope KV region.
-                spec["csa_state_off"] = nope_chunk
-            return spec
+        def _grp(
+            name: str, chunk_bytes: int, owners: dict, csa: bool = False
+        ) -> ArenaGroupSpec:
+            # csa=True → byte offset (within a chunk) where the fused CSA state
+            # segment begins, right after the SWA nope KV region.
+            return ArenaGroupSpec(
+                name=name,
+                num_chunks=num_chunks,
+                bytes_per_chunk=chunk_bytes,
+                chunk_rows=_rows(chunk_bytes),
+                owners=owners,
+                csa_state_off=nope_chunk if csa else None,
+            )
 
-        specs: list[dict] = []
+        specs: list[ArenaGroupSpec] = []
         if self.csa_layers:
             # swa owner is chunk-atomic (page == whole chunk): a c4 SWA block owns
             # its fused [nope | CSA | pad] chunk. compress borrows 16KB pages.
@@ -845,8 +846,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             }
 
         def _arena_rows_for(ratio: int) -> int:
-            name = "c4" if ratio == 4 else ("c128" if ratio == 128 else "dense")
-            return arena_group_rows.get(name, 0)
+            return arena_group_rows.get(group_of_ratio(ratio), 0)
 
         # Per-layer unified_kv: SWA prefix + (CSA/HCA) compress tail (fixed), or
         # one flat per-group arena pool (elastic).
@@ -1040,10 +1040,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         arena_on = getattr(self, "_arena_on", False)
         _rows_by_group: dict[str, int] = {}
         if arena_on:
-            specs = self.model_runner.config.v4_arena_group_specs
-            arena_num_chunks = int(specs[0]["num_chunks"])
+            specs = [
+                ArenaGroupSpec.coerce(s)
+                for s in self.model_runner.config.v4_arena_group_specs
+            ]
+            arena_num_chunks = int(specs[0].num_chunks)
             swa_pages = 0
-            _rows_by_group = {s["name"]: int(s["chunk_rows"]) for s in specs}
+            _rows_by_group = {s.name: int(s.chunk_rows) for s in specs}
             # Persist for the per-group SWA index builds / swa_write (decode +
             # prefill): a group's SWA block spans chunk_rows physical rows
             # (c4=224 fused, c128/dense=128). Off the arena there is no map and
@@ -1058,8 +1061,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # the arena the chunk IS one 128-row block, so stride == block_size.
             if not arena_on:
                 return self.block_size
-            r = self.compress_ratios[layer_id]
-            g = "c4" if r == 4 else ("c128" if r == 128 else "dense")
+            g = group_of_ratio(self.compress_ratios[layer_id])
             return _rows_by_group.get(g, self.block_size)
 
         if isinstance(module, _V4Attention):

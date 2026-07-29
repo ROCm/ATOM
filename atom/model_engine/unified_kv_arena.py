@@ -40,6 +40,8 @@ Self-guarding: ``enabled`` is False when disabled (feature off / non-V4).
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from atom.model_engine.chunk_arena import ArenaEmpty, ChunkArena, ChunkBackedFreeList
 
 # Owner names. SWA is in every group; compress in c4/c128. The DSV4 CSA boundary
@@ -47,6 +49,84 @@ from atom.model_engine.chunk_arena import ArenaEmpty, ChunkArena, ChunkBackedFre
 # (feat/csa-swa-fusion) and rides the SWA block's alloc/free/pin.
 OWNER_SWA = "swa"
 OWNER_COMPRESS = "compress"
+
+# Group names, and the single ratio→group authority. Every other module that
+# needs "which group does a compress ratio live in" MUST call group_of_ratio()
+# instead of re-implementing the mapping (was duplicated in deepseek_v4_attn /
+# deepseek_v4). c4 = CSA (ratio 4), c128 = HCA (ratio 128), dense = ratio 0.
+GROUP_C4 = "c4"
+GROUP_C128 = "c128"
+GROUP_DENSE = "dense"
+
+
+def group_of_ratio(ratio: int) -> str:
+    """Map a layer's compress ratio to its arena group name (single authority)."""
+    if ratio == 4:
+        return GROUP_C4
+    if ratio == 128:
+        return GROUP_C128
+    return GROUP_DENSE
+
+
+@dataclass(frozen=True)
+class ArenaGroupSpec:
+    """Typed physical-layout spec for one arena group (single schema).
+
+    Produced by ``deepseek_v4_attn.compute_arena_group_specs`` (runner side),
+    pickled to the scheduler via ``block_info``, and consumed by ``UnifiedKvArena``
+    / ``BlockManager``. Replaces the former stringly-typed ``dict`` that was
+    hand-indexed in four modules.
+
+    * ``owners`` maps owner name → per-page byte size (``swa`` in every group;
+      ``compress`` only in c4/c128). ``bytes_per_chunk`` must be a common multiple
+      of every owner's page bytes.
+    * ``chunk_rows`` = ``bytes_per_chunk // nope_row`` — physical row stride of a
+      SWA block in ``unified_kv`` (c4 is fatter because CSA state is fused in).
+    * ``csa_state_off`` = byte offset within a c4 chunk where the fused CSA
+      boundary-state segment begins (``None`` when no CSA cache / non-c4).
+    """
+
+    name: str
+    num_chunks: int
+    bytes_per_chunk: int
+    chunk_rows: int
+    owners: dict[str, int] = field(default_factory=dict)
+    csa_state_off: int | None = None
+
+    @property
+    def compress_page_bytes(self) -> int | None:
+        """This group's compress page size, or None if it has no compress owner."""
+        return self.owners.get(OWNER_COMPRESS)
+
+    @property
+    def has_compress(self) -> bool:
+        return OWNER_COMPRESS in self.owners
+
+    @property
+    def max_compressed_blocks(self) -> int:
+        """Elastic compressed capacity of this group = pages that tile its chunks."""
+        pb = self.compress_page_bytes
+        return self.num_chunks * (self.bytes_per_chunk // pb) if pb else 0
+
+    @classmethod
+    def coerce(cls, spec: "ArenaGroupSpec | dict") -> "ArenaGroupSpec":
+        """Accept an ArenaGroupSpec (returned as-is) or a legacy/dict spec.
+
+        Kept so tests and any older serialized config can still pass plain dicts;
+        every internal consumer works on the typed object after coercion.
+        """
+        if isinstance(spec, cls):
+            return spec
+        return cls(
+            name=spec["name"],
+            num_chunks=int(spec["num_chunks"]),
+            bytes_per_chunk=int(spec["bytes_per_chunk"]),
+            chunk_rows=int(
+                spec.get("chunk_rows", spec["bytes_per_chunk"])  # legacy fallback
+            ),
+            owners={k: int(v) for k, v in spec["owners"].items()},
+            csa_state_off=spec.get("csa_state_off"),
+        )
 
 
 class ArenaGroup:
@@ -83,10 +163,8 @@ class UnifiedKvArena:
         block_size: int,
         group_specs: list[dict],
     ):
-        """``group_specs``: one dict per group::
-
-            {"name": str, "num_chunks": int, "bytes_per_chunk": int,
-             "owners": {owner_name: page_bytes, ...}}
+        """``group_specs``: one :class:`ArenaGroupSpec` per group (plain dicts are
+        also accepted and coerced, for tests / legacy serialized config).
 
         ``bytes_per_chunk`` must be a common multiple of every owner's
         ``page_bytes`` in the group (ChunkBackedFreeList asserts divisibility).
@@ -95,13 +173,12 @@ class UnifiedKvArena:
         self.block_size = int(block_size)
         self.enabled = bool(group_specs) and self.block_size > 0
         self.groups: dict[str, ArenaGroup] = {}
-        for spec in group_specs:
-            name = spec["name"]
-            num_chunks = int(spec["num_chunks"])
-            bytes_per_chunk = int(spec["bytes_per_chunk"])
-            owners = {k: int(v) for k, v in spec["owners"].items()}
-            arena = ChunkArena(num_chunks=num_chunks, bytes_per_chunk=bytes_per_chunk)
-            self.groups[name] = ArenaGroup(name, arena, owners)
+        for raw in group_specs:
+            spec = ArenaGroupSpec.coerce(raw)
+            arena = ChunkArena(
+                num_chunks=spec.num_chunks, bytes_per_chunk=spec.bytes_per_chunk
+            )
+            self.groups[spec.name] = ArenaGroup(spec.name, arena, spec.owners)
 
     # --------------------------- generic owner ops ------------------------- #
     def _alloc_owners(self, owners: list[str], lid: int) -> None:
@@ -217,13 +294,9 @@ class UnifiedKvArena:
         return list(self.groups.keys())
 
     def compress_group_of_ratio(self, ratio: int) -> str:
-        """Map a layer's compress ratio to its group name (4->c4, 128->c128,
-        else dense)."""
-        if ratio == 4:
-            return "c4"
-        if ratio == 128:
-            return "c128"
-        return "dense"
+        """Map a layer's compress ratio to its group name. Delegates to the
+        module-level :func:`group_of_ratio` authority."""
+        return group_of_ratio(ratio)
 
     def _physical_table(
         self, group: str, owner: str, logical_table: list[int]
