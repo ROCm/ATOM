@@ -26,6 +26,8 @@ from typing import Optional
 import numpy as np
 
 from atom.config import Config
+from atom.kv_cache.batch import KvBatchTables
+from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
@@ -288,6 +290,7 @@ class ScheduledBatch:
         num_cached_tokens: list[int] | None = None,
         arena=None,
         v4_csa_boundary_source_ids: list[int] | None = None,
+        kv_batch_tables: KvBatchTables | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -397,61 +400,23 @@ class ScheduledBatch:
         self.swa_block_tables = [
             seq.swa_block_table for seq in seqs.values() if seq.block_table
         ]
-        # Unified-KV arena: per-group PHYSICAL block/swa tables, translated here
-        # (scheduler process owns the arena) for shipping to the worker. Empty
-        # dicts when the arena is off — worker falls back to the logical tables.
-        self.arena_block_tables: dict[str, list[list[int]]] = {}
-        self.arena_swa_block_tables: dict[str, list[list[int]]] = {}
-        if arena is not None and getattr(arena, "enabled", False):
-            for g in arena.group_names():
-                self.arena_block_tables[g] = [
-                    arena.physical_compress_table(g, bt) for bt in self.block_tables
-                ]
-                self.arena_swa_block_tables[g] = [
-                    arena.physical_swa_table(g, st) for st in self.swa_block_tables
-                ]
-        # DSV4 CSA fused into the SWA block (feat/csa-swa-fusion): the boundary
-        # snapshot lives in the c4 SWA chunk's fp32 tail segment, indexed by the
-        # block's c4 PHYSICAL swa page (swa owner is chunk-atomic, so 1 chunk ==
-        # 1 SWA block). So the capture-destination page table IS the c4 physical
-        # SWA block table, and the restore source IS the terminal cached block's
-        # c4 physical swa page. main and idx index the SAME chunk (the boundary
-        # views encode the byte-offset difference), so they share one table.
-        # v4_csa_boundary_source_ids holds the terminal cached block's LOGICAL c4
-        # swa id (BlockManager sets it on a hit; -1 otherwise). Requires the arena
-        # (fused CSA has no separate pool); empty/passthrough when off.
-        self.csa_main_page_tables: list[list[int]] = []
-        self.csa_idx_page_tables: list[list[int]] = []
-        self.v4_csa_boundary_source_main = self.v4_csa_boundary_source_ids
-        self.v4_csa_boundary_source_idx = self.v4_csa_boundary_source_ids
-        if (
-            arena is not None
-            and getattr(arena, "enabled", False)
-            and "c4" in self.arena_swa_block_tables
-        ):
-
-            def _phys_src(s):
-                s = int(s)
-                return (
-                    arena.swa_page("c4", s) if s >= 0 and arena.is_swa_backed(s) else -1
-                )
-
-            # Capture-destination table: the c4 physical SWA page per block, but
-            # UNBACKED blocks (window-freed / cached-prefix placeholders, logical
-            # -1) MUST map to -1, NOT physical_swa_table's 0 fallback — the capture
-            # kernel skips phys < 0, whereas a 0 would write CSA state over chunk
-            # 0's LIVE compressed KV (fused: the boundary shares unified_kv, unlike
-            # the old dedicated boundary pool where page 0 was a harmless slot).
-            # main and idx index the same chunk (views encode the byte offset).
-            csa_cap = [[_phys_src(b) for b in st] for st in self.swa_block_tables]
-            self.csa_main_page_tables = csa_cap
-            self.csa_idx_page_tables = csa_cap
-
-            src = np.asarray(
-                [_phys_src(s) for s in self.v4_csa_boundary_source_ids], dtype=np.int32
+        # Physical translation belongs to the KV-cache control plane.  Keep
+        # field aliases temporarily because attention backends still consume the
+        # full ScheduledBatch during the staged migration.
+        if kv_batch_tables is None:
+            kv_batch_tables = build_dsv4_batch_tables(
+                arena=arena,
+                block_tables=self.block_tables,
+                swa_block_tables=self.swa_block_tables,
+                v4_csa_boundary_source_ids=self.v4_csa_boundary_source_ids,
             )
-            self.v4_csa_boundary_source_main = src
-            self.v4_csa_boundary_source_idx = src
+        self.kv_batch_tables = kv_batch_tables
+        self.arena_block_tables = kv_batch_tables.arena_block_tables
+        self.arena_swa_block_tables = kv_batch_tables.arena_swa_block_tables
+        self.csa_main_page_tables = kv_batch_tables.csa_main_page_tables
+        self.csa_idx_page_tables = kv_batch_tables.csa_idx_page_tables
+        self.v4_csa_boundary_source_main = kv_batch_tables.v4_csa_boundary_source_main
+        self.v4_csa_boundary_source_idx = kv_batch_tables.v4_csa_boundary_source_idx
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]

@@ -35,10 +35,15 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
   Total                                      = ~26.5 MB / slot
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Type, cast
+from typing import TYPE_CHECKING, Any, Dict, Optional, Type, cast
+
+if TYPE_CHECKING:
+    from atom.model_engine.scheduler import ScheduledBatch
 
 import numpy as np
 import torch
@@ -53,7 +58,6 @@ from atom.distributed.pcp_utils import (
     pcp_reindex_ragged,
     pcp_round_robin_query_indices,
 )
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.unified_kv_arena import ArenaGroupSpec, group_of_ratio
 from atom.model_ops.attentions.backends import (
     AttentionBackend,

@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from __future__ import annotations
+
 import logging
-from typing import Type
+from typing import TYPE_CHECKING, Type
+
+if TYPE_CHECKING:
+    from atom.model_engine.scheduler import ScheduledBatch
 
 import torch
 
 from atom.config import KVCacheTensor
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils import envs
 

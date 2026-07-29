@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from __future__ import annotations
+
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Type
+
+if TYPE_CHECKING:
+    from atom.model_engine.scheduler import ScheduledBatch
 
 import numpy as np
 import torch
@@ -23,7 +28,6 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_query_indices,
 )
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import (

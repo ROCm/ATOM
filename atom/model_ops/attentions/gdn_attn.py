@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
-from typing import Type
+from typing import TYPE_CHECKING, Type
+
+if TYPE_CHECKING:
+    from atom.model_engine.scheduler import ScheduledBatch
 
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, Context

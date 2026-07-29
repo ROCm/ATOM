@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from __future__ import annotations
+
 import logging
-from typing import Type
+from typing import TYPE_CHECKING, Type
+
+if TYPE_CHECKING:
+    from atom.model_engine.scheduler import ScheduledBatch
 
 import aiter
 import numpy as np
@@ -10,7 +15,6 @@ import torch
 import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     block_table_convert_triton,
