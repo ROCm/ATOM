@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import torch
 
+from atom.utils.custom_register import direct_register_custom_op
+
 try:
     import triton
     import triton.language as tl
@@ -421,7 +423,6 @@ def _apply_attn_res_impl(
     return y, (pref if do_add else prefix_sum)
 
 
-@torch.library.custom_op("atom::apply_attn_res", mutates_args=(), device_types="cuda")
 def _apply_attn_res_op(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -434,7 +435,6 @@ def _apply_attn_res_op(
     return mixed_output
 
 
-@_apply_attn_res_op.register_fake
 def _apply_attn_res_op_fake(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -444,9 +444,14 @@ def _apply_attn_res_op_fake(
     return torch.empty_like(prefix_sum)
 
 
-@torch.library.custom_op(
-    "atom::apply_attn_res_add", mutates_args=(), device_types="cuda"
+direct_register_custom_op(
+    op_name="kimi_k3_apply_attn_res",
+    op_func=_apply_attn_res_op,
+    mutates_args=[],
+    fake_impl=_apply_attn_res_op_fake,
 )
+
+
 def _apply_attn_res_add_op(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -459,7 +464,6 @@ def _apply_attn_res_add_op(
     )
 
 
-@_apply_attn_res_add_op.register_fake
 def _apply_attn_res_add_op_fake(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -468,6 +472,14 @@ def _apply_attn_res_add_op_fake(
     add_hidden: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_apply_attn_res_add",
+    op_func=_apply_attn_res_add_op,
+    mutates_args=[],
+    fake_impl=_apply_attn_res_add_op_fake,
+)
 
 
 def apply_attn_res(
@@ -480,9 +492,11 @@ def apply_attn_res(
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T."""
     if add_hidden is None:
         return (
-            _apply_attn_res_op(prefix_sum, block_residual, score_weight, eps),
+            torch.ops.aiter.kimi_k3_apply_attn_res(
+                prefix_sum, block_residual, score_weight, eps
+            ),
             prefix_sum,
         )
-    return _apply_attn_res_add_op(
+    return torch.ops.aiter.kimi_k3_apply_attn_res_add(
         prefix_sum, block_residual, score_weight, eps, add_hidden
     )
