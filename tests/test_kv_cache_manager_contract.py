@@ -2,6 +2,9 @@
 
 from conftest import MockConfig
 
+from atom.kv_cache.dense_manager import DenseKvCacheManager
+from atom.kv_cache.dsv4.compressed_pool import Dsv4CompressedPool
+from atom.kv_cache.dsv4.manager import Dsv4KvCacheManager
 from atom.kv_cache.factory import make_kv_cache_manager
 from atom.kv_cache.protocol import KvCacheManager
 from atom.model_engine.sequence import Sequence
@@ -9,6 +12,7 @@ from atom.model_engine.sequence import Sequence
 
 def test_factory_result_satisfies_runtime_protocol():
     manager = make_kv_cache_manager(MockConfig())
+    assert isinstance(manager, DenseKvCacheManager)
     assert isinstance(manager, KvCacheManager)
     assert manager.num_total_blocks == 10
     assert manager.kv_usage() == 0.0
@@ -40,3 +44,31 @@ def test_manager_metrics_and_block_access():
 def test_per_request_slot_count_is_exposed_without_free_list_reachthrough():
     manager = make_kv_cache_manager(MockConfig(num_per_req_cache_groups=3))
     assert manager.num_free_per_req_cache_groups == 3
+
+
+def test_factory_dispatches_dsv4_layout_to_dsv4_manager():
+    manager = make_kv_cache_manager(
+        MockConfig(
+            kv_manager_kind="dsv4",
+            num_swa_blocks=4,
+            swa_window_size=4,
+        )
+    )
+    assert isinstance(manager, Dsv4KvCacheManager)
+    assert isinstance(manager._free_list, Dsv4CompressedPool)
+    assert manager.swa_enabled
+    assert manager.ids_conserved()
+
+
+def test_dense_manager_ignores_stale_dsv4_geometry():
+    manager = make_kv_cache_manager(
+        MockConfig(
+            kv_manager_kind="dense",
+            num_swa_blocks=4,
+            swa_window_size=4,
+            v4_arena_group_specs=[{"unexpected": "stale"}],
+        )
+    )
+    assert isinstance(manager, DenseKvCacheManager)
+    assert not manager.swa_enabled
+    assert manager.arena is None

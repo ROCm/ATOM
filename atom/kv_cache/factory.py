@@ -9,12 +9,24 @@ if TYPE_CHECKING:
 
 
 def make_kv_cache_manager(config: Any) -> "KvCacheManager":
-    """Construct the current manager implementation.
+    """Construct the manager selected by the builder-provided pool layout."""
+    manager_kind = getattr(config, "kv_manager_kind", None)
+    if manager_kind is None:
+        # Compatibility for manually-built configs that predate the layout
+        # provider. Production Config declares this field explicitly.
+        manager_kind = (
+            "dsv4"
+            if getattr(config, "num_swa_blocks", 0)
+            or getattr(config, "v4_arena_group_specs", None)
+            else "dense"
+        )
 
-    Dense/DSV4 dispatch is added once the implementations are split; keeping the
-    import local already removes Scheduler's dependency on the compatibility
-    ``model_engine.block_manager`` module.
-    """
-    from atom.model_engine.block_manager import BlockManager
+    if manager_kind == "dense":
+        from atom.kv_cache.dense_manager import DenseKvCacheManager
 
-    return BlockManager(config)
+        return DenseKvCacheManager(config)
+    if manager_kind == "dsv4" or str(manager_kind).startswith("dsv4_"):
+        from atom.kv_cache.dsv4.manager import Dsv4KvCacheManager
+
+        return Dsv4KvCacheManager(config)
+    raise ValueError(f"unknown KV cache manager kind: {manager_kind!r}")

@@ -52,6 +52,12 @@ def _make_all_cleared() -> AllBlocksCleared:
 
 
 class BlockManager:
+    @staticmethod
+    def _make_primary_free_list(
+        capacity: int, *, initially_backed: bool
+    ) -> PooledFreeList:
+        return PooledFreeList(capacity, initially_backed=initially_backed)
+
     def __init__(self, config: Config):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
@@ -89,7 +95,9 @@ class BlockManager:
         # assigned until first _allocate_block). Arena OFF: block_id IS its fixed
         # physical slot (always "backed"), so the unbacked pool stays empty and
         # free_block_ids holds every id — byte-identical to the pre-arena path.
-        self._free_list = PooledFreeList(n_logical, initially_backed=not self._arena_on)
+        self._free_list = self._make_primary_free_list(
+            n_logical, initially_backed=not self._arena_on
+        )
         # Migration aliases for existing diagnostics/tests. Allocation mechanics
         # are owned by PooledFreeList; these names no longer implement queues.
         self.free_block_ids = self._free_list.backed_ids
