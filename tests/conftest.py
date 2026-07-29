@@ -2,14 +2,14 @@
 # Shared fixtures and module stubs for ATOM unit tests.
 # Must be imported before any atom.* module to avoid triggering heavy imports.
 
-import importlib
-import importlib.util
-import importlib.machinery
-import sys
-import os
-import types
 import enum
 import hashlib
+import importlib
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import types
 from itertools import count
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -42,7 +42,6 @@ _atom_config.__package__ = "atom.config"
 class _StubConfig:
     """Placeholder so `from atom.config import Config` doesn't fail."""
 
-    pass
 
 
 class _StubKVCacheTensor:
@@ -56,7 +55,6 @@ class _StubKVCacheTensor:
 class _StubParallelConfig:
     """Placeholder for ParallelConfig."""
 
-    pass
 
 
 class _StubEPLBConfig:
@@ -130,6 +128,27 @@ if importlib.util.find_spec("zmq") is None:
     for _mod_name in ("zmq", "zmq.asyncio"):
         sys.modules[_mod_name] = MagicMock()
 
+# ── 4a. Stub aiter if not installed (GPU build required) ─────────────────
+
+if importlib.util.find_spec("aiter") is None:
+    for _mod_name in ("aiter", "aiter.ops", "aiter.dist"):
+        sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
+
+    _ps_stub = types.ModuleType("aiter.dist.parallel_state")
+    for _fn in (
+        "get_pp_group",
+        "get_tp_group",
+        "init_distributed_environment",
+        "ensure_model_parallel_initialized",
+        "_split_tensor_dict",
+    ):
+        setattr(_ps_stub, _fn, MagicMock())
+    sys.modules.setdefault("aiter.dist.parallel_state", _ps_stub)
+
+    _comm_stub = types.ModuleType("aiter.ops.communication")
+    _comm_stub.set_custom_all_reduce = lambda *a, **k: None
+    sys.modules.setdefault("aiter.ops.communication", _comm_stub)
+
 # ── 4b. Stub atom.utils.custom_register to avoid torch.library side effects
 
 _cr = types.ModuleType("atom.utils.custom_register")
@@ -161,10 +180,10 @@ if importlib.util.find_spec("xxhash") is None:
 
 # ── 6. Now safe to import atom submodules ──────────────────────────────────
 
-from atom.sampling_params import SamplingParams  # noqa: E402
-from atom.model_engine.sequence import Sequence  # noqa: E402
-from atom.model_engine.block_manager import BlockManager  # noqa: E402
-from atom.model_engine.scheduler import Scheduler  # noqa: E402
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.sequence import Sequence
+from atom.sampling_params import SamplingParams
 
 # ── 7. MockConfig ──────────────────────────────────────────────────────────
 

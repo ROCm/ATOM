@@ -55,7 +55,7 @@ class PPStageTransport:
         self.pp_size = pp_size
         self.is_head = pp_rank == 0
         self.is_last = pp_rank == pp_size - 1
-        self._ctx = ctx or zmq.Context.instance()
+        self._ctx = ctx or zmq.Context()
         self._owns_ctx = ctx is None
 
         self._meta_send: list[zmq.Socket] = []
