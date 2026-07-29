@@ -17,6 +17,7 @@ from typing import Any, Optional
 import safetensors
 import safetensors.torch
 import torch
+import torch.utils._python_dispatch
 from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig
@@ -117,6 +118,32 @@ class WeightsMapper:
             for name, value in values.items()
             if (out_name := self._map_name(name)) is not None
         }
+
+
+class _CopyCounter(torch.utils._python_dispatch.TorchDispatchMode):
+    """Count the number of elements written by ``aten.copy_`` while active.
+
+    Used by the online-quant streaming loader to detect when a layer's weights
+    have fully arrived (regardless of how many partial shard/packed writes it
+    took), mirroring vLLM's layerwise ``CopyCounter``.
+
+    The dispatch mode stack is thread-local, so concurrent counters do not see
+    each other's copies -- this class is safe under multi-threaded loading. What
+    is *not* thread-safe is the per-module bookkeeping it feeds (see the TODO on
+    forced single-threading in ``load_model``).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.copied_numel = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        if func is torch.ops.aten.copy_.default:
+            assert args[0].numel() == args[1].numel()
+            self.copied_numel += args[0].numel()
+        return func(*args, **kwargs)
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -602,16 +629,205 @@ def load_model(
                 if staging_map.get(pid) is entry:
                     del staging_map[pid]
 
+    # Online-quant streaming: quantize each eligible Linear right after its
+    # weights load, freeing the source BF16 (see LinearBase._stream_online).
+    # Disabled under dummy loading (no real weights arrive to trigger it).
+    streaming = (
+        envs.ATOM_ONLINE_QUANT_STREAMING
+        and not load_dummy
+        and any(getattr(m, "_stream_online", False) for _, m in model.named_modules())
+    )
+    param_to_stream_module: dict = {}  # id(param) -> owning streaming module
+    streamed_done_module_ids: set = set()  # id(module) already streamed-quantized
+    stream_candidates: list = []  # (name, module) eligible for streaming
+    excessive_loads: list = []  # loads arriving after their module was quantized
+    # Host bytes parked in the _stream_buffer_lists right now, plus the high-water
+    # mark. Buffering is the one cost the old direct-write path did not have: a
+    # checkpoint whose tensors are not grouped by layer keeps several layers'
+    # sources alive at once. vLLM warns about the same thing (reload/layerwise.py
+    # L208-216); the sources here are CPU tensors, so this is host RAM.
+    buf_stats = {"bytes": 0, "mods": 0, "peak_bytes": 0, "peak_mods": 0}
+    if streaming:
+        for mod_name, m in model.named_modules():
+            if not getattr(m, "_stream_online", False):
+                continue
+            stream_candidates.append((mod_name, m))
+            # Elements (not bytes) copied into this module's params so far,
+            # compared against _stream_expected_numel below to decide "complete".
+            m._stream_loaded_numel = 0
+            # Loader calls seen so far, held as (fn, args) until the module is
+            # complete. Buffering keeps the params on meta while the module is
+            # only half loaded, so nothing but the sources is resident.
+            m._stream_buffer_list = []
+            m._stream_buffer_bytes = 0
+            # params_dict keys for this module, needed to drop the pre-quant
+            # Parameter objects once it is done (see _stream_run).
+            m._stream_param_names = [
+                (f"{mod_name}.{p_name}" if mod_name else p_name, p_name)
+                for p_name, p in m.named_parameters(recurse=False)
+                if p is not None
+            ]
+            # Expected copied elements = numel of every loadable param in the
+            # module (weight, plus bias if present). Computed from the meta
+            # shapes; a layer that never reaches this (e.g. padded scales) falls
+            # back to the post-loop pass.
+            m._stream_expected_numel = sum(
+                p.numel()
+                for _, p in m.named_parameters(recurse=False)
+                if p is not None
+            )
+            for _, p in m.named_parameters(recurse=False):
+                if p is not None:
+                    param_to_stream_module[id(p)] = m
+
     num_threads = envs.ATOM_LOADER_NUM_THREADS
+    # TODO(streaming): this blanket downgrade is heavier than it needs to be.
+    # The only hard blocker is the TP all-gather inside online_quantize_weight /
+    # FusedMoE._online_quant, and whether a layer needs that gather is fully
+    # decidable at construction time (tp_size, tp_dim, online target format,
+    # input/output size). Plan: make "needs gather" disqualify a layer from
+    # streaming (it falls back to the post-load pass, which is already the
+    # safety net), leaving the streaming path collective-free and therefore
+    # parallelizable. That then only requires a per-module lock guarding the
+    # _stream_buffer_list append, the _stream_loaded_numel accumulation and the trigger
+    # test -- _CopyCounter itself is thread-local and already safe.
+    # Impact is small for the per_1x32 targets (mxfp4/mxfp8 almost never gather)
+    # and limited to row-parallel layers for per_Token (ptpc_fp8).
+    if streaming and num_threads > 1:
+        logger.info(
+            "Online-quant streaming enabled: forcing single-threaded weight "
+            "loading for deterministic cross-rank collective ordering."
+        )
+        num_threads = 1
     if num_threads > 1:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
     else:
         executor = None
     futures = []
 
+    def _materialize_meta(param, device):
+        """Give a meta streaming param real, zero-initialized storage in place.
+
+        Zeroing (not bare ``torch.empty``) matches the classic create-time state:
+        methods that pad weights zero the padding region there, and the loader
+        only copies the checkpoint's logical rows -- so any padded/unwritten
+        elements must be zero here too, regardless of source format. Done via a
+        uint8 byte view so it also works for FP4/FP8 dtypes that ``zero_()``
+        doesn't support directly.
+
+        The swap (rather than ``param.data = buf``) is required, not stylistic:
+        assigning real storage onto a meta Parameter raises "variable and tensor
+        have incompatible tensor type", because meta carries a different
+        dispatch key. ``swap_tensors`` exchanges the underlying TensorImpl while
+        keeping the same Python object, so every reference the loader captured
+        (``params_dict``, ``param_to_stream_module``'s ``id(param)`` keys, the owning
+        module's registry) stays valid. It also swaps ``__dict__``, which would
+        take the stamped ``weight_loader``/``weight_loader_process`` attributes
+        with it, so those are carried back over afterwards.
+        """
+        buf = torch.empty(tuple(param.shape), dtype=param.dtype, device=device)
+        buf.view(torch.uint8).zero_()
+        attrs = param.__dict__.copy()
+        torch.utils.swap_tensors(
+            param, nn.Parameter(buf, requires_grad=param.requires_grad)
+        )
+        param.__dict__.update(attrs)
+
+    def _stream_replay(module):
+        """Give the module real storage and apply its buffered loader calls.
+
+        Every remaining meta param is materialized, not just the buffered
+        targets: post-processing reads the module as a whole, so a param the
+        checkpoint never provided still needs (zeroed) storage.
+        """
+        for _, p in module.named_parameters(recurse=False):
+            if p is not None and p.data.is_meta:
+                _materialize_meta(p, module._load_device)
+        if module._stream_buffer_list:
+            buf_stats["bytes"] -= module._stream_buffer_bytes
+            buf_stats["mods"] -= 1
+            module._stream_buffer_bytes = 0
+        for fn, args in module._stream_buffer_list:
+            fn(*args)
+        module._stream_buffer_list.clear()
+
+    def _stream_run(fn, args):
+        param = args[0] if args else None
+        module = param_to_stream_module.get(id(param)) if param is not None else None
+        if module is None:
+            fn(*args)
+            return
+        if id(module) in streamed_done_module_ids:
+            # The module already reached _stream_expected_numel and was quantized, so
+            # its params hold quantized data now. Landing here means the
+            # checkpoint carries more elements for this module than its params
+            # can hold, and applying the write would put full-precision bytes
+            # over quantized storage. Drop it -- which is what used to happen
+            # implicitly, since the write went to a Parameter the module had
+            # already replaced. vLLM guards the same case via `can_load()`.
+            excessive_loads.append(getattr(module, "prefix", type(module).__name__))
+            return
+        # While the param is still on meta the loader's copy_ lands in a silent
+        # sink -- nothing is written, no device memory is allocated. Run it
+        # anyway: that is the only way to learn how many elements it *would*
+        # write, because loaders narrow/shard the source, so the incoming
+        # tensor's size is not the answer. The call is buffered and replayed
+        # against real storage once the module is complete, which keeps a
+        # half-loaded module from pinning its full-precision storage.
+        #
+        # A param that already has storage (the fused-expert path materializes
+        # outside _submit) is written for real here instead, and must not be
+        # buffered: replaying an in-place post-load transform would apply it a
+        # second time.
+        deferred = param.data.is_meta
+        with _CopyCounter() as counter:
+            fn(*args)
+        if deferred:
+            if not module._stream_buffer_list:
+                buf_stats["mods"] += 1
+            nbytes = sum(a.nbytes for a in args[1:] if isinstance(a, torch.Tensor))
+            module._stream_buffer_bytes += nbytes
+            buf_stats["bytes"] += nbytes
+            buf_stats["peak_bytes"] = max(buf_stats["peak_bytes"], buf_stats["bytes"])
+            buf_stats["peak_mods"] = max(buf_stats["peak_mods"], buf_stats["mods"])
+            module._stream_buffer_list.append((fn, args))
+        # A loader call fills exactly one destination param, so it can never
+        # legitimately write more than that param's size. Some loaders copy into
+        # the destination more than once -- e.g. an in-place post-load transform
+        # (`param.copy_(fn(param))`) layered on top of the initial copy -- which
+        # would double-count, push _stream_loaded_numel past
+        # _stream_expected_numel early, and quantize the module while later
+        # params are still in flight (silently dropping them). Cap each call at
+        # the destination size.
+        module._stream_loaded_numel += min(counter.copied_numel, param.numel())
+        if module._stream_loaded_numel >= module._stream_expected_numel:
+            # Everything accounted for -> materialize, apply the buffered loads
+            # for real, then quantize and free the source BF16.
+            _stream_replay(module)
+            module.process_weights_after_loading()
+            streamed_done_module_ids.add(id(module))
+            # Quantization swaps in fresh Parameter objects, but params_dict
+            # still points at the originals, and while it does their
+            # full-precision storage cannot be released. `del params_dict` only
+            # runs after the whole load, so without something here the BF16
+            # sources pile up alongside the quantized weights and streaming
+            # peaks *higher* than the classic post-load path.
+            #
+            # Release the storage but keep the Parameter object: param_to_stream_module
+            # is keyed on id(param), so dropping the object would let CPython
+            # recycle that id for an unrelated tensor and produce false hits.
+            # Emptying `.data` frees the bytes while every existing reference,
+            # and every id, stays valid.
+            for full_name, p_name in module._stream_param_names:
+                stale = params_dict.get(full_name)
+                if stale is not None and stale is not getattr(module, p_name, None):
+                    stale.data = torch.empty(0, dtype=stale.dtype, device=stale.device)
+
     def _submit(fn, *args):
         if executor is not None:
             futures.append(executor.submit(fn, *args))
+        elif streaming:
+            _stream_run(fn, args)
         else:
             fn(*args)
 
@@ -757,6 +973,21 @@ def load_model(
                             name_mapped = name.replace(weight_name, param_name)
                             if name_mapped not in params_dict:
                                 continue
+
+                            # Fused-expert loading writes straight into the param,
+                            # bypassing _submit/_stream_run. Materialize a streaming
+                            # meta buffer first so the copy has real storage; this
+                            # module then falls back to the post-loop online-quant
+                            # pass (its copies are not stream-counted).
+                            if streaming:
+                                _fused_param = params_dict[name_mapped]
+                                _fused_mod = param_to_stream_module.get(
+                                    id(_fused_param)
+                                )
+                                if _fused_mod is not None and _fused_param.data.is_meta:
+                                    _materialize_meta(
+                                        _fused_param, _fused_mod._load_device
+                                    )
 
                             # Generic call - model provides implementation details
                             num_experts = getattr(
@@ -968,6 +1199,83 @@ def load_model(
     if load_dummy and load_dummy != "empty":
         initialize_dummy_weights(model, load_dummy)
 
+    # Report streaming coverage. Falling back is always correct (the post-load
+    # pass below quantizes the module normally), but it forfeits the memory
+    # saving that is the whole point of streaming, so a module that silently
+    # never triggers must be visible. Known fallback causes: fused-expert
+    # loading writes past _submit so its copies are never counted, and padded
+    # weights can't reach _stream_expected_numel.
+    if streaming:
+        # A streaming module allocates *every* param on meta, and only the ones
+        # the loader actually touched got materialized. Anything the checkpoint
+        # never provided is still meta; left alone it would surface as a
+        # confusing failure deep inside quantization or at first forward. Give
+        # it real zeroed storage here so the unloaded-parameter warning above
+        # stays the primary, readable signal for that bug.
+        stranded = []
+        for mod_name, m in stream_candidates:
+            # A module that never reached its trigger still holds its buffered
+            # loads; dropping them would silently lose those weights, so replay
+            # here. Genuinely missing params are the ones no loader ever
+            # targeted -- that distinction has to be drawn *before*
+            # _stream_replay, which zero-fills every remaining meta param.
+            targeted = {id(a[0]) for _, a in m._stream_buffer_list}
+            for p_name, p in m.named_parameters(recurse=False):
+                if p.data.is_meta and id(p) not in targeted:
+                    stranded.append(f"{mod_name}.{p_name}")
+            _stream_replay(m)
+
+        fell_back = [
+            n for n, m in stream_candidates if id(m) not in streamed_done_module_ids
+        ]
+        try:
+            _is_rank0 = get_tp_group().rank == 0
+        except Exception:
+            _is_rank0 = True
+        if _is_rank0:
+            if stranded:
+                logger.warning(
+                    "Online-quant streaming: %d parameter(s) were never loaded "
+                    "and stayed on the meta device; they have been zero-filled "
+                    "so post-processing can run, but the model is almost "
+                    "certainly wrong. First %d: %s",
+                    len(stranded),
+                    min(len(stranded), 20),
+                    stranded[:20],
+                )
+            if excessive_loads:
+                _exc = sorted(set(excessive_loads))
+                logger.warning(
+                    "Online-quant streaming: dropped %d load(s) that arrived "
+                    "after their module was already quantized, across %d "
+                    "module(s). The checkpoint supplies more elements for these "
+                    "than _stream_expected_numel accounts for, so the surplus cannot "
+                    "be stored; verify the expected-size computation. First "
+                    "%d: %s",
+                    len(excessive_loads),
+                    len(_exc),
+                    min(len(_exc), 20),
+                    _exc[:20],
+                )
+            logger.info(
+                "Online-quant streaming: buffered loads peaked at %.2f GB of "
+                "host memory, across at most %d simultaneously-incomplete "
+                "module(s).",
+                buf_stats["peak_bytes"] / (1 << 30),
+                buf_stats["peak_mods"],
+            )
+            log = logger.warning if fell_back else logger.info
+            log(
+                "Online-quant streaming: %d/%d eligible modules quantized during "
+                "load, %d fell back to the post-load pass (no memory saving for "
+                "those). First %d fallbacks: %s",
+                len(stream_candidates) - len(fell_back),
+                len(stream_candidates),
+                len(fell_back),
+                min(len(fell_back), 20),
+                fell_back[:20],
+            )
+
     has_online_quant = any(
         getattr(m, "online_quant", False)
         or (
@@ -981,7 +1289,13 @@ def load_model(
     pp_start = time.perf_counter()
 
     for module_name, module in model.named_modules():
-        if hasattr(module, "process_weights_after_loading"):
+        # Streaming already ran this module's own process_weights_after_loading
+        # during the load loop; re-running it would double-shuffle/normalize.
+        # Only that single call is skipped -- the quant_method hooks below are a
+        # separate mechanism and must still run.
+        if hasattr(module, "process_weights_after_loading") and (
+            id(module) not in streamed_done_module_ids
+        ):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
 
@@ -1024,5 +1338,23 @@ def load_model(
             pp_elapsed,
             raw_online_quant_config or {},
         )
+
+    # Peak allocated across load *and* post-processing. It has to span both, or
+    # the two modes aren't comparable: streaming quantizes inside the load loop
+    # while the classic path does it in the post-load pass above. Logged here
+    # rather than read off the KV-cache budget line, whose ``peak_torch`` comes
+    # after ``warmup_model`` resets the high-water mark and so says nothing
+    # about loading -- which is precisely what streaming exists to lower.
+    if torch.cuda.is_available():
+        try:
+            _peak_rank0 = get_tp_group().rank == 0
+        except Exception:
+            _peak_rank0 = True
+        if _peak_rank0:
+            logger.info(
+                "Weight loading peak GPU memory: %.2f GB (streaming=%s)",
+                torch.cuda.max_memory_allocated() / (1 << 30),
+                streaming,
+            )
 
     return loaded_weights_record

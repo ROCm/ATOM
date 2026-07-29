@@ -58,7 +58,11 @@ from atom.model_ops.utils import (
     shuffle_weights,
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
-from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
+from atom.quant_spec import (
+    LayerQuantConfig,
+    should_skip_online_quant,
+    should_stream_online_quant,
+)
 from atom.quantization.quark.utils import (
     dequant_weight_online,
     quant_weight_online,
@@ -628,6 +632,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # When this expert module streams its online quantization, allocate the
+        # source w13/w2 buffers on the meta device (0 real memory at build time);
+        # the loader materializes them on first touch and _online_quant frees
+        # them right after quantizing. Only the initial (unquantized-source)
+        # allocation is meta -- the target buffers built later in _online_quant
+        # go through the Fp8/Mxfp4 method, which allocates real tensors.
+        weight_device = "meta" if getattr(layer, "_stream_online", False) else None
+
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
             torch.empty(
@@ -635,6 +647,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
@@ -647,6 +660,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -911,26 +925,49 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_pad = (
             self.intermediate_size - layer.intermediate_size_per_partition
         )
+        # Streaming source buffers are transient: the loader fills them from the
+        # (logical, unpadded) MXFP4 checkpoint, _online_quant reads them once,
+        # then they're freed. They never feed a kernel, so they skip the
+        # kernel-alignment padding the real (target) buffers get, and are
+        # meta-allocated (0 real memory at build time). Using the logical size
+        # keeps the loader's copy-count == expected numel so streaming actually
+        # triggers -- otherwise the padded shapes would never fill and the layer
+        # would silently fall back to the two-pass path. _online_quant clears
+        # _stream_online before re-creating the target buffers, so those stay
+        # real and padded. This readies the MXFP4-source streaming path for a
+        # future online target (e.g. nvfp4).
+        stream_src = getattr(layer, "_stream_online", False)
+        weight_device = "meta" if stream_src else None
+        int_dim = (
+            intermediate_size_per_partition
+            if stream_src
+            else intermediate_size_per_partition_after_pad
+        )
+        hid_dim = layer.hidden_size if stream_src else hidden_size
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition_after_pad,  # TP included
-                hidden_size // 2,
+                2 * int_dim,  # TP included
+                hid_dim // 2,
                 dtype=weight_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
-        # Zero-fill padding region: FP4 dtype doesn't support torch.zeros,
-        # so we zero the underlying bytes to avoid garbage in padded rows.
-        w13_weight.data.view(torch.uint8).zero_()
+        # Zero-fill padding region: FP4 dtype doesn't support torch.zeros, so we
+        # zero the underlying bytes to avoid garbage in padded rows. Skipped for
+        # streaming sources: they are meta (can't be zeroed here; the loader
+        # zeroes on materialization) and unpadded (nothing to zero).
+        if not stream_src:
+            w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w13_weight_scale = atom_parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                hidden_size // mxfp4_block,
+                2 * int_dim,
+                hid_dim // mxfp4_block,
                 dtype=scale_dtype,
             )
         )
@@ -941,7 +978,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_bias = atom_parameter(
                 torch.zeros(
                     num_experts,
-                    2 * intermediate_size_per_partition_after_pad,
+                    2 * int_dim,
                     dtype=torch.bfloat16,
                 )
             )
@@ -954,20 +991,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_weight = atom_parameter(
             torch.empty(
                 num_experts,
-                hidden_size,
-                intermediate_size_per_partition_after_pad // 2,  # TP included
+                hid_dim,
+                int_dim // 2,  # TP included
                 dtype=weight_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
-        w2_weight.data.view(torch.uint8).zero_()
+        if not stream_src:
+            w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w2_weight_scale = atom_parameter(
             torch.zeros(
                 num_experts,
-                hidden_size,
-                intermediate_size_per_partition_after_pad // mxfp4_block,
+                hid_dim,
+                int_dim // mxfp4_block,
                 dtype=scale_dtype,
             )
         )
@@ -978,7 +1017,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_bias = atom_parameter(
                 torch.zeros(
                     num_experts,
-                    hidden_size,
+                    hid_dim,
                     dtype=torch.bfloat16,
                 )
             )
@@ -1940,6 +1979,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         self.num_experts = num_experts
         intermediate_size_for_weight = intermediate_size_per_partition
+        # Streaming source buffers are transient: the loader fills them from the
+        # checkpoint, _online_quant reads them once, then they're freed. They
+        # never feed a kernel, so they don't need the kernel-alignment padding
+        # the real (target) buffers get. Allocating them at the logical
+        # (checkpoint) size keeps the loader's copy-count == expected numel so
+        # streaming actually triggers -- otherwise a padded per_1x32 source
+        # (e.g. MXFP8 with TP-misaligned intermediate) would never reach the
+        # padded numel and silently fall back to the two-pass path.
+        stream_src = getattr(layer, "_stream_online", False)
 
         if self.block_quant:
             if self.quant_type == QuantType.per_1x128:
@@ -1966,10 +2014,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"{intermediate_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
-            if self.quant_type == QuantType.per_1x32:
+            if self.quant_type == QuantType.per_1x32 and not stream_src:
                 # aiter's GU-interleaved MXFP8 scale shuffle packs 8 scale
                 # columns, i.e. 256 weight columns for 1x32 scales. TP8 on
                 # MiniMax-M3 has local intermediate=384, so pad to 512.
+                # Skipped for streaming source buffers (see stream_src above):
+                # they only hold the checkpoint payload and are freed after
+                # _online_quant, so they stay at the logical size.
                 scale_pack_k = block_k * 8
                 intermediate_size_for_weight = (
                     (intermediate_size_per_partition + scale_pack_k - 1)
@@ -1978,16 +2029,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
         # WEIGHTS
+        # When this module streams its online re-quant (e.g. ptpc_fp8 -> mxfp4,
+        # MXFP8 -> mxfp4), allocate the source w13/w2 buffers on the meta device
+        # (0 real memory at build time); the loader materializes them on first
+        # touch and _online_quant frees them right after re-quantizing. Only the
+        # initial (source) creation is meta -- _online_quant clears the flag
+        # before re-invoking create_weights for the FP8 target so those stay
+        # real (and get the kernel-alignment padding skipped above).
+        weight_device = "meta" if stream_src else None
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_for_weight,
                 hidden_size,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
-        if self.quant_type == QuantType.per_1x32:
+        # Zero padding bytes for the real (non-streaming) padded per_1x32 buffer;
+        # streaming source buffers are unpadded (stream_src) so nothing to zero.
+        if self.quant_type == QuantType.per_1x32 and not stream_src:
             w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -1997,10 +2059,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_for_weight,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
-        if self.quant_type == QuantType.per_1x32:
+        if self.quant_type == QuantType.per_1x32 and not stream_src:
             w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -2658,6 +2721,22 @@ class FusedMoE(torch.nn.Module):
             "params_dtype": self.params_dtype,
             "weight_loader": self.weight_loader,
         }
+        # Stream online quantization: quantize this expert module right after its
+        # weights finish loading (freeing the source BF16), same decision/flow as
+        # LinearBase. Must be set BEFORE create_weights so the unquantized method
+        # allocates the source w13/w2 buffers on the meta device; the loader
+        # materializes them on first touch (see model_loader/loader.py). The
+        # target buffers allocated later inside _online_quant stay real.
+        self._stream_online = should_stream_online_quant(
+            quant_config,
+            prefix,
+            layer_quant_config.quant_type if layer_quant_config else QuantType.No,
+            self.params_dtype,
+            # FusedMoE._online_quant only dequantizes No/per_Token/per_1x128/
+            # per_1x32 sources -- per_Tensor is Linear-only.
+            allow_per_tensor_source=False,
+        )
+        self._load_device = torch.empty(0).device if self._stream_online else None
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
         compilation_config = atom_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -2772,6 +2851,10 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"
             )
         self.moe_quant_params["params_dtype"] = online_quant_dtype
+        # The source buffers were meta-allocated for streaming; the target
+        # buffers we build now must be real, so clear the flag before the second
+        # create_weights (Fp8MoEMethod reads it to decide meta allocation).
+        self._stream_online = False
         with torch.device(device):
             self.quant_method.create_weights(layer=self, **self.moe_quant_params)
 
