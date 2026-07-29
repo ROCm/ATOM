@@ -149,7 +149,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._lookup_server = LookupClientFactory.create_lookup_server(
                 self._engine, meta
             )
-        except Exception as e:  # lookup server optional for save-only smoke
+        except Exception as e:  # noqa: BLE001  # optional third-party service
             logger.warning("LMCache offload: lookup server not started: %s", e)
 
         logger.info(
@@ -200,8 +200,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
             return
         try:
             self._engine.lookup_unpin([str(req_id)])  # LMCache pin keyed by str id
-        except Exception:
-            pass
+        except Exception:  # best-effort third-party cleanup
+            logger.debug(
+                "LMCache offload: lookup unpin failed for %s",
+                req_id,
+                exc_info=True,
+            )
 
     def _profile_enabled(self) -> bool:
         return os.environ.get("OFFLOAD_PROFILE", "0").lower() not in (
@@ -217,7 +221,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
             return {}
         try:
             return dict(gpu_connector.last_transfer_stats())
-        except Exception:
+        except Exception:  # optional instrumentation hook
+            logger.debug("Failed to read GPU transfer stats", exc_info=True)
             return {}
 
     def _reset_gpu_connector_transfer_stats(self) -> None:
@@ -226,8 +231,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
             return
         try:
             gpu_connector.reset_transfer_stats()
-        except Exception:
-            pass
+        except Exception:  # optional instrumentation hook
+            logger.debug("Failed to reset GPU transfer stats", exc_info=True)
 
     # -- copy daemon thread ----------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
@@ -458,7 +463,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             world = int(getattr(config, "tensor_parallel_size", 1) or 1)
             meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
             self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # optional third-party client
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e
             )
@@ -485,7 +490,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                             tdb.process_tokens(token_ids, make_key=False)
                         )[:3]
                     ]
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # debug-only introspection
                 _lh = f"err:{e}"
             logger.debug(
                 "[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
@@ -507,8 +512,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             if self._lookup_client is not None:
                 try:
                     self._lookup_client.clear_lookup_status(sid)
-                except Exception:
-                    pass
+                except Exception:  # best-effort cleanup
+                    logger.debug(
+                        "LMCache offload: clear lookup status failed for %s",
+                        sid,
+                        exc_info=True,
+                    )
             return 0, False
         self._lookup_in_step.append(sid)
         self._load_specs[sid] = LoadSpec(
@@ -579,8 +588,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if self._lookup_client is not None:
             try:
                 self._lookup_client.clear_lookup_status(sid)
-            except Exception:
-                pass
+            except Exception:  # best-effort cleanup
+                logger.debug(
+                    "LMCache offload: clear lookup status failed for %s",
+                    sid,
+                    exc_info=True,
+                )
 
     def _decide_load_after_alloc(
         self, seq, ls: LoadSpec

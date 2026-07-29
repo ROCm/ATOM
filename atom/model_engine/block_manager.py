@@ -6,6 +6,7 @@ from collections import deque
 
 import numpy as np
 import xxhash
+
 from atom.config import Config
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
@@ -60,7 +61,7 @@ class BlockManager:
         # memory reservation; the actual per-rank routing is done in the workers.
         self.dcp_rank = 0
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
+        self.hash_to_block_id: dict[int, int] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.free_block_ids_set: set[int] = set(range(num_blocks))
         self.used_block_ids: set[int] = set()
@@ -474,9 +475,7 @@ class BlockManager:
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         if len(self.free_block_ids_set) < new_blocks_needed:
             return False
-        if not self.swa.has_free(new_blocks_needed):  # True when SWA disabled
-            return False
-        return True
+        return self.swa.has_free(new_blocks_needed)  # True when SWA disabled
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         # Note: in disaggregated (P/D) mode the scheduler skips this call on
