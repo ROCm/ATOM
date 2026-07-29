@@ -757,11 +757,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
-            # Persist the exact physical load range on the sequence. The
-            # scheduler uses it after all TP workers report success to publish
-            # the restored blocks into BlockManager's GPU prefix index.
+            # Persist the physical load start on the sequence. The scheduler
+            # combines it with offload_loaded_tokens after all TP workers
+            # succeed to publish the restored GPU prefix.
             seq.offload_load_start_tokens = hbm
-            seq.offload_load_end_tokens = lmc
             seq.offload_loaded_tokens = max(hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for

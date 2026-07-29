@@ -1294,7 +1294,6 @@ class Scheduler:
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
-        seq.offload_load_end_tokens = None
         seq.offload_load_failed = True
         return True
 
@@ -1328,7 +1327,6 @@ class Scheduler:
             seq.offload_promoted_tokens = promoted
             seq.num_cached_tokens = loaded
         seq.offload_load_start_tokens = None
-        seq.offload_load_end_tokens = None
         seq.offload_loaded = True
 
     def _is_offload_prefill_resume(self, seq: Sequence) -> bool:
