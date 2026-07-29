@@ -1,7 +1,7 @@
 # DSV4 KV Cache 重组执行计划
 
-> **状态**: v3 已实施（2026-07-29，CPU 门禁见 §0）  
-> **基线分支**: `feat/csa-swa-fusion`  
+> **状态**: v3 已实施（2026-07-29，CPU 门禁见 §0）
+> **基线分支**: `feat/csa-swa-fusion`
 > **目标**: 将 DSV4 KV cache 从 `BlockManager`、`ScheduledBatch` 和巨型 attention 文件中解耦，同时保持现有 dense、SWA、CSA snapshot、unified arena 与 offload 行为不变。
 
 ---
@@ -124,7 +124,7 @@ model_engine/{swa_pool,unified_kv_arena,chunk_arena}.py
 
 ## 3. 分阶段执行计划
 
-> **执行方式**: 每阶段作为独立 review 单元；只有上一阶段的确定性测试与回归门禁通过后才进入下一阶段。  
+> **执行方式**: 每阶段作为独立 review 单元；只有上一阶段的确定性测试与回归门禁通过后才进入下一阶段。
 > **Agent 指引**: 推荐使用 `superpowers:subagent-driven-development` 或 `superpowers:executing-plans` 逐 task 实施。
 
 ---
