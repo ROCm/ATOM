@@ -2320,9 +2320,6 @@ class PrefillScheduler:
                 total_seqs_num=num_seqs,
                 total_seqs_num_prefill=num_seqs,
                 cu_stream_fraction=cu_fraction,
-                kv_batch_tables=self.block_manager.build_batch_tables(
-                    scheduled_seqs.values()
-                ),
             ),
             scheduled_seqs,
         )
