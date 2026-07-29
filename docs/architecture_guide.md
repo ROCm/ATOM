@@ -11,7 +11,9 @@
 | `DPEngineCoreProc` | `from atom.model_engine.engine_core import DPEngineCoreProc` | Data-parallel engine core variant |
 | `ModelRunner` | `from atom.model_engine.model_runner import ModelRunner` | Per-GPU model execution |
 | `Scheduler` | `from atom.model_engine.scheduler import Scheduler` | Prefill-first request scheduling |
-| `BlockManager` | `from atom.model_engine.block_manager import BlockManager` | KV cache block allocation |
+| `KvCacheManager` | `from atom.kv_cache.protocol import KvCacheManager` | Scheduler-facing KV control-plane contract |
+| `DenseKvCacheManager` | `from atom.kv_cache.dense_manager import DenseKvCacheManager` | Dense paged-cache implementation |
+| `Dsv4KvCacheManager` | `from atom.kv_cache.dsv4.manager import Dsv4KvCacheManager` | DSV4 compressed/SWA/arena implementation |
 | `Sequence` | `from atom.model_engine.sequence import Sequence` | Request state and token tracking |
 | `ForwardContext` | `from atom.utils.forward_context import ForwardContext` | Global forward pass metadata |
 | `Config` | `from atom.config import Config` | Master configuration dataclass |
@@ -40,7 +42,7 @@ LLMEngine (user-facing API)
 │       │   ├── Sampler / RejectionSampler
 │       │   └── EagleProposer (optional MTP draft)
 │       └── Scheduler
-│           └── BlockManager (KV cache block management)
+│           └── KvCacheManager (factory-selected dense or DSV4 control plane)
 └── Config (master configuration)
 ```
 
@@ -71,14 +73,14 @@ A request flows through the system in ten steps:
 
 5. **`EngineCore.busy_loop()`** — the main execution loop pulls from `input_queue` via `pull_and_process_input_queue()`, feeds new sequences into the scheduler, and repeatedly calls `_process_engine_step()` until all work is done.
 
-6. **`Scheduler.schedule()`** — implements prefill-first scheduling. Waiting sequences are scheduled for prefill if they fit within `max_num_seqs` and `max_num_batched_tokens` and the `BlockManager` can allocate blocks. If no prefills are pending, running sequences are batched for decode. The scheduler returns a `ScheduledBatch` and the corresponding sequence map.
+6. **`Scheduler.schedule()`** — implements prefill-first scheduling. Waiting sequences are scheduled for prefill if they fit within `max_num_seqs` and `max_num_batched_tokens` and the `KvCacheManager` can allocate blocks. The manager also builds backend physical tables without exposing SWA or arena internals. If no prefills are pending, running sequences are batched for decode.
 
 7. **`ModelRunner.forward()`** — executes the three-phase forward pass:
    - `prepare_model()` — assembles input IDs (handling deferred output from previous steps), builds attention metadata, and gathers sampling temperatures.
    - `run_model()` — runs the model forward. Prefill and large batches run eagerly; decode batches replay captured CUDA graphs. Returns logits and hidden states.
    - `postprocess()` — samples tokens (or runs rejection sampling for speculative decoding), prepares deferred output via `tokenIDProcessor`, and optionally proposes draft tokens through `EagleProposer`.
 
-8. **`Scheduler.postprocess()`** — appends sampled tokens to each `Sequence`, records `first_token_time`, checks stop conditions (EOS, stop token IDs, stop token sequences, `max_tokens`), and moves finished sequences out of the running queue. The `BlockManager` deallocates blocks for finished sequences.
+8. **`Scheduler.postprocess()`** — appends sampled tokens to each `Sequence`, records `first_token_time`, checks stop conditions (EOS, stop token IDs, stop token sequences, `max_tokens`), and moves finished sequences out of the running queue. The selected KV manager deallocates blocks for finished sequences.
 
 9. **Output via ZMQ** — finished sequences are placed on the `output_queue`. A dedicated output thread serializes them and sends them over a ZMQ `PUSH` socket back to the `CoreManager`, which receives them on a `PULL` socket and places them in `outputs_queue`.
 
@@ -146,7 +148,7 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
            │  │  └────────────────────────────┘  │  │
            │  └──────────────────────────────────┘  │
            │                                       │
-           │  Scheduler + BlockManager             │
+           │  Scheduler + KvCacheManager           │
            └──────────────────────────────────────┘
 ```
 
@@ -261,7 +263,8 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |
-| `atom/model_engine/block_manager.py` | `BlockManager` KV cache block allocation with optional prefix caching |
+| `atom/kv_cache/` | KV layout provider, manager protocol/factory, dense and DSV4 control planes, physical batch tables, reusable pools |
+| `atom/model_engine/block_manager.py` | Backward-compatible manager entry point |
 | `atom/model_engine/request.py` | `RequestOutput` dataclass for streaming callbacks |
 | `atom/model_engine/async_proc.py` | `AsyncIOProcManager` and `AsyncIOProc` for spawning and managing ModelRunner subprocesses |
 | `atom/utils/forward_context.py` | `ForwardContext`, `Context`, `DPMetadata`, `SpecDecodeMetadata`, `AttentionMetaData` dataclasses and global accessors |

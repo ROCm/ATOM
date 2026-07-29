@@ -1,5 +1,7 @@
 """Scheduler-facing KV manager contract tests."""
 
+import pytest
+
 from conftest import MockConfig
 
 from atom.kv_cache.dense_manager import DenseKvCacheManager
@@ -27,7 +29,7 @@ def test_dense_window_hooks_and_tables_are_safe_noops():
     manager.finish_prefill_chunk(seq)
     tables = manager.build_batch_tables([seq])
     assert tables.is_empty
-    assert tables.logical_csa_boundary_source_ids.tolist() == [-1]
+    assert tables.v4_csa_boundary_source_main.tolist() == [-1]
 
 
 def test_manager_metrics_and_block_access():
@@ -72,3 +74,19 @@ def test_dense_manager_ignores_stale_dsv4_geometry():
     assert isinstance(manager, DenseKvCacheManager)
     assert not manager.swa_enabled
     assert manager.arena is None
+
+
+@pytest.mark.parametrize("manager_kind", ["dense", "dsv4"])
+def test_common_primary_lifecycle_on_both_managers(manager_kind):
+    config = MockConfig(
+        kv_manager_kind=manager_kind,
+        num_swa_blocks=4 if manager_kind == "dsv4" else 0,
+        swa_window_size=4 if manager_kind == "dsv4" else 0,
+    )
+    manager = make_kv_cache_manager(config)
+    seq = Sequence([1, 2, 3, 4], block_size=4)
+    assert manager.can_allocate(seq) == 0
+    manager.allocate(seq)
+    assert manager.kv_usage() > 0
+    manager.deallocate(seq)
+    assert manager.kv_usage() == 0

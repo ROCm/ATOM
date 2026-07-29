@@ -27,7 +27,6 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_cache.batch import KvBatchTables
-from atom.kv_cache.dsv4.batch_tables import build_dsv4_batch_tables
 from atom.kv_cache.factory import make_kv_cache_manager
 from atom.kv_cache.protocol import KvCacheManager
 from atom.kv_transfer.disaggregation import KVConnectorOutput
@@ -289,8 +288,6 @@ class ScheduledBatch:
         remote_kv_block_ids: list[int] | None = None,
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
-        arena=None,
-        v4_csa_boundary_source_ids: list[int] | None = None,
         kv_batch_tables: KvBatchTables | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
@@ -349,28 +346,6 @@ class ScheduledBatch:
             if num_cached_tokens is not None
             else [seq.num_cached_tokens for seq in seqs.values()]
         )
-        # Per-seq one-shot CSA boundary-state snapshot source (physical block id
-        # of the terminal hit block, or -1). Consumed by the DSV4 builder to
-        # build the restore plan on a hit's first suffix chunk. -1 everywhere
-        # unless enable_v4_csa_prefix_state_cache is on and the seq hit.
-        if v4_csa_boundary_source_ids is None:
-            if (
-                kv_batch_tables is not None
-                and kv_batch_tables.logical_csa_boundary_source_ids.size
-            ):
-                v4_csa_boundary_source_ids = (
-                    kv_batch_tables.logical_csa_boundary_source_ids.tolist()
-                )
-            else:
-                v4_csa_boundary_source_ids = [-1] * len(self.req_ids)
-        if len(v4_csa_boundary_source_ids) != len(self.req_ids):
-            raise ValueError(
-                "v4_csa_boundary_source_ids must have one entry per sequence"
-            )
-        self.v4_csa_boundary_source_ids = np.asarray(
-            v4_csa_boundary_source_ids, dtype=np.int32
-        )
-
         # context_lens: for prefill seqs, use num_cached_tokens + num_scheduled_tokens
         self.context_lens = np.asarray(
             [
@@ -409,23 +384,12 @@ class ScheduledBatch:
         self.swa_block_tables = [
             seq.swa_block_table for seq in seqs.values() if seq.block_table
         ]
-        # Physical translation belongs to the KV-cache control plane.  Keep
-        # field aliases temporarily because attention backends still consume the
-        # full ScheduledBatch during the staged migration.
+        # Physical translation belongs to the KV-cache control plane. Dummy and
+        # disaggregated-prefill batches have no local manager and carry an empty
+        # table object.
         if kv_batch_tables is None:
-            kv_batch_tables = build_dsv4_batch_tables(
-                arena=arena,
-                block_tables=self.block_tables,
-                swa_block_tables=self.swa_block_tables,
-                v4_csa_boundary_source_ids=self.v4_csa_boundary_source_ids,
-            )
+            kv_batch_tables = KvBatchTables.empty(num_sequences=len(self.req_ids))
         self.kv_batch_tables = kv_batch_tables
-        self.arena_block_tables = kv_batch_tables.arena_block_tables
-        self.arena_swa_block_tables = kv_batch_tables.arena_swa_block_tables
-        self.csa_main_page_tables = kv_batch_tables.csa_main_page_tables
-        self.csa_idx_page_tables = kv_batch_tables.csa_idx_page_tables
-        self.v4_csa_boundary_source_main = kv_batch_tables.v4_csa_boundary_source_main
-        self.v4_csa_boundary_source_idx = kv_batch_tables.v4_csa_boundary_source_idx
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]

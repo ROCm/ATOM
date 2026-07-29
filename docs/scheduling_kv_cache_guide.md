@@ -9,8 +9,12 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 | `Scheduler` | `atom/model_engine/scheduler.py` | Orchestrates prefill/decode scheduling, preemption, and postprocessing |
 | `ScheduledBatch` | `atom/model_engine/scheduler.py` | Immutable snapshot of a scheduled batch sent to the model runner |
 | `ScheduledBatchOutput` | `atom/model_engine/scheduler.py` | Holds sampled token IDs and draft token IDs returned from forward pass |
-| `BlockManager` | `atom/model_engine/block_manager.py` | Manages paged KV cache blocks with allocation, deallocation, and prefix caching |
-| `Block` | `atom/model_engine/block_manager.py` | Single KV cache block with ID, reference count, hash, and token IDs |
+| `KvCacheManager` | `atom/kv_cache/protocol.py` | Scheduler-facing allocation, window lifecycle, batch-table, and event contract |
+| `DenseKvCacheManager` | `atom/kv_cache/dense_manager.py` | Single primary paged pool |
+| `Dsv4KvCacheManager` | `atom/kv_cache/dsv4/manager.py` | Compressed/SWA/CSA/arena coordination |
+| `KvPoolLayout` | `atom/kv_cache/layout.py` | Builder-produced memory layout used by ModelRunner and the manager factory |
+| `KvBatchTables` | `atom/kv_cache/batch.py` | Backend physical tables shipped with a scheduled batch |
+| `Block` | `atom/model_engine/kv_block.py` | Single logical KV block with ID, reference count, hash, and token IDs |
 | `Sequence` | `atom/model_engine/sequence.py` | Tracks a single request through its lifetime (tokens, blocks, status, timing) |
 | `SequenceStatus` | `atom/model_engine/sequence.py` | Enum: `WAITING`, `RUNNING`, `FINISHED`, `EXIT_ENGINE` |
 | `SequenceType` | `atom/model_engine/sequence.py` | Enum: `DUMMY`, `PREFILL`, `DECODE` |
@@ -42,7 +46,7 @@ class Scheduler:
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
         self.stop_token_ids = config.stop_token_ids
-        self.block_manager = BlockManager(config)
+        self.kv_cache_manager = make_kv_cache_manager(config)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.prev_time = 0.0
@@ -57,7 +61,7 @@ class Scheduler:
         self.total_accepted_tokens = 0
 ```
 
-The scheduler maintains two deques — `waiting` (pending prefill) and `running` (active decode) — plus a `BlockManager` for KV cache allocation.
+The scheduler maintains two deques — `waiting` (pending prefill) and `running` (active decode) — plus a `KvCacheManager`. It imports only the protocol and factory; DSV4 window and arena objects are not exposed to scheduler code.
 
 ### Schedule flow
 
@@ -162,6 +166,8 @@ class ScheduledBatch:
 | `temperatures` | `list[float]` | Sampling temperature per sequence |
 | `context_lens` | `list[int]` | Total token count per sequence (`seq.num_tokens`) |
 | `block_tables` | `list[list[int]]` | Block ID tables for sequences that have block tables |
+| `swa_block_tables` | `list[list[int]]` | Logical window-pool IDs; out-of-window entries are `-1` |
+| `kv_batch_tables` | `KvBatchTables` | Manager-built physical arena/CSA tables; empty for dense/dummy batches |
 | `last_block_num_tokens` | `list[int]` | Number of valid tokens in each sequence's last block |
 | `num_cached_tokens` | `list[int]` | Number of tokens served from prefix cache per sequence |
 | `num_scheduled_tokens` | `list[int]` | Number of new tokens scheduled per sequence |
@@ -195,9 +201,19 @@ class ScheduledBatchOutput:
 - `draft_token_ids` maps sequence ID to a list of speculative draft token IDs for the next step (when MTP is active).
 - A special key `-1` in `token_ids` signals deferred output mode.
 
-## Block manager
+## KV cache managers
 
-The `BlockManager` implements paged KV cache management with fixed-size blocks.
+`make_kv_cache_manager(config)` selects a dense or DSV4 manager from the
+builder-produced `kv_manager_kind`. `Scheduler` calls the common
+`KvCacheManager` protocol; the historical
+`atom/model_engine/block_manager.py` path remains a compatibility entry point.
+
+The common primary lifecycle uses fixed-size logical blocks, chained content
+hashes, per-request state slots, and KV events. DSV4 adds a content-addressed
+window pool and optional byte-chunk arena behind that interface. Physical
+logical-to-arena translation is performed by `build_batch_tables()` and carried
+in `ScheduledBatch.kv_batch_tables`; the backend still receives the complete
+`ScheduledBatch`.
 
 ### Block class
 
@@ -214,10 +230,10 @@ Methods:
 - `update(hash, token_ids)` — Sets the block's hash and token content.
 - `reset()` — Sets `ref_count = 1`, `hash = -1`, `token_ids = []` (used on fresh allocation).
 
-### BlockManager initialization
+### Primary manager initialization
 
 ```python
-class BlockManager:
+class BaseKvCacheManager:
     def __init__(self, config: Config):
         block_size = config.kv_cache_block_size      # Tokens per block (default 16)
         num_blocks = config.num_kvcache_blocks        # Total blocks in pool
@@ -248,8 +264,8 @@ The block pool is pre-allocated at startup. `free_block_ids` is a deque for O(1)
 
 **Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (currently GDN: Qwen3-Next, Qwen3.5; future: DeepseekV4 ring buffer + compressor state, etc.):
 - `free_per_req_cache_groups` — list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `1 + num_speculative_tokens` contiguous tensor slot indices.
-- `per_req_cache_accounting` — maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.
-- `per_req_cache_equiv_blocks` — number of KV cache block equivalents reserved per request for its per-request cache (computed from `AttentionMetadataBuilder.compute_per_req_cache_bytes() / block_bytes`).
+- ModelRunner deducts the full pre-allocated state tensor before computing `KvPoolLayout`; request admission claims only a slot group and does not consume additional paged blocks.
+- `per_req_cache_equiv_blocks` is diagnostic block-equivalent accounting. It is not a second admission-time deduction.
 
 ### Allocation (`allocate`)
 
@@ -647,7 +663,11 @@ def num_tokens(self, value):
 | File | Description |
 |---|---|
 | `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` — scheduling algorithm, postprocessing, speculative decode stats |
-| `atom/model_engine/block_manager.py` | `Block`, `BlockManager` — paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64 |
+| `atom/kv_cache/{protocol,factory,layout,batch}.py` | Neutral manager contract, construction, memory layout, and physical batch tables |
+| `atom/kv_cache/{base_manager,dense_manager}.py` | Shared primary lifecycle and dense implementation |
+| `atom/kv_cache/dsv4/` | DSV4 manager, compressed/window pools, arena, layout, and batch-table translation |
+| `atom/kv_cache/pools/` | Reusable chunk, free-list, and window lifecycle primitives |
+| `atom/model_engine/block_manager.py` | Historical compatibility entry point |
 | `atom/model_engine/sequence.py` | `Sequence`, `SequenceStatus`, `SequenceType` — request lifecycle, token management, timing |
 | `atom/model_engine/request.py` | `RequestOutput` — streaming output dataclass with `request_id`, `output_tokens`, `finished`, `finish_reason` |
 | `atom/config.py` | `Config` — scheduling-related fields (`max_num_seqs`, `max_num_batched_tokens`, `kv_cache_block_size`, `enable_prefix_caching`, `scheduler_delay_factor`), `SpeculativeConfig` |

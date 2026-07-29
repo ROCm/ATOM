@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""BlockManager wired to the unified-KV chunk arena (ATOM_V4_UNIFIED_KV_ARENA).
+"""DSV4 manager wired to the unified-KV chunk arena.
 
 Flag on: compressed block_ids are logical, backed by per-group arena pages;
 SWA and compressed borrow chunks from a shared arena on demand (pool-driven).
@@ -9,7 +9,7 @@ SWA and compressed borrow chunks from a shared arena on demand (pool-driven).
 
 import pytest
 
-from atom.model_engine.block_manager import BlockManager
+from atom.kv_cache.dsv4.manager import Dsv4KvCacheManager
 from conftest import MockConfig
 
 BS = 4  # kv_cache_block_size
@@ -50,20 +50,20 @@ def _assert_backed(bm, seq):
 
 
 def test_arena_constructed_when_flag_on(arena_on):
-    bm = BlockManager(_cfg())
+    bm = Dsv4KvCacheManager(_cfg())
     assert bm.arena is not None and bm.arena.enabled
     # logical id space sized to arena max compressed capacity (6 chunks x 4)
     assert len(bm.blocks) == bm.arena.max_compressed_blocks() == 24
 
 
 def test_arena_absent_when_flag_off():
-    bm = BlockManager(_cfg())  # no arena_on fixture -> flag off
+    bm = Dsv4KvCacheManager(_cfg())  # no arena_on fixture -> flag off
     assert bm.arena is None
     assert len(bm.blocks) == 8  # fixed num_kvcache_blocks
 
 
 def test_allocate_backs_blocks_and_resolves_pages(arena_on, seq_factory):
-    bm = BlockManager(_cfg())
+    bm = Dsv4KvCacheManager(_cfg())
     seq = seq_factory(list(range(1, 2 * BS + 1)))  # 2 blocks
     assert bm.can_allocate(seq) >= 0
     bm.allocate(seq)
@@ -72,7 +72,7 @@ def test_allocate_backs_blocks_and_resolves_pages(arena_on, seq_factory):
 
 
 def test_dealloc_keeps_pages_lazy_then_reusable(arena_on, seq_factory):
-    bm = BlockManager(_cfg())
+    bm = Dsv4KvCacheManager(_cfg())
     seq = seq_factory(list(range(1, 3 * BS + 1)))  # 3 blocks
     bm.allocate(seq)
     ids = list(seq.block_table)
@@ -91,7 +91,7 @@ def test_compressed_borrows_from_swa_under_pressure(arena_on, seq_factory):
     # 6 chunks total. Compressed alone can hold 24 blocks, but only if it can
     # borrow every chunk. Allocate enough compressed blocks to exceed a small
     # initial share, forcing borrow from SWA (evicting cold SWA blocks).
-    bm = BlockManager(_cfg())
+    bm = Dsv4KvCacheManager(_cfg())
     # Prime SWA with some cold blocks, then release so they are ref-0 cached.
     s0 = seq_factory(list(range(1, 4 * BS + 1)))
     bm.allocate(s0)
@@ -106,33 +106,18 @@ def test_compressed_borrows_from_swa_under_pressure(arena_on, seq_factory):
 
 
 def _compressed_ids_conserved(bm):
-    """Every logical compressed id is in exactly one of used / backed-free /
-    unbacked-free (cross-pool lending must not leak ids out of circulation)."""
-    used = bm.used_block_ids
-    backed = bm.free_block_ids_set
-    unbacked = bm._unbacked_free_set
-    assert used.isdisjoint(backed) and used.isdisjoint(unbacked)
-    assert backed.isdisjoint(unbacked)
-    return len(used) + len(backed) + len(unbacked) == len(bm.blocks)
+    return bm.ids_conserved()
 
 
 def _swa_ids_conserved(bm):
-    sw = bm.swa
-    used, backed, unbacked = (
-        sw.used_block_ids,
-        sw.free_block_ids_set,
-        sw._unbacked_free_set,
-    )
-    assert used.isdisjoint(backed) and used.isdisjoint(unbacked)
-    assert backed.isdisjoint(unbacked)
-    return len(used) + len(backed) + len(unbacked) == len(sw.blocks)
+    return bm.ids_conserved()
 
 
 def test_cross_pool_borrow_does_not_leak_ids(arena_on, seq_factory):
     """#11: SWA borrowing a chunk from compressed (and vice versa) evicts a
     sibling block; the evicted logical id must move to the UNBACKED free pool,
     not vanish. Repeated borrow/dealloc/realloc cycles must conserve every id."""
-    bm = BlockManager(_cfg())
+    bm = Dsv4KvCacheManager(_cfg())
     assert _compressed_ids_conserved(bm) and _swa_ids_conserved(bm)
     for rnd in range(6):
         base = 1000 * (rnd + 1)
@@ -156,7 +141,7 @@ def test_admission_credits_backed_free_reuse(arena_on, seq_factory):
     arena pages, but reusing those cached blocks needs no new page — the compressed
     admission check must still pass. On the pre-fix code `backable` was ≈0 and this
     returned False, so the scheduler live-locked (can_allocate -1 forever)."""
-    bm = BlockManager(_cfg())
+    bm = Dsv4KvCacheManager(_cfg())
     s = seq_factory(list(range(1, 20 * BS + 1)))  # 20 blocks (arena max is 24)
     bm.allocate(s)
     bm.deallocate(s)  # 20 ref-0 BACKED cached blocks; arena pages held, ~none free
@@ -170,7 +155,7 @@ def test_cross_pool_evict_moves_id_to_unbacked_and_reusable(arena_on, seq_factor
     """The id evicted by cross-pool lending must move to the UNBACKED free pool
     (not vanish) and be re-allocatable, re-borrowing a page. Drives the evict
     primitive directly (real SWA borrow only consumes blocks during forward)."""
-    bm = BlockManager(_cfg())
+    bm = Dsv4KvCacheManager(_cfg())
     fill = seq_factory(list(range(1, 20 * BS + 1)))
     bm.allocate(fill)
     bm.deallocate(fill)  # 20 ref-0 BACKED compressed cached blocks
@@ -192,7 +177,7 @@ def test_repeated_evict_never_leaks_or_livelocks(arena_on, seq_factory):
     """Hammer the cross-pool evict primitive: every evictable backed-free id can
     be lent, all move to unbacked, none leak, and evict cleanly reports False when
     nothing is left to lend (bounded — no spin)."""
-    bm = BlockManager(_cfg())
+    bm = Dsv4KvCacheManager(_cfg())
     fill = seq_factory(list(range(1, 20 * BS + 1)))
     bm.allocate(fill)
     bm.deallocate(fill)
@@ -208,7 +193,7 @@ def test_repeated_evict_never_leaks_or_livelocks(arena_on, seq_factory):
 
 
 def test_flag_off_behaviour_unchanged(seq_factory):
-    bm = BlockManager(_cfg())  # flag off
+    bm = Dsv4KvCacheManager(_cfg())  # flag off
     seq = seq_factory(list(range(1, 2 * BS + 1)))
     bm.allocate(seq)
     assert len(seq.block_table) == 2

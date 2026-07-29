@@ -1927,12 +1927,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             boundary_b_np = (context_lens_np - extend_lens_np).astype(np.int32)
             # Restore source: the terminal cached block's c4 physical SWA page
             # (main == idx, same chunk). Scheduler set both; -1 = no restore.
+            kv_tables = batch.kv_batch_tables
             src_main_np = np.asarray(
-                getattr(
-                    batch,
-                    "v4_csa_boundary_source_main",
-                    getattr(batch, "v4_csa_boundary_source_ids", [-1] * scheduled_bs),
-                ),
+                kv_tables.v4_csa_boundary_source_main,
                 dtype=np.int32,
             )
             assert src_main_np.shape == (scheduled_bs,)
@@ -1942,7 +1939,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cp4.restore_boundary_plan_gpu = res_gpu
             cp4.num_restore_boundary = n_res
             src_idx_np = np.asarray(
-                getattr(batch, "v4_csa_boundary_source_idx", src_main_np),
+                kv_tables.v4_csa_boundary_source_idx,
                 dtype=np.int32,
             )
             res_idx_gpu, n_res_idx = make_restore_boundary_plan(
@@ -3275,14 +3272,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     def _stage_arena_group_tables(self, batch, scheduled_bs, attn_metadata):
         """Unified-KV arena: stage per-group PHYSICAL block/swa tables (from the
-        scheduler-translated ``batch.arena_*_block_tables``) into the persistent
+        scheduler-translated ``batch.kv_batch_tables``) into the persistent
         ``v4_arena_{bt,swabt}_{group}`` forward_vars buffers and expose GPU +
         numpy views on attn_metadata. Persistent (stable-address) buffers are
         required for CUDAGraph replay — the captured model forward reads the GPU
         views (compressor scatter / csa_translate_pack / indexer gather / SWA
         write). The numpy mirrors feed the eager decode index build. No-op when
         the arena is off (dicts stay None)."""
-        abt = getattr(batch, "arena_block_tables", None)
+        abt = batch.kv_batch_tables.arena_block_tables
         if not abt:
             return
         var = self.model_runner.forward_vars
@@ -3302,7 +3299,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.arena_block_tables_gpu = gpu_bt
         attn_metadata.arena_block_tables_np = np_bt
 
-        aswa = getattr(batch, "arena_swa_block_tables", {}) or {}
+        aswa = batch.kv_batch_tables.arena_swa_block_tables
         gpu_swa, np_swa = {}, {}
         for g, v in aswa.items():
             gpu_swa[g], np_swa[g] = _fill(f"v4_arena_swabt_{g}", v)
@@ -3348,8 +3345,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         tables_attr: str = "csa_page_tables",
         buffer_name: str = "csa_page_tables",
     ):
-        """DSV4 CSA: fill `forward_vars[buffer_name]` from `batch.<tables_attr>`
-        (block -> boundary page id) and return the GPU view sliced to
+        """Fill from ``batch.kv_batch_tables.<tables_attr>`` and return the GPU
+        view sliced to
         scheduled_bs. Cached/uncaptured blocks carry -1; the capture kernel skips
         page < 0, and finalized blocks (the only ones in the capture plan) always
         have a claimed page >= 0. Returns None when the buffer is unregistered.
@@ -3362,7 +3359,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
         page_np = var[buffer_name].np
         page_np[:scheduled_bs] = -1  # default: no page (skipped by the kernel)
-        tables = getattr(batch, tables_attr, None) or []
+        tables = getattr(batch.kv_batch_tables, tables_attr, None) or []
         for i in range(scheduled_bs):
             if i < len(tables):
                 pt = tables[i]
