@@ -28,6 +28,38 @@ STREAM_DONE_MESSAGE = "data: [DONE]\n\n"
 # ============================================================================
 
 
+def _fix_invalid_json_escapes(s: str) -> str:
+    """Fix invalid JSON escapes in model-generated tool-call arguments.
+
+    Models occasionally produce invalid escape sequences like ``\\k`` or
+    ``\\p`` in function.arguments JSON. ``json.loads`` rejects these. This
+    helper doubles any backslash not followed by a valid JSON escape char.
+    """
+    _VALID = frozenset('"\\bfnrtu/')
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        if s[i] == "\\":
+            if i + 1 >= len(s):
+                out.append("\\\\")
+                i += 1
+            elif s[i + 1] == "\\":
+                out.append("\\\\")
+                i += 2
+            elif s[i + 1] in _VALID:
+                out.append("\\")
+                out.append(s[i + 1])
+                i += 2
+            else:
+                out.append("\\\\")
+                out.append(s[i + 1])
+                i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
 def _normalize_tool_call_arguments(tool_calls: Any) -> Any:
     """Deserialize ``function.arguments`` from a JSON string to a mapping.
 
@@ -43,10 +75,14 @@ def _normalize_tool_call_arguments(tool_calls: Any) -> Any:
         if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
             fn = dict(tc["function"])
             if isinstance(fn.get("arguments"), str):
+                raw = fn["arguments"]
                 try:
-                    fn["arguments"] = json.loads(fn["arguments"])
+                    fn["arguments"] = json.loads(raw)
                 except (ValueError, TypeError):
-                    pass
+                    try:
+                        fn["arguments"] = json.loads(_fix_invalid_json_escapes(raw))
+                    except (ValueError, TypeError):
+                        fn["arguments"] = {"_raw": raw}
             tc = {**tc, "function": fn}
         normalized.append(tc)
     return normalized
