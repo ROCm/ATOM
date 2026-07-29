@@ -41,5 +41,7 @@ def test_hash_publish_allows_window_bounded_reuse():
 
     hit = _sequence([1, 2, 3, 4])
     assert pool.bounded_hit(hit, 1, [block_hash]) == 1
+    # Cached-prefix allocation appends into an initially empty table.
+    hit.swa_block_table.clear()
     pool.claim_cached(hit, block_hash, hit.block(0))
     assert hit.swa_block_table[0] >= 0
