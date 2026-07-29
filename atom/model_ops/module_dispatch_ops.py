@@ -97,7 +97,9 @@ direct_register_custom_op(
 # ---------------------------------------------------------------------------
 #
 # Caller contract (the Indexer module looked up by `layer_name`):
-#   - `indexer_score_topk(q_fp8, weights, topk) -> Tensor`   — real impl,
+#   - `indexer_score_topk(q_quant, weights, q_scale, topk) -> Tensor`  — real impl,
+#     (q_quant is FP8, or packed FP4 uint8 when the FP4 indexer is on; q_scale is
+#     the paired e8m0 Q scale on the FP4 path, None for FP8)
 #     must return `[total_tokens, topk] int32` indices
 #
 # `topk` is on the op signature (not derived from the module) so the fake
@@ -115,27 +117,29 @@ direct_register_custom_op(
 
 
 def indexer_score_topk(
-    q_fp8: torch.Tensor,
+    q_quant: torch.Tensor,
     weights: torch.Tensor,
+    q_scale: torch.Tensor | None,
     layer_name: str,
     topk: int,
 ) -> torch.Tensor:
     indexer = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return indexer.indexer_score_topk(q_fp8, weights, topk)
+    return indexer.indexer_score_topk(q_quant, weights, q_scale, topk)
 
 
 def _indexer_score_topk_fake(
-    q_fp8: torch.Tensor,
+    q_quant: torch.Tensor,
     weights: torch.Tensor,
+    q_scale: torch.Tensor | None,
     layer_name: str,
     topk: int,
 ) -> torch.Tensor:
     return torch.empty(
-        (q_fp8.shape[0], topk),
+        (q_quant.shape[0], topk),
         dtype=torch.int32,
-        device=q_fp8.device,
+        device=q_quant.device,
     )
 
 
@@ -147,5 +151,58 @@ direct_register_custom_op(
     # in, so functionalization stays unaware and skips defensive clones.
     mutates_args=(),
     fake_impl=_indexer_score_topk_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if not tbo_active():
+        return tensor_model_parallel_all_reduce(x)
+
+    # Default "inline": correct Plan-A baseline (no overlap, never hangs). Only
+    # move the AR onto the comm stream when explicitly opted into "overlap".
+    if envs.ATOM_TBO_TP_AR_MODE != "overlap":
+        return tensor_model_parallel_all_reduce(x)
+
+    from atom.utils.tbo.ubatching import (
+        tbo_current_ubatch_id,
+        tbo_get_comm_stream,
+        tbo_get_ubatch_tp_comm,
+        tbo_switch_to_compute_sync,
+        tbo_yield_and_switch_from_compute_to_comm,
+    )
+
+    ubatch_id = tbo_current_ubatch_id()
+
+    ub_comm = tbo_get_ubatch_tp_comm(ubatch_id)
+    if ub_comm is None:
+        # world_size == 1: nothing to reduce.
+        return x
+
+    # Hand the CPU baton to the partner ubatch and move onto the comm stream,
+    # so this AR overlaps the partner's compute.
+    tbo_yield_and_switch_from_compute_to_comm()
+    comm_stream = tbo_get_comm_stream()
+    # out-of-place all_reduce on this ubatch's dedicated communicator, launched
+    # on the comm stream (current stream after the switch above).
+    x = ub_comm.all_reduce(x, stream=comm_stream)
+
+    tbo_switch_to_compute_sync()
+    return x
+
+
+def _tbo_all_reduce_fake(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="tbo_all_reduce",
+    op_func=tbo_all_reduce,
+    mutates_args=(),
+    fake_impl=_tbo_all_reduce_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )

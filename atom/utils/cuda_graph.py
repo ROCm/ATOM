@@ -3,16 +3,16 @@
 
 import dataclasses
 import os
+from collections.abc import Callable
 from contextlib import ExitStack
-from typing import Any, Callable, Optional, NamedTuple
+from typing import Any, NamedTuple
 from unittest.mock import patch
 
 import torch
-
-from atom.utils import compilation_counter
-from atom.utils import weak_ref_tensors
 from aiter import logger
+
 from atom.config import Config, CUDAGraphMode
+from atom.utils import compilation_counter, weak_ref_tensors
 from atom.utils.forward_context import get_forward_context
 
 # from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
@@ -49,12 +49,12 @@ class BatchDescriptor(NamedTuple):
 @dataclasses.dataclass
 class CUDAGraphEntry:
     batch_descriptor: BatchDescriptor
-    cudagraph: Optional[torch.cuda.CUDAGraph] = None
-    output: Optional[Any] = None
+    cudagraph: torch.cuda.CUDAGraph | None = None
+    output: Any | None = None
 
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
-    input_addresses: Optional[list[int]] = None
+    input_addresses: list[int] | None = None
 
 
 @dataclasses.dataclass
@@ -68,7 +68,7 @@ class CUDAGraphOptions:
 # weak_ref_tensor op it lets the pool OVERLAY piece outputs across shapes, so the
 # retained pool stays small (~10GB vs ~35GB unshared on DSV4 TP8). First
 # torch.cuda.graph makes the pool; the rest reuse it.
-_shared_graph_pool: Optional[Any] = None
+_shared_graph_pool: Any | None = None
 
 # Per-num_tokens pools (ATOM_PER_BUCKET_POOL=1 fallback). Isolates each shape's
 # pool so shapes can't overlap — costs more memory but avoids any cross-shape
@@ -104,7 +104,7 @@ class CUDAGraphWrapper:
         runnable: Callable,
         vllm_config: Config,
         runtime_mode: CUDAGraphMode,
-        cudagraph_options: Optional[CUDAGraphOptions] = None,
+        cudagraph_options: CUDAGraphOptions | None = None,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
@@ -214,7 +214,18 @@ class CUDAGraphWrapper:
                     if _per_bucket
                     else _cg_mod._shared_graph_pool
                 )
-                with torch.cuda.graph(cudagraph, pool=_pool):
+                # thread_local, not the "global" default: global mode invalidates
+                # the capture when ANY thread makes an unsafe HIP call, and under
+                # DP attention the NCCL watchdog thread polls hipEventQuery on
+                # outstanding works every ~100ms. Piecewise captures one small
+                # graph per layer with eager (collective-issuing) sections in
+                # between, so that poll reliably lands inside a capture and kills
+                # the process with hipErrorStreamCaptureUnsupported. thread_local
+                # restricts the check to the capturing thread, which is the only
+                # one touching this stream.
+                with torch.cuda.graph(
+                    cudagraph, pool=_pool, capture_error_mode="thread_local"
+                ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.cudagraph_options.weak_ref_output:

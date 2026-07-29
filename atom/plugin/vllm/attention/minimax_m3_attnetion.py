@@ -292,9 +292,9 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         if self.kv_cache.ndim != 5:
             raise ValueError(
                 "MiniMax-M3 sparse KV cache must have shape "
-                "[2, num_blocks, block_size, num_kv_heads, head_dim]."
+                "[num_blocks, 2, block_size, num_kv_heads, head_dim]."
             )
-        if self.kv_cache.shape[0] != 2:
+        if self.kv_cache.shape[1] != 2:
             raise ValueError("MiniMax-M3 sparse KV cache must store K and V.")
         if self.kv_cache.shape[2] != SPARSE_BLOCK_SIZE:
             raise ValueError(
@@ -320,7 +320,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
     def _ensure_fp8_scales(self, kv_cache: torch.Tensor):
         if self.kv_cache_dtype != "fp8":
             return None, None
-        _kv, num_blocks, block_size, num_kv_heads, _head_dim = kv_cache.shape
+        num_blocks, _kv, block_size, num_kv_heads, _head_dim = kv_cache.shape
         expected_shape = (num_blocks, num_kv_heads, block_size)
         if (
             self.k_scale is None
@@ -343,10 +343,10 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
     def _page16_shuffle_cache_for_sparse_kernel(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, object, object]:
-        _kv, num_blocks, block_size, num_kv_heads, head_dim = self.kv_cache.shape
+        num_blocks, _kv, block_size, num_kv_heads, head_dim = self.kv_cache.shape
         if block_size != SPARSE_BLOCK_SIZE:
             raise ValueError("MiniMax-M3 sparse cache must use page size 128.")
-        k_cache, v_cache = self.kv_cache.unbind(0)
+        k_cache, v_cache = self.kv_cache.unbind(1)
         if self.kv_cache_dtype == "fp8":
             target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
             k_cache = k_cache.view(target_dtype)

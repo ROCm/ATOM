@@ -993,6 +993,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
+            "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
 
         # Clean up transfer ID mapping on the consumer side

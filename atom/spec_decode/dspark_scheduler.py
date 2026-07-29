@@ -8,9 +8,9 @@ position confidence scores for a batch of draft blocks and an engine throughput
 profile ``SPS(B)``, choose a per-request verification length ``ell_r`` that
 maximizes system-wide token throughput ``Theta = tau * SPS(B)``.
 
-Pure, GPU-free, CPU-testable. The proposer (``atom/spec_decode/eagle.py``) calls
-``schedule_prefix_lengths`` after computing (and STS-calibrating) confidence, and
-truncates each draft block to ``ell_r`` before verification.
+Pure, GPU-free, CPU-testable. ``DSparkProposer`` (``dspark_proposer.py``) and
+ModelRunner call ``schedule_prefix_lengths`` after computing (and STS-calibrating)
+confidence, and truncate each draft block to ``ell_r`` before verification.
 
 Phase-2 scope:
   * ``calibrate_confidence`` — Sequential Temperature Scaling (STS) apply-side.
