@@ -19,7 +19,7 @@
 
 import logging
 import pickle
-from typing import Any, List, Optional
+from typing import Any
 
 import zmq
 
@@ -45,9 +45,9 @@ class PPStageTransport:
         self,
         pp_rank: int,
         pp_size: int,
-        meta_addrs: List[str],
+        meta_addrs: list[str],
         token_addr: str,
-        ctx: Optional[zmq.Context] = None,
+        ctx: zmq.Context | None = None,
     ):
         assert pp_size >= 2, "PPStageTransport is only used when pp_size >= 2"
         assert len(meta_addrs) == pp_size
@@ -58,10 +58,10 @@ class PPStageTransport:
         self._ctx = ctx or zmq.Context.instance()
         self._owns_ctx = ctx is None
 
-        self._meta_send: List[zmq.Socket] = []
-        self._meta_recv: Optional[zmq.Socket] = None
-        self._token_recv: Optional[zmq.Socket] = None
-        self._token_send: Optional[zmq.Socket] = None
+        self._meta_send: list[zmq.Socket] = []
+        self._meta_recv: zmq.Socket | None = None
+        self._token_recv: zmq.Socket | None = None
+        self._token_send: zmq.Socket | None = None
 
         if self.is_head:
             # One PUSH per downstream stage (metadata fan-out).
@@ -87,7 +87,7 @@ class PPStageTransport:
         for sock in self._meta_send:
             sock.send(payload, copy=False)
 
-    def recv_tokens(self, timeout_ms: Optional[int] = None) -> Any:
+    def recv_tokens(self, timeout_ms: int | None = None) -> Any:
         """Head: block for the last stage's sampled ScheduledBatchOutput.
 
         Returns None on timeout.
@@ -98,7 +98,7 @@ class PPStageTransport:
         return pickle.loads(self._token_recv.recv())
 
     # ---- downstream / last side --------------------------------------------
-    def recv_metadata(self, timeout_ms: Optional[int] = None) -> Any:
+    def recv_metadata(self, timeout_ms: int | None = None) -> Any:
         """Downstream: block for the head's scheduled batch."""
         if timeout_ms is not None:
             if not self._meta_recv.poll(timeout_ms):

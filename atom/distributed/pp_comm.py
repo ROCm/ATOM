@@ -4,18 +4,17 @@
 import logging
 import pickle
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
-
 from aiter.dist.parallel_state import (
+    _split_tensor_dict,
+    ensure_model_parallel_initialized,
     get_pp_group,
     get_tp_group,
     init_distributed_environment,
-    ensure_model_parallel_initialized,
-    _split_tensor_dict,
 )
 from aiter.ops.communication import set_custom_all_reduce
+
 from atom.models.utils import IntermediateTensors
 from atom.utils import envs
 
@@ -39,8 +38,8 @@ def pp_send_allgather_group():
 class P2PWork:
     """Handle for an in-flight isend; prevents payload GC until completion."""
 
-    work: Optional[torch.distributed.Work]
-    payload: Optional[torch.Tensor]
+    work: torch.distributed.Work | None
+    payload: torch.Tensor | None
 
 
 def init_pp_aware_dist_env(

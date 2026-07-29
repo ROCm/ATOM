@@ -58,7 +58,7 @@ def test_consumer_targets_every_producer_stage_port():
     # The ports a consumer computes for stages 0..pp-1 must equal the ports each
     # producer stage binds, or a stage never receives its write_request.
     base = 6301
-    args = dict(remote_dp_rank=0, remote_tp_rank=0, remote_tp_size=1, remote_dp_size=1)
+    args = {"remote_dp_rank": 0, "remote_tp_rank": 0, "remote_tp_size": 1, "remote_dp_size": 1}
     pp_size = 4
     consumer_ports = {
         base

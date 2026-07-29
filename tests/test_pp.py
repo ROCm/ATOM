@@ -35,23 +35,22 @@ _comm_stub = types.ModuleType("aiter.ops.communication")
 _comm_stub.set_custom_all_reduce = lambda *a, **k: None
 sys.modules.setdefault("aiter.ops.communication", _comm_stub)
 
-from atom.distributed import pp_comm  # noqa: E402
-from atom.distributed.pp_transport import PPStageTransport  # noqa: E402
-from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
-from atom.model_engine.scheduler import (  # noqa: E402
+from atom.distributed import pp_comm
+from atom.distributed.pp_transport import PPStageTransport
+from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
 )
-from atom.model_engine.sequence import Sequence, SequenceType  # noqa: E402
-from atom.models.utils import (  # noqa: E402
+from atom.model_engine.sequence import Sequence, SequenceType
+from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
     get_pp_indices,
     make_layers,
 )
-
-from tests.conftest import MockConfig  # noqa: E402
+from tests.conftest import MockConfig
 
 # ---------------------------------------------------------------------------
 # Layer partition
@@ -438,14 +437,14 @@ def test_from_cli_args_roundtrip():
 
 
 def _pp_config(**overrides):
-    defaults = dict(
-        pipeline_parallel_size=4,
-        max_num_seqs=8,
-        max_num_batched_tokens=100,
-        max_model_len=131072,
-        kv_cache_block_size=16,
-        num_kvcache_blocks=4096,
-    )
+    defaults = {
+        "pipeline_parallel_size": 4,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 100,
+        "max_model_len": 131072,
+        "kv_cache_block_size": 16,
+        "num_kvcache_blocks": 4096,
+    }
     defaults.update(overrides)
     return MockConfig(**defaults)
 
