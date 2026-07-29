@@ -247,6 +247,18 @@
     "_baseline_note": "Eagle3 spec decode on Kimi-K2.5-MXFP4."
   },
   {
+    "model_name": "Kimi-K3",
+    "model_path": "moonshotai/Kimi-K3",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "moonshotai/Kimi-K3",
+    "_baseline_note": "Kimi-K3 (kimi_linear KDA+MLA, MXFP4 MoE) native ATOM FP8 kv-cache, TP8 (GSM8K 3-shot flexible-extract). Baseline 0.95; threshold 0.94 leaves ~1pp headroom. Refresh after the first CI run."
+  },
+  {
     "model_name": "GLM-5-FP8",
     "model_path": "zai-org/GLM-5-FP8",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
