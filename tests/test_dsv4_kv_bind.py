@@ -49,7 +49,8 @@ def _install_model_types(monkeypatch):
 
 
 def _fixture(*, arena: bool = False, fp8: bool = False):
-    nb, k1, head_dim, index_dim, rope_dim = 3, 2, 4, 4, 2
+    # index_dim includes room for each row's inline fp32 scale.
+    nb, k1, head_dim, index_dim, rope_dim = 3, 2, 4, 8, 2
     swa_blocks, block_size = 2, 4
     swa_rows = swa_blocks * block_size
 
@@ -157,10 +158,10 @@ def test_indexer_and_inner_compressor_views(monkeypatch):
     kv_bind.bind_kv_cache_tensor(builder, 0, indexer)
     kv_bind.bind_kv_cache_tensor(builder, 0, inner)
 
-    assert indexer.kv_cache.shape == (3, 2, 4)
+    assert indexer.kv_cache.shape == (3, 2, 8)
     assert inner.kv_cache.data_ptr() == indexer.kv_cache.data_ptr()
     assert inner.cache_scale.shape == (3, 2)
-    assert inner.cache_scale.stride() == (2, 1)
+    assert inner.cache_scale.stride() == (4, 1)
     idx_f32 = indexer.kv_cache.view(torch.float32)
     assert inner.cache_scale.storage_offset() == idx_f32.storage_offset() + 2
     assert inner.write_mode == "indexer_fp8"
