@@ -92,17 +92,15 @@ class PPStageTransport:
 
         Returns None on timeout.
         """
-        if timeout_ms is not None:
-            if not self._token_recv.poll(timeout_ms):
-                return None
+        if timeout_ms is not None and not self._token_recv.poll(timeout_ms):
+            return None
         return pickle.loads(self._token_recv.recv())
 
     # ---- downstream / last side --------------------------------------------
     def recv_metadata(self, timeout_ms: int | None = None) -> Any:
         """Downstream: block for the head's scheduled batch."""
-        if timeout_ms is not None:
-            if not self._meta_recv.poll(timeout_ms):
-                return None
+        if timeout_ms is not None and not self._meta_recv.poll(timeout_ms):
+            return None
         return pickle.loads(self._meta_recv.recv())
 
     def send_tokens(self, out: Any) -> None:
