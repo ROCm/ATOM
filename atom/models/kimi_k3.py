@@ -11,13 +11,14 @@ the same object hierarchy and skips the vision tower/projector tensors.
 from typing import ClassVar
 
 import torch
-from aiter import ActivationType, QuantType
+from aiter import ActivationType, QuantType, fused_qk_rmsnorm
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from einops import rearrange
 from torch import nn
 
@@ -131,6 +132,41 @@ def _extract_layer_idx(prefix: str) -> int:
         if part.isdigit():
             return int(part)
     return 0
+
+
+def _fused_qk_rmsnorm_fake(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_eps: float,
+    k: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return q.new_empty(q.shape), k.new_empty(k.shape)
+
+
+@torch_compile_guard(gen_fake=_fused_qk_rmsnorm_fake, mutates_args=[])
+def _fused_qk_rmsnorm(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_eps: float,
+    k: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    fused_qk_rmsnorm(
+        q_out_quantized=q_out,
+        q=q,
+        q_weight=q_weight,
+        q_epsilon=q_eps,
+        k_out=k_out,
+        k=k,
+        k_weight=k_weight,
+        k_epsilon=k_eps,
+    )
+    return q_out, k_out
 
 
 class _NoPositionalRotaryEmbedding(RotaryEmbedding):
@@ -471,14 +507,12 @@ class KimiFullAttention(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        from atom.model_ops.kimi_k3 import dual_rmsnorm
-
         q, kv, k_rope = torch.split(
             self.fused_qkv_a_proj(hidden_states),
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        q, kv = dual_rmsnorm(
+        q, kv = _fused_qk_rmsnorm(
             q,
             self.q_a_layernorm.weight,
             self.q_a_layernorm.eps,
