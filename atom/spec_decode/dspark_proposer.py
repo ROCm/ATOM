@@ -490,10 +490,6 @@ class DSparkProposer(Drafter):
         )
 
         if not is_dummy:
-            # `attn_metadata.block_tables` is only conditionally copied over on
-            # the K3 target (unified_attention / triton_mha leaves it None on
-            # prefill and spec paths), so read the canonical source that every
-            # backend itself reads from -- always allocated as a CpuGpuBuffer.
             block_tables = self.runner.forward_vars["block_tables"].gpu[:bs]
             # slot = page_id * block_size + offset_in_page, derived on-device
             # from the block table so there is no host sync.
@@ -507,12 +503,6 @@ class DSparkProposer(Drafter):
             ctx_lens = self._blk_ctx_lens[:bs]  # stable
             ctx_lens.copy_(anchor_positions + (1 + T))
 
-            # The draft's attention reads its layout from the shared forward
-            # context, so retarget it at the block for this pass. Same rebinding
-            # EagleProposer does for its own draft steps; the runner rebuilds the
-            # metadata next step, so nothing needs restoring. Each right-hand
-            # side is a slice of a persistent allocation, so the rebinding is
-            # address-stable.
             attn_metadata.slot_mapping = slots.view(-1)
             attn_metadata.block_tables = block_tables
             attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: bs + 1]
@@ -521,33 +511,6 @@ class DSparkProposer(Drafter):
             # Upper bound rather than a .max() host sync: every context_len is
             # at most the target pass's longest sequence plus the block.
             attn_metadata.max_seqlen_k = int(attn_metadata.max_seqlen_k) + T
-
-            # MLA decode does NOT address KV through block_tables/context_lens.
-            # It walks the flat kv_indptr / kv_indices / kv_last_page_lens triple
-            # (see attention_mla.py's decode section). Leaving those holding the
-            # TARGET's values while cu_seqlens_q now says T queries per request
-            # is what faulted the GPU: the kernel walked indices describing a
-            # different batch than the one it was handed.
-            #
-            # The draft decodes at page_size=1 (the ATOM_MLA_PAGE_SIZE default),
-            # i.e. ONE PAGE PER TOKEN, so kv_indices needs one entry per token
-            # holding that token's flat slot. The target's builder emits one
-            # entry per `runner.block_size` block, so its indices cannot be
-            # reused at any offset -- the granularities differ, not the values.
-            #
-            # Matching the target's granularity instead (segmented MLA, so the
-            # draft reads 128-token pages) was tried and is impossible here:
-            # seg MLA pins BOTH ATOM_MLA_PAGE_SIZE and --block-size to 64
-            # (attention_mla.py:276-285) while the K3 target under unified-attn
-            # + fp8 KV needs --block-size 128. One global block size cannot
-            # satisfy both, so the draft builds its own per-token indices.
-            #
-            # No new kernel: kv_indices_generate_triton already expands each
-            # block-table entry into `ratio` consecutive values
-            # `page_id * ratio + k`, which at ratio = runner.block_size IS the
-            # flat token slot -- the same numbering write_context_kv wrote to.
-            # It masks stores by each request's own length, so the upper-bound
-            # max_seqlen_k below only over-launches grid rows, never overruns.
             kv_indptr = self._blk_kv_indptr[: bs + 1]
             # kv_indptr[0] stays 0 (zero-init, never written). cumsum promotes
             # integers to int64, so land it through copy_ rather than out=.
@@ -563,15 +526,6 @@ class DSparkProposer(Drafter):
             attn_metadata.kv_indices = self._blk_kv_indices
             attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:bs]
 
-            # Persistent-mode work descriptors describe the TARGET's batch: the
-            # GDN hybrid builder inherits aiter_attention's work_* buffers and
-            # populates them on the target pass. `_forward_decode` would pick
-            # them up here (use_persistent_mode is True whenever dp_size == 1
-            # and no LSE is requested) and hand the kernel a work plan for a
-            # different batch -- the same class of out-of-bounds walk this whole
-            # block exists to fix. Clearing them drops mla_decode_fwd onto its
-            # non-persistent split-KV path, which rebuilds its own num_kv_splits
-            # and ignores work_meta_data entirely.
             attn_metadata.work_meta_data = None
             attn_metadata.work_indptr = None
             attn_metadata.work_info_set = None
@@ -612,10 +566,6 @@ class DSparkProposer(Drafter):
                 T,
             )
 
-        # This checkpoint's confidence head is training-only and not loaded, so
-        # `confidence` is None and the verify length stays fixed. The branch is
-        # kept rather than asserted: a future standalone checkpoint may ship a
-        # calibrated head, and then this path picks it up unchanged.
         if self.verify_scheduler is not None:
             self.verify_scheduler.set_last_ell(
                 self.verify_scheduler.compute_ell(confidence[:, :T])
