@@ -23,6 +23,9 @@ def separate_reasoning(text: str) -> Tuple[Optional[str], str]:
         Tuple of (reasoning_content, content). reasoning_content is None if
         no thinking block was found.
     """
+    # MiniMax M3 emits <mm:think>...</mm:think> instead of <think>...</think>;
+    # normalize so the shared logic below handles both.
+    text = text.replace("<mm:think>", "<think>").replace("</mm:think>", "</think>")
     # Check for closed thinking block: <think>...</think>
     match = re.match(r"<think>(.*?)</think>\s*(.*)", text, flags=re.DOTALL)
     if match:
@@ -75,6 +78,10 @@ class ReasoningFilter:
             List of (field_name, text) tuples where field_name is
             "reasoning_content" or "content".
         """
+        # MiniMax M3 uses <mm:think>/</mm:think>; normalize to the <think> tags
+        # the state machine below keys on. These are single special tokens, so
+        # each arrives whole in one chunk — a plain replace is safe.
+        text = text.replace("<mm:think>", "<think>").replace("</mm:think>", "</think>")
         results = []
 
         if self.state == 0:
