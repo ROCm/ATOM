@@ -42,7 +42,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from atom.model_engine.chunk_arena import ArenaEmpty, ChunkArena, ChunkBackedFreeList
+from atom.kv_cache.pools.chunk_arena import (
+    ArenaEmpty,
+    ChunkArena,
+    ChunkBackedFreeList,
+)
 
 # Owner names. SWA is in every group; compress in c4/c128. The DSV4 CSA boundary
 # snapshot is NOT an owner — it is fused into the SWA chunk's tail byte segment
