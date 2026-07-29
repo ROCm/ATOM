@@ -59,7 +59,8 @@ def _materialize_atom_dummy_forward(
         device = input_embeds.device
     else:
         raise RuntimeError(
-            "SGLang dummy forward materialization requires positions, input ids, input embeds"
+            "SGLang dummy forward materialization requires at least one of "
+            "positions, input_ids, or input_embeds"
         )
 
     dummy_positions = (
