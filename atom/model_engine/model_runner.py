@@ -1234,15 +1234,6 @@ class ModelRunner:
         if pcp_size > 1:
             warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
 
-        # TEMPORARY (benign, warmup-only): cap the dummy warmup prefill. A large
-        # all-zero warmup batch samples garbage logits over all positions and
-        # faults the sampler/softmax on gfx1250; real inference only samples the
-        # last token per seq so it is unaffected. Proper fix = skip/greedy sampling
-        # during is_dummy_run warmup, then this cap can go. Not needed for the MoE
-        # (that large-M crash is fixed in aiter grouped_moe_gfx1250).
-        _warmup_cap = int(os.environ.get("ATOM_WARMUP_MAX_TOKENS", "0") or "0")
-        if _warmup_cap > 0:
-            warmup_max_tokens = min(warmup_max_tokens, _warmup_cap)
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1734,15 +1725,8 @@ class ModelRunner:
         if self.config.speculative_config and hasattr(self, "drafter"):
             spec_config = self.config.speculative_config
             draft_hf_config = spec_config.draft_model_hf_config
-            # Two independent questions, previously conflated into one branch:
-            #   (a) HOW MANY draft layers need KV slots, and
-            #   (b) WHOSE pool those slots come from.
-            #
-            # (a) Serial MTP reuses ONE layer `num_nextn_predict_layers` times,
-            #     so its count is that field, not the stack depth. Drafts with a
-            #     real stack (Eagle3 MHA, standalone DSpark) need one slot per
-            #     layer. The Eagle3 MLA draft (K2.6) has no such field and falls
-            #     through to the default 1, which is correct for it.
+
+            # real stack -> 1 slot/layer; else serial MTP reuses one
             owns_pool = hasattr(self, "eagle3_draft_builder")
             has_real_stack = owns_pool or getattr(
                 spec_config, "use_dspark_with_draft", lambda: False
@@ -1752,12 +1736,7 @@ class ModelRunner:
                 if has_real_stack
                 else getattr(draft_hf_config, "num_nextn_predict_layers", 1)
             )
-            # (b) A heterogeneous draft (Eagle3 MHA on an MLA target) owns a
-            #     sibling pool via its builder, so its layers must NOT be added
-            #     to the target's count. Everything else — serial MTP and the
-            #     standalone DSpark draft, whose MLA latent width matches the
-            #     target's full-attention layers — is appended to the target's
-            #     pool past its last layer.
+            # sibling-pool draft not counted in target pool
             if not owns_pool:
                 total_num_layers += num_draft_layers
             logger.info(

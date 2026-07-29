@@ -269,20 +269,12 @@ class K3DSparkMLAAttention(nn.Module):
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             scale=self.scaling,
             num_kv_heads=1,
-            # The draft's KV is bf16 REGARDLESS of --kv_cache_dtype: it owns a
-            # sibling pool (Eagle3DraftBuilder allocates it bf16 to match), so
-            # its cache dtype is independent of the target's. This is not just
-            # the pool's dtype -- MLAAttention derives its whole fp8 story from
-            # this string: `_forward_decode` picks the fp8 `mla_decode_fwd`
-            # overload from it, and `write_context_kv`'s `concat_and_cache_mla`
-            # takes it as `kv_cache_dtype`. Passing the target's "fp8" here
-            # while the pool is bf16 is what aborted in cache_kernels.cu with
-            # "kv cache data type is auto and q_out data type is fp8".
-            #
-            # bf16 also keeps the draft off aiter's fp8 split-KV table
-            # (`get_block_n_fp8`, keyed by padded_heads * block width), which
-            # has no entry for 16 * 7 -- so the checkpoint's own block width of
-            # 7 stays usable.
+            # Draft KV stays bf16 regardless of --kv_cache_dtype: it owns a bf16
+            # sibling pool (Eagle3DraftBuilder), and this string drives
+            # MLAAttention's whole dtype path (fp8 decode overload +
+            # concat_and_cache_mla dtype). "fp8" over a bf16 pool aborts in
+            # cache_kernels; bf16 also dodges aiter's fp8 split-KV table
+            # (get_block_n_fp8, no 16*7 entry), keeping block width 7 usable.
             kv_cache_dtype="bf16",
             layer_num=layer_num,
             use_mla=True,
@@ -323,19 +315,9 @@ class K3DSparkMLAAttention(nn.Module):
         # deepseek_v2 does for its own k-only rope under PCP.
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
-        # Delegate the actual store to the MLA impl rather than calling
-        # concat_and_cache_mla directly: the cache has three possible layouts
-        # (shuffled / seg / plain, selected by env + use_seg_mla) and open-coding
-        # one of them would silently corrupt the other two. `_pcp_write_full_kv`
-        # is the only extracted helper that takes an EXPLICIT slot_mapping --
-        # the normal path inlines the same three-way branch against
-        # `attn_metadata.slot_mapping`, which is not what the context rows use.
-        # Its name says PCP, but the body is the generic layout-aware write.
-        #
-        # kv_cache is bound by the KV builder onto the OUTER Attention module
-        # (aiter_mla.py: `module.kv_cache = kv_cache`), while the normalized
-        # kv_cache_dtype and `_k_scale` live on the impl -- hence the split
-        # between `self.mla_attn` and `impl` here.
+        # reuse _pcp_write_full_kv (not for PCP): only helper taking an explicit
+        # slot_mapping + handling all cache layouts; normal store hardcodes
+        # attn_metadata.slot_mapping, which is the block's, not the context rows'.
         self.mla_attn.impl._pcp_write_full_kv(
             self.mla_attn.kv_cache, kv_c, k_pe, slot_mapping
         )
@@ -361,18 +343,6 @@ class K3DSparkMLAAttention(nn.Module):
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         kv_c = self.kv_a_layernorm(kv_c)
-        # GPU-VERIFY / NOT YET WIRED: this call inherits ATOM's MLA causal
-        # masking. The DSpark block needs it OFF (see the class docstring). The
-        # candidates are (a) threading the `causal` positional arg of
-        # `triton_shuffle_mla_decode_fwd` (attention_mla.py ~line 1028, currently
-        # hardcoded True) out to the caller, or (b) the LSE-merge pattern the
-        # chunked-prefill path already uses (`flash_attn_varlen_func(causal=
-        # False, return_lse=True)` + `merge_attn_states`, ~lines 615/708).
-        # Until one is done the draft attends causally within the block, which
-        # is LOSSLESS but drafts worse -- verification still emits the
-        # target-greedy token, so this is an acceptance-rate bug, not a
-        # correctness bug.
-        # Returns the hidden_size-wide, already output-projected result.
         return self.mla_attn(q_c, kv_c, k_pe, positions)
 
 
