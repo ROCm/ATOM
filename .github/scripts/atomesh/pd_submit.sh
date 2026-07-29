@@ -406,7 +406,7 @@ on_cancel() {
 
 on_exit() {
   local rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
+  if [[ "${rc}" -ne 0 && "${SLURM_JOB_ACTIVE}" == "1" ]]; then
     scancel_slurm_job "exiting rc=${rc}"
   fi
 }
