@@ -493,9 +493,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 graph_accept_lens = accept_lens.clamp(min=1, max=num_draft_tokens)
                 if bool(torch.equal(graph_accept_lens, accept_lens)):
                     return original_draft_extend_for_decode(self, batch, batch_result)
-            except (
-                Exception
-            ):
+            except Exception:
                 return original_draft_extend_for_decode(self, batch, batch_result)
 
             # SGLang's accept_lens includes the target bonus token, but

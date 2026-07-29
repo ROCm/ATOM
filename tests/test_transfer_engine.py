@@ -240,8 +240,7 @@ class TestZMQHandshake:
             received_layer_meta = msgpack.loads(frame2[1])
             expected_keys = {"layer0", "layer1"}
             actual_keys = {
-                k if isinstance(k, str) else k.decode()
-                for k in received_layer_meta
+                k if isinstance(k, str) else k.decode() for k in received_layer_meta
             }
             assert actual_keys == expected_keys
         finally:

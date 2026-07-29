@@ -286,7 +286,10 @@ class SplitItem:
 # used to judge whether the node should be split or not
 def _split_judge_func(node: fx.Node) -> bool:
     # ATOM use mark_spliting_op to mark the attn as splitting op
-    return bool(node.op == "call_function" and (hasattr(node.target, "spliting_op") and node.target.spliting_op))
+    return bool(
+        node.op == "call_function"
+        and (hasattr(node.target, "spliting_op") and node.target.spliting_op)
+    )
 
 
 def split_graph(

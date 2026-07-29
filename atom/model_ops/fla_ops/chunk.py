@@ -254,7 +254,9 @@ def chunk_gated_delta_rule(
             "Please use head_first=False for now instead.",
             stacklevel=2,
         )
-        q, k, v, beta, g = (rearrange(x, "b h t ... -> b t h ...") for x in (q, k, v, beta, g))
+        q, k, v, beta, g = (
+            rearrange(x, "b h t ... -> b t h ...") for x in (q, k, v, beta, g)
+        )
     if not head_first and q.shape[1] < q.shape[2]:
         warnings.warn(
             f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
