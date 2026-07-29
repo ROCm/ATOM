@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Type, cast
 
 if TYPE_CHECKING:
+    from atom.kv_cache.layout import KvLayoutOptions, KvPoolLayout
     from atom.model_engine.scheduler import ScheduledBatch
 
 import numpy as np
@@ -700,6 +701,37 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # max_num_batched_tokens chunk's SWA, ~128 blocks) is dead under
         # window-only — dropped. `+ 64` keeps a slide-boundary safety margin.
         return max_num_seqs * per_decode + 64
+
+    def compute_kv_pool_layout(
+        self,
+        *,
+        available_for_pool: int,
+        block_bytes: int,
+        max_num_seqs: int,
+        max_model_len: int,
+        swa_window_size: int,
+        options: "KvLayoutOptions | None" = None,
+        per_req_cache_bytes: int = 0,
+        slots_per_req: int = 1,
+        max_per_req_cache_slots: int = 0,
+        per_req_cache_equiv_blocks: int = 0,
+    ) -> "KvPoolLayout":
+        """Select the fixed, full-retain, or arena DSV4 pool layout."""
+        from atom.kv_cache.dsv4.layout import compute_dsv4_kv_pool_layout
+
+        return compute_dsv4_kv_pool_layout(
+            self,
+            available_for_pool=available_for_pool,
+            block_bytes=block_bytes,
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            swa_window_size=swa_window_size,
+            options=options,
+            per_req_cache_bytes=per_req_cache_bytes,
+            slots_per_req=slots_per_req,
+            max_per_req_cache_slots=max_per_req_cache_slots,
+            per_req_cache_equiv_blocks=per_req_cache_equiv_blocks,
+        )
 
     def slots_per_req(self) -> int:
         # State cache is one slot per req regardless of MTP. The MTP draft

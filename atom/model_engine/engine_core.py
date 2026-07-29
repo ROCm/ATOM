@@ -93,6 +93,8 @@ class EngineCore:
             config.num_per_req_cache_groups = block_info.get(
                 "num_per_req_cache_groups", 0
             )
+            config.kv_manager_kind = block_info.get("kv_manager_kind", "dense")
+            config.kv_pool_layout_kind = block_info.get("kv_pool_layout_kind", "dense")
             # paged-SWA: propagate SWA pool sizing from the runner subprocess
             # so BlockManager (built in Scheduler below) sees the same value as
             # the runner's attn builder (else swa_enabled=False vs the SWA pool).

@@ -1483,10 +1483,12 @@ class ModelRunner:
         Eagle3 independent MHA). Per-request cache bytes are accounted
         for separately via `compute_per_req_cache_bytes()`.
         """
-        block_bytes = self.attn_metadata_builder.compute_block_bytes()
+        from atom.kv_cache.layout import compute_total_kv_block_bytes
+
+        builders = [self.attn_metadata_builder]
         if hasattr(self, "eagle3_draft_builder"):
-            block_bytes += self.eagle3_draft_builder.compute_block_bytes()
-        return block_bytes
+            builders.append(self.eagle3_draft_builder)
+        return compute_total_kv_block_bytes(builders)
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -1683,101 +1685,46 @@ class ModelRunner:
         )
         self.max_per_req_cache_slots = max_per_req_cache_slots
 
-        # paged-SWA: some attention backends carve a SEPARATE windowed/prefix-
-        # cached SWA pool out of the KV budget. The SWA bytes that
-        # `compute_block_bytes` charges per compressed block move into a
-        # `num_swa_blocks`-sized pool (window-freed, so far smaller than the
-        # compressed pool), and the freed budget grows `num_kvcache_blocks`.
-        # Whether this applies is a builder capability — `swa_pool_block_bytes()`
-        # returns >0 only for backends with a separate SWA pool — so the runner
-        # stays model-agnostic (no architecture check here). Under
-        # PD/disaggregation the SWA pool is transferred per-request by
-        # seq.swa_block_table (only the live window, i.e. the last ~128-token
-        # block); see get_kv_transfer_tensors.
+        # Physical pool partitioning is an attention-builder capability.  The
+        # runner owns the shared GPU budget and target+draft byte accounting,
+        # while each builder supplies its layout without architecture checks here.
         b = self.attn_metadata_builder
-        swa_block_bytes = b.swa_pool_block_bytes()
-        if swa_block_bytes > 0:
-            # block_bytes (from _compute_block_bytes) currently includes the SWA
-            # term; strip it so the compressed pool is sized on compressed bytes.
-            compressed_block_bytes = block_bytes - swa_block_bytes
-            if envs.ATOM_SWA_FULL_RETAIN:
-                # Full-retain: give the SWA tail pool a small fraction `f` of the
-                # budget; the rest stays with the compressed pool. One SWA block is
-                # ~7x the bytes of one compressed block, so a 1:1 mirror
-                # (num_swa == num_kvcache) starves the compressed prefix index
-                # (measured: 298k -> 36.8k blocks -> hit rate collapsed). A small
-                # f keeps compressed near full while retaining the hot-boundary
-                # tail working set (LRU-evicted, same eviction discipline as
-                # vLLM's FreeKVCacheBlockQueue). Memory-bounded regardless of
-                # max_model_len. Live SWA footprint stays ~window/seq (window-free
-                # is kept); the tail pool holds lazily-freed-but-cached tails.
-                f = min(0.9, max(1e-3, envs.ATOM_SWA_TAIL_BUDGET_FRAC))
-                swa_budget = int(available_for_pool * f)
-                compressed_budget = available_for_pool - swa_budget
-                num_swa_blocks = swa_budget // swa_block_bytes
-                num_kvcache_blocks = compressed_budget // compressed_block_bytes
-                swa_reserved = num_swa_blocks * swa_block_bytes
-                logger.info(
-                    f"paged-SWA full-retain: tail_budget_frac={f:.3f}, "
-                    f"swa_budget={swa_budget / (1 << 30):.2f}GB, "
-                    f"compressed_budget={compressed_budget / (1 << 30):.2f}GB"
-                )
-            else:
-                num_swa_blocks = b.swa_pool_num_blocks(
-                    config.max_num_seqs, config.max_model_len
-                )
-                swa_reserved = num_swa_blocks * swa_block_bytes
-                num_kvcache_blocks = max(
-                    0, (available_for_pool - swa_reserved) // compressed_block_bytes
-                )
-            config.num_swa_blocks = int(num_swa_blocks)
-            config.swa_window_size = int(
-                getattr(hf_config, "sliding_window", 128) or 128
-            )
-            self.num_swa_blocks = int(num_swa_blocks)
+        layout = b.compute_kv_pool_layout(
+            available_for_pool=available_for_pool,
+            block_bytes=block_bytes,
+            max_num_seqs=config.max_num_seqs,
+            max_model_len=config.max_model_len,
+            swa_window_size=int(getattr(hf_config, "sliding_window", 128) or 128),
+            per_req_cache_bytes=per_req_cache_bytes,
+            slots_per_req=slots_per_req,
+            max_per_req_cache_slots=max_per_req_cache_slots,
+            per_req_cache_equiv_blocks=per_req_cache_equiv_blocks,
+        )
+        num_kvcache_blocks = int(layout.num_primary_blocks)
+        config.kv_manager_kind = layout.manager_kind
+        config.kv_pool_layout_kind = layout.layout_kind
+        config.num_swa_blocks = int(layout.num_swa_blocks)
+        config.swa_window_size = int(layout.swa_window_size)
+        config.v4_arena_group_specs = layout.arena_specs
+        self.num_swa_blocks = int(layout.num_swa_blocks)
+
+        if layout.num_swa_blocks:
+            swa_reserved = layout.num_swa_blocks * layout.swa_block_bytes
             logger.info(
-                f"paged-SWA pool: num_swa_blocks={num_swa_blocks}, "
-                f"swa_block_bytes={swa_block_bytes}, "
+                f"KV pool layout={layout.layout_kind}: "
+                f"num_swa_blocks={layout.num_swa_blocks}, "
+                f"swa_block_bytes={layout.swa_block_bytes}, "
                 f"swa_reserved={swa_reserved / (1 << 30):.2f}GB, "
-                f"compressed_block_bytes={compressed_block_bytes}, "
+                f"primary_block_bytes={layout.primary_block_bytes}, "
                 f"num_kvcache_blocks={num_kvcache_blocks}"
             )
-        else:
-            config.num_swa_blocks = 0
-            config.swa_window_size = 0
-            self.num_swa_blocks = 0
-            num_kvcache_blocks = available_for_pool // block_bytes
-
-        # Unified-KV chunk arena (ATOM_V4_UNIFIED_KV_ARENA) — UNVALIDATED on GPU.
-        # Replaces the fixed SWA/compressed split with equal-size chunks shared
-        # elastically. Sets per-group specs for BlockManager; compressed capacity
-        # is elastic up to num_chunks * pages_per_chunk(C4=4), so the idx/boundary
-        # caches (indexed by compressed block_id) must be sized to that max ->
-        # num_kvcache_blocks. Requires steps 2-3 (arena tensor + per-group index
-        # translation) to be runnable; GSM8K flag on/off must match before trust.
-        config.v4_arena_group_specs = None
-        if (
-            envs.ATOM_V4_UNIFIED_KV_ARENA
-            and swa_block_bytes > 0
-            and hasattr(b, "compute_arena_group_specs")
-        ):
-            specs = b.compute_arena_group_specs(available_for_pool)
-            if specs:
-                config.v4_arena_group_specs = specs
-                num_chunks = specs[0].num_chunks
-                # max elastic compressed = tightest compress group's
-                # num_chunks * (bytes_per_chunk // compress_page_bytes) (c4 -> 4).
-                cmp_caps = [s.max_compressed_blocks for s in specs if s.has_compress]
-                num_kvcache_blocks = min(cmp_caps) if cmp_caps else num_chunks
-                config.num_swa_blocks = num_chunks
-                self.num_swa_blocks = num_chunks
-                logger.warning(
-                    "unified-KV arena (UNVALIDATED): specs=%s num_chunks=%d "
-                    "num_kvcache_blocks(max compressed)=%d",
-                    specs,
-                    num_chunks,
-                    num_kvcache_blocks,
-                )
+        if layout.layout_kind == "arena":
+            logger.warning(
+                "unified-KV arena (UNVALIDATED): specs=%s "
+                "num_kvcache_blocks(max compressed)=%d",
+                layout.arena_specs,
+                num_kvcache_blocks,
+            )
 
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
@@ -1867,6 +1814,10 @@ class ModelRunner:
             # → worker uses logical block ids as physical → KV corruption once the
             # mapping is non-identity under eviction).
             "v4_arena_group_specs": getattr(config, "v4_arena_group_specs", None),
+            # Factory dispatch is a layout-provider output, propagated to the
+            # scheduler process with the rest of the physical pool geometry.
+            "kv_manager_kind": config.kv_manager_kind,
+            "kv_pool_layout_kind": config.kv_pool_layout_kind,
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):

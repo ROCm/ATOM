@@ -1193,6 +1193,15 @@ class Config:
     stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
+    # ModelRunner-computed KV layout outputs. They are explicitly declared
+    # because get_num_blocks runs in worker processes and EngineCore mirrors the
+    # values into the scheduler process before constructing its manager.
+    kv_manager_kind: str = "dense"
+    kv_pool_layout_kind: str = "dense"
+    num_swa_blocks: int = 0
+    swa_window_size: int = 0
+    per_req_cache_equiv_blocks: int = 0
+    num_per_req_cache_groups: int = 0
     # DSV4 unified-KV chunk arena (ATOM_V4_UNIFIED_KV_ARENA). Per-ratio group
     # specs `[(name, compress_stride, num_chunks), ...]` set by ModelRunner
     # sizing; None/empty disables the arena (BlockManager keeps the two

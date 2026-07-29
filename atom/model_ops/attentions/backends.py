@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
 
 if TYPE_CHECKING:
+    from atom.kv_cache.layout import KvLayoutOptions, KvPoolLayout
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
     from atom.model_engine.scheduler import ScheduledBatch
 
@@ -195,6 +196,36 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Number of blocks to reserve for the paged-SWA pool, or 0 (default).
         Only consulted when `swa_pool_block_bytes()` > 0."""
         return 0
+
+    def compute_kv_pool_layout(
+        self,
+        *,
+        available_for_pool: int,
+        block_bytes: int,
+        max_num_seqs: int,
+        max_model_len: int,
+        swa_window_size: int,
+        options: "KvLayoutOptions | None" = None,
+        per_req_cache_bytes: int = 0,
+        slots_per_req: int = 1,
+        max_per_req_cache_slots: int = 0,
+        per_req_cache_equiv_blocks: int = 0,
+    ) -> "KvPoolLayout":
+        """Compute this backend's physical KV-pool layout.
+
+        The default is a single primary pool.  Hybrid backends override this
+        capability instead of requiring ModelRunner architecture branches.
+        """
+        from atom.kv_cache.layout import compute_default_kv_pool_layout
+
+        return compute_default_kv_pool_layout(
+            available_for_pool=available_for_pool,
+            block_bytes=block_bytes,
+            per_req_cache_bytes=per_req_cache_bytes,
+            slots_per_req=slots_per_req,
+            max_per_req_cache_slots=max_per_req_cache_slots,
+            per_req_cache_equiv_blocks=per_req_cache_equiv_blocks,
+        )
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
