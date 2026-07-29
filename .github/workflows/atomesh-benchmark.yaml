@@ -20,7 +20,9 @@ on:
     # TW weekend nightly at 21:00 Beijing time (13:00 UTC).
     - cron: '0 13 * * 6'
     - cron: '0 13 * * 0'
-    # Spur Agentic Trace nightly at 00:10 Beijing time (16:10 UTC).
+    # TW nightly for DeepSeek and GLM-Agentic cases only at 01:00 Beijing time (17:00 UTC).
+    - cron: '0 17 * * *'
+    # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
@@ -50,7 +52,7 @@ on:
           glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
           glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
           glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,glm-52-mxfp4-1p1d-tp8-dpa-agentic-lmcache-1m-c48,
-          glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48,glm-52-mxfp4-1p1d-tp4-pcp2-agentic-lmcache-1m-c48,
+          glm-52-mxfp4-1p1d-tp4-pcp2-agentic-lmcache-1m-c48,
           kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,
           minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
           minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,
@@ -248,7 +250,7 @@ jobs:
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
-          BENCHMARK_KIND_FILTER: ${{ github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'aiperf_agentic' || '' }}
+          EVENT_SCHEDULE: ${{ github.event_name == 'schedule' && github.event.schedule || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
@@ -268,16 +270,61 @@ jobs:
             fi
           fi
 
-          python3 .github/scripts/atomesh/pd_matrix.py \
-            --suite "$SUITE" \
-            ${MODEL_NAME:+--model "$MODEL_NAME"} \
-            ${CASE_NAME:+--case "$CASE_NAME"} \
-            ${BENCHMARK_KIND_FILTER:+--benchmark-kind "$BENCHMARK_KIND_FILTER"} \
-            ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
-            ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
-            ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
-            --output atomesh-matrix.json \
-            --github-output
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 17 * * *" ]]; then
+            ATOMESH_SLURM_ACCOUNT=amd-frameworks \
+            ATOMESH_SLURM_PARTITION=amd-frameworks \
+            ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
+            ATOMESH_1P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
+            ATOMESH_2P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
+              python3 .github/scripts/atomesh/pd_matrix.py \
+              --suite nightly \
+              --model DeepSeek-V4-Pro \
+              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+              --output atomesh-matrix-deepseek.json
+
+            ATOMESH_SLURM_ACCOUNT=amd-tw \
+            ATOMESH_SLURM_PARTITION=amd-tw \
+            ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
+            ATOMESH_1P1D_NODES=mia1-p01-g36,mia1-p01-g43 \
+            ATOMESH_2P1D_NODES=mia1-p01-g36,mia1-p01-g43 \
+              python3 .github/scripts/atomesh/pd_matrix.py \
+              --suite nightly \
+              --model GLM-5.2-MXFP4 \
+              --benchmark-kind aiperf_agentic \
+              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+              --output atomesh-matrix-glm.json
+
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          deepseek = json.loads(Path("atomesh-matrix-deepseek.json").read_text(encoding="utf-8")).get("include", [])
+          glm_agentic = json.loads(Path("atomesh-matrix-glm.json").read_text(encoding="utf-8")).get("include", [])
+          matrix = {"include": deepseek + glm_agentic}
+          Path("atomesh-matrix.json").write_text(
+              json.dumps(matrix, indent=2),
+              encoding="utf-8",
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"matrix_json={json.dumps(matrix, separators=(',', ':'))}\n")
+              output.write(f"has_matrix={'true' if matrix['include'] else 'false'}\n")
+          print(
+              "Scheduled TW nightly matrix: "
+              f"{len(deepseek)} DeepSeek case(s), {len(glm_agentic)} GLM agentic case(s)"
+          )
+          PY
+          else
+            python3 .github/scripts/atomesh/pd_matrix.py \
+              --suite "$SUITE" \
+              ${MODEL_NAME:+--model "$MODEL_NAME"} \
+              ${CASE_NAME:+--case "$CASE_NAME"} \
+              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+              ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
+              ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
+              --output atomesh-matrix.json \
+              --github-output
+          fi
           cat atomesh-matrix.json
 
       - name: Validate ATOMesh P/D matrix
