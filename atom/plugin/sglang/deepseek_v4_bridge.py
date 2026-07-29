@@ -704,12 +704,10 @@ def _bind_compressor_state(
                 storage_offset=scale_fp32_offset,
             )
         )
-        compressor.write_mode = "indexer_fp8"
+        compressor.quant_mode = "per_row_fp8"
     else:
         compressor.cache_scale = None
-        compressor.write_mode = (
-            "main_2buff_fp8" if kv_cache_rope is not None else "bf16"
-        )
+        compressor.quant_mode = "group_fp8" if kv_cache_rope is not None else "none"
 
 
 def _iter_deepseek_v4_cache_blocks(model):

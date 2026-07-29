@@ -552,7 +552,7 @@ def _bind_compressor_state(
     head_dim: int,
     *,
     is_indexer: bool = False,
-    write_mode: str = "bf16",
+    quant_mode: str = "none",
     kv_cache_rope: torch.Tensor | None = None,
 ) -> None:
     compressor.kv_state = torch.zeros(
@@ -582,12 +582,11 @@ def _bind_compressor_state(
         )
     else:
         compressor.cache_scale = None
-    # #1600 contract: Compressor.forward selects its scatter path from
-    # `write_mode` (was: sniff kv_cache.dtype). The indexer-inner cache is always
-    # fp8 -> "indexer_fp8"; CSA/HCA Main is "bf16" or, under the fp8 2buff layout,
-    # "main_2buff_fp8" with a parallel bf16 RoPE pool bound via `kv_cache_rope`.
+    # Compressor.forward selects its scatter path from `quant_mode`. The
+    # indexer-inner cache uses per-row fp8; CSA/HCA Main uses no quantization or,
+    # under the fp8 2buff layout, group fp8 with a parallel bf16 RoPE pool.
     compressor.kv_cache_rope = kv_cache_rope
-    compressor.write_mode = write_mode
+    compressor.quant_mode = quant_mode
 
 
 def _v4_max_spec_steps(vllm_config) -> int:
@@ -830,9 +829,9 @@ def bind_deepseek_v4_proxy_cache_views(
         index_topk=int(getattr(model.args, "index_topk", 1024)),
         kv_fp8=kv_fp8,
     )
-    # CSA/HCA Main scatter mode: fp8 2buff -> "main_2buff_fp8" (nope fp8 + parallel
-    # bf16 rope), else the plain bf16 scatter. The indexer is always "indexer_fp8".
-    main_write_mode = "main_2buff_fp8" if kv_fp8 else "bf16"
+    # CSA/HCA Main quantization: fp8 2buff -> group fp8 (nope fp8 + parallel
+    # bf16 rope), else no quantization. The indexer always uses per-row fp8.
+    main_quant_mode = "group_fp8" if kv_fp8 else "none"
     views = slice_deepseek_v4_proxy_cache_views(
         proxy.kv_cache,
         compress_ratios=ratios,
@@ -877,7 +876,7 @@ def bind_deepseek_v4_proxy_cache_views(
                 views["csa_main"][csa_i],
                 num_slots,
                 int(model.args.head_dim),
-                write_mode=main_write_mode,
+                quant_mode=main_quant_mode,
                 kv_cache_rope=views["csa_main_rope"][csa_i],
             )
             attn.indexer.kv_cache = views["csa_indexer"][csa_i]
@@ -890,7 +889,7 @@ def bind_deepseek_v4_proxy_cache_views(
                 num_slots,
                 int(model.args.index_head_dim),
                 is_indexer=True,
-                write_mode="indexer_fp8",
+                quant_mode="per_row_fp8",
             )
         elif ratio == 128:
             hca_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
@@ -899,7 +898,7 @@ def bind_deepseek_v4_proxy_cache_views(
                 views["hca_main"][hca_i],
                 num_slots,
                 int(model.args.head_dim),
-                write_mode=main_write_mode,
+                quant_mode=main_quant_mode,
                 kv_cache_rope=views["hca_main_rope"][hca_i],
             )
     # Persistent decode-metadata buffers for the FULL decode CUDA/HIP graph.
