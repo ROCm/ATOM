@@ -38,7 +38,6 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
-from atom.utils.cuda_graph import BatchDescriptor
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -59,6 +58,7 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
+from atom.utils.cuda_graph import BatchDescriptor
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -1016,7 +1016,7 @@ class ModelRunner:
             )
 
     def _make_buffer(
-        self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
+        self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
     ) -> CpuGpuBuffer:
         return CpuGpuBuffer(
             *size, dtype=dtype, device=self.device, pin_memory=True, with_numpy=numpy
