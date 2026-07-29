@@ -20,17 +20,6 @@ This guide targets **AMD MI355 (gfx950) only**, `-tp 8`.
 
 ```bash
 #!/bin/bash
-# ---- load ----
-export ATOM_LOADER_USE_THREADPOOL=1
-export ATOM_LOADER_THREADPOOL_WORKERS=16
-export ATOM_DIST_TIMEOUT_SECONDS=3600
-
-# ---- gfx950 MoE: FlyDSL native SiTUv2 ----
-export ATOM_USE_TRITON_GEMM=1
-export AITER_USE_GROUPED_GEMM=0
-export ATOM_USE_TRITON_MOE=0
-export AITER_FLYDSL_FORCE=1
-export AITER_FORCE_GFX1250=0
 
 python -m atom.entrypoints.openai_server \
   --model Kimi-K3 \
