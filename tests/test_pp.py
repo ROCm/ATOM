@@ -167,7 +167,7 @@ def _fake_pp_group(monkeypatch, rank_in_group=0, world_size=2):
 
 
 def test_send_packs_only_proxy_keys_to_group_relative_next(monkeypatch):
-    grp, sent = _fake_pp_group(monkeypatch, rank_in_group=0, world_size=2)
+    _, sent = _fake_pp_group(monkeypatch, rank_in_group=0, world_size=2)
     it = IntermediateTensors(
         {
             "hidden_states": torch.ones(3, 4),
@@ -182,7 +182,7 @@ def test_send_packs_only_proxy_keys_to_group_relative_next(monkeypatch):
 
 
 def test_send_tolerates_missing_residual(monkeypatch):
-    grp, sent = _fake_pp_group(monkeypatch)
+    _, sent = _fake_pp_group(monkeypatch)
     pp_comm.send_intermediate_tensors(
         IntermediateTensors({"hidden_states": torch.ones(2, 2)})
     )
