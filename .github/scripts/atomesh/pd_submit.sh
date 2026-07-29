@@ -563,12 +563,13 @@ EOF
     printf 'exec %q\n' "${JOB_SCRIPT}"
   } >> "${SUBMIT_SCRIPT}"
   chmod +x "${SUBMIT_SCRIPT}"
-  SBATCH_CMD=(sbatch --controller "${SPUR_CONTROLLER_ADDR}" "${SUBMIT_SCRIPT}")
+  SBATCH_CMD=(sbatch --controller "${SPUR_CONTROLLER_ADDR}" --export=ALL "${SUBMIT_SCRIPT}")
 else
   SBATCH_CMD=(
     sbatch
     --parsable
     --exclusive
+    --export=ALL
     --account "${SLURM_ACCOUNT}"
     --partition "${SLURM_PARTITION}"
     --nodes "${NUM_NODES}"
