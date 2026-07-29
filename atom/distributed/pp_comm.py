@@ -113,7 +113,8 @@ def _async_send_object(
     obj: object, dst_global: int, cpu_group: torch.distributed.ProcessGroup
 ) -> list[P2PWork]:
     """Async version of aiter GroupCoordinator.send_object."""
-    object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+    raw = pickle.dumps(obj)
+    object_tensor = torch.frombuffer(raw, dtype=torch.uint8).clone()
     size_tensor = torch.tensor([object_tensor.numel()], dtype=torch.long, device="cpu")
     works: list[P2PWork] = []
     w = torch.distributed.isend(size_tensor, dst=dst_global, group=cpu_group)
@@ -146,7 +147,7 @@ def async_send_intermediate_tensors(
         if ag_group is not None and tensor.numel() % ag_size == 0:
             tensor = tensor.reshape(ag_size, -1)[ag_rank]
         buf = tensor.clone()
-        if buf.is_cpu:
+        if buf.device.type == "cpu":
             w = torch.distributed.isend(buf, dst=dst_global, group=pp.cpu_group)
         else:
             w = torch.distributed.isend(buf, dst=dst_global, group=pp.device_group)
