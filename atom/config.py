@@ -878,16 +878,6 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
       ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
       their DSpark fields at the config top level: ``target_layer_ids``,
       ``mask_token_id``, ``markov_rank``, and optionally a training block width.
-
-    This adapter runs for every standalone draft, so it stays model-neutral:
-    downstream readers (config validation, ``DSparkProposer``) only ever see the
-    canonical ``dspark_*`` names and never branch on the specific model. The
-    draft-only fields stay untouched for the model itself to read.
-
-    Raises rather than defaulting: a DSpark draft that loads with the wrong aux
-    layers or noise token produces valid-looking tokens at a silently degraded
-    acceptance rate, which is far more expensive to diagnose than a startup
-    failure.
     """
     target_layer_ids = getattr(hf_config, "target_layer_ids", None)
     if not target_layer_ids:
@@ -930,7 +920,7 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
 
 def _normalize_moe_config_fields(
     hf_config: PretrainedConfig,
-    model_path: Optional[str] = None,
+    model_path: str | None = None,
 ) -> None:
     """Normalize common MoE config field names across model families."""
     moe_config = getattr(hf_config, "text_config", hf_config)
@@ -1062,7 +1052,7 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(
-        hf_config: PretrainedConfig, model_path: Optional[str] = None
+        hf_config: PretrainedConfig, model_path: str | None = None
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]

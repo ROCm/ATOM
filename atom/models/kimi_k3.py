@@ -914,16 +914,7 @@ class KimiKDAAttention(nn.Module):
                 lower_bound=self._kda_gate_lower_bound,
             )
         elif gdn_metadata.num_spec_decodes > 0:
-            # Speculative-decode verify: each request feeds `1 + num_spec` query
-            # tokens against a paged KV. gdn_attn zeroes `num_decodes` and routes
-            # here via `num_spec_decodes`, handing over the multi-slot spec
-            # buffers (`spec_state_indices_tensor` [bs, 1+num_spec]) plus
-            # `num_accepted_tokens`. Both kernels then snapshot per-token state
-            # into those slots and, next step, resume from the last ACCEPTED
-            # token's snapshot -- so a rejected draft's state advance is rolled
-            # back instead of permanently corrupting the KDA recurrence (the
-            # missing piece that made spec decode output garbage). Mirrors the
-            # native-GDN spec path in attention_gdn.py.
+            # Speculative-decode pass
             spec_state_indices = gdn_metadata.spec_state_indices_tensor
             spec_query_start_loc = gdn_metadata.spec_query_start_loc
             num_accepted_tokens = gdn_metadata.num_accepted_tokens

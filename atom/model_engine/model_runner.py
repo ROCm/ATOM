@@ -759,10 +759,6 @@ class ModelRunner:
         )
 
         self._build_and_load_model(model_class)
-        # NOTE: the ATOM_SYNC_AFTER_LOAD TP barrier lives inside
-        # `_build_and_load_model` (base impl). A second copy here — introduced by
-        # the #1712 cherry-pick merge — made the barrier run twice and deadlocked
-        # TP load. Removed to restore the single-barrier design.
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -1223,7 +1219,6 @@ class ModelRunner:
         pcp_size = self.config.prefill_context_parallel_size
         if pcp_size > 1:
             warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
-
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1718,9 +1713,10 @@ class ModelRunner:
 
             # real stack -> 1 slot/layer; else serial MTP reuses one
             owns_pool = hasattr(self, "eagle3_draft_builder")
-            has_real_stack = owns_pool or getattr(
-                spec_config, "use_dspark_with_draft", lambda: False
-            )()
+            has_real_stack = (
+                owns_pool
+                or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
+            )
             num_draft_layers = (
                 draft_hf_config.num_hidden_layers
                 if has_real_stack

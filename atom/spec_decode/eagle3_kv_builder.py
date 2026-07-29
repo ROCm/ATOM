@@ -50,7 +50,9 @@ class Eagle3DraftBuilder:
             self.model_runner.config.kv_cache_dtype
         ].itemsize
         if self.is_mla:
-            return self.num_layers * self.block_size * self.mla_dim * dtypes.bf16.itemsize
+            return (
+                self.num_layers * self.block_size * self.mla_dim * dtypes.bf16.itemsize
+            )
         bb = (
             2
             * self.num_layers

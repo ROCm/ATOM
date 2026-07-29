@@ -52,7 +52,7 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
   embed_tokens.weight                           SKIPPED (target's is shared)
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from aiter.rotary_embedding import get_rope
@@ -302,9 +302,7 @@ class K3DSparkMLAAttention(nn.Module):
         """
         qkv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))
         kv_lora = qkv_lora[..., self.q_lora_rank :]
-        kv_c, k_pe = kv_lora.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c = self.kv_a_layernorm(kv_c)
         # RoPE the positional lane only -- there is no query on the context
         # path. The rope kernel is 2-component (rotates query AND key, in place
@@ -339,9 +337,7 @@ class K3DSparkMLAAttention(nn.Module):
         # deepseek_v2: `mla_attn(q_a_layernorm(q_c), kv_a_layernorm(kv_c),
         # k_pe, positions)`.)
         q_c = self.q_a_layernorm(q_lora)
-        kv_c, k_pe = kv_lora.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c = self.kv_a_layernorm(kv_c)
         return self.mla_attn(q_c, kv_c, k_pe, positions)
 
@@ -374,7 +370,9 @@ class K3DSparkMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _linear_out(self.down_proj(self.act_fn(_linear_out(self.gate_up_proj(x)))))
+        return _linear_out(
+            self.down_proj(self.act_fn(_linear_out(self.gate_up_proj(x))))
+        )
 
 
 class K3DSparkDecoderLayer(nn.Module):
@@ -431,7 +429,7 @@ class KimiK3DSpark(nn.Module):
     ``packed_modules_mapping``.
     """
 
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "q_a_proj": ("fused_qkv_a_proj", 0),
         "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
         "gate_proj": ("gate_up_proj", 0),
@@ -447,7 +445,11 @@ class KimiK3DSpark(nn.Module):
     #   embed_tokens: a 2.35GB copy of the target's table. The target's is
     #     shared instead (share_with_target), so loading it would just burn
     #     memory and risk drifting from the target's.
-    skip_weight_prefixes = ["confidence_head.", "embed_tokens.", "lm_head."]
+    skip_weight_prefixes: ClassVar[list[str]] = [
+        "confidence_head.",
+        "embed_tokens.",
+        "lm_head.",
+    ]
 
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
