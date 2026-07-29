@@ -9,10 +9,8 @@ from pathlib import Path
 
 import torch
 
-
 _PATH = (
-    Path(__file__).resolve().parent.parent
-    / "atom/model_ops/attentions/dsv4/kv_bind.py"
+    Path(__file__).resolve().parent.parent / "atom/model_ops/attentions/dsv4/kv_bind.py"
 )
 _SPEC = importlib.util.spec_from_file_location("_dsv4_kv_bind_under_test", _PATH)
 kv_bind = importlib.util.module_from_spec(_SPEC)

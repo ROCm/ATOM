@@ -21,15 +21,12 @@ def _prepare_bind_layout(builder: Any) -> tuple[Any, int, bool]:
     arena_on = bool(getattr(builder, "_arena_on", False))
     if arena_on:
         specs = [
-            ArenaGroupSpec.coerce(spec)
-            for spec in runner.config.v4_arena_group_specs
+            ArenaGroupSpec.coerce(spec) for spec in runner.config.v4_arena_group_specs
         ]
         swa_pages = 0
         # Consumers that build SWA indices run after module binding.  Persisting
         # this map is therefore part of the binding contract, not scratch state.
-        builder._arena_group_rows = {
-            spec.name: int(spec.chunk_rows) for spec in specs
-        }
+        builder._arena_group_rows = {spec.name: int(spec.chunk_rows) for spec in specs}
     return runner, swa_pages, arena_on
 
 
@@ -109,9 +106,9 @@ def _bind_indexer_inner_compressor(
     module.kv_cache = idx_kv
     nb, k1, aligned_dim = idx_kv.shape
     head_dim = builder.index_head_dim
-    assert (k1 * aligned_dim) % 4 == 0, (
-        f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
-    )
+    assert (
+        k1 * aligned_dim
+    ) % 4 == 0, f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
     block_fp32_stride = (k1 * aligned_dim) // 4
     scale_fp32_offset = (k1 * head_dim) // 4
     idx_kv_f32 = idx_kv.view(torch.float32)
@@ -177,9 +174,7 @@ def _bind_main_compressor_c128(
     # C128 arena rows do not track the fatter c4 group's physical block count.
     # Derive the page count from this layer's actual storage when arena-backed.
     hca_pages = (
-        unified[swa_pages:].shape[0] // builder.k2_hca
-        if arena_on
-        else num_blocks
+        unified[swa_pages:].shape[0] // builder.k2_hca if arena_on else num_blocks
     )
     module.kv_cache = unified[swa_pages:].view(
         hca_pages, builder.k2_hca, builder.head_dim
