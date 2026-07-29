@@ -58,7 +58,13 @@ class DSparkProposer(Drafter):
         self._blk_offsets = torch.arange(1, t + 1, **i64)
         self._blk_last_page_lens = torch.ones(max_bs, **i32)
         self._blk_kv_indptr = torch.zeros(max_bs + 1, **i32)
-        self._blk_kv_indices = torch.zeros(max_bs * self.config.max_model_len, **i32)
+        # kv_indptr[-1] = sum(ctx_lens) = sum(anchor + 1 + T). An anchor can sit
+        # at max_model_len - 1, so each request contributes up to
+        # max_model_len + T entries -- pad by max_bs * T so the unchecked
+        # kv_indices_generate_triton write can never run past the buffer.
+        self._blk_kv_indices = torch.zeros(
+            max_bs * (self.config.max_model_len + t), **i32
+        )
 
         self._blk_dtype_q = None
 
