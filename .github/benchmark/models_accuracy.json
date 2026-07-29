@@ -261,7 +261,7 @@
   {
     "model_name": "Kimi-K3 DSpark",
     "model_path": "moonshotai/Kimi-K3",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching --method dspark --draft-model Inferact/Kimi-K3-DSpark --num-speculative-tokens 7",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching --method dspark --draft-model Inferact/Kimi-K3-DSpark --num-speculative-tokens 7 --max-num-seqs 64",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
