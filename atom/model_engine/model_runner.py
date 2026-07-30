@@ -742,9 +742,6 @@ class ModelRunner:
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
 
-        self.use_aux_hidden_state_outputs = False
-        self.use_dspark_aux_capture = False
-        self._aux_hidden_states = None
         self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
             self,
@@ -2998,32 +2995,16 @@ class ModelRunner:
                         model_output
                     )
                     hidden_states = None
-                    self._aux_hidden_states = None
                     logits = None
                 elif self._is_pure_middle_chunk(batch):
                     hidden_states = None
-                    self._aux_hidden_states = None
                     logits = None
                 else:
                     if _pcp_tbo_balanced:
-                        if self.use_aux_hidden_state_outputs:
-                            _h, _aux = model_output
-                            model_output = (
-                                self._restore_pcp_balanced_output(
-                                    _h, _pcp_bal_groups, _pcp_size
-                                ),
-                                _aux,
-                            )
-                        else:
-                            model_output = self._restore_pcp_balanced_output(
-                                model_output, _pcp_bal_groups, _pcp_size
-                            )
-                    if self.use_aux_hidden_state_outputs:
-                        hidden_states, self._aux_hidden_states = model_output
-                    else:
-                        hidden_states = model_output
-                        self._aux_hidden_states = None
-                    self._collect_dspark_aux(hidden_states.shape[0])
+                        model_output = self._restore_pcp_balanced_output(
+                            model_output, _pcp_bal_groups, _pcp_size
+                        )
+                    hidden_states = model_output
                     logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
