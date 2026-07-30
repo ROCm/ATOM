@@ -52,8 +52,6 @@ models:
       common:
         AITER_BF16_FP8_MOE_BOUND: "0"
         ATOM_MOE_GU_ITLV: "1"
-        GPU_MAX_HW_QUEUES: "5"
-        ATOM_CPU_AFFINITY: "1"
       prefill: {}
       decode: {}
     server:
@@ -91,6 +89,10 @@ models:
           topology: 1p1d_dpa
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
           isl: [8192]
           osl: 1024
           concurrency: [256, 512]
@@ -109,6 +111,10 @@ models:
           topology: 2p1d_dpa
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_2P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
           isl: [8192]
           osl: 1024
           concurrency: [256, 512, 1024, 2048]
