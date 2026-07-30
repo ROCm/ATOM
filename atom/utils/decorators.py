@@ -564,10 +564,14 @@ def _support_torch_compile(
             # during Dynamo tracing, and their corresponding files
             inline_call = InliningInstructionTranslator.inline_call
 
-            def patched_inline_call(parent, func, args, kwargs):
+            def patched_inline_call(
+                parent, func, args, kwargs, *extra_args, **extra_kwargs
+            ):
                 code = func.get_code()
                 self.vllm_config.compilation_config.traced_files.add(code.co_filename)
-                return inline_call(parent, func, args, kwargs)
+                return inline_call(
+                    parent, func, args, kwargs, *extra_args, **extra_kwargs
+                )
 
             with patch.object(
                 InliningInstructionTranslator, "inline_call", patched_inline_call
