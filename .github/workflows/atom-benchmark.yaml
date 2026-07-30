@@ -34,6 +34,10 @@ on:
         description: "Benchmark Kimi-K2.7-Code-MXFP4"
         type: boolean
         default: true
+      kimi-k3:
+        description: "Benchmark Kimi-K3 (+ DSpark)"
+        type: boolean
+        default: true
       m3-mxfp8:
         description: "Benchmark MiniMax-M3-MXFP8 (+ EAGLE3)"
         type: boolean

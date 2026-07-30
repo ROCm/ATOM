@@ -209,11 +209,15 @@ class CUDAGraphWrapper:
                 # (more memory) as a fallback.
                 _per_bucket = os.environ.get("ATOM_PER_BUCKET_POOL") == "1"
                 _bkey = batch_descriptor.num_tokens if batch_descriptor else 0
-                _pool = (
-                    _cg_mod._graph_pools.get(_bkey)
-                    if _per_bucket
-                    else _cg_mod._shared_graph_pool
-                )
+                if _per_bucket:
+                    _pool = _cg_mod._graph_pools.get(_bkey)
+                else:
+                    # Match vLLM (platforms/interface.py:get_global_graph_pool):
+                    # use a DEDICATED shareable pool handle created ONCE up front
+                    # for EVERY graph.
+                    if _cg_mod._shared_graph_pool is None:
+                        _cg_mod._shared_graph_pool = torch.cuda.graph_pool_handle()
+                    _pool = _cg_mod._shared_graph_pool
                 # thread_local, not the "global" default: global mode invalidates
                 # the capture when ANY thread makes an unsafe HIP call, and under
                 # DP attention the NCCL watchdog thread polls hipEventQuery on
@@ -223,8 +227,13 @@ class CUDAGraphWrapper:
                 # the process with hipErrorStreamCaptureUnsupported. thread_local
                 # restricts the check to the capturing thread, which is the only
                 # one touching this stream.
+                # Capture on graph_capture()'s stream (vLLM parity), not torch's
+                # own side stream, so pieces + collectives stay coherent.
                 with torch.cuda.graph(
-                    cudagraph, pool=_pool, capture_error_mode="thread_local"
+                    cudagraph,
+                    pool=_pool,
+                    stream=torch.cuda.current_stream(),
+                    capture_error_mode="thread_local",
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
@@ -239,13 +248,10 @@ class CUDAGraphWrapper:
 
             # here we always use weak ref for the output
             # to save memory
-            if _per_bucket:
-                if _bkey not in _cg_mod._graph_pools:
-                    # first graph of this bucket -> remember its pool.
-                    _cg_mod._graph_pools[_bkey] = cudagraph.pool()
-            elif _cg_mod._shared_graph_pool is None:
-                # first graph overall -> remember the shared pool.
-                _cg_mod._shared_graph_pool = cudagraph.pool()
+            # first graph of a per-bucket pool -> remember its pool. (shared pool
+            # is created up front via graph_pool_handle() above, nothing to do.)
+            if _per_bucket and _bkey not in _cg_mod._graph_pools:
+                _cg_mod._graph_pools[_bkey] = cudagraph.pool()
 
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph

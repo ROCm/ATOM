@@ -14,13 +14,16 @@ import glob
 import importlib.util
 import logging
 import os
-from typing import Any, Callable, List, Optional
+from typing import Any
 
 from huggingface_hub import snapshot_download
 
-logger = logging.getLogger("atom")
+from .chat_encoder_adapters import (
+    MessageEncoderAdapter,
+    build_message_encoder_adapter,
+)
 
-MessageEncoder = Callable[..., str]
+logger = logging.getLogger("atom")
 
 
 def _resolve_model_path(model: str) -> str:
@@ -32,7 +35,7 @@ def _resolve_model_path(model: str) -> str:
         return model
 
 
-def _load_encoder_from_dir(model_path: str) -> Optional[MessageEncoder]:
+def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
     """Look for ``<model>/encoding/encoding_*.py`` and load ``encode_messages``.
 
     Returns ``None`` when the directory or matching file is absent (model uses
@@ -72,10 +75,10 @@ def _load_encoder_from_dir(model_path: str) -> Optional[MessageEncoder]:
         return raw(messages, **kwargs)
 
     logger.info(f"Loaded message encoder from {enc_path}")
-    return encode
+    return build_message_encoder_adapter(module_name, encode)
 
 
-def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoder]:
+def load_custom_message_encoder(model_path: str) -> MessageEncoderAdapter | None:
     """Probe ``model_path`` once at startup for a custom message encoder.
 
     Returns the encoder, or ``None`` when the model uses the standard Jinja
@@ -87,28 +90,29 @@ def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoder]:
 
 def apply_chat_template(
     tokenizer: Any,
-    custom_encoder: Optional[MessageEncoder],
-    messages: List[dict],
+    custom_encoder: MessageEncoderAdapter | None,
+    messages: list[dict],
     *,
-    tools: Optional[List[dict]] = None,
+    tools: list[dict] | None = None,
     **kwargs: Any,
 ) -> str:
     """Render ``messages`` to a prompt string.
 
     Dispatches to ``custom_encoder`` if one was discovered for this model,
     otherwise to ``tokenizer.apply_chat_template``. Jinja-only kwargs
-    (``tokenize``, ``add_generation_prompt``) are stripped on the custom
-    path; ``tools`` are forwarded only on the Jinja path (custom encoders
-    don't currently have a tools API — caller is warned and tools are
-    dropped).
+    (``tokenize``, ``add_generation_prompt``) are stripped on the custom path.
+    Model-scoped adapters prepare tools for custom encoders that support them;
+    the generic path does not apply DeepSeek-V4-specific message rewriting.
     """
     if custom_encoder is not None:
         for k in ("tokenize", "add_generation_prompt"):
             kwargs.pop(k, None)
-        if tools:
+        if tools and not custom_encoder.supports_tools:
             logger.warning(
-                "tools= is not supported with the custom message encoder; ignoring."
+                "tools= is not supported by custom message encoder %s; ignoring.",
+                custom_encoder.name,
             )
+        messages = custom_encoder.prepare_messages(messages, tools)
         return custom_encoder(messages, **kwargs)
 
     kwargs["tokenize"] = False

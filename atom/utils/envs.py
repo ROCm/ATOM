@@ -315,7 +315,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
     # They are configured via --dspark-config (JSON dict) and carried in
     # config.dspark (see atom/config.py DSparkConfig). See
-    # recipes/DeepSeek-V4-DSpark.md.
+    # recipes/DSpark.md.
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under
@@ -409,6 +409,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
+    # PP-boundary hidden_states/residual are TP-replicated; when on, each rank
+    # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
+    # link traffic by tp_size. Default on; set "0" for full-tensor sends.
+    "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
 }
 
 
