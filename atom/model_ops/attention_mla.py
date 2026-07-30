@@ -829,7 +829,7 @@ class MLAAttention(nn.Module):
                 # device with no sync.
                 ag_kv = ag_kv.to(self.dtype) * self._k_scale
 
-            sum_seq_len = int(chunk_meta.cu_seqlens_k[c][-1].item())
+            sum_seq_len = chunk_meta.total_tokens[c]
             if sum_seq_len == 0:
                 # All tokens in this chunk are padding for every seq (tail
                 # chunk); collective already ran, just skip the compute.

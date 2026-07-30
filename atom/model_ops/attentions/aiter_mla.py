@@ -1211,6 +1211,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         local_slot_ids_list: list[torch.Tensor] = []
         cu_seqlens_k_list: list[torch.Tensor] = []
+        total_tokens_list: list[int] = []
         padded_local_chunk_seq_lens_list: list[list[int]] = []
         seq_tot_list: list[int] = []
         max_seqlen_k_list: list[int] = []
@@ -1235,6 +1236,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_k_list.append(
                 torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
             )
+            total_tokens_list.append(int(cu[-1]))
             max_seqlen_k_list.append(int(global_chunk_len.max(initial=0)))
             padded_local_chunk_seq_lens_list.append(plc.astype(np.int32).tolist())
             seq_tot_list.append(int(plc.sum()))
@@ -1264,7 +1266,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_indptr=[],
             kv_indices=[],
             cu_seqlens_k=cu_seqlens_k_list,
-            total_tokens=[],
+            total_tokens=total_tokens_list,
             max_seqlen_k=max_seqlen_k_list,
             num_chunks=int(num_chunks),
             k_workspace=self.k_chunk_workspace,
