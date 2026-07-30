@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 try:
@@ -68,7 +69,16 @@ if _HAS_TRITON:
         b_idx = tl.arange(0, BP)
         b_mask = b_idx < Bp
         is_last = b_idx == B  # prefix_sum candidate
-        br_base = t * stride_br_t + b_idx * stride_br_b  # [BP]
+        # BP rounds Bp=B+1 up to a power of 2, so lanes b_idx >= B name rows
+        # block_residual does not have. Their values are never used (masked on
+        # load; the b_idx==B lane takes ps via is_last), but the *address* must
+        # still be in bounds -- an out-of-bounds address faults on gfx1250 even
+        # when the mask is correct, because a false mask does not narrow exec:
+        # the AMD backend swaps in a 0x80000000 sentinel voffset and lets the
+        # access issue. Clamping is addressing-only; masked lanes still resolve
+        # to other=0.0, so the result is bit-identical.
+        b_safe = tl.minimum(b_idx, tl.maximum(B - 1, 0))
+        br_base = t * stride_br_t + b_safe * stride_br_b  # [BP]
         ps_base = t * stride_ps_t
 
         acc_sq = tl.zeros((BP,), dtype=tl.float32)
@@ -168,7 +178,9 @@ if _HAS_TRITON:
         s = tl.program_id(1)
         b_idx = tl.arange(0, BP)
         is_last = b_idx == B
-        br_base = t * stride_br_t + b_idx * stride_br_b
+        # Addressing-only clamp; see _attn_res_fused_kernel.
+        b_safe = tl.minimum(b_idx, tl.maximum(B - 1, 0))
+        br_base = t * stride_br_t + b_safe * stride_br_b
         ps_base = t * stride_ps_t
         acc_sq = tl.zeros((BP,), dtype=tl.float32)
         acc_dot = tl.zeros((BP,), dtype=tl.float32)
@@ -242,7 +254,9 @@ if _HAS_TRITON:
         scores = scores - tl.max(scores, axis=0)
         probs = tl.exp(scores)
         probs = probs / tl.sum(probs, axis=0)
-        br_base = t * stride_br_t + b_idx * stride_br_b
+        # Addressing-only clamp; see _attn_res_fused_kernel.
+        b_safe = tl.minimum(b_idx, tl.maximum(B - 1, 0))
+        br_base = t * stride_br_t + b_safe * stride_br_b
         ps_base = t * stride_ps_t
         for h0 in tl.range(0, H, BLOCK_H, num_stages=NS):
             cols = h0 + tl.arange(0, BLOCK_H)
@@ -276,6 +290,12 @@ if _HAS_TRITON:
 # Dispatch rounds T UP to the smallest bucket >= T (ceil-to-bucket), matching how
 # CUDAGraph captures a handful of fixed batch sizes; T above the largest bucket
 # falls through to the catch-all two-pass path.
+#
+# The two-pass buckets take their num_stages from ATOM_K3_ATTN_RES_NS, which
+# defaults to 1 because pipelining the H loop faults on gfx1250 (see the env
+# definition). Set it to 2 to restore the pipelined variant on architectures
+# where it is safe.
+_ATTN_RES_NS = envs.ATOM_K3_ATTN_RES_NS
 _ATTN_RES_CONFIGS = (
     # (max_tokens, split, S, num_stages, num_warps)
     (8, True, 7, 1, 2),
@@ -283,9 +303,9 @@ _ATTN_RES_CONFIGS = (
     (32, True, 7, 1, 4),
     (64, True, 7, 1, 4),
     (128, True, 6, 1, 4),
-    (256, False, 1, 2, 4),
+    (256, False, 1, _ATTN_RES_NS, 4),
 )
-_ATTN_RES_CATCHALL = (False, 1, 2, 4)  # T > largest bucket
+_ATTN_RES_CATCHALL = (False, 1, _ATTN_RES_NS, 4)  # T > largest bucket
 _ATTN_RES_BLOCK_H = 1024
 
 

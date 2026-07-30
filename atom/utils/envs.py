@@ -208,6 +208,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
     ),
+    # --- gfx1250 (MI450) ---
+    # num_stages for the H loop in the Kimi-K3 attn-residual two-pass kernel.
+    # Pipelining that loop faults with an HSA aperture violation on gfx1250 even
+    # with every address in bounds (a false mask does not narrow exec; the AMD
+    # backend swaps in a sentinel voffset and lets the access issue), so it
+    # defaults off. Pipelining only pays off at small T, which takes the split
+    # path anyway, so 1 costs no measurable throughput.
+    "ATOM_K3_ATTN_RES_NS": lambda: int(os.getenv("ATOM_K3_ATTN_RES_NS", "1") or "1"),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
