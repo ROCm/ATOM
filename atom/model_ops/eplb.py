@@ -2565,12 +2565,6 @@ if _EPLB_HAS_TRITON:
         NUM_BINS: tl.constexpr,  # next_pow2(num_physical + 1); last bins hold oob
         TOP_K: tl.constexpr,
     ):
-        # Same hybrid map as _eplb_remap_kernel (local slot, or token-granularity
-        # Knuth-hash spread across replicas when forced remote), but the record
-        # aggregates the block's physical slots with tl.histogram and emits ONE
-        # atomic per non-empty slot -> collapses per-token atomic contention
-        # (numel) to per-block. On concentrated routing this removes the atomic
-        # serialization that dominates prefill.
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < numel

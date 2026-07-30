@@ -6,8 +6,9 @@ import pytest
 import torch
 
 try:
+    # aiter/triton absent under bare non-GPU pytest
     import atom.model_ops.moe as moe_mod
-except Exception as exc:  # aiter/triton absent under bare non-GPU pytest
+except Exception as exc:  # noqa: BLE001
     pytest.skip(f"requires full atom import env: {exc}", allow_module_level=True)
 
 

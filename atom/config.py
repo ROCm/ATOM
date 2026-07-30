@@ -1406,6 +1406,11 @@ class Config:
                 "moe_backend must be one of {'standard', 'mega'}, "
                 f"got {self.moe_backend!r}"
             )
+        if self.moe_backend == "mega" and not self.enable_expert_parallel:
+            raise ValueError(
+                "moe_backend='mega' requires expert parallelism; "
+                "pass --enable-expert-parallel."
+            )
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)

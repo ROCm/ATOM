@@ -1637,7 +1637,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         ):
             tensor = getattr(layer, name, None)
             if not isinstance(tensor, torch.Tensor):
-                raise RuntimeError(f"MegaMoE weight {name!r} was not prepared")
+                raise TypeError(f"MegaMoE weight {name!r} was not prepared")
             if not tensor.is_contiguous() or tensor.numel() % num_local_experts != 0:
                 raise RuntimeError(
                     "MegaMoE EPLB weight must be contiguous and evenly divisible "
@@ -2751,8 +2751,6 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
-        if not self.online_quant:
-            self._validate_moe_backend()
 
         # Override weight padding alignment before create_weights consumes it.
         # Must happen here (pre-create_weights) — setting it on quant_method
@@ -2782,10 +2780,8 @@ class FusedMoE(torch.nn.Module):
     def _validate_moe_backend(self) -> None:
         if get_current_atom_config().moe_backend != "mega":
             return
-        if not self.use_ep:
-            raise ValueError("moe_backend='mega' requires expert parallelism")
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
-            raise ValueError(
+            raise TypeError(
                 "moe_backend='mega' currently supports only MXFP4/A8W4 MoE, "
                 f"got {type(self.quant_method).__name__}"
             )
