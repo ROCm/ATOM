@@ -2462,10 +2462,13 @@ def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Te
     # Forced-remote (-1): pick a replica per token (deterministic Knuth hash).
     l2p = meta.logical_to_physical_map[layer_id].to(device=topk_ids.device)
     cnt = meta.logical_replica_count[layer_id].to(device=topk_ids.device)
-    token_idx = torch.arange(
-        topk_i64.numel(), device=topk_i64.device
-    ).reshape(topk_i64.shape) // topk_ids.shape[-1]
-    replica_idx = ((token_idx * 2654435769) & 0xFFFFFFFF) % cnt[safe_logical].clamp(min=1)
+    token_idx = (
+        torch.arange(topk_i64.numel(), device=topk_i64.device).reshape(topk_i64.shape)
+        // topk_ids.shape[-1]
+    )
+    replica_idx = ((token_idx * 2654435769) & 0xFFFFFFFF) % cnt[safe_logical].clamp(
+        min=1
+    )
     remote = l2p[safe_logical, replica_idx]
     mapped = torch.where(mapped >= 0, mapped, remote).to(topk_ids.dtype)
     shifted_tail = (topk_i64 + id_delta).to(topk_ids.dtype)
@@ -2547,19 +2550,19 @@ if _EPLB_HAS_TRITON:
 
     @triton.jit
     def _eplb_map_record_hist_kernel(
-        topk_ids_ptr,      # [numel]          logical ids (in dtype)
-        dispatch_ptr,      # [num_logical]    this rank's logical->local physical, or -1
-        l2p_ptr,           # [num_logical*R]  logical->physical replicas (-1 padded)
-        cnt_ptr,           # [num_logical]    replica count per logical
-        out_ids_ptr,       # [numel]          output physical ids (in dtype)
-        load_ptr,          # [num_physical]   _cur_pass_count[layer_id]
+        topk_ids_ptr,  # [numel]          logical ids (in dtype)
+        dispatch_ptr,  # [num_logical]    this rank's logical->local physical, or -1
+        l2p_ptr,  # [num_logical*R]  logical->physical replicas (-1 padded)
+        cnt_ptr,  # [num_logical]    replica count per logical
+        out_ids_ptr,  # [numel]          output physical ids (in dtype)
+        load_ptr,  # [num_physical]   _cur_pass_count[layer_id]
         num_logical,
         id_delta,
         num_physical,
         R,
         numel,
         BLOCK: tl.constexpr,
-        NUM_BINS: tl.constexpr,   # next_pow2(num_physical + 1); last bins hold oob
+        NUM_BINS: tl.constexpr,  # next_pow2(num_physical + 1); last bins hold oob
         TOP_K: tl.constexpr,
     ):
         # Same hybrid map as _eplb_remap_kernel (local slot, or token-granularity
@@ -2575,7 +2578,9 @@ if _EPLB_HAS_TRITON:
         valid = (lid >= 0) & (lid < num_logical)
         is_tail = lid >= num_logical
         safe_lid = tl.where(valid, lid, 0)
-        mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(tl.int64)
+        mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(
+            tl.int64
+        )
         need_spread = valid & (mapped < 0)
         cnt = tl.load(cnt_ptr + safe_lid, mask=mask & valid, other=1).to(tl.int64)
         cnt = tl.maximum(cnt, 1)

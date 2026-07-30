@@ -6,8 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import pytest
-
 torch = pytest.importorskip("torch")
 
 # Keep config import order consistent; skip if the full atom import env
