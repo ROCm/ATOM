@@ -312,6 +312,7 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "compressed-tensors",
         ]:
             self.online_quant = True
             online_parser = get_quant_parser("online_quant")
