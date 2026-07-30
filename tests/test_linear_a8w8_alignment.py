@@ -18,7 +18,7 @@ def _load_alignment_helper():
     )
     namespace = {}
     module = ast.Module(body=[helper], type_ignores=[])
-    exec(
+    exec(  # noqa: S102
         compile(ast.fix_missing_locations(module), str(LINEAR_PATH), "exec"), namespace
     )
     return namespace["_can_use_a8w8_preshuffle"]
@@ -34,7 +34,7 @@ def _load_output_padding_helper():
     )
     namespace = {}
     module = ast.Module(body=[helper], type_ignores=[])
-    exec(
+    exec(  # noqa: S102
         compile(ast.fix_missing_locations(module), str(LINEAR_PATH), "exec"), namespace
     )
     return namespace["_a8w8_preshuffle_output_padding"]
@@ -54,7 +54,7 @@ def _load_linear_method(method_name: str):
     )
     namespace = {}
     module = ast.Module(body=[method], type_ignores=[])
-    exec(
+    exec(  # noqa: S102
         compile(ast.fix_missing_locations(module), str(LINEAR_PATH), "exec"), namespace
     )
     return namespace[method_name]

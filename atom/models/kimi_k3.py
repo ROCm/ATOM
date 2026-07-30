@@ -8,7 +8,7 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
@@ -22,7 +22,6 @@ from einops import rearrange
 from torch import nn
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
-from atom.quant_spec import should_skip_online_quant
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -51,6 +50,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.quant_spec import should_skip_online_quant
 from atom.utils import mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -588,7 +588,7 @@ class KimiFullAttention(nn.Module):
 
 def _kda_attention_with_output_fake(
     hidden_states: torch.Tensor,
-    hidden_states_scale: Optional[torch.Tensor],
+    hidden_states_scale: torch.Tensor | None,
     layer_name: str,
 ) -> torch.Tensor:
     # The mixer output (o_proj) is always bf16 even when the input activation is
@@ -605,7 +605,7 @@ def _kda_attention_with_output_fake(
 )
 def kda_attention_with_output(
     hidden_states: torch.Tensor,
-    hidden_states_scale: Optional[torch.Tensor],
+    hidden_states_scale: torch.Tensor | None,
     layer_name: str,
 ) -> torch.Tensor:
     """Opaque splitting-op boundary for the KDA mixer.
@@ -870,7 +870,7 @@ class KimiKDAAttention(nn.Module):
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
-        hidden_states_scale: Optional[torch.Tensor] = None,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         fwd_ctx = get_forward_context()
         gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
