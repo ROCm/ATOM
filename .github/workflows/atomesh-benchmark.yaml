@@ -79,24 +79,32 @@ on:
         description: 'Optional Slurm account override. Leave empty to use the runner default.'
         required: false
         default: ''
-        type: string
+        type: choice
+        options:
+          - ''
+          - amd-frameworks
+          - amd-tw
       atomesh_slurm_partition:
         description: 'Optional Slurm partition override. Leave empty to use the runner default.'
         required: false
         default: ''
-        type: string
+        type: choice
+        options:
+          - ''
+          - amd-frameworks
+          - amd-tw
       atomesh_log_root:
         description: 'Root directory for ATOMesh Slurm logs'
         required: false
         default: ''
         type: string
       atomesh_1p1d_nodes:
-        description: 'Optional comma-separated ATOMesh 1P1D nodes'
+        description: 'Optional comma-separated ATOMesh 1P1D nodes [mia1-p02-g42, mia1-p02-g44, mia1-p02-g47, mia1-p01-g36, mia1-p01-g47]'
         required: false
         default: ''
         type: string
       atomesh_2p1d_nodes:
-        description: 'Optional comma-separated ATOMesh 2P1D nodes'
+        description: 'Optional comma-separated ATOMesh 2P1D nodes [mia1-p02-g42, mia1-p02-g44, mia1-p02-g47, mia1-p01-g36, mia1-p01-g47]'
         required: false
         default: ''
         type: string
