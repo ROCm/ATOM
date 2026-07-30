@@ -822,7 +822,12 @@ class KimiKDAAttention(nn.Module):
         f_a = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd].contiguous()
         gate = self.f_b_proj(f_a)
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        out = hidden_states.new_empty(
+        # Zeroed, not empty: on the decode path the fused kernel returns early
+        # for rows whose cache slot is PAD_SLOT_ID (CUDAGraph batch padding), so
+        # it leaves those rows unwritten. Uninitialized bf16 easily lands on a
+        # NaN/Inf bit pattern, which o_norm/o_proj then propagate into
+        # hidden_states and the MoE router turns into out-of-range expert ids.
+        out = hidden_states.new_zeros(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
 
