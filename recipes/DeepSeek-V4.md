@@ -36,11 +36,7 @@ The routed-MoE implementation is selectable with `--moe-backend {standard,mega}`
 - **`standard`** — the existing path: separate prepare → dispatch → GEMM1 →
   activation → GEMM2 → combine kernels / all2all steps.
 - **`mega`** — fused FlyDSL **MegaMoE**: dispatch, both grouped GEMMs, and
-  combine are fused into a single megakernel per layer, removing the standalone
-  sort + dispatch launches. This roughly halves the MoE kernel launches per
-  layer, so it is primarily a **decode** win (decode is launch/overhead-bound),
-  and the gain grows with concurrency. Prefill is compute-bound and sees little
-  or no benefit.
+  combine are fused into a single megakernel per layer.
 
 ```bash
 AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
@@ -54,15 +50,9 @@ Notes:
 - Validated target is gfx950 (MI355X) + V4-Pro FP4 e2m1 microscaling; keep the
   same `AITER_BF16_FP8_MOE_BOUND=0` + `ATOM_MOE_GU_ITLV=1` env as the standard
   path.
-- Requires a recent `aiter` (ships the MegaMoE FlyDSL kernels) and a clean JIT
-  cache — clear stale compiled kernels before the first launch:
-  `rm -rf /root/.cache/atom/*`. A stale `aiter`/JIT silently falls back to
-  `standard`, so **confirm the startup log reports `moe_backend='mega'`**.
 - Works with EPLB (`--enable-expert-parallel` + rebalancing): MegaMoE exposes
   its private expert-weight layout to the rebalancer via `get_eplb_weight_views`,
   so expert migration operates on the live fused weights.
-- This is the ATOM-native serving flag; it is unrelated to the vLLM plugin's
-  `--moe-backend aiter` (a different flag namespace).
 
 ### FP8 on MI308 / gfx942 (V4-Flash-Base, FP8 per-block routed experts)
 

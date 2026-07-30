@@ -17,6 +17,7 @@ by shape/quant/mtpr/tile); per-layer weights are swapped in before forward
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -29,18 +30,12 @@ os.environ.setdefault("FUSED_MEGA_COMPACT_ATOM", "1")
 # expert id (kernel patch in fused_moe_gemm_2stage.py). We pass local-epr w1.
 os.environ.setdefault("FUSED_MEGA_W1_LOCAL", "1")
 
+logger = logging.getLogger("atom")
+
 _FLYDSL_KERNELS_PATH = os.environ.get("ATOM_FLYDSL_KERNELS_PATH", "/home/yashao/FlyDSL")
 _FP4 = getattr(torch, "float4_e2m1fn_x2", None)
 _MEGA_CACHE: dict = {}
-_MEGA_DBG_N = 0
-_MEGA_PRE_N = 0
 _MEGA_BUILD_DBG = False
-_MEGA_BUILD_CNT = 0
-_MEGA_DUMP_LAYERS = {
-    int(v)
-    for v in os.environ.get("ATOM_MEGA_DUMP_LAYERS", "0,30").split(",")
-    if v.strip()
-}
 
 
 def _os_env(k):
@@ -56,13 +51,12 @@ def _shuffle_fns():
     """The EXACT shuffle ops MegaMoE's reference uses (FlyDSL tests.utils /
     tests.kernels.utils), NOT aiter's shuffle_weight."""
     _ensure_path()
-    from tests.utils import shuffle_weight
-
     # FlyDSL mega_moe_v1 refactor #807 removed tests/kernels/utils/fp4_utils.py and
     # folded e8m0_shuffle into gemm_common_utils. Alias it so downstream
     # `fp4_utils.e8m0_shuffle(...)` keeps working against the current-tip kernels
     # (weight-prep MUST match the MegaMoE commit we actually run).
     from tests.kernels.utils import gemm_common_utils as fp4_utils
+    from tests.utils import shuffle_weight
 
     return shuffle_weight, fp4_utils
 
@@ -74,7 +68,7 @@ def build_mega_weights(layer) -> None:
     shuffle_weight, fp4_utils = _shuffle_fns()
 
     w13 = layer.w13_weight.data  # [E_local, 2*inter, hidden//2] fp4-packed uint8
-    E, two_inter, h_half = w13.shape
+    E, two_inter, _h_half = w13.shape
     # stash local expert count NOW (from raw shape) — run_mega_moe must not re-infer
     # it from the shuffled _mega_w1 (shape changes with shuffle_weight_w4/.view(-1)).
     layer._mega_local_E = int(E)
@@ -114,32 +108,19 @@ def build_mega_weights(layer) -> None:
         fp4_utils.e8m0_shuffle(s2f).view(torch.uint8).contiguous().view(-1)
     )
 
-    # stash RAW fp4 weights+scales (CPU) for a few layers for offline dequant compare
-    global _MEGA_BUILD_CNT
-    _idx = _MEGA_BUILD_CNT
-    _MEGA_BUILD_CNT += 1
-    if os.environ.get("ATOM_MEGA_DUMP", "") and _idx in _MEGA_DUMP_LAYERS:
-        layer._raw_w13 = w13.detach().cpu()
-        layer._raw_w13_scale = s1.detach().cpu()
-        layer._raw_w2 = w2.detach().cpu()
-        layer._raw_w2_scale = s2.detach().cpu()
-        layer._mega_dump_first = True
-        layer._mega_layer_idx = _idx
-
     global _MEGA_BUILD_DBG
     if not _MEGA_BUILD_DBG:
         _MEGA_BUILD_DBG = True
         _w13b = getattr(layer, "w13_bias", None)
         _w2b = getattr(layer, "w2_bias", None)
-        print(
+        logger.info(
             f"[MEGA-BUILD] w13={tuple(w13.shape)}{w13.dtype} w13_scale={tuple(s1.shape)}{s1.dtype} "
             f"w2={tuple(w2.shape)}{w2.dtype} w2_scale={tuple(s2.shape)}{s2.dtype} | "
             f"_mega_w1={tuple(layer._mega_w1.shape)} _mega_w1_scale={tuple(layer._mega_w1_scale.shape)} "
             f"_mega_w2={tuple(layer._mega_w2.shape)} _mega_w2_scale={tuple(layer._mega_w2_scale.shape)} | "
             f"w13_bias={None if _w13b is None else tuple(_w13b.shape)} "
             f"w2_bias={None if _w2b is None else tuple(_w2b.shape)} "
-            f"GU_ITLV={_os_env('ATOM_MOE_GU_ITLV')}",
-            flush=True,
+            f"GU_ITLV={_os_env('ATOM_MOE_GU_ITLV')}"
         )
 
 
@@ -158,7 +139,6 @@ def get_or_build_mega_moe(
     w2,
     w2_scale,
     gemm2_tile=(-1, -1, -1),
-    gemm2_tile_table=None,
 ):
     key = (
         rank,
@@ -194,14 +174,12 @@ def get_or_build_mega_moe(
             gemm2_tile_n=tn,
             gemm2_tile_k=tk,
             gemm2_persist_m=-1,
-            # mega_moe_v1 (e9d3bfcf+) replaced stage2_mode="fused" with
-            # enable_fused_stage1/enable_fused_stage2 (both default True = fused).
-            # A/B toggle (ATOM_MEGA_FUSED=0 -> non-fused: standard dispatch/gemm/
-            # unified combine). Both flags move together: mega_moe.py forbids
-            # fused_stage1=True + fused_stage2=False.
-            enable_fused_stage1=(os.environ.get("ATOM_MEGA_FUSED", "1") == "1"),
-            enable_fused_stage2=(os.environ.get("ATOM_MEGA_FUSED", "1") == "1"),
-            gemm2_tile_table=gemm2_tile_table,
+            # Both stages fused: the whole point of the mega backend. mega_moe.py
+            # forbids fused_stage1=True + fused_stage2=False, so they move together.
+            enable_fused_stage1=True,
+            enable_fused_stage2=True,
+            # ATOM no longer builds a tune table; MegaMoE auto-loads its own.
+            gemm2_tile_table=None,
         )
         _MEGA_CACHE[key] = m
     return m
@@ -218,17 +196,10 @@ def run_mega_moe(
     experts: int,
     topk: int,
     quant: str = "a8w4",
-    gemm2_tile=None,
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoE. x: [tokens, model_dim] bf16 (this rank's
     local tokens, pre-dispatch). topk_ids: global expert ids. Returns
     [tokens, model_dim] bf16."""
-    if gemm2_tile is None:
-        # mega_moe_v1 auto-loads its per-M MegaGemm2 tune table when
-        # gemm2_tile_m<=0 (native best-config path: prefill tile_m=64, decode
-        # 16/32). Override via ATOM_MEGA_GEMM2_TILE="m,n,k" to force a fixed tile.
-        _t = os.environ.get("ATOM_MEGA_GEMM2_TILE", "-1,-1,-1")
-        gemm2_tile = tuple(int(v) for v in _t.split(","))
     from aiter.dist.parallel_state import get_ep_group
 
     am = get_ep_group().device_communicator.all2all_manager
@@ -262,14 +233,7 @@ def run_mega_moe(
             w1_scale=layer._mega_w1_scale,
             w2=layer._mega_w2,
             w2_scale=layer._mega_w2_scale,
-            gemm2_tile=tuple(gemm2_tile),
-            gemm2_tile_table=None,
         )
-
-    # Per-M GEMM2 tile selection now lives in FlyDSL: MegaMoE auto-loads its
-    # MegaGemm2 tune JSON by default (symmetric with gemm1's MegaStage1 auto-tune)
-    # and falls back to the op's single default tile on a miss. ATOM no longer
-    # builds/forwards the table (we pass gemm2_tile_table=None to get_or_build).
 
     # per-layer weight swap (runtime pointer args; shapes identical across layers).
     # mega_moe_v1 refactor (8acf56d): fused stage-1 weights are held as
@@ -283,134 +247,6 @@ def run_mega_moe(
 
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
-    # PRE-FORWARD routing diagnostic (prints BEFORE the crashing gemm2 kernel).
-    global _MEGA_PRE_N
-    if _MEGA_PRE_N < 4:
-        _MEGA_PRE_N += 1
-        try:
-            _i64 = ids.to(torch.int64)
-            _rs, _ = torch.sort(_i64, dim=1)
-            _dups = int((_rs[:, 1:] == _rs[:, :-1]).sum().item())
-            _cnt = torch.bincount(_i64.reshape(-1), minlength=experts)
-            _emax = int(_cnt.max().item())
-            _eargmax = int(_cnt.argmax().item())
-            _lo, _hi = rank * local_E, (rank + 1) * local_E
-            _self_local = int(((_i64 >= _lo) & (_i64 < _hi)).sum().item())
-            print(
-                f"[MEGA-PRE] rank={rank} run_tokens={run_tokens} mtpr={mtpr} max_recv={world*mtpr} "
-                f"experts={experts} local_E={local_E} topk_arg={topk} ids.shape={tuple(ids.shape)} "
-                f"ids[min={int(ids.min())},max={int(ids.max())}] row_dups={_dups} "
-                f"per_expert_max={_emax}@e{_eargmax} self->local={_self_local} "
-                f"x.shape={tuple(x.shape)} w1={tuple(layer._mega_w1.shape)} "
-                f"stage1.w1_id={id(getattr(mega,'_s1_w1',None))} layer_w1_id={id(layer._mega_w1)}",
-                flush=True,
-            )
-            import sys as _sys
-
-            _sys.stdout.flush()
-        except Exception as _e:  # noqa: BLE001
-            print(f"[MEGA-PRE] print failed: {_e}", flush=True)
-    # DUMP the exact warmup inputs (this rank) BEFORE the crashing forward, so we
-    # can replay real routing in the standalone bench. Gated by ATOM_MEGA_DUMP_IDS=dir.
-    _dd = os.environ.get("ATOM_MEGA_DUMP_IDS", "")
-    if _dd and not getattr(layer, "_mega_ids_dumped", False):
-        try:
-            os.makedirs(_dd, exist_ok=True)
-            torch.save(
-                {
-                    "rank": rank,
-                    "world": world,
-                    "run_tokens": run_tokens,
-                    "mtpr": mtpr,
-                    "experts": experts,
-                    "local_E": local_E,
-                    "topk": topk,
-                    "ids": ids.detach().cpu(),
-                    "wts": wts.detach().cpu(),
-                    "x": x.detach().to(torch.bfloat16).cpu(),
-                },
-                f"{_dd}/atom_ids_rank{rank}.pt",
-            )
-            layer._mega_ids_dumped = True
-            print(
-                f"[MEGA-DUMP-IDS] rank{rank} saved to {_dd}/atom_ids_rank{rank}.pt",
-                flush=True,
-            )
-        except Exception as _e:  # noqa: BLE001
-            print(f"[MEGA-DUMP-IDS] failed: {_e}", flush=True)
-    # inference_mode(False): the fused kernels do in-place resets on their persistent
-    # buffers (op.total_recv.zero_(), local_hist/cursor.zero_()); running the forward
-    # outside inference mode keeps those buffers normal tensors so cudagraph capture
-    # (also outside inference mode) can reset them without the inference-tensor error.
     with torch.inference_mode(False), torch.no_grad():
         out = mega.forward_bf16(x.contiguous(), wts, ids)
-    # one-shot dump for offline numeric compare (ATOM_MEGA_DUMP=/path, small bs only)
-    _dump = os.environ.get("ATOM_MEGA_DUMP", "")
-    if (
-        _dump
-        and run_tokens <= 1024
-        and getattr(layer, "_mega_dump_first", False)
-        and getattr(layer, "_mega_dumped", False) is False
-        and not torch.cuda.is_current_stream_capturing()
-        and int(ids.unique().numel()) >= 32
-    ):
-        try:
-            from aiter.dist.parallel_state import get_ep_group as _gep
-
-            _r = int(_gep().device_communicator.all2all_manager.rank)
-            torch.save(
-                {
-                    "rank": _r,
-                    "run_tokens": run_tokens,
-                    "x": x.detach().to(torch.bfloat16).cpu(),
-                    "wts": wts.detach().cpu(),
-                    "ids": ids.detach().cpu(),
-                    "mega_w1": layer._mega_w1.detach().cpu(),
-                    "mega_w1_scale": layer._mega_w1_scale.detach().cpu(),
-                    "mega_w2": layer._mega_w2.detach().cpu(),
-                    "mega_w2_scale": layer._mega_w2_scale.detach().cpu(),
-                    "raw_w13": layer._raw_w13,
-                    "raw_w13_scale": layer._raw_w13_scale,
-                    "raw_w2": layer._raw_w2,
-                    "raw_w2_scale": layer._raw_w2_scale,
-                    "out": out.detach().to(torch.bfloat16).cpu(),
-                    "model_dim": model_dim,
-                    "inter_dim": inter_dim,
-                    "experts": experts,
-                    "topk": topk,
-                    "layer_idx": int(getattr(layer, "_mega_layer_idx", -1)),
-                },
-                f"{_dump}/mega_dump_rank{_r}_L{int(getattr(layer, '_mega_layer_idx', -1))}.pt",
-            )
-            layer._mega_dumped = True
-            print(
-                f"[MEGA-DUMP] rank{_r} L{int(getattr(layer,'_mega_layer_idx',-1))} saved run_tokens={run_tokens}",
-                flush=True,
-            )
-        except Exception as _e:  # noqa: BLE001
-            print(f"[MEGA-DUMP] failed: {_e}", flush=True)
-    global _MEGA_DBG_N
-    if _MEGA_DBG_N < 2:
-        _MEGA_DBG_N += 1
-        try:
-            _i64 = ids.to(torch.int64)
-            # per-row distinct expert count (topk should be all-distinct)
-            _rowsorted, _ = torch.sort(_i64, dim=1)
-            _dups = int((_rowsorted[:, 1:] == _rowsorted[:, :-1]).sum().item())
-            # per-GLOBAL-expert receive count (token-copies), and the max
-            _cnt = torch.bincount(_i64.reshape(-1), minlength=experts)
-            _emax = int(_cnt.max().item())
-            _eargmax = int(_cnt.argmax().item())
-            # how many of THIS rank's local tokens hit each local-expert range (sanity)
-            _lo, _hi = rank * local_E, (rank + 1) * local_E
-            _self_local = int(((_i64 >= _lo) & (_i64 < _hi)).sum().item())
-            print(
-                f"[MEGA-DBG] rank={rank} run_tokens={run_tokens} mtpr={mtpr} max_recv={world*mtpr} "
-                f"experts={experts} local_E={local_E} topk={topk} "
-                f"ids[min={int(ids.min())},max={int(ids.max())}] row_dups={_dups} "
-                f"per_expert_max_count={_emax}@e{_eargmax} self->local={_self_local}",
-                flush=True,
-            )
-        except Exception as _e:  # noqa: BLE001
-            print(f"[MEGA-DBG] print failed: {_e}", flush=True)
     return out
