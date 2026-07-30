@@ -65,6 +65,7 @@ class EngineArgs:
     dp_load_balance: str = DP_LB_DEFAULT
     enable_tbo: Optional[str] = None
     all2all_backend: Optional[str] = None
+    moe_backend: str = "standard"
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
@@ -263,6 +264,14 @@ class EngineArgs:
             help="All2all backend mode for MORI. "
             "Default is 'high-throughput'. "
             "Use '--all2all-backend low-latency' for AsyncLL MORI kernel overlap.",
+        )
+        parser.add_argument(
+            "--moe-backend",
+            type=str,
+            default="standard",
+            choices=["standard", "mega"],
+            help="MoE implementation. 'standard' uses the existing "
+            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
         )
         parser.add_argument(
             "--method",

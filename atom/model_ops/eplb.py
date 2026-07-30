@@ -1827,6 +1827,27 @@ class EPLBManager:
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
         num_local = self.live_metadata.num_local_physical_experts
+        # Specialized quant methods own their live weight layout. Ask the method
+        # for expert-major views so EPLB never needs to know Mega-private fields
+        # or shuffle details. Methods without this hook use the legacy collector.
+        quant_method = getattr(layer, "quant_method", None)
+        provider = getattr(quant_method, "get_eplb_weight_views", None)
+        if callable(provider):
+            method_views = provider(layer, num_local)
+            if method_views is not None:
+                if not method_views:
+                    raise RuntimeError(
+                        "EPLB quant method returned no live expert weights"
+                    )
+                for tensor in method_views:
+                    if tensor.dim() == 0 or int(tensor.shape[0]) != num_local:
+                        raise RuntimeError(
+                            "EPLB quant method must return expert-major "
+                            f"weights with shape[0]={num_local}, got "
+                            f"shape={tuple(tensor.shape)}."
+                        )
+                return method_views
+
         names = (
             "w13_weight",
             "w2_weight",
