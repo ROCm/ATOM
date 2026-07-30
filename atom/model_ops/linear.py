@@ -373,6 +373,27 @@ def gemm_a8w8_per_token_impl(
     )
 
 
+def _can_use_a8w8_preshuffle(output_size: int, input_size: int) -> bool:
+    """Whether an a8w8 weight can use the AITER bpreshuffle GEMM as-is.
+
+    ``shuffle_weight(..., layout=(16, 16))`` packs the output (N) dim in 16-row
+    tiles and the input (K) dim in ``BK = IK * 2 = 32``-col tiles (it asserts
+    ``x.shape[-1] % 32 == 0``). So N must be 16-aligned and K must be 32-aligned.
+    A fused output that is not 16-aligned (e.g. KDA in_proj, whose
+    N = 4*local_proj + num_heads + head_dim) must first be padded -- see
+    ``_a8w8_preshuffle_output_padding``.
+    """
+    return output_size % 16 == 0 and input_size % 32 == 0
+
+
+def _a8w8_preshuffle_output_padding(output_size: int) -> int:
+    """Rows needed to pad an a8w8 weight's output dim (N) up to the GEMM's N-tile
+    (128). Returns 0 when already tile-aligned. Padding N to 128 also makes it
+    16-aligned, so the tuned preshuffle GEMM can run instead of falling back."""
+    remainder = output_size % 128
+    return 0 if remainder == 0 else 128 - remainder
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -688,6 +709,16 @@ class LinearBase(nn.Module):
         }
 
     def process_weights_after_loading(self):
+        # Empty fused shell: a container module already folded this Linear's
+        # weight into a sibling and released the storage (weight.data =
+        # new_empty(0)) -- e.g. KDA b_proj / f_a_proj, whose weights
+        # KimiKDAAttention.process_weights_after_loading concatenates into in_proj.
+        # Such a shell is never called at runtime, so skip all post-load work.
+        # In particular this avoids online-requantizing a 0-element weight (which
+        # would be wasted work, misreport in the online-quant summary, and can
+        # produce degenerate scale tensors).
+        if self.weight.numel() == 0:
+            return
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
@@ -775,6 +806,10 @@ class LinearBase(nn.Module):
                     need_shuffle = True
             if need_shuffle:
                 if self.weight.dim() == 2:
+                    # a8w8 (per_Token fp8) bpreshuffle needs an N-tile-aligned
+                    # output; pad a misaligned fused N (e.g. KDA in_proj) before
+                    # shuffling so the padded rows land in the shuffled layout too.
+                    self._maybe_pad_a8w8_preshuffle_output()
                     shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
@@ -782,6 +817,46 @@ class LinearBase(nn.Module):
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+
+    def _maybe_pad_a8w8_preshuffle_output(self):
+        """Pad a per_Token FP8 weight's output dim (N) up to the CK bpreshuffle
+        N-tile when it is not tile-aligned, so the fused GEMM can use the tuned
+        preshuffle path. Records the logical width in ``_output_size_before_padding``
+        so ``forward`` slices the padding rows back off. No-op (byte-identical) for
+        already-aligned weights, so existing models are unaffected.
+        """
+        if not (
+            self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
+        ):
+            return
+        if self.weight.dim() != 2:
+            return
+        output_size, input_size = self.weight.shape
+        if _can_use_a8w8_preshuffle(output_size, input_size):
+            return
+        pad = _a8w8_preshuffle_output_padding(output_size)
+        if not _can_use_a8w8_preshuffle(output_size + pad, input_size):
+            # Padding the output (N) cannot make this weight preshuffle-able, i.e.
+            # the input dim K is not 32-aligned. Fail loudly here rather than let
+            # shuffle_weights hit its cryptic `x.shape[-1] % 32 == 0` assertion.
+            raise RuntimeError(
+                f"{self.prefix}: a8w8 bpreshuffle GEMM requires K % 32 == 0, got "
+                f"K={input_size}. Align K or run this layer via the triton a8w8 "
+                f"path (ATOM_USE_TRITON_GEMM=1)."
+            )
+        self._output_size_before_padding = output_size
+        # Padding rows are zeros -> their GEMM output is discarded after slicing.
+        self.weight.data = torch.nn.functional.pad(self.weight.data, (0, 0, 0, pad))
+        # Grow the per-output-channel weight_scale with matching (arbitrary) rows.
+        ws = self.weight_scale.data
+        self.weight_scale.data = torch.cat(
+            [ws, ws.new_ones((pad, *ws.shape[1:]))], dim=0
+        )
+        # Bias is also per-output-channel; pad with zeros so `y += bias` on the
+        # padded output stays shape-correct (KDA is bias=False, but keep general).
+        if self.bias is not None:
+            b = self.bias.data
+            self.bias.data = torch.cat([b, b.new_zeros((pad, *b.shape[1:]))], dim=0)
 
     # linear mark trace shape/dtype helper
     def get_trace_prefix(
@@ -925,6 +1000,10 @@ class LinearBase(nn.Module):
                 )
                 if self.bias is not None:
                     y += self.bias
+        if hasattr(self, "_output_size_before_padding"):
+            # Drop the CK-tile padding rows added to the a8w8 preshuffle weight so
+            # the GEMM output matches this layer's logical output width.
+            y = y[..., : self._output_size_before_padding]
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = tensor_model_parallel_all_reduce(y)
         return y

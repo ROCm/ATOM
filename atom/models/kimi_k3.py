@@ -8,21 +8,21 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 import torch
-from aiter import ActivationType, QuantType, fused_qk_rmsnorm
+from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from einops import rearrange
 from torch import nn
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.quant_spec import should_skip_online_quant
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -134,39 +134,38 @@ def _extract_layer_idx(prefix: str) -> int:
     return 0
 
 
-def _fused_qk_rmsnorm_fake(
-    q: torch.Tensor,
-    q_weight: torch.Tensor,
-    q_eps: float,
-    k: torch.Tensor,
-    k_weight: torch.Tensor,
-    k_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return q.new_empty(q.shape), k.new_empty(k.shape)
+# RMSNorm+quant fusion is scheme-agnostic: the aiter fused RMSNorm kernels
+# (RMSNorm._aiter_rms_quant and deepseek's _fuse_rmsnorm_quant) emit any of these
+# dynamic activation quant layouts, so a preceding norm can fold the quant for a
+# Linear that runs one of them. Everything else (per_Tensor, static-scale, No)
+# keeps the standalone quant inside the Linear.
+_RMS_FUSABLE_QUANT_TYPES = (
+    QuantType.per_1x32,
+    QuantType.per_1x128,
+    QuantType.per_Token,
+)
 
 
-@torch_compile_guard(gen_fake=_fused_qk_rmsnorm_fake, mutates_args=[])
-def _fused_qk_rmsnorm(
-    q: torch.Tensor,
-    q_weight: torch.Tensor,
-    q_eps: float,
-    k: torch.Tensor,
-    k_weight: torch.Tensor,
-    k_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-    fused_qk_rmsnorm(
-        q_out_quantized=q_out,
-        q=q,
-        q_weight=q_weight,
-        q_epsilon=q_eps,
-        k_out=k_out,
-        k=k,
-        k_weight=k_weight,
-        k_epsilon=k_eps,
-    )
-    return q_out, k_out
+def _effective_layer_quant(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> tuple[QuantType, torch.dtype | None]:
+    """Resolve the ``(quant_type, quant_dtype)`` a Linear runs with at runtime.
+
+    Same resolution the Linear itself performs (mirrors
+    ``LinearBase.online_quantize_weight`` and deepseek_v2's MLA setup): the static
+    checkpoint scheme, overridden by the online-quant target when that override
+    actually applies (``should_skip_online_quant``). A preceding RMSNorm uses this
+    to decide whether -- and in which scheme (fp8 / fp4x2, per-token / block) -- to
+    fuse its activation quant, rather than hard-coding one layout.
+    """
+    if quant_config is None:
+        return QuantType.No, None
+    cfg = quant_config.get_layer_quant_config(prefix)
+    if quant_config.online_quant:
+        online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+        if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
+            cfg = online_cfg
+    return cfg.quant_type, cfg.quant_dtype
 
 
 class _NoPositionalRotaryEmbedding(RotaryEmbedding):
@@ -259,7 +258,14 @@ class KimiMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+        # `x` arrives as a (fp8, scale) tuple when the preceding RMSNorm fused its
+        # activation quant (dense-MLP layers); gate_up_proj then consumes it
+        # directly. Plain-tensor input (shared experts, unfused layers) keeps the
+        # standalone quant inside gate_up_proj.
+        x_scale = None
+        if isinstance(x, tuple):
+            x, x_scale = x
+        return self.down_proj(self.act_fn(self.gate_up_proj(x, x_scale)))
 
 
 class KimiSparseMoeBlock(nn.Module):
@@ -504,31 +510,92 @@ class KimiFullAttention(nn.Module):
             prefix=prefix,
         )
 
+        # --- RMSNorm(+quant) fusion metadata (general across fp8 / fp4x2) ------
+        # q/kv latent norms + optional q-activation quant fuse into ONE kernel via
+        # _fuse_rmsnorm_quant. The scheme is q_b_proj's (the consumer of the normed
+        # q); when it is not a fusable quant scheme we still fuse the two norms
+        # (quant_type=No, bf16 out) so the dual-norm stays a single launch.
+        qknorm_type, qknorm_dtype = _effective_layer_quant(
+            quant_config, f"{prefix}.q_b_proj"
+        )
+        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
+        self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
+        self.qknorm_quant_type_value = (
+            qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
+        )
+        # input_layernorm fuses its activation quant only when BOTH consumers of
+        # the normed hidden state -- fused_qkv_a_proj and g_proj -- run with the
+        # same fusable RMSNorm quant scheme (else a mismatched consumer mis-GEMMs).
+        a_scheme = _effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")
+        g_scheme = _effective_layer_quant(quant_config, f"{prefix}.g_proj")
+        self.fuse_input_norm_quant = (
+            a_scheme[0] in _RMS_FUSABLE_QUANT_TYPES and a_scheme == g_scheme
+        )
+        self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        q, kv, k_rope = torch.split(
-            self.fused_qkv_a_proj(hidden_states),
+        # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
+        # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
+        # MLA module (q_proj consumes it). kv_c_normed stays bf16 -- it is written
+        # to the KV cache and re-projected inside MLA, so it must not be quantized.
+        from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
+
+        # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
+        # quant; both fused_qkv_a_proj and g_proj consume it directly.
+        hidden_states_scale = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+
+        q_c, kv_c, k_rope = torch.split(
+            self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        q, kv = _fused_qk_rmsnorm(
-            q,
+        q_shuffle = False
+        q_scale_shuffle_padding = False
+        if self.qknorm_dtype == dtypes.fp4x2:
+            from atom.model_ops.linear import use_triton_gemm
+            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
+
+            if not use_triton_gemm():
+                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
+                    q_c.shape[0]
+                )
+        (q, q_scale), _, kv, _ = _fuse_rmsnorm_quant(
+            q_c,
             self.q_a_layernorm.weight,
             self.q_a_layernorm.eps,
-            kv,
+            kv_c,
             self.kv_a_layernorm.weight,
             self.kv_a_layernorm.eps,
+            None,
+            dtype_quant=self.qknorm_dtype,
+            shuffle=q_shuffle,
+            scale_shuffle_padding=q_scale_shuffle_padding,
+            group_size=128,
+            quant_type=self.qknorm_quant_type_value,
+            output_unquantized_inp1=False,
+            transpose_scale=True,
         )
-        attn_out = self.attn(q, kv, k_rope, positions)
-        attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))
+        attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        attn_out = attn_out * torch.sigmoid(
+            self.g_proj(hidden_states, hidden_states_scale)
+        )
         return self.o_proj(attn_out)
 
 
 def _kda_attention_with_output_fake(
-    hidden_states: torch.Tensor, layer_name: str
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    layer_name: str,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    # The mixer output (o_proj) is always bf16 even when the input activation is
+    # fp8 (fused input_layernorm+quant), so pin the dtype rather than empty_like.
+    return torch.empty(
+        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+    )
 
 
 @mark_spliting_op(
@@ -537,7 +604,9 @@ def _kda_attention_with_output_fake(
     mutates_args=[],
 )
 def kda_attention_with_output(
-    hidden_states: torch.Tensor, layer_name: str
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    layer_name: str,
 ) -> torch.Tensor:
     """Opaque splitting-op boundary for the KDA mixer.
 
@@ -551,7 +620,7 @@ def kda_attention_with_output(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return self._forward_impl(hidden_states)
+    return self._forward_impl(hidden_states, hidden_states_scale)
 
 
 class KimiKDAAttention(nn.Module):
@@ -675,6 +744,14 @@ class KimiKDAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        # The decoder's input_layernorm can fuse its activation quant into the
+        # single fused in_proj GEMM (q|k|v|g|b|f_a) that consumes the normed hidden
+        # state; the (fp8, scale) rides the splitting custom op into _forward_impl.
+        # Enabled for any fusable RMSNorm quant scheme (fp8 / fp4x2).
+        in_proj_type, _ = _effective_layer_quant(quant_config, f"{prefix}.in_proj")
+        self.fuse_input_norm_quant = in_proj_type in _RMS_FUSABLE_QUANT_TYPES
+        self.input_quant_prefix = f"{prefix}.in_proj"
+
     def process_weights_after_loading(self) -> None:
         """Fuse all hidden-input projections into the single in-proj (one GEMM).
 
@@ -778,15 +855,30 @@ class KimiKDAAttention(nn.Module):
         return chunk_kda(**kwargs, disable_recompute=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
+        # per-token quant; carry the scale through the opaque splitting custom op
+        # so in_proj consumes it in _forward_impl.
+        hidden_states_scale = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
         # Route through the opaque custom op so torch.compile splits the graph
         # here instead of tracing the stateful recurrence in _forward_impl.
-        return torch.ops.aiter.kda_attention_with_output(hidden_states, self.layer_name)
+        return torch.ops.aiter.kda_attention_with_output(
+            hidden_states, hidden_states_scale, self.layer_name
+        )
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         fwd_ctx = get_forward_context()
         gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
         if gdn_metadata is None:
-            return hidden_states.new_zeros(hidden_states.shape)
+            # Output is bf16 even when the input activation is fp8 (fused quant).
+            return torch.zeros(
+                hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+            )
 
         cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         conv_state = cache.k_cache
@@ -796,6 +888,8 @@ class KimiKDAAttention(nn.Module):
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
+        if hidden_states_scale is not None:
+            hidden_states_scale = hidden_states_scale[:num_actual_tokens]
         # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
         # part. `out_gate` is the KDA output gate consumed at o_norm below
         # (computed here so it rides the same GEMM instead of a separate one
@@ -806,7 +900,7 @@ class KimiKDAAttention(nn.Module):
         lp = self.local_proj_size
         nlh = self.num_local_heads
         hd = self.head_dim
-        fused_in = self.in_proj(hidden_states)
+        fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
         # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
         # row stride N_fused). Both causal-conv consumers read the token stride
         # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
@@ -822,7 +916,8 @@ class KimiKDAAttention(nn.Module):
         f_a = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd].contiguous()
         gate = self.f_b_proj(f_a)
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        out = hidden_states.new_empty(
+        # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
+        out = fused_in.new_empty(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
 
@@ -1005,9 +1100,36 @@ class KimiDecoderLayer(nn.Module):
             self.mlp = KimiMLP(
                 config, quant_config=quant_config, prefix=f"{prefix}.mlp"
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Fuse the activation quant into input_layernorm when the attention input
+        # projection(s) run with a fusable quant scheme (self_attn decides and
+        # exposes the flag + representative prefix). The normed output then flows
+        # to the attention as a (fp8, scale) tuple instead of a bf16 tensor + a
+        # standalone quant op.
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.self_attn.fuse_input_norm_quant,
+            quant_config=(
+                quant_config if self.self_attn.fuse_input_norm_quant else None
+            ),
+            prefix=self.self_attn.input_quant_prefix,
+        )
+        # Fuse post_attention_layernorm's quant into the dense-MLP gate_up_proj.
+        # MoE layers are skipped: their router gate is unquantized and the routed
+        # experts are excluded, so the normed output has mixed-precision consumers.
+        if hasattr(self, "mlp"):
+            ffn_type, _ = _effective_layer_quant(
+                quant_config, f"{prefix}.mlp.gate_up_proj"
+            )
+            self.fuse_ffn_norm_quant = ffn_type in _RMS_FUSABLE_QUANT_TYPES
+        else:
+            self.fuse_ffn_norm_quant = False
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fuse_ffn_norm_quant,
+            quant_config=quant_config if self.fuse_ffn_norm_quant else None,
+            prefix=f"{prefix}.mlp.gate_up_proj",
         )
 
         self.use_attn_residuals = (
