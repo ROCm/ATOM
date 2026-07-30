@@ -335,7 +335,6 @@ class ScheduledBatch:
             for seq in seqs.values()
             if getattr(seq, "mrope_positions", None) is not None
         }
-        self.has_mrope = bool(self.mrope_positions_by_req)
 
         # num_cached_tokens for chunked prefill support
         self.num_cached_tokens = (
@@ -412,6 +411,9 @@ class ScheduledBatch:
         # cudagraph shape. None outside DSpark-under-DP steps.
         self.dspark_dp_bs = None
         self.dspark_dp_total_tokens = None
+        # Flat PIECEWISE replay token count for this decode step (set in
+        # prepare_inputs). None when N/A -> consumers use bs*max_seqlen_q.
+        self.dynamic_num_tokens_pad = None
 
         # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
@@ -564,6 +566,9 @@ class Scheduler:
         # of `schedule()` can skip the running-queue scan entirely on
         # pure-decode steps (the common case).
         self._partial_prefill_count: int = 0
+        self._schedule_tick: int = 0
+
+        self._num_parked_remote_kv: int = 0
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -895,6 +900,7 @@ class Scheduler:
         Tries prefill first; if no new prefills are ready, falls back to
         decoding already-running sequences.
         """
+        self._schedule_tick += 1
         scheduled_seqs = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
@@ -976,6 +982,7 @@ class Scheduler:
             # promotion below, which would overwrite ABORTED with RUNNING and
             # lose the abort intent.
             if seq.status == SequenceStatus.ABORTED:
+                self._uncount_inflight_load(seq)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = "aborted"
                 self._rejected.append(seq)
@@ -996,6 +1003,10 @@ class Scheduler:
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 self._rejected.append(seq)
                 continue
+
+            if len(self.running) >= self.max_num_seqs:
+                self.waiting.appendleft(seq)
+                break
 
             remote_ready_for_decode = self._resolve_waiting_remote_kv(
                 seq, skipped_waiting_requests
@@ -1037,6 +1048,13 @@ class Scheduler:
                 )
                 continue
 
+            if (
+                needs_remote_load
+                and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
+            ):
+                self.waiting.appendleft(seq)
+                break
+
             # Probe cache hits FIRST so budget check sees the real
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
@@ -1051,7 +1069,7 @@ class Scheduler:
             # the token_ids, so num_tokens > num_prompt_tokens and those tokens
             # still need KV recomputed.
             num_new_tokens = (
-                seq.num_tokens - num_cached_blocks * self.block_manager.block_size
+                seq.num_tokens - num_cached_blocks * self.block_manager.hash_block_size
             )
             if (
                 self.enable_chunked_prefill
@@ -1066,15 +1084,6 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
             self.block_manager.allocate(seq, num_cached_blocks)
-
-            # Snapshot the genuine prefix-cache hit at admission. After this,
-            # num_cached_tokens is repurposed to track chunked-prefill progress
-            # (it grows to the full prompt length in postprocess), so it can't be
-            # used to report the cache hit. Set once per seq (Phase-2 admission
-            # only); Phase-1 resume doesn't recompute num_cached_blocks.
-            seq.prefix_cache_hit_tokens = (
-                num_cached_blocks * self.block_manager.block_size
-            )
 
             self._notify_connector_after_prefill_alloc(seq)
 
@@ -1091,6 +1100,10 @@ class Scheduler:
                 self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
+
+            seq.prefix_cache_hit_tokens = (
+                num_cached_blocks * self.block_manager.block_size
+            )
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
 
@@ -1110,6 +1123,18 @@ class Scheduler:
                 len(skipped_waiting_requests),
             )
             self.waiting.extend(skipped_waiting_requests)
+
+        if self._num_parked_remote_kv > 0 and self._schedule_tick % 100 == 0:
+            logger.info(
+                "PD backpressure: parked=%d, waiting=%d, running=%d, "
+                "resident=%d/%d, kv_usage=%.2f",
+                self._num_parked_remote_kv,
+                len(self.waiting),
+                len(self.running),
+                len(self.running) + self._num_parked_remote_kv,
+                self.max_num_seqs,
+                self._kv_usage(),
+            )
 
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
@@ -1280,6 +1305,7 @@ class Scheduler:
         if self._connector_flag("is_offload"):
             self._mark_offload_load_ready(seq)
             return False
+        self._uncount_inflight_load(seq)
         return True
 
     def _consume_failed_remote_kv(self, seq: Sequence) -> bool:
@@ -1289,6 +1315,7 @@ class Scheduler:
         if self.kv_connector is not None and hasattr(self.kv_connector, "load_failed"):
             self.kv_connector.load_failed(seq.id)
         seq.status = SequenceStatus.WAITING
+        self._uncount_inflight_load(seq)
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_failed = True
@@ -1421,6 +1448,13 @@ class Scheduler:
     ) -> None:
         skipped_waiting_requests.append(seq)
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        self._num_parked_remote_kv += 1
+        seq._counted_as_inflight_load = True
+
+    def _uncount_inflight_load(self, seq: Sequence) -> None:
+        if getattr(seq, "_counted_as_inflight_load", False):
+            self._num_parked_remote_kv -= 1
+            seq._counted_as_inflight_load = False
 
     def _adjust_prefill_chunk_after_alloc(self, seq: Sequence, chunk: int) -> int:
         if self.kv_connector is not None and hasattr(
@@ -2176,7 +2210,6 @@ class PrefillScheduler:
                 name=disagg_cu_shm_name, create=False
             )
             logger.info("initialized shared memory")
-        self.num_seq_done = 0
         self._pending_lock = threading.Lock()
 
     def is_finished(self) -> bool:

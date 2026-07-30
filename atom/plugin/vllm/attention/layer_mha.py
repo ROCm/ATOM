@@ -908,7 +908,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
         assert self.attn_type == AttentionType.DECODER
         block_size = vllm_config.cache_config.block_size
-        if self.sliding_window is not None:
+        if self.sliding_window is not None and self.sliding_window > 0:
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

@@ -167,6 +167,107 @@ def cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=None):
     return out
 
 
+def dcp_gather_compressed_kv(
+    kv_cache: torch.Tensor, slot_ids: torch.Tensor
+) -> torch.Tensor:
+    """Gather this rank's compressed KV entries from the paged cache.
+
+    Local-gather step: the MLA cache stores compressed latent KV as
+    ``[num_slots, 1, kv_lora_rank + qk_rope_head_dim]`` (or ``[num_slots, d]``),
+    so gathering the local rank's interleaved tokens for a chunk is a plain
+    index_select over the token-slot axis. This replaces vLLM's
+    ``cp_gather_cache`` custom op (unavailable in the aiter server path).
+
+    Args:
+        kv_cache: paged compressed KV cache, token-slot major on dim 0.
+        slot_ids: int tensor of absolute slot ids to gather (this rank's local
+            tokens for the chunk, in per-seq order).
+
+    Returns:
+        [len(slot_ids), kv_lora_rank + qk_rope_head_dim] compressed KV.
+    """
+    gathered = kv_cache.index_select(0, slot_ids)
+    # Collapse any singleton head dim -> [toks, kv_lora_rank + qk_rope_head_dim].
+    return gathered.reshape(slot_ids.shape[0], -1)
+
+
+def reorg_kvcache(
+    allgatered_kv_c_normed: torch.Tensor,
+    allgatered_k_pe: torch.Tensor,
+    padded_local_chunk_seq_lens_lst: list,
+    local_context_lens_allranks: list,
+    sum_seq_len: int,
+    max_seq_len: int,
+    chunk_size: int,
+    chunk_idx: int,
+    toks: int,
+):
+    """Reorg + unpad AllGathered compressed KV into per-sequence contiguous
+    layout for the attention kernel.
+
+    The AllGather concatenates every rank's local (padded) chunk gather along
+    dim 0, so tokens for one sequence are interleaved across the per-rank
+    blocks. This walks each seq's per-rank contribution and concatenates them
+    back into the original token order, dropping padding.
+
+    e.g.
+    allgatered = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...,      # rank 0 block
+                  T0_4, T0_5, pad, pad, T1_2, pad, ...]         # rank 1 block
+    -> reorganized = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
+                      T1_0, T1_1, T1_2, ...]
+
+    Args:
+        padded_local_chunk_seq_lens_lst: per-seq local chunk lengths (padded)
+            under the current CP rank.
+        local_context_lens_allranks: per-seq local context lengths on each rank.
+        sum_seq_len: sum of the per-seq (global) chunk lengths.
+        max_seq_len: max per-seq (global) chunk length.
+        chunk_size: local padded max context chunk from metadata building.
+        chunk_idx: chunk index of the chunked prefill.
+        toks: number of tokens per rank's local gather (one AllGather block).
+    """
+    kv_c_segments = []
+    k_pe_segments = []
+    src_token_idx = 0
+    max_seq_len_check = 0
+    for padded_local_chunk_seq_len, local_context_lens in zip(
+        padded_local_chunk_seq_lens_lst, local_context_lens_allranks
+    ):
+        cur_seq_len = 0
+        for rank, local_context_len in enumerate(local_context_lens):
+            # We split the context into multiple chunks depending on the
+            # workspace size, so the last chunk on a shorter rank may be
+            # partial: clamp to what actually remains on that rank.
+            local_chunk_len = min(
+                max(0, local_context_len - chunk_idx * chunk_size),
+                padded_local_chunk_seq_len,
+            )
+            if local_chunk_len != 0:
+                kv_c_segment = allgatered_kv_c_normed[
+                    rank * toks
+                    + src_token_idx : rank * toks
+                    + src_token_idx
+                    + local_chunk_len
+                ]
+                k_pe_segment = allgatered_k_pe[
+                    rank * toks
+                    + src_token_idx : rank * toks
+                    + src_token_idx
+                    + local_chunk_len
+                ]
+                kv_c_segments.append(kv_c_segment)
+                k_pe_segments.append(k_pe_segment)
+                cur_seq_len += local_chunk_len
+        max_seq_len_check = max(max_seq_len_check, cur_seq_len)
+        src_token_idx += padded_local_chunk_seq_len
+    reorganized_kv_c_normed = torch.cat(kv_c_segments, dim=0)
+    reorganized_k_pe = torch.cat(k_pe_segments, dim=0)
+    assert reorganized_kv_c_normed.shape[0] == sum_seq_len
+    assert reorganized_k_pe.shape[0] == sum_seq_len
+    assert max_seq_len_check == max_seq_len
+    return reorganized_kv_c_normed, reorganized_k_pe
+
+
 def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, interleave_size=1):
     """Compute per-DCP-rank local sequence lengths.
 

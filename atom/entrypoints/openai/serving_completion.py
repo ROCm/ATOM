@@ -103,6 +103,7 @@ async def stream_completion_response(
                     "object": TEXT_COMPLETION_OBJECT,
                     "created": int(time.time()),
                     "model": model,
+                    "choices": [],
                     "usage": {
                         "prompt_tokens": num_tokens_input,
                         "completion_tokens": num_tokens_output,
@@ -262,6 +263,7 @@ async def stream_completion_response_fanout(
             "object": TEXT_COMPLETION_OBJECT,
             "created": int(time.time()),
             "model": model,
+            "choices": [],
             "usage": usage,
         }
         # Coalesce the per-sibling stop chunks + usage + [DONE] into one send.

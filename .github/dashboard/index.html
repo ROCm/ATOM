@@ -657,6 +657,9 @@ function atomeshPointRow(point, meta, idx) {
     prefillDpa: Boolean(point.prefill_dpa),
     decodeDpa: Boolean(point.decode_dpa),
     configLabel: point.config_label || '',
+    benchmarkKind: point.benchmark_kind || meta.benchmark_kind || '',
+    scenario: point.scenario || meta.scenario || '',
+    publicDataset: point.public_dataset || meta.public_dataset || '',
     rocmVersion: point.rocm || meta.rocm_version || '',
     dockerImage: point.image || meta.docker_image || '',
     status: Number.isFinite(interactivity) && Number.isFinite(totalTputPerGpu ?? outputTputPerGpu) ? 'completed' : 'incomplete',
@@ -748,6 +751,29 @@ function atomeshBaseModelName(model) {
   return String(model || 'unknown').replace(/-Eagle3$/i, '');
 }
 
+const AGENTIC_TRACE_FILTER = 'agentic-trace';
+
+function isAgenticTraceRow(row) {
+  const benchmarkKind = String(row?.benchmarkKind || row?.benchmark_kind || '').toLowerCase();
+  if (benchmarkKind === 'aiperf_agentic' || benchmarkKind.includes('agentic')) return true;
+  const markers = [
+    row?.scenario,
+    row?.sourceTopology,
+    row?.topology,
+    row?.configLabel,
+    row?.id,
+  ].filter(Boolean).join(' ');
+  return /\bagent(?:ic|x)\b/i.test(markers);
+}
+
+function atomeshIslOslFilterValue(row) {
+  return isAgenticTraceRow(row) ? AGENTIC_TRACE_FILTER : row.islOsl;
+}
+
+function atomeshMatchesIslOslFilter(row) {
+  return state.filters.islOsl.includes(atomeshIslOslFilterValue(row));
+}
+
 function atomeshPointScore(row) {
   return parseAtomeshNumber(row.totalTputPerGpu);
 }
@@ -766,7 +792,12 @@ function mergeAtomeshTopologyRows(rows) {
       sourceTopology: row.sourceTopology || row.topology,
       model,
     };
-    const key = `${normalized.backend}|${normalized.hardware}|${normalized.model}|${normalized.islOsl}|${normalized.concurrency}`;
+    // Standard benchmarks intentionally collapse topologies to the best result.
+    // Agentic traces keep each topology because every topology is a distinct case.
+    const agenticTopology = isAgenticTraceRow(normalized)
+      ? normalized.sourceTopology || normalized.topology || 'agentic'
+      : '';
+    const key = `${normalized.backend}|${normalized.hardware}|${normalized.model}|${normalized.islOsl}|${normalized.concurrency}|${agenticTopology}`;
     const current = merged[key];
     const nextScore = atomeshMergeScore(normalized);
     if (!current) {
@@ -1109,7 +1140,11 @@ function buildAccuracyPreviewRows(preview) {
 const _lc = (a, b) => { const la = a.toLowerCase(), lb = b.toLowerCase(); return la < lb ? -1 : la > lb ? 1 : 0; };
 const allBackends = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[0]), ...atomeshSummaryRows.map(row => row.backend)])].sort(_lc);
 const allModels = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[1]), ...atomeshSummaryRows.map(row => row.model)])].sort(_lc);
-const allIslOsl = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[2]), ...atomeshSummaryRows.map(row => row.islOsl)])].sort();
+const standardIslOsl = [...new Set([
+  ...Object.keys(historyMap).map(k => k.split('|')[2]),
+  ...atomeshSummaryRows.filter(row => !isAgenticTraceRow(row)).map(row => row.islOsl),
+])].filter(Boolean).sort();
+const allIslOsl = [AGENTIC_TRACE_FILTER, ...standardIslOsl];
 const allConc = [...new Set([...Object.keys(historyMap).map(k => +k.split('|')[3]), ...atomeshSummaryRows.map(row => row.concurrency)].filter(Number.isFinite))].sort((a, b) => a - b);
 const allHardware = [...new Set([...Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'), ...atomeshSummaryRows.map(row => row.hardware || 'unknown')])].sort(_lc);
 const defaultHardware = allHardware.includes('mi355x') ? 'mi355x' : (allHardware[0] || 'unknown');
@@ -1152,7 +1187,7 @@ function filteredAtomeshRows() {
   return atomeshSummaryRows.filter(row => (
     state.filters.backends.includes(row.backend)
     && state.filters.models.includes(row.model)
-    && state.filters.islOsl.includes(row.islOsl)
+    && atomeshMatchesIslOslFilter(row)
     && state.filters.conc.includes(row.concurrency)
     && state.filters.hardware.includes(row.hardware || 'unknown')
   ));
@@ -1163,6 +1198,7 @@ function filteredAtomeshRows() {
    ================================================================ */
 // ISL/OSL compact format: "1024/1024" → "1k/1k", "8192/1024" → "8k/1k"
 function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+n / 1024).toPrecision(3)) + 'k' : n); }
+function fmtIslOslFilterOption(s) { return s === AGENTIC_TRACE_FILTER ? 'Agentic Trace' : fmtIslOsl(s); }
 function fmtHardware(s) { return s === 'unknown' ? 'Unknown' : String(s).toUpperCase(); }
 function selectedHardware() {
   const hw = state.filters.hardware[0];
@@ -1450,7 +1486,7 @@ document.getElementById('dl-btn').onclick = () => {
 const filterDefs = [
   { id: 'backends', label: 'Backend', options: allBackends },
   { id: 'models', label: 'Model', options: allModels },
-  { id: 'islOsl', label: 'ISL/OSL', options: allIslOsl, format: fmtIslOsl },
+  { id: 'islOsl', label: 'ISL/OSL', options: allIslOsl, format: fmtIslOslFilterOption },
   { id: 'conc', label: 'Concurrency', options: allConc.map(String) },
   { id: 'hardware', label: 'Hardware', options: allHardware, format: fmtHardware },
 ];
@@ -3514,7 +3550,7 @@ function filteredAtomeshHistoryRows({ includeModelFilter = true } = {}) {
     const model = atomeshDisplayModel(row);
     return state.filters.backends.includes(row.backend || ATOMESH_DATA.backend)
       && (!includeModelFilter || state.filters.models.includes(model))
-      && state.filters.islOsl.includes(row.islOsl)
+      && atomeshMatchesIslOslFilter(row)
       && state.filters.conc.includes(row.concurrency)
       && state.filters.hardware.includes(row.hardware || 'unknown');
   });
@@ -3627,7 +3663,10 @@ function renderAtomeshPerformanceTab() {
   const chartSpecs = Object.entries(chartGroups).sort(([a], [b]) => _lc(a, b)).map(([model, modelRows], chartIdx) => {
     const seriesGroups = {};
     for (const row of modelRows) {
-      const key = `${row.model}|${row.islOsl}`;
+      const agenticTopology = isAgenticTraceRow(row)
+        ? row.sourceTopology || row.topology || 'agentic'
+        : '';
+      const key = `${row.model}|${row.islOsl}|${agenticTopology}`;
       if (!seriesGroups[key]) seriesGroups[key] = [];
       seriesGroups[key].push(row);
     }
@@ -3636,7 +3675,9 @@ function renderAtomeshPerformanceTab() {
       const first = groupRows[0];
       const color = getModelColor(ATOMESH_DATA.backend, first.model);
       return {
-        label: `${first.model} ${first.islOsl}`,
+        label: isAgenticTraceRow(first)
+          ? `${first.model} Agentic Trace · ${first.sourceTopology || first.topology}`
+          : `${first.model} ${first.islOsl}`,
         data: groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c })),
         borderColor: color.border,
         backgroundColor: color.border,

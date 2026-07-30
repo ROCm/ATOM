@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_ops/eplb.py (Module-D migration planning/execution)
 
-import pytest
 from contextlib import contextmanager
+
+import pytest
 
 torch = pytest.importorskip("torch")
 

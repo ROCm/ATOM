@@ -146,7 +146,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
-    "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
+    "DeepSeekMTPModel": "atom.plugin.vllm.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
@@ -154,6 +154,9 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
+    "KimiK3ForConditionalGeneration": (
+        "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
+    ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3:MiniMaxM3SparseForCausalLM",
@@ -266,6 +269,27 @@ def _select_model_arch(vllm_config: VllmConfig) -> str:
         )
         return draft_arch
     return model_arch
+
+
+def _get_draft_step_idx_from_forward_context() -> int:
+    try:
+        from vllm.forward_context import get_forward_context
+
+        attn_metadata = get_forward_context().attn_metadata
+    except (ImportError, AssertionError):
+        return 0
+
+    metadata_groups = (
+        attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+    )
+    draft_indices = [
+        int(draft_index)
+        for metadata_by_layer in metadata_groups
+        if metadata_by_layer is not None
+        for metadata in metadata_by_layer.values()
+        if (draft_index := getattr(metadata, "draft_index", None)) is not None
+    ]
+    return max(draft_indices, default=0)
 
 
 def _patch_required_act_dtype_post_load_hooks(
@@ -900,6 +924,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     hidden_states = self.model(input_ids=input_ids, positions=positions)
                     self._mtp_target_hidden_states = hidden_states
         else:
+            if (
+                self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
+                and "spec_step_idx" not in model_kwargs
+            ):
+                model_kwargs["spec_step_idx"] = (
+                    _get_draft_step_idx_from_forward_context()
+                )
             hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -909,6 +940,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             )
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
+
+        if self.model_arch == "DeepSeekMTPModel":
+            # vLLM samples from the pre-final-norm state, but recycles the
+            # post-final-norm state into the next MTP step.
+            spec_step_idx = int(model_kwargs.get("spec_step_idx", 0))
+            recycle_hidden = self.model.get_recycle_hidden(hidden_states, spec_step_idx)
+            return hidden_states, recycle_hidden
 
         return hidden_states
 

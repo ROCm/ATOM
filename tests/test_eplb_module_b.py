@@ -41,6 +41,17 @@ def _record_single_pass(monitor, *, counts):
     monitor.on_forward_end(is_dummy_run=False)
 
 
+def _step(mgr):
+    """Advance the manager one prefill step without torch.distributed.
+
+    Drives the dp==migration-group path (a real runtime topology, e.g. DSv4-Pro
+    DP=8/TP=1): the step gate then reuses the DP-provided prefill flag directly,
+    so no collective is issued and these scheduler unit tests need no dist init.
+    """
+    mgr._dp_is_migration_group = True
+    mgr.on_forward_pass_end(local_has_prefill=True, dp_any_has_prefill=True)
+
+
 def _spy_rebalance(mgr, fired):
     """Replace the runtime rebalance with a 0-yield spy that records each fire.
 
@@ -78,18 +89,18 @@ def test_manager_steps_with_dummy_and_triggers_by_interval(monkeypatch):
 
     # vllm-style warm start: first window = interval//4 = 2, so the first LIVE
     # rebalance fires on call 3; steady state then uses the full interval (8).
-    manager.on_forward_pass_end(is_dummy_run=False)  # 1 (first window)
-    manager.on_forward_pass_end(is_dummy_run=True)  # 2 (first window)
+    _step(manager)  # 1 (first window)
+    _step(manager)  # 2 (first window)
     assert fired == []
-    manager.on_forward_pass_end(is_dummy_run=False)  # 3 -> first rebalance
+    _step(manager)  # 3 -> first rebalance
     assert fired == [1]
     assert manager.rebalance_count == 1
 
     # Steady state: the next rebalance is a full interval (8 calls) later.
     for _ in range(7):
-        manager.on_forward_pass_end(is_dummy_run=False)
+        _step(manager)
     assert fired == [1]
-    manager.on_forward_pass_end(is_dummy_run=False)  # 8th steady call -> fire
+    _step(manager)  # 8th steady call -> fire
     assert fired == [1, 1]
     assert manager.rebalance_count == 2
 
@@ -114,8 +125,8 @@ def test_manager_balancedness_gate_skips_when_balanced(monkeypatch):
     # manager-only unit test there is no model, so provide a minimal stub.
     # counts=[3,3] with ep_size=2 -> perg=[3,3] -> mean/max = 1.0.
     manager.live_metadata = types.SimpleNamespace(ep_size=2)
-    manager.on_forward_pass_end(is_dummy_run=False)  # consumes interval yield
-    manager.on_forward_pass_end(is_dummy_run=False)  # enters _rebalance, gate skips
+    _step(manager)  # consumes interval yield
+    _step(manager)  # enters _rebalance, gate skips
     assert fired == []
     assert manager.rebalance_count == 0
     assert manager.last_balancedness == pytest.approx(1.0)
@@ -139,8 +150,8 @@ def test_manager_min_vs_mean_aggregation(monkeypatch):
     )
     _spy_rebalance(mgr_min, fired_min)
     mgr_min.live_metadata = types.SimpleNamespace(ep_size=2)
-    mgr_min.on_forward_pass_end(is_dummy_run=False)
-    mgr_min.on_forward_pass_end(is_dummy_run=False)
+    _step(mgr_min)
+    _step(mgr_min)
     assert fired_min == [1]  # min=0.6 < 0.7 -> rebalance
 
     fired_mean = []
@@ -153,8 +164,8 @@ def test_manager_min_vs_mean_aggregation(monkeypatch):
     )
     _spy_rebalance(mgr_mean, fired_mean)
     mgr_mean.live_metadata = types.SimpleNamespace(ep_size=2)
-    mgr_mean.on_forward_pass_end(is_dummy_run=False)
-    mgr_mean.on_forward_pass_end(is_dummy_run=False)
+    _step(mgr_mean)
+    _step(mgr_mean)
     assert fired_mean == []  # mean=0.8 >= 0.7 -> skip
 
 

@@ -117,6 +117,7 @@ class AiterMhaMetadataForVllm:
     use_cascade: bool = False
     common_prefix_len: int = 0
     total_tokens: int = 0
+    draft_index: int = 0
 
 
 @dataclass
@@ -185,6 +186,10 @@ class AiterMlaPrefillMetadataForVllm:
         padded_local_cu_seq_lens: torch.Tensor | None = None
         cu_seq_lens_lst: list[list[int]] | None = None
         chunk_size: int | None = None
+        # Per-chunk local token->seq map for gather_and_maybe_dequant_cache under
+        # fp8 DCP (mirrors token_to_seq but over the padded local per-rank
+        # chunk layout). [num_chunks, max_local_toks].
+        padded_local_token_to_seq: torch.Tensor | None = None
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -981,6 +986,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             use_cascade=False,
             common_prefix_len=0,
             total_tokens=self.total_tokens,
+            draft_index=draft_index,
         )
 
     # this method will be called by vllm, so it follows the vllm's interface convention
@@ -1417,6 +1423,18 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     # to page_size
                     max_context_chunk = round_down(max_context_chunk, self.page_size)
 
+                if self.dcp_world_size > 1:
+                    # DCP: the chunk must be a whole number of virtual blocks so
+                    # it splits evenly across ranks and the
+                    # `max_context_chunk % dcp_world_size == 0` assert below
+                    # holds. On ROCm `aot_schedule` is False, so the page
+                    # round-down above is skipped — align here regardless
+                    # (dcp_virtual_block_size = cp_kv_cache_interleave_size *
+                    # dcp_world_size, always a multiple of dcp_world_size).
+                    max_context_chunk = round_down(
+                        max_context_chunk, self.dcp_virtual_block_size
+                    )
+
                 assert max_context_chunk > 0
                 num_chunks = cdiv(max_context_len_cpu, max_context_chunk)
 
@@ -1517,6 +1535,21 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         dtype=torch.int32,
                     )
 
+                    # Local token->seq map for gather_and_maybe_dequant_cache
+                    # (fp8 DCP): mirrors token_to_seq but over the padded local
+                    # per-rank chunk layout. Length per chunk == seq_tot[i].
+                    max_local_toks = int(
+                        padded_local_chunk_seq_lens.sum(dim=1).max().item()
+                    )
+                    padded_local_token_to_seq_cpu = torch.zeros(
+                        [num_chunks, max_local_toks], dtype=torch.int32
+                    )
+                    for _c in range(num_chunks):
+                        _t2s = torch.repeat_interleave(
+                            range_idx, padded_local_chunk_seq_lens[_c]
+                        )
+                        padded_local_token_to_seq_cpu[_c, : _t2s.shape[0]] = _t2s
+
                 chunked_context_metadata_cls = (
                     AiterMlaPrefillMetadataForVllm.AiterMlaChunkedContextMetadataForVllm
                 )
@@ -1544,6 +1577,9 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
+                        padded_local_token_to_seq=padded_local_token_to_seq_cpu.to(
+                            device, non_blocking=True
+                        ),
                         prefill_tokens_with_context=prefill_tokens_with_context,
                     )
                 else:
