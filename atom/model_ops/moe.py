@@ -1042,6 +1042,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max().to(torch.float32)
             )
 
+        self._process_weight_layout_after_loading(layer)
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
 
@@ -1400,6 +1403,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
         )
+        return self._apply_after_routing(
+            layer=layer,
+            x=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=top_k,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+
+    def _apply_after_routing(
+        self,
+        *,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        activation: ActivationType,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        """Execute the standard MXFP4 path after routing and EPLB remapping."""
+        del top_k  # The standard kernels infer top-k from the routing tensors.
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
@@ -1415,6 +1445,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_extra_args["linear_beta"] = getattr(
                 layer, "activation_situ_linear_beta", None
             )
+
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -1533,6 +1564,96 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 out_e = out_e + shared_w2_bias[e]
             shared_out = out_e if shared_out is None else shared_out + out_e
         return shared_out
+
+
+class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
+    """MXFP4 MoE method backed by the fused FlyDSL MegaMoE pipeline."""
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(quant_config, moe)
+        # Mega owns the weight layout and the complete routed-MoE execution.
+        # Standard Triton weight/forward paths must not preempt it.
+        self.use_triton = False
+        self.use_triton_decode = False
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
+
+        build_mega_weights(layer)
+
+        # Mega reads only _mega_* weights. Release the raw AITER weight copies
+        # and skip the standard shuffle so both layouts are not retained.
+        layer.w13_weight.data = torch.empty(
+            0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
+        )
+        layer.w2_weight.data = torch.empty(
+            0, dtype=layer.w2_weight.dtype, device=layer.w2_weight.device
+        )
+        logger.info("Prepared MegaMoE weights for fused MoE layer")
+
+    def init_prepare_finalize(self, layer: torch.nn.Module):
+        # Mega includes dispatch, both GEMMs, and combine, so it must not
+        # allocate the standard MORI prepare/finalize modular kernel.
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+
+    def _apply_after_routing(
+        self,
+        *,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        activation: ActivationType,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        del expert_map, activation, apply_router_weight_on_input
+        from atom.model_ops.fused_moe.flydsl_mega_experts import run_mega_moe
+
+        return run_mega_moe(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            experts=global_num_experts,
+            topk=top_k,
+            quant="a8w4",
+        )
+
+    def get_eplb_weight_views(
+        self, layer: torch.nn.Module, num_local_experts: int
+    ) -> list[torch.Tensor]:
+        """Expose live Mega weights as expert-major aliases for EPLB."""
+        views: list[torch.Tensor] = []
+        for name in (
+            "_mega_w1",
+            "_mega_w1_scale",
+            "_mega_w2",
+            "_mega_w2_scale",
+        ):
+            tensor = getattr(layer, name, None)
+            if not isinstance(tensor, torch.Tensor):
+                raise RuntimeError(f"MegaMoE weight {name!r} was not prepared")
+            if not tensor.is_contiguous() or tensor.numel() % num_local_experts != 0:
+                raise RuntimeError(
+                    "MegaMoE EPLB weight must be contiguous and evenly divisible "
+                    f"by local experts: name={name!r}, shape={tuple(tensor.shape)}, "
+                    f"num_local_experts={num_local_experts}."
+                )
+            views.append(tensor.view(num_local_experts, -1))
+        return views
+
+
+def _make_mxfp4_moe_method(
+    quant_config: LayerQuantConfig, moe: FusedMoEConfig
+) -> Mxfp4MoEMethod:
+    if get_current_atom_config().moe_backend == "mega":
+        return MegaMxfp4MoEMethod(quant_config, moe)
+    return Mxfp4MoEMethod(quant_config, moe)
 
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
@@ -2623,13 +2744,15 @@ class FusedMoE(torch.nn.Module):
         elif layer_quant_config.quant_dtype == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(layer_quant_config, moe)
         elif layer_quant_config.quant_dtype == dtypes.fp4x2:
-            self.quant_method = Mxfp4MoEMethod(layer_quant_config, moe)
+            self.quant_method = _make_mxfp4_moe_method(layer_quant_config, moe)
         else:
             raise ValueError(
                 f"Unsupported quant dtype: {layer_quant_config.quant_dtype}"
             )
 
         assert self.quant_method is not None
+        if not self.online_quant:
+            self._validate_moe_backend()
 
         # Override weight padding alignment before create_weights consumes it.
         # Must happen here (pre-create_weights) — setting it on quant_method
@@ -2654,6 +2777,18 @@ class FusedMoE(torch.nn.Module):
 
     def process_weights_after_loading(self):
         self._online_quant()
+        self._validate_moe_backend()
+
+    def _validate_moe_backend(self) -> None:
+        if get_current_atom_config().moe_backend != "mega":
+            return
+        if not self.use_ep:
+            raise ValueError("moe_backend='mega' requires expert parallelism")
+        if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
+            raise ValueError(
+                "moe_backend='mega' currently supports only MXFP4/A8W4 MoE, "
+                f"got {type(self.quant_method).__name__}"
+            )
 
     def _online_quant(self):
         """Handle online quantization: (optionally dequant →) quantize weights,
@@ -2753,7 +2888,9 @@ class FusedMoE(torch.nn.Module):
         if online_quant_dtype == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(online_quant_config, self.moe_config)
         elif online_quant_dtype == dtypes.fp4x2:
-            self.quant_method = Mxfp4MoEMethod(online_quant_config, self.moe_config)
+            self.quant_method = _make_mxfp4_moe_method(
+                online_quant_config, self.moe_config
+            )
         else:
             raise ValueError(
                 f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"
