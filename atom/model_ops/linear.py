@@ -775,9 +775,6 @@ class LinearBase(nn.Module):
             need_shuffle = (
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
-                # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
-                # weight; only the AITER bpreshuffle fallback needs the shuffle.
-                and not (use_triton_gemm() and gemm_a8w8_triton is not None)
             ) or (
                 self.quant_type == QuantType.per_1x32
                 and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
@@ -920,7 +917,11 @@ class LinearBase(nn.Module):
                         self.bias,
                         dtype=otype,
                     )
-                elif use_triton_gemm() and gemm_a8w8_triton is not None:
+                elif (
+                    use_triton_gemm()
+                    and gemm_a8w8_triton is not None
+                    and self.params_dtype != dtypes.fp8
+                ):
                     # Triton a8w8 per-token-per-channel GEMM (unshuffled weight).
                     y = gemm_a8w8_per_token_impl(
                         x,

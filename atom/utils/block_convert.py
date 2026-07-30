@@ -220,6 +220,7 @@ def mtp_prepare_decode_mla_kernel(
     sparse_kv_indptr_ptr,  # int32 [bs+1] out (IS_SPARSE only)
     positions_ptr,  # int64 [bs] in/out (UPDATE_POSITIONS only)
     context_lens_ptr,  # int32 [bs] in/out (UPDATE_CONTEXT_LENS only)
+    kv_last_page_lens_ptr,  # int32 [bs] out (BLOCK_SIZE > 1 only)
     bs,
     index_topk,
     position_stride,
@@ -227,6 +228,7 @@ def mtp_prepare_decode_mla_kernel(
     UPDATE_POSITIONS: tl.constexpr,
     UPDATE_CONTEXT_LENS: tl.constexpr,
     BLOCK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """Single-program fused per-draft-step MTP-decode metadata for MLA.
 
@@ -239,6 +241,16 @@ def mtp_prepare_decode_mla_kernel(
     reads happen before any write, so the in-place ``kv_indptr`` update is
     hazard-free. ``sparse_kv_indptr[0]`` is written on-device (no Python-scalar
     H2D copy, which is what caused the original hot-path Host-Device sync).
+
+    ``BLOCK_SIZE > 1`` (dense asm/seg MLA, page_size=64): the per-token
+    ``kv_indptr += cu_seqlens_q`` arithmetic no longer holds because ``kv_indptr``
+    is a *block*-count CSR (one entry per ``BLOCK_SIZE`` tokens). Instead recompute
+    it block-granularly from the pre-increment ``context_lens`` — mirroring the
+    initial ``prepare_decode`` build (``cumsum(cdiv(len, block_size))``) — and emit
+    the per-seq ``kv_last_page_lens`` (``(len-1) % block_size + 1``), which the
+    block==1 path leaves at a constant 1. Requires ``UPDATE_CONTEXT_LENS`` so the
+    pre-increment length is read here (not bumped by the caller beforehand); dense
+    only (sparse packs per-token regardless of block_size).
     """
     offs = tl.arange(0, BLOCK)
     mask_p1 = offs < (bs + 1)  # indptr arrays are length bs+1
@@ -248,6 +260,31 @@ def mtp_prepare_decode_mla_kernel(
     # clobber the shifted [i+1] read used for per-seq counts.
     kvi = tl.load(kv_indptr_ptr + offs, mask=mask_p1, other=0)
     cuq = tl.load(cu_seqlens_q_ptr + offs, mask=mask_p1, other=0)
+
+    if BLOCK_SIZE > 1:
+        # Block-granular recompute from pre-increment context_lens. cu_seqlens_q
+        # is an arange for the draft (one query token per seq), so nq == 1, but
+        # derive it from the CSR to stay general.
+        ctx = tl.load(context_lens_ptr + offs, mask=mask_bs, other=0)
+        cuq_next = tl.load(cu_seqlens_q_ptr + offs + 1, mask=mask_bs, other=0)
+        nq = cuq_next - cuq
+        new_len = ctx + nq
+        blocks = tl.where(mask_bs, (new_len + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
+        # inclusive scan: csum[i] == kv_indptr[i + 1] (block-count CSR)
+        csum = tl.cumsum(blocks, axis=0)
+        tl.store(kv_indptr_ptr + offs + 1, csum, mask=mask_bs)
+        tl.store(kv_indptr_ptr + offs, tl.zeros_like(csum), mask=(offs == 0))
+        last_page = (new_len - 1) % BLOCK_SIZE + 1
+        tl.store(kv_last_page_lens_ptr + offs, last_page, mask=mask_bs)
+        if UPDATE_CONTEXT_LENS:
+            tl.store(context_lens_ptr + offs, new_len, mask=mask_bs)
+        if UPDATE_POSITIONS:
+            pos = tl.load(
+                positions_ptr + offs * position_stride, mask=mask_bs, other=0
+            )
+            tl.store(positions_ptr + offs * position_stride, pos + 1, mask=mask_bs)
+        return
+
     new_kvi = kvi + cuq
 
     if IS_SPARSE:

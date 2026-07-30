@@ -1272,7 +1272,18 @@ class MLAAttention(nn.Module):
             paged_kv_indices = attn_metadata.kv_indices
             paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
             max_q_len = attn_metadata.max_seqlen_q
-            if self.is_sparse_mla:
+            if (
+                not self.is_sparse_mla
+                and self.use_seg_mla
+                and attn_metadata.max_seqlen_q > 1
+                and hasattr(attn_metadata, "split_cu_seqlens_q")
+            ):
+                paged_cu_seqlens_q = attn_metadata.split_cu_seqlens_q
+                paged_kv_indptr = attn_metadata.split_kv_indptr
+                paged_kv_indices = attn_metadata.split_kv_indices
+                paged_kv_last_page_lens = attn_metadata.split_kv_last_page_lens
+                max_q_len = 1
+            elif self.is_sparse_mla:
                 if attn_metadata.max_seqlen_q > 1:
                     # MTP verify: per-token layout with max_q_len=1.
                     # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).

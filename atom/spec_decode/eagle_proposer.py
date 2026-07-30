@@ -282,11 +282,32 @@ class EagleProposer(Drafter):
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
             attn_metadata.block_tables = var["block_tables"].gpu[:bs]
-        elif attn_metadata.slot_mapping is not None:
+        elif (
+            attn_metadata.slot_mapping is not None
+            and attn_metadata.slot_mapping.shape[0] > len(input_ids)
+        ):
             # Make MLA draft slot_mapping == q rows. DeepSeek-V4 uses
             # block_tables + context_lens (slot_mapping is None) — nothing to
             # size, so skip instead of subscripting None.
+            #
+            # MLA draft reuses the target's attn_metadata directly. When the
+            # target decode ran padded up to a captured cudagraph token count
+            # (e.g. 252 real tokens -> 256), its slot_mapping is longer than the
+            # draft's i==0 pass, which runs on the real (unpadded) tokens. Trim
+            # to the real length so the shuffle-KV fused MLA kernel's
+            # b_slot <= bk check holds (padding slots must not be written).
             attn_metadata.slot_mapping = attn_metadata.slot_mapping[: len(input_ids)]
+            n_real = len(input_ids)
+            scsq = getattr(attn_metadata, "split_cu_seqlens_q", None)
+            if scsq is not None and scsq.shape[0] > n_real + 1:
+                attn_metadata.split_cu_seqlens_q = scsq[: n_real + 1]
+                attn_metadata.split_kv_indptr = attn_metadata.split_kv_indptr[
+                    : n_real + 1
+                ]
+                attn_metadata.split_kv_last_page_lens = (
+                    attn_metadata.split_kv_last_page_lens[:n_real]
+                )
+                # split_kv_indices is CSR-bounded by split_kv_indptr; no trim.
 
         # Backends that expose flat per-seq kv_indices/kv_indptr (MLA, MHA)
         # wire them through eagle's mid-step block; V4 has block_tables +
@@ -406,11 +427,30 @@ class EagleProposer(Drafter):
                                 "sparse_kv_indptr"
                             ].gpu[: bs + 1]
                         cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
+                        mla_block_size = self.runner.attn_metadata_builder.block_size
                         if target_uses_mla and has_flat_kv:
-                            # MLA: block_size=1, kv_indptr tracks tokens
-                            kv_indptr[1 : bs + 1] -= torch.cumsum(
-                                num_reject_tokens, dim=0
-                            )
+                            # block_size==1 (shuffle-KV / aiter page1): kv_indptr
+                            # tracks tokens, so roll it back by nrej tokens here.
+                            # block_size>1 (asm/seg, page_size=64): kv_indptr is a
+                            # block-count CSR that prepare_mtp_decode recomputes
+                            # from the (reject-adjusted) context_lens below, so a
+                            # token-count rollback here would be wrong — skip it.
+                            if mla_block_size == 1:
+                                kv_indptr[1 : bs + 1] -= torch.cumsum(
+                                    num_reject_tokens, dim=0
+                                )
+                            # The target verify forward wrote KV for all
+                            # (mtp_k + 1) candidate tokens and left context_lens
+                            # counting all of them, but the rejected drafts are
+                            # discarded. kv_indptr is rolled back above; the
+                            # dense (shuffle-KV) MLA decode reads context_lens as
+                            # seqused_k, so it must be rolled back the same way
+                            # or the draft attends to nrej stale KV entries and
+                            # acceptance collapses (worse at multi-bs). The
+                            # sparse path reject-adjusts via sparse_kv_indptr, so
+                            # skip it there.
+                            if not self.runner.attn_metadata_builder.is_sparse:
+                                attn_metadata.context_lens[:bs] -= num_reject_tokens
                         if positions.ndim == 1:
                             positions = torch.index_select(
                                 positions, 0, last_token_indices
@@ -459,6 +499,17 @@ class EagleProposer(Drafter):
                         # MLA/MHA path: slot derived from flat kv_indices.
                         raw_slots = kv_indices[kv_indptr[1 : bs + 1] - 1]
                         builder = self.runner.attn_metadata_builder
+                        mla_block_size = builder.block_size
+                        if target_uses_mla and mla_block_size > 1:
+                            # block-count CSR: kv_indices holds physical block
+                            # ids, so expand the last block to the appended
+                            # token's slot = block * block_size + (last_page-1),
+                            # matching prepare_decode's block->slot expansion.
+                            # block_size==1 needs no expansion: kv_indices
+                            # already holds token slots.
+                            raw_slots = raw_slots * mla_block_size + (
+                                attn_metadata.kv_last_page_lens[:bs] - 1
+                            )
                         if getattr(builder, "dcp_world_size", 1) > 1:
                             # DCP round-robin: only rank (context_len-1) % W owns
                             # this draft token; other ranks' kv_indptr didn't grow,
