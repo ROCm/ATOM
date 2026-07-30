@@ -1,10 +1,31 @@
 # SPDX-License-Identifier: MIT
 # PD-disaggregation + pipeline-parallel unit tests (GPU-free).
 
+import sys
 import threading
+import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+
+# Ensure aiter.dist.parallel_state exposes symbols mooncake_connector needs.
+_ps = sys.modules.get("aiter.dist.parallel_state")
+if _ps is not None:
+    for _fn in ("get_dp_group", "get_tp_group"):
+        if not hasattr(_ps, _fn):
+            setattr(_ps, _fn, MagicMock())
+else:
+    _aiter_pkg = types.ModuleType("aiter")
+    _aiter_pkg.__path__ = []
+    sys.modules.setdefault("aiter", _aiter_pkg)
+    _dist = types.ModuleType("aiter.dist")
+    _dist.__path__ = []
+    sys.modules.setdefault("aiter.dist", _dist)
+    _ps_stub = types.ModuleType("aiter.dist.parallel_state")
+    for _fn in ("get_dp_group", "get_tp_group"):
+        setattr(_ps_stub, _fn, MagicMock())
+    sys.modules.setdefault("aiter.dist.parallel_state", _ps_stub)
 
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,

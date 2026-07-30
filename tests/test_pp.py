@@ -252,6 +252,17 @@ def test_recv_threads_allgather_group(monkeypatch):
     grp.recv_tensor_dict.assert_called_once_with(src=0, all_gather_group=tp)
 
 
+def _real_split_tensor_dict(tensor_dict):
+    metadata_list = []
+    tensor_list = []
+    for key, value in tensor_dict.items():
+        metadata_list.append(
+            {"key": key, "dtype": value.dtype, "shape": list(value.shape)}
+        )
+        tensor_list.append(value)
+    return metadata_list, tensor_list
+
+
 def _fake_async_pp_group(monkeypatch, rank_in_group=0, world_size=2):
     grp = MagicMock()
     grp.rank_in_group = rank_in_group
@@ -260,6 +271,7 @@ def _fake_async_pp_group(monkeypatch, rank_in_group=0, world_size=2):
     grp.cpu_group = MagicMock()
     grp.device_group = MagicMock()
     monkeypatch.setattr(pp_comm, "get_pp_group", lambda: grp)
+    monkeypatch.setattr(pp_comm, "_split_tensor_dict", _real_split_tensor_dict)
     return grp
 
 
