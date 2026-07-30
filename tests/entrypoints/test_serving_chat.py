@@ -120,6 +120,34 @@ class TestBuildChatResponse:
         assert '"cmd"' in tc["function"]["arguments"]
         assert resp.choices[0]["finish_reason"] == "tool_calls"
 
+    def test_glm_tool_call_parsed(self):
+        raw = (
+            "<tool_call>bash"
+            "<arg_key>command</arg_key><arg_value>ls</arg_value>"
+            "</tool_call>"
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        output = self._make_output(text=raw)
+        resp = build_chat_response("req-1", "model", raw, output, tools=tools)
+
+        message = resp.choices[0]["message"]
+        assert message["content"] == ""
+        assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+            "command": "ls"
+        }
+        assert resp.choices[0]["finish_reason"] == "tool_calls"
+
     def test_timing_in_usage(self):
         output = self._make_output(ttft=0.15, tpot=0.03, latency=0.8)
         resp = build_chat_response("req-1", "model", "text", output)

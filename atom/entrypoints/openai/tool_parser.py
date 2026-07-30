@@ -3,7 +3,7 @@
 
 """Tool call parser for models that output tool calls.
 
-Two on-the-wire formats are auto-detected and normalized into the OpenAI
+Three on-the-wire formats are auto-detected and normalized into the OpenAI
 ``tool_calls`` structure:
 
 1. Kimi-K2 special-token format::
@@ -21,10 +21,17 @@ Two on-the-wire formats are auto-detected and normalized into the OpenAI
     </function>
     </tool_call>
 
-The Qwen XML carries no value types, so when the request's ``tools`` schema is
+3. GLM-4.7 / GLM-5 XML format::
+
+    <tool_call>NAME
+    <arg_key>PNAME</arg_key><arg_value>VALUE</arg_value>
+    ...
+    </tool_call>
+
+The XML formats carry no value types, so when the request's ``tools`` schema is
 supplied each parameter is coerced to the declared JSON-Schema type (int, float,
-bool, null, object, array); otherwise it is left as a string. This mirrors the
-qwen3_coder/qwen3_xml parsers in vLLM and SGLang.
+bool, null, object, array). This mirrors the qwen3_xml and glm47 parsers in
+vLLM and SGLang.
 
 OpenAI format:
     {"tool_calls": [{"id": "call_0", "type": "function",
@@ -69,11 +76,25 @@ _QWEN_PARAM_RE = re.compile(
     r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
     re.DOTALL,
 )
+_GLM_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_GLM_ARG_RE = re.compile(
+    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+    re.DOTALL,
+)
 
 
 def _is_qwen_xml(text: str) -> bool:
     """Detect the Qwen3 XML tool-call format (and not the Kimi token format)."""
     return _QWEN_TOOL_PREFIX in text and "<|tool_calls_section_begin|>" not in text
+
+
+def _is_glm_xml(text: str) -> bool:
+    """Detect the GLM-4.7 / GLM-5 native XML tool-call format."""
+    return (
+        "<tool_call>" in text
+        and _QWEN_TOOL_PREFIX not in text
+        and "<|tool_calls_section_begin|>" not in text
+    )
 
 
 def _build_param_types(tools: Optional[list]) -> Dict[str, Dict[str, Any]]:
@@ -133,6 +154,36 @@ def _coerce_param_value(value: str, ptype: Any) -> Any:
     return v
 
 
+def _coerce_glm_param_value(value: str, ptype: Any) -> Any:
+    """Coerce a GLM argument while preserving bare string values.
+
+    GLM emits schema-declared strings without JSON quotes and emits structured
+    values as JSON. When no schema is available, use JSON/literal parsing as a
+    best effort and fall back to the original text.
+    """
+    v = value.strip("\n")
+    if ptype is not None:
+        t = str(ptype).lower()
+        if t in ("string", "str", "text", "varchar", "char", "enum"):
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in {'"', "'"}:
+                try:
+                    parsed = json.loads(v) if v[0] == '"' else ast.literal_eval(v)
+                    if isinstance(parsed, str):
+                        return parsed
+                except Exception:
+                    return v[1:-1]
+            return v
+        return _coerce_param_value(v, ptype)
+
+    try:
+        return json.loads(v)
+    except Exception:
+        try:
+            return ast.literal_eval(v)
+        except Exception:
+            return v
+
+
 def _parse_qwen_function(
     fn_text: str, param_types: Dict[str, Dict[str, Any]], index: int
 ) -> Optional[ToolCall]:
@@ -183,15 +234,61 @@ def _parse_qwen_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCal
     return content.strip(), tool_calls
 
 
+def _parse_glm_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+    """Parse GLM-4.7 / GLM-5 XML tool calls."""
+    param_types = _build_param_types(tools)
+    content_parts: List[str] = []
+    tool_calls: List[ToolCall] = []
+    last_end = 0
+
+    for match in _GLM_TOOL_CALL_RE.finditer(text):
+        content_parts.append(text[last_end : match.start()])
+        body = match.group(1)
+        args_start = body.find("<arg_key>")
+        if args_start == -1:
+            name = body.strip()
+            args_text = ""
+        else:
+            name = body[:args_start].strip()
+            args_text = body[args_start:]
+
+        if not name:
+            content_parts.append(match.group(0))
+            last_end = match.end()
+            continue
+
+        types = param_types.get(name, {})
+        arguments: Dict[str, Any] = {}
+        for key, value in _GLM_ARG_RE.findall(args_text):
+            key = key.strip()
+            if key:
+                arguments[key] = _coerce_glm_param_value(value, types.get(key))
+
+        tool_calls.append(
+            ToolCall(
+                id=_unique_tool_call_id(),
+                type="function",
+                function={
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            )
+        )
+        last_end = match.end()
+
+    content_parts.append(text[last_end:])
+    return "".join(content_parts).strip(), tool_calls
+
+
 def parse_tool_calls(
     text: str, tools: Optional[list] = None
 ) -> Tuple[str, List[ToolCall]]:
     """Parse tool calls from model output text.
 
     Args:
-        text: Raw model output that may contain tool calls (Kimi token format
-            or Qwen3 XML format).
-        tools: Optional request tool definitions; used to type-coerce Qwen XML
+        text: Raw model output that may contain tool calls (Kimi token format,
+            Qwen3 XML format, or GLM XML format).
+        tools: Optional request tool definitions; used to type-coerce XML
             parameter values to their declared JSON-Schema types.
 
     Returns:
@@ -201,6 +298,10 @@ def parse_tool_calls(
     # Qwen3 XML format
     if _is_qwen_xml(text):
         return _parse_qwen_xml(text, tools)
+
+    # GLM-4.7 / GLM-5 XML format
+    if _is_glm_xml(text):
+        return _parse_glm_xml(text, tools)
 
     # Kimi-K2 special-token format
     section_match = re.search(
@@ -253,7 +354,7 @@ def _parse_tool_call_entries(section_text: str) -> List[ToolCall]:
 
 @dataclass
 class ToolCallStreamParser:
-    """Stateful streaming parser for tool calls (Kimi tokens or Qwen3 XML).
+    """Stateful streaming parser for tool calls (Kimi, Qwen3, or GLM).
 
     Processes text chunks and emits structured events:
     - ("content", text) — regular content before tool calls
@@ -261,9 +362,9 @@ class ToolCallStreamParser:
     - ("tool_call_args", {"index": N, "function": {"arguments": chunk}})
     - ("tool_call_end", None) — all tool calls complete
 
-    The wire format is auto-detected from the first chunks. For the Qwen3 XML
-    format content is streamed normally and the ``<tool_call>`` block is buffered
-    and parsed when complete (robust against partial-XML streaming edge cases);
+    The wire format is auto-detected from the first chunks. For XML formats,
+    content is streamed normally and the ``<tool_call>`` block is buffered and
+    parsed when complete (robust against partial-XML streaming edge cases);
     ``tools`` enables JSON-Schema type coercion of parameter values.
 
     Kimi states:
@@ -277,14 +378,14 @@ class ToolCallStreamParser:
     current_index: int = 0
     _emitted_calls: int = 0
     tools: Optional[list] = None
-    fmt: Optional[str] = None  # None (undecided) | "kimi" | "qwen"
+    fmt: Optional[str] = None  # None (undecided) | "kimi" | "xml"
 
     def process(self, text: str) -> list:
         """Process a text chunk and return list of (event_type, data) tuples."""
         if self.fmt is None:
             self.buf += text
             if _QWEN_TOOL_PREFIX in self.buf or "<tool_call>" in self.buf:
-                self.fmt = "qwen"
+                self.fmt = "xml"
             elif "<|tool_calls_section_begin|>" in self.buf:
                 self.fmt = "kimi"
             elif "<" not in self.buf and len(self.buf) > 8:
@@ -297,12 +398,12 @@ class ToolCallStreamParser:
             # Format decided: replay the accumulated buffer through the handler.
             text, self.buf = self.buf, ""
 
-        if self.fmt == "qwen":
-            return self._process_qwen(text)
+        if self.fmt == "xml":
+            return self._process_xml(text)
         return self._process_kimi(text)
 
-    # -- Qwen3 XML ----------------------------------------------------------
-    def _process_qwen(self, text: str) -> list:
+    # -- Qwen3 / GLM XML ----------------------------------------------------
+    def _process_xml(self, text: str) -> list:
         results: list = []
         self.buf += text
         if self.state == 0:
@@ -333,7 +434,7 @@ class ToolCallStreamParser:
                     self.buf = self.buf[cut:]
         return results
 
-    def _flush_qwen(self) -> list:
+    def _flush_xml(self) -> list:
         results: list = []
         if self.state == 0:
             if self.buf:
@@ -341,8 +442,18 @@ class ToolCallStreamParser:
                 self.buf = ""
             return results
         # state 1: parse the complete (or trailing) tool-call block.
-        _content, tool_calls = _parse_qwen_xml(self.buf, self.tools)
+        raw_buffer = self.buf
+        if _is_qwen_xml(raw_buffer):
+            content, tool_calls = _parse_qwen_xml(raw_buffer, self.tools)
+        elif _is_glm_xml(raw_buffer):
+            content, tool_calls = _parse_glm_xml(raw_buffer, self.tools)
+        else:
+            content, tool_calls = raw_buffer, []
         self.buf = ""
+        if not tool_calls:
+            content = raw_buffer
+        if content:
+            results.append(("content", content))
         for tc in tool_calls:
             tc.id = _unique_tool_call_id()
             results.append(
@@ -449,8 +560,8 @@ class ToolCallStreamParser:
 
     def flush(self) -> list:
         """Flush remaining buffer content."""
-        if self.fmt == "qwen":
-            return self._flush_qwen()
+        if self.fmt == "xml":
+            return self._flush_xml()
         results = []
         if self.state == 0 and self.buf:
             results.append(("content", self.buf))
