@@ -23,18 +23,19 @@ import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple  # noqa: UP035
 
 import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
+
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.utils.arg_parser import FlexibleArgumentParser
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
 from .protocol import (
@@ -42,12 +43,6 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
-)
-from .serving_chat import (
-    build_chat_response,
-    build_chat_response_multi,
-    stream_chat_response,
-    stream_chat_response_fanout,
 )
 from .serving_anthropic import (
     AnthropicMessagesRequest,
@@ -62,12 +57,19 @@ from .serving_anthropic import (
     stream_message_stop,
     stream_signature_delta,
 )
+from .serving_chat import (
+    build_chat_response,
+    build_chat_response_multi,
+    stream_chat_response,
+    stream_chat_response_fanout,
+)
 from .serving_completion import (
     build_completion_response,
     build_completion_response_multi,
     stream_completion_response,
     stream_completion_response_fanout,
 )
+from .streaming_dispatch import StreamBatchDispatcher
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -82,16 +84,17 @@ DEFAULT_PORT = 8000
 # ============================================================================
 
 engine = None
-tokenizer: Optional[AutoTokenizer] = None
-processor: Optional[Any] = None
+tokenizer: AutoTokenizer | None = None
+processor: Any | None = None
 model_name: str = ""
-default_chat_template_kwargs: Dict[str, Any] = {}
-custom_message_encoder: Optional[Any] = None
-_stream_queues: Dict[str, asyncio.Queue] = {}
-_seq_id_to_request_id: Dict[int, str] = {}
-_stream_loops: Dict[str, AbstractEventLoop] = {}
-_request_start_times: Dict[str, float] = {}
-_request_logger: Optional[logging.Logger] = None
+default_chat_template_kwargs: dict[str, Any] = {}
+custom_message_encoder: Any | None = None
+_stream_queues: dict[str, asyncio.Queue] = {}
+_seq_id_to_request_id: dict[int, str] = {}
+_stream_loops: dict[str, AbstractEventLoop] = {}
+_request_start_times: dict[str, float] = {}
+_request_logger: logging.Logger | None = None
+_stream_batch_dispatcher: StreamBatchDispatcher | None = None
 
 
 # ============================================================================
@@ -324,19 +327,13 @@ def _prepare_multimodal_inputs(
     return inputs["input_ids"][0].tolist(), multimodal_data
 
 
-def _send_stream_chunk_direct(
-    request_output: RequestOutput,
-    request_id: str,
-    stream_queue: asyncio.Queue,
-    loop: AbstractEventLoop,
-) -> None:
-    """Send stream chunk directly to the queue."""
-    global tokenizer
+# ── Batched stream dispatch ──────────────────────────────────────────────
 
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+
+def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
+    """Build a raw chunk; detokenization happens once in the batch dispatcher."""
     started_at = _request_start_times.get(request_id)
     chunk_data = {
-        "text": new_text,
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
@@ -346,11 +343,34 @@ def _send_stream_chunk_direct(
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
+    return chunk_data
+
+
+def _send_stream_chunk_direct(
+    request_output: RequestOutput,
+    request_id: str,
+    stream_queue: asyncio.Queue,
+    loop: AbstractEventLoop,
+) -> None:
+    """Buffer a single-request chunk for this engine step."""
+    assert _stream_batch_dispatcher is not None
+    _stream_batch_dispatcher.enqueue(
+        loop=loop,
+        queue=stream_queue,
+        state_key=request_id,
+        chunk=_build_stream_chunk(request_output, request_id),
+    )
+
+
+def flush_stream_batch() -> None:
+    """Flush this output thread's engine-step batch into asyncio queues."""
+    if _stream_batch_dispatcher is not None:
+        _stream_batch_dispatcher.flush()
 
 
 def _send_stream_chunk_tagged(
     request_output: RequestOutput,
+    request_id: str,
     sibling_index: int,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
@@ -364,18 +384,14 @@ def _send_stream_chunk_tagged(
     This path serves ``SamplingParams.n > 1`` by tagging each sibling's chunks
     so the shared stream consumer can merge them in order.
     """
-    global tokenizer
-
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
-    chunk_data = {
-        "text": new_text,
-        "token_ids": request_output.output_tokens,
-        "finished": request_output.finished,
-        "finish_reason": request_output.finish_reason,
-    }
-    if getattr(request_output, "kv_transfer_params_output", None):
-        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, (sibling_index, chunk_data))
+    assert _stream_batch_dispatcher is not None
+    _stream_batch_dispatcher.enqueue(
+        loop=loop,
+        queue=stream_queue,
+        state_key=(request_id, sibling_index),
+        chunk=_build_stream_chunk(request_output, request_id),
+        tag=sibling_index,
+    )
 
 
 async def generate_async(
@@ -831,6 +847,8 @@ def cleanup_streaming_request(
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    if _stream_batch_dispatcher is not None:
+        _stream_batch_dispatcher.discard_request(request_id)
     if aborted:
         try:
             engine.core_mgr.abort_request(seq_id)
@@ -967,7 +985,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
-            _send_stream_chunk_tagged(request_output, idx, shared_queue, stream_loop)
+            _send_stream_chunk_tagged(
+                request_output, request_id, idx, shared_queue, stream_loop
+            )
 
         return _cb
 
@@ -1433,6 +1453,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 if prompt.rstrip().endswith("<think>"):
                     reasoning_filter.state = 1
                 tool_parser = ToolCallStreamParser()
+                tool_parser.tools = anthropic_to_openai_tools(request.tools)
                 block_index = 0
                 started_text = False
                 started_thinking = False
@@ -1602,15 +1623,19 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         from .reasoning import separate_reasoning
         from .tool_parser import parse_tool_calls
 
-        final_output = None
-        async for output in generate_async(prompt, sampling_params, request_id):
-            final_output = output
+        final_output = await _run_nonstream_with_disconnect(
+            generate_async(prompt, sampling_params, request_id),
+            raw_request,
+            request_id,
+        )
         if final_output is None:
             raise RuntimeError("No output generated")
 
         raw_text = final_output["text"]
         reasoning_content, content_with_tools = separate_reasoning(raw_text)
-        content_text, tool_calls = parse_tool_calls(content_with_tools)
+        content_text, tool_calls = parse_tool_calls(
+            content_with_tools, anthropic_to_openai_tools(request.tools)
+        )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         if not getattr(request, "thinking", None):
@@ -1627,8 +1652,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             cache_read_input_tokens=cache_read_input_tokens,
         )
 
+    except _ClientDisconnected:
+        # Client hung up; seq already aborted + popped. Nothing to return.
+        return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except Exception as e:
-        logger.error(f"Error in anthropic_messages: {e}", exc_info=True)
+        logger.exception("Error in anthropic_messages")
         return JSONResponse(
             status_code=500,
             content={
@@ -1743,7 +1771,7 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global custom_message_encoder
+    global custom_message_encoder, _stream_batch_dispatcher
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -1793,6 +1821,15 @@ def main():
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    _stream_batch_dispatcher = StreamBatchDispatcher(tokenizer)
+
+    # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
+    # their chunks into a thread-local; the engine core manager's output thread
+    # calls this flush after each step's callbacks to drain the buffer into the
+    # per-request asyncio queues (one call_soon_threadsafe per event loop).
+    # Registered lazily here to avoid the api_server <-> engine_core_mgr import
+    # cycle; the core manager leaves the hook as None until this resolves it.
+    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
 
     import signal
 
