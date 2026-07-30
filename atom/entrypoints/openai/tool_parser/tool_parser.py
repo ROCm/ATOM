@@ -14,7 +14,7 @@ emits tool calls incrementally and implements ``process``/``flush`` itself.
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar
 
 
 def unique_tool_call_id() -> str:
@@ -31,9 +31,9 @@ class ToolCall:
 
     id: str
     type: str
-    function: Dict[str, str]
+    function: dict[str, str]
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "type": self.type, "function": self.function}
 
 
@@ -46,7 +46,7 @@ class ToolCallParser(ABC):
 
     NAME: ClassVar[str]
 
-    def __init__(self, tools: Optional[list] = None):
+    def __init__(self, tools: list | None = None):
         self.tools = tools
         self.buf = ""
         # 0 = still in plain content, 1 = inside a tool-call region. Kimi adds
@@ -63,7 +63,7 @@ class ToolCallParser(ABC):
 
     @classmethod
     @abstractmethod
-    def parse(cls, text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
         """Parse a complete output into ``(leading_content, tool_calls)``."""
 
     # -- streaming ----------------------------------------------------------
@@ -111,11 +111,11 @@ class BufferedMarkerParser(ToolCallParser):
     """
 
     # Any of these opening the tool-call region; the earliest one wins.
-    START_MARKERS: ClassVar[Tuple[str, ...]] = ()
+    START_MARKERS: ClassVar[tuple[str, ...]] = ()
     # While no marker has been seen, a trailing run starting with one of these
     # may be the first bytes of a marker, so it is held back rather than emitted
     # as content (it would otherwise leak '<' into the user-visible text).
-    HOLDBACK_CHARS: ClassVar[Tuple[str, ...]] = ("<",)
+    HOLDBACK_CHARS: ClassVar[tuple[str, ...]] = ("<",)
 
     @classmethod
     def find_start(cls, text: str) -> int:

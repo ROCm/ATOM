@@ -19,7 +19,7 @@ request's ``tools`` and infers a missing value type from the schema / JSON.
 
 import json
 import re
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar
 
 from .schema import build_param_types, coerce_param_value
 from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
@@ -63,7 +63,7 @@ def _unwrap_wrapper_args(args: Any, allowed: set) -> Any:
         if isinstance(v, str):
             try:
                 v = json.loads(v)
-            except Exception:
+            except (ValueError, TypeError):
                 break
         if not isinstance(v, dict):
             break
@@ -71,7 +71,7 @@ def _unwrap_wrapper_args(args: Any, allowed: set) -> Any:
     return args
 
 
-def _coerce(value: str, string_attr: Optional[str], ptype: Any) -> Any:
+def _coerce(value: str, string_attr: str | None, ptype: Any) -> Any:
     """Decode one ``<parameter>`` body.
 
     Deliberately not :func:`~.schema.coerce_json_or_raw`: on a JSON-decode miss
@@ -83,7 +83,7 @@ def _coerce(value: str, string_attr: Optional[str], ptype: Any) -> Any:
     if string_attr == "false":
         try:
             return json.loads(value)
-        except Exception:
+        except (ValueError, TypeError):
             return value
     # attr absent -> use declared schema type if known, else infer via JSON.
     if ptype is not None:
@@ -91,13 +91,11 @@ def _coerce(value: str, string_attr: Optional[str], ptype: Any) -> Any:
     v = value.strip()
     try:
         return json.loads(v)
-    except Exception:
+    except (ValueError, TypeError):
         return v
 
 
-def _infer_name(
-    arg_names: set, param_types: Dict[str, Dict[str, Any]]
-) -> Optional[str]:
+def _infer_name(arg_names: set, param_types: dict[str, dict[str, Any]]) -> str | None:
     """Pick the request tool whose parameter set best matches ``arg_names``."""
     best, best_score = None, -1e9
     for name, props in param_types.items():
@@ -113,7 +111,7 @@ def _infer_name(
 class DsmlParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "dsml"
     # Region-start markers, both marked and marker-less variants.
-    START_MARKERS: ClassVar[Tuple[str, ...]] = (
+    START_MARKERS: ClassVar[tuple[str, ...]] = (
         "<" + _DSML + "tool_call",  # marked (covers tool_call / tool_calls)
         "<" + _DSML + "invoke",  # marked invoke
         "<invoke name=",  # marker-less invoke (common malform)
@@ -123,7 +121,7 @@ class DsmlParser(BufferedMarkerParser):
     # detect() is inherited: any start marker present means DSML.
 
     @classmethod
-    def parse(cls, text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
         """Parse DeepSeek-V4 DSML tool calls; return (leading_content, tool_calls)."""
         param_types = build_param_types(tools)
         start = cls.find_start(text)
@@ -132,14 +130,14 @@ class DsmlParser(BufferedMarkerParser):
         content = text[:start]
         region = text[start:]
 
-        calls: List[Tuple[str, Dict[str, Any]]] = []
+        calls: list[tuple[str, dict[str, Any]]] = []
         invokes = list(_INVOKE_RE.finditer(region))
         if invokes:
             for m in invokes:
                 name = m.group(1)
                 body = m.group(2) or ""  # None for self-closing <invoke .../>
                 types = param_types.get(name, {})
-                args: Dict[str, Any] = {
+                args: dict[str, Any] = {
                     pm.group(1): _coerce(
                         pm.group(3), pm.group(2), types.get(pm.group(1))
                     )
@@ -155,7 +153,7 @@ class DsmlParser(BufferedMarkerParser):
                             parsed = json.loads(stripped)
                             if isinstance(parsed, dict):
                                 args = parsed
-                        except Exception:
+                        except (ValueError, TypeError):
                             pass
                 args = _unwrap_wrapper_args(args, set(types))
                 calls.append((name, args))

@@ -17,7 +17,7 @@ vLLM and SGLang.
 
 import json
 import re
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar
 
 from .kimi_tool_parser import KIMI_SECTION_BEGIN
 from .schema import build_param_types, coerce_param_value
@@ -35,8 +35,8 @@ _PARAM_RE = re.compile(
 
 
 def _parse_function(
-    fn_text: str, param_types: Dict[str, Dict[str, Any]]
-) -> Optional[ToolCall]:
+    fn_text: str, param_types: dict[str, dict[str, Any]]
+) -> ToolCall | None:
     """Parse the inside of one ``<function=NAME>...`` block into a ToolCall."""
     gt = fn_text.find(">")
     if gt == -1:
@@ -46,7 +46,7 @@ def _parse_function(
         return None
     body = fn_text[gt + 1 :]
     types = param_types.get(name, {})
-    args: Dict[str, Any] = {}
+    args: dict[str, Any] = {}
     for pm in _PARAM_RE.finditer(body):
         seg = pm.group(1)
         if seg is None:
@@ -67,7 +67,7 @@ def _parse_function(
 
 class QwenXmlParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "qwen"
-    START_MARKERS: ClassVar[Tuple[str, ...]] = ("<tool_call>", QWEN_TOOL_PREFIX)
+    START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>", QWEN_TOOL_PREFIX)
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -75,13 +75,13 @@ class QwenXmlParser(BufferedMarkerParser):
         return QWEN_TOOL_PREFIX in text and KIMI_SECTION_BEGIN not in text
 
     @classmethod
-    def parse(cls, text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
         """Parse Qwen3 XML tool calls; return (leading_content, tool_calls)."""
         param_types = build_param_types(tools)
         # Content precedes the first tool marker.
         start = cls.find_start(text)
         content = text[:start] if start != -1 else text
-        tool_calls: List[ToolCall] = []
+        tool_calls: list[ToolCall] = []
         for fm in _FUNCTION_RE.finditer(text):
             fn_text = fm.group(1) if fm.group(1) is not None else fm.group(2)
             if not fn_text:

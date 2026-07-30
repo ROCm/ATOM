@@ -4,7 +4,6 @@
 """Streaming facade: sniff the format once, then delegate every chunk to it."""
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .registry import EMIT_CONTENT, WAIT, sniff_stream
 from .tool_parser import ToolCallParser
@@ -26,14 +25,14 @@ class ToolCallStreamParser:
     ends.
     """
 
-    tools: Optional[list] = None
+    tools: list | None = None
     # Pre-detection accumulator. Once a format is chosen this is handed to the
     # concrete parser and never used again.
     _buf: str = ""
-    _parser: Optional[ToolCallParser] = field(default=None, repr=False)
+    _parser: ToolCallParser | None = field(default=None, repr=False)
 
     @property
-    def fmt(self) -> Optional[str]:
+    def fmt(self) -> str | None:
         """Detected format name, or None while still undecided."""
         return self._parser.NAME if self._parser is not None else None
 

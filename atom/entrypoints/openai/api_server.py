@@ -26,15 +26,16 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
+
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.utils.arg_parser import FlexibleArgumentParser
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
 from .protocol import (
@@ -42,12 +43,6 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
-)
-from .serving_chat import (
-    build_chat_response,
-    build_chat_response_multi,
-    stream_chat_response,
-    stream_chat_response_fanout,
 )
 from .serving_anthropic import (
     AnthropicMessagesRequest,
@@ -61,6 +56,12 @@ from .serving_anthropic import (
     stream_message_start,
     stream_message_stop,
     stream_signature_delta,
+)
+from .serving_chat import (
+    build_chat_response,
+    build_chat_response_multi,
+    stream_chat_response,
+    stream_chat_response_fanout,
 )
 from .serving_completion import (
     build_completion_response,
@@ -89,11 +90,11 @@ model_name: str = ""
 default_chat_template_kwargs: Dict[str, Any] = {}
 custom_message_encoder: Optional[Any] = None
 _stream_queues: Dict[str, asyncio.Queue] = {}
-_seq_id_to_request_id: Dict[int, str] = {}
-_stream_loops: Dict[str, AbstractEventLoop] = {}
-_request_start_times: Dict[str, float] = {}
-_request_logger: Optional[logging.Logger] = None
-_stream_batch_dispatcher: Optional[StreamBatchDispatcher] = None
+_seq_id_to_request_id: dict[int, str] = {}
+_stream_loops: dict[str, AbstractEventLoop] = {}
+_request_start_times: dict[str, float] = {}
+_request_logger: logging.Logger | None = None
+_stream_batch_dispatcher: StreamBatchDispatcher | None = None
 
 
 # ============================================================================
@@ -1655,7 +1656,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except Exception as e:
-        logger.exception(f"Error in anthropic_messages: {e}")
+        logger.exception("Error in anthropic_messages")
         return JSONResponse(
             status_code=500,
             content={

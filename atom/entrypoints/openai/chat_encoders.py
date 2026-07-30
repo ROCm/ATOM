@@ -14,7 +14,7 @@ import glob
 import importlib.util
 import logging
 import os
-from typing import Any, List, Optional
+from typing import Any
 
 from huggingface_hub import snapshot_download
 
@@ -35,7 +35,7 @@ def _resolve_model_path(model: str) -> str:
         return model
 
 
-def _load_encoder_from_dir(model_path: str) -> Optional[MessageEncoderAdapter]:
+def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
     """Look for ``<model>/encoding/encoding_*.py`` and load ``encode_messages``.
 
     Returns ``None`` when the directory or matching file is absent (model uses
@@ -78,7 +78,7 @@ def _load_encoder_from_dir(model_path: str) -> Optional[MessageEncoderAdapter]:
     return build_message_encoder_adapter(module_name, encode)
 
 
-def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoderAdapter]:
+def load_custom_message_encoder(model_path: str) -> MessageEncoderAdapter | None:
     """Probe ``model_path`` once at startup for a custom message encoder.
 
     Returns the encoder, or ``None`` when the model uses the standard Jinja
@@ -90,10 +90,10 @@ def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoderAdapt
 
 def apply_chat_template(
     tokenizer: Any,
-    custom_encoder: Optional[MessageEncoderAdapter],
-    messages: List[dict],
+    custom_encoder: MessageEncoderAdapter | None,
+    messages: list[dict],
     *,
-    tools: Optional[List[dict]] = None,
+    tools: list[dict] | None = None,
     **kwargs: Any,
 ) -> str:
     """Render ``messages`` to a prompt string.

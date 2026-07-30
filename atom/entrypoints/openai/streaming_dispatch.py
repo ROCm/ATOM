@@ -5,8 +5,9 @@
 
 import threading
 from asyncio import AbstractEventLoop, Queue
+from collections.abc import Hashable
 from dataclasses import dataclass, field
-from typing import Any, Hashable, Optional
+from typing import Any
 
 
 @dataclass
@@ -45,7 +46,7 @@ class _BufferedChunk:
     queue: Queue
     state_key: Hashable
     chunk: dict
-    tag: Optional[int]
+    tag: int | None
 
 
 class StreamBatchDispatcher:
@@ -64,7 +65,7 @@ class StreamBatchDispatcher:
         queue: Queue,
         state_key: Hashable,
         chunk: dict,
-        tag: Optional[int] = None,
+        tag: int | None = None,
     ) -> None:
         """Buffer a raw chunk until the current engine step is flushed."""
         buf = getattr(self._thread_local, "buf", None)

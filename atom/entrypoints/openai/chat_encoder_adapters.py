@@ -3,23 +3,24 @@
 
 """Model-scoped adapters for dynamically loaded chat encoders."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any
 
 MessageEncoder = Callable[..., str]
-MessagePreparer = Callable[[List[dict], Optional[List[dict]]], List[dict]]
+MessagePreparer = Callable[[list[dict], list[dict] | None], list[dict]]
 
 
 def _copy_messages(
-    messages: List[dict], _tools: Optional[List[dict]] = None
-) -> List[dict]:
+    messages: list[dict], _tools: list[dict] | None = None
+) -> list[dict]:
     """Return shallow message copies without model-specific rewriting."""
     return [dict(message) for message in messages]
 
 
 def _prepare_deepseek_v4_messages(
-    messages: List[dict], tools: Optional[List[dict]]
-) -> List[dict]:
+    messages: list[dict], tools: list[dict] | None
+) -> list[dict]:
     """Prepare the internal message shape expected by DSV4 ``encode_messages``.
 
     The DeepSeek-V4 reference encoder reads tool schemas from a system message's
@@ -42,7 +43,7 @@ class MessageEncoderAdapter:
     prepare_messages: MessagePreparer
     supports_tools: bool = False
 
-    def __call__(self, messages: List[dict], **kwargs: Any) -> str:
+    def __call__(self, messages: list[dict], **kwargs: Any) -> str:
         """Preserve the callable behavior of the former encoder return value."""
         return self.encode(messages, **kwargs)
 

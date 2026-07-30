@@ -17,7 +17,7 @@ when it parses as JSON) and otherwise kept as a raw string.
 
 import json
 import re
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar
 
 from .qwen3_tool_parser import QWEN_TOOL_PREFIX
 from .schema import build_param_types, coerce_json_or_raw
@@ -33,7 +33,7 @@ _ARG_RE = re.compile(
 
 class GlmParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "glm"
-    START_MARKERS: ClassVar[Tuple[str, ...]] = ("<tool_call>",)
+    START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -43,14 +43,14 @@ class GlmParser(BufferedMarkerParser):
         return "<arg_key>" in text or "<tool_call>" in text
 
     @classmethod
-    def parse(cls, text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
         """Parse GLM tool calls; return (leading_content, tool_calls)."""
         param_types = build_param_types(tools)
         start = text.find("<tool_call>")
         if start == -1:
             return text.strip(), []
         content = text[:start]
-        tool_calls: List[ToolCall] = []
+        tool_calls: list[ToolCall] = []
         for m in _TOOLCALL_RE.finditer(text):
             body = m.group(1) if m.group(1) is not None else m.group(2)
             if not body:
@@ -60,7 +60,7 @@ class GlmParser(BufferedMarkerParser):
             if not name:
                 continue
             types = param_types.get(name, {})
-            args: Dict[str, Any] = {}
+            args: dict[str, Any] = {}
             for pm in _ARG_RE.finditer(body):
                 k = pm.group(1).strip()
                 if k:

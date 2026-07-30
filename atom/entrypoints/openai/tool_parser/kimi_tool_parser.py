@@ -18,7 +18,7 @@ rather than a random one, and ``index`` comes from the wire too.
 """
 
 import re
-from typing import ClassVar, List, Optional, Tuple
+from typing import ClassVar
 
 from .tool_parser import ToolCall, ToolCallParser
 
@@ -40,7 +40,7 @@ _ENTRY_RE = re.compile(
 )
 
 
-def _parse_entries(section_text: str) -> List[ToolCall]:
+def _parse_entries(section_text: str) -> list[ToolCall]:
     """Parse individual tool call entries from the section content."""
     tool_calls = []
     for match in _ENTRY_RE.finditer(section_text):
@@ -68,7 +68,7 @@ class KimiParser(ToolCallParser):
         return KIMI_SECTION_BEGIN in text
 
     @classmethod
-    def parse(cls, text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
         section_match = _SECTION_RE.search(text)
         if not section_match:
             # Unclosed section: the model was cut off mid-block; salvage whatever

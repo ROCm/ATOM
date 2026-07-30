@@ -11,16 +11,16 @@ otherwise it is left alone.
 
 import ast
 import json
-from typing import Any, Dict, Optional
+from typing import Any
 
 
-def build_param_types(tools: Optional[list]) -> Dict[str, Dict[str, Any]]:
+def build_param_types(tools: list | None) -> dict[str, dict[str, Any]]:
     """Map ``function_name -> {param_name: json_schema_type}`` from request tools.
 
     Accepts OpenAI (``{"type": "function", "function": {...}}``) and bare
     (``{"name": ..., "parameters"/"input_schema": {...}}``) tool entries.
     """
-    out: Dict[str, Dict[str, Any]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
@@ -64,9 +64,9 @@ def coerce_param_value(value: str, ptype: Any) -> Any:
         if t.startswith(("object", "dict", "map", "array", "list", "tuple")):
             try:
                 return json.loads(v)
-            except Exception:
+            except (ValueError, TypeError):
                 return ast.literal_eval(v)  # safer for single-quoted Python literals
-    except Exception:
+    except Exception:  # noqa: BLE001
         return v
     return v
 
@@ -83,5 +83,5 @@ def coerce_json_or_raw(value: str, ptype: Any) -> Any:
     s = v.strip()
     try:
         return json.loads(s)
-    except Exception:
+    except (ValueError, TypeError):
         return v

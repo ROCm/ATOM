@@ -10,8 +10,6 @@ below is the single place that ordering is expressed — do not reorder without
 re-reading the notes on each entry.
 """
 
-from typing import List, Optional, Tuple, Type
-
 from .deepseekv4_tool_parser import DsmlParser
 from .glm_tool_parser import GlmParser
 from .kimi_tool_parser import KIMI_SECTION_BEGIN, KimiParser
@@ -26,7 +24,7 @@ from .tool_parser import ToolCall, ToolCallParser
 #                         prefixes every tag with the ns_token.
 #   GLM before Qwen     — both use `<tool_call>`; GLM never emits `<function=`,
 #                         which GlmParser.detect checks for explicitly.
-_DETECT_ORDER: Tuple[Type[ToolCallParser], ...] = (
+_DETECT_ORDER: tuple[type[ToolCallParser], ...] = (
     MiniMaxParser,
     DsmlParser,
     GlmParser,
@@ -35,8 +33,8 @@ _DETECT_ORDER: Tuple[Type[ToolCallParser], ...] = (
 
 
 def parse_tool_calls(
-    text: str, tools: Optional[list] = None
-) -> Tuple[str, List[ToolCall]]:
+    text: str, tools: list | None = None
+) -> tuple[str, list[ToolCall]]:
     """Parse tool calls from a complete model output.
 
     Args:
