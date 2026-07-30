@@ -978,9 +978,7 @@ class ModelRunner:
             data_parallel_size=config.parallel_config.data_parallel_size,
             data_parallel_rank=config.parallel_config.data_parallel_rank,
             prefill_context_model_parallel_size=config.prefill_context_parallel_size,
-            decode_context_parallel_size=getattr(
-                config, "decode_context_parallel_size", 1
-            ),
+            decode_context_parallel_size=config.decode_context_parallel_size,
         )
 
     def _get_cumsum_and_arange(
