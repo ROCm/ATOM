@@ -40,6 +40,8 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    use_fp4_non_shuffle_triton_gemm,
+    use_triton_gemm,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -208,15 +210,33 @@ class SituAndMul(nn.Module):
 
 
 class KimiRMSNormGated(nn.Module):
-    def __init__(self, hidden_size: int, eps: float):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float,
+        quant_type: QuantType | None = None,
+        quant_dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         self.weight = atom_parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        # When ``quant_type`` names a fusable per-token scheme, the per-head
+        # sigmoid-gated norm also emits (quantized, scale) so the consuming
+        # o_proj skips its standalone quant; otherwise it returns a bf16 tensor.
+        self.quant_type = quant_type
+        self.quant_dtype = quant_dtype
 
-    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, gate: torch.Tensor):
         from atom.model_ops.kimi_k3 import rmsnorm_gated
 
-        return rmsnorm_gated(x, self.weight, gate, self.variance_epsilon)
+        return rmsnorm_gated(
+            x,
+            self.weight,
+            gate,
+            self.variance_epsilon,
+            quant_type=self.quant_type,
+            quant_dtype=self.quant_dtype,
+        )
 
 
 def _sharded_vector_loader(tp_rank: int, tp_size: int):
@@ -372,9 +392,37 @@ class KimiSparseMoeBlock(nn.Module):
                 source_quant_dtype=_routed_source_quant_dtype(up_proj_prefix),
                 prefix=up_proj_prefix,
             )
+            up_proj_quant_type, up_proj_quant_dtype = _effective_layer_quant(
+                quant_config, up_proj_prefix
+            )
+            latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
+            # AITER RMSNorm+quant emits the activation layout consumed directly by
+            # the routed up-projection. FP4 Triton paths choose an M-dependent
+            # shuffled/non-shuffled scale layout, so keep those on their existing
+            # standalone quant path until the fused kernel supports both layouts.
+            fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
+                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
+            )
+            self.fuse_routed_norm_quant = latent_moe_use_norm and (
+                (
+                    up_proj_quant_type == QuantType.per_1x32
+                    and up_proj_quant_dtype == dtypes.fp4x2
+                    and not fp4_triton_active
+                )
+                or (
+                    up_proj_quant_type in (QuantType.per_1x128, QuantType.per_Token)
+                    and up_proj_quant_dtype == dtypes.fp8
+                )
+            )
             self.routed_expert_norm = (
-                RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
-                if getattr(config, "latent_moe_use_norm", False)
+                RMSNorm(
+                    self.moe_hidden_size,
+                    eps=config.rms_norm_eps,
+                    fused_quant=self.fuse_routed_norm_quant,
+                    quant_config=quant_config,
+                    prefix=up_proj_prefix,
+                )
+                if latent_moe_use_norm
                 else None
             )
 
@@ -419,7 +467,13 @@ class KimiSparseMoeBlock(nn.Module):
                 routed_output = tensor_model_parallel_all_reduce(routed_output)
             if self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
-            routed_output = self.routed_expert_up_proj(routed_output)
+            if isinstance(routed_output, tuple):
+                routed_output, routed_output_scale = routed_output
+                routed_output = self.routed_expert_up_proj(
+                    routed_output, x_scale=routed_output_scale
+                )
+            else:
+                routed_output = self.routed_expert_up_proj(routed_output)
         return routed_output
 
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -452,10 +506,10 @@ class KimiSparseMoeBlock(nn.Module):
         current = torch.cuda.current_stream()
         alt = self.alt_stream
         alt.wait_stream(current)
+        routed_output = self.routed_expert_forward(hidden_states)
         with torch.cuda.stream(alt):
             # GEMM only — NO all_reduce inside the alt-stream block.
             shared_output = self.shared_experts(identity)
-        routed_output = self.routed_expert_forward(hidden_states)
         current.wait_stream(alt)
         if self.use_latent_moe:
             # shared branch is TP-partial; reduce it now on the main stream, after
@@ -793,7 +847,13 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
-        self.o_norm = KimiRMSNormGated(self.head_dim, eps=config.rms_norm_eps)
+        o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        self.o_norm = KimiRMSNormGated(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            quant_type=o_type,
+            quant_dtype=o_dtype,
+        )
         self.o_proj = RowParallelLinear(
             self.proj_size,
             self.hidden_size,
@@ -1116,8 +1176,15 @@ class KimiKDAAttention(nn.Module):
         else:
             out.zero_()
 
-        out = self.o_norm(out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim))
-        return self.o_proj(rearrange(out, "t h d -> t (h d)"))
+        normed = self.o_norm(
+            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
+        )
+        # A fused per-token quant makes o_norm return (quantized, scale); feed it
+        # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
+        if isinstance(normed, tuple):
+            o_fp8, o_scale = normed
+            return self.o_proj(o_fp8, x_scale=o_scale)
+        return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
 
 
 class KimiDecoderLayer(nn.Module):
