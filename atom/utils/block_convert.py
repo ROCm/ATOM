@@ -279,9 +279,7 @@ def mtp_prepare_decode_mla_kernel(
         if UPDATE_CONTEXT_LENS:
             tl.store(context_lens_ptr + offs, new_len, mask=mask_bs)
         if UPDATE_POSITIONS:
-            pos = tl.load(
-                positions_ptr + offs * position_stride, mask=mask_bs, other=0
-            )
+            pos = tl.load(positions_ptr + offs * position_stride, mask=mask_bs, other=0)
             tl.store(positions_ptr + offs * position_stride, pos + 1, mask=mask_bs)
         return
 

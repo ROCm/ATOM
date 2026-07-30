@@ -317,9 +317,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 bmt_max_bs + 1, dtype=np.int32
             )
             mla_metadata["split_cu_seqlens_q"].copy_to_gpu()
-            mla_metadata["split_kv_indptr"] = CpuGpuBuffer(
-                bmt_max_bs + 1, **i32_kwargs
-            )
+            mla_metadata["split_kv_indptr"] = CpuGpuBuffer(bmt_max_bs + 1, **i32_kwargs)
             mla_metadata["split_kv_last_page_lens"] = CpuGpuBuffer(
                 bmt_max_bs, **i32_kwargs
             )
@@ -1453,9 +1451,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             per_token_kv_lens = (
                 np.repeat(context_lens[:scheduled_bs], max_seqlen_q)
                 - max_seqlen_q
-                + np.tile(
-                    np.arange(1, max_seqlen_q + 1, dtype=np.int32), scheduled_bs
-                )
+                + np.tile(np.arange(1, max_seqlen_q + 1, dtype=np.int32), scheduled_bs)
             )
             per_token_kv_lens = np.clip(per_token_kv_lens, 0, None)
             per_token_blocks = cdiv(per_token_kv_lens, self.block_size)
@@ -1463,9 +1459,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["split_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
                 per_token_blocks, dtype=np.int32
             )
-            var["split_kv_indptr"].np[
-                sum_scheduled_tokens + 1 : sum_tokens + 1
-            ] = var["split_kv_indptr"].np[sum_scheduled_tokens]
+            var["split_kv_indptr"].np[sum_scheduled_tokens + 1 : sum_tokens + 1] = var[
+                "split_kv_indptr"
+            ].np[sum_scheduled_tokens]
             var["split_kv_last_page_lens"].np[:sum_scheduled_tokens] = np.where(
                 per_token_kv_lens > 0,
                 (per_token_kv_lens - 1) % self.block_size + 1,
