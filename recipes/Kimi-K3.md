@@ -50,15 +50,17 @@ export ENABLE_CK=0                          # CK never registered gfx1250 -> fly
 export ATOM_USE_TRITON_GEMM=1
 export AITER_USE_GROUPED_GEMM=1             # flydsl grouped MoE
 export ATOM_USE_TRITON_MLA=1                # K3 MLA-latent Triton path
-export ATOM_USE_TRITON_MLA_SHUFFLE_KV=1     # shuffled KV gather
 export ATOM_USE_CUSTOM_ALL_GATHER=0
 
 # ---- gfx1250 correctness ----
 export ATOM_K3_MOE_CHUNK=128                # grouped MoE/MXFP4 only correct at small M; sub-batch to <=128
+export ATOM_KDA_FORCE_RECURRENT=1           # chunk_kda NaNs here; run KDA prefill recurrently
+export ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1   # avoid aiter's Gluon MXFP4 preshuffle GEMM
 
 python -m atom.entrypoints.openai_server \
   --model Kimi-K3 \
   --kv_cache_dtype bf16 -tp 4 \
+  --block-size 64 \
   --trust-remote-code \
   --max-model-len 4096 \
   --max-num-seqs 8 \
@@ -68,17 +70,23 @@ python -m atom.entrypoints.openai_server \
   --no-enable_prefix_caching
 ```
 
-Chunked prefill is ON (bounds the MLA prefill activation to the chunk); prefix caching stays off for the KDA hybrid. `-tp 4` because that box has 4 GPUs, not a model requirement.
+Chunked prefill is ON (bounds the MLA prefill activation to the chunk); prefix caching stays off for the KDA hybrid. `-tp 4` because that box has 4 GPUs, not a model requirement. `--block-size 64` is not a hard requirement with shuffled KV off (see below), but it is the value the gsm8k number below was measured with.
 
-`ATOM_KDA_FORCE_RECURRENT` and `ATOM_WARMUP_MAX_TOKENS` from the original bring-up scripts no longer exist and must not be set. `ATOM_K3_ATTN_RES_NS` already defaults to `1`; `2` restores the pipelined attn-residual H loop, which faults on gfx1250.
+`ATOM_WARMUP_MAX_TOKENS` from the original bring-up scripts no longer exists and is not needed: the uncapped 2048-token warmup prefill passes on this stack. `ATOM_K3_ATTN_RES_NS` already defaults to `1`; `2` restores the pipelined attn-residual H loop, which faults on gfx1250.
 
-Validated GSM8K result (gfx1250 tp4, `num_concurrent=8`), measured on the pre-upstream bring-up branch and not re-run on this tree:
+Three of the settings above are gfx1250 workarounds for kernels reached through aiter, and each one is load-bearing for either startup or accuracy:
+
+- **`ATOM_KDA_FORCE_RECURRENT=1`** — `chunk_kda` NaNs on gfx1250 for prompts shorter than its chunk size, and its `transpose_state_layout` output can mismatch what the decode-time `fused_recurrent_kda` reader expects, so the first decode step goes NaN too. NaN logits make argmax pick token id 0, and the server emits `"!"` forever at 0.0 gsm8k. Running KDA prefill on `fused_recurrent_kda` keeps the state layout consistent across prefill and decode.
+- **`ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1`** — on gfx1250 `gemm_afp4wfp4_preshuffle` dispatches to a Gluon kernel with no usable M: it asserts `M >= 32`, and its only tuned config for `M >= 32` is `BLOCK_SIZE_M=256`, which memory-faults. K3 reaches it because the checkpoint's quant config marks the routed latent projections `per_1x32`/`fp4x2`, and `ATOM_K3_MOE_CHUNK=128` puts them at `M=128`. This flag keeps the same MXFP4 weights and scales but takes the plain `gemm_afp4wfp4` kernel on an unshuffled layout. aiter disabled the Gluon dispatch deliberately in `0730b33fc` ("disable 1250 gluon path", TODO: revert after upstream triton is fixed); `9312ef7c0` re-enabled it.
+- **`ATOM_USE_TRITON_MLA_SHUFFLE_KV` left at its `0` default** — do not set it to `1` on gfx1250. The shuffled-KV path calls aiter's `fused_qk_rope_cat_and_cache_mla`, which prepends an extra positional argument for the Gluon kernel. That kernel's signature has no such slot, so every later positional shifts by one and the last one lands on the `k_scale_ptr` keyword: `TypeError: dynamic_func() got multiple values for argument 'k_scale_ptr'`. Setting it also makes `aiter_mla.py` require `--block-size 64`.
+
+Validated GSM8K result (gfx1250 tp4, `num_concurrent=8`), measured on this tree with the command above against aiter `main` (`56f56db7e`, unmodified) and triton `3.8.0`:
 
 ```text
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9613|±  |0.0053|
-|     |       |strict-match    |     5|exact_match|↑  |0.9598|±  |0.0054|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9575|±  |0.0056|
+|     |       |strict-match    |     5|exact_match|↑  |0.9575|±  |0.0056|
 ```
 
 ---

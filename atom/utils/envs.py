@@ -223,6 +223,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # splitting into <=N-token sub-batches is numerically identical and keeps
     # every kernel at a correct M. 0 (default) = no splitting; gfx1250 needs 128.
     "ATOM_K3_MOE_CHUNK": lambda: int(os.getenv("ATOM_K3_MOE_CHUNK", "0") or "0"),
+    # Run K3's KDA prefill on fused_recurrent_kda instead of chunk_kda. Needed on
+    # gfx1250, where chunk_kda NaNs; see KimiKDA._run_kda's call site.
+    "ATOM_KDA_FORCE_RECURRENT": lambda: (
+        os.getenv("ATOM_KDA_FORCE_RECURRENT", "0") == "1"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
