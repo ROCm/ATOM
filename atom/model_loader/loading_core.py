@@ -12,13 +12,16 @@ AITER build, and `loader.py` imports AITER at module level.
 
 import concurrent.futures
 import contextlib
+import json
 import logging
+import os
 import time
 from collections.abc import Callable, Iterable
 
 import torch
 from torch import nn
 from transformers import AutoConfig
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from atom.model_loader.expert_staging import ExpertStagingPool
 from atom.model_loader.weight_dispatch import WeightDispatcher
@@ -41,6 +44,44 @@ def rank_tag() -> str:
         if torch.distributed.is_initialized():
             return f"rank_{torch.distributed.get_rank()}"
     return "rank_?"
+
+
+def verify_shard_files_present(model_name_or_path: str) -> None:
+    """Fail early when the shard index references files that are not on disk.
+
+    An interrupted download leaves a complete ``model.safetensors.index.json``
+    next to an incomplete set of shards. Without this check the load happily
+    skips every tensor those shards held, and the first symptom is the far
+    downstream "MoE parameter(s) did not receive every routed expert" report --
+    which reads like a loader or quantization bug rather than a missing file.
+    Naming the absent shards here turns that into a one-line diagnosis.
+
+    No-op for single-file checkpoints, for a bare HF repo id (nothing to stat),
+    and for an unreadable index (the existing load path already reports that).
+    """
+    index_path = os.path.join(model_name_or_path, SAFE_WEIGHTS_INDEX_NAME)
+    if not os.path.isfile(index_path):
+        return
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except (OSError, ValueError):
+        return
+    shards = sorted(set(weight_map.values()))
+    missing = [
+        s for s in shards if not os.path.isfile(os.path.join(model_name_or_path, s))
+    ]
+    if not missing:
+        return
+    shown = "\n  ".join(missing[:20])
+    elided = f"\n  ... and {len(missing) - 20} more" if len(missing) > 20 else ""
+    raise FileNotFoundError(
+        f"Checkpoint at {model_name_or_path} is incomplete: "
+        f"{SAFE_WEIGHTS_INDEX_NAME} references {len(shards)} shard file(s), "
+        f"but {len(missing)} of them are absent:\n  {shown}{elided}\n"
+        "Re-download the checkpoint -- an interrupted `hf download` is the "
+        "usual cause, and re-running it resumes the missing files."
+    )
 
 
 def load_weights_into_model(
@@ -185,6 +226,12 @@ def load_weights_into_model(
         if ckpt_name not in rewritten:
             rewritten[ckpt_name] = rewriter.rewrite(ckpt_name)
         return rewritten[ckpt_name] is not None
+
+    # Cheap stat-only preflight: an incomplete download otherwise surfaces as a
+    # confusing partial-expert-coverage error thousands of tensors later.
+    # Skipped under --load_dummy, which never touches the checkpoint.
+    if not load_dummy:
+        verify_shard_files_present(model_name_or_path)
 
     # Phase timings. The caller reports one aggregate number for the whole load,
     # which cannot tell "the disk is slow" from "the per-tensor dispatch is
