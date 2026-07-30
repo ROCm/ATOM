@@ -208,6 +208,13 @@ exports = {
     "EVAL_CONCURRENCY": csv_value(
         accuracy.get("concurrency") or cell.get("concurrency", [])
     ),
+    "EVAL_THRESHOLD": "" if accuracy.get("threshold") is None else accuracy.get("threshold"),
+    "SWEBENCH_AGENT_WORKERS": "" if accuracy.get("agent_workers") is None else accuracy.get("agent_workers"),
+    "SWEBENCH_AGENT_STEP_LIMIT": "" if accuracy.get("agent_step_limit") is None else accuracy.get("agent_step_limit"),
+    "SWEBENCH_AGENT_TIMEOUT": "" if accuracy.get("agent_timeout") is None else accuracy.get("agent_timeout"),
+    "SWEBENCH_SCORE_TIMEOUT": "" if accuracy.get("score_timeout") is None else accuracy.get("score_timeout"),
+    "SWEBENCH_MAX_WORKERS": "" if accuracy.get("max_workers") is None else accuracy.get("max_workers"),
+    "SWEBENCH_EVAL_TIMEOUT": "" if accuracy.get("instance_timeout") is None else accuracy.get("instance_timeout"),
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
     "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
     "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),

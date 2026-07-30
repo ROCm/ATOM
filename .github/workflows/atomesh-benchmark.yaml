@@ -8,6 +8,7 @@ on:
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
+      - '.github/dashboard/index.html'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -16,13 +17,12 @@ on:
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
+      - '.github/dashboard/index.html'
   schedule:
     # TW weekend nightly at 21:00 Beijing time (13:00 UTC).
     - cron: '0 13 * * 6'
     - cron: '0 13 * * 0'
-    # TW nightly for DeepSeek and GLM-Agentic cases only at 01:00 Beijing time (17:00 UTC).
-    - cron: '0 17 * * *'
-    # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
+    # Spur Agentic Trace nightly at 00:10 Beijing time (16:10 UTC).
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
@@ -51,8 +51,7 @@ on:
           glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
           glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
           glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
-          glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,glm-52-mxfp4-1p1d-tp8-dpa-agentic-lmcache-1m-c48,
-          glm-52-mxfp4-1p1d-tp4-pcp2-agentic-lmcache-1m-c48,
+          glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,
           kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,
           minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
           minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,
@@ -67,24 +66,13 @@ on:
         default: rocm/atom-dev:latest
         type: string
       atomesh_slurm_submit_runner:
-        description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X, atomesh-cicd-crusoe-mi355 = Crusoe MI355X'
+        description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X'
         required: false
         default: atomesh-cicd
         type: choice
         options:
           - atomesh-cicd
           - atomesh-cicd-mi350
-          - atomesh-cicd-crusoe-mi355
-      atomesh_slurm_account:
-        description: 'Optional Slurm account override. Leave empty to use the runner default.'
-        required: false
-        default: ''
-        type: string
-      atomesh_slurm_partition:
-        description: 'Optional Slurm partition override. Leave empty to use the runner default.'
-        required: false
-        default: ''
-        type: string
       atomesh_log_root:
         description: 'Root directory for ATOMesh Slurm logs'
         required: false
@@ -106,7 +94,7 @@ on:
         default: ''
         type: string
       eval_concurrency:
-        description: 'Optional lm_eval concurrency override, e.g. 64 or 32,64 (no quotes)'
+        description: 'Optional accuracy concurrency override: lm_eval requests or SWE-bench agent workers'
         required: false
         default: ''
         type: string
@@ -122,20 +110,19 @@ on:
         type: boolean
 
 env:
-  ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != '' && inputs.atomesh_slurm_account || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd' && 'amd-frameworks' || '') }}
-  ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != '' && inputs.atomesh_slurm_partition || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd' && 'amd-frameworks' || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && 'amd-spur' || '')) }}
+  ATOMESH_SLURM_ACCOUNT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks' }}
+  ATOMESH_SLURM_PARTITION: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks' }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
   ATOMESH_DASHBOARD_HARDWARE: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'MI350X' || 'MI355X' }}
   ATOMESH_PD_RANK_MAPPING_POLICY: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'idx2idx' || 'none' }}
-  ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root != '' && inputs.atomesh_log_root || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && '/shared_nfs/ATOMESH_CI/LOG/' || '/it-share/ATOMESH_LOG/')) }}
-  ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && '/shared_nfs/huggingface_models/amd' || '/mnt/models') }}
-  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != '' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && '' || 'mia1-p02-g42,mia1-p02-g44')) }}
-  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != '' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && '' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47')) }}
+  ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root != '' && inputs.atomesh_log_root || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || '/it-share/ATOMESH_LOG/') }}
+  ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || '/mnt/models' }}
+  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != '' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || 'mia1-p02-g42,mia1-p02-g44') }}
+  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != '' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47') }}
 
 concurrency:
-  # Keep manual benchmark dispatches independent so different cases on the same branch can run together.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   actions: read
@@ -250,7 +237,7 @@ jobs:
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
-          EVENT_SCHEDULE: ${{ github.event_name == 'schedule' && github.event.schedule || '' }}
+          BENCHMARK_KIND_FILTER: ${{ github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'aiperf_agentic' || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
@@ -270,61 +257,16 @@ jobs:
             fi
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 17 * * *" ]]; then
-            ATOMESH_SLURM_ACCOUNT=amd-frameworks \
-            ATOMESH_SLURM_PARTITION=amd-frameworks \
-            ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
-            ATOMESH_1P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
-            ATOMESH_2P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
-              python3 .github/scripts/atomesh/pd_matrix.py \
-              --suite nightly \
-              --model DeepSeek-V4-Pro \
-              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
-              --output atomesh-matrix-deepseek.json
-
-            ATOMESH_SLURM_ACCOUNT=amd-tw \
-            ATOMESH_SLURM_PARTITION=amd-tw \
-            ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
-            ATOMESH_1P1D_NODES=mia1-p01-g36,mia1-p01-g43 \
-            ATOMESH_2P1D_NODES=mia1-p01-g36,mia1-p01-g43 \
-              python3 .github/scripts/atomesh/pd_matrix.py \
-              --suite nightly \
-              --model GLM-5.2-MXFP4 \
-              --benchmark-kind aiperf_agentic \
-              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
-              --output atomesh-matrix-glm.json
-
-            python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          deepseek = json.loads(Path("atomesh-matrix-deepseek.json").read_text(encoding="utf-8")).get("include", [])
-          glm_agentic = json.loads(Path("atomesh-matrix-glm.json").read_text(encoding="utf-8")).get("include", [])
-          matrix = {"include": deepseek + glm_agentic}
-          Path("atomesh-matrix.json").write_text(
-              json.dumps(matrix, indent=2),
-              encoding="utf-8",
-          )
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-              output.write(f"matrix_json={json.dumps(matrix, separators=(',', ':'))}\n")
-              output.write(f"has_matrix={'true' if matrix['include'] else 'false'}\n")
-          print(
-              "Scheduled TW nightly matrix: "
-              f"{len(deepseek)} DeepSeek case(s), {len(glm_agentic)} GLM agentic case(s)"
-          )
-          PY
-          else
-            python3 .github/scripts/atomesh/pd_matrix.py \
-              --suite "$SUITE" \
-              ${MODEL_NAME:+--model "$MODEL_NAME"} \
-              ${CASE_NAME:+--case "$CASE_NAME"} \
-              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
-              ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
-              ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
-              --output atomesh-matrix.json \
-              --github-output
-          fi
+          python3 .github/scripts/atomesh/pd_matrix.py \
+            --suite "$SUITE" \
+            ${MODEL_NAME:+--model "$MODEL_NAME"} \
+            ${CASE_NAME:+--case "$CASE_NAME"} \
+            ${BENCHMARK_KIND_FILTER:+--benchmark-kind "$BENCHMARK_KIND_FILTER"} \
+            ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+            ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
+            ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
+            --output atomesh-matrix.json \
+            --github-output
           cat atomesh-matrix.json
 
       - name: Validate ATOMesh P/D matrix
@@ -373,7 +315,7 @@ jobs:
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
-    timeout-minutes: 420
+    timeout-minutes: ${{ matrix.accuracy.task == 'swebench_lite' && 780 || 420 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
@@ -424,6 +366,7 @@ jobs:
               "osl": get("osl"),
               "concurrency": get("concurrency"),
               "run_eval": get("run_eval"),
+              "accuracy": get("accuracy"),
           }
 
           print("=== ATOMesh benchmark config summary ===")
@@ -442,9 +385,8 @@ jobs:
         run: |
           set -euo pipefail
           ORIGINAL_WORKSPACE="${GITHUB_WORKSPACE}"
-          CURRENT_USER="$(id -un 2>/dev/null || id -u)"
           if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-            SHARED_WORKSPACE="/data/${CURRENT_USER}/atomesh-ci/${GITHUB_RUN_ID}/${{ matrix.id }}"
+            SHARED_WORKSPACE="/data/$(id -un)/atomesh-ci/${GITHUB_RUN_ID}/${{ matrix.id }}"
             rm -rf "${SHARED_WORKSPACE}"
             mkdir -p "${SHARED_WORKSPACE}"
             if command -v rsync >/dev/null 2>&1; then
@@ -457,40 +399,17 @@ jobs:
           fi
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
           SLURM_CANCEL_HELPER="${RESULT_DIR}/${{ matrix.id }}.slurm-cancel.sh"
-          SLURM_JOB_NAME="${{ matrix.id }}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
-          if [[ -z "${SPUR_CONTROLLER_ADDR}" && "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
-            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
-          elif [[ -z "${SPUR_CONTROLLER_ADDR}" && "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-            SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
-          fi
           PD_SUBMIT_PID=""
-          scancel_slurm_by_name_from_wrapper() {
-            command -v scancel >/dev/null 2>&1 || return 0
-            local -a scancel_cmd=(scancel)
-            if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
-              scancel_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
-            fi
-            scancel_cmd+=(--user "${CURRENT_USER}" --name "${SLURM_JOB_NAME}")
-            if command -v timeout >/dev/null 2>&1; then
-              timeout "${SLURM_SCANCEL_TIMEOUT_SECONDS:-8}" "${scancel_cmd[@]}" || true
-            else
-              "${scancel_cmd[@]}" || true
-            fi
-          }
           cleanup_slurm_from_wrapper() {
             local rc=$?
             trap - EXIT HUP INT TERM
             if [[ "${rc}" -ne 0 ]]; then
               echo "=== cancelling Slurm job from workflow wrapper rc=${rc} ==="
               if [[ -x "${SLURM_CANCEL_HELPER}" ]]; then
-                SLURM_CANCEL_WAIT_SECONDS="${SLURM_CANCEL_WAIT_SECONDS:-5}" \
-                  SLURM_CANCEL_KILL_WAIT_SECONDS="${SLURM_CANCEL_KILL_WAIT_SECONDS:-5}" \
-                  bash "${SLURM_CANCEL_HELPER}" || true
+                bash "${SLURM_CANCEL_HELPER}" || true
               else
                 echo "Slurm cancel helper is not available yet"
               fi
-              scancel_slurm_by_name_from_wrapper
             fi
             if [[ -n "${PD_SUBMIT_PID}" ]] && kill -0 "${PD_SUBMIT_PID}" 2>/dev/null; then
               kill "${PD_SUBMIT_PID}" 2>/dev/null || true

@@ -58,6 +58,7 @@ allow = (
     "EXTRA_SERVER_ARGS",
     "RUN_EVAL",
     "EVAL_",
+    "SWEBENCH_",
 )
 for key, value in sorted(os.environ.items()):
     if key.startswith(allow):
@@ -89,6 +90,7 @@ run_container_rank() {
   local rank_dir="${RUN_DIR}/rank-${rank}"
   local bin_dir="${RUN_DIR}/bin"
   local video_gid render_gid host_ionic nccl_socket_ifname
+  local docker_socket_gid docker_cli
 
   mkdir -p "${rank_dir}"
   mkdir -p "${bin_dir}"
@@ -163,6 +165,24 @@ EOF
     -v /mnt:/mnt
     -v /data:/data
   )
+
+  if [[ "${rank}" -eq 0 && "${EVAL_TASK:-}" == "swebench_lite" ]]; then
+    if [[ ! -S /var/run/docker.sock ]]; then
+      echo "ERROR: local SWE-bench Lite requires /var/run/docker.sock" >&2
+      return 2
+    fi
+    docker_cli="$(readlink -f "$(command -v docker)")"
+    docker_socket_gid="$(stat -c '%g' /var/run/docker.sock)"
+    # Agent generation and official scoring create sibling containers through
+    # the host daemon. This mount is intentionally limited to the rank-0
+    # accuracy container.
+    docker_args+=(
+      -v /var/run/docker.sock:/var/run/docker.sock
+      -v "${docker_cli}":/usr/local/bin/docker-host:ro
+      -e SWEBENCH_DOCKER_EXECUTABLE=/usr/local/bin/docker-host
+      --group-add "${docker_socket_gid}"
+    )
+  fi
 
   [[ -n "${video_gid}" ]] && docker_args+=(--group-add "${video_gid}")
   [[ -n "${render_gid}" ]] && docker_args+=(--group-add "${render_gid}")
@@ -389,6 +409,21 @@ srun \
     mkdir -p "${rank_dir}"
     docker rm -f "${container}" >/dev/null 2>&1 || true
     docker pull "'"${DOCKER_IMAGE}"'"
+    nested_docker_args=()
+    if [[ "${rank}" -eq 0 && "${EVAL_TASK:-}" == "swebench_lite" ]]; then
+      if [[ ! -S /var/run/docker.sock ]]; then
+        echo "ERROR: local SWE-bench Lite requires /var/run/docker.sock" >&2
+        exit 2
+      fi
+      host_docker_cli="$(readlink -f "$(command -v docker)")"
+      docker_socket_gid="$(stat -c "%g" /var/run/docker.sock)"
+      nested_docker_args=(
+        -v /var/run/docker.sock:/var/run/docker.sock
+        -v "${host_docker_cli}:/usr/local/bin/docker-host:ro"
+        -e SWEBENCH_DOCKER_EXECUTABLE=/usr/local/bin/docker-host
+        --group-add "${docker_socket_gid}"
+      )
+    fi
     docker run --rm --name "${container}" \
       --network host --ipc host --privileged \
       --device /dev/kfd --device /dev/dri --device /dev/infiniband \
@@ -410,6 +445,7 @@ srun \
       -v /mnt:/mnt \
       -v /data:/data \
       -v /it-share:/it-share \
+      "${nested_docker_args[@]}" \
       "'"${DOCKER_IMAGE}"'" \
       bash -lc "cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh" \
       2>&1 | tee "${rank_dir}/container.log"
