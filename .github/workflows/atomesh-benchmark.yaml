@@ -76,7 +76,7 @@ on:
           - atomesh-cicd-mi350
           - atomesh-cicd-crusoe-mi355
       atomesh_slurm_account:
-        description: 'Optional Slurm account override. Leave empty to use the runner default.'
+        description: 'Optional Slurm account override. Leave empty to use the runner default. amd-frameworks[42/44/47]; amd-tw[36/43]'
         required: false
         default: ''
         type: choice
@@ -85,7 +85,7 @@ on:
           - amd-frameworks
           - amd-tw
       atomesh_slurm_partition:
-        description: 'Optional Slurm partition override. Leave empty to use the runner default.'
+        description: 'Optional Slurm partition override. Leave empty to use the runner default. amd-frameworks[42/44/47]; amd-tw[36/43]'
         required: false
         default: ''
         type: choice
