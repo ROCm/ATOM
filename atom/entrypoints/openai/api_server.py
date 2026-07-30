@@ -1655,7 +1655,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except Exception as e:
-        logger.error(f"Error in anthropic_messages: {e}", exc_info=True)
+        logger.exception(f"Error in anthropic_messages: {e}")
         return JSONResponse(
             status_code=500,
             content={

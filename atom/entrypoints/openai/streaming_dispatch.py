@@ -97,9 +97,7 @@ class StreamBatchDispatcher:
             if item.chunk.get("finished"):
                 self._drop_state(item.state_key, state)
 
-            payload = (
-                item.chunk if item.tag is None else (item.tag, item.chunk)
-            )
+            payload = item.chunk if item.tag is None else (item.tag, item.chunk)
             by_loop.setdefault(item.loop, []).append((item.queue, payload))
 
         for loop, items in by_loop.items():

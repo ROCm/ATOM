@@ -42,6 +42,7 @@ _INVOKE_RE = re.compile(
     re.DOTALL,
 )
 
+
 def _unwrap_wrapper_args(args: Any, allowed: set) -> Any:
     """Strip spurious ``{"arguments": {...}}`` / ``{"input": {...}}`` envelopes.
 
