@@ -76,6 +76,7 @@ from atom.model_ops.attention_mla import (
     is_rocm_aiter_fp4bmm_enabled,
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
+    triton_filter_and_convert_dcp_index,
     triton_gather_kv_indices_sparse,
 )
 from atom.model_ops.base_attention import Attention
@@ -111,6 +112,24 @@ from atom.plugin.vllm.attention.layer_sparse_mla import (
 from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
+# shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
+# `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.distributed.dcp_utils import (
+    get_dcp_group,
+    get_dcp_rank,
+    get_dcp_world_size,
+)
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_is_enabled,
+    pcp_pad_dense,
+    pcp_pad_len,
+    pcp_round_robin_split,
+)
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
@@ -1569,21 +1588,71 @@ def sparse_attn_indexer(
         assert batch_size == context.batch_size
         num_padded_tokens = batch_size * next_n
         batch_size, next_n, heads, _ = padded_q_fp8_decode_tokens.shape
-        logits = torch.empty(
-            [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
-        )
-        deepgemm_fp8_paged_mqa_logits(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
-            logits,
-            decode_metadata.context_lens,
-            attn_metadata.block_tables,
-            max_model_len,
-            KVBlockSize=runner_block_size,
-            Preshuffle=True,
-        )
-        num_rows = logits.shape[0]
+        num_rows = batch_size * next_n
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1:
+            # DCP b2-logits (see DCP_Further_Optimization2.md §2.7.1): each rank
+            # holds only 1/W of the KV (index_cache is sharded, same slot_mapping
+            # as the main KV). Score the LOCAL shard — block_tables already point
+            # at it, so only context_lens must be localized — then all-gather the
+            # per-rank logit rows and interleave back to global sequence order.
+            # With interleave=1 a global position p is owned by rank p % W at
+            # local position p // W, so global_logits[q, j*W + r] equals
+            # local_logits_from_rank_r[q, j]. This is exactly equivalent to
+            # scoring the full sequence on a single rank, so the subsequent
+            # top-k is a normal (exact) global top-k — no merge kernel needed.
+            assert attn_metadata.max_seqlen_q == 1, (
+                "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
+                "qlen=1 decode only (MTP verify is Phase 2)."
+            )
+            dcp_rank = get_dcp_rank()
+            g_ctx = decode_metadata.context_lens
+            base = g_ctx // dcp_world_size
+            # round-robin (interleave=1) local length: base + 1 for the ranks
+            # that own the remainder tail, matching prepare_decode's slot split.
+            local_ctx = (
+                base + (g_ctx - base * dcp_world_size - dcp_rank).clamp(0, 1)
+            ).to(torch.int32)
+            l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
+            local_logits = torch.empty(
+                [num_rows, l_max], dtype=torch.float32, device="cuda"
+            )
+            deepgemm_fp8_paged_mqa_logits(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                local_logits,
+                local_ctx,
+                attn_metadata.block_tables,
+                l_max,
+                KVBlockSize=runner_block_size,
+                Preshuffle=True,
+            )
+            # [num_rows, l_max] -> all-gather dim0 -> [W, num_rows, l_max]
+            gathered = get_dcp_group().all_gather(
+                local_logits.contiguous(), dim=0
+            ).reshape(dcp_world_size, num_rows, l_max)
+            # interleave to global order: out[q, j*W + r] = gathered[r, q, j]
+            logits = (
+                gathered.permute(1, 2, 0)
+                .reshape(num_rows, l_max * dcp_world_size)[:, :max_model_len]
+                .contiguous()
+            )
+        else:
+            logits = torch.empty(
+                [num_rows, max_model_len], dtype=torch.float32, device="cuda"
+            )
+            deepgemm_fp8_paged_mqa_logits(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                logits,
+                decode_metadata.context_lens,
+                attn_metadata.block_tables,
+                max_model_len,
+                KVBlockSize=runner_block_size,
+                Preshuffle=True,
+            )
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
@@ -1602,6 +1671,24 @@ def sparse_attn_indexer(
                 topk_indices,
                 attn_metadata.kv_indices,
                 attn_metadata.kv_indptr,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
+            )
+        elif dcp_world_size > 1:
+            # topk_indices now hold GLOBAL positions. Keep only this rank's owned
+            # tokens (p % W == r), de-interleave (p // W), and gather the local
+            # main-KV slot; non-owned columns become -1 (masked by the sparse
+            # decode kernel). sparse_kv_indptr stays the global-clip length, so
+            # the per-request region size is unchanged (no compaction needed).
+            triton_filter_and_convert_dcp_index(
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.g_kv_indptr,
+                attn_metadata.kv_indptr,
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.kv_indices,
+                topk_indices,
+                dcp_rank,
+                dcp_world_size,
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
             )
