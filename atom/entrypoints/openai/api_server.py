@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple  # noqa: UP035
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -84,12 +84,12 @@ DEFAULT_PORT = 8000
 # ============================================================================
 
 engine = None
-tokenizer: Optional[AutoTokenizer] = None
-processor: Optional[Any] = None
+tokenizer: AutoTokenizer | None = None
+processor: Any | None = None
 model_name: str = ""
-default_chat_template_kwargs: Dict[str, Any] = {}
-custom_message_encoder: Optional[Any] = None
-_stream_queues: Dict[str, asyncio.Queue] = {}
+default_chat_template_kwargs: dict[str, Any] = {}
+custom_message_encoder: Any | None = None
+_stream_queues: dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: dict[int, str] = {}
 _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
