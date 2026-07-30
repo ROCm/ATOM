@@ -43,7 +43,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 
 def _unique_tool_call_id() -> str:
@@ -60,9 +60,9 @@ class ToolCall:
 
     id: str
     type: str
-    function: Dict[str, str]
+    function: dict[str, str]
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "type": self.type, "function": self.function}
 
 
@@ -97,13 +97,13 @@ def _is_glm_xml(text: str) -> bool:
     )
 
 
-def _build_param_types(tools: Optional[list]) -> Dict[str, Dict[str, Any]]:
+def _build_param_types(tools: list | None) -> dict[str, dict[str, Any]]:
     """Map ``function_name -> {param_name: json_schema_type}`` from request tools.
 
     Accepts OpenAI (``{"type": "function", "function": {...}}``) and bare
     (``{"name": ..., "parameters"/"input_schema": {...}}``) tool entries.
     """
-    out: Dict[str, Dict[str, Any]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
@@ -147,9 +147,9 @@ def _coerce_param_value(value: str, ptype: Any) -> Any:
         if t.startswith(("object", "dict", "map", "array", "list", "tuple")):
             try:
                 return json.loads(v)
-            except Exception:
+            except json.JSONDecodeError:
                 return ast.literal_eval(v)  # safer for single-quoted Python literals
-    except Exception:
+    except (ValueError, SyntaxError, OverflowError):
         return v
     return v
 
@@ -170,23 +170,23 @@ def _coerce_glm_param_value(value: str, ptype: Any) -> Any:
                     parsed = json.loads(v) if v[0] == '"' else ast.literal_eval(v)
                     if isinstance(parsed, str):
                         return parsed
-                except Exception:
+                except (ValueError, SyntaxError):
                     return v[1:-1]
             return v
         return _coerce_param_value(v, ptype)
 
     try:
         return json.loads(v)
-    except Exception:
+    except json.JSONDecodeError:
         try:
             return ast.literal_eval(v)
-        except Exception:
+        except (ValueError, SyntaxError):
             return v
 
 
 def _parse_qwen_function(
-    fn_text: str, param_types: Dict[str, Dict[str, Any]], index: int
-) -> Optional[ToolCall]:
+    fn_text: str, param_types: dict[str, dict[str, Any]], index: int
+) -> ToolCall | None:
     """Parse the inside of one ``<function=NAME>...`` block into a ToolCall."""
     gt = fn_text.find(">")
     if gt == -1:
@@ -196,7 +196,7 @@ def _parse_qwen_function(
         return None
     body = fn_text[gt + 1 :]
     types = param_types.get(name, {})
-    args: Dict[str, Any] = {}
+    args: dict[str, Any] = {}
     for pm in _QWEN_PARAM_RE.finditer(body):
         seg = pm.group(1)
         if seg is None:
@@ -215,7 +215,7 @@ def _parse_qwen_function(
     )
 
 
-def _parse_qwen_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+def _parse_qwen_xml(text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
     """Parse Qwen3 XML tool calls; return (leading_content, tool_calls)."""
     param_types = _build_param_types(tools)
     # Content precedes the first tool marker.
@@ -223,7 +223,7 @@ def _parse_qwen_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCal
         i for i in (text.find("<tool_call>"), text.find(_QWEN_TOOL_PREFIX)) if i != -1
     ]
     content = text[: min(markers)] if markers else text
-    tool_calls: List[ToolCall] = []
+    tool_calls: list[ToolCall] = []
     for fm in _QWEN_FUNCTION_RE.finditer(text):
         fn_text = fm.group(1) if fm.group(1) is not None else fm.group(2)
         if not fn_text:
@@ -234,11 +234,11 @@ def _parse_qwen_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCal
     return content.strip(), tool_calls
 
 
-def _parse_glm_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall]]:
+def _parse_glm_xml(text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
     """Parse GLM-4.7 / GLM-5 XML tool calls."""
     param_types = _build_param_types(tools)
-    content_parts: List[str] = []
-    tool_calls: List[ToolCall] = []
+    content_parts: list[str] = []
+    tool_calls: list[ToolCall] = []
     last_end = 0
 
     for match in _GLM_TOOL_CALL_RE.finditer(text):
@@ -258,7 +258,7 @@ def _parse_glm_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall
             continue
 
         types = param_types.get(name, {})
-        arguments: Dict[str, Any] = {}
+        arguments: dict[str, Any] = {}
         for key, value in _GLM_ARG_RE.findall(args_text):
             key = key.strip()
             if key:
@@ -281,8 +281,8 @@ def _parse_glm_xml(text: str, tools: Optional[list]) -> Tuple[str, List[ToolCall
 
 
 def parse_tool_calls(
-    text: str, tools: Optional[list] = None
-) -> Tuple[str, List[ToolCall]]:
+    text: str, tools: list | None = None
+) -> tuple[str, list[ToolCall]]:
     """Parse tool calls from model output text.
 
     Args:
@@ -326,7 +326,7 @@ def parse_tool_calls(
     return content.strip(), tool_calls
 
 
-def _parse_tool_call_entries(section_text: str) -> List[ToolCall]:
+def _parse_tool_call_entries(section_text: str) -> list[ToolCall]:
     """Parse individual tool call entries from the section content."""
     tool_calls = []
     pattern = re.compile(
@@ -377,8 +377,8 @@ class ToolCallStreamParser:
     buf: str = ""
     current_index: int = 0
     _emitted_calls: int = 0
-    tools: Optional[list] = None
-    fmt: Optional[str] = None  # None (undecided) | "kimi" | "xml"
+    tools: list | None = None
+    fmt: str | None = None  # None (undecided) | "kimi" | "xml"
 
     def process(self, text: str) -> list:
         """Process a text chunk and return list of (event_type, data) tuples."""
