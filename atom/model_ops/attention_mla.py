@@ -1289,6 +1289,30 @@ class MLAAttention(nn.Module):
             else:
                 page_size = 1
 
+            # DCP + MTP (max_q_len>1): KV is round-robin sharded across ranks, so
+            # the intra-block causal mask must be applied on GLOBAL positions
+            # g(j)=j*W+r. Pass the cprr params (g_kv_indptr + cp world/rank) so the
+            # kernel selects the cprr variant and masks correctly. qlen=1 keeps the
+            # plain path (single query sees all local KV -> no mask needed).
+            cp_world_size = 1
+            cp_rank = 0
+            g_kv_indptr = None
+            if self.dcp_world_size > 1 and max_q_len > 1:
+                # cprr kernel is bf16-only (no fp8 cprr kernel on gfx950).
+                if self.kv_cache_dtype == "fp8":
+                    raise NotImplementedError(
+                        "MTP + DCP (max_q_len>1) requires bf16 KV cache: the "
+                        "round-robin CP (cprr) MLA kernel has no fp8 variant. "
+                        "Use --kv_cache_dtype bf16, or disable DCP/MTP for fp8."
+                    )
+                cp_world_size = self.dcp_world_size
+                cp_rank = self.dcp_rank
+                g_kv_indptr = getattr(attn_metadata, "g_kv_indptr", None)
+                assert g_kv_indptr is not None, (
+                    "MTP+DCP decode requires attn_metadata.g_kv_indptr; the "
+                    "metadata builder / cudagraph-capture path must set it."
+                )
+
             seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
             _, final_lse = mla_decode_fwd(
                 q,
@@ -1313,6 +1337,9 @@ class MLAAttention(nn.Module):
                 q_scale=self._q_scale,
                 kv_scale=self._k_scale,
                 return_lse=return_lse,
+                g_kv_indptr=g_kv_indptr,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
             )
 
         o = self._restore_query_heads(o, num_heads_q)
