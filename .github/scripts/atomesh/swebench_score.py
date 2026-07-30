@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Run the official SWE-bench harness and publish ATOMesh accuracy JSON."""
 
 from __future__ import annotations
@@ -11,7 +10,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_DATASET = "princeton-nlp/SWE-bench_Lite"
 DEFAULT_TASK = "swebench_lite"
 
@@ -22,23 +20,19 @@ def load_predictions(path: Path, model_name: str) -> list[dict[str, str]]:
     try:
         payload: Any = json.loads(text)
     except json.JSONDecodeError:
-        payload = [
-            json.loads(line)
-            for line in text.splitlines()
-            if line.strip()
-        ]
+        payload = [json.loads(line) for line in text.splitlines() if line.strip()]
 
     if isinstance(payload, dict):
         rows = list(payload.values())
     elif isinstance(payload, list):
         rows = payload
     else:
-        raise ValueError(f"{path} must contain a JSON object, array, or JSONL")
+        raise TypeError(f"{path} must contain a JSON object, array, or JSONL")
 
     predictions: dict[str, dict[str, str]] = {}
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
-            raise ValueError(f"prediction {index} is not a JSON object")
+            raise TypeError(f"prediction {index} is not a JSON object")
         instance_id = row.get("instance_id")
         if not isinstance(instance_id, str) or not instance_id:
             raise ValueError(f"prediction {index} has no valid instance_id")
@@ -46,9 +40,7 @@ def load_predictions(path: Path, model_name: str) -> list[dict[str, str]]:
         if patch is None:
             patch = ""
         if not isinstance(patch, str):
-            raise ValueError(
-                f"prediction {instance_id} has a non-string model_patch"
-            )
+            raise TypeError(f"prediction {instance_id} has a non-string model_patch")
         predictions[instance_id] = {
             "instance_id": instance_id,
             "model_name_or_path": model_name,
@@ -115,9 +107,7 @@ def find_report(work_dir: Path, model_name: str, run_id: str) -> Path:
             "resolved_instances",
         }.issubset(payload):
             return path
-    raise FileNotFoundError(
-        f"official SWE-bench report was not found under {work_dir}"
-    )
+    raise FileNotFoundError(f"official SWE-bench report was not found under {work_dir}")
 
 
 def parse_report(report: dict[str, Any]) -> tuple[int, int]:
@@ -231,8 +221,7 @@ def main() -> int:
     predictions_path = out_dir / "predictions.jsonl"
     write_predictions(predictions, predictions_path)
     print(
-        f"[swebench] staged {len(predictions)} predictions at "
-        f"{predictions_path}",
+        f"[swebench] staged {len(predictions)} predictions at " f"{predictions_path}",
         flush=True,
     )
 
@@ -252,10 +241,7 @@ def main() -> int:
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     resolved, submitted = parse_report(report)
-    if (
-        args.expected_instances is not None
-        and submitted != args.expected_instances
-    ):
+    if args.expected_instances is not None and submitted != args.expected_instances:
         raise ValueError(
             f"official report submitted {submitted} instances; "
             f"expected {args.expected_instances}"

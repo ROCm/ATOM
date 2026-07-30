@@ -465,9 +465,7 @@ def perf_point(
         "accuracy_threshold": (
             round_or_none(accuracy.get("threshold"), digits=4) if accuracy else None
         ),
-        "accuracy_fewshot": (
-            int_value(accuracy.get("fewshot")) if accuracy else None
-        ),
+        "accuracy_fewshot": (int_value(accuracy.get("fewshot")) if accuracy else None),
     }
     if accuracy and accuracy.get("task") == "gsm8k":
         point["gsm8k"] = round_or_none(accuracy.get("value"), digits=4)

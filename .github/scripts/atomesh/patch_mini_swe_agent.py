@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Apply ATOMesh's pinned mini-swe-agent 2.4.5 runtime fixes."""
 
 from __future__ import annotations
@@ -7,7 +6,6 @@ import importlib
 import importlib.metadata
 import sys
 from pathlib import Path
-
 
 EXPECTED_VERSION = "2.4.5"
 MARKER = "ATOMesh local-Docker submission fallback"
@@ -41,11 +39,8 @@ def main() -> int:
 
     source = replace_once(
         source,
-        "    agent = None\n"
-        "    exit_status = None",
-        "    agent = None\n"
-        "    env = None\n"
-        "    exit_status = None",
+        "    agent = None\n" "    exit_status = None",
+        "    agent = None\n" "    env = None\n" "    exit_status = None",
     )
     source = replace_once(
         source,
@@ -90,8 +85,7 @@ def main() -> int:
     )
     source = replace_once(
         source,
-        "    finally:\n"
-        "        if agent is not None:",
+        "    finally:\n" "        if agent is not None:",
         "    finally:\n"
         '        if env is not None and callable(getattr(env, "cleanup", None)):\n'
         "            try:\n"
