@@ -583,6 +583,11 @@ _CONFIG_REGISTRY: dict[str, str] = {
 }
 
 
+# model_types that exist only as speculative-draft checkpoints. transformers
+# has no config class for them, so AutoConfig.from_pretrained raises; load them
+# as a bare PretrainedConfig instead (see get_hf_config).
+_PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
+
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k3": "text_config",
@@ -664,6 +669,14 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         except Exception:
             hf_config._multimodal_config = None
         return hf_config
+
+    if model_type in _PLAIN_CONFIG_MODEL_TYPES:
+        # Speculative-draft checkpoints ship their own model_type that
+        # transformers has never heard of (and never will -- they are not
+        # standalone LMs). There is no schema to map onto, and nothing here
+        # needs one: the draft model reads plain attributes off the config.
+        # Keep every field verbatim as a bare PretrainedConfig.
+        return PretrainedConfig.from_dict(config_dict)
 
     if model_type in _CONFIG_REGISTRY:
         config_class = AutoConfig.for_model(_CONFIG_REGISTRY[model_type])
@@ -849,9 +862,65 @@ class ParallelConfig:
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
 
 
+_DSPARK_DEFAULT_MAX_BLOCK = 16
+_DSPARK_DEFAULT_ROLLING_WINDOW = 128
+
+
+def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
+    """Map a standalone DSpark draft config onto ATOM's canonical names.
+
+    DSpark checkpoints come in two shapes and name the same quantities
+    differently:
+
+    - INLINE (e.g. V4-Pro-DSpark) ships inside the target checkpoint and already
+      uses the ``dspark_*`` names the rest of ATOM reads. It never comes here.
+    - STANDALONE drafts are their OWN checkpoint (``architectures:
+      ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
+      their DSpark fields at the config top level: ``target_layer_ids``,
+      ``mask_token_id``, ``markov_rank``, and optionally a training block width.
+    """
+    target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+    if not target_layer_ids:
+        raise ValueError(
+            "K3DSparkModel config is missing `target_layer_ids` (the target "
+            "decoder layers whose hidden states the draft consumes). Without "
+            "it the draft has no context input."
+        )
+    # 0-based target decoder-layer indices, matching ATOM's `layers[i]` aux-tap
+    # convention: the reference indexes `hidden_states[layer_id + 1]`, i.e. the
+    # OUTPUT of layer `layer_id`, which is the layer this convention taps.
+    hf_config.dspark_target_layer_ids = [int(i) for i in target_layer_ids]
+
+    mask_token_id = getattr(hf_config, "mask_token_id", None)
+    if mask_token_id is None:
+        raise ValueError(
+            "K3DSparkModel config is missing `mask_token_id` (the noise token "
+            "the draft block is seeded with)."
+        )
+    hf_config.dspark_noise_token_id = int(mask_token_id)
+
+    hf_config.dspark_markov_rank = int(getattr(hf_config, "markov_rank", 0) or 0)
+    # Synthesized marker, not a checkpoint field: the flavor discriminator the
+    # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
+    hf_config.dspark_with_draft = True
+
+    # NOTE: no `dspark_block_size` here. Unlike V4-Pro-DSpark and the SpecForge
+    # SpecForge DFlash checkpoints, this config carries no block width: the draft is
+    # width-agnostic in its weights and the block is sized by
+    # --num-speculative-tokens (7 in the checkpoint's own serving recipe).
+    # DSparkProposer._resolve_mtp_k falls back to that.
+
+    logger.info(
+        "Detected MLA DSpark drafter with a separate draft model "
+        f"(markov_rank={hf_config.dspark_markov_rank}, "
+        f"target_layers={hf_config.dspark_target_layer_ids}, "
+        f"mask_token_id={hf_config.dspark_noise_token_id})"
+    )
+
+
 def _normalize_moe_config_fields(
     hf_config: PretrainedConfig,
-    model_path: Optional[str] = None,
+    model_path: str | None = None,
 ) -> None:
     """Normalize common MoE config field names across model families."""
     moe_config = getattr(hf_config, "text_config", hf_config)
@@ -916,17 +985,41 @@ class SpeculativeConfig:
     }
 
     def use_dspark(self) -> bool:
-        """DeepSeek-V4 DSpark semi-autoregressive block drafter.
+        """DSpark semi-autoregressive block drafter (either flavor).
 
-        DSpark ships inside the V4 checkpoint under the same `mtp.*` namespace as
-        serial MTP, but it is a parallel block drafter (parallel backbone +
-        Markov sequential head + confidence head), NOT serial MTP. We detect it
-        by the DSpark-only `dspark_block_size` config field and route it to its
-        own draft model class. We intentionally never silently fall back to MTP:
-        a wrong fallback loads cleanly but measures the wrong algorithm.
+        DSpark is a parallel block drafter (parallel backbone + Markov
+        sequential head + confidence head), NOT serial MTP. Two checkpoint
+        flavors reach here, and both normalize to `dspark_block_size` in
+        `hf_config_override`:
+
+        - V4-Pro-DSpark: ships INSIDE the V4 target checkpoint under the same
+          `mtp.*` namespace serial MTP uses, so only the DSpark-only
+          `dspark_block_size` field distinguishes the two.
+        - Kimi-K3-DSpark: a standalone MLA-backbone checkpoint with its own
+          `architectures: ["K3DSparkModel"]`.
+
+        We intentionally never silently fall back to MTP: a wrong fallback
+        loads cleanly but measures the wrong algorithm.
         """
         cfg = self.draft_model_hf_config
-        return self.method == "dspark" or bool(getattr(cfg, "dspark_block_size", None))
+        return (
+            self.method == "dspark"
+            or bool(getattr(cfg, "dspark_block_size", None))
+            or bool(getattr(cfg, "dspark_with_draft", False))
+        )
+
+    def use_dspark_with_draft(self) -> bool:
+        """True when DSpark was given a separate draft model (--draft-model).
+
+        ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
+        it in config.json. It is synthesized by
+        :func:`_normalize_draft_dspark_config`, which runs from
+        :meth:`hf_config_override` when the draft's ``architectures`` is
+        ``["K3DSparkModel"]``, so it is set for exactly the configs that went
+        through that normalization.
+        """
+        cfg = self.draft_model_hf_config
+        return bool(getattr(cfg, "dspark_with_draft", False))
 
     def __post_init__(self):
         if self.draft_model_hf_config is None:
@@ -959,10 +1052,13 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(
-        hf_config: PretrainedConfig, model_path: Optional[str] = None
+        hf_config: PretrainedConfig, model_path: str | None = None
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if arch.endswith("DSparkModel"):
+            _normalize_draft_dspark_config(hf_config)
+            return
         if arch == "LlamaForCausalLMEagle3":
             hf_config.architectures = ["Eagle3LlamaModel"]
         elif arch == "Eagle3DeepseekV2ForCausalLM":
@@ -1444,19 +1540,42 @@ class Config:
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
-            # DSpark is a parallel block drafter: the whole block is produced in
-            # one backbone pass. dspark_block_size (5 for V4-Pro-DSpark) is only
-            # the TRAINING default draft width, NOT a hard ceiling: the DSpark
-            # weights are draft-width-agnostic (no parameter shape depends on it),
-            # so a wider verify horizon is drafted in the same single pass, with
-            # positions past block_size RoPE-extrapolated. The real ceiling is the
-            # rolling target-KV window (sliding_window=128), beyond which the
-            # [window ++ draft] block attention no longer fits its context.
             is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
-            max_spec = (
-                int(getattr(draft_cfg, "sliding_window", 128)) if is_dspark else 4
-            )
+            if not is_dspark:
+                # Sequential drafters (MTP / Eagle): one drafted token per
+                # backbone pass, so the horizon is a small fixed depth.
+                max_spec = 4
+            else:
+                # DSpark is a PARALLEL block drafter: all flavors
+                # (inline V4, standalone K3 / Qwen3 / ...) share this path with
+                # no per-model constants.
+                train_block = getattr(draft_cfg, "dspark_block_size", None)
+                if getattr(draft_cfg, "dspark_with_draft", False):
+                    # Standalone draft: attends a paged sibling KV holding the
+                    # full context, so the hard ceiling is a block cap the
+                    # checkpoint may set, else a generous default.
+                    max_spec = int(
+                        getattr(draft_cfg, "dspark_max_block", None)
+                        or _DSPARK_DEFAULT_MAX_BLOCK
+                    )
+                else:
+                    # Inline draft (V4): attends a ROLLING target-KV window, so
+                    # the hard ceiling is that window -- beyond it the
+                    # [window ++ draft] block attention no longer fits its
+                    # context. `sliding_window` may be present-but-None.
+                    max_spec = int(
+                        getattr(draft_cfg, "sliding_window", None)
+                        or _DSPARK_DEFAULT_ROLLING_WINDOW
+                    )
+                if train_block and num_spec is not None and num_spec > train_block:
+                    logger.warning(
+                        "num_speculative_tokens=%d exceeds the DSpark draft's "
+                        "training block size (%d): accepted, but expect a lower "
+                        "accepted length.",
+                        num_spec,
+                        train_block,
+                    )
             if num_spec is None or num_spec < 1 or num_spec > max_spec:
                 raise ValueError(
                     f"num_speculative_tokens must be between 1 and {max_spec}, "

@@ -1708,25 +1708,32 @@ class ModelRunner:
         total_num_layers = hf_config.num_hidden_layers
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
-            draft_hf_config = self.config.speculative_config.draft_model_hf_config
-            if hasattr(self, "eagle3_draft_builder"):
-                # Heterogeneous draft (e.g. Eagle3 MHA on MLA target) owns
-                # its own KV pool via its builder; don't add to target's count.
-                num_draft_layers = draft_hf_config.num_hidden_layers
-                logger.info(
-                    f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
-                    f"{num_draft_layers} Eagle3 draft layers (separate non-MLA cache)"
-                )
-            else:
-                # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
-                num_draft_layers = getattr(
-                    draft_hf_config, "num_nextn_predict_layers", 1
-                )
+            spec_config = self.config.speculative_config
+            draft_hf_config = spec_config.draft_model_hf_config
+
+            # real stack -> 1 slot/layer; else serial MTP reuses one
+            owns_pool = hasattr(self, "eagle3_draft_builder")
+            has_real_stack = (
+                owns_pool
+                or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
+            )
+            num_draft_layers = (
+                draft_hf_config.num_hidden_layers
+                if has_real_stack
+                else getattr(draft_hf_config, "num_nextn_predict_layers", 1)
+            )
+            # sibling-pool draft not counted in target pool
+            if not owns_pool:
                 total_num_layers += num_draft_layers
-                logger.info(
-                    f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
-                    f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
+            logger.info(
+                f"Allocating KV cache for {hf_config.num_hidden_layers} target "
+                f"layers + {num_draft_layers} draft layers"
+                + (
+                    " (separate sibling pool)"
+                    if owns_pool
+                    else f" = {total_num_layers} total layers"
                 )
+            )
 
         # Primary KV cache allocation (model-agnostic, delegated to the
         # attention builder). Each builder owns its tensor layout: MLA →
@@ -1780,17 +1787,19 @@ class ModelRunner:
         # can access it without recomputing from drafter state. Heterogeneous
         # drafts (Eagle3 MHA) own their own layer space via their builder.
         # Eagle3 MLA drafts (K2.6) share the target's MLA pool but still
-        # appear as one extra layer at index num_hidden_layers. In both Eagle3
-        # variants the eagle3 draft model has no `.model.mtp_start_layer_idx`,
-        # so only MTP-style drafts take the first branch.
-        is_eagle3 = (
-            self.config.speculative_config is not None
-            and self.config.speculative_config.method == "eagle3"
-        )
-        self.mtp_start_layer_idx = (
-            self.drafter.model.model.mtp_start_layer_idx
-            if hasattr(self, "drafter") and not is_eagle3
-            else hf_config.num_hidden_layers
+        # appear as one extra layer at index num_hidden_layers.
+        #
+        # Only serial-MTP draft models carry `.model.mtp_start_layer_idx`; the
+        # eagle3 and standalone-DSpark drafts do not, and both simply start
+        # right after the target's last layer. Probe for the attribute instead
+        # of enumerating the flavors that lack it — the previous
+        # `not is_eagle3` spelling silently grew wrong the moment a third
+        # standalone flavor appeared.
+        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
+        self.mtp_start_layer_idx = getattr(
+            getattr(drafter_model, "model", None),
+            "mtp_start_layer_idx",
+            hf_config.num_hidden_layers,
         )
         for model_name, model in models_to_bind:
             logger.info(
