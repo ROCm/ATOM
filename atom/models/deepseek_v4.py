@@ -121,8 +121,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
 #
-# Each V4 block (block_size=2*lcm(m, m')=256 original tokens) holds k_per_block
-# compressed entries per layer (k1=64 for CSA, k2=2 for HCA). Compressor.forward
+# Each V4 block (block_size=lcm(m, m')=128 original tokens) holds k_per_block
+# compressed entries per layer (k1=32 for CSA, k2=1 for HCA). Compressor.forward
 # scatters newly-compressed entries into block-table-indexed slots; sparse_attn
 # input gathers all committed entries up to the current position.
 #
@@ -131,12 +131,10 @@ logger = logging.getLogger(__name__)
 # per-seq dispatch.
 # ---------------------------------------------------------------------------
 
-# V4 paper §3.6.1: classical-KV block_size = a multiple of lcm(m, m'). For
-# V4-Pro / V4-Flash lcm(4, 128) = 128; we use 2*lcm = 256 original tokens so
-# k1_csa = 256/4 = 64 (the FP4 indexer kernels need kv_block_size=64). Kept as
-# a constant so Compressor code does not need to import the builder. MUST match
-# DeepseekV4AttentionMetadataBuilder.block_size and config.kv_cache_block_size.
-_V4_BLOCK_SIZE: int = 256
+# V4 paper §3.6.1: classical-KV block_size = lcm(m, m') = 128 original tokens.
+# Kept as a constant so Compressor code does not need to import the builder.
+# MUST match the SGLang/vLLM V4 bridge block size and config.kv_cache_block_size.
+_V4_BLOCK_SIZE: int = 128
 
 _V4_RMSNORM_BACKEND = os.environ.get("ATOM_V4_RMSNORM_BACKEND", "triton")
 _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
