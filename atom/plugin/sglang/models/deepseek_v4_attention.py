@@ -118,8 +118,13 @@ def _install_draft_extend_fused_swa_patch() -> None:
     """Patch ATOM DSV4 symbols only while SGLang graph integration needs them."""
 
     import atom.models.deepseek_v4 as dsv4
+    from atom.plugin.sglang.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
 
     _install_v4_nm_aiter_compat_patch()
+    # The SGLang proxy KV pool allocates DSV4 compressed-KV pages with the
+    # historical 128-token layout. Keep the model-side compressor scatter/gather
+    # math aligned in plugin mode without changing native ATOM defaults.
+    dsv4._V4_BLOCK_SIZE = ATOM_DEEPSEEK_V4_BLOCK_SIZE
     if getattr(dsv4, "_atom_sglang_draft_extend_fused_swa_patched", False):
         return
 
