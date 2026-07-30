@@ -3,6 +3,8 @@
 
 """Tests for tool call parsing."""
 
+import json
+
 from atom.entrypoints.openai.tool_parser import (
     ToolCall,
     ToolCallStreamParser,
@@ -115,6 +117,116 @@ class TestParseToolCalls:
         assert tool_calls[0].function["arguments"] == args
 
 
+class TestGlmToolCalls:
+    """Tests for the GLM-4.7 / GLM-5 native XML format."""
+
+    @staticmethod
+    def _tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "configure",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "count": {"type": "integer"},
+                            "enabled": {"type": "boolean"},
+                            "payload": {"type": "object"},
+                            "labels": {"type": "array"},
+                            "raw": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "ping",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
+    def test_single_tool_call(self):
+        text = (
+            "<tool_call>bash"
+            "<arg_key>command</arg_key><arg_value>ls</arg_value>"
+            "</tool_call>"
+        )
+        content, tool_calls = parse_tool_calls(text, self._tools())
+
+        assert content == ""
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function["name"] == "bash"
+        assert json.loads(tool_calls[0].function["arguments"]) == {"command": "ls"}
+
+    def test_multiple_typed_arguments(self):
+        text = (
+            "Checking. "
+            "<tool_call>configure"
+            "<arg_key>count</arg_key><arg_value>3</arg_value>"
+            "<arg_key>enabled</arg_key><arg_value>false</arg_value>"
+            '<arg_key>payload</arg_key><arg_value>{"mode":"fast"}</arg_value>'
+            '<arg_key>labels</arg_key><arg_value>["a","b"]</arg_value>'
+            '<arg_key>raw</arg_key><arg_value>{"keep":"as text"}</arg_value>'
+            "</tool_call>"
+            " Done."
+        )
+        content, tool_calls = parse_tool_calls(text, self._tools())
+
+        assert "Checking." in content
+        assert "Done." in content
+        arguments = json.loads(tool_calls[0].function["arguments"])
+        assert arguments == {
+            "count": 3,
+            "enabled": False,
+            "payload": {"mode": "fast"},
+            "labels": ["a", "b"],
+            "raw": '{"keep":"as text"}',
+        }
+
+    def test_multiple_calls_and_zero_arguments(self):
+        text = (
+            "<tool_call>ping</tool_call>"
+            "<tool_call>bash"
+            "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+            "</tool_call>"
+        )
+        content, tool_calls = parse_tool_calls(text, self._tools())
+
+        assert content == ""
+        assert [tc.function["name"] for tc in tool_calls] == ["ping", "bash"]
+        assert json.loads(tool_calls[0].function["arguments"]) == {}
+        assert json.loads(tool_calls[1].function["arguments"]) == {"command": "pwd"}
+        assert tool_calls[0].id != tool_calls[1].id
+
+    def test_quoted_string_is_unwrapped(self):
+        text = (
+            "<tool_call>bash"
+            '<arg_key>command</arg_key><arg_value>"ls -la"</arg_value>'
+            "</tool_call>"
+        )
+        _, tool_calls = parse_tool_calls(text, self._tools())
+        assert json.loads(tool_calls[0].function["arguments"]) == {"command": "ls -la"}
+
+    def test_empty_function_name_is_preserved_as_content(self):
+        text = "<tool_call>  </tool_call>"
+        content, tool_calls = parse_tool_calls(text, self._tools())
+        assert content == text
+        assert tool_calls == []
+
+
 # ============================================================================
 # ToolCallStreamParser Tests
 # ============================================================================
@@ -123,9 +235,9 @@ class TestParseToolCalls:
 class TestToolCallStreamParser:
     """Tests for the ToolCallStreamParser streaming state machine."""
 
-    def _run_parser(self, tokens):
+    def _run_parser(self, tokens, tools=None):
         """Helper: run tokens through parser and return all events."""
-        parser = ToolCallStreamParser()
+        parser = ToolCallStreamParser(tools=tools)
         results = []
         for token in tokens:
             results.extend(parser.process(token))
@@ -211,3 +323,57 @@ class TestToolCallStreamParser:
         assert len(starts) == 1
         ends = [d for t, d in results if t == "tool_call_end"]
         assert len(ends) == 1  # flush should emit tool_call_end
+
+    def test_glm_tool_call_streaming(self):
+        tools = TestGlmToolCalls._tools()
+        tokens = [
+            "I'll ",
+            "check.",
+            "<tool_",
+            "call>ba",
+            "sh<arg_key>comm",
+            "and</arg_key><arg_value>ls -la",
+            "</arg_value></tool_",
+            "call>",
+        ]
+        results = self._run_parser(tokens, tools)
+
+        content = "".join(d for t, d in results if t == "content")
+        assert content == "I'll check."
+
+        starts = [d for t, d in results if t == "tool_call_start"]
+        assert len(starts) == 1
+        assert starts[0]["function"]["name"] == "bash"
+
+        args = [d for t, d in results if t == "tool_call_args"]
+        assert len(args) == 1
+        assert json.loads(args[0]["function"]["arguments"]) == {"command": "ls -la"}
+
+        ends = [d for t, d in results if t == "tool_call_end"]
+        assert len(ends) == 1
+
+    def test_glm_multiple_and_zero_arg_streaming(self):
+        tools = TestGlmToolCalls._tools()
+        tokens = [
+            "<tool_call>ping</tool_call>",
+            "<tool_call>bash<arg_key>command</arg_key>",
+            "<arg_value>pwd</arg_value></tool_call>",
+        ]
+        results = self._run_parser(tokens, tools)
+
+        starts = [d for t, d in results if t == "tool_call_start"]
+        assert [start["function"]["name"] for start in starts] == ["ping", "bash"]
+        assert [start["index"] for start in starts] == [0, 1]
+        assert starts[0]["id"] != starts[1]["id"]
+
+        args = [d for t, d in results if t == "tool_call_args"]
+        assert json.loads(args[0]["function"]["arguments"]) == {}
+        assert json.loads(args[1]["function"]["arguments"]) == {"command": "pwd"}
+
+    def test_incomplete_glm_call_is_returned_as_content(self):
+        text = "<tool_call>bash" "<arg_key>command</arg_key><arg_value>ls</arg_value>"
+        results = self._run_parser([text], TestGlmToolCalls._tools())
+
+        content = "".join(d for t, d in results if t == "content")
+        assert content == text
+        assert not [d for t, d in results if t == "tool_call_start"]
