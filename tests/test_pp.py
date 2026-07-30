@@ -20,7 +20,9 @@ sys.modules.setdefault("aiter", types.ModuleType("aiter"))
 sys.modules.setdefault("aiter.ops", types.ModuleType("aiter.ops"))
 sys.modules.setdefault("aiter.dist", types.ModuleType("aiter.dist"))
 
-_ps_stub = types.ModuleType("aiter.dist.parallel_state")
+_ps_stub = sys.modules.get("aiter.dist.parallel_state") or types.ModuleType(
+    "aiter.dist.parallel_state"
+)
 for _fn in (
     "get_pp_group",
     "get_tp_group",
@@ -28,12 +30,16 @@ for _fn in (
     "ensure_model_parallel_initialized",
     "_split_tensor_dict",
 ):
-    setattr(_ps_stub, _fn, MagicMock())
-sys.modules.setdefault("aiter.dist.parallel_state", _ps_stub)
+    if not hasattr(_ps_stub, _fn):
+        setattr(_ps_stub, _fn, MagicMock())
+sys.modules["aiter.dist.parallel_state"] = _ps_stub
 
-_comm_stub = types.ModuleType("aiter.ops.communication")
-_comm_stub.set_custom_all_reduce = lambda *a, **k: None
-sys.modules.setdefault("aiter.ops.communication", _comm_stub)
+_comm_stub = sys.modules.get("aiter.ops.communication") or types.ModuleType(
+    "aiter.ops.communication"
+)
+if not hasattr(_comm_stub, "set_custom_all_reduce"):
+    _comm_stub.set_custom_all_reduce = lambda *a, **k: None
+sys.modules["aiter.ops.communication"] = _comm_stub
 
 from atom.distributed import pp_comm
 from atom.distributed.pp_transport import PPStageTransport
