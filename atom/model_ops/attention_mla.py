@@ -1281,7 +1281,9 @@ class MLAAttention(nn.Module):
             # persistent lets metadata (reduce_partial_map) drive the split, so
             # 16 is inert; the non-persistent fallback (gfx942 DCP) still needs
             # the DCP-scaled split to keep the fp32 `logits` small (CUDA-graph OOM).
-            num_kv_splits = 16 if use_persistent_mode else max(1, 16 // self.dcp_world_size)
+            num_kv_splits = (
+                16 if use_persistent_mode else max(1, 16 // self.dcp_world_size)
+            )
 
             # TODO refactor this
             if envs.ATOM_MLA_PAGE_SIZE is not None:

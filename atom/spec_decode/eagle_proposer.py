@@ -400,7 +400,9 @@ class EagleProposer(Drafter):
                             # this draft token; other ranks' kv_indptr didn't grow,
                             # so raw_slots would point at a stale slot. Emit -1.
                             ctx = attn_metadata.context_lens[:bs]
-                            owned = ((ctx - 1) % builder.dcp_world_size) == builder.dcp_rank
+                            owned = (
+                                (ctx - 1) % builder.dcp_world_size
+                            ) == builder.dcp_rank
                             slot_mapping[:] = torch.where(owned, raw_slots, -1)
                         else:
                             slot_mapping[:] = raw_slots

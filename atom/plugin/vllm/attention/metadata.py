@@ -1,13 +1,20 @@
-from typing import Optional
 import logging
-
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
-
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.chip_info import get_gfx
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonMetadataBuilder,
+    QueryLenSupport,
+)
+from vllm.v1.attention.backend import (
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+)
+
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import dcp_persistent_supported
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
@@ -17,14 +24,6 @@ from atom.plugin.vllm.attention.layer_mla import (
 )
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
-from vllm.model_executor.layers.attention.mla_attention import (
-    MLACommonMetadataBuilder,
-    QueryLenSupport,
-)
-from vllm.v1.attention.backend import (
-    AttentionCGSupport,
-    AttentionMetadataBuilder,
-)
 
 logger = logging.getLogger("atom")
 

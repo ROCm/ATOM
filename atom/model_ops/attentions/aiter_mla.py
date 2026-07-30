@@ -15,6 +15,7 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
     get_dcp_rank,
@@ -1701,9 +1702,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # non-DCP / qlen=1 paths keep the plain kernel). Consumed by
         # _forward_decode -> mla_decode_fwd for the MTP (max_q_len>1) cprr mask.
         attn_metadata.g_kv_indptr = (
-            var["g_kv_indptr"].copy_to_gpu(bs + 1)
-            if self.dcp_world_size > 1
-            else None
+            var["g_kv_indptr"].copy_to_gpu(bs + 1) if self.dcp_world_size > 1 else None
         )
 
         if ctx_mla_ps_sparse is not None:
