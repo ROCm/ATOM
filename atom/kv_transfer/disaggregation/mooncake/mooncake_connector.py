@@ -23,15 +23,18 @@ import msgpack
 import msgspec
 import torch
 import zmq
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation.port_offset import (
-    consumer_region_indices,
-    side_channel_port_offset as _port_offset,
-)
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
+)
+from atom.kv_transfer.disaggregation.port_offset import (
+    consumer_region_indices,
+)
+from atom.kv_transfer.disaggregation.port_offset import (
+    side_channel_port_offset as _port_offset,
 )
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
@@ -42,7 +45,6 @@ from atom.model_engine.sequence import Sequence
 from atom.models.utils import get_pp_indices
 from atom.utils import get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 logger = logging.getLogger("atom")
 

@@ -1714,13 +1714,13 @@ def _get_current_atom_config_from_vllm_forward_context() -> Config | None:
         from vllm.forward_context import (
             is_forward_context_available,
         )
-    except Exception:
+    except (ImportError, AttributeError):
         return None
     if not is_forward_context_available():
         return None
     try:
         return get_vllm_forward_context().additional_kwargs.get("atom_config")
-    except Exception:
+    except (ImportError, AttributeError):
         return None
 
 

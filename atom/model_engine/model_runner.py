@@ -1439,10 +1439,13 @@ class ModelRunner:
             total = end - start
         else:
             total = num_hidden
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            if not hasattr(self, "eagle3_draft_builder"):
-                draft_hf = self.config.speculative_config.draft_model_hf_config
-                total += getattr(draft_hf, "num_nextn_predict_layers", 1)
+        if (
+            self.config.speculative_config
+            and hasattr(self, "drafter")
+            and not hasattr(self, "eagle3_draft_builder")
+        ):
+            draft_hf = self.config.speculative_config.draft_model_hf_config
+            total += getattr(draft_hf, "num_nextn_predict_layers", 1)
         return total
 
     def _compute_block_bytes(self):
