@@ -468,7 +468,12 @@ class DSparkProposer(Drafter):
         """
         T = self.mtp_k
         block_size = self.runner.block_size
-        num_tokens = main_hidden_all.shape[0]
+        num_tokens = target_positions.shape[0]
+        assert main_hidden_all.shape[0] >= num_tokens, (
+            f"aux hidden has {main_hidden_all.shape[0]} rows but the target "
+            f"forwarded {num_tokens} positions; the aux capture is not "
+            "row-aligned to the target pass."
+        )
         # warmup_model() runs at the end of ModelRunner.__init__, BEFORE
         # allocate_kv_cache(), so on a dummy run there is no paged state: the
         # draft's kv_cache is still the empty init tensor and attn_metadata's
@@ -482,7 +487,7 @@ class DSparkProposer(Drafter):
         if not is_dummy:
             with record_function(f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"):
                 self.model.write_context_kv(
-                    main_hidden_all,
+                    main_hidden_all[:num_tokens],
                     target_positions,
                     attn_metadata.slot_mapping[:num_tokens],
                 )

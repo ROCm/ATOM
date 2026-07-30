@@ -318,6 +318,37 @@ def cp_mha_gather_cache(
     )
 
 
+def _run_attention_impl(
+    q: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch into the bound layer's impl. Shared by both boundary ops below."""
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    if use_mla:
+        return self.impl.forward(
+            query=q,
+            k_nope=k,
+            k_rope=v,
+            positions=positions,
+            q_scale=q_scale,
+        )
+    return self.impl.forward(
+        query=q,
+        key=k,
+        value=v,
+        position=positions,
+        q_scale=q_scale,
+        qkv=qkv,
+    )
+
+
 def fake_(
     q: torch.Tensor,
     q_scale: Optional[torch.Tensor],
@@ -355,25 +386,77 @@ def unified_attention_with_output_base(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    atom_config = get_current_atom_config()
-    self = atom_config.compilation_config.static_forward_context[layer_name]
-    if use_mla:
-        return self.impl.forward(
-            query=q,
-            k_nope=k,
-            k_rope=v,
-            positions=positions,
-            q_scale=q_scale,
-        )
-    else:
-        return self.impl.forward(
-            query=q,
-            key=k,
-            value=v,
-            position=positions,
-            q_scale=q_scale,
-            qkv=qkv,
-        )
+    """Opaque splitting-op boundary for attention, returning a fresh output.
+
+    Unsafe under PIECEWISE -- see ``unified_attention_into_output`` below, which
+    is what ATOM's native ``Attention`` uses. Kept unchanged for the plugin
+    callers, which do not go through ATOM's piecewise backend.
+    """
+    return _run_attention_impl(
+        q, q_scale, k, v, positions, layer_name, use_mla, qkv
+    )
+
+
+def _unified_attention_into_output_fake(
+    q: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return None
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=_unified_attention_into_output_fake,
+    mutates_args=["output"],
+)
+def unified_attention_into_output(
+    q: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Same boundary, but the result lands in a CALLER-allocated ``output``.
+
+    That is the whole difference, and it is what PIECEWISE needs. The caller
+    allocates on its own side of the splitting op, so under PIECEWISE the buffer
+    comes out of the preceding compiled piece's cudagraph pool and holds a fixed
+    address across replays. An output allocated in here, in an eager section,
+    only repeats its address while the caching allocator happens to hand back
+    the same block; when it stops -- as it does once a spec-decode batch makes
+    the eager allocation sizes move step to step -- the next captured piece
+    reads a stale pointer and CUDAGraphWrapper's input_addresses assert fires.
+    Same contract as vLLM's ``*_with_output`` ops and
+    ``kimi_k3.kda_core_with_output``.
+
+    Split from ``unified_attention_with_output_base`` rather than replacing it:
+    that op is also called from the SGLang plugin, which runs its own runtime
+    and does not need this.
+
+    The impl still allocates its own result and it is copied here. The copy is
+    eager -- one [tokens, out_width] write per attention layer -- and the
+    address guarantee holds without it being removed. Eliminating it means
+    threading ``output`` down through all six ``forward_impl`` exits into the
+    backend kernels, which is a separate change.
+    """
+    out = _run_attention_impl(
+        q, q_scale, k, v, positions, layer_name, use_mla, qkv
+    )
+    # Guard for the day an impl learns to write into `output` directly: then
+    # `out` IS `output` and copying a tensor onto itself is wasted bandwidth.
+    if out.data_ptr() != output.data_ptr():
+        output.view_as(out).copy_(out)
 
 
 def linear_attention_with_output_base_fake(

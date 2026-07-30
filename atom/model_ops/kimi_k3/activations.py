@@ -115,20 +115,41 @@ def situ_and_mul(
 
 
 def rmsnorm_gated(
-    x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps: float
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
 ) -> torch.Tensor:
-    """rmsnorm(x) over last dim * weight * sigmoid(gate).
+    """rmsnorm(x) over last dim * weight * sigmoid(gate), written into ``out``.
 
     ``gate`` may be strided (e.g. a column slice of a fused GEMM output): the
     kernel reads it via (outer, head) strides so no contiguous copy is needed.
     ``x`` is normed row-wise and is made contiguous (cheap; the caller's ``out``
     already is). Supports a 2D ``[M, H]`` or 3D ``[outer, heads, H]`` gate.
+
+    ``out`` is a contiguous buffer holding ``x``'s element count that the kernel
+    writes into directly, and which is returned. There is deliberately no
+    allocating form: the only caller is the KDA mixer, which hands over the
+    cudagraph-owned buffer its splitting op was given, so the result lands at
+    its final address instead of being allocated here and copied. ``out`` may
+    alias ``x`` -- one program per row, whole row loaded before it is stored.
     """
     h = x.shape[-1]
     x2 = x.reshape(-1, h)
     m = x2.shape[0]
+    # Must end up a view of `out`, never a copy, or the kernel writes where the
+    # caller never looks. A contiguous `out` reshapes to [m, h] for free.
+    assert out.is_contiguous() and out.numel() == x2.numel(), (
+        "rmsnorm_gated(out=...) needs a contiguous buffer holding x's "
+        f"element count; got {tuple(out.shape)} "
+        f"contiguous={out.is_contiguous()} for x {tuple(x.shape)}"
+    )
     if not _HAS_TRITON or m == 0 or h > 8192:
-        return _rmsnorm_gated_torch(x, weight, gate, eps)
+        # The torch reference is a plain expression, so it allocates; landing it
+        # in `out` needs this copy. Unreachable for KDA (triton present, h=128,
+        # m>0), and copies nothing on the m==0 batch that can reach it.
+        return out.view_as(x).copy_(_rmsnorm_gated_torch(x, weight, gate, eps))
     if gate.ndim == 3:
         heads = gate.shape[1]
         stride_g_outer, stride_g_head = gate.stride(0), gate.stride(1)
@@ -137,7 +158,7 @@ def rmsnorm_gated(
         heads = 1
         stride_g_outer, stride_g_head = gate.stride(0), 0
     x2 = x2.contiguous()
-    y = torch.empty_like(x2)
+    y = out.view(m, h)
     BLOCK = triton.next_power_of_2(h)
     _rmsnorm_gated_kernel[(m,)](
         x2,
@@ -153,7 +174,7 @@ def rmsnorm_gated(
         HEADS=heads,
         BLOCK=BLOCK,
     )
-    return y.reshape_as(x)
+    return out
 
 
 # --------------------------------------------------------------------------- #

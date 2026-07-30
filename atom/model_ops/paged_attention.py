@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from .attention_mla import MLAModules
+from .attention_mla import MLAModules, _mla_output_width
 from .base_attention import BaseAttention
 from atom.config import get_current_atom_config
 from atom.utils.selector import get_attn_backend
@@ -118,7 +118,28 @@ class Attention(BaseAttention):
         qkv: torch.Tensor = None,
         **kwargs,
     ):
-        output = torch.ops.aiter.unified_attention_with_output_base(
-            query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
+        # Allocated HERE, on the caller's side of the splitting op, so that under
+        # PIECEWISE it comes out of the preceding compiled piece's cudagraph pool
+        # and holds a fixed address across replays. See the op's docstring.
+        # Plain attribute arithmetic, so dynamo folds the shape to a constant.
+        output_shape = list(query.shape)
+        atom_config = get_current_atom_config()
+        if self.use_mla:
+            output_shape[-1] = _mla_output_width(
+                self.impl, atom_config.hf_config.hidden_size
+            )
+        output = torch.empty(
+            output_shape, dtype=atom_config.torch_dtype, device=query.device
+        )
+        torch.ops.aiter.unified_attention_into_output(
+            query,
+            q_scale,
+            key,
+            value,
+            positions,
+            self.layer_name,
+            self.use_mla,
+            qkv,
+            output,
         )
         return output

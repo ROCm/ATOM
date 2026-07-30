@@ -209,10 +209,17 @@ class KimiRMSNormGated(nn.Module):
         self.weight = atom_parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """``out`` is required -- the sole caller is the KDA mixer, which always
+        has a destination buffer. See ``rmsnorm_gated``'s docstring."""
         from atom.model_ops.kimi_k3 import rmsnorm_gated
 
-        return rmsnorm_gated(x, self.weight, gate, self.variance_epsilon)
+        return rmsnorm_gated(x, self.weight, gate, self.variance_epsilon, out=out)
 
 
 def _sharded_vector_loader(tp_rank: int, tp_size: int):
@@ -525,6 +532,78 @@ class KimiFullAttention(nn.Module):
         return self.o_proj(attn_out)
 
 
+def _kda_core_with_output_fake(
+    mixed_qkv: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    out_gate: torch.Tensor,
+    core: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=_kda_core_with_output_fake,
+    mutates_args=["core"],
+)
+def kda_core_with_output(
+    mixed_qkv: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    out_gate: torch.Tensor,
+    core: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Opaque splitting-op boundary for the STATEFUL part of the KDA mixer.
+
+    The recurrence reads the forward context, calls fla causal-conv/kda kernels
+    and mutates the per-request conv/ssm cache in place. torch.compile (level 3)
+    mis-compiles that stateful path into garbage if it is allowed to trace
+    through it, so it is wrapped in a custom op — inductor treats it as opaque
+    and the piecewise backend splits the graph here.
+
+    Scope is the recurrence plus ``o_norm``. The projections around it are pure
+    and stay in the compiled region, which buys two things:
+
+    - Address stability. A PIECEWISE graph reads its inputs from the addresses
+      baked in at capture, so a tensor crossing from an eager section into a
+      captured piece must not move. ``core`` is allocated by the PRECEDING
+      compiled piece, so it comes out of the cudagraph pool and is fixed by
+      construction -- the contract vLLM's ``*_with_output`` ops rely on. The
+      earlier version wrapped the whole mixer and returned o_proj's freshly
+      allocated result, whose address only repeated while the caching allocator
+      happened to hand back the same block. That stopped holding under spec
+      decode: the result is sized by the REAL token count while the graph is
+      captured at a padded bucket, so the allocation size moved step to step.
+      The MLA layers never had the problem because their splitting op returns
+      the attention core at the padded row count, with o_proj already outside.
+    - Speed. in_proj / f_b_proj / o_proj and o_proj's TP all_reduce now run
+      inside the captured graph rather than eager, on all 69 KDA layers.
+
+    ``o_norm`` is deliberately kept on this side even though it is pure:
+    ``KimiRMSNormGated`` is the one module in the mixer that appears nowhere
+    else in a compiled region, so exposing it to dynamo would be the only
+    untested tracing surface in the change. Everything left in the compiled
+    region (``MergedColumnParallelLinear``, ``ColumnParallelLinear``,
+    ``RowParallelLinear``) already traces today in the MLP and MLA layers. The
+    cost of keeping it here is one fused kernel's worth of missed fusion, not
+    the graph capture.
+
+    ``core`` is the POST-o_norm result, [tokens, local_proj_size], ready for
+    o_proj. It arrives with the compiled region's padded row count; rows past
+    ``num_actual_tokens`` are left undefined (see the allocation site).
+
+    Only reachable under PIECEWISE. Every other cudagraph mode keeps the
+    original whole-mixer boundary, ``kda_attention_with_output`` below.
+    """
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    self._core_impl(mixed_qkv, gate, beta, out_gate, core)
+
+
 def _kda_attention_with_output_fake(
     hidden_states: torch.Tensor, layer_name: str
 ) -> torch.Tensor:
@@ -539,19 +618,23 @@ def _kda_attention_with_output_fake(
 def kda_attention_with_output(
     hidden_states: torch.Tensor, layer_name: str
 ) -> torch.Tensor:
-    """Opaque splitting-op boundary for the KDA mixer.
+    """Opaque splitting-op boundary around the WHOLE KDA mixer.
 
-    The KDA recurrence reads the forward context, calls fla causal-conv/kda
-    kernels and mutates the per-request conv/ssm cache in place. torch.compile
-    (level 3) mis-compiles that stateful path into garbage if it is allowed to
-    trace through it, so the whole mixer is wrapped in a custom op — inductor
-    treats it as opaque and the piecewise backend splits the graph here,
-    exactly as the GDN path does via aiter.linear_attention_with_output_base.
+    The original boundary, and the one every cudagraph mode except PIECEWISE
+    still uses. Projections, recurrence, o_norm and o_proj all run eager behind
+    it, so the compiled region sees one opaque node per KDA layer.
+
+    ``kda_core_with_output`` above narrows this to just the stateful part, which
+    is what PIECEWISE needs: it wants the projections inside a captured piece
+    and the boundary tensor allocated by one. Neither buys anything here -- with
+    a single whole-forward FULL graph there is no eager/captured seam to keep
+    addresses stable across -- so the target's validated path is left exactly as
+    it was rather than made to carry a change aimed at a mode it does not run.
     """
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return self._forward_impl(hidden_states)
+    return self._forward_whole(hidden_states)
 
 
 class KimiKDAAttention(nn.Module):
@@ -582,10 +665,25 @@ class KimiKDAAttention(nn.Module):
         self.activation = "silu"
         self.base_linear_attention = True
 
-        # Register under a stable name so the kda_attention_with_output custom op
-        # can recover this module from the forward context. The op is the
-        # graph-split boundary that keeps torch.compile from tracing (and
-        # mis-compiling) the stateful KDA recurrence.
+        # Where to put the graph-split boundary. Narrowing it to the stateful
+        # core only pays off under PIECEWISE, which is also the only mode that
+        # needs it: that is where an eager section hands a tensor to a captured
+        # piece that reads it from a baked-in address. FULL / NONE capture the
+        # whole forward (or nothing), so there is no such seam and the original
+        # whole-mixer boundary is left untouched. Resolved once here so the
+        # branch in forward() is a constant for dynamo.
+        cudagraph_mode = getattr(
+            atom_config.compilation_config, "cudagraph_mode", None
+        )
+        self._narrow_split = bool(
+            hasattr(cudagraph_mode, "requires_piecewise_compilation")
+            and cudagraph_mode.requires_piecewise_compilation()
+        )
+
+        # Register under a stable name so the kda_core_with_output custom op can
+        # recover this module from the forward context. The op is the graph-split
+        # boundary that keeps torch.compile from tracing (and mis-compiling) the
+        # stateful KDA recurrence.
         self.layer_name = prefix
         compilation_config = atom_config.compilation_config
         if self.layer_name in compilation_config.static_forward_context:
@@ -777,32 +875,17 @@ class KimiKDAAttention(nn.Module):
         # and preserves the same chunk-KDA forward semantics.
         return chunk_kda(**kwargs, disable_recompute=True)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Route through the opaque custom op so torch.compile splits the graph
-        # here instead of tracing the stateful recurrence in _forward_impl.
-        return torch.ops.aiter.kda_attention_with_output(hidden_states, self.layer_name)
+    def _project(self, hidden_states: torch.Tensor):
+        """The pure front half of the mixer, shared by both boundaries.
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        fwd_ctx = get_forward_context()
-        gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
-        if gdn_metadata is None:
-            return hidden_states.new_zeros(hidden_states.shape)
-
-        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
-        conv_state = cache.k_cache
-        ssm_state = cache.v_cache
-        if conv_state.size(1) != self.local_proj_size * 3:
-            conv_state = conv_state.transpose(-1, -2)
-
-        num_actual_tokens = gdn_metadata.num_actual_tokens
-        hidden_states = hidden_states[:num_actual_tokens]
-        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
-        # part. `out_gate` is the KDA output gate consumed at o_norm below
-        # (computed here so it rides the same GEMM instead of a separate one
-        # after the recurrence). in_proj's weight was grown in
-        # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
-        # so this single unquantized call emits all six; f_b_proj stays a
-        # separate GEMM because it consumes f_a's output, not hidden_states.
+        Single fused in-proj GEMM producing [q | k | v | g]; slice out each
+        part. ``out_gate`` is the KDA output gate consumed at o_norm (computed
+        here so it rides the same GEMM instead of a separate one after the
+        recurrence). in_proj's weight was grown in process_weights_after_loading
+        to the fused [q | k | v | g | b | f_a], so this single unquantized call
+        emits all six; f_b_proj stays a separate GEMM because it consumes f_a's
+        output, not hidden_states.
+        """
         lp = self.local_proj_size
         nlh = self.num_local_heads
         hd = self.head_dim
@@ -815,15 +898,108 @@ class KimiKDAAttention(nn.Module):
         mixed_qkv = fused_in[..., : 3 * lp]
         out_gate = fused_in[..., 3 * lp : 4 * lp]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
-        # delta-rule write strength must stay fp32 for accuracy.
-        beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
+        # delta-rule write strength must stay fp32 for accuracy. Its leading
+        # unsqueeze, and gate's 4D rearrange, happen inside _core_impl.
+        beta = fused_in[..., 4 * lp : 4 * lp + nlh]
         # f_a feeds a second GEMM (f_b_proj); make it contiguous so tgemm sees a
         # unit row stride rather than the fused output's N_fused stride.
         f_a = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd].contiguous()
         gate = self.f_b_proj(f_a)
-        gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        out = hidden_states.new_empty(
-            (num_actual_tokens, self.num_local_heads, self.head_dim)
+        return mixed_qkv, out_gate, beta, gate
+
+    def _forward_whole(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The original all-eager mixer, behind ``kda_attention_with_output``.
+
+        Used by every cudagraph mode except PIECEWISE. Projections run on the
+        real tokens only, as before; the recurrence and o_norm are the shared
+        ``_core_impl``.
+        """
+        fwd_ctx = get_forward_context()
+        gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+        if gdn_metadata is None:
+            return hidden_states.new_zeros(hidden_states.shape)
+        num_actual_tokens = gdn_metadata.num_actual_tokens
+        hidden_states = hidden_states[:num_actual_tokens]
+        mixed_qkv, out_gate, beta, gate = self._project(hidden_states)
+        core = hidden_states.new_empty((num_actual_tokens, self.local_proj_size))
+        self._core_impl(mixed_qkv, gate, beta, out_gate, core)
+        return self.o_proj(core)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Route to whichever splitting-op boundary this cudagraph mode wants;
+        ``_narrow_split`` is fixed at construction so dynamo folds the branch.
+
+        The PIECEWISE arm below is the compiled region of the mixer:
+        projections and column slices only. The recurrence and o_norm go
+        through the opaque op, which writes its result into `core`.
+        """
+        if not self._narrow_split:
+            return torch.ops.aiter.kda_attention_with_output(
+                hidden_states, self.layer_name
+            )
+        lp = self.local_proj_size
+        mixed_qkv, out_gate, beta, gate = self._project(hidden_states)
+        # Allocated HERE, in the compiled piece, so a captured graph owns the
+        # address the eager section writes to. Already o_proj-shaped, so nothing
+        # between the op and o_proj needs tracing.
+        #
+        # new_empty, not new_zeros: the op fills only the real tokens, so the
+        # pad tail is undefined -- but those rows are discarded downstream, and
+        # everything they pass through (o_proj, all_reduce, apply_attn_res_add,
+        # rmsnorm, MoE routing, the mxfp4 GEMM's per-row block scales) is
+        # per-token, with no tensor-wide activation reduction that could let
+        # them reach a real token. Zeroing them cost ~108MB of in-graph writes
+        # per forward across the 69 KDA layers for no reachable effect.
+        core = hidden_states.new_empty((hidden_states.shape[0], lp))
+        torch.ops.aiter.kda_core_with_output(
+            mixed_qkv, gate, beta, out_gate, core, self.layer_name
+        )
+        return self.o_proj(core)
+
+    def _core_impl(
+        self,
+        mixed_qkv: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+        out_gate: torch.Tensor,
+        core: torch.Tensor,
+    ) -> None:
+        fwd_ctx = get_forward_context()
+        gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+        if gdn_metadata is None:
+            # Was "return zeros for the whole mixer": o_proj has no bias, so
+            # zeroing its input reproduces that. This is the one path that
+            # needs it -- `core` is uninitialized and nothing else writes it.
+            core.zero_()
+            return
+
+        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        conv_state = cache.k_cache
+        ssm_state = cache.v_cache
+        if conv_state.size(1) != self.local_proj_size * 3:
+            conv_state = conv_state.transpose(-1, -2)
+
+        # The compiled region works at the padded bucket row count; the
+        # recurrence only ever touches the real tokens. Slicing here keeps every
+        # branch below written against real rows, exactly as before. gate and
+        # beta also take the leading-axis shape the fla kernels expect, which
+        # used to be applied at the projection site.
+        num_actual_tokens = gdn_metadata.num_actual_tokens
+        hd = self.head_dim
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        gate = rearrange(gate[:num_actual_tokens], "t (h d) -> 1 t h d", d=hd)
+        beta = beta[:num_actual_tokens].unsqueeze(0)
+        # The recurrence target IS core's real-token region, viewed per head --
+        # not a fresh tensor. Two reasons: nothing has to be copied into place
+        # afterwards, and this eager section stops making a per-layer
+        # allocation whose size tracks the batch. 69 varying-size allocations
+        # per forward are exactly what shuffles the caching allocator's free
+        # list, which is what moves the addresses of tensors the captured
+        # pieces read. core is [tokens, nlh*hd] and contiguous, so the view is
+        # free. The pad tail is left undefined on purpose -- see the allocation
+        # site for why nothing downstream can observe it.
+        out = core[:num_actual_tokens].view(
+            num_actual_tokens, self.num_local_heads, hd
         )
 
         conv_weights = self.conv_weight
@@ -963,8 +1139,17 @@ class KimiKDAAttention(nn.Module):
         else:
             out.zero_()
 
-        out = self.o_norm(out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim))
-        return self.o_proj(rearrange(out, "t h d -> t (h d)"))
+        # o_norm stays here rather than in the compiled region (see the op's
+        # docstring). It normalizes row-wise -- one triton program per row,
+        # loading the whole row before storing it -- so it can write back over
+        # its own input. `out` is core's real-token region, so the result lands
+        # at the address the next captured piece reads, with no copy and no
+        # extra allocation.
+        self.o_norm(
+            out,
+            rearrange(out_gate[:num_actual_tokens], "t (h d) -> t h d", d=hd),
+            out=out,
+        )
 
 
 class KimiDecoderLayer(nn.Module):
